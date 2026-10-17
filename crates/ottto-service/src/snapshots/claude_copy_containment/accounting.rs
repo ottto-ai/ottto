@@ -13,6 +13,25 @@ use crate::snapshots::{
 use std::collections::BTreeMap;
 use std::mem::{size_of, size_of_val};
 
+#[cfg(test)]
+thread_local! {
+    static OBSERVATION_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+#[cfg(test)]
+fn reset_observation_counts() {
+    OBSERVATION_COUNTS.with(|value| value.set((0, 0)));
+}
+#[cfg(test)]
+fn observation_counts() -> (usize, usize) {
+    OBSERVATION_COUNTS.with(std::cell::Cell::get)
+}
+impl ScanIndex {
+    /// Inactive process context only; never evidence or a read/upload grant.
+    pub(crate) fn copy_completion_observation_enabled(&self) -> bool {
+        self.active_copy_scan.is_some()
+    }
+}
+
 /// Report references must be the same actual owners used to build evidence in
 /// the enclosing lexical source completion. No borrowed row referent is walked
 /// again through evidence. Real cloned owners remain separate graph roots.
@@ -33,7 +52,13 @@ pub(crate) fn observe_owned_completion(
     frame: BorrowedClaudeCompletion<'_, '_>,
     limit: usize,
 ) -> Option<usize> {
-    if frame.index.active_copy_scan.is_none() || !heap_layout_bound::layout_supported() {
+    #[cfg(test)]
+    OBSERVATION_COUNTS.with(|value| {
+        let (entries, walks) = value.get();
+        value.set((entries + 1, walks));
+    });
+    if !frame.index.copy_completion_observation_enabled() || !heap_layout_bound::layout_supported()
+    {
         return None;
     }
     let BorrowedClaudeCompletion {
@@ -47,6 +72,11 @@ pub(crate) fn observe_owned_completion(
     } = frame;
     let mut c = Counter::new(limit);
     c.add(size_of::<ScanIndex>())?;
+    #[cfg(test)]
+    OBSERVATION_COUNTS.with(|value| {
+        let (entries, walks) = value.get();
+        value.set((entries, walks + 1));
+    });
     index.completed_heap_bound(&mut c)?;
     c.add(size_of::<SourceScanResult>())?;
     scan.completed_claude_heap_bound(&mut c)?;

@@ -87,8 +87,10 @@ String/Vec capacity and tree storage count; no identity value is returned.
 
 The strict API reader is explicitly dropped after its last generation check and
 before this observation. Unknown process context, unsupported layout, opaque
-Claude-incompatible carriers or exhausted accounting return unavailable. The new
-models are mechanical; classification, account qualification, ledger eviction,
+Claude-incompatible carriers or exhausted accounting return unavailable. The ordinary default path does not
+invoke this observation; unsupported layout exits before graph traversal. This
+inactive validation scaffold must be consolidated into the actual admission gate,
+rather than retained as a redundant production walk. The new models are mechanical; classification, account qualification, ledger eviction,
 serialization and caps are unchanged.
 
 This observation is **not a cache-admission or full peak-memory permit**. It omits
