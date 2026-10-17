@@ -1,6 +1,7 @@
 use super::*;
 use crate::snapshots::*;
 use serde_json::json;
+use sha2::Digest;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -278,8 +279,11 @@ fn copy_containment_retained_peer_cap_withholds_native_candidate_without_growing
             claude_duplicate_request_owner(C, C),
         ]),
     );
-    let withheld =
-        index.record_known_copy_holds(&scan.snapshots, &[(&key, &revision)], |_, _| false);
+    let withheld = index.try_record_known_copy_holds(
+        &scan.snapshots,
+        super::super::producer::OpenedFiles::pairs(&[(&key, &revision)]),
+        |_, _| false,
+    );
     assert_eq!(withheld, BTreeSet::from([B.to_string()]));
     assert_eq!(index.copy_hold_count(), 1);
     assert!(!index.claude_copy_holds.entries.contains_key(&key));
@@ -389,7 +393,9 @@ fn copy_containment_native_scanner_proven_own_change_reads_once_with_other_wakes
         None,
     );
     assert!(authority.copied_source_session_ids.contains(A));
-    authority.retain_copy_uploadable(&mut changed.snapshots);
+    authority
+        .retain_copy_uploadable(&mut changed.snapshots)
+        .unwrap();
     assert!(
         changed.snapshots.is_empty(),
         "a wake never releases a held body"
@@ -571,7 +577,9 @@ fn copy_containment_native_fold_withholds_known_copies_before_healthy_wire_ack_a
         authority.copied_source_session_ids,
         BTreeSet::from([A.to_string(), B.to_string()])
     );
-    authority.retain_copy_uploadable(&mut scan.snapshots);
+    authority
+        .retain_copy_uploadable(&mut scan.snapshots)
+        .unwrap();
     assert_eq!(scan.snapshots.len(), 1);
     assert_eq!(scan.snapshots[0].source_session_id, C);
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut working);
@@ -621,4 +629,162 @@ fn copy_containment_native_fold_withholds_known_copies_before_healthy_wire_ack_a
     assert!(!reloaded.files.contains_key(&local_index_key(&f.path(B))));
     assert_eq!(reloaded.current_snapshot_fingerprints(), accepted);
     writeln!(std::io::stderr().lock(), "copy_containment_native_preoffer: actual_native_fold=true known_copies_held=2 serialized_healthy_bodies=1 actual_entity_ack_validator=true selected_save_reload=true first_unseen_gap_unchanged=true c5_basis_parity_unproved=true runtime_owner_unwired=true").unwrap();
+}
+
+#[test]
+fn copy_containment_producer_borrowed_plan_allocates_nothing_and_preserves_exact_owner_semantics() {
+    use super::super::producer::{OpenedFiles, Plan};
+    let f = Fixture::new();
+    f.write(B, &["req_shared", "req_own"], false);
+    let mut index = ScanIndex::default();
+    let scan = f.scan(&mut index);
+    let key = local_index_key(&f.path(B));
+    let revision = scan.snapshots[0].source_file_fingerprint.clone().unwrap();
+    index.attach_copy_scan_context(context(&key, None));
+    index.claude_duplicate_request_owners.insert(
+        format!("{:x}", sha2::Sha256::digest(b"req_shared")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(A, A),
+            claude_duplicate_request_owner(B, B),
+        ]),
+    );
+    let inputs = [(&*key, &*revision)];
+    let ((temporary, ledger, returned), measured) = crate::retry_allocation_probe::measure(|| {
+        let plan = Plan::borrowed(&index, &scan.snapshots, OpenedFiles::pairs(&inputs)).unwrap();
+        (plan.temporary, plan.ledger, plan.returned)
+    });
+    assert_eq!(measured.allocations, 0);
+    assert_eq!(measured.requested_live, 0);
+    assert!(temporary > 0 && ledger > 0 && returned > 0);
+    let mut excluded = index.clone();
+    let no_copy = excluded.try_record_known_copy_holds(
+        &scan.snapshots,
+        OpenedFiles::pairs(&inputs),
+        |_, _| true,
+    );
+    assert!(no_copy.is_empty());
+    assert_eq!(excluded.copy_hold_count(), 0);
+    let withheld =
+        index.try_record_known_copy_holds(&scan.snapshots, OpenedFiles::pairs(&inputs), |_, _| {
+            false
+        });
+    assert_eq!(withheld, BTreeSet::from([B.to_string()]));
+    assert_eq!(index.copy_hold_count(), 1);
+    assert_eq!(
+        index.claude_copy_holds.entries[&key].peers,
+        BTreeSet::from([claude_duplicate_request_owner(A, A).source_session_id_hash,])
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_producer_plan: borrowed_allocations=0 exact_owner_exclusion_preserved=true opens_borrowed=true temporary_upper={} ledger_upper={} returned_upper={} no_required_admission_claim=true",temporary,ledger,returned).unwrap();
+}
+
+#[test]
+fn copy_containment_producer_resource_refusal_is_not_empty_or_silent_filter_success() {
+    use super::super::producer::WithheldSessions;
+    let f = Fixture::new();
+    f.write(C, &["req_healthy"], false);
+    let mut index = ScanIndex::default();
+    let mut scan = f.scan(&mut index);
+    let original = serde_json::to_vec(&scan.snapshots).unwrap();
+    let disposition = ClaudeUsageAuthorityDisposition {
+        copied_source_session_ids: WithheldSessions::refused(),
+        transcript_ownership_complete: true,
+        ..Default::default()
+    };
+    assert!(disposition.ensure_copy_preparation_available().is_err());
+    assert!(!disposition.copied_source_session_ids.is_empty());
+    assert!(disposition
+        .retain_copy_uploadable(&mut scan.snapshots)
+        .is_err());
+    assert_eq!(serde_json::to_vec(&scan.snapshots).unwrap(), original);
+    let cloned = disposition.clone();
+    assert!(cloned.ensure_copy_preparation_available().is_err());
+    assert_eq!(cloned, disposition);
+    let mut bound = crate::heap_layout_bound::Counter::new(31 * 1024 * 1024);
+    assert!(cloned.completion_owned_heap_bound(&mut bound).is_none());
+    // No withheld/accepted body mutation or fake empty ownership posture.
+    assert_eq!(index.copy_hold_count(), 0);
+    assert_eq!(WithheldSessions::default(), BTreeSet::new());
+    assert_eq!(
+        WithheldSessions::default(),
+        WithheldSessions::from(BTreeSet::new())
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_producer_refusal: explicit_error=true candidate_bytes_unchanged=true refused_not_empty=true clone_stays_refused=true no_offer_or_save=true").unwrap();
+}
+
+#[test]
+fn copy_containment_producer_paid_set_and_clone_outlive_index_without_early_credit_return() {
+    use super::super::producer::OpenedFiles;
+    let f = Fixture::new();
+    f.write(B, &["req_shared", "req_own"], false);
+    let mut ordinary = ScanIndex::default();
+    let scan = f.scan(&mut ordinary);
+    let key = local_index_key(&f.path(B));
+    let revision = scan.snapshots[0].source_file_fingerprint.clone().unwrap();
+    ordinary.claude_duplicate_request_owners.insert(
+        format!("{:x}", sha2::Sha256::digest(b"req_shared")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(A, A),
+            claude_duplicate_request_owner(B, B),
+        ]),
+    );
+    let path = f.base.join("producer-index.json");
+    ordinary.save(&path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let owner = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
+    owner.require_copy_containment_for_test();
+    let loaded = ScanIndex::load_required_copy_index(&path, &owner);
+    if !super::super::required_decode::profile_supported() {
+        assert!(loaded.is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(owner.reserved_copy_bytes_for_test(), Some(0));
+        writeln!(std::io::stderr().lock(), "copy_containment_producer_paid: unsupported_load_refused=true disk_unchanged=true actual_new_debt_and_escaped_clone_credit_positive=UNEXECUTED").unwrap();
+        return;
+    }
+    let mut index = loaded.unwrap();
+    index.attach_unknown_copy_owner("a".repeat(64)).unwrap();
+    let inputs = [(&*key, &*revision)];
+    let result =
+        index.try_record_known_copy_holds(&scan.snapshots, OpenedFiles::pairs(&inputs), |_, _| {
+            false
+        });
+    result.ensure_available().unwrap();
+    assert_eq!(result, BTreeSet::from([B.to_string()]));
+    assert_eq!(index.copy_hold_count(), 1);
+    assert!(index.required_copy_owner().unwrap().is_some());
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "producer cannot save on its own"
+    );
+    let ledger_before = serde_json::to_vec(&index).unwrap();
+    let mut pressure = Vec::new();
+    while let Some(credit) = owner.reserve_copy_bytes(1024) {
+        pressure.push(credit);
+    }
+    let refused =
+        index.try_record_known_copy_holds(&scan.snapshots, OpenedFiles::pairs(&inputs), |_, _| {
+            false
+        });
+    assert!(refused.ensure_available().is_err());
+    assert!(!refused.is_empty());
+    assert_eq!(serde_json::to_vec(&index).unwrap(), ledger_before);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    drop(pressure);
+    drop(refused);
+    let (clone, cloning) = crate::retry_allocation_probe::measure(|| result.clone());
+    assert_eq!(
+        cloning.allocations, 0,
+        "paid immutable set clones share its actual owner"
+    );
+    drop(index);
+    let escaped = owner.reserved_copy_bytes_for_test().unwrap();
+    assert!(escaped > 0);
+    owner.clear();
+    assert_eq!(owner.reserved_copy_bytes_for_test(), Some(escaped));
+    drop(result);
+    assert_eq!(owner.reserved_copy_bytes_for_test(), Some(escaped));
+    assert!(clone.contains(B));
+    drop(clone);
+    assert_eq!(owner.reserved_copy_bytes_for_test(), Some(0));
+    writeln!(std::io::stderr().lock(), "copy_containment_producer_paid: new_debt_paid=true escaped_after_index_bytes={} clone_allocations=0 funding_refusal_preserves_ledger_and_disk=true cache_clear_preserves_credit=true last_clone_retires_credit=true disk_unchanged=true native_capture_unqualified=true",escaped).unwrap();
 }

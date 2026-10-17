@@ -134,3 +134,41 @@ set still require prepayment and custody through their actual lifetimes.
 Native capture/event/context gaps are separate. These remaining owners prevent
 native attachment, activation, intake, merge and release. Optional status scope
 is frozen; no transport or broader control change belongs to this slice.
+
+
+## Pre-offer producer and escaped-set custody slice
+
+The opened-file handoff is now a borrowed view of the same current page's
+pending finalization inputs, avoiding its former pre-fold Vec allocation.
+The required producer first makes a nonallocating borrowed cost plan, then
+reserves temporary revision-map/peer collectors, affected ledger growth and
+returned withholding storage before running the existing overlap decision.
+The exclusion rule, record/peer limits, held revision semantics and single
+native fold are unchanged. Stack hex encoding retains the exact request and
+source-owner hash domains; the exclusion callback borrows its family root.
+Repeated peer observations deliberately overcharge the plan and can refuse
+one preparation; no new cap or eligibility is inferred from that refusal.
+
+Returned withheld IDs have their own immutable private owner and reservation.
+Required disposition clones share that physical storage instead of silently
+copying unreserved IDs. Credit remains live after the scan index is dropped,
+after optional cache clearing and until the last returned clone retires.
+The private Arc wrapper exposes no Weak handle and releases its allocation
+before its reservation. Ordinary inactive callers retain their prior behavior.
+No public Clone signature, persisted field or protocol changes.
+
+A funding failure is an explicit resource refusal, never an empty withheld
+set or successful filter. Filtering returns an error without removing candidate
+bodies; the local evidence path exits before C5 tagging, and the actual source
+finish propagates refusal before binding, offer or save, preserving last durable
+state. This slice cannot truthfully retain an exclusion without its storage,
+so that preparation aborts rather than claiming healthy progress or installing
+a permanent whole-source hold. Native capture/wake/admission remains separate
+and inactive.
+
+Three further regression tests are authored: borrowed-plan zero allocation and
+exact native-owner/exclusion parity; refusal preservation through filtering and
+cloning; and supported-profile producer growth, pressure refusal plus escaped
+clone/credit lifetime. The last positive branch remains UNEXECUTED if the real
+profile refuses. Source and tests await their own hosted CI; no local Cargo or
+model review ran. Installed CPU, RSS and rereads remain unproved.

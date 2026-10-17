@@ -2,15 +2,14 @@
 //! context yet: absence keeps BASE behavior, never an active-status claim.
 use super::*;
 use crate::snapshots::{local_index_key, CandidateFile, ScanIndex};
-use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HeldFile {
-    revision: HoldRevision,
+    pub(super) revision: HoldRevision,
     /// Full duplicate-census source handles, scoped by the enclosing context.
-    peers: BTreeSet<String>,
+    pub(super) peers: BTreeSet<String>,
     #[serde(skip)]
     observed: HoldObservation,
 }
@@ -69,7 +68,7 @@ crate::heap_layout_bound::fields!(HoldReasonCounts;
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(transparent)]
 pub(crate) struct Holds {
-    entries: BTreeMap<String, HeldFile>,
+    pub(super) entries: BTreeMap<String, HeldFile>,
 }
 crate::heap_layout_bound::fields!(Holds; entries);
 impl<'de> Deserialize<'de> for Holds {
@@ -414,10 +413,10 @@ impl ScanIndex {
     /// Called AFTER the one authoritative native fold, BEFORE C5/name binding
     /// and before any body builder. A miss preserves the accepted interim BASE
     /// behavior for NEW candidates; it can NEVER release an existing hold.
-    pub(crate) fn record_known_copy_holds(
+    pub(super) fn record_known_copy_holds(
         &mut self,
         items: &[SnapshotItem],
-        opened_files: &[(&str, &str)],
+        opened_files: super::producer::OpenedFiles<'_>,
         excluded: impl Fn(&SnapshotItem, &str) -> bool,
     ) -> BTreeSet<String> {
         if self.active_copy_scan.is_none() && self.claude_copy_holds.is_empty() {
@@ -428,7 +427,7 @@ impl ScanIndex {
         // entry or an inferred session-to-path mapping. A partial input can
         // withhold a body; it supplies no completeness or release permission.
         let mut file_keys = BTreeMap::<&str, Vec<&str>>::new();
-        for &(key, revision) in opened_files {
+        for (key, revision) in opened_files.iter() {
             file_keys.entry(revision).or_default().push(key);
         }
         let context = self.active_copy_scan.as_ref();
@@ -459,22 +458,21 @@ impl ScanIndex {
                 continue;
             }
             let context = context.expect("checked owner context");
-            let root = crate::snapshots::claude_snapshot_family_root(item);
             let own =
-                crate::snapshots::claude_duplicate_request_owner(&root, &item.source_session_id);
+                super::producer::hash(Some(b"claude_duplicate_source:v1"), &item.source_session_id);
+            let own = std::str::from_utf8(&own).expect("hex digest is ASCII");
             let mut peers = BTreeSet::new();
             for id in &item.claude_usage_request_ids {
-                let hash = format!("{:x}", sha2::Sha256::digest(id.as_bytes()));
-                if excluded(item, &hash) {
+                let hash = super::producer::hash(None, id);
+                let hash = std::str::from_utf8(&hash).expect("hex digest is ASCII");
+                if excluded(item, hash) {
                     continue;
                 }
-                if let Some(owners) = self.claude_duplicate_request_owners.get(&hash) {
+                if let Some(owners) = self.claude_duplicate_request_owners.get(hash) {
                     peers.extend(
                         owners
                             .iter()
-                            .filter(|owner| {
-                                owner.source_session_id_hash != own.source_session_id_hash
-                            })
+                            .filter(|owner| owner.source_session_id_hash != own)
                             .map(|owner| owner.source_session_id_hash.clone()),
                     );
                 }

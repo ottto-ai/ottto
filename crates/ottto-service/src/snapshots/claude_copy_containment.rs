@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub(in crate::snapshots) mod accounting;
 pub(in crate::snapshots) mod membership;
 pub(crate) mod pipeline;
+pub(in crate::snapshots) mod producer;
 // Inactive mechanical decoder/copy checkpoint. Production attachment awaits
 // complete native ownership and settlement qualification.
 #[allow(dead_code)]

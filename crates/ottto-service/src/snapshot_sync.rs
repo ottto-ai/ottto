@@ -4112,6 +4112,7 @@ fn finish_sync_source(
                 evidence_started.elapsed().as_millis()
             );
         }
+        disposition.ensure_copy_preparation_available()?;
         claude_authority_disposition = disposition;
         observe_copy_containment_status(daemon, &index, "uncommitted_scan_observation");
         if census_withheld {
@@ -5376,7 +5377,14 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
     }
     // Keep all actual native observations through the authoritative fold;
     // withheld copies never reach C5 construction, name/account binding or POST.
-    disposition.retain_copy_uploadable(&mut scan_result.snapshots);
+    if disposition
+        .retain_copy_uploadable(&mut scan_result.snapshots)
+        .is_err()
+    {
+        // Explicit pre-offer refusal is consumed by finish_sync_source before
+        // binding, selection, upload or save. No C5/tag/identity work follows.
+        return (disposition, true, stats);
+    }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.

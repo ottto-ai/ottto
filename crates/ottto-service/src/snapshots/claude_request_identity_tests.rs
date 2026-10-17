@@ -3799,7 +3799,11 @@ fn copy_containment_unrecorded_overflow_preserves_unsettled_identity_and_own_tel
         .insert(key.clone(), BTreeSet::from(["c".repeat(64)]));
     let accepted = index.accepted_snapshot_fingerprints.clone();
     let accepted_files = index.file_snapshot_fingerprints.clone();
-    let withheld = index.record_known_copy_holds(&copied, &[(&key, &revision)], |_, _| false);
+    let withheld = index.try_record_known_copy_holds(
+        &copied,
+        claude_copy_containment::producer::OpenedFiles::pairs(&[(&key, &revision)]),
+        |_, _| false,
+    );
     assert_eq!(withheld, BTreeSet::from([OTHER_ROOT.to_string()]));
     assert_eq!(index.copy_hold_count(), 0);
     assert_eq!(
@@ -3878,7 +3882,7 @@ fn copy_containment_unrecorded_overflow_preserves_unsettled_identity_and_own_tel
     let mut uploads = parse_session(&dir, &lines);
     uploads.extend(copied);
     disposition.retain_uploadable(&mut uploads);
-    disposition.retain_copy_uploadable(&mut uploads);
+    disposition.retain_copy_uploadable(&mut uploads).unwrap();
     assert_eq!(disposition.copied_source_session_ids, withheld);
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0].source_session_id, ROOT);

@@ -1,5 +1,6 @@
 //! Required index credit only. This does not admit native membership, pay the
-//! existing record_known_copy_holds producer, or enable the containment policy.
+//! producer by itself, or enable the containment policy. The producer must
+//! separately prepay its temporary, growth and escaped-output owners.
 use super::super::sampled_scan::{CopyReservation, SharedCache};
 use super::super::ScanIndex;
 use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
@@ -108,7 +109,7 @@ impl IndexCredit {
             })),
         }
     }
-    fn append(&mut self, ledger: usize, selective: usize) -> Result<(), Unavailable> {
+    pub(super) fn append(&mut self, ledger: usize, selective: usize) -> Result<(), Unavailable> {
         let current = self.paid().ok_or(Unavailable)?;
         let metadata = Self::metadata_layout().ok_or(Unavailable)?;
         let ledger_bytes = current
@@ -181,7 +182,11 @@ pub(in crate::snapshots) fn ledger_bound(index: &ScanIndex) -> Option<usize> {
     Some(c.bytes)
 }
 
-fn prospective_nodes<K, V>(existing: usize, insertions: usize, c: &mut Counter) -> Option<()> {
+pub(super) fn prospective_nodes<K, V>(
+    existing: usize,
+    insertions: usize,
+    c: &mut Counter,
+) -> Option<()> {
     if insertions == 0 {
         return c.add(0);
     }

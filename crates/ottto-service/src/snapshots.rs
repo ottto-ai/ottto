@@ -2428,7 +2428,7 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// retention still uses the union; this only classifies settlement.
     account_deferred_source_session_ids: BTreeSet<String>,
     /// Independent copied-request hold class; not authority/account demotion.
-    copied_source_session_ids: BTreeSet<String>,
+    copied_source_session_ids: claude_copy_containment::producer::WithheldSessions,
     pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
@@ -2539,12 +2539,21 @@ impl ClaudeUsageAuthorityDisposition {
             .collect()
     }
 
-    pub(crate) fn retain_copy_uploadable(&self, snapshots: &mut Vec<SnapshotItem>) {
+    pub(crate) fn ensure_copy_preparation_available(&self) -> anyhow::Result<()> {
+        self.copied_source_session_ids.ensure_available()
+    }
+
+    pub(crate) fn retain_copy_uploadable(
+        &self,
+        snapshots: &mut Vec<SnapshotItem>,
+    ) -> anyhow::Result<()> {
+        self.ensure_copy_preparation_available()?;
         snapshots.retain(|item| {
             !self
                 .copied_source_session_ids
                 .contains(&item.source_session_id)
         });
+        Ok(())
     }
 
     pub(crate) fn retain_uploadable(&self, snapshots: &mut Vec<SnapshotItem>) {
@@ -3982,7 +3991,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         max_duplicate_owners,
         identity,
         &BTreeSet::new(),
-        &[],
+        claude_copy_containment::producer::OpenedFiles::pairs(&[]),
     )
 }
 
@@ -4008,19 +4017,8 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
     // committed entry fingerprints during corrective rearm. Incomplete parses
     // are included only to keep existing held bodies withheld, never as proof
     // of complete comparison/coverage.
-    let copy_files = if index.active_copy_scan.is_some() || index.copy_hold_count() > 0 {
-        scan.pending_finalization
-            .iter()
-            .map(|pending| {
-                (
-                    pending.index_key.as_str(),
-                    pending.source_file_fingerprint.as_str(),
-                )
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let copy_files =
+        claude_copy_containment::producer::OpenedFiles::pending(&scan.pending_finalization);
     apply_claude_reported_usage_with_index_limits_and_current_files(
         &mut scan.snapshots,
         api_report,
@@ -4032,7 +4030,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
         MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
         identity,
         &current_files,
-        &copy_files,
+        copy_files,
     )
 }
 
@@ -4048,7 +4046,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     max_duplicate_owners: usize,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     current_files: &BTreeSet<String>,
-    copy_files: &[(&str, &str)],
+    copy_files: claude_copy_containment::producer::OpenedFiles<'_>,
 ) -> ClaudeUsageAuthorityDisposition {
     let mut duplicate_census = accumulate_claude_usage_family_pending_with_limit(
         snapshots,
@@ -4991,11 +4989,11 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     duplicate_census.fence_after = index.claude_duplicate_request_witness_overflowed;
     disposition.duplicate_census = duplicate_census;
     disposition.copied_source_session_ids =
-        index.record_known_copy_holds(snapshots, copy_files, |item, hash| {
-            let root = claude_snapshot_family_root(item);
+        index.try_record_known_copy_holds(snapshots, copy_files, |item, hash| {
+            let root = claude_copy_containment::producer::root(item);
             proven
-                .get(&root)
-                .or_else(|| reconstructed.get(&root))
+                .get(root)
+                .or_else(|| reconstructed.get(root))
                 .filter(|_| {
                     item.usage_accounting_contract.as_deref()
                         == Some("session_exclusive_reported_usage:v1")
