@@ -5752,6 +5752,32 @@ where
     })
 }
 
+// Packing needs encoded lengths, not a retained copy of every pending body.
+// Use the same serde JSON encoding without allocating its output. There is no
+// early size cap: serializers must still finish or report their original error.
+struct SnapshotPackingLength {
+    bytes: usize,
+}
+impl std::io::Write for SnapshotPackingLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot packing length overflow",
+            )
+        })?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn snapshot_packing_json_length<T: Serialize + ?Sized>(item: &T) -> serde_json::Result<usize> {
+    let mut length = SnapshotPackingLength { bytes: 0 };
+    serde_json::to_writer(&mut length, item)?;
+    Ok(length.bytes)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upload_resumable_batches_with_body_witness_partitioned<
     T,
@@ -5848,18 +5874,18 @@ where
         })?;
     }
 
-    let mut pending_by_fingerprint: BTreeMap<String, (usize, Vec<u8>, String)> = BTreeMap::new();
+    let mut pending_by_fingerprint: BTreeMap<String, (usize, usize, String)> = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
         let witness = body_witness(item);
         if !progress.contains_body(fingerprint(item), &witness) {
             match pending_by_fingerprint.entry(fingerprint(item).to_string()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    let body = serde_json::to_vec(item).map_err(|_| {
+                    let body_length = snapshot_packing_json_length(item).map_err(|_| {
                         anyhow::Error::new(SnapshotLocalStateRejected {
                             operation: "serialize snapshot for batch packing",
                         })
                     })?;
-                    entry.insert((index, body, witness));
+                    entry.insert((index, body_length, witness));
                 }
                 std::collections::btree_map::Entry::Occupied(_) => {
                     // The finalized fingerprint covers every post-policy
@@ -5880,8 +5906,8 @@ where
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
     let mut current_batch_class = None;
-    for (index, body, _) in pending_by_fingerprint.into_values() {
-        let item_bytes = body.len().saturating_add(1);
+    for (index, body_length, _) in pending_by_fingerprint.into_values() {
+        let item_bytes = body_length.saturating_add(1);
         let item_batch_class = batch_class(&items[index]);
         if !batch.is_empty()
             && (batch.len() == SNAPSHOT_BATCH_LIMIT
@@ -10958,6 +10984,11 @@ mod tests {
         .expect("an identical burst never fences the source");
         assert_eq!(batch_lengths, vec![1]);
         assert_eq!(accepted, 1);
+    }
+
+    mod packing_count_tests {
+        use super::*;
+        include!("snapshot_sync/packing_count_tests.rs");
     }
 
     #[derive(Clone, Serialize)]
