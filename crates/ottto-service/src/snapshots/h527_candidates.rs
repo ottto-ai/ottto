@@ -590,7 +590,11 @@ fn is_exact_decimal(value: &str) -> bool {
         None => (value, None),
     };
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-    digits(whole) && (whole == "0" || !whole.starts_with('0')) && fraction.is_none_or(digits)
+    let fraction_ok = match fraction {
+        Some(fraction) => digits(fraction),
+        None => true,
+    };
+    digits(whole) && (whole == "0" || !whole.starts_with('0')) && fraction_ok
 }
 
 /// One unchanged item through the ordinary daemon request and serializer: the
