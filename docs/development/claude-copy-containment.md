@@ -75,6 +75,32 @@ production duplicate-map limits; no artificial lower-limit seam is used.
 These new source tests require exact-head CI. They do not activate the policy or
 establish installed tag share, memory, read-admission or whole-frame peak behavior.
 
+## Completion accounting reservation
+
+The actual fold/filter boundary now has a read-only observation of the current
+Claude-owned graphs. It has explicit models for completed scan storage, current
+index storage, API/trace report backing, borrowed evidence
+indices, owned grouping/mixed output, and the scan's status-ledger clone. Borrowed
+row references charge their map/vector slots without charging the same report
+payload again. Real equal-content clones still own separate allocations. Spare
+String/Vec capacity and tree storage count; no identity value is returned.
+
+The strict API reader is explicitly dropped after its last generation check and
+before this observation. Unknown process context, unsupported layout, opaque
+Claude-incompatible carriers or exhausted accounting return unavailable. The new
+models are mechanical; classification, account qualification, ledger eviction,
+serialization and caps are unchanged.
+
+This observation is **not a cache-admission or full peak-memory permit**. It omits
+preparation/cache owners and later lazy or temporary C5/account-output growth.
+The lazy request-root index is not initialized by accounting and gains no stable
+heap claim. Capture remains blocked until future input/output/scratch is prepaid
+or an explicit lifetime separation is proved. No native ID set is retained or
+callback/read/ACK/eligibility is granted by these bytes. New synthetic tests cover
+alias versus clone capacity, lazy slots, owned mixed/ledger storage, an actual
+native scan's no-allocation refusal and unchanged body bytes. Requested-layout
+positive execution is separate from those structural controls.
+
 ## Inactive process-attempt integration
 
 A positively observed own-file or sidecar revision change can request native

@@ -5,6 +5,7 @@
 use super::{SnapshotItem, MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS};
 use serde::{Deserialize, Serialize};
 
+pub(in crate::snapshots) mod accounting;
 pub(in crate::snapshots) mod membership;
 pub(crate) mod pipeline;
 

@@ -369,6 +369,35 @@ pub(crate) struct Grouping {
 }
 
 impl Grouping {
+    /// Byte-only observation; no grouping, identity or amount is returned.
+    pub(in crate::snapshots) fn completion_owned_heap_bound(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(self, c)
+    }
+}
+
+// Exhaustive owned models. Borrowed ScanEvidence deliberately has no stable
+// heap implementation: its OnceCell may still grow after an observation.
+crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
+crate::heap_layout_bound::fields!(Amounts; counts, costs, observed, poisoned, cost_missing);
+crate::heap_layout_bound::fields!(RowGroup; total, by_key, refused);
+crate::heap_layout_bound::fields!(Grouping; groups, group_count, max_groups, keys,
+    keys_over_cap, failed, transcript_requests, telemetry_only_requests,
+    excluded_requests, unowned_request);
+crate::heap_layout_bound::fields!(DesktopCensus; completed_at_unix_seconds, logins_by_org);
+impl crate::heap_layout_bound::HeapLayoutBound for Ineligible {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::RowsNotReproduced | Self::MoneyNotMicroExact => c.add(0),
+        }
+    }
+}
+
+impl Grouping {
     pub(crate) fn new(max_groups: usize) -> Self {
         Self {
             groups: BTreeMap::new(),
@@ -1180,6 +1209,52 @@ pub(crate) struct ScanEvidence<'a> {
 pub(crate) struct DesktopCensus {
     pub(crate) completed_at_unix_seconds: u64,
     pub(crate) logins_by_org: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl ScanEvidence<'_> {
+    /// Owned storage at this observation only. Report referents are charged by
+    /// their actual owners; this does not initialize the lazy index or bound
+    /// later classification/encoding growth and grants no cache admission.
+    pub(in crate::snapshots) fn completion_owned_heap_bound(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        use crate::heap_layout_bound::{tree_nodes, HeapLayoutBound};
+        let Self {
+            requests,
+            owners,
+            request_roots,
+            unhealthy_roots,
+            pending_writer_witnesses,
+            invalid_logins,
+            memberships,
+            desktop_census,
+            sole_login_enabled,
+            status_coverage,
+            default_home,
+        } = self;
+        tree_nodes::<(&str, &str), Option<&ClaudeLocalOtelEvidence>>(requests.len(), c)?;
+        tree_nodes::<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>(owners.len(), c)?;
+        tree_nodes::<(&str, &str), ()>(invalid_logins.len(), c)?;
+        // Only slot storage: every string/row behind these references belongs
+        // to the separately charged API/trace reports.
+        if let Some(roots) = request_roots.get() {
+            c.add(
+                roots
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(&str, Option<&str>)>())?,
+            )?;
+        }
+        unhealthy_roots.completed_heap_bound(c)?;
+        pending_writer_witnesses.completed_heap_bound(c)?;
+        memberships.completed_heap_bound(c)?;
+        desktop_census.completed_heap_bound(c)?;
+        sole_login_enabled.completed_heap_bound(c)?;
+        if let Some(coverage) = status_coverage {
+            coverage.completion_owned_heap_bound(c)?;
+        }
+        default_home.completed_heap_bound(c)
+    }
 }
 
 impl<'a> ScanEvidence<'a> {
@@ -2171,3 +2246,109 @@ fn tag_item(
 crate::heap_layout_bound::fields!(OrgMarkers; entries, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
 crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
+
+#[cfg(test)]
+mod completion_accounting_tests {
+    use super::*;
+    use crate::heap_layout_bound::Counter;
+    use crate::snapshots::claude_copy_containment::accounting::reports_owned_heap_bound;
+    use std::io::Write;
+    const LIMIT: usize = crate::source_rotation::OVERLAP_BUDGET;
+    fn api(spare: usize) -> ClaudeLocalOtelLoadReport {
+        let mut row = ClaudeLocalOtelEvidence {
+            request_id: "req_component".into(),
+            session_id: "synthetic-root".into(),
+            ..Default::default()
+        };
+        row.request_id.reserve_exact(spare);
+        ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([("synthetic-root".into(), vec![row])]),
+            ..Default::default()
+        }
+    }
+    fn evidence_bytes(evidence: &ScanEvidence<'_>) -> usize {
+        let mut c = Counter::new(LIMIT);
+        evidence.completion_owned_heap_bound(&mut c).unwrap();
+        c.bytes
+    }
+    fn report_bytes(
+        api: &ClaudeLocalOtelLoadReport,
+        trace: &ClaudeTraceOwnershipLoadReport,
+    ) -> usize {
+        let mut c = Counter::new(LIMIT);
+        reports_owned_heap_bound(api, trace, &mut c, LIMIT).unwrap();
+        c.bytes
+    }
+    #[test]
+    fn copy_containment_completion_accounting_borrowed_aliases_and_real_clone_capacity() {
+        let small = api(0);
+        let slack = api(4096);
+        let trace = ClaudeTraceOwnershipLoadReport::default();
+        let before = serde_json::to_vec(&slack.evidence).unwrap();
+        let a = ScanEvidence::new(&small, &trace, BTreeSet::new(), None);
+        let b = ScanEvidence::new(&slack, &trace, BTreeSet::new(), None);
+        assert_eq!(
+            evidence_bytes(&a),
+            evidence_bytes(&b),
+            "borrowed row backing is not charged again"
+        );
+        assert!(a.request_roots.get().is_none() && b.request_roots.get().is_none());
+        let capacity_delta = slack.evidence["synthetic-root"][0].request_id.capacity()
+            - small.evidence["synthetic-root"][0].request_id.capacity();
+        assert_eq!(
+            report_bytes(&slack, &trace) - report_bytes(&small, &trace),
+            capacity_delta
+        );
+        let real_clone = small.clone();
+        let mut combined = Counter::new(LIMIT);
+        reports_owned_heap_bound(&small, &trace, &mut combined, LIMIT).unwrap();
+        reports_owned_heap_bound(&real_clone, &trace, &mut combined, LIMIT).unwrap();
+        assert_eq!(
+            combined.bytes,
+            report_bytes(&small, &trace) + report_bytes(&real_clone, &trace),
+            "actual equal-content owners each retain their allocations"
+        );
+        let (_, allocations) = crate::retry_allocation_probe::measure(|| evidence_bytes(&b));
+        assert_eq!(allocations.allocations, 0);
+        assert_eq!(serde_json::to_vec(&slack.evidence).unwrap(), before);
+        writeln!(std::io::stderr().lock(), "copy_containment_accounting_aliases: borrowed_payload_second_charge=0 real_clones_separate=true actual_capacity_delta={capacity_delta} observation_allocations=0 lazy_index_uninitialized=true bytes_unchanged=true component_only=true admission_proved=false").unwrap();
+    }
+    #[test]
+    fn copy_containment_completion_accounting_lazy_slots_and_grouping_owned_storage() {
+        let api = api(0);
+        let trace = ClaudeTraceOwnershipLoadReport::default();
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let before = evidence_bytes(&evidence);
+        evidence.request_roots.set(Vec::with_capacity(7)).unwrap();
+        let capacity = evidence.request_roots.get().unwrap().capacity();
+        assert_eq!(
+            evidence_bytes(&evidence) - before,
+            capacity * std::mem::size_of::<(&str, Option<&str>)>()
+        );
+        let mut grouping = Grouping::new(4);
+        let mut login = "component-login".to_string();
+        login.reserve_exact(1024);
+        grouping.keys.insert(AuthorityKey {
+            login: Some(login),
+            org: None,
+            basis: TELEMETRY,
+        });
+        let baseline = grouping.clone();
+        let mut c = Counter::new(LIMIT);
+        grouping.completion_owned_heap_bound(&mut c).unwrap();
+        assert!(
+            c.bytes
+                >= grouping
+                    .keys
+                    .first()
+                    .unwrap()
+                    .login
+                    .as_ref()
+                    .unwrap()
+                    .capacity()
+        );
+        assert_eq!(grouping, baseline);
+        // These observations never make OnceCell stable or prepay future work.
+        writeln!(std::io::stderr().lock(), "copy_containment_accounting_lazy: initialized_slot_capacity={capacity} owned_key_slack_counted=true grouping_unchanged=true future_growth_unqualified=true cache_admission=false").unwrap();
+    }
+}

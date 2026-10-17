@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 666,
-  "content_sha256": "72dc9190114dbc9214e2b5f6e637437eb32b9b9f954ea2d1c2457aadb121f375",
+  "candidate_file_count": 668,
+  "content_sha256": "46a602aabf2310cbec7c6fa1e7239fc8cebbe1af82e144721a8e70eb38822725",
   "files": [
     {
       "executable": false,
@@ -818,8 +818,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_status_coverage.rs",
-      "sha256": "c49a7a648e17e42c2b261f02dcfe3cc4f60c67825b97c3ab9df538fca2b89da5",
-      "size_bytes": 18720
+      "sha256": "c5eddfb92a94febe3e53c78e93706862d95ea9f6f53d5ab1a394d9949b2c2eaa",
+      "size_bytes": 21226
     },
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "42763152bd14842e95df38d7e1cfee8b7ab4bf089b1eada7183277a5945d8e69",
-      "size_bytes": 771027
+      "sha256": "91b469c87188b5e051aa569b9053cfef7e1643090e22b98d48cfc4c8fd17f631",
+      "size_bytes": 771866
     },
     {
       "executable": false,
@@ -1231,8 +1231,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "2b2c0e0ace7f637b25352401b7e94089a5568ad84eb3e50838023e0e7a6e75cc",
-      "size_bytes": 2469019
+      "sha256": "493957bd74f82dfe55f92804dfb5d8f3224165731592fdcc80ed58871dd160d4",
+      "size_bytes": 2475260
     },
     {
       "executable": false,
@@ -1280,8 +1280,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment.rs",
-      "sha256": "abbad0929ba29375c1467aef21f4aa7e147e19f692cb6f2089b6bf55d72be694",
-      "size_bytes": 6557
+      "sha256": "cddca8236edc22125e64d8591eed3cd20227d02cdd8ba18fe4b2d3aaabdbb87d",
+      "size_bytes": 6598
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_copy_containment/accounting.rs",
+      "sha256": "9a6b7ebd81031a9f712de690d86a396e6ae6efd254b41268abbe1380b1448ca7",
+      "size_bytes": 9461
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_copy_containment/accounting/tests.rs",
+      "sha256": "b3ea5e9bd90a51604fd8a7fee000de3d25507f7170d5da057fd7028853396048",
+      "size_bytes": 2971
     },
     {
       "executable": false,
@@ -1329,15 +1343,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_accounts.rs",
-      "sha256": "4e203c130f4890733218f4d7228ff141e4e481afdf56717b39592629ffed70bc",
-      "size_bytes": 21485
+      "sha256": "ddc4cf5bf53d97137a6031d9eed49eb8c2e9db23d10246ab4fa7097bb47fa6c3",
+      "size_bytes": 23098
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity.rs",
-      "sha256": "2fefdfb03cf357e379f337c5f5d6381e5c99930345b49aaefce01a0c6f8aedf1",
-      "size_bytes": 84092
+      "sha256": "a5dbf6e6f64880cf92f2525564b4eaafa41c7b1b39b9604e81d21818dc2c8563",
+      "size_bytes": 92102
     },
     {
       "executable": false,
@@ -1560,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/claude-copy-containment.md",
-      "sha256": "6af31158baa1841f4bed164677670febf777fddde904184ec20893d581187b10",
-      "size_bytes": 22686
+      "sha256": "ba1c6f3478f3433b35c011709c729ef7b306587013d4c30b645afb23a809cd5a",
+      "size_bytes": 24321
     },
     {
       "executable": false,
@@ -4665,9 +4679,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T23:59:45.230085Z",
+  "generated_at": "2026-10-17T00:09:20.736775Z",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 667,
+  "output_file_count": 669,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4704,5 +4718,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9319d6f52131ef59598431f27c33c4085a810d4a"
+  "source_commit": "6e1c1d60e3dc983779a93775509a3c7c897cd3d7"
 }

@@ -38,6 +38,18 @@ pub(crate) struct MixedUploads {
     request_identity: BTreeMap<String, (String, String)>,
 }
 
+crate::heap_layout_bound::fields!(MixedUploads; bodies, request_identity);
+
+impl MixedUploads {
+    /// Mechanical owned storage only; no admission or identity witness.
+    pub(super) fn completion_owned_heap_bound(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(self, c)
+    }
+}
+
 impl MixedUploads {
     pub(crate) fn admit_request_identity(&mut self, item: &SnapshotItem) {
         if item.provenance.collector == super::claude_request_identity::COLLECTOR {
@@ -541,4 +553,35 @@ fn request_accounts<'a>(
         return Err(Coverage::MissingRequests);
     }
     Ok(accounts)
+}
+
+#[cfg(test)]
+mod completion_accounting_tests {
+    use super::*;
+    #[test]
+    fn copy_containment_completion_accounting_mixed_output_is_owned_and_unchanged() {
+        let mut mixed = MixedUploads::default();
+        let mut body = "component-body".to_string();
+        body.reserve_exact(2048);
+        let capacity = body.capacity();
+        mixed.bodies.insert(
+            "component-session".into(),
+            ("component-semantic".into(), body),
+        );
+        mixed.request_identity.insert(
+            "component-session".into(),
+            ("component-semantic".into(), "component-other-body".into()),
+        );
+        let before = mixed.clone();
+        let mut c = crate::heap_layout_bound::Counter::new(crate::source_rotation::OVERLAP_BUDGET);
+        mixed.completion_owned_heap_bound(&mut c).unwrap();
+        assert!(c.bytes >= capacity);
+        assert_eq!(mixed, before);
+        let (_, allocations) = crate::retry_allocation_probe::measure(|| {
+            let mut c =
+                crate::heap_layout_bound::Counter::new(crate::source_rotation::OVERLAP_BUDGET);
+            mixed.completion_owned_heap_bound(&mut c)
+        });
+        assert_eq!(allocations.allocations, 0);
+    }
 }

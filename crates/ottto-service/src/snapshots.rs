@@ -27,6 +27,9 @@ use toml_edit::{DocumentMut, Item};
 pub(crate) mod cache_observations;
 #[allow(dead_code)] // Containment selection/checkpoint wiring is not active yet.
 mod claude_copy_containment;
+pub(crate) use claude_copy_containment::accounting::{
+    observe_owned_completion, BorrowedClaudeCompletion,
+};
 pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_identity;
 #[cfg(test)]
@@ -2430,6 +2433,35 @@ pub struct ClaudeUsageAuthorityDisposition {
 }
 
 impl ClaudeUsageAuthorityDisposition {
+    /// Byte-only ownership observation; no ACK, identity or cache permission.
+    pub(crate) fn completion_owned_heap_bound(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        use crate::heap_layout_bound::{tree_nodes, HeapLayoutBound};
+        let Self {
+            duplicate_census,
+            quarantined_source_session_ids,
+            account_deferred_source_session_ids,
+            copied_source_session_ids,
+            mixed_uploads,
+            request_groupings,
+            transcript_ownership_complete,
+        } = self;
+        duplicate_census.completed_heap_bound(c)?;
+        transcript_ownership_complete.completed_heap_bound(c)?;
+        quarantined_source_session_ids.completed_heap_bound(c)?;
+        account_deferred_source_session_ids.completed_heap_bound(c)?;
+        copied_source_session_ids.completed_heap_bound(c)?;
+        mixed_uploads.completion_owned_heap_bound(c)?;
+        tree_nodes::<String, claude_request_identity::Grouping>(request_groupings.len(), c)?;
+        for (key, grouping) in request_groupings {
+            key.completed_heap_bound(c)?;
+            grouping.completion_owned_heap_bound(c)?;
+        }
+        Some(())
+    }
+
     pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {
         self.account_deferred_source_session_ids
             .extend(session_ids.iter().cloned());
@@ -2878,6 +2910,105 @@ impl CodexJoinValidator {
     }
 }
 impl SourceScanResult {
+    /// Current Claude completion storage only, never future peak/admission.
+    pub(crate) fn completed_claude_heap_bound(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound;
+        let Self {
+            source,
+            backfill_window_days,
+            backfill_file_limit,
+            discovered_file_count,
+            skipped_file_count_due_to_limit,
+            scan_cap_hit,
+            scanned_file_count,
+            scanned_session_count,
+            semantic_noop_count,
+            census_complete,
+            census_window_end,
+            state_census_complete,
+            sidecar_census_complete,
+            symlink_rejected_count,
+            directory_entry_cap_exceeded_count,
+            unreadable_path_count,
+            oversized_file_count,
+            disappeared_file_count,
+            malformed_json_line_count,
+            invalid_utf8_line_count,
+            over_line_cap_count,
+            recognized_usage_drop_count,
+            ownership_incomplete_file_count,
+            zero_snapshot_confirmed_count,
+            zero_snapshot_usage_evidence_count,
+            dropped_usage_record_count,
+            terminal_ownership_incomplete_file_count,
+            terminal_zero_snapshot_usage_evidence_count,
+            terminal_recognized_usage_drop_count,
+            terminal_dropped_usage_record_count,
+            terminal_over_line_cap_count,
+            census_residue_index_key_count,
+            census_residue_archived_rollout_count,
+            census_residue_blocked_session_count,
+            snapshots,
+            pending_finalization,
+            local_codex_diagnostics,
+            codex_join_validation,
+            codex_legacy_join_baselines,
+        } = self;
+        if *source != SnapshotSource::ClaudeCode
+            || local_codex_diagnostics.is_some()
+            || codex_join_validation.is_some()
+            || !codex_legacy_join_baselines.is_empty()
+        {
+            return None;
+        }
+        // Scalar/inline fields already occupy the enclosing struct's slot.
+        source.completed_heap_bound(c)?;
+        backfill_window_days.completed_heap_bound(c)?;
+        backfill_file_limit.completed_heap_bound(c)?;
+        discovered_file_count.completed_heap_bound(c)?;
+        skipped_file_count_due_to_limit.completed_heap_bound(c)?;
+        scan_cap_hit.completed_heap_bound(c)?;
+        scanned_file_count.completed_heap_bound(c)?;
+        scanned_session_count.completed_heap_bound(c)?;
+        semantic_noop_count.completed_heap_bound(c)?;
+        census_complete.completed_heap_bound(c)?;
+        state_census_complete.completed_heap_bound(c)?;
+        sidecar_census_complete.completed_heap_bound(c)?;
+        symlink_rejected_count.completed_heap_bound(c)?;
+        directory_entry_cap_exceeded_count.completed_heap_bound(c)?;
+        unreadable_path_count.completed_heap_bound(c)?;
+        oversized_file_count.completed_heap_bound(c)?;
+        disappeared_file_count.completed_heap_bound(c)?;
+        malformed_json_line_count.completed_heap_bound(c)?;
+        invalid_utf8_line_count.completed_heap_bound(c)?;
+        over_line_cap_count.completed_heap_bound(c)?;
+        recognized_usage_drop_count.completed_heap_bound(c)?;
+        ownership_incomplete_file_count.completed_heap_bound(c)?;
+        zero_snapshot_confirmed_count.completed_heap_bound(c)?;
+        zero_snapshot_usage_evidence_count.completed_heap_bound(c)?;
+        dropped_usage_record_count.completed_heap_bound(c)?;
+        terminal_ownership_incomplete_file_count.completed_heap_bound(c)?;
+        terminal_zero_snapshot_usage_evidence_count.completed_heap_bound(c)?;
+        terminal_recognized_usage_drop_count.completed_heap_bound(c)?;
+        terminal_dropped_usage_record_count.completed_heap_bound(c)?;
+        terminal_over_line_cap_count.completed_heap_bound(c)?;
+        census_residue_index_key_count.completed_heap_bound(c)?;
+        census_residue_archived_rollout_count.completed_heap_bound(c)?;
+        census_residue_blocked_session_count.completed_heap_bound(c)?;
+
+        c.add(
+            codex_legacy_join_baselines
+                .capacity()
+                .checked_mul(std::mem::size_of::<codex_file_join::LegacyBaseline>())?,
+        )?;
+        census_window_end.completed_heap_bound(c)?;
+        snapshots.completed_heap_bound(c)?;
+        pending_finalization.completed_heap_bound(c)
+    }
+
     pub(crate) fn validate_codex_checkpoint(&self) -> Result<()> {
         if let Some(validation) = &self.codex_join_validation {
             validation.validate_all()?;
@@ -56181,6 +56312,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
 crate::heap_layout_bound::fields!(OwnedSourceScan; resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
+crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);

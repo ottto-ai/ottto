@@ -5334,6 +5334,9 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
+    // Every selected root completed its strict generation check above. This
+    // owner is no longer used; drop retained map nodes before observation.
+    drop(api_read);
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
     let identity_evidence = emission_permitted.then(|| {
@@ -5351,6 +5354,21 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         &trace_report,
         index,
         identity_evidence.as_ref(),
+    );
+    // Observation only at the real fold/filter boundary. Missing process
+    // context/layout is None before walking. This omits preparation owners and
+    // future C5 scratch/output, so it MUST NOT authorize optional cache capture.
+    let _owned_observation = crate::snapshots::observe_owned_completion(
+        crate::snapshots::BorrowedClaudeCompletion {
+            index,
+            scan: scan_result,
+            disposition: &disposition,
+            api: &api_report,
+            trace: &trace_report,
+            evidence: identity_evidence.as_ref(),
+            originals: &originals,
+        },
+        crate::source_rotation::OVERLAP_BUDGET,
     );
     // Keep all actual native observations through the authoritative fold;
     // withheld copies never reach C5 construction, name/account binding or POST.
