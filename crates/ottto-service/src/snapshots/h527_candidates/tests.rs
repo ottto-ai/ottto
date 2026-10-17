@@ -16,6 +16,37 @@ const HELD_MIXED_FIXTURE: &str =
     include_str!("../../../../../fixtures/h527-candidates/held-mixed.v1.json");
 const UNQUALIFIED_REDACTED_FIXTURE: &str =
     include_str!("../../../../../fixtures/h527-candidates/unqualified-redacted.v1.json");
+const DISCLOSURE_NOT_RUN_FIXTURE: &str =
+    include_str!("../../../../../fixtures/h527-candidates/disclosure-not-run.v1.json");
+/// SESSION's `canonical_json_digest(sorted(scope_session_keys))` at
+/// a1f87dd8a8aca2ae0140e29f6904aa9892fed69f, over this file's 18 keys.
+const SCOPE_SESSION_KEYS_SHA256: &str =
+    "05fd1152dbf7eb9dd8bb3e764ab9fc311646aa013bca4ea356059ac6e88feaa8";
+/// SESSION's closed `CandidateBundle` and `CandidateReason` at the same commit.
+const FROZEN_BUNDLE_FIELDS: [&str; 10] = [
+    "contract_version",
+    "operation_id",
+    "user_id",
+    "organization_id",
+    "device_id",
+    "machine_id",
+    "producer_revision",
+    "collector_version",
+    "scope_session_keys",
+    "members",
+];
+const FROZEN_CANDIDATE_REASONS: [&str; 10] = [
+    "qualified_source_ownership",
+    "exact_exclusion",
+    "exact_previous_ack_membership",
+    "local_exclusion_disclosed_residual",
+    "unknown_owner",
+    "incomplete_census",
+    "cap_overflow",
+    "creator_hold",
+    "missing_evidence",
+    "money_decrease",
+];
 const REDACTED_BODY: &str = "<exact ordinary batch bytes>";
 const REDACTED_BODY_SHA256: &str = "<sha256 of exact ordinary batch bytes>";
 
@@ -268,25 +299,31 @@ fn session_keys_match_backend_session_entity_key_vectors() {
 }
 
 #[test]
-fn reason_vocabulary_is_closed() {
+fn reason_vocabulary_matches_the_frozen_contract() {
+    let reasons = EligibleReason::ALL
+        .map(EligibleReason::as_str)
+        .into_iter()
+        .chain(HeldReason::ALL.map(HeldReason::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(reasons, FROZEN_CANDIDATE_REASONS);
     assert_eq!(
-        EligibleReason::ALL.map(EligibleReason::as_str),
-        [
-            "qualified_source_ownership",
-            "exact_exclusion",
-            "exact_previous_ack_membership",
-        ]
+        Conservation::ALL.map(Conservation::as_str),
+        ["qualified", "disclosed_residual", "unknown"]
     );
+    // The disclosed basis has its own state and never borrows `qualified`;
+    // strict reasons never accept the disclosed state; nothing eligible is
+    // `unknown`.
+    for reason in EligibleReason::ALL {
+        let required = reason.required_conservation();
+        assert_eq!(
+            required == Conservation::DisclosedResidual,
+            reason == EligibleReason::LocalExclusionDisclosedResidual
+        );
+        assert_ne!(required, Conservation::Unknown);
+    }
     assert_eq!(
-        HeldReason::ALL.map(HeldReason::as_str),
-        [
-            "unknown_owner",
-            "incomplete_census",
-            "cap_overflow",
-            "creator_hold",
-            "missing_evidence",
-            "money_decrease",
-        ]
+        DISCLOSED_RESIDUAL_BASIS,
+        "local_exclusion_disclosed_residual:v1"
     );
 }
 
@@ -300,6 +337,17 @@ fn held_mixed_packet_matches_committed_fixture() {
     let fixture = HELD_MIXED_FIXTURE.trim_end_matches('\n');
     assert_eq!(export.packet_json, fixture);
     assert_eq!(export.packet_sha256, sha256_hex(fixture.as_bytes()));
+    // Exactly the frozen bundle's keys: SESSION refuses extras.
+    let packet: Value = serde_json::from_str(&export.packet_json).expect("packet");
+    assert_eq!(
+        packet
+            .as_object()
+            .expect("packet")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(FROZEN_BUNDLE_FIELDS)
+    );
     for (ordinal, reason, local_checks_passed) in [
         (1, "missing_evidence", false),
         (4, "creator_hold", false),
@@ -358,6 +406,10 @@ fn unproven_usage_is_not_disqualifying_but_global_conservation_still_holds() {
         let report = report(&export, ordinal);
         assert_eq!(report["local_checks_passed"], Value::Bool(true));
         assert_eq!(report["global_conservation_evidence"], "unavailable");
+        assert_eq!(
+            report["disclosed_residual_evidence"],
+            "exclusion_artifact_missing"
+        );
     }
     assert_eq!(report(&export, 1)["usage_accounting_contract"], Value::Null);
     assert_eq!(
@@ -482,15 +534,22 @@ fn export_binds_the_running_build_and_marks_unproven_fields() {
     let packet: Value = serde_json::from_str(&export.packet_json).expect("packet");
     let binary = fs::read(std::env::current_exe().expect("current exe")).expect("binary");
     assert_eq!(packet["collector_version"], collector_version());
-    assert_eq!(packet["producer_binary_sha256"], sha256_hex(&binary));
-    assert_eq!(
-        packet["producer_revision_source"],
-        "operator_supplied_unverified"
-    );
-    assert_eq!(
-        packet["unresolved_fields"],
-        json!(["prior_refusal_body_witness"])
-    );
+    assert!(packet.get("producer_binary_sha256").is_none());
+    // The packet carries each report's SHA, which binds the build and the
+    // unproven fields.
+    for ordinal in 1..=18 {
+        let report = report(&export, ordinal);
+        assert_eq!(report["collector_version"], collector_version());
+        assert_eq!(report["producer_binary_sha256"], sha256_hex(&binary));
+        assert_eq!(
+            report["producer_revision_source"],
+            "operator_supplied_unverified"
+        );
+        assert_eq!(
+            report["unresolved_fields"],
+            json!(["prior_refusal_body_witness"])
+        );
+    }
     assert_eq!(packet["contract_version"], CANDIDATES_CONTRACT_VERSION);
     assert_eq!(
         packet["scope_session_keys"],
@@ -615,9 +674,9 @@ fn unqualified_artifact_carries_ordinary_bytes_while_the_packet_stays_held() {
     );
 }
 
-/// A strict local reading of the operator packet contract. SESSION's server
-/// owns the real rejection; this only pins that the two shapes cannot be
-/// confused on this side.
+/// A strict local reading of SESSION's closed `CandidateBundle` at
+/// a1f87dd8. The server owns the real rejection; this pins the shape on this
+/// side.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -629,10 +688,7 @@ struct OperatorPacketShape {
     device_id: String,
     machine_id: String,
     producer_revision: String,
-    producer_revision_source: String,
-    producer_binary_sha256: String,
     collector_version: String,
-    unresolved_fields: Vec<String>,
     scope_session_keys: Vec<String>,
     members: Vec<OperatorMemberShape>,
 }
@@ -646,8 +702,10 @@ struct OperatorMemberShape {
     prior_refusal_body_witness: String,
     disposition: String,
     reason: String,
-    qualification_report_sha256: String,
+    qualification_report_sha256: Option<String>,
     cross_session_conservation: String,
+    batch_request_json: Option<String>,
+    batch_request_sha256: Option<String>,
 }
 
 fn parse_operator_packet(json: &str) -> Result<OperatorPacketShape, String> {
@@ -655,6 +713,32 @@ fn parse_operator_packet(json: &str) -> Result<OperatorPacketShape, String> {
         serde_json::from_str(json).map_err(|error| error.to_string())?;
     if packet.contract_version != CANDIDATES_CONTRACT_VERSION {
         return Err(format!("contract {}", packet.contract_version));
+    }
+    if packet.scope_session_keys.len() != MANIFEST_MEMBER_COUNT
+        || packet.members.len() != MANIFEST_MEMBER_COUNT
+    {
+        return Err("bundle requires exactly 18 scope keys and members".to_string());
+    }
+    for member in &packet.members {
+        if !FROZEN_CANDIDATE_REASONS.contains(&member.reason.as_str()) {
+            return Err(format!("reason {}", member.reason));
+        }
+        let eligible = EligibleReason::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == member.reason);
+        match (member.disposition.as_str(), eligible) {
+            ("held", None) => {
+                if member.batch_request_json.is_some() || member.batch_request_sha256.is_some() {
+                    return Err("held member must omit batch_request".to_string());
+                }
+            }
+            ("eligible", Some(reason)) => {
+                if member.cross_session_conservation != reason.required_conservation().as_str() {
+                    return Err("eligible member requires matching conservation state".to_string());
+                }
+            }
+            _ => return Err("disposition and reason disagree".to_string()),
+        }
     }
     Ok(packet)
 }
@@ -668,6 +752,36 @@ fn unqualified_artifact_cannot_be_read_as_an_operator_packet() {
     let packet = parse_operator_packet(&export.packet_json).expect("operator packet");
     assert_eq!(packet.members.len(), MANIFEST_MEMBER_COUNT);
     assert!(parse_operator_packet(&artifact.json).is_err());
+    // The earlier packet's producer fields are extras the frozen bundle refuses.
+    for (field, value) in [
+        (
+            "producer_binary_sha256",
+            json!(sha256_hex(b"h527-fixture-binary")),
+        ),
+        (
+            "producer_revision_source",
+            json!("operator_supplied_unverified"),
+        ),
+        ("unresolved_fields", json!(["prior_refusal_body_witness"])),
+    ] {
+        let mut extra: Value = serde_json::from_str(&export.packet_json).expect("packet");
+        extra[field] = value;
+        assert!(
+            parse_operator_packet(&extra.to_string()).is_err(),
+            "{field}"
+        );
+    }
+    // A held member cannot carry the disclosed reason, and an eligible one
+    // cannot pair it with a strict or unknown state.
+    let mut borrowed: Value = serde_json::from_str(&export.packet_json).expect("packet");
+    borrowed["members"][0]["reason"] = json!("local_exclusion_disclosed_residual");
+    assert!(parse_operator_packet(&borrowed.to_string()).is_err());
+    for state in ["qualified", "unknown"] {
+        let mut mismatched = borrowed.clone();
+        mismatched["members"][0]["disposition"] = json!("eligible");
+        mismatched["members"][0]["cross_session_conservation"] = json!(state);
+        assert!(parse_operator_packet(&mismatched.to_string()).is_err());
+    }
     // Relabelling the contract does not make the shapes compatible.
     let mut relabelled: Value = serde_json::from_str(&artifact.json).expect("artifact json");
     relabelled["contract_version"] = json!(CANDIDATES_CONTRACT_VERSION);
@@ -690,4 +804,172 @@ fn unqualified_artifact_cannot_be_read_as_an_operator_packet() {
     }
     assert!(!artifact.json.contains("\"eligible\""));
     assert!(!artifact.json.contains("\"qualified\""));
+    assert!(!artifact.json.contains("disclosed_residual\""));
+    assert!(!artifact.json.contains("scope_session_keys_sha256"));
+}
+
+fn disclosure_summary(copy_screen: CopyScreen) -> LocalExclusionSummary {
+    LocalExclusionSummary {
+        exclusion_artifact_sha256: sha256_hex(b"h527-fixture-exclusion-artifact"),
+        excluded_request_count: 3,
+        excluded_token_counts: ExcludedTokenCounts {
+            input_tokens: 30,
+            output_tokens: 6,
+            cache_read_tokens: 1200,
+            cache_creation_5m_tokens: 40,
+            ..ExcludedTokenCounts::default()
+        },
+        excluded_catalog_cost_usd: "0.004215".to_string(),
+        copy_screen,
+    }
+}
+
+fn not_run() -> CopyScreen {
+    CopyScreen::NotRun {
+        reason: "No trivial existing server read is available.".to_string(),
+    }
+}
+
+#[test]
+fn disclosure_record_matches_the_frozen_shape_and_scope_digest() {
+    let json =
+        local_exclusion_disclosure_json(&scope(), &members(), &disclosure_summary(not_run()))
+            .expect("disclosure");
+
+    assert_eq!(json, DISCLOSURE_NOT_RUN_FIXTURE.trim_end_matches('\n'));
+    let value: Value = serde_json::from_str(&json).expect("disclosure json");
+    assert_eq!(
+        value["scope_session_keys_sha256"],
+        SCOPE_SESSION_KEYS_SHA256
+    );
+    assert_eq!(value["residual_statement"], DISCLOSED_RESIDUAL_STATEMENT);
+    assert_eq!(
+        value["local_exclusion_scope"],
+        "all_local_transcripts_including_other_17_targets:v1"
+    );
+    assert_eq!(
+        value["identity_rule"],
+        "b2_counting_only_keep_root_owned_evidence:v1"
+    );
+    // Exact decimal string, not a float; all eight counters even when zero.
+    assert_eq!(value["excluded_catalog_cost_usd"], "0.004215");
+    assert_eq!(
+        value["excluded_token_counts"]
+            .as_object()
+            .expect("counts")
+            .len(),
+        8
+    );
+    assert_eq!(value["excluded_token_counts"]["reasoning_output_tokens"], 0);
+    // Absent screen details are explicit nulls: SESSION requires every field.
+    assert_eq!(value["copy_screen_status"], "not_run");
+    assert_eq!(value["copy_screen_artifact_sha256"], Value::Null);
+    // The digest covers the sorted keys, so manifest order does not change it.
+    let mut reversed = members();
+    reversed.reverse();
+    assert_eq!(
+        local_exclusion_disclosure_json(&scope(), &reversed, &disclosure_summary(not_run()))
+            .expect("disclosure"),
+        json
+    );
+    for (screen, status) in [
+        (
+            CopyScreen::NoMatch {
+                artifact_sha256: sha256_hex(b"screen"),
+            },
+            "no_match",
+        ),
+        (
+            CopyScreen::ExclusionsApplied {
+                artifact_sha256: sha256_hex(b"screen"),
+            },
+            "exclusions_applied",
+        ),
+    ] {
+        let ran: Value = serde_json::from_str(
+            &local_exclusion_disclosure_json(&scope(), &members(), &disclosure_summary(screen))
+                .expect("disclosure"),
+        )
+        .expect("disclosure json");
+        assert_eq!(ran["copy_screen_status"], status);
+        assert_eq!(ran["copy_screen_artifact_sha256"], sha256_hex(b"screen"));
+        assert_eq!(ran["copy_screen_not_run_reason"], Value::Null);
+    }
+    // A disclosure qualifies nothing: the packet for the same scope stays held.
+    let disposition = complete_census();
+    let index = ScanIndex::default();
+    let export = run_export(&[], &disposition, &index);
+    for ordinal in 1..=18 {
+        assert_held_without_body(&packet_member(&export, ordinal), "missing_evidence");
+    }
+    assert!(!export.packet_json.contains("disclosed_residual"));
+}
+
+#[test]
+fn disclosure_refuses_unbound_scope_inexact_money_and_bad_screen_evidence() {
+    let refuse = |members: Vec<ApprovedMember>, summary: LocalExclusionSummary, expected: &str| {
+        let error =
+            local_exclusion_disclosure_json(&scope(), &members, &summary).expect_err("refused");
+        assert!(error.contains(expected), "{error}");
+    };
+
+    refuse(
+        members().into_iter().take(17).collect(),
+        disclosure_summary(not_run()),
+        "exactly 18",
+    );
+    let mut unbound = members();
+    unbound[0].session_key_sha256 = members()[1].session_key_sha256.clone();
+    refuse(unbound, disclosure_summary(not_run()), "does not bind");
+    let upper = "A".repeat(64);
+    for artifact in ["", "abc", upper.as_str()] {
+        let mut summary = disclosure_summary(not_run());
+        summary.exclusion_artifact_sha256 = artifact.to_string();
+        refuse(members(), summary, "exclusion_artifact_sha256");
+    }
+    for money in [
+        "", "-1", "-0.1", "1e-3", "1E3", "01.5", "00", ".5", "1.", "1.2.3", "NaN", "inf", " 1",
+        "1,5", "+1",
+    ] {
+        let mut summary = disclosure_summary(not_run());
+        summary.excluded_catalog_cost_usd = money.to_string();
+        refuse(members(), summary, "excluded_catalog_cost_usd");
+    }
+    for reason in [
+        String::new(),
+        " \t ".to_string(),
+        "x".repeat(1025),
+        "line\nbreak".to_string(),
+        "\u{1c}".to_string(),
+    ] {
+        refuse(
+            members(),
+            disclosure_summary(CopyScreen::NotRun { reason }),
+            "not_run reason",
+        );
+    }
+    let upper = "F".repeat(64);
+    for artifact in ["", "abc", upper.as_str()] {
+        refuse(
+            members(),
+            disclosure_summary(CopyScreen::NoMatch {
+                artifact_sha256: artifact.to_string(),
+            }),
+            "copy screen artifact",
+        );
+    }
+
+    for money in ["0", "0.0", "12", "12.000000000000000001"] {
+        let mut summary = disclosure_summary(not_run());
+        summary.excluded_catalog_cost_usd = money.to_string();
+        let value: Value = serde_json::from_str(
+            &local_exclusion_disclosure_json(&scope(), &members(), &summary).expect("disclosure"),
+        )
+        .expect("disclosure json");
+        assert_eq!(value["excluded_catalog_cost_usd"], money);
+    }
+    let longest = disclosure_summary(CopyScreen::NotRun {
+        reason: "é".repeat(1024),
+    });
+    assert!(local_exclusion_disclosure_json(&scope(), &members(), &longest).is_ok());
 }

@@ -6,13 +6,13 @@
 
 ```
 {contract_version:"h527_candidates:v1", operation_id, user_id, organization_id, device_id,
- machine_id, producer_revision, producer_revision_source:"operator_supplied_unverified",
- producer_binary_sha256, collector_version, unresolved_fields:["prior_refusal_body_witness"],
- scope_session_keys:[18],
+ machine_id, producer_revision, collector_version, scope_session_keys:[18],
  members:[{source_session_id, session_key_sha256, prior_refusal_body_witness,
            disposition:"held", reason, qualification_report_sha256,
            cross_session_conservation:"unknown"}]}
 ```
+
+The top level is exactly the closed `CandidateBundle` that SESSION froze at commit `a1f87dd8a8aca2ae0140e29f6904aa9892fed69f`, which refuses any other key. The held fixture parses under that commit's `parse_candidate_bundle`.
 
 - `session_key_sha256` is SHA-256 of the UTF-8 `session_key:v1` string: (`claude_code`, machine id, full source session id), with backslash doubled and pipe written as `\p`, joined by `|`. This matches the backend's `session_entity_key`, not the unit-separated storage locator. Tests pin four backend-computed vectors.
 - Scope and member validation:
@@ -22,16 +22,18 @@
   - Each member's key must bind its id, and its refusal value must be 64 hex.
   - Members and keys must be distinct.
   - Anything else refuses the whole export.
-- `collector_version` and `producer_binary_sha256` describe the build that actually ran the export: its own compiled version and the SHA-256 of its executable. They never claim to be the installed daemon's version.
-- `prior_refusal_body_witness` is opaque diagnostic metadata, copied and not verified. The daemon's additive upload body witness covers only additive evidence, so it does not identify a refused body. `unresolved_fields` keeps that gate explicit. A replacement, `prior_refusal_record_sha256`, would digest the destination-scoped tuple (destination namespace hash, snapshot fingerprint, body witness, reason, full source session id). It is not implemented, because two things are still undefined: the exact byte encoding with shared vectors, and how a newer local refusal record is detected between plan and apply.
-- Each member has a content-free qualification report (RFC 8785, `h527_candidate_qualification:v1`) with local hold, census, fence and request-set facts, `local_checks_passed`, and `global_conservation_evidence: "unavailable"`. Only the report's SHA travels in the packet; the report stays with the operator.
+- `collector_version` describes the build that actually ran the export, never the installed daemon's version. That build's executable SHA-256 (`producer_binary_sha256`), `producer_revision_source: "operator_supplied_unverified"` and `unresolved_fields: ["prior_refusal_body_witness"]` are written into every member's qualification report, so the packet binds them through each report SHA. Earlier drafts put them at the packet's top level, where the frozen bundle refuses them.
+- `prior_refusal_body_witness` is opaque diagnostic metadata, copied and not verified. The daemon's additive upload body witness covers only additive evidence, so it does not identify a refused body. `unresolved_fields` keeps that gate explicit. A replacement, `prior_refusal_record_sha256`, would digest the destination-scoped tuple (destination namespace hash, snapshot fingerprint, body witness, reason, full source session id). SOURCE's Amendment 1 makes that tuple diagnostic only: there is no local-ledger drift gate at apply time. It is still not implemented, because no shared byte encoding with test vectors exists, and the exporter does not invent one.
+- Each member has a content-free qualification report (RFC 8785, `h527_candidate_qualification:v1`) with local hold, census, fence and request-set facts, `local_checks_passed`, `global_conservation_evidence: "unavailable"` and `disclosed_residual_evidence: "exclusion_artifact_missing"`. Only the report's SHA travels in the packet; the report stays with the operator.
 
 ## Verdicts
 
 Reasons are a closed set:
 
-- eligible: `qualified_source_ownership`, `exact_exclusion`, `exact_previous_ack_membership`
+- eligible: `qualified_source_ownership`, `exact_exclusion`, `exact_previous_ack_membership`, `local_exclusion_disclosed_residual`
 - held: `unknown_owner`, `incomplete_census`, `cap_overflow`, `creator_hold`, `missing_evidence`, `money_decrease`
+
+Conservation states are `qualified`, `disclosed_residual` and `unknown`. An eligible `local_exclusion_disclosed_residual` member must carry `disclosed_residual`; every other eligible reason must carry `qualified`; `unknown` never qualifies. The exporter emits no eligible member.
 
 No member is eligible today. Cross-session conservation has to cover the target set and every already-counted accepted session. That includes accepted bodies whose transcripts were deleted or left the census window. A complete local census cannot prove absence there, and no interface supplies qualified historical evidence. So conservation stays `unknown`, and no caller flag or report hash can change that.
 
@@ -48,6 +50,34 @@ Local checks still run, first failure wins:
 A member that passes every local check is held as `missing_evidence` (the missing global conservation proof), with `local_checks_passed: true`. Session-exclusive proof is not required: a truthful unproven transcript body passes the local checks the same way a proven one does.
 
 Items are never changed. Contract-5 rows can only come from the ordinary sync cycle's own fresh permit. The exporter neither forces nor fakes one, and a body built without that permit stays untagged.
+
+## Disclosed residual basis
+
+Ron chose a lean option: SOURCE may qualify a member under the named basis `local_exclusion_disclosed_residual:v1` instead of strict proof. That basis is a risk-reviewed qualification with an unbounded residual, not conservation proof. It needs a reviewed local exclusion artifact for the target, built over every local transcript including the other 17 targets. Nothing here produces that artifact, so every member stays held with `missing_evidence`, and Ron's product decision alone does not make any member eligible.
+
+`local_exclusion_disclosure_json` writes one target's `LocalExclusionDisclosure` record, field for field as SESSION froze it:
+
+```
+{scope_session_keys_sha256, exclusion_artifact_sha256,
+ local_exclusion_scope:"all_local_transcripts_including_other_17_targets:v1",
+ identity_rule:"b2_counting_only_keep_root_owned_evidence:v1",
+ excluded_request_count, excluded_token_counts:{8 counters},
+ excluded_catalog_cost_usd:"<exact decimal>",
+ copy_screen_status, copy_screen_artifact_sha256, copy_screen_not_run_reason,
+ residual_statement:"<exact SESSION text>"}
+```
+
+- `scope_session_keys_sha256` is SESSION's `canonical_json_digest(sorted(scope_session_keys))`: SHA-256 of the compact JSON array of the 18 sorted keys. A test pins the value that SESSION's own function returns for the fixture scope.
+- The identity rule is counting only. A shared request is counted once, in the session that keeps it, and no name, tag or kind moves. The keeping root tags a kept shared request only from its own request evidence; otherwise it stays untagged under its starting subscription.
+- The eight token counters are always written, including zeros.
+- `excluded_catalog_cost_usd` is the exclusion money estimated at catalog prices. It is a plain decimal string with no sign, exponent or leading zeros. It is never the server's canonical admitted money; the server prices admitted money and applies its floors independently.
+- The copy screen is optional:
+  - `not_run` needs a nonblank reason of at most 1024 characters and a null artifact.
+  - `no_match` and `exclusions_applied` need a 64-hex artifact and a null reason.
+  - Both nullable fields are always written.
+- The exclusion totals come in as input from the exclusion artifact. This function only fixes the record's shape and validation. It never changes a packet member, and only SOURCE's reviewed certificate can name the basis.
+
+Before any execution go, SI requires SOURCE's actual per-member preview to be reviewed. It shows, as counts and hashes only, which kept shared requests are tagged and which are untagged, along with the keeping root's own evidence. It must also show that B2 allocation changes zero names.
 
 ## Unqualified review artifact
 
@@ -69,13 +99,15 @@ Items are never changed. Contract-5 rows can only come from the ordinary sync cy
 - It is neither an admission bundle nor a plan member, and it grants no upload permission. The server's own rejection belongs to the admission writer.
 - `qualification_gaps` is a closed list:
   - `cross_session_conservation_evidence_unavailable`
+  - `local_exclusion_artifact_missing`
   - `prior_refusal_record_codec_not_frozen`
-  - `prior_refusal_ledger_drift_recheck_unspecified`
   - `producer_revision_unverified`
   - `contract5_permit_provenance_unattested`
 
 The operator packet for the same inputs still holds every member without a body.
 
 Fixture `fixtures/h527-candidates/unqualified-redacted.v1.json` is the RFC 8785 form of the artifact for the same synthetic scenario. It has each body and body hash replaced by fixed placeholders, because tests compare the bodies against the ordinary serializer directly.
+
+Fixture `fixtures/h527-candidates/disclosure-not-run.v1.json` is the exact disclosure record for the fixture scope, with a synthetic exclusion summary and a skipped screen. It validates under SESSION's frozen `LocalExclusionDisclosure`.
 
 Fixture `fixtures/h527-candidates/held-mixed.v1.json` is the exact packet for a synthetic census covering every member-scoped hold class and the global hold. Tests drive real parser items from synthetic transcripts. Validation is hosted Public CI only; no local Cargo was run. A green CI does not make this core releasable.

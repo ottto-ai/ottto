@@ -18,6 +18,13 @@
 //! The operator manifest names members; it is never ownership proof, and no
 //! caller flag or report hash can upgrade conservation.
 //!
+//! SOURCE's named `local_exclusion_disclosed_residual:v1` basis is a
+//! risk-reviewed alternative to strict proof, not that proof. It needs a
+//! reviewed local exclusion artifact covering every local transcript, which
+//! nothing here produces, so it does not change any member's disposition.
+//! `local_exclusion_disclosure_json` only fixes the shape of the per-target
+//! disclosure record that SOURCE reviews.
+//!
 //! A second, separate output exists for review only:
 //! `h527_unqualified_candidates:v1` carries each candidate's exact ordinary
 //! batch bytes so SOURCE can inspect whether proof is possible. It is local,
@@ -45,13 +52,22 @@ pub(crate) const MANIFEST_MEMBER_COUNT: usize = 18;
 /// Why nothing in the unqualified artifact may be admitted. Closed list.
 const UNQUALIFIED_ARTIFACT_GAPS: [&str; 5] = [
     "cross_session_conservation_evidence_unavailable",
+    "local_exclusion_artifact_missing",
     "prior_refusal_record_codec_not_frozen",
-    "prior_refusal_ledger_drift_recheck_unspecified",
     "producer_revision_unverified",
     "contract5_permit_provenance_unattested",
 ];
 /// No interface supplies qualified evidence about historical accepted bodies.
 const GLOBAL_CONSERVATION_EVIDENCE: &str = "unavailable";
+/// The disclosed basis needs a reviewed local exclusion artifact; none exists.
+const DISCLOSED_RESIDUAL_EVIDENCE: &str = "exclusion_artifact_missing";
+pub(crate) const DISCLOSED_RESIDUAL_BASIS: &str = "local_exclusion_disclosed_residual:v1";
+/// Exact text SOURCE's disclosure record requires.
+pub(crate) const DISCLOSED_RESIDUAL_STATEMENT: &str = "Some copied requests may count in the session that uploaded first and show under its starting subscription; overlap with ids no longer locally present cannot be ruled out; the residual is unbounded by proof.";
+const LOCAL_EXCLUSION_SCOPE: &str = "all_local_transcripts_including_other_17_targets:v1";
+/// Shared requests count once; names and tags never move between sessions.
+const B2_IDENTITY_RULE: &str = "b2_counting_only_keep_root_owned_evidence:v1";
+const MAX_COPY_SCREEN_REASON_CHARS: usize = 1024;
 /// The operator supplies the commit; this binary cannot prove it.
 const PRODUCER_REVISION_SOURCE: &str = "operator_supplied_unverified";
 /// Manifest fields whose definition is still open. The refusal value is copied
@@ -62,20 +78,23 @@ const MIN_MACHINE_ID_CHARS: usize = 8;
 const MAX_MACHINE_ID_CHARS: usize = 128;
 const SNAPSHOT_STORAGE_SEPARATOR: char = '\u{1f}';
 
-/// Closed vocabulary only. No member qualifies while global conservation
-/// evidence is unavailable, so the exporter emits none of these.
+/// Closed vocabulary only. No member qualifies while neither strict
+/// conservation evidence nor a reviewed exclusion artifact exists, so the
+/// exporter emits none of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EligibleReason {
     QualifiedSourceOwnership,
     ExactExclusion,
     ExactPreviousAckMembership,
+    LocalExclusionDisclosedResidual,
 }
 
 impl EligibleReason {
-    pub(crate) const ALL: [Self; 3] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::QualifiedSourceOwnership,
         Self::ExactExclusion,
         Self::ExactPreviousAckMembership,
+        Self::LocalExclusionDisclosedResidual,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -83,6 +102,35 @@ impl EligibleReason {
             Self::QualifiedSourceOwnership => "qualified_source_ownership",
             Self::ExactExclusion => "exact_exclusion",
             Self::ExactPreviousAckMembership => "exact_previous_ack_membership",
+            Self::LocalExclusionDisclosedResidual => "local_exclusion_disclosed_residual",
+        }
+    }
+
+    /// The only conservation state an eligible member with this reason may
+    /// carry. The disclosed basis never borrows the strict `qualified` state.
+    pub(crate) fn required_conservation(self) -> Conservation {
+        match self {
+            Self::LocalExclusionDisclosedResidual => Conservation::DisclosedResidual,
+            _ => Conservation::Qualified,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Conservation {
+    Qualified,
+    DisclosedResidual,
+    Unknown,
+}
+
+impl Conservation {
+    pub(crate) const ALL: [Self; 3] = [Self::Qualified, Self::DisclosedResidual, Self::Unknown];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Qualified => "qualified",
+            Self::DisclosedResidual => "disclosed_residual",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -185,6 +233,9 @@ pub(crate) struct CandidateExport {
     pub(crate) qualification_reports: Vec<MemberQualificationReport>,
 }
 
+/// Exactly SESSION's closed `CandidateBundle` fields; it refuses any other key.
+/// The producer binary, the revision's provenance and the unresolved fields
+/// travel in each member's qualification report, bound by its SHA.
 #[derive(Serialize)]
 struct Packet<'a> {
     contract_version: &'static str,
@@ -194,10 +245,7 @@ struct Packet<'a> {
     device_id: &'a str,
     machine_id: &'a str,
     producer_revision: &'a str,
-    producer_revision_source: &'static str,
-    producer_binary_sha256: &'a str,
     collector_version: &'a str,
-    unresolved_fields: [&'static str; 1],
     scope_session_keys: Vec<&'a str>,
     members: Vec<PacketMember<'a>>,
 }
@@ -255,7 +303,7 @@ fn build_candidate_export(
     for member in members {
         let facts = local_facts(member, evidence);
         let reason = held_reason(&facts, evidence);
-        let report = qualification_report(scope, member, evidence, &facts, reason)?;
+        let report = qualification_report(scope, member, evidence, producer, &facts, reason)?;
         packet_members.push(PacketMember {
             source_session_id: &member.source_session_id,
             session_key_sha256: &member.session_key_sha256,
@@ -263,7 +311,7 @@ fn build_candidate_export(
             disposition: "held",
             reason: reason.as_str(),
             qualification_report_sha256: report.sha256.clone(),
-            cross_session_conservation: "unknown",
+            cross_session_conservation: Conservation::Unknown.as_str(),
         });
         reports.push(report);
     }
@@ -275,10 +323,7 @@ fn build_candidate_export(
         device_id: &scope.device_id,
         machine_id: &scope.machine_id,
         producer_revision: &scope.producer_revision,
-        producer_revision_source: PRODUCER_REVISION_SOURCE,
-        producer_binary_sha256: &producer.binary_sha256,
         collector_version: &producer.collector_version,
-        unresolved_fields: UNRESOLVED_FIELDS,
         scope_session_keys: members
             .iter()
             .map(|member| member.session_key_sha256.as_str())
@@ -374,7 +419,7 @@ fn build_unqualified_artifact(
             source_session_id: &member.source_session_id,
             session_key_sha256: &member.session_key_sha256,
             prior_refusal_body_witness: &member.prior_refusal_body_witness,
-            cross_session_conservation: "unknown",
+            cross_session_conservation: Conservation::Unknown.as_str(),
             operator_packet_reason: held_reason(&facts, evidence).as_str(),
             local_checks_passed: local_failure(&facts, evidence).is_none(),
             body_status,
@@ -406,6 +451,146 @@ fn build_unqualified_artifact(
         .map_err(|error| format!("unqualified artifact encoding: {error}"))?;
     let sha256 = sha256_hex(json.as_bytes());
     Ok(UnqualifiedArtifact { json, sha256 })
+}
+
+/// Exclusion totals for one target, as recorded in a reviewed local exclusion
+/// artifact. Nothing in this module computes them: that needs an exclusion
+/// pass over every local transcript, which this exporter does not run.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalExclusionSummary {
+    pub(crate) exclusion_artifact_sha256: String,
+    pub(crate) excluded_request_count: u64,
+    pub(crate) excluded_token_counts: ExcludedTokenCounts,
+    /// Estimated exclusion money at catalog prices, as an exact decimal
+    /// string. It is never the server's canonical admitted money.
+    pub(crate) excluded_catalog_cost_usd: String,
+    pub(crate) copy_screen: CopyScreen,
+}
+
+/// All eight dimensions are always present; zero is evidence, not a default.
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct ExcludedTokenCounts {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) cache_creation_5m_tokens: u64,
+    pub(crate) cache_creation_1h_tokens: u64,
+    pub(crate) cache_creation_unattributed_input_tokens: u64,
+    pub(crate) reasoning_output_tokens: u64,
+    pub(crate) unattributed_total_tokens: u64,
+}
+
+/// The optional server copy screen. Skipping it is explicit, with a reason.
+#[derive(Debug, Clone)]
+pub(crate) enum CopyScreen {
+    NotRun { reason: String },
+    NoMatch { artifact_sha256: String },
+    ExclusionsApplied { artifact_sha256: String },
+}
+
+/// SESSION's `LocalExclusionDisclosure`, field for field. The two nullable
+/// screen fields are always written, as explicit nulls when absent.
+#[derive(Serialize)]
+struct LocalExclusionDisclosure<'a> {
+    scope_session_keys_sha256: String,
+    exclusion_artifact_sha256: &'a str,
+    local_exclusion_scope: &'static str,
+    identity_rule: &'static str,
+    excluded_request_count: u64,
+    excluded_token_counts: &'a ExcludedTokenCounts,
+    excluded_catalog_cost_usd: &'a str,
+    copy_screen_status: &'static str,
+    copy_screen_artifact_sha256: Option<&'a str>,
+    copy_screen_not_run_reason: Option<&'a str>,
+    residual_statement: &'static str,
+}
+
+/// One target's disclosure record for SOURCE's disclosed-residual review.
+///
+/// It is review evidence, never a disposition: the operator packet for the
+/// same scope keeps every member held, and only SOURCE's reviewed certificate
+/// can name this basis. The scope digest covers all 18 keys.
+pub(crate) fn local_exclusion_disclosure_json(
+    scope: &OperatorScope,
+    members: &[ApprovedMember],
+    summary: &LocalExclusionSummary,
+) -> Result<String, String> {
+    validate_scope(scope)?;
+    validate_members(scope, members)?;
+    if !is_lower_hex(&summary.exclusion_artifact_sha256, 64) {
+        return Err("exclusion_artifact_sha256 must be 64 lowercase hex".to_string());
+    }
+    if !is_exact_decimal(&summary.excluded_catalog_cost_usd) {
+        return Err(
+            "excluded_catalog_cost_usd must be an exact nonnegative decimal string".to_string(),
+        );
+    }
+    let (copy_screen_status, copy_screen_artifact_sha256, copy_screen_not_run_reason) =
+        match &summary.copy_screen {
+            CopyScreen::NotRun { reason } => {
+                let chars = reason.chars().count();
+                if reason.trim().is_empty()
+                    || chars > MAX_COPY_SCREEN_REASON_CHARS
+                    || reason.chars().any(char::is_control)
+                {
+                    return Err(
+                        "copy screen not_run reason must be nonblank plain text of at most 1024 characters"
+                            .to_string(),
+                    );
+                }
+                ("not_run", None, Some(reason.as_str()))
+            }
+            CopyScreen::NoMatch { artifact_sha256 }
+            | CopyScreen::ExclusionsApplied { artifact_sha256 } => {
+                if !is_lower_hex(artifact_sha256, 64) {
+                    return Err("copy screen artifact must be 64 lowercase hex".to_string());
+                }
+                let status = if matches!(summary.copy_screen, CopyScreen::NoMatch { .. }) {
+                    "no_match"
+                } else {
+                    "exclusions_applied"
+                };
+                (status, Some(artifact_sha256.as_str()), None)
+            }
+        };
+    let disclosure = LocalExclusionDisclosure {
+        scope_session_keys_sha256: scope_session_keys_sha256(members)?,
+        exclusion_artifact_sha256: &summary.exclusion_artifact_sha256,
+        local_exclusion_scope: LOCAL_EXCLUSION_SCOPE,
+        identity_rule: B2_IDENTITY_RULE,
+        excluded_request_count: summary.excluded_request_count,
+        excluded_token_counts: &summary.excluded_token_counts,
+        excluded_catalog_cost_usd: &summary.excluded_catalog_cost_usd,
+        copy_screen_status,
+        copy_screen_artifact_sha256,
+        copy_screen_not_run_reason,
+        residual_statement: DISCLOSED_RESIDUAL_STATEMENT,
+    };
+    serde_json::to_string(&disclosure).map_err(|error| format!("disclosure encoding: {error}"))
+}
+
+/// SESSION's `canonical_json_digest(sorted(scope_session_keys))`: SHA-256 of
+/// the compact JSON array of the sorted keys.
+fn scope_session_keys_sha256(members: &[ApprovedMember]) -> Result<String, String> {
+    let mut keys = members
+        .iter()
+        .map(|member| member.session_key_sha256.as_str())
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    let json =
+        serde_json::to_string(&keys).map_err(|error| format!("scope digest encoding: {error}"))?;
+    Ok(sha256_hex(json.as_bytes()))
+}
+
+/// Plain nonnegative decimal without exponent, sign or leading zeros, so the
+/// value is exact and has one spelling.
+fn is_exact_decimal(value: &str) -> bool {
+    let (whole, fraction) = match value.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (value, None),
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    digits(whole) && (whole == "0" || !whole.starts_with('0')) && fraction.is_none_or(digits)
 }
 
 /// One unchanged item through the ordinary daemon request and serializer: the
@@ -552,6 +737,7 @@ fn qualification_report(
     scope: &OperatorScope,
     member: &ApprovedMember,
     evidence: &PipelineEvidence<'_>,
+    producer: &ProducerBuild,
     facts: &MemberFacts<'_>,
     reason: HeldReason,
 ) -> Result<MemberQualificationReport, String> {
@@ -559,11 +745,16 @@ fn qualification_report(
     let report = json!({
         "contract_version": QUALIFICATION_REPORT_CONTRACT_VERSION,
         "operation_id": scope.operation_id,
+        "producer_revision_source": PRODUCER_REVISION_SOURCE,
+        "producer_binary_sha256": producer.binary_sha256,
+        "collector_version": producer.collector_version,
+        "unresolved_fields": UNRESOLVED_FIELDS,
         "session_key_sha256": member.session_key_sha256,
         "disposition": "held",
         "reason": reason.as_str(),
-        "cross_session_conservation": "unknown",
+        "cross_session_conservation": Conservation::Unknown.as_str(),
         "global_conservation_evidence": GLOBAL_CONSERVATION_EVIDENCE,
+        "disclosed_residual_evidence": DISCLOSED_RESIDUAL_EVIDENCE,
         "local_checks_passed": local_failure(facts, evidence).is_none(),
         "item_match_count": facts.item_match_count,
         "usage_accounting_contract": facts.item.and_then(|item| item.usage_accounting_contract.as_deref()),
