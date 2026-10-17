@@ -265,6 +265,80 @@ fn collector<K, V>(count: usize, c: &mut Counter) -> Option<()> {
     c.add(nodes.bytes.checked_mul(2)?)
 }
 
+/// Frozen scalar cost only, not permission to run a consumer. The future
+/// caller must reserve before constructing either set, keep that reservation
+/// through the actual CAS/report lifetime, and separately own escaped output.
+#[derive(Debug, Clone, Copy)]
+struct ConsumerCosts {
+    cardinality_upper: usize,
+    full_collectors: usize,
+    affected_string_copies: usize,
+    total: usize,
+}
+
+fn consumer_costs(index: &ScanIndex, previous: &ScanIndex) -> Option<ConsumerCosts> {
+    if !super::required_decode::profile_supported() {
+        return None;
+    }
+    if index.claude_copy_holds.is_empty() {
+        return Some(ConsumerCosts {
+            cardinality_upper: 0,
+            full_collectors: 0,
+            affected_string_copies: 0,
+            total: 0,
+        });
+    }
+    let mut full = Counter::new(LIMIT);
+    // ONE frozen borrowed pass. Files.len bounds legacy last-fingerprint
+    // fallbacks without an extra file walk; exact-map files are overcounted.
+    let mut count = index
+        .files
+        .len()
+        .checked_add(previous.files.len())?
+        .checked_add(index.codex_state_only_snapshot_fingerprints.len())?
+        .checked_add(previous.codex_state_only_snapshot_fingerprints.len())?;
+    for values in index
+        .file_snapshot_fingerprints
+        .values()
+        .chain(previous.file_snapshot_fingerprints.values())
+    {
+        count = count.checked_add(values.len())?;
+    }
+    // The first owned set survives CAS. Another owned set and a FAT &str set
+    // coexist during each manifest call. Separate physical owners, not aliases.
+    collector::<String, ()>(count, &mut full)?;
+    collector::<String, ()>(count, &mut full)?;
+    collector::<&str, ()>(count, &mut full)?;
+    let mut payload = 0usize;
+    for key in index.claude_copy_holds.entries_for_budget() {
+        for owner in [index, previous] {
+            if let Some(values) = owner.file_snapshot_fingerprints.get(key) {
+                for fp in values {
+                    payload = payload.checked_add(fp.capacity())?;
+                }
+            } else if let Some(fp) = owner
+                .files
+                .get(key)
+                .and_then(|entry| entry.last_snapshot_fingerprint.as_ref())
+            {
+                // Canonical field type imposes no64B length validation here.
+                payload = payload.checked_add(fp.capacity())?;
+            }
+        }
+    }
+    let affected_string_copies = payload.checked_mul(2)?;
+    let total = full.bytes.checked_add(affected_string_copies)?;
+    if total > LIMIT {
+        return None;
+    }
+    Some(ConsumerCosts {
+        cardinality_upper: count,
+        full_collectors: full.bytes,
+        affected_string_copies,
+        total,
+    })
+}
+
 fn selection_bound(
     index: &ScanIndex,
     previous: &ScanIndex,
@@ -518,6 +592,137 @@ mod tests {
             assert!(actual.requested_peak_with_overlap <= c.bytes);
             assert_eq!(actual.requested_live, 0);
             eprintln!("copy_containment_required_collector: n={count} conservative_full_collector={} actual_requested_peak={} incremental_payload_excluded=true", c.bytes, actual.requested_peak_with_overlap);
+        }
+    }
+
+    #[test]
+    fn copy_containment_consumer_legacy_owned_lifetime_across_actual_cas_and_manifest() {
+        use std::io::Write;
+        // Ordinary existing index/CAS is the lifetime oracle, not required
+        // admission. This fixture can execute on an unsupported new-codec
+        // layout without pretending that its resource bound is validated.
+        let root = std::env::temp_dir().join(format!(
+            "ottto-copy-consumer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Remove(root.clone());
+        let path = root.join("index.json");
+        let legacy = "legacy-".repeat(128);
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            "legacy.jsonl".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":1, "modified_unix_seconds":1, "source_file_fingerprint":"a".repeat(64),
+                "last_snapshot_fingerprint":legacy
+            }))
+            .unwrap(),
+        );
+        index
+            .snapshot_activity_at
+            .insert(legacy.clone(), Some("2026-10-17T00:01:00Z".to_string()));
+        // No exact-map entry: ordinary current_snapshot_fingerprints must
+        // retain the legacy String instead of treating an empty map as empty.
+        assert!(index.file_snapshot_fingerprints.is_empty());
+        index.save(&path).unwrap();
+        let before_generation = index.generation;
+        let ((first_live, after_cas, manifest_peak), stats) =
+            crate::retry_allocation_probe::measure(|| {
+                let current = index.current_snapshot_fingerprints();
+                assert!(current.contains(&legacy));
+                let first_live = crate::retry_allocation_probe::stats().requested_live;
+                assert!(first_live > 0);
+                index.save(&path).unwrap(); // actual ordinary generation CAS
+                assert_eq!(index.generation, before_generation + 1);
+                let after_cas = crate::retry_allocation_probe::stats().requested_live;
+                assert!(after_cas >= first_live);
+                crate::retry_allocation_probe::phase_begin();
+                let manifest = index
+                    .manifest_for_window(
+                        super::super::super::SnapshotSource::ClaudeCode,
+                        "2026-10-17T00:00:00Z",
+                        "2026-10-18T00:00:00Z",
+                    )
+                    .unwrap();
+                assert_eq!(manifest.entity_count, 1);
+                assert!(
+                    current.contains(&legacy),
+                    "first owned set survives the second manifest owner"
+                );
+                let manifest_peak = crate::retry_allocation_probe::phase_peak();
+                drop(manifest);
+                drop(current);
+                (first_live, after_cas, manifest_peak)
+            });
+        assert_eq!(stats.requested_live, 0);
+        assert!(manifest_peak > legacy.len());
+        writeln!(std::io::stderr().lock(), "copy_containment_consumer_lifetime: legacy_bytes={} first_owned_live={first_live} after_actual_CAS={after_cas} manifest_incremental_peak={manifest_peak} final_live=0 ordinary_oracle_not_required_admission=true", legacy.len()).unwrap();
+    }
+
+    #[test]
+    fn copy_containment_consumer_preflight_counts_legacy_and_fat_reference_boundaries() {
+        use std::io::Write;
+        let mut index = ScanIndex::default();
+        index.claude_copy_holds = serde_json::from_value(serde_json::json!({
+            "legacy.jsonl": {"revision": {"version":1, "reason":"copied_overlap_unproven",
+                "source_revision":"a".repeat(64), "comparison_context":"b".repeat(64),
+                "first_observed_unix_seconds":null}, "peers":["c".repeat(64)]}
+        }))
+        .unwrap();
+        index.files.insert(
+            "legacy.jsonl".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":1, "modified_unix_seconds":1, "source_file_fingerprint":"a".repeat(64),
+                "last_snapshot_fingerprint":"L".repeat(1024)
+            }))
+            .unwrap(),
+        );
+        if !super::super::required_decode::profile_supported() {
+            assert!(consumer_costs(&index, &ScanIndex::default()).is_none());
+            writeln!(std::io::stderr().lock(), "copy_containment_consumer_preflight: unsupported profile; positive bound branches UNEXECUTED").unwrap();
+            return;
+        }
+        for count in [31usize, 32, 33, 47, 48, 49, 63, 64, 65] {
+            index.file_snapshot_fingerprints.insert(
+                "exact.jsonl".to_string(),
+                (0..count).map(|n| format!("fp-{n}")).collect(),
+            );
+            let (cost, allocations) = crate::retry_allocation_probe::measure(|| {
+                consumer_costs(&index, &ScanIndex::default()).unwrap()
+            });
+            assert_eq!(allocations.allocations, 0);
+            assert_eq!(
+                cost.cardinality_upper,
+                count + 1,
+                "one legacy file even with no exact map for it"
+            );
+            assert!(
+                cost.affected_string_copies >= 2048,
+                "two full legacy String copies, never assumed64B"
+            );
+            assert_eq!(
+                cost.total,
+                cost.full_collectors + cost.affected_string_copies
+            );
+            let mut thin = Counter::new(LIMIT);
+            let mut fat = Counter::new(LIMIT);
+            collector::<&String, ()>(cost.cardinality_upper, &mut thin).unwrap();
+            collector::<&str, ()>(cost.cardinality_upper, &mut fat).unwrap();
+            assert!(
+                fat.bytes > thin.bytes,
+                "actual fat-reference storage is separate"
+            );
+            writeln!(std::io::stderr().lock(), "copy_containment_consumer_preflight: count={count} upper={} full_collectors={} affected_owned_strings={} total={} preflight_allocations=0 status_escape_UNPAID=true", cost.cardinality_upper, cost.full_collectors, cost.affected_string_copies, cost.total).unwrap();
         }
     }
 }

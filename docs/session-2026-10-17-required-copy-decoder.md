@@ -56,3 +56,47 @@ propagation, pay existing new-debt producer growth, complete native cache and
 wake custody, exact durable drain and status, execute supported positive paths,
 validate normal/partial/shed/CAS and identity parity, review, and measure the
 installed application. This draft has no merge or release readiness.
+
+
+## Private status and consumer ownership checkpoint
+
+The draft now includes a private, move-only, single typed observation slot.
+Its fixed timestamp/counts/basis are prepaid before one Box allocation;
+replacement reuses the box, equal payloads keep their id/time/sequence, and
+clearing keeps the private sequence high-water mark. No generic event history
+is retained by this new owner. The ordinary scan producer is not switched to
+it yet. A private initial status projection prepays materialized event copies
+and full vector growth overlap; a lexical guard in the control Status arm
+covers its second canonical projection and owned JSON conversion. Status
+reads do not advance the observation sequence; canonical upload exclusion
+remains exact. Optional observation failure does not clear required scan debt
+or establish that there are no holds. Other control consumers remain unqualified.
+
+Copies retained by API callers after ownership transfer are outside the scan
+cache's shared 31 MiB allowance. No public Clone/schema or transport concurrency
+change is proposed. Socket response/value buffers remain live through the
+existing write timeout. XPC retains its String/CString/duplicated C buffer
+through the existing shim's copy/send/free sequence. Those are fixed per-output
+representations, not a shared aggregate claim over arbitrary response lifetimes.
+For complete serialized output size B, the reporting-only conservative Rust
+buffer-growth representation is 4 * max(B, 128); String/CString/duplicate overlap
+is 6 * max(B + 1, 128). These include unchanged baseline bytes, are not allocation
+admission gates, and do not measure opaque XPC-framework memory or daemon RSS.
+No reservation crosses the C ABI; transport free/timeout behavior is unchanged.
+
+A borrowed scalar preflight also accounts for legacy last-fingerprint strings,
+owned entity collectors and the manifest's fat-reference collector, without an
+allocated affected-fingerprint set or per-held whole-index walk. Actual scan
+consumer reservation/lifetime hooks are still unwired. New-debt/native cache
+owners, the other internal consumers and full normal/partial/shed/CAS execution
+remain required before activation.
+
+Ten further tests are authored for actual CAS/manifest lifetime, consumer and
+Vec growth boundaries, API ownership transfer, fixed stack representation,
+prepayment/reuse/drop/refusal with required debt intact, actual daemon repeated
+reads/interleaved sequences, structural drift, and the actual control Status
+arm. These tests have no execution acceptance yet. Positive supported-layout
+branches explicitly report UNEXECUTED when the pinned profile refuses; ordinary
+allocation characterizations do not authorize required-path admission. The
+previous 55-test CI head does not validate this new checkpoint. No local Cargo
+or model review ran. This draft still has no merge or release readiness.

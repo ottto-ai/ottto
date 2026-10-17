@@ -54,6 +54,18 @@ struct HoldReasonCounts {
     incident_copy_safety: usize,
 }
 
+// Exhaustive scalar/static-string accounting for the private fixed slot.
+crate::heap_layout_bound::fields!(CopyContainmentStatus;
+    mode, held_revision_count, parked_held_revision_count,
+    attempt_unavailable_revision_count, attempt_repeated_revision_count,
+    retained_prior_local_ack_count, past_acceptance_unknown_count,
+    new_without_prior_local_ack_count, oldest_known_observed_age_seconds,
+    observation_age_unknown_count, marker_settled_suppressed_by_recorded_holds,
+    withheld_candidates_observed, w4_cache_state, parked_while_w4_unavailable_count,
+    hold_record_limit_refusals, hold_peer_limit_refusals, unrecorded_held_revision_count, reasons);
+crate::heap_layout_bound::fields!(HoldReasonCounts;
+    copied_overlap_unproven, comparison_unavailable, owner_budget_exceeded, incident_copy_safety);
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(transparent)]
 pub(crate) struct Holds {

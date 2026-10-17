@@ -14,6 +14,10 @@ pub(crate) mod pipeline;
 pub(in crate::snapshots) mod required_budget;
 #[allow(dead_code)]
 pub(in crate::snapshots) mod required_decode;
+#[allow(dead_code)]
+pub(in crate::snapshots) mod status_costing;
+#[allow(dead_code)]
+pub(in crate::snapshots) mod status_slot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativePairObservation {

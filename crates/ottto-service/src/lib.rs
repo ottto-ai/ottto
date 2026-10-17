@@ -236,7 +236,8 @@ pub enum LocalHealthUploadFailureKind {
     ContractRejected,
 }
 
-#[derive(Debug, Clone)]
+// Required observation credit is move-only; this private state is never cloned.
+#[derive(Debug)]
 struct DaemonState {
     machine: MachineIdentity,
     relay: RelayState,
@@ -255,6 +256,8 @@ struct DaemonState {
     /// `with_source_state_dir(default_sources_dir())`.
     source_state_dir: Option<PathBuf>,
     local_health_events: Vec<LocalHealthEventV1>,
+    // Inactive producer checkpoint: fixed private owner, no generic event history.
+    copy_observation: snapshots::CopyObservationState,
     command_ledger: Vec<LocalHealthCommandResultV1>,
     account: LocalAccountBinding,
     connection: Option<LocalConnectionBinding>,
@@ -446,6 +449,7 @@ impl LocalDaemon {
                 source_reconciliation: BTreeMap::new(),
                 source_state_dir: None,
                 local_health_events: Vec::new(),
+                copy_observation: snapshots::CopyObservationState::default(),
                 command_ledger: Vec::new(),
                 account: LocalAccountBinding::not_connected(),
                 connection: None,
@@ -1972,6 +1976,13 @@ impl Drop for RepairLease {
 }
 
 fn status_from_state(state: &DaemonState) -> DaemonStatus {
+    // The inactive typed producer has no slot in ordinary operation. If a
+    // source test installs one, prepay BEFORE cloning/appending/projecting.
+    // Refusal suppresses only this optional observation, never required debt.
+    // Control/transport continuation owners still need separate qualification.
+    let copy_projection = state
+        .copy_observation
+        .prepay_projection(&state.machine.machine_id, state.local_health_events.len());
     let mut status = empty_status(state.machine.clone(), current_rfc3339_timestamp());
     status.account = state.account.clone();
     // Legacy builds could start a second browser claim over a fully bound
@@ -2008,6 +2019,8 @@ fn status_from_state(state: &DaemonState) -> DaemonStatus {
             active_sessions::read_active_session_reconciliation(&default_support_dir(), source);
     }
     status.local_health_events = state.local_health_events.clone();
+    let _copy_output =
+        copy_projection.and_then(|projection| projection.append(&mut status.local_health_events));
     status.command_ledger = state.command_ledger.clone();
     refresh_canonical_local_health_with_started_at(&mut status, &state.started_at);
     status
@@ -2152,6 +2165,7 @@ fn next_local_health_sequence(state: &DaemonState) -> u64 {
         .local_health_events
         .iter()
         .map(|event| event.sequence)
+        .chain(std::iter::once(state.copy_observation.last_sequence()))
         .chain(
             state
                 .command_ledger

@@ -599,3 +599,290 @@ fn copy_containment_local_status_is_bounded_deduplicated_and_absent_from_backend
     }
     writeln!(std::io::stderr().lock(), "copy_containment_status_envelope: default_disabled_no_event=true repeated_observations=200 own_retained_events=1 unchanged_payload_dedup=true changed_basis_replaces=true changed_payload_sequence_and_id_advance=true local_event_retained=true canonical_backend_type_and_id_absent=true unrelated_evidence_bytes_unchanged=true no_content=true").unwrap();
 }
+
+/// API ownership-transfer characterization, not a required-budget gate.
+/// Caller-retained outputs after transfer are outside scan/cache31MiB.
+/// The existing protocol values escape both producer and daemon lifetimes.
+#[test]
+fn copy_containment_status_caller_outputs_survive_api_ownership_transfer() {
+    use std::io::Write;
+    let daemon = test_daemon("otm_test");
+    daemon.transcript_cache.require_copy_containment_for_test();
+    let index = ScanIndex::default();
+    record_copy_containment_status(&daemon, &index, "uncommitted_scan_observation").unwrap();
+    let (event_id, message_pointer) = {
+        let state = daemon.state().unwrap();
+        let event = state
+            .local_health_events
+            .iter()
+            .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
+            .unwrap();
+        (
+            event.event_id.clone(),
+            event.payload["message"].as_str().unwrap().as_ptr() as usize,
+        )
+    };
+    let ((statuses, serialized), allocations) = crate::retry_allocation_probe::measure(|| {
+        let statuses = (0..4)
+            .map(|_| daemon.status_for_trusted_client().unwrap())
+            .collect::<Vec<_>>();
+        let serialized = statuses
+            .iter()
+            .map(|status| serde_json::to_vec(status).unwrap())
+            .collect::<Vec<_>>();
+        (statuses, serialized)
+    });
+    assert!(allocations.requested_live > 0);
+    let mut pointers = BTreeSet::new();
+    for status in &statuses {
+        let event = status
+            .local_health_events
+            .iter()
+            .find(|event| event.event_id == event_id)
+            .unwrap();
+        let pointer = event.payload["message"].as_str().unwrap().as_ptr() as usize;
+        assert_ne!(pointer, message_pointer, "status owns a DEEP payload copy");
+        assert!(
+            pointers.insert(pointer),
+            "returned outputs do not alias payload storage"
+        );
+        assert!(!status
+            .canonical_health
+            .as_ref()
+            .unwrap()
+            .evidence
+            .iter()
+            .any(|evidence| evidence.event_type == COPY_CONTAINMENT_EVENT_TYPE));
+    }
+    drop(index);
+    // Synthetic producer removal cannot retract already returned output.
+    daemon
+        .state()
+        .unwrap()
+        .local_health_events
+        .retain(|event| event.event_id != event_id);
+    drop(daemon);
+    for (status, wire) in statuses.iter().zip(&serialized) {
+        assert!(status
+            .local_health_events
+            .iter()
+            .any(|event| event.event_id == event_id));
+        assert_eq!(*wire, serde_json::to_vec(status).unwrap());
+    }
+    let later_clone = statuses[0].clone();
+    assert!(later_clone
+        .local_health_events
+        .iter()
+        .any(|event| event.event_id == event_id));
+    writeln!(std::io::stderr().lock(), "copy_containment_status_output_escape: returned_statuses=4 serialized_outputs=4 deep_payloads=4 producer_and_daemon_dropped=true later_protocol_clone=true requested_live_all_output_including_baseline={} frame_credit_carrier=false no_admission_claim=true", allocations.requested_live).unwrap();
+}
+
+/// Private typed owner prototype, not ordinary producer/control attachment.
+#[test]
+fn copy_containment_typed_status_actual_reads_preserve_interleaved_sequences_and_disable() {
+    use std::io::Write;
+    let daemon = test_daemon("otm_test");
+    let index = ScanIndex::default();
+    let observation = index.copy_containment_status(Some(100));
+    {
+        let mut state = daemon.state().unwrap();
+        assert_eq!(
+            state.copy_observation.replace(
+                &daemon.transcript_cache,
+                observation.clone(),
+                "durable_selected_index",
+                1
+            ),
+            Some(false)
+        );
+        assert_eq!(state.copy_observation.last_sequence(), 0);
+        crate::push_local_health_event(
+            &mut state,
+            "BeforeTypedObservation",
+            "before_typed",
+            ottto_protocol::LocalHealthAuthority::Runtime,
+            serde_json::json!({"before":true}),
+        );
+    }
+    daemon.transcript_cache.require_copy_containment_for_test();
+    let result = {
+        let mut state = daemon.state().unwrap();
+        let next = crate::next_local_health_sequence(&state);
+        state.copy_observation.replace(
+            &daemon.transcript_cache,
+            observation.clone(),
+            "durable_selected_index",
+            next,
+        )
+    };
+    if result.is_none() {
+        // Exact closed guard: unsupported branches must never be reported as
+        // executed positive ordering/allocation proof.
+        assert_eq!(daemon.state().unwrap().copy_observation.last_sequence(), 0);
+        assert!(!daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .local_health_events
+            .iter()
+            .any(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE));
+        writeln!(std::io::stderr().lock(), "copy_containment_typed_status_actual_owner: supported_projection=false multiread_interleaving_disable_positive=UNEXECUTED producer_unwired=true").unwrap();
+        return;
+    }
+    assert_eq!(result, Some(true));
+    {
+        let mut state = daemon.state().unwrap();
+        assert_eq!(state.copy_observation.last_sequence(), 2);
+        crate::push_local_health_event(
+            &mut state,
+            "AfterTypedObservation",
+            "after_typed",
+            ottto_protocol::LocalHealthAuthority::Runtime,
+            serde_json::json!({"after":true}),
+        );
+        assert_eq!(state.local_health_events.last().unwrap().sequence, 3);
+        assert_eq!(
+            state.local_health_events.len(),
+            2,
+            "typed slot never grows shared event history"
+        );
+    }
+    let first = daemon.status_for_trusted_client().unwrap();
+    let kept = first
+        .local_health_events
+        .iter()
+        .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
+        .unwrap()
+        .clone();
+    assert_eq!(kept.event_id, "evt_claude_copy_containment_2");
+    assert_eq!(kept.payload["basis"], "durable_selected_index");
+    assert_eq!(
+        kept.payload["observation"],
+        serde_json::to_value(&observation).unwrap()
+    );
+    for _ in 0..4 {
+        let mut status = daemon.status_for_trusted_client().unwrap();
+        assert_eq!(
+            status
+                .local_health_events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            status
+                .local_health_events
+                .iter()
+                .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE),
+            Some(&kept)
+        );
+        assert_eq!(
+            crate::next_local_health_sequence(&daemon.state().unwrap()),
+            4,
+            "status projection never mutates state sequence"
+        );
+        for _ in 0..2 {
+            crate::refresh_canonical_local_health(&mut status);
+            assert_eq!(
+                status
+                    .local_health_events
+                    .iter()
+                    .filter(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
+                    .count(),
+                1
+            );
+            assert!(!status
+                .canonical_health
+                .as_ref()
+                .unwrap()
+                .evidence
+                .iter()
+                .any(|entry| entry.event_type == COPY_CONTAINMENT_EVENT_TYPE));
+        }
+    }
+    {
+        let mut state = daemon.state().unwrap();
+        let next = crate::next_local_health_sequence(&state);
+        assert_eq!(
+            state.copy_observation.replace(
+                &daemon.transcript_cache,
+                observation.clone(),
+                "durable_selected_index",
+                next
+            ),
+            Some(false)
+        );
+        assert_eq!(state.copy_observation.last_sequence(), 2);
+        assert_eq!(
+            state.copy_observation.replace(
+                &daemon.transcript_cache,
+                observation,
+                "durable_partial_selection",
+                next
+            ),
+            Some(true)
+        );
+        assert_eq!(state.copy_observation.last_sequence(), 4);
+        state.copy_observation.clear();
+        assert_eq!(crate::next_local_health_sequence(&state), 5);
+    }
+    assert!(!daemon
+        .status_for_trusted_client()
+        .unwrap()
+        .local_health_events
+        .iter()
+        .any(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE));
+    drop(daemon);
+    assert!(
+        first.local_health_events.iter().any(|event| event == &kept),
+        "returned API values survive private slot disable/drop"
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_typed_status_actual_owner: supported_projection=true multiread=4 equal_payload_id_stable=true interleaved_order=true private_highwater_survives_clear=true reads_never_advance_sequence=true repeated_projection_no_duplicate=true canonical_exclusion=true caller_output_survives_drop=true producer_unwired=true").unwrap();
+}
+
+#[test]
+#[serial]
+fn copy_containment_control_status_lexical_guard_preserves_response_contract_and_private_sequence()
+{
+    use std::io::Write;
+    let daemon = test_daemon("otm_test");
+    daemon.transcript_cache.require_copy_containment_for_test();
+    let index = ScanIndex::default();
+    let admitted = daemon
+        .state()
+        .unwrap()
+        .copy_observation
+        .replace(
+            &daemon.transcript_cache,
+            index.copy_containment_status(Some(100)),
+            "durable_selected_index",
+            1,
+        )
+        .is_some();
+    let request = serde_json::from_value::<ottto_protocol::LocalControlRequest>(serde_json::json!({
+        "request_id":"req_copy_status_synthetic", "protocol_version":ottto_protocol::PROTOCOL_VERSION,
+        "token":"token", "client_kind":"cli", "command":"status", "refresh_agent_status":false
+    })).unwrap();
+    let response = crate::control::handle_request(&daemon, request);
+    assert!(response.ok, "{}", serde_json::to_string(&response).unwrap());
+    assert_eq!(response.request_id, "req_copy_status_synthetic");
+    let payload = response.payload.unwrap();
+    let observations = payload["local_health_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event_type"] == COPY_CONTAINMENT_EVENT_TYPE)
+        .collect::<Vec<_>>();
+    if admitted {
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["event_id"], "evt_claude_copy_containment_1");
+        assert_eq!(daemon.state().unwrap().copy_observation.last_sequence(), 1);
+    } else {
+        assert!(observations.is_empty());
+        assert_eq!(daemon.state().unwrap().copy_observation.last_sequence(), 0);
+    }
+    assert!(!serde_json::to_string(&payload["canonical_health"])
+        .unwrap()
+        .contains(COPY_CONTAINMENT_EVENT_TYPE));
+    writeln!(std::io::stderr().lock(), "copy_containment_control_status: actual_handle_request=true refresh_agent_status=false protocol_unchanged=true canonical_exclusion=true private_sequence_unchanged=true positive_typed_slot_and_lexical_control_projection={} provider_fixture_calls=0 transport_unchanged=true", if admitted { "EXECUTED" } else { "UNEXECUTED" }).unwrap();
+}
