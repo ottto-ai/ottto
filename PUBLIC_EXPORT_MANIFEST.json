@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 666,
-  "content_sha256": "f9cd124d7a79e03bcbabee4f2f35be0f23c2c09dfc9d7ae0acb18e93fd60e64b",
+  "content_sha256": "c32ed7a64fd306cdb3aa1c3355437f34c7d496548efbf4a58d0df7b60b44e9ee",
   "files": [
     {
       "executable": false,
@@ -1357,8 +1357,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/h527_candidates/tests.rs",
-      "sha256": "8cca54d275fad1319b5d3c23b9dfb50dd016ae957f899e445f10ce6af23cd87f",
-      "size_bytes": 19022
+      "sha256": "c3524984ace262a1ca0b1969afca0534c4948b22bf6fc9eae5106b57f3ed7966",
+      "size_bytes": 19038
     },
     {
       "executable": false,

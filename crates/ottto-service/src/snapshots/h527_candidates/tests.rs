@@ -415,8 +415,10 @@ fn census_gaps_hold_members_that_would_otherwise_qualify() {
         let export = run_export(&snapshots, &disposition, &index);
         assert_held_without_body(&packet_member(&export, 1), "cap_overflow");
     }
-    let mut overflowed = ScanIndex::default();
-    overflowed.claude_duplicate_request_witness_overflowed = true;
+    let overflowed = ScanIndex {
+        claude_duplicate_request_witness_overflowed: true,
+        ..ScanIndex::default()
+    };
     let export = run_export(&snapshots, &complete_census(), &overflowed);
     assert_held_without_body(&packet_member(&export, 1), "cap_overflow");
 
