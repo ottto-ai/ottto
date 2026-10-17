@@ -3660,7 +3660,13 @@ impl SourcePreparation {
                                 .into_iter()
                                 .flat_map(|lease| lease.early_evidence_roots()),
                         )
-                        .filter(|_| permitted);
+                        .filter(|root| {
+                            permitted
+                                && self
+                                    .native_comparison_lease
+                                    .as_ref()
+                                    .is_some_and(|lease| lease.family_can_optimize(root))
+                        });
                     let occupied = self
                         .native_comparison_reservation
                         .as_ref()
@@ -3723,7 +3729,10 @@ impl SourcePreparation {
                                 None
                             }
                         };
-                        if let Some(qualification) = qualification {
+                        if let Some(mut qualification) = qualification {
+                            if let Some(lease) = self.native_comparison_lease.as_ref() {
+                                lease.apply_family_policy(&mut qualification);
+                            }
                             match crate::snapshots::claude_native_comparison::Controller::new_paid(
                                 qualification,
                                 state.native_ordinary_body_frontier(),
@@ -3768,6 +3777,9 @@ impl SourcePreparation {
                         current,
                         &self.committed_index,
                         &mut self.native_comparison_reservation,
+                        self.native_comparison_lease
+                            .as_mut()
+                            .expect("paid controller has bound lease"),
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
@@ -4358,8 +4370,8 @@ fn prepare_sync_source(
     }
     if let Some(lease) = native_comparison_lease.as_mut() {
         if let Some(native_context) = scan.native_comparison_context() {
-            let scope = format!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:{context_curve_enabled}");
-            lease.bind(format!("{:x}", Sha256::digest(scope.as_bytes())));
+            let scope = crate::snapshots::claude_native_comparison::lifecycle::Scope::from_arguments(format_args!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:{context_curve_enabled}"));
+            lease.bind_scope(scope);
         } else {
             lease.revoke();
         }
@@ -4491,6 +4503,12 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    if let Some(lease) = native_comparison_lease.as_mut() {
+        lease.observe_policy_page(
+            &scan_result.census_window_end,
+            scan_result.scanned_file_count,
+        );
+    }
     // Recheck the same owner after native continuation. A failed comparison
     // carries its unresolved exact dependencies into selected-state fallback.
     let comparison_current = native_comparison_controller
@@ -5476,6 +5494,16 @@ fn finish_sync_source(
         }
     }
     if let Some(lease) = native_comparison_lease.as_mut() {
+        lease.note_policy_settled(
+            scan_result.census_complete,
+            upload_fully_settled
+                && crate::snapshots::claude_native_comparison::selected_page_is_clean(
+                    &scan_result,
+                    &index,
+                    &claude_authority_disposition,
+                ),
+            claude_authority_disposition.duplicate_census.census_invalid,
+        );
         lease.note_selected_save(
             actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
         );

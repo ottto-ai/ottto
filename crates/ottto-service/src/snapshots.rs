@@ -4418,6 +4418,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         if unresolved_duplicate {
             continue;
         }
+        #[cfg(test)]
+        eprintln!("claude_curve_native_predicate: sid8={:.8x} census_complete={census_complete} owned_start_census_verified={owned_start_census_verified} native_identity_complete={} native_request_index_complete={} owned_start_proven={owned_start_proven} same_window_pending_valid=true unresolved_duplicate=false", Sha256::digest(item.source_session_id.as_bytes()), item.claude_context_curve_identity_complete, item.claude_context_curve_request_index_complete);
 
         let mut owned_occurrences = item
             .claude_usage_occurrences
@@ -12631,7 +12633,10 @@ impl OwnedSourceScan {
             &self.snapshots,
             frontier,
             self.file_limit.saturating_sub(self.scanned_file_count),
-        );
+            &self.pending_finalization,
+            self.file_limit,
+            recovery.as_mut(),
+        )?;
         if selection.matched_roots > 0 || !selection.unresolved_sources.is_empty() {
             if let Some(recovery) = recovery.as_mut() {
                 let reason = || {

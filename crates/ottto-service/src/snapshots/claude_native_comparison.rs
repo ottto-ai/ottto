@@ -1,4 +1,4 @@
-//! Private, default-inactive native comparison preparation. Nothing here is
+//! Private native comparison preparation. Nothing here is
 //! ownership, coverage, a settled body, or permission to suppress a rearm.
 use super::*;
 pub(crate) mod lifecycle;
@@ -2000,6 +2000,7 @@ pub(crate) struct Controller {
 pub(crate) struct RecoveryBudget<'a> {
     pub(crate) previous: &'a ScanIndex,
     pub(crate) credit: &'a mut Option<crate::source_rotation::PaidReservation>,
+    pub(crate) lease: &'a mut lifecycle::Lease,
 }
 
 impl Controller {
@@ -2107,8 +2108,17 @@ impl Controller {
         current: bool,
         previous: &ScanIndex,
         credit: &mut Option<crate::source_rotation::PaidReservation>,
+        lease: &mut lifecycle::Lease,
     ) -> Result<bool, crate::source_rotation::LocalRefusal> {
-        self.advance_with_budget(scan, current, Some(RecoveryBudget { previous, credit }))
+        self.advance_with_budget(
+            scan,
+            current,
+            Some(RecoveryBudget {
+                previous,
+                credit,
+                lease,
+            }),
+        )
     }
 
     fn advance_with_budget(
@@ -2147,7 +2157,7 @@ impl Controller {
         )?;
         self.native_frontier = next_frontier;
         self.awaiting_targets = selection.queued > 0;
-        if !selection.unresolved_sources.is_empty() {
+        if selection.requires_base || !selection.unresolved_sources.is_empty() {
             self.failed = true;
             self.acquisition
                 .unresolved_sources
@@ -2239,6 +2249,7 @@ pub(crate) struct TargetSelection {
     pub(crate) queued: usize,
     pub(crate) matched_roots: usize,
     pub(crate) unresolved_sources: BTreeSet<String>,
+    pub(crate) requires_base: bool,
 }
 
 impl Qualification {
@@ -2330,7 +2341,8 @@ impl Qualification {
         native: &[SnapshotItem],
         remaining_files: usize,
     ) -> (Vec<CandidateFile>, TargetSelection) {
-        self.take_target_candidates_after(native, 0, remaining_files)
+        self.take_target_candidates_after(native, 0, remaining_files, &[], usize::MAX, None)
+            .expect("logical target selection adapter")
     }
 
     pub(super) fn take_target_candidates_after(
@@ -2338,7 +2350,10 @@ impl Qualification {
         native: &[SnapshotItem],
         frontier: usize,
         remaining_files: usize,
-    ) -> (Vec<CandidateFile>, TargetSelection) {
+        pending: &[PendingIndexFinalization],
+        file_limit: usize,
+        mut recovery: Option<&mut RecoveryBudget<'_>>,
+    ) -> Result<(Vec<CandidateFile>, TargetSelection), crate::source_rotation::LocalRefusal> {
         let mut sources_by_root = BTreeMap::<String, BTreeSet<String>>::new();
         let mut result = TargetSelection::default();
         for item in &native[frontier..] {
@@ -2352,11 +2367,19 @@ impl Qualification {
                     }
                 }
                 None => {
-                    self.unknown_native_sources
-                        .insert(item.source_session_id.clone());
-                    result
-                        .unresolved_sources
-                        .insert(item.source_session_id.clone());
+                    if recovery.is_some() {
+                        // No exact native novelty is not a positive S/Q3 hit.
+                        // Withdraw optional negatives and use ordinary BASE;
+                        // never create an invisible generic-session deferral.
+                        result.requires_base = true;
+                    } else {
+                        // Preserved logical full-path prototype adapter.
+                        self.unknown_native_sources
+                            .insert(item.source_session_id.clone());
+                        result
+                            .unresolved_sources
+                            .insert(item.source_session_id.clone());
+                    }
                 }
             }
         }
@@ -2382,6 +2405,34 @@ impl Qualification {
             self.correction_forbidden_roots.insert(root.clone());
             self.native_corrections
                 .retain(|_, receipt| receipt.root() != root);
+            // Shipping acquisition policy is deliberately deferred-only. A
+            // real hit can queue A for the NEXT ordinary BASE pass, never an
+            // optional in-pass target body. Oversized/latched/exited roots use
+            // BASE immediately; removing this root also withdraws negatives.
+            if let Some(recovery) = recovery.as_mut() {
+                let new_local = sources
+                    .iter()
+                    .filter(|source| {
+                        pending.iter().any(|read| {
+                            !recovery.previous.files.contains_key(&read.index_key)
+                                && !recovery
+                                    .previous
+                                    .file_snapshot_fingerprints
+                                    .contains_key(&read.index_key)
+                                && claude_index_path_member_ref(Path::new(&read.index_key))
+                                    .is_some_and(|member| member.matches_member(source))
+                        })
+                    })
+                    .count();
+                if !recovery.lease.defer_family(
+                    &root,
+                    family.members.len() > file_limit,
+                    (sources.len(), new_local),
+                    recovery.credit,
+                )? {
+                    continue;
+                }
+            }
             result.matched_roots += 1;
             let mut required_revisions = family
                 .certified
@@ -2401,7 +2452,8 @@ impl Qualification {
                 .members
                 .iter()
                 .all(|member| required_revisions.contains_key(member));
-            let available = complete_selected_family
+            let available = recovery.is_none()
+                && complete_selected_family
                 && candidates.len().saturating_add(family.certified.len()) <= remaining_files;
             let targets = family
                 .certified
@@ -2429,7 +2481,7 @@ impl Qualification {
             );
         }
         result.queued = candidates.len();
-        (candidates, result)
+        Ok((candidates, result))
     }
 
     pub(super) fn take_native_acquisition(
@@ -2613,7 +2665,9 @@ pub(crate) fn enabled() -> bool {
     }
     #[cfg(not(test))]
     {
-        false
+        // The reviewed deferred-only path has no configuration opt-in. An
+        // unvalidated layout remains ordinary BASE before optional admission.
+        crate::heap_layout_bound::layout_supported()
     }
 }
 
@@ -2642,7 +2696,7 @@ crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envel
 crate::heap_layout_bound::fields!(WindowEligibility; census_window_end, roots, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowRoot; proof, certified);
 
-crate::heap_layout_bound::fields!(TargetSelection; queued, matched_roots, unresolved_sources);
+crate::heap_layout_bound::fields!(TargetSelection; queued, matched_roots, unresolved_sources, requires_base);
 
 crate::heap_layout_bound::fields!(PendingComparison; sources, required_revisions, candidates, available);
 crate::heap_layout_bound::fields!(TargetAcquisition; completed_target_files, acquired_roots, ready_for_fold_sources, unresolved_sources, rearm_roots, known_rearm_candidates);

@@ -1,3 +1,27 @@
+# Deferred-only native comparison cut (2026-10-18)
+
+The current candidate uses selected C3 fallback on every genuine hit; no
+optional target bodies are acquired in that pass. Process-only family policy
+latched across selected saves guarantees BASE recovery and the existing bounded
+exit. Unknown native membership remains ordinary BASE. Optional local status
+reports conservative counts and unknown ages without a transcript/index walk.
+
+Current affected supported controls passed 89/0 with one historical oracle
+explicitly ignored, including the qualified representative and allocation-free
+fixed context scope. Static Clippy is clean. Exact containing CI, strict review
+and final domain/parent disposition remain pending. The reviewed candidate
+includes enablement only on validated layouts; installed behavior is unchanged. Installed memory/CPU savings are unproved.
+The old literal additive-equality diagnostic remains FAIL/SUPERSEDED: exact
+identity and own-body ACK conservation pass, while BASE's fixed nonterminal
+ordering does not reach the candidate's earned terminal curves in three ordinary
+followups. See [the current contract](development/native-comparison-driver.md).
+
+The earlier source checkpoint is retained in Git history. No persisted schema,
+provider/account action, replay, release or installed-runtime change is part of
+this cut.
+
+## Historical selected-fallback checkpoints
+
 # Native comparison selected fallback
 
 The default-inactive two-phase driver now carries unresolved native dependencies

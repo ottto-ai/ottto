@@ -176,7 +176,30 @@ pub struct DaemonStatus {
     pub local_health_events: Vec<LocalHealthEventV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_ledger: Vec<LocalHealthCommandResultV1>,
+    /// Content-free, process-local comparison progress. Omitted by older or
+    /// inactive daemons. Never provider evidence or server snapshot metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_comparison: Option<NativeComparisonStatus>,
     pub generated_at: Rfc3339Timestamp,
+}
+
+/// Known current-process deferral counts are conservative upper bounds until
+/// a complete settled census reconciles them. Missing counts mean UNKNOWN,
+/// never zero. New-local candidates have no prior local ACK witness; this is
+/// not a claim about server history. A restarted process cannot recover age.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeComparisonStatus {
+    pub observation_available: bool,
+    pub in_flight: bool,
+    pub deferred_family_count: Option<u64>,
+    pub withheld_candidate_count: Option<u64>,
+    pub withheld_new_local_candidate_count: Option<u64>,
+    pub oldest_deferred_age_millis: Option<u64>,
+    pub unknown_age_family_count: Option<u64>,
+    pub prior_process_debt_unknown: bool,
+    pub base_exit_family_count: Option<u64>,
+    pub process_base_exit: bool,
+    pub counts_are_upper_bounds: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -592,8 +592,14 @@ impl LocalDaemon {
     }
 
     fn status_for_authorized_client(&self) -> Result<DaemonStatus, LocalApiError> {
-        let state = self.state()?;
-        Ok(status_from_state(&state))
+        let mut status = {
+            let state = self.state()?;
+            status_from_state(&state)
+        };
+        if snapshots::claude_native_comparison::enabled() {
+            status.native_comparison = Some(self.native_comparison.status());
+        }
+        Ok(status)
     }
 
     /// Snapshot of the current pending claim plus the account binding, used by

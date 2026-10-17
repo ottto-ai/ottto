@@ -3671,7 +3671,23 @@ fn native_comparison_corrected_native_receipt_fixture(
         scan.snapshots[0].usage_accounting_contract.as_deref(),
         Some("session_exclusive_reported_usage:v1")
     );
-    completion.prepare_native_corrections(&scan, &previous, &disposition);
+    if mode == "credit_refused" {
+        completion.attach_reservation(crate::source_rotation::PaidReservation::from_remainder(
+            Some(0),
+            0,
+            0,
+        ));
+        let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
+            completion.prepare_native_corrections(&scan, &previous, &disposition)
+        });
+        assert_eq!(
+            allocation.allocations, 0,
+            "declined optional correction metadata allocates nothing"
+        );
+        assert_eq!(completion.pending_native_correction_count_for_test(), 0);
+    } else {
+        completion.prepare_native_corrections(&scan, &previous, &disposition);
+    }
     for item in &mut scan.snapshots {
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     }
@@ -3730,7 +3746,7 @@ fn native_comparison_corrected_native_receipt_fixture(
     if mode == "capture_only" {
         return (fixture, index, completion.window);
     }
-    if matches!(mode, "exact_ack" | "wrong_witness") {
+    if matches!(mode, "exact_ack" | "wrong_witness" | "credit_refused") {
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: "claude_code".to_owned(),
@@ -3776,7 +3792,9 @@ fn native_comparison_corrected_native_receipt_fixture(
     index.save(&path).unwrap();
     completion.note_native_corrections_after_save(&index, &previous, |fp, witness| match mode {
         "refused" => None,
-        "exact_ack" => Some(witnesses.get(fp).is_some_and(|actual| actual == witness)),
+        "exact_ack" | "credit_refused" => {
+            Some(witnesses.get(fp).is_some_and(|actual| actual == witness))
+        }
         _ => Some(false),
     });
     let expected = usize::from(matches!(mode, "exact_ack" | "noop"));
@@ -3793,6 +3811,7 @@ fn native_comparison_corrected_native_receipt_fixture(
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
     for mode in [
         "capture_only",
+        "credit_refused",
         "pending",
         "wrong_witness",
         "refused",
@@ -3893,4 +3912,58 @@ fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before
         .iter()
         .any(|p| p.path == fixture.paths[1]));
     writeln!(std::io::stderr().lock(),"native_comparison_default_recovery_priority: actual_save_reload=true ordinary_constructor=true no_process_recovery_list=true known_empty_fp_queue_prefix_before_audits=true same_page_cap=true audit_debt_preserved=true no_new_native_eligibility=true").unwrap();
+}
+
+#[test]
+fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
+    let fixture = NativePreparationFixture::new();
+    let mut state = fixture.paused();
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let mut qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualification.certified_member_count(), 2);
+    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
+    let mut generic = parse_claude_code_jsonl_file(&path, WINDOW, hex64('e'))
+        .unwrap()
+        .remove(0);
+    generic.source_session_id = "generic-unproven-input".into();
+    generic.claude_usage_request_ids.clear();
+    assert!(generic.request_count > 0);
+    let before_body = serde_json::to_vec(&generic).unwrap();
+    let before_index = serde_json::to_value(&fixture.index).unwrap();
+    let owner = std::sync::Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut lease = owner.begin();
+    lease.bind("logical-policy-decision-only".into());
+    assert!(
+        !lease.allowed(),
+        "this regression never fabricates a bootstrap grant"
+    );
+    let mut credit = crate::source_rotation::PaidReservation::from_remainder(
+        Some(crate::source_rotation::PARKED_BUDGET),
+        0,
+        0,
+    );
+    let (targets, selection) = qualification
+        .take_target_candidates_after(
+            std::slice::from_ref(&generic),
+            0,
+            0,
+            &[],
+            8,
+            Some(&mut claude_native_comparison::RecoveryBudget {
+                previous: &fixture.index,
+                credit: &mut credit,
+                lease: &mut lease,
+            }),
+        )
+        .unwrap();
+    assert!(selection.requires_base);
+    assert!(targets.is_empty() && selection.unresolved_sources.is_empty());
+    assert_eq!(owner.status().deferred_family_count, Some(0));
+    assert_eq!(serde_json::to_vec(&generic).unwrap(), before_body);
+    assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_index);
+    eprintln!("native_comparison_deferred_unknown: decision_only=true unknown_ids_not_positive=true BASE_required=true new_debt=0 body_index_unchanged=true bootstrap_grant=false physical_liveness_claim=false");
 }

@@ -1,9 +1,82 @@
-# Default-inactive native comparison driver
+# Deferred native comparison driver
 
-This draft implementation begins a moving two-phase Claude scan. There is no
-runtime flag, environment switch, API, or production opt-in. Only a scoped test
-can enable preparation. Production behavior remains unchanged; no rearm
-suppression or selected-body deferral is activated.
+The candidate enables deferred-only Claude comparison on a validated layout.
+There is no runtime flag, environment switch, API or configuration opt-in.
+Unsupported layouts remain ordinary BASE before optional admission. The source
+change is under validation and review; it does not change an installed daemon
+until a containing release is installed. Installed performance remains unproved.
+
+## Current candidate: deferred-only hits
+
+The earlier full in-pass target path is retained for component tests. The
+current runtime candidate never acquires an optional target body in the hit
+pass. Exact eligible negative evidence may suppress a redundant corrective
+rearm. A genuine possible-overlap or legacy-prefix hit withdraws that family's
+eligibility and invokes the existing selected fallback: withhold only current
+B/C bodies, restore their prior selected facts, invalidate A's source revisions
+and queue A before its dependents. Actual native observations still enter the
+single authoritative fold. Unknown native membership is BASE, not an invented
+positive match or new withholding debt.
+
+A process-only family latch prevents repeated deferral: defer, then BASE until
+a later no-hit, no-native-read, settled census. A second hit during the latch
+rides the pending BASE recovery. At most two successfully saved eligible
+deferrals are allowed per family in a process; the family then stays BASE.
+Oversized families go BASE immediately. Restart begins BASE with prior debt age
+unknown. No additional timer, retry, persisted field or upload queue is added.
+Prior accepted heads, bindings, names and own-evidence tags remain unchanged.
+New copies are neither committed nor confirmed empty before exact comparison.
+
+The optional local `DaemonStatus.native_comparison` object contains scalar
+counts only, including deferred families, withheld candidates, candidates with
+no prior local ACK witness, known oldest age, unknown ages and BASE exits.
+Counts are conservative current-process upper bounds until source settlement;
+no local ACK witness does not mean never accepted by the server. Busy/unknown
+observations use absent counts rather than zero. The field is absent while the
+feature is inactive. Status does not walk transcripts or copy an index.
+
+Family-policy and correction descriptors use the existing moving reservation.
+Metadata refusal declines an optional receipt or selects BASE; it cannot weaken
+an ACK, release a held body or spend mandatory recovery credit. This is not a
+universal finish-stage or process RSS bound.
+
+### Phase-specific additive curves
+
+A deferred family can be read at a different real census phase. The canonical
+curve builder requires an actual complete native census or an exactly verified
+owned start, plus native identity/request completeness and provider ownership
+proof. Envelope membership, restored entries, upload settlement and the
+fallback itself cannot supply that evidence. Curves never feed ownership,
+coverage, bindings, names or tags.
+
+The synthetic representative checks every serialized non-curve field exactly,
+except observation time: each `collected_at` must equal its independently
+recorded native read time, and successive ACK times must not decrease. Each
+mode's finalizer witness must match its own latest strict effective-body ACK;
+selected file witnesses must be derived from those bodies. No wire value or
+witness is normalized. Candidate owned curve points contain BASE's exact
+points with equal values.
+
+The original stronger cross-mode additive-byte-equality diagnostic is explicitly
+FAIL/SUPERSEDED, not accepted as passing. Three ordinary BASE followups show A
+on page 0 before terminal page 1, finalized with native census incomplete each
+time. Same-census convergence is therefore UNMET-BY-BASE-ORDERING. The candidate
+can emit complete curves on these families that BASE never reaches: more
+additive detail from the unchanged builder, not money or identity changes.
+
+One supported Rust 1.95 synthetic workload (8 MiB of ignored progress padding,
+three quiet windows plus a real hit and recovery) avoided 25,193,878 logical
+native bytes and used 222,525 fewer process CPU microseconds. It incurred one
+extra copy read (218 bytes) and two earlier curve uploads (7,310 item-wire
+bytes). The fake uploader's CPU is included; network latency is unmeasured.
+The three extra BASE ordering diagnostics are excluded from those savings.
+These figures include test-observer/harness overhead, describe logical reads,
+and do not establish physical SSD I/O, installed CPU/RSS savings or admission
+at thousands of families. Exact candidate CI, strict review and enablement
+remain pending. The enabled path is included in the candidate reviewed diff,
+with unsupported layouts still BASE.
+
+## Historical implementation checkpoints
 
 ## Initial checkpoint
 

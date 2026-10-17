@@ -116,6 +116,42 @@ struct PendingNativeCorrection {
     body_witness: String,
 }
 
+/// Optional correction metadata shares the SAME moving reservation. A
+/// refusal only declines a future optimization receipt; it cannot alter an
+/// offered body, selected ACK, or mandatory recovery credit. Retain a
+/// conservative construction upper bound until this completion is dropped.
+fn prepay_correction_metadata(
+    reservation: &mut Option<crate::source_rotation::PaidReservation>,
+    bytes: Option<usize>,
+) -> Option<usize> {
+    let bytes = bytes?;
+    match reservation.as_mut() {
+        Some(paid) => {
+            let owned = paid.allocated().checked_add(bytes)?;
+            paid.grow_for(owned).then_some(owned)
+        }
+        None => {
+            #[cfg(test)]
+            {
+                Some(0)
+            } // Explicit logical primitive; no physical admission claim.
+            #[cfg(not(test))]
+            {
+                None
+            }
+        }
+    }
+}
+fn retain_correction_metadata(
+    reservation: &mut Option<crate::source_rotation::PaidReservation>,
+    owned: usize,
+) -> bool {
+    match reservation.as_mut() {
+        Some(paid) => paid.record_allocated(owned),
+        None => cfg!(test),
+    }
+}
+
 impl NativeCorrection {
     pub(super) fn root(&self) -> &str {
         &self.root
@@ -506,8 +542,11 @@ impl Completion {
                     && !pending.sampled_audit_verified
                     && pending.source_file_fingerprint == plan.revision
                     && item.source_file_fingerprint.as_ref() == Some(&plan.revision)
-                    && claude_index_path_family_member(Path::new(&pending.index_key)).is_some_and(
-                        |(root, member)| root == plan.root && member == item.source_session_id,
+                    && claude_index_path_member_ref(Path::new(&pending.index_key)).is_some_and(
+                        |member| {
+                            member.root == plan.root
+                                && member.matches_member(&item.source_session_id)
+                        },
                     )
                     && previous
                         .files
@@ -517,6 +556,29 @@ impl Completion {
                 continue;
             };
             if window.correction_revoked_keys.contains(&pending.index_key) {
+                continue;
+            }
+            let strings = pending
+                .index_key
+                .len()
+                .checked_add(plan.root.len())
+                .and_then(|bytes| bytes.checked_add(plan.proof.len()))
+                .and_then(|bytes| bytes.checked_add(plan.revision.len()));
+            let growth = if self.pending_corrections.len() == self.pending_corrections.capacity() {
+                self.pending_corrections
+                    .len()
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(std::mem::size_of::<PendingNativeCorrection>()))
+            } else {
+                Some(0)
+            };
+            let Some(owned) = prepay_correction_metadata(
+                &mut self.reservation,
+                strings.and_then(|bytes| bytes.checked_add(growth?)),
+            ) else {
+                continue;
+            };
+            if self.pending_corrections.try_reserve_exact(1).is_err() {
                 continue;
             }
             self.pending_corrections.push(PendingNativeCorrection {
@@ -529,6 +591,10 @@ impl Completion {
                 fingerprint: String::new(),
                 body_witness: String::new(),
             });
+            if !retain_correction_metadata(&mut self.reservation, owned) {
+                self.pending_corrections.clear();
+                return;
+            }
         }
     }
 
@@ -536,6 +602,7 @@ impl Completion {
     /// recomputed. Repeated canonical checks must agree; a mismatch revokes this
     /// optional candidate. No additional serialization or alternate body exists.
     pub(crate) fn observe_native_correction(&mut self, item: &SnapshotItem, body_witness: &str) {
+        let reservation = &mut self.reservation;
         self.pending_corrections.retain_mut(|candidate| {
             if candidate.plan.revision != item.source_file_fingerprint.as_deref().unwrap_or("")
                 || !claude_index_path_member_ref(Path::new(&candidate.key)).is_some_and(
@@ -548,9 +615,17 @@ impl Completion {
                 return true;
             }
             if candidate.fingerprint.is_empty() && candidate.body_witness.is_empty() {
+                let Some(owned) = prepay_correction_metadata(
+                    reservation,
+                    item.snapshot_fingerprint
+                        .len()
+                        .checked_add(body_witness.len()),
+                ) else {
+                    return false;
+                };
                 candidate.fingerprint = item.snapshot_fingerprint.clone();
                 candidate.body_witness = body_witness.to_owned();
-                true
+                retain_correction_metadata(reservation, owned)
             } else {
                 candidate.fingerprint == item.snapshot_fingerprint
                     && candidate.body_witness == body_witness
@@ -605,10 +680,10 @@ impl Completion {
             let Some(entry) = index.files.get(&candidate.key) else {
                 continue;
             };
-            let Some(selected_fingerprint) = entry.last_snapshot_fingerprint.clone() else {
+            let Some(selected_fingerprint) = entry.last_snapshot_fingerprint.as_ref() else {
                 continue;
             };
-            let Some(selected_body_witness) = entry.last_upload_body_witness.clone() else {
+            let Some(selected_body_witness) = entry.last_upload_body_witness.as_ref() else {
                 continue;
             };
             let exact_noop = !previous
@@ -622,23 +697,37 @@ impl Completion {
                     .get(&candidate.key)
                     .is_some_and(|fps| fps.len() == 1 && fps.contains(&candidate.fingerprint))
                 && previous.files.get(&candidate.key).is_some_and(|old| {
-                    old.last_snapshot_fingerprint.as_ref() == Some(&selected_fingerprint)
-                        && old.last_upload_body_witness.as_ref() == Some(&selected_body_witness)
+                    old.last_snapshot_fingerprint.as_ref() == Some(selected_fingerprint)
+                        && old.last_upload_body_witness.as_ref() == Some(selected_body_witness)
                 });
             if !exact_ack && !exact_noop {
                 continue;
             }
+            let growth = window.native_corrections.growth_peak();
+            let Some(owned) = prepay_correction_metadata(
+                &mut self.reservation,
+                selected_fingerprint
+                    .len()
+                    .checked_add(selected_body_witness.len())
+                    .and_then(|bytes| bytes.checked_add(growth?)),
+            ) else {
+                continue;
+            };
             let receipt = NativeCorrection {
                 root: candidate.plan.root,
                 proof: candidate.plan.proof,
                 revision: candidate.plan.revision,
                 fingerprint: candidate.fingerprint,
                 body_witness: candidate.body_witness,
-                selected_fingerprint,
-                selected_body_witness,
+                selected_fingerprint: selected_fingerprint.clone(),
+                selected_body_witness: selected_body_witness.clone(),
             };
             if receipt.current(&candidate.key, index) {
                 window.native_corrections.insert(candidate.key, receipt);
+                if !retain_correction_metadata(&mut self.reservation, owned) {
+                    window.native_corrections.clear();
+                    break;
+                }
             }
         }
         self.native_plans.clear();
