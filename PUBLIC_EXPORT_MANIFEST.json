@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 658,
-  "content_sha256": "01cd56bb688080826a296d2db590d51754d1b5f320941fea0d417d11c289e55e",
+  "candidate_file_count": 660,
+  "content_sha256": "59074f6e1aad4862284bdb29b633f5ec7a45d8cbc49023229acd28a8974883fa",
   "files": [
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "16097baa811f5547831ae2a39c631267216cd6c7d35e80bc8e483d656a3950a9",
-      "size_bytes": 766311
+      "sha256": "7ea4360232e1f35350d48ba116f14428867f006471b18a00c5199841a463f87e",
+      "size_bytes": 767420
     },
     {
       "executable": false,
@@ -1205,6 +1205,13 @@
       "path": "crates/ottto-service/src/snapshot_sync/h357_ack_tests.rs",
       "sha256": "1ceb3b2bc63bb8f01fb1ddf63a178e8a76430d4412e67e72c489136f640354a2",
       "size_bytes": 63050
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync/packing_count_tests.rs",
+      "sha256": "fa3cb5c995912cb69041f1f21d72644745b1d21db9979eee0a9bf57e297079a3",
+      "size_bytes": 10540
     },
     {
       "executable": false,
@@ -2864,6 +2871,13 @@
       "path": "docs/session-2026-10-15-owned-held-index-restoration.md",
       "sha256": "7c5cba676d5e5d77262f4a46bf34860358008a378c839c3eba502b2a6327a917",
       "size_bytes": 1555
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-17-snapshot-packing-memory.md",
+      "sha256": "3c885494ec9d74298ba695784959a6cc62fe49ba28ff76316a11dd9987a90de4",
+      "size_bytes": 1787
     },
     {
       "executable": false,
@@ -4609,9 +4623,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T02:37:36+00:00",
+  "generated_at": "2026-10-17T00:29:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 659,
+  "output_file_count": 661,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4648,5 +4662,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b3947d471967189e9021709bb915d50904f68009"
+  "source_commit": "bdd504a11fa5e919e29b5ae228bf34ca65bec344"
 }
