@@ -100,3 +100,37 @@ branches explicitly report UNEXECUTED when the pinned profile refuses; ordinary
 allocation characterizations do not authorize required-path admission. The
 previous 55-test CI head does not validate this new checkpoint. No local Cargo
 or model review ran. This draft still has no merge or release readiness.
+
+
+## Required file and partial-checkpoint integration slice
+
+An explicit paid file-load entry now uses the guarded decoder and the same
+strict validity/canonicalization checks. Unknown profile refuses before file
+IO; missing-file defaults also acquire real required credit. The ordinary
+native producer is not attached to this entry. Required saves derive the same
+shared owner from their index credit and use it for the competing CAS decode
+under the existing lock, without recursively calling a locking load. Unpaid
+required clones refuse before IO. The existing bounded input/shape checks and
+ordinary save behavior remain.
+
+The actual partial-checkpoint function now uses fallible selected-index and
+held-restore operations. Selection and induced consumers reuse one frozen
+borrowed fingerprint cardinality and prepay their collectors. Both existing
+restore operations remain. A failed shed checkpoint borrows the unchanged
+committed index for status instead of deep-cloning its ledger.
+
+Two additional tests are authored for strict invalid/missing paid loads and
+actual progress-lock/partial-selection/save/CAS success and failure, retaining
+exact held debt and old accepted file state. They include healthy synthetic
+no-body progress, refused unpaid clones and preserved bounded-read limits.
+They are not native-parse, ACK, money/identity or installed acceptance. The
+supported carrier path explicitly reports UNEXECUTED when the real profile
+refuses; there is no layout bypass. This source slice has no compile/test
+acceptance until its own automatic CI completes.
+
+The existing record_known_copy_holds producer's opened-file/revision map,
+peer/root/hash temporaries, new/revised hold allocation and returned withheld
+set still require prepayment and custody through their actual lifetimes.
+Native capture/event/context gaps are separate. These remaining owners prevent
+native attachment, activation, intake, merge and release. Optional status scope
+is frozen; no transport or broader control change belongs to this slice.

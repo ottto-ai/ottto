@@ -1808,8 +1808,8 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         })
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
-    let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
-    committable.restore_copy_held_checkpoint(committed_index);
+    let mut committable = index.try_committable_subset(committed_index, &accepted, &quarantined)?;
+    committable.try_restore_copy_held_checkpoint(committed_index)?;
     if let Some(scan) = correction_scan {
         // A2: settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
@@ -4602,7 +4602,6 @@ fn finish_sync_source(
             let first_shed = Instant::now();
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
-            let mut checkpoint_succeeded = true;
             let committable = match checkpoint_partial_snapshot_index(
                 &index,
                 &committed_index,
@@ -4617,19 +4616,22 @@ fn finish_sync_source(
                     scan_result.validate_codex_checkpoint()
                 },
             ) {
-                Ok(committable) => committable,
+                Ok(committable) => Some(committable),
                 Err(error) => {
-                    checkpoint_succeeded = false;
                     eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
                         safe_error(&error)
                     );
-                    committed_index.clone()
+                    None
                 }
             };
+            let checkpoint_succeeded = committable.is_some();
+            // A failed save borrows its unchanged durable baseline for status.
+            // Never deep-clone an unpaid required ledger merely to report it.
+            let committable = committable.as_ref().unwrap_or(&committed_index);
             if checkpoint_succeeded && source == SnapshotSource::ClaudeCode {
-                observe_copy_containment_status(daemon, &committable, "durable_partial_selection");
+                observe_copy_containment_status(daemon, committable, "durable_partial_selection");
             }
             if retry.enabled()
                 && checkpoint_succeeded
@@ -4647,7 +4649,7 @@ fn finish_sync_source(
                         account_witness,
                         &scan_result.snapshots,
                         &mut index,
-                        &committable,
+                        committable,
                         &upload_progress,
                         &index_path,
                         &upload_progress_path,
@@ -4672,7 +4674,7 @@ fn finish_sync_source(
                         accepted,
                         receipt_window_days,
                     )
-                    .with_snapshot_terminal_counts(&committable),
+                    .with_snapshot_terminal_counts(committable),
                     // `server_error` is the closest code the receipt contract
                     // carries; the loss report is where the shed is named
                     // precisely.

@@ -22884,7 +22884,46 @@ impl ScanIndex {
         Self::load_with_copy_debt_policy(path, true)
     }
 
+    /// Explicit paid load for required carrier integration. The ordinary
+    /// producer is not attached to this entry until its new-debt/native owners
+    /// are qualified. Unknown profile refuses before file IO or capture.
+    #[allow(dead_code)]
+    pub(crate) fn load_required_copy_index(
+        path: &Path,
+        owner: &Arc<sampled_scan::SharedCache>,
+    ) -> Result<Self> {
+        if !claude_copy_containment::required_decode::profile_supported() {
+            return Err(anyhow::anyhow!("required copy decoding unavailable"));
+        }
+        Self::load_with_copy_debt_owner(path, true, Some(owner))
+    }
+
+    fn decode_required_copy_index<R: Read>(
+        input: R,
+        owner: &Arc<sampled_scan::SharedCache>,
+    ) -> Result<Self> {
+        use claude_copy_containment::required_decode::{decode, DecodeError};
+        match decode(input, owner) {
+            Ok(index) => Ok(index),
+            Err(DecodeError::Unavailable) => {
+                Err(anyhow::anyhow!("required copy decoding unavailable"))
+            }
+            Err(DecodeError::Invalid) => Err(anyhow::anyhow!(
+                "invalid containment-required scan index; preparation stopped without rebuilding"
+            )),
+            Err(DecodeError::Io(error)) => Err(error.into()),
+        }
+    }
+
     fn load_with_copy_debt_policy(path: &Path, copy_debt_required: bool) -> Result<Self> {
+        Self::load_with_copy_debt_owner(path, copy_debt_required, None)
+    }
+
+    fn load_with_copy_debt_owner(
+        path: &Path,
+        copy_debt_required: bool,
+        owner: Option<&Arc<sampled_scan::SharedCache>>,
+    ) -> Result<Self> {
         let exists = if copy_debt_required {
             path.try_exists()
                 .context("inspect containment-required scan index")?
@@ -22892,7 +22931,10 @@ impl ScanIndex {
             path.exists()
         };
         if !exists {
-            return Ok(Self::default());
+            return match owner {
+                Some(owner) => Self::decode_required_copy_index(&b"{}"[..], owner),
+                None => Ok(Self::default()),
+            };
         }
         let _lock = CheckpointLock::acquire(path)?;
         let file =
@@ -22906,7 +22948,14 @@ impl ScanIndex {
                 quarantine_invalid_scan_index(path)
             }
         };
-        match serde_json::from_reader::<_, Self>(BufReader::new(file)) {
+        let decoded = match owner {
+            Some(owner) => Ok(Self::decode_required_copy_index(
+                BufReader::new(file),
+                owner,
+            )?),
+            None => serde_json::from_reader::<_, Self>(BufReader::new(file)),
+        };
+        match decoded {
             Ok(mut index)
                 if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
                     && index
@@ -22982,18 +23031,37 @@ impl ScanIndex {
         self.save_internal(path, Some(cap))
     }
     fn save_internal(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
+        // Freeze the existing shared owner before IO. Never recursively invoke
+        // a locking load beneath this save's CheckpointLock. Unpaid required
+        // clones refuse without touching the durable checkpoint.
+        let required_owner = self.required_copy_owner()?.cloned();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
         }
         let _lock = CheckpointLock::acquire(path)?;
         if path.exists() {
-            let current: Self = match read_limit {
-                Some(cap) => crate::snapshot_retry::decode_state(
-                    &crate::snapshot_retry::read_state(path, cap)
-                        .context("read bounded current local snapshot scan index")?,
+            let current: Self = match (read_limit, required_owner.as_ref()) {
+                (Some(cap), owner) => {
+                    // Keep the existing capped input buffer and shape guard;
+                    // only the added held-subdocument decode changes owner.
+                    let bytes = crate::snapshot_retry::read_state(path, cap)
+                        .context("read bounded current local snapshot scan index")?;
+                    match owner {
+                        Some(owner) => {
+                            crate::snapshot_retry::state_shape(&bytes)?;
+                            Self::decode_required_copy_index(bytes.as_slice(), owner)
+                        }
+                        None => crate::snapshot_retry::decode_state(&bytes),
+                    }
+                }
+                (None, Some(owner)) => Self::decode_required_copy_index(
+                    BufReader::new(
+                        File::open(path).context("open current local snapshot scan index")?,
+                    ),
+                    owner,
                 ),
-                None => serde_json::from_reader(BufReader::new(
+                (None, None) => serde_json::from_reader(BufReader::new(
                     File::open(path).context("open current local snapshot scan index")?,
                 ))
                 .map_err(anyhow::Error::from),

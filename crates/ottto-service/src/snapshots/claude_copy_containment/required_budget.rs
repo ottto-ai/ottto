@@ -343,25 +343,15 @@ fn selection_bound(
     index: &ScanIndex,
     previous: &ScanIndex,
     quarantined: &std::collections::BTreeMap<String, super::super::SnapshotQuarantineRecord>,
+    fingerprints: usize,
 ) -> Option<usize> {
     use super::super::{ClaudeOwnedStartCensusWitness, SnapshotQuarantineRecord};
     if index.claude_copy_holds.is_empty() {
         return Some(0);
     }
     let mut c = Counter::new(LIMIT);
-    // ONE borrowed cardinality pass per selected checkpoint. No allocated
-    // affected set, no per-held full-index walk, and no payload graph cloning.
-    let mut fingerprints = index
-        .codex_state_only_snapshot_fingerprints
-        .len()
-        .checked_add(previous.codex_state_only_snapshot_fingerprints.len())?;
-    for values in index
-        .file_snapshot_fingerprints
-        .values()
-        .chain(previous.file_snapshot_fingerprints.values())
-    {
-        fingerprints = fingerprints.checked_add(values.len())?;
-    }
+    // Reuse the one frozen borrowed cardinality computed for this selection
+    // and its induced current-entity/manifest consumers. No second map walk.
     collector::<&String, ()>(fingerprints, &mut c)?;
     let quarantine_count = quarantined
         .len()
@@ -460,6 +450,16 @@ impl ScanIndex {
         }
         Ok(credit)
     }
+    /// Only a paid required owner may decode a competing CAS checkpoint.
+    /// An infallible Clone is explicitly unpaid and must fail before IO/copy.
+    pub(in crate::snapshots) fn required_copy_owner(
+        &self,
+    ) -> Result<Option<&Arc<SharedCache>>, Unavailable> {
+        if !self.copy_debt_budget.required() {
+            return Ok(None);
+        }
+        Ok(Some(self.checked_copy_credit()?.reservation.owner()))
+    }
     pub(crate) fn try_clone_for_copy(&self) -> Result<Self, Unavailable> {
         if !self.copy_debt_budget.required() {
             return Ok(self.clone());
@@ -499,17 +499,23 @@ impl ScanIndex {
             return Err(Unavailable);
         };
         let ledger = ledger_bound(self).ok_or(Unavailable)?;
-        let selective =
-            credit
-                .selective_bytes
-                .checked_add(prior)
-                .and_then(|bytes| {
-                    bytes.checked_add(
-                        restore_bound(self, previous, accepted.len())?
-                            .checked_add(selection_bound(self, previous, quarantined)?)?,
-                    )
-                })
-                .ok_or(Unavailable)?;
+        let consumers = consumer_costs(self, previous).ok_or(Unavailable)?;
+        let selective = credit
+            .selective_bytes
+            .checked_add(prior)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    restore_bound(self, previous, accepted.len())?
+                        .checked_add(selection_bound(
+                            self,
+                            previous,
+                            quarantined,
+                            consumers.cardinality_upper,
+                        )?)?
+                        .checked_add(consumers.total)?,
+                )
+            })
+            .ok_or(Unavailable)?;
         let metadata = IndexCredit::metadata_layout().ok_or(Unavailable)?;
         let bytes = ledger
             .checked_add(selective)

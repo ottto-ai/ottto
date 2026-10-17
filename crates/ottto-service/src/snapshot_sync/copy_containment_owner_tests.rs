@@ -886,3 +886,160 @@ fn copy_containment_control_status_lexical_guard_preserves_response_contract_and
         .contains(COPY_CONTAINMENT_EVENT_TYPE));
     writeln!(std::io::stderr().lock(), "copy_containment_control_status: actual_handle_request=true refresh_agent_status=false protocol_unchanged=true canonical_exclusion=true private_sequence_unchanged=true positive_typed_slot_and_lexical_control_projection={} provider_fixture_calls=0 transport_unchanged=true", if admitted { "EXECUTED" } else { "UNEXECUTED" }).unwrap();
 }
+
+fn copy_required_carrier_seed(path: &Path) -> String {
+    let key = "synthetic-claude-held.jsonl".to_string();
+    let fp = "d".repeat(64);
+    let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
+    value["files"] = serde_json::json!({(key.clone()): {
+        "size_bytes":1, "modified_unix_seconds":1, "source_file_fingerprint":"a".repeat(64),
+        "last_snapshot_fingerprint":fp
+    }});
+    value["file_snapshot_fingerprints"] = serde_json::json!({(key.clone()):["d".repeat(64)]});
+    value["snapshot_activity_at"] = serde_json::json!({("d".repeat(64)):"2026-06-16T10:00:00Z"});
+    value["accepted_snapshot_fingerprints"] = serde_json::json!(["d".repeat(64)]);
+    value["claude_copy_holds"] = serde_json::json!({(key.clone()): {
+        "revision":{"version":1,"reason":"copied_overlap_unproven",
+            "source_revision":"b".repeat(64),"comparison_context":"c".repeat(64),
+            "first_observed_unix_seconds":null},"peers":["e".repeat(64)]
+    }});
+    let mut seed: ScanIndex = serde_json::from_value(value).unwrap();
+    seed.save(path).unwrap();
+    key
+}
+
+#[test]
+fn copy_containment_required_file_load_preserves_invalid_bytes_and_missing_profile_refuses() {
+    use std::io::Write;
+    let fixture = IdentityPipelineHome::new();
+    let path = fixture.base.join("required-invalid-index.json");
+    let missing = fixture.base.join("required-missing-index.json");
+    let invalid = b"{\"claude_copy_holds\":{\"held\":{\"revision\":{\"version\":99}}}}";
+    std::fs::write(&path, invalid).unwrap();
+    let daemon = test_daemon("otm_required_synthetic");
+    daemon.transcript_cache.require_copy_containment_for_test();
+    assert!(ScanIndex::load_required_copy_index(&path, &daemon.transcript_cache).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), invalid);
+    let loaded = ScanIndex::load_required_copy_index(&missing, &daemon.transcript_cache);
+    if let Ok(index) = loaded {
+        // A missing file has the same empty baseline, but its required lease
+        // is real. This branch cannot be simulated on an unsupported profile.
+        assert_eq!(index.generation, 0);
+        assert_eq!(index.copy_hold_count(), 0);
+        let mut unpaid = index.clone();
+        assert!(unpaid.save(&missing).is_err());
+        assert!(!missing.exists());
+        writeln!(std::io::stderr().lock(), "copy_containment_required_file_loader: strict_invalid_preserved=true missing_paid_default=true unpaid_clone_save_refused_before_file_creation=true supported_positive=EXECUTED").unwrap();
+    } else {
+        assert!(!missing.exists());
+        writeln!(std::io::stderr().lock(), "copy_containment_required_file_loader: invalid_bytes_preserved=true missing_required_load_refused=true no_new_checkpoint=true supported_positive=UNEXECUTED").unwrap();
+    }
+}
+
+#[test]
+fn copy_containment_required_load_actual_partial_save_and_cas_keep_exact_debt() {
+    use std::io::Write;
+    let fixture = IdentityPipelineHome::new();
+    let path = fixture.base.join("required-partial-index.json");
+    let progress_path = fixture.base.join("required-partial-progress.json");
+    let key = copy_required_carrier_seed(&path);
+    let initial_bytes = std::fs::read(&path).unwrap();
+    let daemon = test_daemon("otm_required_synthetic");
+    daemon.transcript_cache.require_copy_containment_for_test();
+    let baseline = match ScanIndex::load_required_copy_index(&path, &daemon.transcript_cache) {
+        Ok(index) => index,
+        Err(error) => {
+            assert!(error
+                .to_string()
+                .contains("required copy decoding unavailable"));
+            assert_eq!(std::fs::read(&path).unwrap(), initial_bytes);
+            writeln!(std::io::stderr().lock(), "copy_containment_required_actual_partial: guarded_load_refused=true disk_bytes_unchanged=true partial_restore_CAS_success_failure_positive=UNEXECUTED producer_not_attached=true").unwrap();
+            return;
+        }
+    };
+    let held_before = serde_json::to_value(&baseline).unwrap()["claude_copy_holds"].clone();
+    let mut working = baseline.try_clone_for_copy().unwrap();
+    let held_entry = working.files.get_mut(&key).unwrap();
+    held_entry.source_file_fingerprint.clear();
+    held_entry.source_file_fingerprint.push_str(&"b".repeat(64));
+    let fingerprint = held_entry.last_snapshot_fingerprint.as_mut().unwrap();
+    fingerprint.clear();
+    fingerprint.push_str(&"f".repeat(64));
+    // A separate synthetic confirmed-empty new file proves healthy selection
+    // progress without inventing an ACK or clearing a held copy. Native parse
+    // and money/identity acceptance are deliberately outside this fixture.
+    let healthy_key = "synthetic-healthy-empty.jsonl".to_string();
+    working.files.insert(
+        healthy_key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":0,"modified_unix_seconds":1,"source_file_fingerprint":"a".repeat(64),
+            "last_snapshot_fingerprint":null
+        }))
+        .unwrap(),
+    );
+    working.confirmed_empty_files.insert(healthy_key.clone());
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    progress.save(&progress_path).unwrap();
+    let progress_bytes = std::fs::read(&progress_path).unwrap();
+    let selected = checkpoint_partial_snapshot_index(
+        &working,
+        &baseline,
+        &progress,
+        &[],
+        None,
+        &BTreeSet::new(),
+        &path,
+        &progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(selected.generation, baseline.generation + 1);
+    assert_eq!(
+        serde_json::to_value(&selected).unwrap()["claude_copy_holds"],
+        held_before
+    );
+    assert_eq!(
+        serde_json::to_value(&selected.files[&key]).unwrap(),
+        serde_json::to_value(&baseline.files[&key]).unwrap()
+    );
+    assert!(selected.files.contains_key(&healthy_key));
+    let persisted = ScanIndex::load_required_copy_index(&path, &daemon.transcript_cache).unwrap();
+    assert_eq!(
+        serde_json::to_value(&selected).unwrap(),
+        serde_json::to_value(&persisted).unwrap()
+    );
+    let winner_bytes = std::fs::read(&path).unwrap();
+    assert!(checkpoint_partial_snapshot_index(
+        &working,
+        &baseline,
+        &progress,
+        &[],
+        None,
+        &BTreeSet::new(),
+        &path,
+        &progress_path,
+        || Ok(())
+    )
+    .is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), winner_bytes);
+    assert_eq!(std::fs::read(&progress_path).unwrap(), progress_bytes);
+    // Infallible clone does not grant permission, including at the actual CAS
+    // save entry. Failure must precede any competing checkpoint rewrite.
+    let mut unpaid = selected.clone();
+    assert!(unpaid.save(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), winner_bytes);
+    let mut bounded = selected.try_clone_for_copy().unwrap();
+    assert!(bounded.save_with_read_limit(&path, 1).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), winner_bytes);
+    let cap = winner_bytes.len() + 1024;
+    bounded.save_with_read_limit(&path, cap).unwrap();
+    assert_eq!(bounded.generation, selected.generation + 1);
+    assert_eq!(
+        serde_json::to_value(&bounded).unwrap()["claude_copy_holds"],
+        held_before
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_required_actual_partial: supported_positive=EXECUTED paid_loader=true actual_progress_lock_selection_held_restore_CAS_save=true healthy_no_body_selected=true held_entry_restored=true exact_debt_preserved=true stale_CAS_and_unpaid_clone_refused=true bounded_read_limit_preserved=true no_native_capture_or_activation=true").unwrap();
+}

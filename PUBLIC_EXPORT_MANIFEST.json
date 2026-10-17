@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 675,
-  "content_sha256": "2d320515957b2b0823720ae5e5aba8f0470cb13b4080733507e64e1a35a492c2",
+  "content_sha256": "0c777b41f75a4692ffff024313e7a278923e4021e49647ea1fddc85f5b4a5db3",
   "files": [
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "316bb350b83be1d94dd5c067450e9c59aab05d3e95b91590a1e1258cdb3bf95c",
-      "size_bytes": 773082
+      "sha256": "bf0d2078695713e30d3f1d2355f1d8eb4f6e45645f588195ecc2fa11b8447648",
+      "size_bytes": 773278
     },
     {
       "executable": false,
@@ -1203,8 +1203,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/copy_containment_owner_tests.rs",
-      "sha256": "7111944f3fb4d4459e50dba1c874a47db33be78fd739dfb09feba18ac287a291",
-      "size_bytes": 38504
+      "sha256": "d23c5f8431dee013b49d57f926180a29b659880336c2c4f8f049dabd60a3e495",
+      "size_bytes": 46233
     },
     {
       "executable": false,
@@ -1238,8 +1238,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "69e498a3fdb7d34b363693ef9b67476c8a8a6b5b4320194124e2f5ac155114c2",
-      "size_bytes": 2475743
+      "sha256": "66e4cc3b3060072657554ab18988968e89553c293c70687a550b0f12de423a09",
+      "size_bytes": 2478742
     },
     {
       "executable": false,
@@ -1336,8 +1336,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment/required_budget.rs",
-      "sha256": "257de7f353e480dd3150e37a19849f758968759b2c328a3569ad021f22a1d11e",
-      "size_bytes": 30438
+      "sha256": "66310c4a50a8167d543695ef7d500af7abb8773366bb4955d3bf3e1e4229338e",
+      "size_bytes": 30762
     },
     {
       "executable": false,
@@ -2974,8 +2974,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-17-required-copy-decoder.md",
-      "sha256": "ce76b4b71efe43d8afdb7de4a9f56567fe9cb5f8db56b5498a422f19ff671044",
-      "size_bytes": 6568
+      "sha256": "ab682e7e6d510c53d4c13e2302679ffa81247abcf786d3f6700fb05a20c97bf3",
+      "size_bytes": 8598
     },
     {
       "executable": false,
@@ -4728,7 +4728,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-17T04:02:12.200378Z",
+  "generated_at": "2026-10-17T04:27:58.864278Z",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 676,
   "public_roots": [
