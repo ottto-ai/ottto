@@ -4268,7 +4268,7 @@ fn finish_sync_source(
                 &mut index,
                 cycle_request_identity_permit(source, &activity_hint),
                 prepared_claude_evidence,
-                comparison_completion.as_ref(),
+                comparison_completion.as_mut(),
                 native_comparison_lease.as_ref(),
             );
         if let Ok(counts) = serde_json::to_string(&stats) {
@@ -5666,7 +5666,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     index: &mut ScanIndex,
     permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     mut prepared: Option<PreparedClaudeLocalEvidence>,
-    comparison: Option<&crate::snapshots::claude_native_comparison::Completion>,
+    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -5675,9 +5675,13 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
 ) {
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
-    let observations =
-        comparison.map(|_| crate::snapshots::record_claude_native_observations(scan_result, index));
-    if let Some(fallback) = comparison.and_then(|comparison| comparison.fallback.as_ref()) {
+    let observations = comparison
+        .as_deref()
+        .map(|_| crate::snapshots::record_claude_native_observations(scan_result, index));
+    if let Some(fallback) = comparison
+        .as_deref()
+        .and_then(|comparison| comparison.fallback.as_ref())
+    {
         fallback.withhold(scan_result);
     }
     let emission_permitted = permit.is_some();
@@ -5832,11 +5836,19 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         index,
         identity_evidence.as_ref(),
         observations,
-        comparison.map(|comparison| comparison.fold_view(lease)),
+        comparison
+            .as_deref()
+            .map(|comparison| comparison.fold_view(lease)),
     );
-    if let Some(fallback) = comparison.and_then(|comparison| comparison.fallback.as_ref()) {
+    if let Some(fallback) = comparison
+        .as_deref()
+        .and_then(|comparison| comparison.fallback.as_ref())
+    {
         fallback.after_native_fold(scan_result, index);
         disposition.transcript_ownership_complete = false;
+    }
+    if let Some(comparison) = comparison {
+        comparison.retire_native_fold_owner();
     }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The

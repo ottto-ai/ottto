@@ -149,6 +149,7 @@ struct RearmFixture {
     support: PathBuf,
     index_path: PathBuf,
     progress_path: PathBuf,
+    request_identity: bool,
     native_lifecycle:
         std::sync::Arc<crate::snapshots::claude_native_comparison::lifecycle::Lifecycle>,
 }
@@ -168,6 +169,7 @@ impl RearmFixture {
         }
         let fixture = Self {
             case,
+            request_identity: false,
             native_lifecycle: std::sync::Arc::new(Default::default()),
             index_path: base.join("claude-scan-index.json"),
             progress_path: base.join("claude-upload-progress.json"),
@@ -308,9 +310,11 @@ impl RearmFixture {
             &[],
             false,
             true, // Match its context-curve setting; byte parity includes it.
-            false,
+            self.request_identity,
         );
-        scan.enable_native_comparison();
+        if crate::snapshots::claude_native_comparison::enabled() {
+            scan.enable_native_comparison();
+        }
         let mut lease = self.native_lifecycle.begin();
         if let Some(context) = scan.native_comparison_context() {
             lease.bind(format!("oracle-native:{REARM_DESTINATION}:{context}"));
@@ -322,6 +326,7 @@ impl RearmFixture {
             "record_count_15m":0, "record_count_24h":0,
             "local_usage_reconciliation_enabled":true, "backfill_window_days":183,
             "recommended_scan_after":collected_at,
+            "session_request_identity_contract":self.request_identity.then_some("own_request_identity_rows:v1"),
         }))
         .unwrap();
         let status = test_agent_status(SourceKind::ClaudeCode);
@@ -377,13 +382,24 @@ impl RearmFixture {
 
     /// One page through the production stage order of `finish_sync_source`.
     fn page(&self, collected_at: &str, upload: RearmUpload) -> RearmPage {
+        self.page_with_targeted_upload(collected_at, upload, None)
+    }
+
+    /// Interrupt only an actual offered batch containing this session. Earlier
+    /// native recovery pages use their real successful ACK/save path.
+    fn page_with_targeted_upload(
+        &self,
+        collected_at: &str,
+        upload: RearmUpload,
+        target: Option<&str>,
+    ) -> RearmPage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         index.activate_upload_context("upload-context-rearm".to_string());
         index.activate_effective_upload_body_witness_revision(
             EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
         );
         let (mut native_preparation, mut index, mut scan, committed_index) =
-            if crate::snapshots::claude_native_comparison::enabled() {
+            if crate::snapshots::claude_native_comparison::enabled() || self.request_identity {
                 let (mut frame, index, scan) = self.native_page(index, collected_at);
                 let previous = std::mem::take(&mut frame.committed_index);
                 (Some(frame), index, scan, previous)
@@ -437,6 +453,16 @@ impl RearmFixture {
         } else {
             None
         };
+        // Narrow incremental owner measurement. This is not a total frame,
+        // parser scratch, allocator or RSS bound. The actual supported layout
+        // walker includes map nodes, string/vector capacity and moved terminal.
+        let comparison_requested =
+            |completion: &Option<crate::snapshots::claude_native_comparison::Completion>| {
+                completion.as_ref().map_or(Some(0), |value| {
+                    crate::heap_layout_bound::bound(value, crate::source_rotation::PARKED_BUDGET)
+                })
+            };
+        let comparison_before_fold = comparison_requested(&comparison_completion);
         let parsed = scan
             .snapshots
             .iter()
@@ -447,14 +473,21 @@ impl RearmFixture {
                 &self.support,
                 &mut scan,
                 &mut index,
-                None,
+                cycle_request_identity_permit(SnapshotSource::ClaudeCode, &frame.activity_hint),
                 frame.prepared_claude_evidence.take(),
-                comparison_completion.as_ref(),
+                comparison_completion.as_mut(),
                 frame.native_comparison_lease.as_ref(),
             )
         } else {
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
         };
+        assert!(
+            comparison_completion
+                .as_ref()
+                .is_none_or(|completion| { !completion.ordinary_terminal_retained_for_test() }),
+            "ordinary terminal graph is retired by the actual evidence/fold stage before upload"
+        );
+        let comparison_after_fold = comparison_requested(&comparison_completion);
         let duplicate_census = disposition.duplicate_census;
         let transcript_ownership_complete = disposition.transcript_ownership_complete;
         let deferred_accounts = index.bind_session_accounts_with_mixed(
@@ -489,6 +522,10 @@ impl RearmFixture {
                 },
             );
         }
+        let comparison_before_upload = comparison_requested(&comparison_completion);
+        if comparison_completion.is_some() {
+            writeln!(std::io::stderr().lock(), "native_comparison_incremental_owner: before_fold_requested={comparison_before_fold:?} after_fold_requested={comparison_after_fold:?} before_upload_requested={comparison_before_upload:?} limit={} normal_terminal_retired_before_upload=true fallback_terminal_moved_not_cloned=true total_existing_finish_peak_proved=false rss_measured=false", crate::source_rotation::PARKED_BUDGET).unwrap();
+        }
         let native_correction_candidates = comparison_completion.as_ref().map_or(0, |comparison| {
             comparison.pending_native_correction_count_for_test()
         });
@@ -520,6 +557,7 @@ impl RearmFixture {
         let mut offered = BTreeSet::new();
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
+        let mut actual_upload = RearmUpload::Accept;
         let result = upload_resumable_batches_with_body_witness(
             &scan.snapshots,
             &unique_poison_scope(),
@@ -529,7 +567,14 @@ impl RearmFixture {
             snapshot_upload_body_witness,
             |items| {
                 offered.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                match upload {
+                actual_upload = if target.is_none_or(|session| {
+                    items.iter().any(|item| item.source_session_id == session)
+                }) {
+                    upload
+                } else {
+                    RearmUpload::Accept
+                };
+                match actual_upload {
                     RearmUpload::Accept => {
                         uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
                         {
@@ -579,8 +624,8 @@ impl RearmFixture {
             },
             |_| Ok(()),
         );
-        if upload != RearmUpload::Accept {
-            match upload {
+        if actual_upload != RearmUpload::Accept {
+            match actual_upload {
                 RearmUpload::Shed => {
                     assert!(matches!(result, Ok(ResumableUploadResult::Shed { .. })))
                 }
@@ -1252,6 +1297,7 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         progress_path: base.join("claude-upload-progress.json"),
         base,
         case: "native-parity-independent-index",
+        request_identity: source.request_identity,
         native_lifecycle: std::sync::Arc::new(Default::default()),
     }
 }
@@ -1574,4 +1620,217 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     );
     assert!(quiet.iter().all(|page| page.offered.is_empty()));
     writeln!(std::io::stderr().lock(),"native_comparison_real_copy_hit: hit_body_ran=true quiet0_before_hit=true actual_page2_capacity_fallback=true copy_withheld_until_samewindow_native=true selected_restore_debt3=true copy_not_fake_empty=true exact_pair_saved=true no_positive_copied_posture_or_tags=true bounded_copy_liveness=true").unwrap();
+}
+
+fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool) {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} supported_positive=UNEXECUTED").unwrap();
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut fixture = RearmFixture::new("native-copy-offer-interruption");
+    fixture.establish();
+    let quiet = fixture.generation(10);
+    assert_eq!(rearm_reads(&quiet), 0);
+    let before = serde_json::to_value(&quiet.last().unwrap().index).unwrap();
+    const COPY: &str = "f6666666-6666-4666-8666-666666666666";
+    let copy_path = native_comparison_add_import(&fixture, COPY, "req_root_1");
+    let mut interruption = None;
+    for number in 0..REARM_MAX_PAGES {
+        let page = fixture.page_with_targeted_upload(
+            &format!("2026-08-02T11:{number:02}:00Z"),
+            upload,
+            Some(COPY),
+        );
+        let copy = page.scan.snapshots.iter().find(|item| {
+            item.source_session_id == COPY && page.offered.contains(&item.snapshot_fingerprint)
+        });
+        if let Some(copy) = copy {
+            assert!(!page.uploaded.contains(&copy.snapshot_fingerprint));
+            assert_eq!(copy.first_turn_context_tokens, None);
+            assert_eq!(copy.peak_context_fill_tokens, None);
+            assert_eq!(copy.last_turn_context_tokens, None);
+            assert!(copy.request_evidence.is_empty());
+            assert!(page.duplicate_census.census_complete,
+                "interrupt after the actual terminal native duplicate fold, not the earlier A correction");
+            assert!(!page.fully_settled && !page.scan.census_complete);
+            let saved = serde_json::to_value(&page.index).unwrap();
+            assert!(
+                saved["files"].get(copy_path.to_str().unwrap()).is_none(),
+                "partial selected save never commits an unACKed new copy"
+            );
+            assert!(!page
+                .index
+                .accepted_snapshot_fingerprint_recorded(&copy.snapshot_fingerprint));
+            native_comparison_assert_old_bindings(&before, &page.index);
+            assert!(page.index.bounded_sweep_had_unsettled_upload());
+            assert!(!fixture.native_lifecycle.retained_valid_for_test());
+            interruption = Some(copy.snapshot_fingerprint.clone());
+            break;
+        }
+    }
+    let interrupted_fp = interruption.expect("bounded actual copy offer reached and interrupted");
+    if restart {
+        // Fresh process owner only: keep the exact partial-save index and
+        // original files. No seeded permit, cursor or replay reset.
+        fixture.native_lifecycle = std::sync::Arc::new(Default::default());
+    }
+    let mut recovered = false;
+    for hour in 12..20 {
+        let pages = fixture.generation(hour);
+        for page in &pages {
+            for copy in page.scan.snapshots.iter().filter(|item| {
+                item.source_session_id == COPY && page.offered.contains(&item.snapshot_fingerprint)
+            }) {
+                assert_eq!(copy.first_turn_context_tokens, None);
+                assert_eq!(copy.peak_context_fill_tokens, None);
+                assert_eq!(copy.last_turn_context_tokens, None);
+                assert!(copy.request_evidence.is_empty());
+                assert!(page.uploaded.contains(&copy.snapshot_fingerprint));
+            }
+        }
+        let last = pages.last().unwrap();
+        native_comparison_assert_old_bindings(&before, &last.index);
+        let saved = serde_json::to_value(&last.index).unwrap();
+        if last.scan.census_complete
+            && last.fully_settled
+            && saved["file_snapshot_fingerprints"][copy_path.to_str().unwrap()]
+                .as_array()
+                .is_some_and(|fps| !fps.is_empty())
+        {
+            assert!(
+                last.index
+                    .accepted_snapshot_fingerprint_recorded(&interrupted_fp),
+                "the exact corrected copy body survives interruption and is durably ACKed"
+            );
+            recovered = true;
+            break;
+        }
+    }
+    assert!(
+        recovered,
+        "partial selected debt/restart must recover within ordinary bounded generations"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
+}
+
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_copy_offer_shed_partial_save_recovers() {
+    native_comparison_copy_offer_interruption(RearmUpload::Shed, false);
+}
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
+    native_comparison_copy_offer_interruption(RearmUpload::AckLost, false);
+}
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_copy_offer_shed_restart_recovers() {
+    native_comparison_copy_offer_interruption(RearmUpload::Shed, true);
+}
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_copy_offer_ack_loss_restart_recovers() {
+    native_comparison_copy_offer_interruption(RearmUpload::AckLost, true);
+}
+
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
+    use sha2::{Digest, Sha256};
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(
+            std::io::stderr().lock(),
+            "native_comparison_own_C5: supported_positive=UNEXECUTED"
+        )
+        .unwrap();
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut base = RearmFixture::new("native-positive-own-C5");
+    base.request_identity = true;
+    let candidate = native_comparison_independent_history(&base);
+    base.establish();
+    base.generation(10);
+    {
+        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+        candidate.establish();
+        assert_eq!(rearm_reads(&candidate.generation(10)), 0);
+    }
+    const OWN: &str = "d7777777-7777-4777-8777-777777777777";
+    native_comparison_add_import(&base, OWN, "req_own_C5");
+    // Own request-scoped OTEL identity, never an A marker or possible owner.
+    let api_path = base
+        .support
+        .join("local-otel")
+        .join("claude-code-effort")
+        .join(format!("{:x}.jsonl", Sha256::digest(OWN.as_bytes())));
+    let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+        serde_json::from_str(&std::fs::read_to_string(&api_path).unwrap()).unwrap();
+    let login = "a".repeat(64);
+    let org = "d".repeat(64);
+    row.account_identity_checked = true;
+    row.account_identifier_hash = Some(login.clone());
+    row.request_identity = Some(
+        serde_json::from_value(serde_json::json!({
+            "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+            "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":login},
+            "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":org},
+        }))
+        .unwrap(),
+    );
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&row).unwrap())
+    );
+    std::fs::write(&api_path, serde_json::to_string(&row).unwrap() + "\n").unwrap();
+    let baseline = base.generation(11);
+    let optimized = {
+        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+        candidate.generation(11)
+    };
+    let exact = |pages: &[RearmPage]| {
+        let (page, item) = pages
+            .iter()
+            .find_map(|page| {
+                page.scan
+                    .snapshots
+                    .iter()
+                    .find(|item| item.source_session_id == OWN)
+                    .map(|item| (page, item))
+            })
+            .expect("actual own-C5 body");
+        assert!(page.offered.contains(&item.snapshot_fingerprint));
+        assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+        assert_eq!(
+            item.provenance.collector,
+            crate::snapshots::claude_request_identity::COLLECTOR
+        );
+        assert!(
+            !item.request_evidence.is_empty(),
+            "positive own identity must actually execute"
+        );
+        assert!(item.request_evidence.iter().all(|e| e.identity_basis
+            == crate::snapshots::claude_request_identity::TELEMETRY
+            && e.provider_workspace_hash.as_deref() == Some(org.as_str())));
+        assert!(item
+            .usage_buckets
+            .iter()
+            .flat_map(|b| &b.model_usage)
+            .any(|r| r.evidence_ref.is_some()));
+        assert!(
+            !page.transcript_ownership_complete,
+            "own OTEL identity survives the unsettled transcript-marker gate"
+        );
+        serde_json::to_vec(item).unwrap()
+    };
+    assert_eq!(
+        exact(&baseline),
+        exact(&optimized),
+        "exact own C5 head, bytes, identity basis and per-request tags equal base"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_own_C5: body_ran=true actual_hint_capture_and_emission=true own_telemetry_tags_positive=true base_exact_bytes_equal=true no_borrowed_identity=true transcript_settled_false=true exact_wire_ACK_save=true").unwrap();
 }

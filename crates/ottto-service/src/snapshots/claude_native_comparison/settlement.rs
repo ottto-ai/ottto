@@ -92,6 +92,16 @@ impl Completion {
                 .and_then(|fallback| fallback.terminal.as_deref())
         })
     }
+    /// The ordinary terminal graph is needed only through the native fold.
+    /// Retire it before body preparation/upload. A fallback terminal has a
+    /// different lifetime: both selected-save restore seams still need it.
+    pub(crate) fn retire_native_fold_owner(&mut self) {
+        drop(self.native_terminal.take());
+    }
+    #[cfg(test)]
+    pub(crate) fn ordinary_terminal_retained_for_test(&self) -> bool {
+        self.native_terminal.is_some()
+    }
     #[cfg(test)]
     pub(crate) fn native_correction_count_for_test(&self) -> usize {
         self.window
