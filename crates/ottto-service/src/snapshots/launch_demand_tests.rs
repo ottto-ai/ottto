@@ -176,6 +176,7 @@ fn scan(
             OwnedSourceScanStep::Complete {
                 mut index,
                 mut scan,
+                ..
             } => {
                 apply_upload_policy(
                     SnapshotSource::ClaudeCode,

@@ -551,7 +551,9 @@ fn production_scan_at_with_setup(
         }
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete { mut index, scan } => {
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
                 // Exercise existing native post-policy finalization and exact
                 // acceptance before testing durable no-op suppression. Preserve
                 // raw native output separately for full-oracle comparisons.

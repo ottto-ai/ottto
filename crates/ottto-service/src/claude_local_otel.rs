@@ -634,6 +634,19 @@ fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
 }
 
 impl ClaudeApiEvidenceRead {
+    pub(crate) fn permissive_readset_is_current(&self, support_dir: &Path) -> bool {
+        self.reads.iter().all(|(root, witness)| {
+            if witness.generation.is_some() {
+                return self.strict_generation_matches(support_dir, root);
+            }
+            // A witnessed absence contributes no effort rows. Reappearance,
+            // unreadability or an incomplete nonempty read requires base load.
+            witness.health.missing_files == 1
+                && fs::metadata(evidence_path(support_dir, root))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+    }
+
     pub(crate) fn load(
         support_dir: &Path,
         session_ids: impl IntoIterator<Item = String>,
@@ -655,13 +668,9 @@ impl ClaudeApiEvidenceRead {
         self.reads.retain(|root, _| roots.contains(root));
     }
 
-    pub(crate) fn take_strict_report(
-        &mut self,
-        support_dir: &Path,
-        session_id: &str,
-    ) -> ClaudeLocalOtelLoadReport {
-        let witness = self.reads.remove(session_id);
-        let rows = self.evidence.remove(session_id);
+    /// Read-only validation of the opened generation; no rows are consumed or
+    /// cloned. Unknown/replaced generations are ineligible for preflight reuse.
+    pub(crate) fn strict_generation_matches(&self, support_dir: &Path, session_id: &str) -> bool {
         let current = fs::metadata(evidence_path(support_dir, session_id))
             .ok()
             .and_then(|metadata| api_file_generation(&metadata));
@@ -671,11 +680,23 @@ impl ClaudeApiEvidenceRead {
         } else {
             current
         };
-        if let Some(witness) = witness {
-            if witness.health.is_complete()
+        self.reads.get(session_id).is_some_and(|witness| {
+            witness.health.is_complete()
                 && witness.generation.is_some()
                 && witness.generation == current
-            {
+        })
+    }
+
+    pub(crate) fn take_strict_report(
+        &mut self,
+        support_dir: &Path,
+        session_id: &str,
+    ) -> ClaudeLocalOtelLoadReport {
+        let reusable = self.strict_generation_matches(support_dir, session_id);
+        let witness = self.reads.remove(session_id);
+        let rows = self.evidence.remove(session_id);
+        if let Some(witness) = witness {
+            if reusable {
                 let mut report = ClaudeLocalOtelLoadReport {
                     health: witness.health,
                     ..Default::default()
@@ -691,6 +712,21 @@ impl ClaudeApiEvidenceRead {
         drop(rows);
         load_claude_api_request_evidence_report(support_dir, [session_id.to_string()])
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeTraceReadGeneration {
+    opened: ApiFileGeneration,
+}
+
+pub(crate) fn claude_trace_read_generation(
+    support_dir: &Path,
+    session_id: &str,
+) -> Option<ClaudeTraceReadGeneration> {
+    fs::metadata(trace_evidence_path(support_dir, session_id))
+        .ok()
+        .and_then(|metadata| api_file_generation(&metadata))
+        .map(|opened| ClaudeTraceReadGeneration { opened })
 }
 
 pub fn load_claude_effort_evidence(
@@ -916,6 +952,8 @@ pub fn load_claude_trace_ownership_evidence(
             report.unreadable_lines += 1;
             continue;
         };
+        #[cfg(test)]
+        TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
         let mut seen_fingerprints = BTreeSet::new();
         let mut request_fingerprints = BTreeMap::<String, String>::new();
         let mut rows = Vec::new();
@@ -958,6 +996,26 @@ pub fn load_claude_trace_ownership_evidence(
         }
     }
     report
+}
+
+#[cfg(test)]
+thread_local! { static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+pub(crate) fn reset_evidence_read_counts_for_test() {
+    API_READ_RECEIPT.with(|receipt| {
+        let (_, _, force) = receipt.get();
+        receipt.set((0, 0, force));
+    });
+    TRACE_READ_RECEIPT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn evidence_read_counts_for_test() -> (usize, usize) {
+    (
+        API_READ_RECEIPT.with(|receipt| receipt.get().0),
+        TRACE_READ_RECEIPT.with(std::cell::Cell::get),
+    )
 }
 
 /// Build the legacy effort index by Anthropic request id.
@@ -3215,5 +3273,37 @@ mod tests {
         assert_eq!(first_report.evidence["sess-mixed"], rows);
         fs::remove_dir_all(first).unwrap();
         fs::remove_dir_all(second).unwrap();
+    }
+}
+
+crate::heap_layout_bound::fields!(ClaudeApiEvidenceRead; evidence, reads);
+crate::heap_layout_bound::fields!(ApiReadWitness; health, generation);
+crate::heap_layout_bound::fields!(ApiFileGeneration; device, inode, bytes, modified, changed);
+crate::heap_layout_bound::fields!(ClaudeTraceReadGeneration; opened);
+crate::heap_layout_bound::fields!(ClaudeLocalOtelLoadHealth; missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids);
+crate::heap_layout_bound::fields!(ClaudeLocalOtelEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, observed_at, model, effort, query_source, speed, cost_usd_micros, event_sequence, app_version, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, request_count, account_identity_checked, account_identifier_hash, request_identity);
+crate::heap_layout_bound::fields!(ClaudeRequestIdentityEvidence; identity_hash_scheme, account, organization, disposition);
+crate::heap_layout_bound::fields!(ClaudeIdentityAttributeEvidence; origin, disposition, resource_hash, log_record_hash);
+crate::heap_layout_bound::fields!(ClaudeTraceOwnershipEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, agent_id, parent_agent_id, workflow_run_id, observed_at);
+crate::heap_layout_bound::fields!(ClaudeTraceOwnershipLoadReport; evidence, missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids);
+
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityDisposition {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Missing | Self::Invalid | Self::Conflict | Self::Complete => counter.add(0),
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityAttributeOrigin {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Missing | Self::Resource | Self::LogRecord | Self::ResourceAndLogRecord => {
+                counter.add(0)
+            }
+        }
     }
 }

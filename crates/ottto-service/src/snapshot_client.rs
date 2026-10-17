@@ -714,6 +714,63 @@ fn default_occurrence_count() -> u64 {
     1
 }
 
+/// The existing public ACK version for additive body evidence. Keep synthetic
+/// transport responses on the same contract as the production ACK validator;
+/// internal envelope versions are not public ACK versions.
+pub(crate) fn snapshot_ack_body_witness_version(
+    item: &crate::snapshots::SnapshotItem,
+) -> Result<Option<u64>> {
+    if item.context_curve.is_none()
+        && item.session_account_evidence.is_none()
+        && item.cache_observations.is_none()
+    {
+        return Ok(None);
+    }
+    let version = snapshot_upload_body_witness_version(item)
+        .filter(|version| {
+            matches!(
+                *version,
+                SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
+                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
+                    | 15
+                    | 16
+                    | 19
+                    | 20
+                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
+                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+            )
+        })
+        .ok_or_else(|| anyhow!("snapshot evidence has no supported body witness version"))?;
+    let public_version = match version {
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION => {
+            SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION
+        }
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION => {
+            SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION
+        }
+        15 => 13,
+        16 => 14,
+        19 => 17,
+        20 => 18,
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
+            if item.cache_observations.is_some() {
+                13
+            } else {
+                SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION
+            }
+        }
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION => {
+            if item.cache_observations.is_some() {
+                14
+            } else {
+                SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+            }
+        }
+        _ => unreachable!("the supported-version filter is exhaustive"),
+    };
+    Ok(Some(public_version))
+}
+
 impl SnapshotBatchResponse {
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
@@ -830,60 +887,13 @@ impl SnapshotBatchResponse {
     fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let mut expected = std::collections::BTreeMap::new();
         for item in &request.snapshots {
-            if item.context_curve.is_none()
-                && item.session_account_evidence.is_none()
-                && item.cache_observations.is_none()
-            {
+            let Some(public_version) = snapshot_ack_body_witness_version(item)? else {
                 continue;
-            }
-            let version = snapshot_upload_body_witness_version(item)
-                .filter(|version| {
-                    matches!(
-                        *version,
-                        SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
-                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
-                            | 15
-                            | 16
-                            | 19
-                            | 20
-                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
-                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
-                    )
-                })
-                .ok_or_else(|| {
-                    anyhow!("snapshot evidence has no supported body witness version")
-                })?;
+            };
             let key = (
                 item.source_session_id.clone(),
                 item.snapshot_fingerprint.clone(),
             );
-            let public_version = match version {
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION => {
-                    SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION
-                }
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION => {
-                    SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION
-                }
-                15 => 13,
-                16 => 14,
-                19 => 17,
-                20 => 18,
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
-                    if item.cache_observations.is_some() {
-                        13
-                    } else {
-                        SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION
-                    }
-                }
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION => {
-                    if item.cache_observations.is_some() {
-                        14
-                    } else {
-                        SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION
-                    }
-                }
-                _ => unreachable!("the supported-version filter is exhaustive"),
-            };
             let proof = (public_version, snapshot_upload_body_witness(item));
             if expected
                 .insert(key, proof.clone())

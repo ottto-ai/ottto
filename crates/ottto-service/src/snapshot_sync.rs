@@ -1655,10 +1655,69 @@ fn save_index_and_publish_manifest(
     Ok(())
 }
 
+// Test-only empty-ACK/shed boundary; invokes the real locked partial save.
+#[cfg(test)]
+pub(crate) fn comparison_partial_checkpoint_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    index_path: &Path,
+    progress_path: &Path,
+) -> Result<ScanIndex> {
+    let mut progress = SnapshotUploadProgress::load(
+        progress_path,
+        &format!("{:064x}", 587),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )?;
+    progress.save(progress_path)?;
+    checkpoint_partial_snapshot_index(
+        index,
+        committed,
+        &progress,
+        snapshots,
+        None,
+        &BTreeSet::new(),
+        index_path,
+        progress_path,
+        || Ok(()),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn comparison_partial_fallback_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    scan: &SourceScanResult,
+    fallback: &mut crate::snapshots::claude_native_comparison::SelectedFallback,
+    index_path: &Path,
+    progress_path: &Path,
+) -> Result<ScanIndex> {
+    let mut progress = SnapshotUploadProgress::load(
+        progress_path,
+        &format!("{:064x}", 588),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )?;
+    progress.save(progress_path)?;
+    checkpoint_partial_snapshot_index_with_comparison(
+        index,
+        committed,
+        &progress,
+        &scan.snapshots,
+        Some(scan),
+        &BTreeSet::new(),
+        index_path,
+        progress_path,
+        || Ok(()),
+        None,
+        Some(fallback),
+    )
+}
+
 /// Preserve only delivery-owned file checkpoints on an unfinished upload.
 /// Hold the progress lock through index CAS: neither an unsaved ACK nor a
 /// racing ledger generation may certify the scan's new file/body witnesses.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn checkpoint_partial_snapshot_index(
     index: &ScanIndex,
     committed_index: &ScanIndex,
@@ -1696,6 +1755,35 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
     progress_path: &Path,
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
+) -> Result<ScanIndex> {
+    checkpoint_partial_snapshot_index_with_comparison(
+        index,
+        committed_index,
+        progress,
+        snapshots,
+        correction_scan,
+        locally_held,
+        index_path,
+        progress_path,
+        validate_destination,
+        read_limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_partial_snapshot_index_with_comparison(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+    read_limit: Option<usize>,
+    fallback: Option<&mut crate::snapshots::claude_native_comparison::SelectedFallback>,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -1765,6 +1853,16 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         // A2: settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
         committable.settle_empty_claude_proof_corrections(scan);
+    }
+    #[cfg(test)]
+    crate::snapshots::envelope_selection_experiment::after_selected_restore(
+        &mut committable,
+        committed_index,
+    );
+    if let Some(fallback) = fallback {
+        fallback
+            .restore_selected(&mut committable, committed_index)
+            .map_err(|reason| anyhow!(reason))?;
     }
     committable.mark_bounded_sweep_unsettled();
     validate_destination()?;
@@ -3136,6 +3234,18 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     fn monotonic(&self) -> Duration {
         self.started.elapsed()
     }
+    fn retained_bound(&self, limit: usize) -> Option<usize> {
+        if crate::snapshots::claude_native_comparison::enabled() {
+            self.daemon.native_comparison.retained_bound(limit)
+        } else {
+            Some(0)
+        }
+    }
+    fn discard_retained(&mut self) {
+        if crate::snapshots::claude_native_comparison::enabled() {
+            self.daemon.native_comparison.discard_retained();
+        }
+    }
     fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
         self.retry
             .boundary(busy, self.home, self.support_dir, self.daemon);
@@ -3390,6 +3500,11 @@ fn persist_machine_icon_at(path: &Path, response: &AgentStatusSnapshotUploadResp
 // Preparation stays owned by the existing cycle. No token/report lease or
 // partially finalized body crosses a collection step.
 struct SourcePreparation {
+    native_comparison_lease: Option<crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    prepared_claude_evidence: Option<PreparedClaudeLocalEvidence>,
+    terminal_native_traversal:
+        Option<Box<crate::snapshots::claude_native_comparison::TerminalTraversal>>,
+    native_comparison_controller: Option<crate::snapshots::claude_native_comparison::Controller>,
     retry_authority: Option<live_snapshot_retry::LiveAuthority>,
     source: SnapshotSource,
     claude_scan_roots: Option<Vec<PathBuf>>,
@@ -3426,13 +3541,87 @@ enum SourcePreparationStep {
 }
 impl SourcePreparation {
     fn step(mut self) -> SourcePreparationStep {
-        let state = self.scan.take().expect("active source preparation");
+        let mut state = self.scan.take().expect("active source preparation");
+        if state.native_comparison_ready() {
+            if let Some(support_dir) = state.native_comparison_support_dir().map(Path::to_path_buf)
+            {
+                if self.prepared_claude_evidence.is_none() {
+                    let (index, native) = state.native_comparison_inputs();
+                    self.prepared_claude_evidence = Some(PreparedClaudeLocalEvidence::load(
+                        &support_dir,
+                        native,
+                        index,
+                    ));
+                    if self
+                        .native_comparison_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.allowed())
+                    {
+                        let previous = self
+                            .native_comparison_lease
+                            .as_mut()
+                            .and_then(|lease| lease.take_window());
+                        let qualification = state.prepare_native_comparison_with_window(
+                            self.prepared_claude_evidence.as_ref().unwrap().rows(),
+                            previous,
+                        );
+                        if let Some(qualification) = qualification {
+                            self.native_comparison_controller =
+                                Some(crate::snapshots::claude_native_comparison::Controller::new(
+                                    qualification,
+                                ));
+                        } else {
+                            state.disable_native_comparison();
+                            if let Some(lease) = self.native_comparison_lease.as_mut() {
+                                lease.revoke();
+                            }
+                        }
+                    }
+                }
+                if let Some(controller) = self.native_comparison_controller.as_mut() {
+                    // The prepared owner and PRE-MUTATION proof survive every
+                    // target yield. No second load/requalification from P_new.
+                    let current = self
+                        .native_comparison_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.allowed())
+                        && self
+                            .prepared_claude_evidence
+                            .as_ref()
+                            .is_some_and(|evidence| {
+                                evidence.frozen_roots_are_current(
+                                    &support_dir,
+                                    controller.required_roots(),
+                                )
+                            });
+                    if !controller.advance(&mut state, current) {
+                        if let Some(lease) = self.native_comparison_lease.as_mut() {
+                            lease.revoke();
+                        }
+                    }
+                } else {
+                    state.resume_native_comparison_base();
+                }
+            } else {
+                state.disable_native_comparison();
+                if let Some(lease) = self.native_comparison_lease.as_mut() {
+                    lease.revoke();
+                }
+            }
+            self.scan = Some(state);
+            return SourcePreparationStep::Pending(self);
+        }
         match state.step(self.attribution_context.as_ref()) {
             crate::snapshots::OwnedSourceScanStep::Pending(next) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
-            crate::snapshots::OwnedSourceScanStep::Complete { index, scan } => {
+            crate::snapshots::OwnedSourceScanStep::Complete {
+                index,
+                scan,
+                terminal_native_traversal,
+            } => {
+                self.terminal_native_traversal = terminal_native_traversal;
                 SourcePreparationStep::Complete {
                     preparation: self,
                     index,
@@ -3470,6 +3659,11 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    // Capture before any fallible provider/destination/root work. Dropping an
+    // unfinished frame or returning early revokes reuse for the next cycle.
+    let mut native_comparison_lease = (source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_native_comparison::enabled())
+    .then(|| daemon.native_comparison.begin());
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
         // would scan, re-derive and re-POST the same pages it just shed, which is
@@ -3834,7 +4028,7 @@ fn prepare_sync_source(
         // are unchanged.
         sampled_scope.push_str(":request_identity");
     }
-    let scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
+    let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
         &roots,
         index,
@@ -3859,7 +4053,22 @@ fn prepare_sync_source(
             Sha256::digest(sampled_scope.as_bytes())
         )),
     );
+    if crate::snapshots::claude_native_comparison::enabled() {
+        scan.enable_native_comparison();
+    }
+    if let Some(lease) = native_comparison_lease.as_mut() {
+        if let Some(native_context) = scan.native_comparison_context() {
+            let scope = format!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:{context_curve_enabled}");
+            lease.bind(format!("{:x}", Sha256::digest(scope.as_bytes())));
+        } else {
+            lease.revoke();
+        }
+    }
     Ok(Some(SourcePreparation {
+        native_comparison_lease,
+        prepared_claude_evidence: None,
+        terminal_native_traversal: None,
+        native_comparison_controller: None,
         retry_authority,
         source,
         claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
@@ -3951,6 +4160,10 @@ fn finish_sync_source(
     retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
     let SourcePreparation {
+        mut native_comparison_lease,
+        prepared_claude_evidence,
+        terminal_native_traversal,
+        native_comparison_controller,
         retry_authority,
         source,
         claude_scan_roots,
@@ -3976,6 +4189,33 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    // Recheck the same owner after native continuation. A failed comparison
+    // carries its unresolved exact dependencies into selected-state fallback.
+    let comparison_current = native_comparison_controller
+        .as_ref()
+        .is_some_and(|controller| {
+            native_comparison_lease
+                .as_ref()
+                .is_some_and(|lease| lease.allowed())
+                && prepared_claude_evidence.as_ref().is_some_and(|evidence| {
+                    evidence.frozen_roots_are_current(support_dir, controller.required_roots())
+                })
+        });
+    if !comparison_current {
+        if let Some(lease) = native_comparison_lease.as_mut() {
+            lease.revoke();
+        }
+    }
+    let mut comparison_completion = match native_comparison_controller {
+        Some(controller) => Some(
+            controller
+                .complete(&scan_result, terminal_native_traversal, comparison_current)
+                .map_err(|reason| anyhow!(reason))?,
+        ),
+        None => {
+            crate::snapshots::claude_native_comparison::Completion::base(terminal_native_traversal)
+        }
+    };
     let client = &receipt_client;
     let codex_join_validator = scan_result.codex_joining_validator();
     let validate_joined = |snapshots: &[SnapshotItem]| -> Result<()> {
@@ -4018,20 +4258,29 @@ fn finish_sync_source(
     // labels on the wire.
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
-        let (disposition, census_withheld, stats) = apply_claude_local_evidence_to_scan_with_permit(
-            support_dir,
-            &mut scan_result,
-            &mut index,
-            cycle_request_identity_permit(source, &activity_hint),
-        );
+        let (disposition, census_withheld, stats) =
+            apply_claude_local_evidence_to_scan_with_comparison(
+                support_dir,
+                &mut scan_result,
+                &mut index,
+                cycle_request_identity_permit(source, &activity_hint),
+                prepared_claude_evidence,
+                comparison_completion.as_mut(),
+                native_comparison_lease.as_ref(),
+            );
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
                 "local snapshot sync: claude local evidence duration_ms={} counts={counts}",
                 evidence_started.elapsed().as_millis()
             );
         }
+        actual_native_conjunction =
+            crate::snapshots::claude_native_comparison::actual_native_conjunction(&disposition)
+                && !census_withheld
+                && scan_result.census_complete;
         claude_authority_disposition = disposition;
         if census_withheld {
             backfill_succeeded = false;
@@ -4133,6 +4382,23 @@ fn finish_sync_source(
     } else {
         Vec::new()
     };
+    if let Some(comparison) = comparison_completion.as_mut() {
+        comparison.capture_native_corrections(
+            &mut scan_result,
+            &committed_index,
+            &claude_authority_disposition,
+            |snapshot| {
+                effective_snapshot_upload_body_witness(
+                    snapshot,
+                    &upload_progress,
+                    cache_observations_enabled,
+                    activity_hint.snapshot_head_cas_required,
+                    &legacy_reconciliation_pending,
+                    &claude_authority_disposition,
+                )
+            },
+        );
+    }
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
@@ -4523,7 +4789,7 @@ fn finish_sync_source(
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
             let mut checkpoint_succeeded = true;
-            let committable = match checkpoint_partial_snapshot_index(
+            let committable = match checkpoint_partial_snapshot_index_with_comparison(
                 &index,
                 &committed_index,
                 &upload_progress,
@@ -4536,6 +4802,10 @@ fn finish_sync_source(
                     ensure_authority()?;
                     scan_result.validate_codex_checkpoint()
                 },
+                None,
+                comparison_completion
+                    .as_mut()
+                    .and_then(|comparison| comparison.fallback.as_mut()),
             ) {
                 Ok(committable) => committable,
                 Err(error) => {
@@ -4632,7 +4902,7 @@ fn finish_sync_source(
             // delta can prune those ACKs. Local-state failures leave durability
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
-                match checkpoint_partial_snapshot_index(
+                match checkpoint_partial_snapshot_index_with_comparison(
                     &index,
                     &committed_index,
                     &upload_progress,
@@ -4645,6 +4915,10 @@ fn finish_sync_source(
                         ensure_authority()?;
                         scan_result.validate_codex_checkpoint()
                     },
+                    None,
+                    comparison_completion
+                        .as_mut()
+                        .and_then(|comparison| comparison.fallback.as_mut()),
                 ) {
                     Ok(committable) => index = committable,
                     Err(checkpoint_error) => eprintln!(
@@ -4812,6 +5086,15 @@ fn finish_sync_source(
         &claude_cutoff_corrections,
         upload_fully_settled,
     );
+    if let Some(fallback) = comparison_completion
+        .as_mut()
+        .and_then(|comparison| comparison.fallback.as_mut())
+    {
+        fallback
+            .restore_selected(&mut index, &committed_index)
+            .map_err(|reason| anyhow!(reason))?;
+        upload_fully_settled = false;
+    }
     backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
@@ -4843,6 +5126,39 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    if upload_fully_settled
+        && native_comparison_lease
+            .as_ref()
+            .is_some_and(|lease| lease.allowed())
+    {
+        if let Some(comparison) = comparison_completion.as_mut() {
+            comparison.note_native_corrections_after_save(
+                &index,
+                &committed_index,
+                |fp, witness| {
+                    if upload_progress.quarantined_fingerprints.contains_key(fp)
+                        || upload_progress.permanent_rejections.contains_key(fp)
+                        || upload_progress.active_quarantine_retries.contains(fp)
+                    {
+                        None
+                    } else {
+                        Some(
+                            upload_progress.accepted_fingerprints.contains(fp)
+                                && upload_progress
+                                    .accepted_body_witnesses
+                                    .get(fp)
+                                    .is_some_and(|accepted| accepted == witness),
+                        )
+                    }
+                },
+            );
+        }
+    }
+    if let Some(lease) = native_comparison_lease.as_mut() {
+        lease.note_selected_save(
+            actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
+        );
+    }
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. A conflict pass has still
     // durably committed its accepted siblings, but remains a source failure so
@@ -4962,6 +5278,23 @@ fn finish_sync_source(
             state: CollectorState::Success,
         },
     )?;
+    if let Some(mut lease) = native_comparison_lease {
+        lease.stage_window_after_save(
+            comparison_completion.and_then(|comparison| comparison.window),
+            &index,
+            scan_result.census_complete,
+        );
+        // Only an existing permit may survive a known, saved bounded page.
+        // The actual terminal native conjunction remains the sole bootstrap.
+        lease.finish(
+            upload_fully_settled
+                && crate::snapshots::claude_native_comparison::selected_page_is_clean(
+                    &scan_result,
+                    &index,
+                    &claude_authority_disposition,
+                ),
+        );
+    }
     Ok(())
 }
 
@@ -5088,6 +5421,196 @@ pub struct ClaudeLocalEvidenceStats {
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
 }
 
+struct PreparedTraceRead {
+    generation: Option<crate::claude_local_otel::ClaudeTraceReadGeneration>,
+    report: crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+}
+
+/// One moving owner for the permissive effort rows and strict paired view.
+/// Preflight borrows rows; finish consumes them after the original effort fold.
+/// A changed/unknown opened generation always falls back to the existing load.
+struct PreparedClaudeLocalEvidence {
+    sessions: BTreeSet<String>,
+    api: crate::claude_local_otel::ClaudeApiEvidenceRead,
+    api_failed: bool,
+    trace_rows: BTreeMap<String, Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
+    traces: BTreeMap<String, PreparedTraceRead>,
+    healthy_roots: BTreeSet<String>,
+}
+
+impl PreparedClaudeLocalEvidence {
+    fn load(support_dir: &Path, native: &[SnapshotItem], index: &ScanIndex) -> Self {
+        let sessions = claude_evidence_session_ids(native)
+            .into_iter()
+            .chain(crate::snapshots::claude_pending_family_session_ids(index))
+            .collect::<BTreeSet<_>>();
+        let loaded =
+            crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, sessions.clone());
+        let api_failed = loaded.is_err();
+        let api = loaded.unwrap_or_default();
+        let roots = claude_evidence_root_session_ids(native)
+            .into_iter()
+            .chain(crate::snapshots::claude_pending_family_session_ids(index))
+            .collect::<BTreeSet<_>>();
+        let mut trace_rows = BTreeMap::new();
+        let mut traces = BTreeMap::new();
+        let mut healthy_roots = BTreeSet::new();
+        for root in roots {
+            if crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, &root)
+                .is_empty()
+                || crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
+                    support_dir,
+                    &root,
+                )
+                .is_empty()
+            {
+                continue;
+            }
+            let before = crate::claude_local_otel::claude_trace_read_generation(support_dir, &root);
+            let mut report = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                support_dir,
+                [root.clone()],
+            );
+            let after = crate::claude_local_otel::claude_trace_read_generation(support_dir, &root);
+            let generation = if before.is_some() && before == after {
+                before
+            } else {
+                None
+            };
+            if generation.is_some()
+                && report.is_complete()
+                && api.strict_generation_matches(support_dir, &root)
+            {
+                healthy_roots.insert(root.clone());
+            }
+            if let Some(rows) = report.evidence.remove(&root) {
+                trace_rows.insert(root.clone(), rows);
+            }
+            traces.insert(root, PreparedTraceRead { generation, report });
+        }
+        Self {
+            sessions,
+            api,
+            api_failed,
+            trace_rows,
+            traces,
+            healthy_roots,
+        }
+    }
+
+    fn rows(&self) -> crate::snapshots::claude_native_comparison::PairedRows<'_> {
+        crate::snapshots::claude_native_comparison::PairedRows {
+            api: &self.api.evidence,
+            trace: &self.trace_rows,
+            healthy_roots: &self.healthy_roots,
+        }
+    }
+
+    /// Check every root used by a frozen negative, including retained legacy
+    /// predecessors. This validates opened generations without reloading rows
+    /// or replacing P. It returns no new paired view or proof. A controller must
+    /// revoke and take the base path on false; unrelated ineligible roots do
+    /// not expand the qualified population or poison healthy-family evidence.
+    fn frozen_roots_are_current(
+        &self,
+        support_dir: &Path,
+        required_roots: &BTreeSet<String>,
+    ) -> bool {
+        !self.api_failed
+            && required_roots.iter().all(|root| {
+                self.healthy_roots.contains(root)
+                    && self.api.strict_generation_matches(support_dir, root)
+                    && self.traces.get(root).is_some_and(|read| {
+                        read.report.is_complete()
+                            && read.generation.is_some()
+                            && read.generation
+                                == crate::claude_local_otel::claude_trace_read_generation(
+                                    support_dir,
+                                    root,
+                                )
+                    })
+            })
+    }
+
+    fn take_api(
+        &mut self,
+        support_dir: &Path,
+    ) -> Result<crate::claude_local_otel::ClaudeApiEvidenceRead> {
+        if self.api_failed || !self.api.permissive_readset_is_current(support_dir) {
+            // Even permissive effort enrichment must not consume a stale
+            // preflight view after a moving native continuation yields.
+            return crate::claude_local_otel::ClaudeApiEvidenceRead::load(
+                support_dir,
+                self.sessions.clone(),
+            );
+        }
+        Ok(std::mem::take(&mut self.api))
+    }
+
+    fn take_trace(
+        &mut self,
+        support_dir: &Path,
+        root: &str,
+    ) -> crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+        if let Some(mut read) = self.traces.remove(root) {
+            if read.generation.is_some()
+                && read.generation
+                    == crate::claude_local_otel::claude_trace_read_generation(support_dir, root)
+            {
+                if let Some(rows) = self.trace_rows.remove(root) {
+                    read.report.evidence.insert(root.to_owned(), rows);
+                }
+                return read.report;
+            }
+        }
+        self.trace_rows.remove(root);
+        crate::claude_local_otel::load_claude_trace_ownership_evidence(
+            support_dir,
+            [root.to_owned()],
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_claude_negative_rows_for_test(
+    support_dir: &Path,
+    index: &ScanIndex,
+    required_roots: &BTreeSet<String>,
+    after_load: impl FnOnce(),
+) -> (bool, bool) {
+    let prepared = PreparedClaudeLocalEvidence::load(support_dir, &[], index);
+    let before = prepared.frozen_roots_are_current(support_dir, required_roots);
+    after_load();
+    let after = prepared.frozen_roots_are_current(support_dir, required_roots);
+    (before, after)
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_claude_pair_for_test(
+    support_dir: &Path,
+    native: &[SnapshotItem],
+    index: &ScanIndex,
+    root: &str,
+    after_load: impl FnOnce(),
+) -> (
+    crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    bool,
+    usize,
+) {
+    let mut prepared = PreparedClaudeLocalEvidence::load(support_dir, native, index);
+    let healthy = prepared.rows().healthy_roots.contains(root);
+    after_load();
+    let mut api = prepared.take_api(support_dir).expect("synthetic API read");
+    let permissive_rows = api.evidence.get(root).map_or(0, Vec::len);
+    (
+        api.take_strict_report(support_dir, root),
+        prepared.take_trace(support_dir, root),
+        healthy,
+        permissive_rows,
+    )
+}
+
 /// The dark path: contract-5 bodies are never built.
 pub(crate) fn apply_claude_local_evidence_to_scan(
     support_dir: &Path,
@@ -5112,6 +5635,55 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
+    apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, permit, None)
+}
+
+fn apply_claude_local_evidence_to_scan_with_prepared(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+    prepared: Option<PreparedClaudeLocalEvidence>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    apply_claude_local_evidence_to_scan_with_comparison(
+        support_dir,
+        scan_result,
+        index,
+        permit,
+        prepared,
+        None,
+        None,
+    )
+}
+
+fn apply_claude_local_evidence_to_scan_with_comparison(
+    support_dir: &Path,
+    scan_result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+    mut prepared: Option<PreparedClaudeLocalEvidence>,
+    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
+    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    // Actual native occurrences are recorded once BEFORE emission filtering.
+    // The authoritative fold still sees the actual terminal census decision.
+    let observations = comparison
+        .as_deref()
+        .map(|_| crate::snapshots::record_claude_native_observations(scan_result, index));
+    if let Some(fallback) = comparison
+        .as_deref()
+        .and_then(|comparison| comparison.fallback.as_ref())
+    {
+        fallback.withhold(scan_result);
+    }
     let emission_permitted = permit.is_some();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
@@ -5136,7 +5708,11 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         ..Default::default()
     };
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
-    match crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids) {
+    let api_load = match prepared.as_mut() {
+        Some(read) => read.take_api(support_dir),
+        None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids),
+    };
+    match api_load {
         Ok(evidence) => {
             let census_window_end = scan_result.census_window_end.clone();
             crate::snapshots::apply_claude_effort_evidence_with_index(
@@ -5191,10 +5767,13 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     for root_session_id in usage_roots {
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
-        let mut trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
-            support_dir,
-            [root_session_id.clone()],
-        );
+        let mut trace = match prepared.as_mut() {
+            Some(read) => read.take_trace(support_dir, &root_session_id),
+            None => crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                support_dir,
+                [root_session_id.clone()],
+            ),
+        };
         if !api.health.is_complete() {
             stats.api_incomplete_root_count += 1;
         }
@@ -5250,13 +5829,27 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
     });
-    let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_identity(
+    let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
         &trace_report,
         index,
         identity_evidence.as_ref(),
+        observations,
+        comparison
+            .as_deref()
+            .map(|comparison| comparison.fold_view(lease)),
     );
+    if let Some(fallback) = comparison
+        .as_deref()
+        .and_then(|comparison| comparison.fallback.as_ref())
+    {
+        fallback.after_native_fold(scan_result, index);
+        disposition.transcript_ownership_complete = false;
+    }
+    if let Some(comparison) = comparison {
+        comparison.retire_native_fold_owner();
+    }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.
@@ -16835,6 +17428,13 @@ mod tests {
     include!("retry_bounded_native_tests.rs");
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
+    mod p12_base_exit_tests {
+        include!("snapshot_sync/p12_base_exit_tests.rs");
+    }
+    mod p12_pipeline_original_tests {
+        include!("snapshot_sync/p12_pipeline_original_tests.rs");
+    }
+
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
@@ -18247,7 +18847,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 
@@ -18258,3 +18858,6 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 mod h357_ack_tests;
 
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason);
+
+crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
+crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);

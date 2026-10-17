@@ -182,6 +182,10 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
                 .insert("opaque".into(), serde_json::json!({"opaque":true}));
         }
         Ok(Some(SourcePreparation {
+            native_comparison_lease: None,
+            prepared_claude_evidence: None,
+            terminal_native_traversal: None,
+            native_comparison_controller: None,
             retry_authority: None,
             source,
             claude_scan_roots: None,

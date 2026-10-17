@@ -3820,12 +3820,15 @@ fn apply_claude_reported_usage_with_index_and_limits(
         max_duplicate_owners,
         identity,
         &BTreeSet::new(),
+        None,
+        None,
     )
 }
 
 /// Current-page reads defer earlier empty-pair completion until finalization
 /// and file selection. In particular a failed newer read cannot certify the
 /// previously stored empty revision as this page's current result.
+#[cfg(test)]
 pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
     scan: &mut SourceScanResult,
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -3833,6 +3836,78 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
     index: &mut ScanIndex,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
+    apply_claude_reported_usage_to_scan_with_observations(
+        scan,
+        api_report,
+        trace_report,
+        index,
+        identity,
+        None,
+    )
+}
+
+// A consumed receipt, not a second graph of snapshots or provider rows. It can
+// only be minted by accumulating actual native occurrences into this index.
+// No S/possible-owner input and no Clone implementation exist.
+pub(crate) struct ClaudeNativeObservations {
+    counts: ClaudeDuplicateCensusCounts,
+    census_window_end: String,
+    index_generation: u64,
+}
+
+#[allow(dead_code)] // The inactive driver's pre-offer path is not integrated yet.
+pub(crate) fn record_claude_native_observations(
+    scan: &SourceScanResult,
+    index: &mut ScanIndex,
+) -> ClaudeNativeObservations {
+    ClaudeNativeObservations {
+        counts: accumulate_claude_usage_family_pending_with_limit(
+            &scan.snapshots,
+            &mut index.claude_usage_family_pending,
+            &scan.census_window_end,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        ),
+        census_window_end: scan.census_window_end.clone(),
+        index_generation: index.generation,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
+    scan: &mut SourceScanResult,
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+    observations: Option<ClaudeNativeObservations>,
+) -> ClaudeUsageAuthorityDisposition {
+    apply_claude_reported_usage_to_scan_with_comparison(
+        scan,
+        api_report,
+        trace_report,
+        index,
+        identity,
+        observations,
+        None,
+    )
+}
+
+pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
+    scan: &mut SourceScanResult,
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+    observations: Option<ClaudeNativeObservations>,
+    comparison: Option<claude_native_comparison::FoldView<'_>>,
+) -> ClaudeUsageAuthorityDisposition {
+    // A previous unsettled upload requires a clean followup before manifest /
+    // replay settlement, but cannot erase the actual healthy terminal native
+    // window. Fold those observations once before any recovered body can leave.
+    let native_census_complete = scan.census_complete
+        || comparison
+            .as_ref()
+            .is_some_and(|view| view.native_census_complete(scan));
     let current_files = if index.claude_usage_authority_quarantine.is_empty() {
         BTreeSet::new()
     } else {
@@ -3846,12 +3921,14 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
         api_report,
         trace_report,
         index,
-        scan.census_complete,
+        native_census_complete,
         &scan.census_window_end,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
         MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
         identity,
         &current_files,
+        observations,
+        comparison.and_then(|view| view.negatives),
     )
 }
 
@@ -3867,13 +3944,28 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     max_duplicate_owners: usize,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     current_files: &BTreeSet<String>,
+    observations: Option<ClaudeNativeObservations>,
+    negatives: Option<claude_native_comparison::NegativeView<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
-    let mut duplicate_census = accumulate_claude_usage_family_pending_with_limit(
-        snapshots,
-        &mut index.claude_usage_family_pending,
-        census_window_end,
-        max_pending_occurrences,
-    );
+    let mut duplicate_census = match observations {
+        Some(observed) => {
+            assert_eq!(
+                observed.census_window_end, census_window_end,
+                "native observations cannot cross census windows"
+            );
+            assert_eq!(
+                observed.index_generation, index.generation,
+                "native observations cannot cross selected-index saves"
+            );
+            observed.counts
+        }
+        None => accumulate_claude_usage_family_pending_with_limit(
+            snapshots,
+            &mut index.claude_usage_family_pending,
+            census_window_end,
+            max_pending_occurrences,
+        ),
+    };
     duplicate_census.census_complete = census_complete;
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
 
@@ -4013,48 +4105,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .get(&root_session_id)
             .or_else(|| reconstructed.get(&root_session_id));
         let Some(family) = family else { continue };
-        let Some(rows) = family.rows_by_member.get(&item.source_session_id) else {
+        let Some((rows, excluded_request_hashes)) = claude_reported_usage_inputs(item, family)
+        else {
             continue;
         };
-        let excluded_request_hashes = family
-            .witness
-            .legacy_excluded_request_id_hashes
-            .get(&item.source_session_id)
-            .cloned()
-            .unwrap_or_default();
-        let request_hashes = item
-            .claude_usage_request_ids
-            .iter()
-            .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
-            .filter(|request_hash| !excluded_request_hashes.contains(request_hash))
-            .collect::<BTreeSet<_>>();
-        if family
-            .witness
-            .member_request_id_fingerprints
-            .get(&item.source_session_id)
-            != Some(&claude_request_id_set_fingerprint(&request_hashes))
-        {
-            continue;
-        }
-        let current_occurrences = item
-            .claude_usage_occurrences
-            .iter()
-            .map(|(request_id, occurrence)| {
-                (
-                    format!("{:x}", Sha256::digest(request_id.as_bytes())),
-                    ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
-                )
-            })
-            .filter(|(request_hash, _)| !excluded_request_hashes.contains(request_hash))
-            .collect::<BTreeMap<_, _>>();
-        if family
-            .witness
-            .member_occurrence_fingerprints
-            .get(&item.source_session_id)
-            != Some(&claude_occurrence_map_fingerprint(&current_occurrences))
-        {
-            continue;
-        }
         // The rebuild mirrors each of its rows into the grouping, so groups
         // are bounded by the rows it builds, never by the request count.
         let mut sink = identity.and_then(|evidence| {
@@ -4693,6 +4747,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .iter()
             .map(|item| item.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
+        // Final proof and demotion state, not the preflight's possible owners.
+        // Every other rearm disjunct below remains authoritative.
+        let negative_keys =
+            if !duplicate_census_invalid && !index.claude_duplicate_request_witness_overflowed {
+                negatives
+                    .as_ref()
+                    .map(|view| view.keys(index, &demoting_members_by_root, &complete_families))
+                    .unwrap_or_default()
+            } else {
+                BTreeSet::new()
+            };
         for (index_key, entry) in &mut index.files {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
@@ -4709,8 +4774,23 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                 });
             if full_rearm
-                || (proven.contains_key(&root_session_id)
-                    && !current_ids.contains(source_session_id.as_str()))
+                || {
+                    let proof_rearm = proven.contains_key(&root_session_id)
+                        && !current_ids.contains(source_session_id.as_str())
+                        && !negative_keys.contains(index_key.as_str());
+                    #[cfg(test)]
+                    {
+                        proof_rearm
+                            && !envelope_selection_experiment::suppress_certified_negative_rearm(
+                                &root_session_id,
+                                index_key,
+                            )
+                    }
+                    #[cfg(not(test))]
+                    {
+                        proof_rearm
+                    }
+                }
                 || invalidated_witness_roots.contains(&root_session_id)
                 || changed_duplicate_owners.contains(&duplicate_owner)
                 || current_member_owns_changed_request
@@ -5215,9 +5295,24 @@ fn claude_legacy_request_owners(
     if !api_report.health.is_complete() || !trace_report.is_complete() {
         return None;
     }
+    claude_legacy_request_owners_from_rows(api_report.evidence.iter(), &trace_report.evidence)
+}
+
+fn claude_legacy_request_owners_from_rows<'a>(
+    api_rows: impl IntoIterator<
+        Item = (
+            &'a String,
+            &'a Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
+        ),
+    >,
+    trace_rows_by_root: &BTreeMap<
+        String,
+        Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
+    >,
+) -> Option<BTreeMap<String, ClaudeLegacyRequestOwner>> {
     let mut owners = BTreeMap::new();
-    for (root_session_id, api_rows) in &api_report.evidence {
-        let trace_rows = trace_report.evidence.get(root_session_id)?;
+    for (root_session_id, api_rows) in api_rows {
+        let trace_rows = trace_rows_by_root.get(root_session_id)?;
         let members = std::iter::once(root_session_id.clone())
             .chain(
                 trace_rows
@@ -5433,17 +5528,51 @@ fn reconstruct_claude_usage_family(
     trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
     legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
 ) -> Option<ProvenClaudeUsageFamily> {
+    reconstruct_claude_usage_family_from_rows(
+        root_session_id,
+        witness,
+        api_report.evidence.get(root_session_id)?,
+        trace_report.evidence.get(root_session_id)?,
+        legacy_request_owners,
+    )
+}
+
+fn reconstruct_claude_usage_family_from_rows(
+    root_session_id: &str,
+    witness: &ClaudeUsageFamilyWitness,
+    api_rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+) -> Option<ProvenClaudeUsageFamily> {
+    let reduced = reconstruct_claude_usage_ledger_from_rows(
+        root_session_id,
+        witness,
+        api_rows,
+        trace_rows,
+        legacy_request_owners,
+    )?;
+    Some(ProvenClaudeUsageFamily {
+        witness: witness.clone(),
+        rows_by_member: reduced.rows_by_member,
+    })
+}
+
+// Share the exact validation without retaining a second copy of the API rows
+// in the moving comparison plan. The base caller discards assigned hashes as
+// before; preparation moves them into its small, negative-only envelope.
+fn reconstruct_claude_usage_ledger_from_rows(
+    root_session_id: &str,
+    witness: &ClaudeUsageFamilyWitness,
+    api_rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+) -> Option<ReducedClaudeUsageLedger> {
     let members = witness
         .member_request_id_fingerprints
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let reduced = reduce_claude_usage_ledger(
-        root_session_id,
-        &members,
-        api_report.evidence.get(root_session_id)?,
-        trace_report.evidence.get(root_session_id)?,
-    )?;
+    let reduced = reduce_claude_usage_ledger(root_session_id, &members, api_rows, trace_rows)?;
     let assigned_request_id_fingerprints = reduced
         .assigned_request_id_hashes
         .iter()
@@ -5455,10 +5584,7 @@ fn reconstruct_claude_usage_family(
     {
         return None;
     }
-    Some(ProvenClaudeUsageFamily {
-        witness: witness.clone(),
-        rows_by_member: reduced.rows_by_member,
-    })
+    Some(reduced)
 }
 
 fn reduce_claude_usage_ledger(
@@ -6221,12 +6347,72 @@ fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
     }
 }
 
-fn rebuild_claude_reported_usage(
-    item: &mut SnapshotItem,
+fn claude_reported_usage_inputs<'a>(
+    item: &SnapshotItem,
+    family: &'a ProvenClaudeUsageFamily,
+) -> Option<(
+    &'a [crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    BTreeSet<String>,
+)> {
+    let rows = family.rows_by_member.get(&item.source_session_id)?;
+    let excluded_request_hashes = family
+        .witness
+        .legacy_excluded_request_id_hashes
+        .get(&item.source_session_id)
+        .cloned()
+        .unwrap_or_default();
+    let request_hashes = item
+        .claude_usage_request_ids
+        .iter()
+        .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
+        .filter(|request_hash| !excluded_request_hashes.contains(request_hash))
+        .collect::<BTreeSet<_>>();
+    if family
+        .witness
+        .member_request_id_fingerprints
+        .get(&item.source_session_id)
+        != Some(&claude_request_id_set_fingerprint(&request_hashes))
+    {
+        return None;
+    }
+    let current_occurrences = item
+        .claude_usage_occurrences
+        .iter()
+        .map(|(request_id, occurrence)| {
+            (
+                format!("{:x}", Sha256::digest(request_id.as_bytes())),
+                ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
+            )
+        })
+        .filter(|(request_hash, _)| !excluded_request_hashes.contains(request_hash))
+        .collect::<BTreeMap<_, _>>();
+    if family
+        .witness
+        .member_occurrence_fingerprints
+        .get(&item.source_session_id)
+        != Some(&claude_occurrence_map_fingerprint(&current_occurrences))
+    {
+        return None;
+    }
+    Some((rows, excluded_request_hashes))
+}
+
+struct PreparedClaudeReportedUsage {
+    totals: UsageTotals,
+    model_usage: Vec<SnapshotModelUsage>,
+    usage_buckets: Vec<SnapshotUsageBucket>,
+    reported_activity: UsageBucketState,
+    cost: Option<SnapshotCost>,
+}
+
+// The exact same derivation decides both preflight eligibility and the
+// authoritative rebuild. It cannot change a body, index, or ownership witness.
+fn prepare_claude_reported_usage(
+    item: &SnapshotItem,
     rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
     excluded_request_hashes: &BTreeSet<String>,
     mut sink: Option<&mut claude_request_identity::RequestSink<'_, '_>>,
-) -> bool {
+) -> Option<PreparedClaudeReportedUsage> {
     let owned_request_ids = item
         .claude_usage_request_ids
         .iter()
@@ -6246,7 +6432,7 @@ fn rebuild_claude_reported_usage(
                 .contains(&format!("{:x}", Sha256::digest(row.request_id.as_bytes())))
         })
     {
-        return false;
+        return None;
     }
     let account_hashes = rows
         .iter()
@@ -6267,10 +6453,7 @@ fn rebuild_claude_reported_usage(
             .map(u128::from)
             .and_then(|value| value.checked_mul(1_000_000));
         if let Some(cost_picos) = cost_picos {
-            total_cost_picos = match total_cost_picos.checked_add(cost_picos) {
-                Some(value) => value,
-                None => return false,
-            };
+            total_cost_picos = total_cost_picos.checked_add(cost_picos)?;
         } else {
             cost_complete = false;
         }
@@ -6287,7 +6470,7 @@ fn rebuild_claude_reported_usage(
                     .get("speed_mode")
                     .is_some_and(|existing| existing != speed)
             }) {
-                return false;
+                return None;
             }
             insert_selector_raw(
                 &mut selector,
@@ -6304,7 +6487,7 @@ fn rebuild_claude_reported_usage(
             .zip(reported_effort.as_deref())
             .is_some_and(|(transcript, reported)| transcript != reported)
         {
-            return false;
+            return None;
         }
         let effort = occurrence
             .and_then(|occurrence| occurrence.reasoning_effort.clone())
@@ -6329,7 +6512,7 @@ fn rebuild_claude_reported_usage(
                     .as_deref()
                     .is_some_and(|model| model != row.model)
             {
-                return false;
+                return None;
             }
             (
                 occurrence.usage.clone(),
@@ -6372,12 +6555,9 @@ fn rebuild_claude_reported_usage(
             cache_creation: None,
         });
         if !totals.add(&usage) {
-            return false;
+            return None;
         }
-        let Some((bucket_start, normalized_timestamp)) = activity_bucket_from_timestamp(&timestamp)
-        else {
-            return false;
-        };
+        let (bucket_start, normalized_timestamp) = activity_bucket_from_timestamp(&timestamp)?;
         let (row_key, selector_context, selector_sources) =
             build_row_identity(&model, &selector, effort.as_deref());
         if let Some(sink) = sink.as_deref_mut() {
@@ -6402,7 +6582,7 @@ fn rebuild_claude_reported_usage(
                     existing.selector_sources.insert(field, source);
                 }
                 if !existing.usage.add(&usage) {
-                    return false;
+                    return None;
                 }
             }
             None => {
@@ -6446,7 +6626,7 @@ fn rebuild_claude_reported_usage(
         });
     }
     if session_rows.is_empty() {
-        return false;
+        return None;
     }
     let mut model_usage = session_rows
         .iter()
@@ -6455,6 +6635,38 @@ fn rebuild_claude_reported_usage(
     for row in &mut model_usage {
         row.account_identifier_hash = account_identifier_hash.clone();
     }
+    Some(PreparedClaudeReportedUsage {
+        totals,
+        model_usage,
+        usage_buckets,
+        reported_activity,
+        cost: cost_complete.then(|| SnapshotCost {
+            total_cost_usd: Some(usd_picos_string(total_cost_picos)),
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
+            evidence_source: "claude_code_api_request".to_string(),
+        }),
+    })
+}
+
+fn rebuild_claude_reported_usage(
+    item: &mut SnapshotItem,
+    rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    excluded_request_hashes: &BTreeSet<String>,
+    sink: Option<&mut claude_request_identity::RequestSink<'_, '_>>,
+) -> bool {
+    let Some(PreparedClaudeReportedUsage {
+        totals,
+        model_usage,
+        usage_buckets,
+        reported_activity,
+        cost,
+    }) = prepare_claude_reported_usage(item, rows, excluded_request_hashes, sink)
+    else {
+        return false;
+    };
     item.input_tokens = totals.input_tokens;
     item.output_tokens = totals.output_tokens;
     item.cache_read_tokens = totals.cache_read_tokens;
@@ -6490,14 +6702,7 @@ fn rebuild_claude_reported_usage(
             item.source_ended_at = Some(last_activity_at);
         }
     }
-    item.cost = cost_complete.then(|| SnapshotCost {
-        total_cost_usd: Some(usd_picos_string(total_cost_picos)),
-        input_cost_usd: None,
-        output_cost_usd: None,
-        cache_read_cost_usd: None,
-        cache_creation_cost_usd: None,
-        evidence_source: "claude_code_api_request".to_string(),
-    });
+    item.cost = cost;
     true
 }
 
@@ -11568,6 +11773,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             OwnedSourceScanStep::Complete {
                 index: complete_index,
                 scan,
+                ..
             } => {
                 *index = complete_index;
                 return Ok(scan);
@@ -11657,7 +11863,10 @@ fn prepare_owned_scan_candidate(
     candidate.source_file_fingerprint = sidecar_fingerprint;
 }
 
+pub(crate) mod claude_native_comparison;
+
 pub(crate) struct OwnedSourceScan {
+    native_comparison: Option<claude_native_comparison::NativePhase>,
     resource_probe: crate::local_resource_diagnostics::Probe,
     sampling: Option<sampled_scan::Context>,
     source: SnapshotSource,
@@ -11722,9 +11931,145 @@ pub(crate) enum OwnedSourceScanStep {
     Complete {
         index: ScanIndex,
         scan: SourceScanResult,
+        terminal_native_traversal: Option<Box<claude_native_comparison::TerminalTraversal>>,
     },
 }
 impl OwnedSourceScan {
+    pub(crate) fn enable_native_comparison(&mut self) {
+        if self.source == SnapshotSource::ClaudeCode {
+            self.native_comparison = Some(claude_native_comparison::NativePhase::default());
+        }
+    }
+
+    pub(crate) fn native_comparison_ready(&self) -> bool {
+        self.native_comparison
+            .as_ref()
+            .is_some_and(|phase| phase.ready())
+    }
+
+    pub(crate) fn native_comparison_support_dir(&self) -> Option<&Path> {
+        self.claude_effort_support_dir.as_deref()
+    }
+
+    pub(crate) fn native_comparison_context(&self) -> Option<&str> {
+        self.index
+            .traversal
+            .as_ref()
+            .map(|traversal| traversal.context_fingerprint.as_str())
+    }
+
+    pub(crate) fn resume_native_comparison_base(&mut self) {
+        if let Some(phase) = self.native_comparison.as_mut() {
+            phase.resume();
+        }
+    }
+
+    pub(crate) fn disable_native_comparison(&mut self) {
+        if let Some(phase) = self.native_comparison.as_mut() {
+            phase.disable();
+        }
+    }
+
+    pub(crate) fn native_comparison_inputs(&self) -> (&ScanIndex, &[SnapshotItem]) {
+        (&self.index, &self.snapshots)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_native_comparison(
+        &mut self,
+        rows: claude_native_comparison::PairedRows<'_>,
+    ) -> claude_native_comparison::Qualification {
+        self.prepare_native_comparison_with_window(rows, None)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn prepare_native_comparison_with_window(
+        &mut self,
+        rows: claude_native_comparison::PairedRows<'_>,
+        previous: Option<Box<claude_native_comparison::WindowEligibility>>,
+    ) -> Option<claude_native_comparison::Qualification> {
+        let healthy = self.native_comparison_is_healthy();
+        let phase = self
+            .native_comparison
+            .as_mut()
+            .expect("native comparison opted in");
+        let qualification =
+            if healthy && phase.import_window(previous, &self.index, &self.census_window_end) {
+                Some(phase.qualify(&self.index, &self.snapshots, &self.census_window_end, rows))
+            } else {
+                None
+            };
+        phase.resume();
+        qualification
+    }
+
+    fn native_comparison_is_healthy(&self) -> bool {
+        // Before census counters are folded into traversal, require no local
+        // read/parser loss and a healthy retained traversal. Unknown is base.
+        let local = &self.census;
+        self.state_census_complete
+            && self.sidecar_census_complete
+            && local.directory_entry_cap_exceeded_count == 0
+            && local.symlink_rejected_count == 0
+            && local.unreadable_path_count == 0
+            && local.oversized_file_count == 0
+            && local.disappeared_file_count == 0
+            && local.malformed_json_line_count == 0
+            && local.invalid_utf8_line_count == 0
+            && local.over_line_cap_count == 0
+            && local.recognized_usage_drop_count == 0
+            && local.ownership_incomplete_file_count == 0
+            && local.zero_snapshot_usage_evidence_count == 0
+            && local.dropped_usage_record_count == 0
+            && self
+                .index
+                .traversal
+                .as_ref()
+                .is_some_and(|traversal| !traversal.counts.has_errors())
+    }
+
+    pub(crate) fn take_native_comparison_acquisition(
+        &self,
+        qualification: &mut claude_native_comparison::Qualification,
+    ) -> claude_native_comparison::TargetAcquisition {
+        assert!(self.active_file.is_none() && self.identified_candidates.is_empty());
+        qualification.take_native_acquisition(
+            &self.snapshots,
+            &self.pending_finalization,
+            self.native_comparison_is_healthy(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_native_comparison_targets(
+        &mut self,
+        qualification: &mut claude_native_comparison::Qualification,
+    ) -> claude_native_comparison::TargetSelection {
+        self.acquire_native_comparison_targets_after(qualification, 0)
+    }
+
+    fn acquire_native_comparison_targets_after(
+        &mut self,
+        qualification: &mut claude_native_comparison::Qualification,
+        frontier: usize,
+    ) -> claude_native_comparison::TargetSelection {
+        assert!(self.active_file.is_none() && self.identified_candidates.is_empty());
+        let (candidates, selection) = qualification.take_target_candidates_after(
+            &self.snapshots,
+            frontier,
+            self.file_limit.saturating_sub(self.scanned_file_count),
+        );
+        if !candidates.is_empty() {
+            let phase = self
+                .native_comparison
+                .as_mut()
+                .expect("native comparison opted in");
+            phase.start_targets(&candidates);
+            self.identified_candidates.extend(candidates);
+        }
+        selection
+    }
+
     #[cfg(test)]
     pub(crate) fn test_active_physical_lines(&self) -> usize {
         self.active_file
@@ -11770,6 +12115,42 @@ impl OwnedSourceScan {
     pub(crate) fn new_with_identity_capture(
         source: SnapshotSource,
         roots: &[PathBuf],
+        owned_index: ScanIndex,
+        collected_at: &str,
+        requested_backfill_window_days: u64,
+        file_limit: usize,
+        artifacts_enabled: bool,
+        claude_effort_support_dir: Option<&Path>,
+        hinted_paths: &[PathBuf],
+        watcher_overflowed: bool,
+        context_curve_enabled: bool,
+        claude_request_identity_capture: bool,
+    ) -> Self {
+        Self::new_with_identity_capture_and_recovery_priority(
+            source,
+            roots,
+            owned_index,
+            collected_at,
+            requested_backfill_window_days,
+            file_limit,
+            artifacts_enabled,
+            claude_effort_support_dir,
+            hinted_paths,
+            watcher_overflowed,
+            context_curve_enabled,
+            claude_request_identity_capture,
+            &[],
+        )
+    }
+
+    /// Inactive source seam for already queued, durably rearmed recovery paths.
+    /// This only changes native selection order, never ownership or settlement.
+    /// The controller must still bind its process/source/destination scope and
+    /// prove selected-save/restart liveness before using it.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn new_with_identity_capture_and_recovery_priority(
+        source: SnapshotSource,
+        roots: &[PathBuf],
         mut owned_index: ScanIndex,
         collected_at: &str,
         requested_backfill_window_days: u64,
@@ -11780,6 +12161,7 @@ impl OwnedSourceScan {
         watcher_overflowed: bool,
         context_curve_enabled: bool,
         claude_request_identity_capture: bool,
+        recovery_priority: &[PathBuf],
     ) -> Self {
         let resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
@@ -11905,6 +12287,55 @@ impl OwnedSourceScan {
         let hinted_budget = selection_limit
             .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
+        // Recovery must be selected before audits consume the page. Only
+        // existing queued paths with durable rearm debt are eligible here.
+        // Unknown/outside-page paths are not injected, and no deadline, source
+        // fingerprint, census flag or budget is changed by selection.
+        if source == SnapshotSource::ClaudeCode && claude_native_comparison::enabled() {
+            if recovery_priority.is_empty() {
+                // Selected fallback persists A at the front of this SAME
+                // queue with existing empty-fp debt. A restarted process has
+                // no lease/certificate or separate recovery path list. Honor
+                // only that queued debt prefix before audits; never inject a
+                // path, scan for missing members or mint native eligibility.
+                while pending_paths.len() < selection_limit {
+                    let known_debt =
+                        traversal
+                            .pending_candidates
+                            .front()
+                            .is_some_and(|candidate| {
+                                index
+                                    .files
+                                    .get(&local_index_key(&candidate.path))
+                                    .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                            });
+                    if !known_debt {
+                        break;
+                    }
+                    if let Some(candidate) = traversal.pending_candidates.pop_front() {
+                        pending_paths.push(candidate);
+                    }
+                }
+            } else {
+                claude_native_comparison::select_recovery_before_audits(
+                    &mut traversal.pending_candidates,
+                    &mut pending_paths,
+                    &index.files,
+                    recovery_priority,
+                    selection_limit,
+                );
+            }
+        }
+        // Nonshipping candidate: exercise target priority at the actual
+        // selection boundary, before audits, with the unchanged page cap.
+        #[cfg(test)]
+        envelope_selection_experiment::before_audit_selection(
+            source,
+            &mut traversal.pending_candidates,
+            &mut pending_paths,
+            &mut index.files,
+            selection_limit,
+        );
         let audit_now = sampled_scan::now_seconds();
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
@@ -12147,6 +12578,7 @@ impl OwnedSourceScan {
                 inventory
             });
         Self {
+            native_comparison: None,
             resource_probe,
             sampling: None,
             source,
@@ -12256,6 +12688,7 @@ impl OwnedSourceScan {
             self.release_sampled_cache_for_copy_refusal();
         }
         let Self {
+            mut native_comparison,
             resource_probe,
             mut sampling,
             index: mut index_storage,
@@ -13243,6 +13676,12 @@ impl OwnedSourceScan {
                 pending!();
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
+                if native_comparison
+                    .as_mut()
+                    .is_some_and(|phase| phase.pause_before_finalization())
+                {
+                    pending!();
+                }
                 if let Some(traversal) = index.traversal.as_mut() {
                     traversal.codex_parent_resolution_retry_required |=
                         codex_parent_resolution_retry_required;
@@ -13519,6 +13958,7 @@ impl OwnedSourceScan {
                         &traversal_snapshot.observed_index_keys,
                     );
                 }
+                let mut terminal_native_traversal = None;
                 if (raw_census_complete
                     && codex_legacy_join_baselines.is_empty()
                     && !pending_finalization.iter().any(|pending| {
@@ -13530,6 +13970,13 @@ impl OwnedSourceScan {
                     || restart_after_hints
                     || parent_resolution_restart
                 {
+                    terminal_native_traversal = claude_native_comparison::TerminalTraversal::take(
+                        index,
+                        source,
+                        native_comparison.is_some(),
+                        raw_census_complete,
+                        &census_window_end,
+                    );
                     index.traversal = None;
                     index.resume_after_path = None;
                     index.resume_upper_bound_path = None;
@@ -13687,6 +14134,7 @@ impl OwnedSourceScan {
                 return OwnedSourceScanStep::Complete {
                     index: index_storage,
                     scan,
+                    terminal_native_traversal,
                 };
             };
             let preflight_source_file_fingerprint =
@@ -13780,6 +14228,20 @@ impl OwnedSourceScan {
                     )
                 })
                 .unwrap_or_else(|| index.candidate_decision_with_reason(&candidate));
+            let target_match = native_comparison
+                .as_ref()
+                .and_then(|phase| phase.target_revision_matches(&candidate));
+            if target_match == Some(false) {
+                // Comparison requires this exact frozen object and sidecars.
+                // The ordinary path may reparse replacements, but a target
+                // cannot silently claim that it compared the frozen revision.
+                census.disappeared_file_count += 1;
+                pending!();
+            }
+            let comparison_target = target_match == Some(true);
+            if comparison_target {
+                decision = CandidateDecision::Parse;
+            }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.claude_parse_reasons[reason as usize];
@@ -13815,6 +14277,9 @@ impl OwnedSourceScan {
             }
             match decision {
                 CandidateDecision::Skip => {
+                    if let Some(phase) = native_comparison.as_mut() {
+                        phase.record_actual_skip(index, &candidate, &census_window_end);
+                    }
                     if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
                         census.add_terminal_jsonl_loss(loss);
                     }
@@ -13825,6 +14290,11 @@ impl OwnedSourceScan {
                     pending!();
                 }
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
+            }
+            if let Some(phase) = native_comparison.as_mut() {
+                // This is an actual native acquisition attempt, before parser
+                // construction can fail or complete with no emitted entity.
+                phase.record_parse_attempt(&candidate);
             }
             scanned_file_count += 1;
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
@@ -13896,6 +14366,7 @@ impl OwnedSourceScan {
                         && index.files.contains_key(&key)
                         && !protected
                         && !forced_family
+                        && !comparison_target
                         && !parent_proof_required
                         && (debt.is_some() || context.audit_slots > 0);
                         let scope = context.file_scope(
@@ -13954,6 +14425,7 @@ impl OwnedSourceScan {
             pending!();
         }
         OwnedSourceScanStep::Pending(Self {
+            native_comparison,
             resource_probe,
             sampling,
             source,
@@ -25528,6 +26000,11 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
 }
 
 #[cfg(test)]
+pub(crate) mod envelope_selection_experiment {
+    include!("snapshots/envelope_selection_experiment.rs");
+}
+
+#[cfg(test)]
 mod tests {
     include!("snapshots/claude_request_account_tests.rs");
     mod claude_request_identity_tests {
@@ -25536,6 +26013,13 @@ mod tests {
     mod census_convergence_tests {
         include!("snapshots/census_convergence_tests.rs");
     }
+    mod p12_base_exit_tests {
+        include!("snapshots/p12_base_exit_tests.rs");
+    }
+    mod p12_usage_original_tests {
+        include!("snapshots/p12_usage_original_tests.rs");
+    }
+
     mod giant_row_measurement_tests {
         include!("snapshots/giant_row_measurement_tests.rs");
     }
@@ -56560,7 +57044,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger);
 crate::heap_layout_bound::fields!(OwnedActiveFile; sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::heap_layout_bound::fields!(OwnedSourceScan; resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
@@ -56872,3 +57356,8 @@ mod census_unreadable_tests {
         );
     }
 }
+
+crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_member);
+
+crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
+crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until);

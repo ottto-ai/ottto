@@ -179,7 +179,7 @@ fn raw_scan_capturing(
             });
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete { index, scan } => {
+            OwnedSourceScanStep::Complete { index, scan, .. } => {
                 return Run {
                     index,
                     result: scan,
