@@ -3828,6 +3828,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
 /// Current-page reads defer earlier empty-pair completion until finalization
 /// and file selection. In particular a failed newer read cannot certify the
 /// previously stored empty revision as this page's current result.
+#[cfg(test)]
 pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
     scan: &mut SourceScanResult,
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -3871,6 +3872,7 @@ pub(crate) fn record_claude_native_observations(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
     scan: &mut SourceScanResult,
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,

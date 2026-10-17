@@ -1717,6 +1717,7 @@ pub(crate) fn comparison_partial_fallback_for_test(
 /// Hold the progress lock through index CAS: neither an unsaved ACK nor a
 /// racing ledger generation may certify the scan's new file/body witnesses.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn checkpoint_partial_snapshot_index(
     index: &ScanIndex,
     committed_index: &ScanIndex,
