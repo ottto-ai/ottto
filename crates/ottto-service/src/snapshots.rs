@@ -35,6 +35,7 @@ mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
 mod context_curve;
+mod h527_candidates;
 #[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]

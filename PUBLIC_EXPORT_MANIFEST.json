@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 662,
-  "content_sha256": "fc7a5018bdf9f57beaa530c2291a05b98462b247d7c2799621fc0cd89a189536",
+  "candidate_file_count": 666,
+  "content_sha256": "f9cd124d7a79e03bcbabee4f2f35be0f23c2c09dfc9d7ae0acb18e93fd60e64b",
   "files": [
     {
       "executable": false,
@@ -1238,8 +1238,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "df037fc57cd5863fff789d0c3b7b9752fe75614ff05be84e7f5ce30725d9e362",
-      "size_bytes": 2463548
+      "sha256": "c72af8e7c708e5fe0a0308e102f23e2b5454fe2f4c3e9d3d927c82c17b09e54c",
+      "size_bytes": 2463569
     },
     {
       "executable": false,
@@ -1345,6 +1345,20 @@
       "path": "crates/ottto-service/src/snapshots/giant_row_measurement_tests.rs",
       "sha256": "4901febe540660dd3dd34a81f1ff599615f59dc4733afc2294b8cbfd5dced220",
       "size_bytes": 17307
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/h527_candidates.rs",
+      "sha256": "4149a23c7609206e43a8f98059487ca55e0a44d82fba2a058cd0c1c6e8a44659",
+      "size_bytes": 21490
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/h527_candidates/tests.rs",
+      "sha256": "8cca54d275fad1319b5d3c23b9dfb50dd016ae957f899e445f10ce6af23cd87f",
+      "size_bytes": 19022
     },
     {
       "executable": false,
@@ -2882,6 +2896,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-17-h527-candidate-exporter.md",
+      "sha256": "70dc871ad0e99046fb56cd8434b4e102aa793fc93904a835c24a10997600f0e7",
+      "size_bytes": 4692
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-17-snapshot-packing-memory.md",
       "sha256": "3c885494ec9d74298ba695784959a6cc62fe49ba28ff76316a11dd9987a90de4",
       "size_bytes": 1787
@@ -3522,6 +3543,13 @@
       "path": "fixtures/diagnostics/redacted-bundle.json",
       "sha256": "5f288688816f7fe4b9152edc899ea48cdbe97b2a1fb1236e39eb087405ac268d",
       "size_bytes": 3171
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/h527-candidates/held-mixed.v1.json",
+      "sha256": "1718d6eebab7aea69d8814b18a3cb00c436c9f7b063d916874ad633397a22ebd",
+      "size_bytes": 9333
     },
     {
       "executable": false,
@@ -4639,7 +4667,7 @@
   ],
   "generated_at": "2026-10-17T00:29:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 663,
+  "output_file_count": 667,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
