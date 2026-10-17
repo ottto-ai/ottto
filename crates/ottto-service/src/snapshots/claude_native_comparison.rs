@@ -1107,7 +1107,7 @@ impl NativePhase {
         index: &ScanIndex,
         native: &[SnapshotItem],
         credit: &mut Option<crate::source_rotation::PaidReservation>,
-    ) -> bool {
+    ) -> Option<usize> {
         use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
         (|| {
             let paid = credit.as_mut()?;
@@ -1169,10 +1169,14 @@ impl NativePhase {
                         .checked_mul(std::mem::size_of::<(String, ())>())?,
                 )?;
             }
+            // Empty destination containers are still charged by the shared
+            // whole-owned walker after this constructor returns.
+            let mut empty = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            Qualification::default().completed_heap_bound(&mut empty)?;
+            cost.add(empty.bytes)?;
             paid.grow_for(paid.allocated().checked_add(cost.bytes)?)
-                .then_some(())
+                .then_some(cost.bytes)
         })()
-        .is_some()
     }
 
     #[cfg(test)]
@@ -1183,7 +1187,7 @@ impl NativePhase {
         census_window_end: &str,
         rows: PairedRows<'_>,
     ) -> Qualification {
-        self.qualify_with_credit(index, native, census_window_end, rows, None)
+        self.qualify_with_credit(index, native, census_window_end, rows, None, 0)
     }
 
     pub(super) fn qualify_with_credit(
@@ -1192,9 +1196,22 @@ impl NativePhase {
         native: &[SnapshotItem],
         census_window_end: &str,
         rows: PairedRows<'_>,
-        mut credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
+        credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
+        workspace: usize,
     ) -> Qualification {
         assert!(self.ready(), "preflight must precede native finalization");
+        let logical = credit.is_none();
+        let mut funding = match credit {
+            Some(slot) => match slot.as_mut() {
+                Some(paid) => Some(QualificationFunding {
+                    base: paid.allocated(),
+                    workspace,
+                    paid,
+                }),
+                None => return Qualification::default(),
+            },
+            None => None,
+        };
         let native_by_root = group_native_by_root(native);
         let correction_roots = self
             .native_corrections
@@ -1234,6 +1251,21 @@ impl NativePhase {
             self.disable();
             return Qualification::default();
         };
+        // Paid early qualification is deliberately E-empty. A logical test
+        // may exercise the canonical legacy branch, never a paid production
+        // caller: that global owner graph has no construction credit here.
+        if !logical {
+            selected_roots.retain(|root| {
+                index
+                    .claude_usage_family_witnesses
+                    .get(root)
+                    .is_some_and(|w| {
+                        w.legacy_excluded_request_id_hashes.is_empty()
+                            && w.legacy_owner_roots.is_empty()
+                            && w.legacy_exclusion_evidence_fingerprint.is_none()
+                    })
+            });
+        }
         let needs_legacy_owners = selected_roots.iter().any(|root| {
             index
                 .claude_usage_family_witnesses
@@ -1289,6 +1321,29 @@ impl NativePhase {
             let Some(trace) = rows.trace.get(root) else {
                 continue;
             };
+            // Prepay the canonical borrowed reduction and ALL root-local
+            // metadata before its first owned member/hash/tree allocation.
+            // Prior accepted families coexist; a refused next root stays BASE
+            // without erasing their exact negative evidence.
+            let occupied = match funding.as_mut() {
+                Some(funding) => {
+                    let plan = qualification_family_construction_peak(
+                        root,
+                        retained,
+                        api,
+                        trace,
+                        current_native,
+                    );
+                    let admitted = plan.and_then(|extra| {
+                        funding.root_peak(families.len(), retained_family_heap, extra)
+                    });
+                    let Some(occupied) = admitted else {
+                        continue;
+                    };
+                    occupied
+                }
+                None => 0,
+            };
             let Some(ledger) = reconstruct_claude_usage_ledger_borrowed(
                 root,
                 retained,
@@ -1298,24 +1353,11 @@ impl NativePhase {
             ) else {
                 continue;
             };
-            // Compute held constructor inputs once per family with current
-            // native members, never once per evidence row or growing bucket.
-            let held_prepare_workspace = if credit.is_some() && !current_native.is_empty() {
-                (|| {
-                    let mut held = crate::heap_layout_bound::Counter::new(
-                        crate::source_rotation::PARKED_BUDGET,
-                    );
-                    crate::heap_layout_bound::tree_nodes::<String, FrozenFamily>(
-                        families.len(),
-                        &mut held,
-                    )?;
-                    held.add(retained_family_heap)?;
-                    held.add(borrowed_claude_ledger_workspace(&ledger)?)?;
-                    Some(held.bytes)
-                })()
-            } else {
-                Some(0)
-            };
+            #[cfg(test)]
+            if funding.is_some() {
+                assert!(borrowed_claude_ledger_workspace(&ledger)
+                    .is_some_and(|bytes| bytes <= occupied));
+            }
             // Current members that would fail the exact authoritative rebuild
             // make this family ineligible. Shared checks include native set and
             // occurrence fingerprints, selectors, totals, clocks and overflow.
@@ -1325,17 +1367,15 @@ impl NativePhase {
                 else {
                     return true;
                 };
-                match credit.as_deref_mut() {
-                    Some(credit) => {
-                        credit.as_mut().and_then(|paid| {
-                            validate_claude_reported_usage_paid(
-                                item,
-                                rows,
-                                &excluded,
-                                held_prepare_workspace?,
-                                paid,
-                            )
-                        }) != Some(true)
+                match funding.as_mut() {
+                    Some(funding) => {
+                        validate_claude_reported_usage_paid(
+                            item,
+                            rows,
+                            &excluded,
+                            occupied,
+                            funding.paid,
+                        ) != Some(true)
                     }
                     None => {
                         // Only the explicit logical test adapter is unpriced;
@@ -1357,21 +1397,9 @@ impl NativePhase {
             if !self.parsed_roots.contains(root)
                 && captured.peek().is_some_and(|(_, skip)| skip.root == *root)
             {
-                // Complete physical membership bounds the captured leaves.
-                // Pay the new buffer before moving existing descriptors; a
-                // refusal leaves all earlier qualified roots intact.
+                // The root plan already paid this exact destination buffer;
+                // move the captured descriptor graph, never clone it.
                 let members = retained.member_request_id_fingerprints.len();
-                if let Some(credit) = credit.as_deref_mut() {
-                    let admitted = credit.as_mut().is_some_and(|paid| {
-                        members
-                            .checked_mul(std::mem::size_of::<(String, NormalSkip)>())
-                            .and_then(|bytes| paid.allocation_ceiling().checked_add(bytes))
-                            .is_some_and(|peak| paid.grow_for(peak))
-                    });
-                    if !admitted {
-                        continue;
-                    }
-                }
                 if certified.reserve_merge(members).is_none() {
                     continue;
                 }
@@ -1499,6 +1527,29 @@ impl NativePhase {
             }
             // ledger.rows_by_member drops here; no retained API row graph.
         }
+        // No captured/path graph or ledger temporary coexists with the final
+        // inline envelope construction beyond the prepaid root/summary cost.
+        drop(captured);
+        if let Some(funding) = funding.as_mut() {
+            let admitted = (|| {
+                let mut extra =
+                    crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+                let entries = families
+                    .values()
+                    .try_fold(0usize, |n, f| n.checked_add(f.envelope.len()))?;
+                extra.add(entries.checked_mul(std::mem::size_of::<EnvelopeMember>())?)?;
+                extra.add(families.len().checked_mul(std::mem::size_of::<String>())?)?;
+                extra.add(
+                    families
+                        .keys()
+                        .try_fold(0usize, |n, root| n.checked_add(root.len()))?,
+                )?;
+                funding.root_peak(families.len(), retained_family_heap, extra.bytes)
+            })();
+            if admitted.is_none() {
+                return Qualification::default();
+            }
+        }
         let mut qualification = Qualification::from_frozen_families(families);
         qualification.correction_revoked_keys = std::mem::take(&mut self.correction_revoked_keys);
         qualification.correction_forbidden_roots =
@@ -1524,6 +1575,171 @@ impl NativePhase {
             }));
         qualification
     }
+}
+
+/// Synchronous construction custody, borrowing the SAME moving reservation.
+/// `workspace` is the prepaid grouping/index view; `base` includes the old
+/// capture buffer and prepared rows. Root peaks replace one another, rather
+/// than adding every dropped temporary to the next family's allowance.
+struct QualificationFunding<'a> {
+    paid: &'a mut crate::source_rotation::PaidReservation,
+    base: usize,
+    workspace: usize,
+}
+impl QualificationFunding<'_> {
+    fn root_peak(&mut self, families: usize, retained: usize, extra: usize) -> Option<usize> {
+        use crate::heap_layout_bound::{self, Counter};
+        let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        // Include the destination node BEFORE insertion of this next root.
+        heap_layout_bound::tree_nodes::<String, FrozenFamily>(families.checked_add(1)?, &mut cost)?;
+        cost.add(retained)?;
+        cost.add(extra)?;
+        let peak = self
+            .base
+            .checked_add(self.workspace)?
+            .checked_add(cost.bytes)?;
+        self.paid.grow_for(peak).then_some(peak)
+    }
+}
+
+/// Allocation capacities of the EXISTING canonical borrowed reduction plus
+/// frozen metadata and per-current-member validation. No projection, IDs or
+/// strings are constructed by this input-only planner. E-nonempty families
+/// are not paid early candidates, so the legacy global owner graph is absent.
+pub(super) fn qualification_family_construction_peak(
+    root: &str,
+    witness: &ClaudeUsageFamilyWitness,
+    api: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    trace: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    native: &[&SnapshotItem],
+) -> Option<usize> {
+    use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
+    if !heap_layout_bound::layout_supported()
+        || !witness.legacy_excluded_request_id_hashes.is_empty()
+        || !witness.legacy_owner_roots.is_empty()
+        || witness.legacy_exclusion_evidence_fingerprint.is_some()
+    {
+        return None;
+    }
+    let members = witness.member_request_id_fingerprints.len();
+    let strings = witness
+        .member_request_id_fingerprints
+        .keys()
+        .try_fold(0usize, |n, member| n.checked_add(member.len()))?;
+    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+    // Canonical reconstruction: cloned member set, borrowed request trees,
+    // assigned sets/row buffers and its assigned-fingerprint validation map.
+    heap_layout_bound::tree_nodes::<String, ()>(members, &mut cost)?;
+    heap_layout_bound::tree_nodes::<&str, &crate::claude_local_otel::ClaudeLocalOtelEvidence>(
+        api.len(),
+        &mut cost,
+    )?;
+    heap_layout_bound::tree_nodes::<&str, &crate::claude_local_otel::ClaudeTraceOwnershipEvidence>(
+        trace.len(),
+        &mut cost,
+    )?;
+    heap_layout_bound::tree_nodes::<String, BTreeSet<String>>(members, &mut cost)?;
+    heap_layout_bound::tree_nodes::<String, Vec<&crate::claude_local_otel::ClaudeLocalOtelEvidence>>(
+        members, &mut cost,
+    )?;
+    heap_layout_bound::tree_nodes::<String, String>(members, &mut cost)?;
+    // One empty root per member plus every request node, including growth.
+    heap_layout_bound::tree_nodes::<String, ()>(api.len().checked_add(members)?, &mut cost)?;
+    cost.add(strings.checked_mul(4)?)?; // four independent cloned member keys
+    cost.add(members.checked_mul(64)?)?; // assigned fingerprints
+    cost.add(api.len().checked_mul(64)?)?; // retained request-hash strings
+                                           // Per-member Vec push: <=4A retained slots plus <=2A old slots during grow.
+    cost.add(api.len().checked_mul(6)?.checked_mul(std::mem::size_of::<
+        &crate::claude_local_otel::ClaudeLocalOtelEvidence,
+    >())?)?;
+    let mut row_clone = 0usize;
+    for row in api {
+        let mut one = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        row.completed_heap_bound(&mut one)?;
+        row_clone = row_clone.max(one.bytes);
+    }
+    let mut owner_temporary = root.len();
+    for row in trace {
+        let mut one = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        row.completed_heap_bound(&mut one)?;
+        row_clone = row_clone.max(one.bytes);
+        owner_temporary =
+            owner_temporary.max(root.len().checked_add(7)?.checked_add(row.agent_id.len())?);
+    }
+    // Fingerprint validation clones only ONE canonical row at a time. Digest
+    // formatting grows a 64/71-byte string; charge its full old+new buffers.
+    cost.add(row_clone)?;
+    cost.add(384)?;
+    cost.add(
+        owner_temporary
+            .max(1)
+            .checked_next_power_of_two()?
+            .checked_mul(3)?,
+    )?;
+    cost.add(64)?; // reduced evidence fingerprint
+
+    // All root-local metadata may coexist with that ledger. Certified leaves
+    // MOVE from the already-paid old capture; only their new buffer is added.
+    cost.add(members.checked_mul(std::mem::size_of::<(String, NormalSkip)>())?)?;
+    heap_layout_bound::tree_nodes::<&str, ()>(members, &mut cost)?;
+    cost.add(native.len().checked_mul(std::mem::size_of::<&str>())?)?;
+    heap_layout_bound::tree_nodes::<&str, ()>(native.len(), &mut cost)?;
+    heap_layout_bound::tree_nodes::<String, ()>(members, &mut cost)?; // frozen members
+    cost.add(strings)?;
+    heap_layout_bound::tree_nodes::<String, FrozenNativePrior>(native.len(), &mut cost)?;
+    let mut member_validation = 0usize;
+    for item in native {
+        let mut current = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        heap_layout_bound::tree_nodes::<String, ()>(
+            item.claude_usage_request_ids.len(),
+            &mut current,
+        )?;
+        current.add(item.claude_usage_request_ids.len().checked_mul(64)?)?;
+        heap_layout_bound::tree_nodes::<String, ClaudeTranscriptUsageOccurrenceWitness>(
+            item.claude_usage_occurrences.len(),
+            &mut current,
+        )?;
+        current.add(item.claude_usage_occurrences.len().checked_mul(64)?)?;
+        for occurrence in item.claude_usage_occurrences.values() {
+            // These are precisely the three cloned strings in From<Occurrence>.
+            let bytes = occurrence
+                .model
+                .as_ref()
+                .map_or(0, String::len)
+                .checked_add(occurrence.reasoning_effort.as_ref().map_or(0, String::len))?
+                .checked_add(
+                    occurrence
+                        .selector
+                        .context
+                        .get("speed_mode")
+                        .map_or(0, String::len),
+                )?;
+            current.add(bytes)?;
+        }
+        member_validation = member_validation.max(current.bytes);
+        cost.add(item.source_session_id.len())?;
+        cost.add(item.source_file_fingerprint.as_ref().map_or(0, String::len))?;
+        cost.add(
+            witness
+                .member_request_id_fingerprints
+                .get(&item.source_session_id)
+                .map_or(0, String::len),
+        )?;
+        cost.add(
+            witness
+                .member_occurrence_fingerprints
+                .get(&item.source_session_id)
+                .map_or(0, String::len),
+        )?;
+    }
+    cost.add(member_validation)?; // validation is serial, not native.len copies
+    heap_layout_bound::tree_nodes::<String, ()>(api.len(), &mut cost)?; // assembled S
+                                                                        // Hashes move from assigned sets; temporary request-hash formatting above
+                                                                        // already coexists. Paired roots are E-empty: exactly this one root.
+    heap_layout_bound::tree_nodes::<String, ()>(1, &mut cost)?;
+    cost.add(root.len().checked_mul(2)?)?; // paired root and family-map key
+    cost.add(64)?; // frozen P
+    Some(cost.bytes)
 }
 
 struct FrozenFamily {
@@ -1580,6 +1796,57 @@ impl Controller {
             failed: false,
             acquisition: TargetAcquisition::default(),
         }
+    }
+
+    /// Required-root keys are new ownership, not a free consequence of moving
+    /// the qualification. Fund them before the canonical constructor clones.
+    pub(crate) fn new_paid(
+        qualification: Qualification,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Result<Self, crate::source_rotation::LocalRefusal> {
+        use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
+        let refusal = crate::source_rotation::LocalRefusal(
+            "native comparison controller roots cannot be prepaid",
+        );
+        let paid = credit.as_mut().ok_or(refusal)?;
+        let roots = || {
+            qualification
+                .families
+                .values()
+                .flat_map(|family| family.paired_roots.iter().map(String::as_str))
+                .chain(
+                    qualification
+                        .native_corrections
+                        .values()
+                        .map(NativeCorrection::root),
+                )
+        };
+        let plan = (|| {
+            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            heap_layout_bound::tree_nodes::<String, ()>(roots().count(), &mut cost)?;
+            cost.add(roots().try_fold(0usize, |n, root| n.checked_add(root.len()))?)?;
+            TargetAcquisition::default().completed_heap_bound(&mut cost)?;
+            paid.allocated().checked_add(cost.bytes)
+        })()
+        .filter(|peak| paid.grow_for(*peak))
+        .ok_or(refusal)?;
+        let controller = Self::new(qualification);
+        // Required roots and empty acquisition state are the only added heap.
+        let mut extra = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        controller
+            .required_roots
+            .completed_heap_bound(&mut extra)
+            .ok_or(refusal)?;
+        controller
+            .acquisition
+            .completed_heap_bound(&mut extra)
+            .ok_or(refusal)?;
+        let owned = paid.allocated().checked_add(extra.bytes).ok_or(refusal)?;
+        if owned > plan || !paid.record_allocated(owned) {
+            return Err(refusal);
+        }
+        paid.retire_speculation();
+        Ok(controller)
     }
 
     pub(crate) fn required_roots(&self) -> &BTreeSet<String> {
@@ -1790,6 +2057,9 @@ impl Qualification {
     }
     fn from_frozen_families(mut families: BTreeMap<String, FrozenFamily>) -> Self {
         let mut envelope_roots = Vec::new();
+        if envelope_roots.try_reserve_exact(families.len()).is_err() {
+            return Self::default();
+        }
         let Some(entries) = families.values().try_fold(0usize, |count, family| {
             count.checked_add(family.envelope.len())
         }) else {

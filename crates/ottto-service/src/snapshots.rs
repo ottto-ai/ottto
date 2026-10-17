@@ -6755,14 +6755,12 @@ fn validate_claude_reported_usage_paid<
     item: &SnapshotItem,
     rows: &[R],
     excluded: &BTreeSet<String>,
-    held_workspace: usize,
+    occupied: usize,
     paid: &mut crate::source_rotation::PaidReservation,
 ) -> Option<bool> {
     let previous_ceiling = paid.allocation_ceiling();
     let construction = reported_usage_construction_peak(item, rows)?;
-    let peak = previous_ceiling
-        .checked_add(held_workspace)?
-        .checked_add(construction)?;
+    let peak = occupied.checked_add(construction)?;
     if !paid.grow_for(peak) {
         return None;
     }
@@ -6790,6 +6788,7 @@ fn validate_claude_reported_usage_paid<
     Some(valid)
 }
 
+#[cfg(test)]
 fn borrowed_claude_ledger_workspace(
     ledger: &ReducedClaudeUsageLedger<&crate::claude_local_otel::ClaudeLocalOtelEvidence>,
 ) -> Option<usize> {
@@ -12471,33 +12470,69 @@ impl OwnedSourceScan {
                 }
                 None => phase.import_window(previous, &self.index, &self.census_window_end),
             };
-        let workspace_paid = imported
-            && match credit.as_deref_mut() {
+        let external = credit.as_deref().and_then(|slot| {
+            slot.as_ref()?
+                .allocated()
+                .checked_sub(phase.owned_capture_bytes()?)
+        });
+        let workspace = imported
+            .then(|| match credit.as_deref_mut() {
                 Some(credit) => {
                     phase.prepay_qualification_workspace(&self.index, &self.snapshots, credit)
                 }
-                None => true, // Logical component fixtures carry no admission claim.
-            };
-        if imported && !workspace_paid {
+                None => Some(0), // Logical fixtures carry no admission claim.
+            })
+            .flatten();
+        if imported && workspace.is_none() {
             phase.disable();
             phase.resume();
             return Err(crate::source_rotation::LocalRefusal(
                 "native comparison qualification workspace cannot be prepaid",
             ));
         }
-        let qualification = if workspace_paid {
+        let mut qualification = if let Some(workspace) = workspace {
             let qualification = phase.qualify_with_credit(
                 &self.index,
                 &self.snapshots,
                 &self.census_window_end,
                 rows,
-                credit,
+                credit.as_deref_mut(),
+                workspace,
             );
             phase.capture_active().then_some(qualification)
         } else {
             None
         };
         phase.resume();
+        if let Some(slot) = credit {
+            // All root-local temporaries and the old moved certificate buffer
+            // are gone. Replace their future reservation with actual retained
+            // qualification + current phase custody exactly once.
+            use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+            let owned = (|| {
+                let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+                if let Some(q) = qualification.as_ref() {
+                    q.completed_heap_bound(&mut cost)?;
+                }
+                external?
+                    .checked_add(phase.owned_capture_bytes()?)?
+                    .checked_add(cost.bytes)
+            })();
+            let recorded = slot
+                .as_mut()
+                .zip(owned)
+                .is_some_and(|(paid, bytes)| paid.record_allocated(bytes));
+            if !recorded {
+                drop(qualification.take());
+                phase.disable();
+                return Err(crate::source_rotation::LocalRefusal(
+                    "native comparison retained qualification cannot be reconciled",
+                ));
+            }
+            if let Some(paid) = slot.as_mut() {
+                paid.retire_speculation();
+            }
+        }
         Ok(qualification)
     }
 
@@ -39221,6 +39256,28 @@ mod tests {
                 None,
             )
             .unwrap();
+            let witness = index.claude_usage_family_witnesses.get(&parent).unwrap();
+            let api = api_report.evidence.get(&parent).unwrap();
+            let trace = trace_report.evidence.get(&parent).unwrap();
+            let construction = claude_native_comparison::qualification_family_construction_peak(
+                &parent,
+                witness,
+                api,
+                trace,
+                &[&items[0], &items[1]],
+            )
+            .unwrap();
+            let (borrowed, allocation) = crate::retry_allocation_probe::measure(|| {
+                reconstruct_claude_usage_ledger_borrowed(&parent, witness, api, trace, None)
+                    .unwrap()
+            });
+            assert!(allocation.requested_peak_with_overlap <= construction);
+            assert_eq!(
+                borrowed.rows_by_member.get(&parent).unwrap().len(),
+                family.rows_by_member.get(&parent).unwrap().len()
+            );
+            eprintln!("native qualification ledger: actual_requested_peak={} prepaid_root_construction={construction} canonical_borrowed_rows=true not_full_frame_or_RSS=true", allocation.requested_peak_with_overlap);
+            drop(borrowed);
             let rows = family.rows_by_member.get(&parent).unwrap();
             let peak = reported_usage_construction_peak(&items[0], rows).unwrap();
             let body = serde_json::to_vec(&items[0]).unwrap();

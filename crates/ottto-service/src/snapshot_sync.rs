@@ -3724,10 +3724,20 @@ impl SourcePreparation {
                             }
                         };
                         if let Some(qualification) = qualification {
-                            self.native_comparison_controller =
-                                Some(crate::snapshots::claude_native_comparison::Controller::new(
-                                    qualification,
-                                ));
+                            match crate::snapshots::claude_native_comparison::Controller::new_paid(
+                                qualification,
+                                &mut self.native_comparison_reservation,
+                            ) {
+                                Ok(controller) => {
+                                    self.native_comparison_controller = Some(controller)
+                                }
+                                Err(_) => {
+                                    state.disable_native_comparison();
+                                    if let Some(lease) = self.native_comparison_lease.as_mut() {
+                                        lease.refuse_admission();
+                                    }
+                                }
+                            }
                         } else {
                             state.disable_native_comparison();
                             if let Some(lease) = self.native_comparison_lease.as_mut() {
