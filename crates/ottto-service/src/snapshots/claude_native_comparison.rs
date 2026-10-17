@@ -2,9 +2,35 @@
 //! ownership, coverage, a settled body, or permission to suppress a rearm.
 use super::*;
 pub(crate) mod lifecycle;
+mod metadata;
 mod settlement;
+use metadata::{Map as DescriptorMap, Set as DescriptorSet};
 use settlement::NativeCorrection;
 pub(crate) use settlement::{Completion, SelectedFallback};
+
+#[cfg(test)]
+thread_local! {
+    static TARGET_UNKNOWN_ALLOWANCE_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct TargetUnknownAllowanceTest;
+#[cfg(test)]
+pub(crate) fn target_unknown_allowance_for_test() -> TargetUnknownAllowanceTest {
+    TARGET_UNKNOWN_ALLOWANCE_TEST.with(|state| assert!(state.replace(Some(0)).is_none()));
+    TargetUnknownAllowanceTest
+}
+#[cfg(test)]
+impl TargetUnknownAllowanceTest {
+    pub(crate) fn hits(&self) -> usize {
+        TARGET_UNKNOWN_ALLOWANCE_TEST.with(|state| state.get().expect("active refusal fixture"))
+    }
+}
+#[cfg(test)]
+impl Drop for TargetUnknownAllowanceTest {
+    fn drop(&mut self) {
+        TARGET_UNKNOWN_ALLOWANCE_TEST.with(|state| state.set(None));
+    }
+}
 
 /// Borrow the same process lease at the final rearm decision, rather than
 /// turning its earlier allowed() result into a durable permission bit.
@@ -16,13 +42,13 @@ pub(crate) struct NegativeView<'a> {
 /// a lease nor a possible-owner envelope can manufacture this moving owner.
 pub(crate) struct FoldView<'a> {
     pub(super) negatives: Option<NegativeView<'a>>,
-    native_terminal: Option<&'a TerminalTraversal>,
+    native_window: Option<&'a str>,
 }
 impl FoldView<'_> {
     pub(super) fn native_census_complete(&self, scan: &SourceScanResult) -> bool {
-        self.native_terminal.is_some_and(|terminal| {
+        self.native_window.is_some_and(|window| {
             scan.source == SnapshotSource::ClaudeCode
-                && terminal.traversal.census_window_end == scan.census_window_end
+                && window == scan.census_window_end
                 && scan.state_census_complete
                 && scan.sidecar_census_complete
         })
@@ -32,7 +58,7 @@ impl Completion {
     pub(crate) fn fold_view<'a>(&'a self, lease: Option<&'a lifecycle::Lease>) -> FoldView<'a> {
         FoldView {
             negatives: self.negatives(lease),
-            native_terminal: self.native_terminal(),
+            native_window: self.native_window(),
         }
     }
     pub(crate) fn negatives<'a>(
@@ -53,7 +79,7 @@ impl<'a> NegativeView<'a> {
         demoting: &BTreeMap<String, BTreeSet<String>>,
         members: &BTreeMap<String, BTreeSet<String>>,
     ) -> BTreeSet<&'a str> {
-        if !self.lease.allowed() {
+        if !self.lease.allowed() || !self.window.accounted() {
             return BTreeSet::new();
         }
         let mut keys: BTreeSet<&'a str> = self
@@ -159,6 +185,18 @@ pub(crate) struct PairedRows<'a> {
     pub(crate) healthy_roots: &'a BTreeSet<String>,
 }
 
+pub(crate) fn early_root_is_eligible(index: &ScanIndex, root: &str) -> bool {
+    !index.claude_usage_authority_quarantine.contains_key(root)
+        && index
+            .claude_usage_family_witnesses
+            .get(root)
+            .is_some_and(|witness| {
+                witness.legacy_excluded_request_id_hashes.is_empty()
+                    && witness.legacy_owner_roots.is_empty()
+                    && witness.legacy_exclusion_evidence_fingerprint.is_none()
+            })
+}
+
 /// A single moving owner for the actual completed native traversal. It never
 /// enters SourceScanResult (which is Clone) or a disk record. It qualifies only
 /// native census completion, never uniqueness, a permit or upload settlement.
@@ -166,7 +204,21 @@ pub(crate) struct PairedRows<'a> {
 pub(crate) struct TerminalTraversal {
     traversal: ScanTraversalCheckpoint,
 }
+/// Only the completed window is needed by the final native fold. This receipt
+/// can only consume the actual terminal owner; it cannot be minted from a flag,
+/// a negative certificate or a restored traversal. Selected recovery keeps the
+/// original full owner instead, until its durable save.
+struct NativeCensusCompletion {
+    census_window_end: String,
+}
 impl TerminalTraversal {
+    fn into_native_census(self: Box<Self>) -> NativeCensusCompletion {
+        let Self { traversal } = *self;
+        NativeCensusCompletion {
+            census_window_end: traversal.census_window_end,
+        }
+    }
+
     pub(super) fn take(
         index: &mut ScanIndex,
         source: SnapshotSource,
@@ -206,6 +258,7 @@ impl TerminalTraversal {
     }
 }
 crate::heap_layout_bound::fields!(TerminalTraversal; traversal);
+crate::heap_layout_bound::fields!(NativeCensusCompletion; census_window_end);
 
 /// Select only caller-known recovery paths already in this traversal queue and
 /// still carrying durable rearm debt. The queue retains its allocation and all
@@ -248,26 +301,94 @@ struct NormalSkip {
     candidate: CandidateFile,
 }
 
+/// Ephemeral index membership, borrowing the canonical path identities. The
+/// sorted view validates the same complete physical universe as the ordinary
+/// owned membership map; it is neither request coverage nor a durable witness.
+pub(super) struct MembershipView<'a> {
+    members: Vec<ClaudeIndexPathMemberRef<'a>>,
+}
+impl<'a> MembershipView<'a> {
+    pub(super) fn selected_count(
+        index: &ScanIndex,
+        selected: impl Fn(&str) -> bool,
+    ) -> Option<usize> {
+        index
+            .files
+            .keys()
+            .filter_map(|key| claude_index_path_member_ref(Path::new(key)))
+            .filter(|identity| selected(identity.root))
+            .try_fold(0usize, |count, _| count.checked_add(1))
+    }
+    pub(super) fn capture(index: &'a ScanIndex, selected: impl Fn(&str) -> bool) -> Option<Self> {
+        let count = Self::selected_count(index, &selected)?;
+        let mut members = Vec::new();
+        members.try_reserve_exact(count).ok()?;
+        for key in index.files.keys() {
+            let Some(identity) = claude_index_path_member_ref(Path::new(key)) else {
+                continue;
+            };
+            if selected(identity.root) {
+                members.push(identity);
+            }
+        }
+        // slice::sort_unstable uses no heap workspace. Root then optional stem
+        // orders members exactly as root or root+'_'+stem in the owned map.
+        members.sort_unstable();
+        Some(Self { members })
+    }
+    pub(super) fn matches(&self, root: &str, witness: &ClaudeUsageFamilyWitness) -> bool {
+        let start = self.members.partition_point(|member| member.root < root);
+        let end = self.members.partition_point(|member| member.root <= root);
+        let members = &self.members[start..end];
+        members.len() == witness.member_request_id_fingerprints.len()
+            && members.iter().any(|member| member.subagent_stem.is_none())
+            && members.windows(2).all(|pair| pair[0] != pair[1])
+            && members
+                .iter()
+                .zip(witness.member_request_id_fingerprints.keys())
+                .all(|(actual, expected)| actual.matches_member(expected))
+    }
+}
+
 /// Eligibility descriptors only. No Clone, rows, assigned request sets or
 /// envelope graph survive the page. A later page must reconstruct P again.
 #[derive(Debug)]
 pub(crate) struct WindowEligibility {
     census_window_end: String,
-    roots: BTreeMap<String, WindowRoot>,
-    revoked_roots: BTreeSet<String>,
-    native_corrections: BTreeMap<String, NativeCorrection>,
-    correction_revoked_keys: BTreeSet<String>,
-    correction_forbidden_roots: BTreeSet<String>,
+    roots: DescriptorMap<WindowRoot>,
+    revoked_roots: DescriptorSet,
+    native_corrections: DescriptorMap<NativeCorrection>,
+    correction_revoked_keys: DescriptorSet,
+    correction_forbidden_roots: DescriptorSet,
 }
 #[derive(Debug)]
 struct WindowRoot {
     proof: String,
-    certified: BTreeMap<String, NormalSkip>,
+    certified: DescriptorMap<NormalSkip>,
 }
 impl WindowEligibility {
+    fn accounted(&self) -> bool {
+        self.roots.accounted()
+            && self.revoked_roots.accounted()
+            && self.native_corrections.accounted()
+            && self.correction_revoked_keys.accounted()
+            && self.correction_forbidden_roots.accounted()
+    }
+
     #[cfg(test)]
     pub(super) fn native_correction_count_for_test(&self) -> usize {
         self.native_corrections.len()
+    }
+    fn membership_scratch_peak(&self, index: &ScanIndex) -> Option<usize> {
+        if !crate::heap_layout_bound::layout_supported() || !self.accounted() {
+            return None;
+        }
+        // Exact one-buffer capacity; path strings remain borrowed from index.
+        // No owned intermediate/final membership trees or sorting Vec exists.
+        MembershipView::selected_count(index, |root| self.roots.contains_key(root))?
+            .checked_mul(std::mem::size_of::<ClaudeIndexPathMemberRef<'_>>())?
+            // Canonical SHA formatter: old32/new64 ASCII hex buffer overlap.
+            .checked_add(96)
     }
     fn root_is_current(root: &str, saved: &WindowRoot, index: &ScanIndex) -> bool {
         let Some(witness) = index.claude_usage_family_witnesses.get(root) else {
@@ -291,21 +412,18 @@ impl WindowEligibility {
 
     /// Recheck after the authoritative fold/selected rollback, before retention.
     /// Current-page reconstruction is still required before any later use.
-    pub(crate) fn retain_current(&mut self, index: &ScanIndex) {
-        let members = complete_claude_usage_family_members(index);
+    pub(crate) fn retain_current(&mut self, index: &ScanIndex) -> bool {
+        let Some(members) = MembershipView::capture(index, |root| self.roots.contains_key(root))
+        else {
+            return false;
+        };
         self.roots.retain(|root, saved| {
             let current = !self.revoked_roots.contains(root)
                 && Self::root_is_current(root, saved, index)
                 && index
                     .claude_usage_family_witnesses
                     .get(root)
-                    .is_some_and(|witness| {
-                        members.get(root).is_some_and(|actual| {
-                            actual
-                                .iter()
-                                .eq(witness.member_request_id_fingerprints.keys())
-                        })
-                    });
+                    .is_some_and(|witness| members.matches(root, witness));
             if !current {
                 self.revoked_roots.insert(root.clone());
             }
@@ -316,6 +434,7 @@ impl WindowEligibility {
                 && !self.correction_forbidden_roots.contains(receipt.root())
                 && receipt.current(key, index)
         });
+        true
     }
 
     #[cfg(test)]
@@ -337,23 +456,386 @@ impl WindowEligibility {
 #[derive(Default)]
 pub(crate) struct NativePhase {
     disabled: bool,
-    parsed_keys: BTreeSet<String>,
-    native_corrections: BTreeMap<String, NativeCorrection>,
-    correction_revoked_keys: BTreeSet<String>,
-    correction_forbidden_roots: BTreeSet<String>,
+    retained_target_bytes: usize,
+    parsed_keys: DescriptorSet,
+    native_corrections: DescriptorMap<NativeCorrection>,
+    correction_revoked_keys: DescriptorSet,
+    correction_forbidden_roots: DescriptorSet,
     paused: bool,
     prepared: bool,
     // Actual page Skips plus moved same-window descriptors. Retention uses the
     // shared rotation budget; positive target reads still obey the page limit.
-    skips: BTreeMap<String, NormalSkip>,
+    skips: DescriptorMap<NormalSkip>,
     // Eligibility is revoked by the actual parse attempt, including a parse
     // that later fails or produces no body. Body lists cannot recover this.
-    parsed_roots: BTreeSet<String>,
-    target_revisions: BTreeMap<String, String>,
-    attempted_targets: BTreeSet<String>,
+    parsed_roots: DescriptorSet,
+    target_revisions: DescriptorMap<String>,
+    attempted_targets: DescriptorSet,
+}
+
+struct WindowImportPlan {
+    roots: usize,
+    corrections: usize,
+    members: usize,
+    parsed_roots: usize,
+    revoked_keys: usize,
+    extra: usize,
 }
 
 impl NativePhase {
+    #[cfg(test)]
+    pub(super) fn capture_count_for_test(&self) -> usize {
+        self.skips.len()
+    }
+    pub(super) fn early_evidence_roots<'a>(
+        &'a self,
+        native: &'a [SnapshotItem],
+    ) -> impl Iterator<Item = &'a str> + Clone {
+        self.skips
+            .values()
+            .map(|skip| skip.root.as_str())
+            .chain(self.native_corrections.values().map(NativeCorrection::root))
+            .chain(native.iter().map(claude_snapshot_family_root_ref))
+    }
+    pub(super) fn capture_active(&self) -> bool {
+        !self.disabled
+            && self.parsed_keys.accounted()
+            && self.native_corrections.accounted()
+            && self.correction_revoked_keys.accounted()
+            && self.correction_forbidden_roots.accounted()
+            && self.skips.accounted()
+            && self.parsed_roots.accounted()
+            && self.target_revisions.accounted()
+            && self.attempted_targets.accounted()
+    }
+
+    pub(super) fn owned_capture_bytes(&self) -> Option<usize> {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        if !crate::heap_layout_bound::layout_supported() {
+            return None;
+        }
+        let mut counter = Counter::new(usize::MAX);
+        self.heap_bound(&mut counter)?;
+        counter.add(self.retained_target_bytes)?;
+        Some(counter.bytes)
+    }
+
+    /// The current canonical file-finish slot is ordinary serial work. Before
+    /// its body outlives that slot, pay all additional retention and any new
+    /// destination buffer while its old buffer/earlier target bodies coexist.
+    /// No pricing clone or second projection is constructed.
+    pub(super) fn retain_target_output(
+        &mut self,
+        parsed: &ParsedJsonlFile,
+        snapshots: &mut Vec<SnapshotItem>,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Result<(), crate::source_rotation::LocalRefusal> {
+        let refuse = || {
+            crate::source_rotation::LocalRefusal(
+                "native comparison target retention refused before source offer",
+            )
+        };
+        let plan = (|| {
+            let paid = credit.as_mut()?;
+            #[cfg(test)]
+            TARGET_UNKNOWN_ALLOWANCE_TEST.with(|state| {
+                if let Some(hits) = state.get() {
+                    state.set(Some(hits + 1));
+                    paid.at_turn(None); // failure injection can only REMOVE admission
+                }
+            });
+            let finished = crate::heap_layout_bound::completed_bound(
+                &parsed.snapshots,
+                crate::source_rotation::PARKED_BUDGET,
+            )?;
+            let slot = std::mem::size_of::<SnapshotItem>();
+            let source_buffer = parsed.snapshots.capacity().checked_mul(slot)?;
+            let payload = finished
+                .checked_sub(std::mem::size_of::<Vec<SnapshotItem>>())?
+                .checked_sub(source_buffer)?;
+            let length = snapshots.len().checked_add(parsed.snapshots.len())?;
+            let capacity = snapshots.capacity().max(length);
+            let new_buffer = if length > snapshots.capacity() {
+                capacity.checked_mul(slot)?
+            } else {
+                0
+            };
+            let retained_buffer = capacity
+                .checked_sub(snapshots.capacity())?
+                .checked_mul(slot)?;
+            let retained = payload.checked_add(retained_buffer)?;
+            let peak = paid
+                .allocated()
+                .checked_add(payload)?
+                .checked_add(new_buffer)?;
+            paid.grow_for(peak).then_some((retained, length))
+        })()
+        .ok_or_else(refuse)?;
+        if plan.1 > snapshots.capacity() {
+            snapshots
+                .try_reserve_exact(plan.1 - snapshots.len())
+                .map_err(|_| refuse())?;
+        }
+        let paid = credit.as_mut().ok_or_else(refuse)?;
+        let allocated = paid.allocated().checked_add(plan.0).ok_or_else(refuse)?;
+        let retained = self
+            .retained_target_bytes
+            .checked_add(plan.0)
+            .ok_or_else(refuse)?;
+        if !paid.record_allocated(allocated) {
+            return Err(refuse());
+        }
+        self.retained_target_bytes = retained;
+        paid.retire_speculation();
+        Ok(())
+    }
+
+    fn prepay_capture(
+        &self,
+        candidate: &CandidateFile,
+        skip_context: Option<(&ScanIndex, &str)>,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Option<(usize, bool)> {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let paid = credit.as_mut()?;
+        let before = self.owned_capture_bytes()?;
+        let external = paid.allocated().checked_sub(before)?;
+        let mut extra = Counter::new(usize::MAX);
+        let path = candidate.path.to_str()?; // no lossy-path allocation in this optional mode
+        let length = path.len();
+        // Canonical subagent resolution builds one Vec<&str>. Include its
+        // old/replacement capacity while collecting the path components.
+        let components = candidate.path.components().count().max(4);
+        extra.add(components.checked_mul(std::mem::size_of::<&str>())?)?;
+        extra.add(
+            components
+                .checked_mul(2)?
+                .checked_mul(std::mem::size_of::<&str>())?,
+        )?;
+        // local key; stored key clone; subagent field strings; formatted
+        // source-id's old/new buffers; returned root/member scratch. These are
+        // separate owners in the canonical path helper, each <= path length.
+        for _ in 0..7 {
+            extra.add(length)?;
+        }
+        if let Some((index, window)) = skip_context {
+            extra.add(self.skips.growth_peak()?)?;
+            candidate.completed_heap_bound(&mut extra)?;
+            extra.add(candidate.source_file_fingerprint.len())?;
+            extra.add(window.len())?;
+            extra.add(
+                index
+                    .active_upload_context_fingerprint
+                    .as_ref()
+                    .map_or(0, String::len),
+            )?;
+        } else {
+            // Parsed key, revoked correction key, parsed root: each compact
+            // buffer is paid at its old-plus-new replacement peak.
+            extra.add(self.parsed_keys.growth_peak()?)?;
+            extra.add(self.correction_revoked_keys.growth_peak()?)?;
+            extra.add(self.parsed_roots.growth_peak()?)?;
+        }
+        let admitted = paid.grow_for(paid.allocated().checked_add(extra.bytes)?);
+        Some((external, admitted))
+    }
+
+    fn finish_paid_capture(
+        &mut self,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+        external: usize,
+    ) -> bool {
+        let recorded = self
+            .owned_capture_bytes()
+            .and_then(|owned| external.checked_add(owned))
+            .is_some_and(|owned| {
+                credit
+                    .as_mut()
+                    .is_some_and(|paid| paid.record_allocated(owned))
+            });
+        if !recorded {
+            self.disable();
+            if let Some(paid) = credit.as_mut() {
+                // No descriptor eligibility survives. Keep all already-paid
+                // future recovery credit in the enclosing moving owner.
+                let _ = paid.record_allocated(external);
+            }
+        }
+        recorded
+    }
+
+    pub(super) fn record_parse_attempt_paid(
+        &mut self,
+        candidate: &CandidateFile,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> bool {
+        if self.disabled {
+            return false;
+        }
+        let Some((external, true)) = self.prepay_capture(candidate, None, credit) else {
+            self.disable();
+            return false;
+        };
+        self.record_parse_attempt(candidate);
+        self.finish_paid_capture(credit, external)
+    }
+
+    pub(super) fn record_actual_skip_paid(
+        &mut self,
+        index: &ScanIndex,
+        candidate: &CandidateFile,
+        window: &str,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) {
+        if self.disabled {
+            return;
+        }
+        let Some((external, admitted)) =
+            self.prepay_capture(candidate, Some((index, window)), credit)
+        else {
+            self.disable();
+            return;
+        };
+        if !admitted {
+            // A new optional Skip descriptor has no effect if omitted. Keep
+            // previously paid certificates; the missing member takes BASE.
+            // Unknown accounting (above) and unrecordable parse revocation
+            // (record_parse_attempt_paid) still disable the entire phase.
+            return;
+        }
+        self.record_actual_skip(index, candidate, window);
+        self.finish_paid_capture(credit, external);
+    }
+
+    fn window_import_plan(
+        &self,
+        previous: &WindowEligibility,
+        index: &ScanIndex,
+    ) -> Option<WindowImportPlan> {
+        use crate::heap_layout_bound::Counter;
+        let roots = previous.roots.len();
+        let corrections = previous.native_corrections.len();
+        let members = previous
+            .roots
+            .values()
+            .try_fold(0usize, |n, root| n.checked_add(root.certified.len()))?;
+        let revoked = previous.revoked_roots.len().checked_add(roots)?;
+        let correction_revoked = previous
+            .correction_revoked_keys
+            .len()
+            .checked_add(corrections)?;
+        let mut extra = Counter::new(usize::MAX);
+        extra.add(previous.membership_scratch_peak(index)?)?;
+        extra.add(previous.revoked_roots.merge_buffer_peak(roots)?)?;
+        extra.add(self.parsed_roots.merge_buffer_peak(revoked)?)?;
+        extra.add(
+            self.correction_revoked_keys
+                .merge_buffer_peak(correction_revoked)?,
+        )?;
+        extra.add(
+            self.correction_forbidden_roots
+                .merge_buffer_peak(previous.correction_forbidden_roots.len())?,
+        )?;
+        extra.add(self.native_corrections.merge_buffer_peak(corrections)?)?;
+        extra.add(self.skips.merge_buffer_peak(members)?)?;
+        // retain_current may add a tombstone for every root before moving
+        // these same keys into parsed_roots. Only this clone is new.
+        for root in previous.roots.keys() {
+            extra.add(root.len())?;
+        }
+        Some(WindowImportPlan {
+            roots,
+            corrections,
+            members,
+            parsed_roots: revoked,
+            revoked_keys: correction_revoked,
+            extra: extra.bytes,
+        })
+    }
+    #[cfg(test)]
+    pub(super) fn window_import_extra_for_test(
+        &self,
+        previous: &WindowEligibility,
+        index: &ScanIndex,
+    ) -> Option<usize> {
+        self.window_import_plan(previous, index)
+            .map(|plan| plan.extra)
+    }
+    /// Pay membership scratch and all destination slot buffers while the old
+    /// window remains owned. No provider rows, index facts or permission change
+    /// before this reservation. The ordinary membership validator remains the
+    /// authority, including unexpected paths and duplicate physical members.
+    pub(super) fn import_window_paid(
+        &mut self,
+        previous: Option<Box<WindowEligibility>>,
+        index: &ScanIndex,
+        census_window_end: &str,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> bool {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let Some(mut previous) = previous else {
+            return true;
+        };
+        let occupied = (|| {
+            let mut old = Counter::new(usize::MAX);
+            previous.heap_bound(&mut old)?;
+            credit
+                .as_ref()?
+                .allocated()
+                .checked_sub(self.owned_capture_bytes()?)?
+                .checked_sub(old.bytes)
+        })();
+        let prepared = (|| {
+            let external = occupied?;
+            if !self.capture_active()
+                || !previous.accounted()
+                || previous.census_window_end != census_window_end
+            {
+                return None;
+            }
+            let plan = self.window_import_plan(&previous, index)?;
+            let paid = credit.as_mut()?;
+            if !paid.grow_for(paid.allocated().checked_add(plan.extra)?) {
+                return None;
+            }
+            previous.revoked_roots.reserve_merge(plan.roots)?;
+            self.parsed_roots.reserve_merge(plan.parsed_roots)?;
+            self.correction_revoked_keys
+                .reserve_merge(plan.revoked_keys)?;
+            self.correction_forbidden_roots
+                .reserve_merge(previous.correction_forbidden_roots.len())?;
+            self.native_corrections.reserve_merge(plan.corrections)?;
+            self.skips.reserve_merge(plan.members)?;
+            Some(external)
+        })();
+        let accepted = if prepared.is_some() {
+            self.import_window(Some(previous), index, census_window_end)
+        } else {
+            drop(previous);
+            false
+        };
+        if !accepted {
+            self.disable();
+        }
+        let reconciled = occupied
+            .and_then(|external| external.checked_add(self.owned_capture_bytes()?))
+            .is_some_and(|owned| {
+                credit
+                    .as_mut()
+                    .is_some_and(|paid| paid.record_allocated(owned))
+            });
+        if !reconciled {
+            // No target/controller exists at import. Unknown ownership cannot
+            // expose an optional certificate; the actual caller revokes lease.
+            self.disable();
+            return false;
+        }
+        if let Some(paid) = credit.as_mut() {
+            paid.retire_speculation();
+        }
+        accepted
+    }
+
     pub(super) fn import_window(
         &mut self,
         previous: Option<Box<WindowEligibility>>,
@@ -363,10 +845,15 @@ impl NativePhase {
         let Some(mut previous) = previous else {
             return true;
         };
-        if previous.census_window_end != census_window_end {
+        if !self.capture_active()
+            || !previous.accounted()
+            || previous.census_window_end != census_window_end
+        {
             return false;
         }
-        previous.retain_current(index);
+        if !previous.retain_current(index) {
+            return false;
+        }
         self.correction_revoked_keys
             .extend(previous.correction_revoked_keys);
         self.correction_forbidden_roots
@@ -494,7 +981,7 @@ impl NativePhase {
     }
 
     pub(super) fn pause_before_finalization(&mut self) -> bool {
-        if self.disabled || self.prepared {
+        if !self.capture_active() || self.prepared {
             return false;
         }
         self.paused = true;
@@ -502,7 +989,7 @@ impl NativePhase {
     }
 
     pub(super) fn ready(&self) -> bool {
-        self.paused && !self.prepared
+        self.capture_active() && self.paused && !self.prepared
     }
     pub(super) fn resume(&mut self) {
         self.prepared = true;
@@ -515,6 +1002,7 @@ impl NativePhase {
     pub(super) fn disable(&mut self) {
         *self = Self {
             disabled: true,
+            retained_target_bytes: self.retained_target_bytes,
             prepared: true,
             ..Self::default()
         };
@@ -545,18 +1033,166 @@ impl NativePhase {
         self.paused = false;
     }
 
+    /// Candidate selection already has its own construction boundary. At this
+    /// seam, pay the extra queued ownership and both capture maps BEFORE any
+    /// enqueue makes the target eligible for physical acquisition. Retained
+    /// candidate storage is conservatively charged until this phase retires.
+    pub(super) fn start_targets_paid(
+        &mut self,
+        candidates: &[CandidateFile],
+        queue: &mut VecDeque<CandidateFile>,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Result<(), crate::source_rotation::LocalRefusal> {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let refuse = || {
+            crate::source_rotation::LocalRefusal(
+                "native comparison queued target metadata cannot be prepaid",
+            )
+        };
+        let plan = (|| {
+            let paid = credit.as_mut()?;
+            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            cost.add(self.target_revisions.merge_buffer_peak(candidates.len())?)?;
+            cost.add(self.attempted_targets.merge_buffer_peak(candidates.len())?)?;
+            let mut retained_extra = 0usize;
+            let length = queue.len().checked_add(candidates.len())?;
+            if length > queue.capacity() {
+                retained_extra = length.checked_mul(std::mem::size_of::<CandidateFile>())?;
+                cost.add(retained_extra)?;
+            }
+            for candidate in candidates {
+                // local_index_key is borrowed for UTF-8 paths; non-UTF-8 is
+                // optional BASE rather than an unpriced lossy conversion.
+                let key = candidate.path.to_str()?;
+                cost.add(key.len().checked_mul(2)?)?;
+                cost.add(candidate.source_file_fingerprint.len())?;
+                let mut candidate_cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+                candidate.completed_heap_bound(&mut candidate_cost)?;
+                cost.add(candidate_cost.bytes)?;
+                retained_extra = retained_extra.checked_add(candidate_cost.bytes)?;
+            }
+            let before = self.owned_capture_bytes()?;
+            let external = paid.allocated().checked_sub(before)?;
+            let retained = self.retained_target_bytes.checked_add(retained_extra)?;
+            if !paid.grow_for(paid.allocated().checked_add(cost.bytes)?) {
+                return None;
+            }
+            // Each buffer was priced at old-plus-new overlap. reserve_exact
+            // prevents the per-insert geometric growth from adding workspace.
+            self.target_revisions.reserve_merge(candidates.len())?;
+            self.attempted_targets.reserve_merge(candidates.len())?;
+            if length > queue.capacity() {
+                queue.try_reserve_exact(candidates.len()).ok()?;
+            }
+            self.start_targets(candidates);
+            self.retained_target_bytes = retained;
+            let owned = external.checked_add(self.owned_capture_bytes()?)?;
+            paid.record_allocated(owned).then_some(())
+        })();
+        plan.ok_or_else(refuse)
+    }
+
     pub(super) fn target_revision_matches(&self, candidate: &CandidateFile) -> Option<bool> {
         self.target_revisions
             .get(&local_index_key(&candidate.path))
             .map(|expected| expected == &candidate.source_file_fingerprint)
     }
 
+    /// Only the global qualification workspace: grouping, selected/candidate
+    /// roots, borrowed physical membership and revoked-root growth. Per-family
+    /// ledger/transform construction is a separate boundary, not inferred from
+    /// this reservation. All loops here borrow existing input; no probe clone.
+    pub(super) fn prepay_qualification_workspace(
+        &self,
+        index: &ScanIndex,
+        native: &[SnapshotItem],
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> bool {
+        use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
+        (|| {
+            let paid = credit.as_mut()?;
+            let roots = self
+                .skips
+                .len()
+                .checked_add(native.len())?
+                .checked_add(self.native_corrections.len())?;
+            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            heap_layout_bound::tree_nodes::<String, Vec<&SnapshotItem>>(native.len(), &mut cost)?;
+            heap_layout_bound::tree_nodes::<&str, ()>(self.native_corrections.len(), &mut cost)?;
+            heap_layout_bound::tree_nodes::<String, ()>(roots, &mut cost)?; // selected roots
+            heap_layout_bound::tree_nodes::<String, ()>(roots, &mut cost)?; // candidate clone
+            heap_layout_bound::tree_nodes::<String, ()>(roots, &mut cost)?; // controller roots
+                                                                            // Native grouping's per-root Vec starts at four; total retained
+                                                                            // slots <=4N, with <=2N additional replacement slots overlapping.
+            cost.add(
+                native
+                    .len()
+                    .checked_mul(6)?
+                    .checked_mul(std::mem::size_of::<&SnapshotItem>())?,
+            )?;
+            let selected_strings = self
+                .skips
+                .values()
+                .map(|skip| skip.root.len())
+                .chain(
+                    native
+                        .iter()
+                        .map(|item| claude_snapshot_family_root_ref(item).len()),
+                )
+                .chain(
+                    self.native_corrections
+                        .values()
+                        .map(|receipt| receipt.root().len()),
+                )
+                .try_fold(0usize, |n, bytes| n.checked_add(bytes))?;
+            // Selected roots + candidate clone + controller required roots.
+            cost.add(selected_strings.checked_mul(3)?)?;
+            cost.add(native.iter().try_fold(0usize, |n, item| {
+                n.checked_add(claude_snapshot_family_root_ref(item).len())
+            })?)?;
+            // The canonical membership capture selects a subset of physical
+            // paths. Price the complete borrowed index-key universe without
+            // constructing an owned universe or a roots-times-files walk.
+            cost.add(
+                index
+                    .files
+                    .len()
+                    .checked_mul(std::mem::size_of::<ClaudeIndexPathMemberRef<'_>>())?,
+            )?;
+            self.parsed_roots.completed_heap_bound(&mut cost)?;
+            let revoked = roots.checked_add(self.parsed_roots.len())?;
+            if revoked != 0 {
+                let capacity = revoked.checked_next_power_of_two()?;
+                cost.add(
+                    capacity
+                        .checked_add(capacity / 2)?
+                        .checked_mul(std::mem::size_of::<(String, ())>())?,
+                )?;
+            }
+            paid.grow_for(paid.allocated().checked_add(cost.bytes)?)
+                .then_some(())
+        })()
+        .is_some()
+    }
+
+    #[cfg(test)]
     pub(super) fn qualify(
         &mut self,
         index: &ScanIndex,
         native: &[SnapshotItem],
         census_window_end: &str,
         rows: PairedRows<'_>,
+    ) -> Qualification {
+        self.qualify_with_credit(index, native, census_window_end, rows, None)
+    }
+
+    pub(super) fn qualify_with_credit(
+        &mut self,
+        index: &ScanIndex,
+        native: &[SnapshotItem],
+        census_window_end: &str,
+        rows: PairedRows<'_>,
+        mut credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Qualification {
         assert!(self.ready(), "preflight must precede native finalization");
         let native_by_root = group_native_by_root(native);
@@ -583,11 +1219,21 @@ impl NativePhase {
         });
         if selected_roots.is_empty() {
             return Qualification {
-                revoked_roots: self.parsed_roots.union(&candidate_roots).cloned().collect(),
+                revoked_roots: self
+                    .parsed_roots
+                    .iter()
+                    .chain(candidate_roots.iter())
+                    .cloned()
+                    .collect(),
                 ..Default::default()
             };
         }
-        let indexed_members = complete_claude_usage_family_members(index);
+        let Some(indexed_members) =
+            MembershipView::capture(index, |root| selected_roots.contains(root))
+        else {
+            self.disable();
+            return Qualification::default();
+        };
         let needs_legacy_owners = selected_roots.iter().any(|root| {
             index
                 .claude_usage_family_witnesses
@@ -606,18 +1252,30 @@ impl NativePhase {
             // Avoid constructing a global request-owner graph for that case.
             None
         };
+        // Phase::resume used to discard this graph after cloning every valid
+        // descriptor into a family. Consume its existing buffer once instead;
+        // sorted root/key order needs no sort workspace or second path/stat
+        // graph. Invalid roots are discarded, never certified by a miss.
+        let mut captured = std::mem::take(&mut self.skips).into_entries();
+        captured.sort_unstable_by(|(a_key, a), (b_key, b)| {
+            a.root.cmp(&b.root).then_with(|| a_key.cmp(b_key))
+        });
+        let mut captured = captured.into_iter().peekable();
         let mut families = BTreeMap::new();
+        let mut retained_family_heap = 0usize;
         for (root, retained) in &index.claude_usage_family_witnesses {
+            while captured
+                .peek()
+                .is_some_and(|(_, skip)| skip.root.as_str() < root.as_str())
+            {
+                drop(captured.next());
+            }
             // Freeze/reconstruct P from retained state. Never substitute a new
             // proof or mutate the index while deciding negative eligibility.
             if !selected_roots.contains(root)
                 || !rows.healthy_roots.contains(root)
                 || index.claude_usage_authority_quarantine.contains_key(root)
-                || !indexed_members.get(root).is_some_and(|members| {
-                    members
-                        .iter()
-                        .eq(retained.member_request_id_fingerprints.keys())
-                })
+                || !indexed_members.matches(root, retained)
             {
                 continue;
             }
@@ -631,7 +1289,7 @@ impl NativePhase {
             let Some(trace) = rows.trace.get(root) else {
                 continue;
             };
-            let Some(ledger) = reconstruct_claude_usage_ledger_from_rows(
+            let Some(ledger) = reconstruct_claude_usage_ledger_borrowed(
                 root,
                 retained,
                 api,
@@ -640,38 +1298,99 @@ impl NativePhase {
             ) else {
                 continue;
             };
-            let family = ProvenClaudeUsageFamily {
-                witness: retained.clone(),
-                rows_by_member: ledger.rows_by_member,
+            // Compute held constructor inputs once per family with current
+            // native members, never once per evidence row or growing bucket.
+            let held_prepare_workspace = if credit.is_some() && !current_native.is_empty() {
+                (|| {
+                    let mut held = crate::heap_layout_bound::Counter::new(
+                        crate::source_rotation::PARKED_BUDGET,
+                    );
+                    crate::heap_layout_bound::tree_nodes::<String, FrozenFamily>(
+                        families.len(),
+                        &mut held,
+                    )?;
+                    held.add(retained_family_heap)?;
+                    held.add(borrowed_claude_ledger_workspace(&ledger)?)?;
+                    Some(held.bytes)
+                })()
+            } else {
+                Some(0)
             };
             // Current members that would fail the exact authoritative rebuild
             // make this family ineligible. Shared checks include native set and
             // occurrence fingerprints, selectors, totals, clocks and overflow.
             if current_native.iter().any(|item| {
-                let Some((rows, excluded)) = claude_reported_usage_inputs(item, &family) else {
+                let Some((rows, excluded)) =
+                    claude_reported_usage_inputs_from_rows(item, retained, &ledger.rows_by_member)
+                else {
                     return true;
                 };
-                prepare_claude_reported_usage(item, rows, &excluded, None).is_none()
+                match credit.as_deref_mut() {
+                    Some(credit) => {
+                        credit.as_mut().and_then(|paid| {
+                            validate_claude_reported_usage_paid(
+                                item,
+                                rows,
+                                &excluded,
+                                held_prepare_workspace?,
+                                paid,
+                            )
+                        }) != Some(true)
+                    }
+                    None => {
+                        // Only the explicit logical test adapter is unpriced;
+                        // production SourcePreparation always supplies credit.
+                        #[cfg(test)]
+                        {
+                            prepare_claude_reported_usage(item, rows, &excluded, None).is_none()
+                        }
+                        #[cfg(not(test))]
+                        {
+                            true
+                        }
+                    }
+                }
             }) {
                 continue;
             }
-            let certified = self
-                .skips
-                .iter()
-                .filter(|(key, skip)| {
-                    skip.root == *root
-                        && !self.parsed_roots.contains(root)
-                        && skip.census_window_end == census_window_end
-                        && index.files.get(*key).is_some_and(|entry| {
-                            entry.source_file_fingerprint == skip.revision
-                                && skip.upload_context == index.active_upload_context_fingerprint
-                        })
-                        && retained
-                            .member_request_id_fingerprints
-                            .contains_key(&skip.member)
-                })
-                .map(|(key, skip)| (key.clone(), skip.clone()))
-                .collect::<BTreeMap<_, _>>();
+            let mut certified = DescriptorMap::default();
+            if !self.parsed_roots.contains(root)
+                && captured.peek().is_some_and(|(_, skip)| skip.root == *root)
+            {
+                // Complete physical membership bounds the captured leaves.
+                // Pay the new buffer before moving existing descriptors; a
+                // refusal leaves all earlier qualified roots intact.
+                let members = retained.member_request_id_fingerprints.len();
+                if let Some(credit) = credit.as_deref_mut() {
+                    let admitted = credit.as_mut().is_some_and(|paid| {
+                        members
+                            .checked_mul(std::mem::size_of::<(String, NormalSkip)>())
+                            .and_then(|bytes| paid.allocation_ceiling().checked_add(bytes))
+                            .is_some_and(|peak| paid.grow_for(peak))
+                    });
+                    if !admitted {
+                        continue;
+                    }
+                }
+                if certified.reserve_merge(members).is_none() {
+                    continue;
+                }
+            }
+            while captured.peek().is_some_and(|(_, skip)| skip.root == *root) {
+                let (key, skip) = captured.next().expect("peeked captured certificate");
+                if !self.parsed_roots.contains(root)
+                    && skip.census_window_end == census_window_end
+                    && index.files.get(&key).is_some_and(|entry| {
+                        entry.source_file_fingerprint == skip.revision
+                            && skip.upload_context == index.active_upload_context_fingerprint
+                    })
+                    && retained
+                        .member_request_id_fingerprints
+                        .contains_key(&skip.member)
+                {
+                    certified.insert(key, skip);
+                }
+            }
             let certified_members = certified
                 .values()
                 .map(|skip| skip.member.as_str())
@@ -693,7 +1412,8 @@ impl NativePhase {
             {
                 continue; // Ambiguous physical member paths cannot certify negatives.
             }
-            let prior_native_revisions = current_native
+            let mut assigned = ledger.assigned_request_id_hashes;
+            let prior_native = current_native
                 .iter()
                 // Q5 initially covers only exact pre-mutation P with E empty.
                 // Full request-set/occurrence/projection checks ran above.
@@ -707,30 +1427,77 @@ impl NativePhase {
                     item.source_file_fingerprint
                         .as_ref()
                         .filter(|revision| !revision.is_empty())
-                        .map(|revision| (item.source_session_id.clone(), revision.clone()))
+                        .map(|revision| {
+                            let member = &item.source_session_id;
+                            (
+                                member.clone(),
+                                FrozenNativePrior {
+                                    revision: revision.clone(),
+                                    request_fingerprint: retained
+                                        .member_request_id_fingerprints
+                                        .get(member)
+                                        .cloned(),
+                                    occurrence_fingerprint: retained
+                                        .member_occurrence_fingerprints
+                                        .get(member)
+                                        .cloned(),
+                                    assigned: assigned.remove(member),
+                                },
+                            )
+                        })
                 })
                 .collect::<BTreeMap<_, _>>();
             if !certified.is_empty()
-                || !prior_native_revisions.is_empty()
+                || !prior_native.is_empty()
                 || correction_roots.contains(root.as_str())
             {
+                // Retain only S for actual Skip members and the precise Q5
+                // fields for current native members. The canonical proof was
+                // fully reconstructed above; its rows and whole witness are
+                // not needed by the controller or the terminal window.
+                let mut envelope = BTreeSet::new();
+                for skip in certified.values() {
+                    if let Some(hashes) = assigned.remove(&skip.member) {
+                        envelope.extend(hashes);
+                    }
+                    if let Some(hashes) =
+                        retained.legacy_excluded_request_id_hashes.get(&skip.member)
+                    {
+                        envelope.extend(hashes.iter().cloned());
+                    }
+                }
                 let paired_roots = std::iter::once(root.clone())
                     // The shared reconstruction above verified these exact
                     // predecessor roots against the excluded-request owners.
                     .chain(retained.legacy_owner_roots.iter().cloned())
                     .collect();
-                families.insert(
-                    root.clone(),
-                    FrozenFamily {
-                        witness: family.witness,
-                        assigned: ledger.assigned_request_id_hashes,
-                        certified,
-                        prior_native_revisions,
-                        paired_roots,
-                    },
-                );
+                let frozen = FrozenFamily {
+                    proof: claude_usage_family_witness_fingerprint(retained),
+                    members: retained
+                        .member_request_id_fingerprints
+                        .keys()
+                        .cloned()
+                        .collect(),
+                    envelope,
+                    certified,
+                    prior_native,
+                    paired_roots,
+                };
+                use crate::heap_layout_bound::HeapLayoutBound;
+                let mut retained = crate::heap_layout_bound::Counter::new(usize::MAX);
+                if frozen.completed_heap_bound(&mut retained).is_none() {
+                    continue; // An unaccountable family never enters S.
+                }
+                let Some(total) = retained_family_heap
+                    .checked_add(retained.bytes)
+                    .and_then(|bytes| bytes.checked_add(root.len()))
+                else {
+                    continue;
+                };
+                retained_family_heap = total;
+                families.insert(root.clone(), frozen);
             }
-            // family.rows_by_member is dropped here; no retained API row graph.
+            // ledger.rows_by_member drops here; no retained API row graph.
         }
         let mut qualification = Qualification::from_frozen_families(families);
         qualification.correction_revoked_keys = std::mem::take(&mut self.correction_revoked_keys);
@@ -760,11 +1527,18 @@ impl NativePhase {
 }
 
 struct FrozenFamily {
-    witness: ClaudeUsageFamilyWitness,
-    assigned: BTreeMap<String, BTreeSet<String>>,
-    certified: BTreeMap<String, NormalSkip>,
-    prior_native_revisions: BTreeMap<String, String>,
+    proof: String,
+    members: BTreeSet<String>,
+    envelope: BTreeSet<String>,
+    certified: DescriptorMap<NormalSkip>,
+    prior_native: BTreeMap<String, FrozenNativePrior>,
     paired_roots: BTreeSet<String>,
+}
+struct FrozenNativePrior {
+    revision: String,
+    request_fingerprint: Option<String>,
+    occurrence_fingerprint: Option<String>,
+    assigned: Option<BTreeSet<String>>,
 }
 
 /// Moves the one frozen qualification through native continuation. A target
@@ -778,6 +1552,11 @@ pub(crate) struct Controller {
     awaiting_targets: bool,
     failed: bool,
     acquisition: TargetAcquisition,
+}
+
+pub(crate) struct RecoveryBudget<'a> {
+    pub(crate) previous: &'a ScanIndex,
+    pub(crate) credit: &'a mut Option<crate::source_rotation::PaidReservation>,
 }
 
 impl Controller {
@@ -817,7 +1596,28 @@ impl Controller {
     /// Called at the initial preparation pause and each subsequent target
     /// pause. False requires revoking the process lease; all actual native
     /// bodies remain available to the unchanged authoritative base fold.
+    #[cfg(test)]
     pub(crate) fn advance(&mut self, scan: &mut OwnedSourceScan, current: bool) -> bool {
+        self.advance_with_budget(scan, current, None)
+            .expect("logical native comparison adapter")
+    }
+
+    pub(crate) fn advance_paid(
+        &mut self,
+        scan: &mut OwnedSourceScan,
+        current: bool,
+        previous: &ScanIndex,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Result<bool, crate::source_rotation::LocalRefusal> {
+        self.advance_with_budget(scan, current, Some(RecoveryBudget { previous, credit }))
+    }
+
+    fn advance_with_budget(
+        &mut self,
+        scan: &mut OwnedSourceScan,
+        current: bool,
+        recovery: Option<RecoveryBudget<'_>>,
+    ) -> Result<bool, crate::source_rotation::LocalRefusal> {
         if self.failed
             || !current
             || !scan.native_comparison_is_healthy()
@@ -825,7 +1625,7 @@ impl Controller {
         {
             self.failed = true;
             scan.disable_native_comparison();
-            return false;
+            return Ok(false);
         }
         if self.awaiting_targets {
             let acquired = scan.take_native_comparison_acquisition(&mut self.qualification);
@@ -835,13 +1635,17 @@ impl Controller {
             if unresolved {
                 self.failed = true;
                 scan.disable_native_comparison();
-                return false;
+                return Ok(false);
             }
         }
         scan.resume_native_comparison_base();
         let next_frontier = scan.snapshots.len();
-        let selection = scan
-            .acquire_native_comparison_targets_after(&mut self.qualification, self.native_frontier);
+        let selection = scan.acquire_native_comparison_targets_after(
+            &mut self.qualification,
+            self.native_frontier,
+            recovery,
+            &self.acquisition.known_rearm_candidates,
+        )?;
         self.native_frontier = next_frontier;
         self.awaiting_targets = selection.queued > 0;
         if !selection.unresolved_sources.is_empty() {
@@ -850,9 +1654,9 @@ impl Controller {
                 .unresolved_sources
                 .extend(selection.unresolved_sources);
             scan.disable_native_comparison();
-            return false;
+            return Ok(false);
         }
-        true
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -865,13 +1669,51 @@ impl Controller {
 pub(crate) struct Qualification {
     families: BTreeMap<String, FrozenFamily>,
     envelope_roots: Vec<String>,
-    envelope_by_hash: BTreeMap<String, Vec<usize>>,
+    envelope_by_hash: Vec<EnvelopeMember>,
     pending: BTreeMap<String, PendingComparison>,
     unknown_native_sources: BTreeSet<String>,
-    revoked_roots: BTreeSet<String>,
-    native_corrections: BTreeMap<String, NativeCorrection>,
-    correction_revoked_keys: BTreeSet<String>,
-    correction_forbidden_roots: BTreeSet<String>,
+    revoked_roots: DescriptorSet,
+    native_corrections: DescriptorMap<NativeCorrection>,
+    correction_revoked_keys: DescriptorSet,
+    correction_forbidden_roots: DescriptorSet,
+}
+
+/// Exact SHA-256 bytes, not a probabilistic filter or uniqueness evidence.
+/// Sorted (digest, root slot) pairs replace one owned hex key/tree node and
+/// slot vector per possible hash. These closed fields own no heap allocation.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct EnvelopeMember {
+    digest: [u8; 32],
+    slot: usize,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for EnvelopeMember {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self { digest, slot } = self;
+        let digest: &[u8; 32] = digest;
+        let slot: &usize = slot;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(digest, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(slot, c)
+    }
+}
+fn envelope_digest(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let nibble = |byte| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let mut digest = [0; 32];
+    for (pair, out) in bytes.chunks_exact(2).zip(&mut digest) {
+        *out = nibble(pair[0])?
+            .checked_mul(16)?
+            .checked_add(nibble(pair[1])?)?;
+    }
+    Some(digest)
 }
 
 struct PendingComparison {
@@ -901,8 +1743,23 @@ pub(crate) struct TargetSelection {
 }
 
 impl Qualification {
+    pub(super) fn recovery_targets(&self) -> impl Iterator<Item = &CandidateFile> + Clone {
+        self.pending
+            .values()
+            .flat_map(|plan| plan.candidates.iter())
+    }
+
+    fn metadata_accounted(&self) -> bool {
+        self.families
+            .values()
+            .all(|family| family.certified.accounted())
+            && self.revoked_roots.accounted()
+            && self.native_corrections.accounted()
+            && self.correction_revoked_keys.accounted()
+            && self.correction_forbidden_roots.accounted()
+    }
     fn into_window(self, census_window_end: &str) -> Option<Box<WindowEligibility>> {
-        let mut roots = BTreeMap::new();
+        let mut roots = DescriptorMap::default();
         for (root, family) in self.families {
             if family.certified.is_empty() || self.revoked_roots.contains(&root) {
                 continue;
@@ -917,7 +1774,7 @@ impl Qualification {
             roots.insert(
                 root,
                 WindowRoot {
-                    proof: claude_usage_family_witness_fingerprint(&family.witness),
+                    proof: family.proof,
                     certified: family.certified,
                 },
             );
@@ -933,42 +1790,30 @@ impl Qualification {
     }
     fn from_frozen_families(mut families: BTreeMap<String, FrozenFamily>) -> Self {
         let mut envelope_roots = Vec::new();
-        let mut envelope_by_hash = BTreeMap::<String, Vec<usize>>::new();
+        let Some(entries) = families.values().try_fold(0usize, |count, family| {
+            count.checked_add(family.envelope.len())
+        }) else {
+            return Self::default();
+        };
+        let mut envelope_by_hash = Vec::new();
+        if envelope_by_hash.try_reserve_exact(entries).is_err() {
+            return Self::default();
+        }
         for (root, family) in &mut families {
             if family.certified.is_empty() {
                 continue;
             }
             let slot = envelope_roots.len();
             envelope_roots.push(root.clone());
-            let mut record_root = |hash: String| {
-                let slots = envelope_by_hash
-                    .entry(hash)
-                    .or_insert_with(|| Vec::with_capacity(1));
-                // Roots are visited monotonically. Usually one slot; avoid a
-                // tree allocation per hash while deduplicating assigned + E.
-                if slots.last() != Some(&slot) {
-                    slots.push(slot);
-                }
-            };
-            for skip in family.certified.values() {
-                // A certified member is not a current native prior. Move its
-                // hashes, avoiding a duplicate retained S graph per family.
-                if let Some(assigned) = family.assigned.remove(&skip.member) {
-                    for hash in assigned {
-                        record_root(hash);
-                    }
-                }
-                if let Some(excluded) = family
-                    .witness
-                    .legacy_excluded_request_id_hashes
-                    .get(&skip.member)
-                {
-                    for hash in excluded {
-                        record_root(hash.clone());
-                    }
-                }
+            for hash in std::mem::take(&mut family.envelope) {
+                let Some(digest) = envelope_digest(&hash) else {
+                    return Self::default(); // Invalid input is BASE, never a negative.
+                };
+                envelope_by_hash.push(EnvelopeMember { digest, slot });
             }
         }
+        envelope_by_hash.sort_unstable();
+        envelope_by_hash.dedup();
         Self {
             families,
             envelope_roots,
@@ -1051,9 +1896,8 @@ impl Qualification {
                 }
             }
             let complete_selected_family = family
-                .witness
-                .member_request_id_fingerprints
-                .keys()
+                .members
+                .iter()
                 .all(|member| required_revisions.contains_key(member));
             let available = complete_selected_family
                 && candidates.len().saturating_add(family.certified.len()) <= remaining_files;
@@ -1169,15 +2013,13 @@ impl Qualification {
             return Some(hashes);
         };
         let member = &item.source_session_id;
-        let prior = family.prior_native_revisions.get(member);
-        if prior.is_none()
-            || prior != item.source_file_fingerprint.as_ref()
-            || family
-                .witness
-                .legacy_excluded_request_id_hashes
-                .get(member)
-                .is_some_and(|excluded| !excluded.is_empty())
-            || family.witness.member_request_id_fingerprints.get(member)
+        // Only E-empty native members enter this frozen prior map. Its exact
+        // pre-mutation proof and fingerprints cannot be replaced by P_new.
+        let Some(prior) = family.prior_native.get(member) else {
+            return Some(hashes);
+        };
+        if Some(&prior.revision) != item.source_file_fingerprint.as_ref()
+            || prior.request_fingerprint.as_ref()
                 != Some(&claude_request_id_set_fingerprint(&hashes))
         {
             return Some(hashes);
@@ -1192,12 +2034,12 @@ impl Qualification {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        if family.witness.member_occurrence_fingerprints.get(member)
+        if prior.occurrence_fingerprint.as_ref()
             != Some(&claude_occurrence_map_fingerprint(&occurrences))
         {
             return Some(hashes);
         }
-        let Some(prior_s) = family.assigned.get(member) else {
+        let Some(prior_s) = prior.assigned.as_ref() else {
             return Some(hashes);
         };
         Some(hashes.difference(prior_s).cloned().collect())
@@ -1209,12 +2051,17 @@ impl Qualification {
         let novel = self.new_native_hashes(item)?;
         let mut roots = BTreeSet::new();
         for hash in novel {
-            if let Some(slots) = self.envelope_by_hash.get(&hash) {
-                for &slot in slots {
-                    let root = &self.envelope_roots[slot];
-                    if self.families.contains_key(root) {
-                        roots.insert(root.clone());
-                    }
+            let digest = envelope_digest(&hash)?;
+            let start = self
+                .envelope_by_hash
+                .partition_point(|entry| entry.digest < digest);
+            for entry in self.envelope_by_hash[start..]
+                .iter()
+                .take_while(|entry| entry.digest == digest)
+            {
+                let root = &self.envelope_roots[entry.slot];
+                if self.families.contains_key(root) {
+                    roots.insert(root.clone());
                 }
             }
         }
@@ -1232,12 +2079,7 @@ impl Qualification {
                 family
                     .certified
                     .values()
-                    .filter(|skip| {
-                        family
-                            .witness
-                            .member_request_id_fingerprints
-                            .contains_key(&skip.member)
-                    })
+                    .filter(|skip| family.members.contains(&skip.member))
                     .count()
             })
             .sum()
@@ -1290,8 +2132,9 @@ impl Drop for TestScope {
 }
 
 crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, upload_context, candidate);
-crate::heap_layout_bound::fields!(NativePhase; disabled, parsed_keys, native_corrections, correction_revoked_keys, correction_forbidden_roots, paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
-crate::heap_layout_bound::fields!(FrozenFamily; witness, assigned, certified, prior_native_revisions, paired_roots);
+crate::heap_layout_bound::fields!(NativePhase; disabled, retained_target_bytes, parsed_keys, native_corrections, correction_revoked_keys, correction_forbidden_roots, paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
+crate::heap_layout_bound::fields!(FrozenFamily; proof, members, envelope, certified, prior_native, paired_roots);
+crate::heap_layout_bound::fields!(FrozenNativePrior; revision, request_fingerprint, occurrence_fingerprint, assigned);
 crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, awaiting_targets, failed, acquisition);
 crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowEligibility; census_window_end, roots, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);

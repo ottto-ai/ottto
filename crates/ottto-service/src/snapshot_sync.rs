@@ -1709,7 +1709,7 @@ pub(crate) fn comparison_partial_fallback_for_test(
         progress_path,
         || Ok(()),
         None,
-        Some(fallback),
+        Some(NativeSelectedRestore::Logical(fallback)),
     )
 }
 
@@ -1771,6 +1771,27 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
     )
 }
 
+enum NativeSelectedRestore<'a> {
+    Paid(&'a mut crate::snapshots::claude_native_comparison::Completion),
+    // Primitive save fixtures carry no source/lifecycle admission claim.
+    #[cfg(test)]
+    Logical(&'a mut crate::snapshots::claude_native_comparison::SelectedFallback),
+}
+impl NativeSelectedRestore<'_> {
+    fn restore(self, index: &mut ScanIndex, previous: &ScanIndex) -> Result<()> {
+        match self {
+            Self::Paid(completion) => completion
+                .restore_selected_paid(index, previous)
+                .map(|_| ())
+                .map_err(anyhow::Error::from),
+            #[cfg(test)]
+            Self::Logical(fallback) => fallback
+                .restore_selected(index, previous)
+                .map_err(|reason| anyhow!(reason)),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn checkpoint_partial_snapshot_index_with_comparison(
     index: &ScanIndex,
@@ -1783,7 +1804,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     progress_path: &Path,
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
-    fallback: Option<&mut crate::snapshots::claude_native_comparison::SelectedFallback>,
+    fallback: Option<NativeSelectedRestore<'_>>,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -1860,9 +1881,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         committed_index,
     );
     if let Some(fallback) = fallback {
-        fallback
-            .restore_selected(&mut committable, committed_index)
-            .map_err(|reason| anyhow!(reason))?;
+        fallback.restore(&mut committable, committed_index)?;
     }
     committable.mark_bounded_sweep_unsettled();
     validate_destination()?;
@@ -3140,7 +3159,11 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     type Source = SnapshotSource;
     type Frame = SourcePreparation;
     type Completed = (SourcePreparation, ScanIndex, SourceScanResult);
-    fn prepare(&mut self, source: SnapshotSource) -> Result<Option<SourcePreparation>> {
+    fn prepare(
+        &mut self,
+        source: SnapshotSource,
+        remaining: Option<usize>,
+    ) -> Result<Option<SourcePreparation>> {
         ensure_snapshot_scan_authority(
             self.device,
             source,
@@ -3148,7 +3171,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             &self.account_witness,
             self.daemon,
         )?;
-        prepare_sync_source(
+        let mut prepared = prepare_sync_source(
             self.client,
             self.device,
             self.device_secret,
@@ -3160,7 +3183,11 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             self.transport_cycle,
             self.account_witness,
             self.retry.enabled(),
-        )
+        )?;
+        if let Some(frame) = prepared.as_mut() {
+            frame.accept_native_rotation_turn(remaining);
+        }
+        Ok(prepared)
     }
     fn validate(&mut self, frame: &SourcePreparation) -> Result<()> {
         ensure_snapshot_scan_authority(
@@ -3173,10 +3200,16 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     }
     fn step(
         &mut self,
-        frame: SourcePreparation,
+        mut frame: SourcePreparation,
+        remaining: Option<usize>,
     ) -> crate::source_rotation::Step<SourcePreparation, Self::Completed> {
+        frame.accept_native_rotation_turn(remaining);
         match frame.step() {
             SourcePreparationStep::Pending(frame) => crate::source_rotation::Step::Pending(frame),
+            SourcePreparationStep::Refused(frame, reason) => {
+                drop(frame);
+                crate::source_rotation::Step::Refused(reason)
+            }
             SourcePreparationStep::Complete {
                 preparation,
                 index,
@@ -3187,7 +3220,8 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     fn bound(&self, frame: &SourcePreparation, limit: usize) -> Option<usize> {
         crate::heap_layout_bound::bound(frame, limit)
     }
-    fn finish(&mut self, completed: Self::Completed) -> Result<()> {
+    fn finish(&mut self, mut completed: Self::Completed, remaining: Option<usize>) -> Result<()> {
+        completed.0.accept_native_rotation_turn(remaining);
         let source = completed.0.source;
         crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             let (preparation, index, scan) = completed;
@@ -3221,7 +3255,12 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         match result {
             Ok(()) => self.transport_cycle.note_success(),
             Err(error) => {
-                self.transport_cycle.note_error(&error);
+                if error
+                    .downcast_ref::<crate::source_rotation::LocalRefusal>()
+                    .is_none()
+                {
+                    self.transport_cycle.note_error(&error);
+                }
                 eprintln!(
                     "local snapshot sync skipped for {}: {}",
                     source.api_slug(),
@@ -3500,6 +3539,7 @@ fn persist_machine_icon_at(path: &Path, response: &AgentStatusSnapshotUploadResp
 // Preparation stays owned by the existing cycle. No token/report lease or
 // partially finalized body crosses a collection step.
 struct SourcePreparation {
+    native_comparison_reservation: Option<crate::source_rotation::PaidReservation>,
     native_comparison_lease: Option<crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     prepared_claude_evidence: Option<PreparedClaudeLocalEvidence>,
     terminal_native_traversal:
@@ -3533,6 +3573,7 @@ struct SourcePreparation {
 #[allow(clippy::large_enum_variant)] // Move the native owned context without boxing/cloning its graph.
 enum SourcePreparationStep {
     Pending(SourcePreparation),
+    Refused(SourcePreparation, crate::source_rotation::LocalRefusal),
     Complete {
         preparation: SourcePreparation,
         index: ScanIndex,
@@ -3540,31 +3581,148 @@ enum SourcePreparationStep {
     },
 }
 impl SourcePreparation {
+    fn accept_native_rotation_turn(&mut self, remaining: Option<usize>) {
+        if self.native_comparison_reservation.is_none()
+            && self
+                .scan
+                .as_ref()
+                .is_some_and(|scan| scan.native_capture_active())
+            && crate::heap_layout_bound::layout_supported()
+        {
+            self.native_comparison_reservation =
+                crate::source_rotation::PaidReservation::from_remainder(remaining, 0, 0);
+        }
+        if let Some(paid) = self.native_comparison_reservation.as_mut() {
+            paid.at_turn(remaining);
+        }
+    }
+    fn native_incremental_owned_bytes(
+        &self,
+        state: &crate::snapshots::OwnedSourceScan,
+    ) -> Option<usize> {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        if !crate::heap_layout_bound::layout_supported() {
+            return None;
+        }
+        let mut counter = Counter::new(usize::MAX);
+        // No working/committed index or ordinary active parser is charged a
+        // second time. These are the optional moving/retained native owners.
+        self.native_comparison_lease.heap_bound(&mut counter)?;
+        self.prepared_claude_evidence.heap_bound(&mut counter)?;
+        self.terminal_native_traversal.heap_bound(&mut counter)?;
+        self.native_comparison_controller.heap_bound(&mut counter)?;
+        counter.add(state.native_capture_bytes()?)?;
+        Some(counter.bytes)
+    }
+
     fn step(mut self) -> SourcePreparationStep {
         let mut state = self.scan.take().expect("active source preparation");
+        if state.native_capture_active() {
+            let initialize = self
+                .native_comparison_reservation
+                .as_ref()
+                .is_some_and(|paid| paid.allocated() == 0);
+            let occupied = initialize
+                .then(|| self.native_incremental_owned_bytes(&state))
+                .flatten();
+            let paid = self
+                .native_comparison_reservation
+                .as_mut()
+                .is_some_and(|paid| {
+                    if !initialize {
+                        return true;
+                    }
+                    occupied
+                        .is_some_and(|bytes| paid.grow_for(bytes) && paid.record_allocated(bytes))
+                });
+            if !paid {
+                state.disable_native_comparison();
+            }
+        }
+        if state.native_capture_disabled() {
+            if let Some(lease) = self.native_comparison_lease.as_mut() {
+                lease.revoke();
+            }
+        }
         if state.native_comparison_ready() {
             if let Some(support_dir) = state.native_comparison_support_dir().map(Path::to_path_buf)
             {
                 if self.prepared_claude_evidence.is_none() {
-                    let (index, native) = state.native_comparison_inputs();
-                    self.prepared_claude_evidence = Some(PreparedClaudeLocalEvidence::load(
-                        &support_dir,
-                        native,
-                        index,
-                    ));
-                    if self
+                    let permitted = self
                         .native_comparison_lease
                         .as_ref()
-                        .is_some_and(|lease| lease.allowed())
+                        .is_some_and(|lease| lease.allowed());
+                    let roots = state
+                        .native_early_evidence_roots()
+                        .chain(
+                            self.native_comparison_lease
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|lease| lease.early_evidence_roots()),
+                        )
+                        .filter(|_| permitted);
+                    let occupied = self
+                        .native_comparison_reservation
+                        .as_ref()
+                        .map(|paid| paid.allocated());
+                    let loaded = self
+                        .native_comparison_reservation
+                        .as_mut()
+                        .and_then(|paid| {
+                            let (index, _) = state.native_comparison_inputs();
+                            PreparedClaudeLocalEvidence::load_paid_eligible(
+                                &support_dir,
+                                index,
+                                roots,
+                                paid,
+                                occupied?,
+                            )
+                        });
+                    if loaded.is_none() {
+                        // No controller/deferral has been created at this first
+                        // preparation seam. Drop all speculative rows and keep
+                        // the ordinary final cohort/loader authoritative.
+                        state.disable_native_comparison();
+                        if let Some(lease) = self.native_comparison_lease.as_mut() {
+                            lease.revoke();
+                        }
+                        if let (Some(paid), Some(occupied)) =
+                            (self.native_comparison_reservation.as_mut(), occupied)
+                        {
+                            let _ = paid.record_allocated(occupied);
+                            paid.retire_speculation();
+                        }
+                    }
+                    self.prepared_claude_evidence = loaded;
+                    let allowed = self
+                        .native_comparison_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.allowed());
+                    if let (true, Some(evidence)) =
+                        (allowed, self.prepared_claude_evidence.as_ref())
                     {
                         let previous = self
                             .native_comparison_lease
                             .as_mut()
                             .and_then(|lease| lease.take_window());
-                        let qualification = state.prepare_native_comparison_with_window(
-                            self.prepared_claude_evidence.as_ref().unwrap().rows(),
+                        let qualification = match state.prepare_native_comparison_paid(
+                            evidence.rows(),
                             previous,
-                        );
+                            &mut self.native_comparison_reservation,
+                        ) {
+                            Ok(qualification) => qualification,
+                            Err(_) => {
+                                // No controller, target or deferral exists at
+                                // this boundary. Finish the ordinary BASE pass
+                                // and suppress repeated optional admission for
+                                // this Lifecycle, even if capacity improves.
+                                state.disable_native_comparison();
+                                if let Some(lease) = self.native_comparison_lease.as_mut() {
+                                    lease.refuse_admission();
+                                }
+                                None
+                            }
+                        };
                         if let Some(qualification) = qualification {
                             self.native_comparison_controller =
                                 Some(crate::snapshots::claude_native_comparison::Controller::new(
@@ -3594,9 +3752,24 @@ impl SourcePreparation {
                                     controller.required_roots(),
                                 )
                             });
-                    if !controller.advance(&mut state, current) {
-                        if let Some(lease) = self.native_comparison_lease.as_mut() {
-                            lease.revoke();
+                    match controller.advance_paid(
+                        &mut state,
+                        current,
+                        &self.committed_index,
+                        &mut self.native_comparison_reservation,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Some(lease) = self.native_comparison_lease.as_mut() {
+                                lease.revoke();
+                            }
+                        }
+                        Err(reason) => {
+                            if let Some(lease) = self.native_comparison_lease.as_mut() {
+                                lease.refuse_admission();
+                            }
+                            drop(state);
+                            return SourcePreparationStep::Refused(self, reason);
                         }
                     }
                 } else {
@@ -3611,16 +3784,25 @@ impl SourcePreparation {
             self.scan = Some(state);
             return SourcePreparationStep::Pending(self);
         }
-        match state.step(self.attribution_context.as_ref()) {
-            crate::snapshots::OwnedSourceScanStep::Pending(next) => {
+        match state.step_paid(
+            self.attribution_context.as_ref(),
+            &mut self.native_comparison_reservation,
+        ) {
+            Err(reason) => {
+                if let Some(lease) = self.native_comparison_lease.as_mut() {
+                    lease.refuse_admission();
+                }
+                SourcePreparationStep::Refused(self, reason)
+            }
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
-            crate::snapshots::OwnedSourceScanStep::Complete {
+            Ok(crate::snapshots::OwnedSourceScanStep::Complete {
                 index,
                 scan,
                 terminal_native_traversal,
-            } => {
+            }) => {
                 self.terminal_native_traversal = terminal_native_traversal;
                 SourcePreparationStep::Complete {
                     preparation: self,
@@ -3630,6 +3812,113 @@ impl SourcePreparation {
             }
         }
     }
+}
+#[cfg(test)]
+fn collect_native_preparation_with_rotation(
+    frame: SourcePreparation,
+    require_frame_bound: bool,
+) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+    try_collect_native_preparation_with_rotation(frame, require_frame_bound)
+        .expect("owned source completion")
+}
+#[cfg(test)]
+fn try_collect_native_preparation_with_rotation(
+    frame: SourcePreparation,
+    require_frame_bound: bool,
+) -> Result<(SourcePreparation, ScanIndex, SourceScanResult)> {
+    struct Collect {
+        frame: Option<SourcePreparation>,
+        completed: Option<(SourcePreparation, ScanIndex, SourceScanResult)>,
+        failure: Option<anyhow::Error>,
+        require_bound: bool,
+        started: Instant,
+        steps: usize,
+    }
+    impl crate::source_rotation::Owner for Collect {
+        type Source = SnapshotSource;
+        type Frame = SourcePreparation;
+        type Completed = (SourcePreparation, ScanIndex, SourceScanResult);
+        fn prepare(
+            &mut self,
+            _: SnapshotSource,
+            remaining: Option<usize>,
+        ) -> Result<Option<Self::Frame>> {
+            let mut frame = self.frame.take();
+            if let Some(frame) = frame.as_mut() {
+                frame.accept_native_rotation_turn(remaining);
+            }
+            Ok(frame)
+        }
+        fn validate(&mut self, _: &Self::Frame) -> Result<()> {
+            Ok(())
+        }
+        fn step(
+            &mut self,
+            mut frame: Self::Frame,
+            remaining: Option<usize>,
+        ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
+            self.steps += 1;
+            assert!(
+                self.steps <= 1024,
+                "same owned scanner must finish within existing fixture steps"
+            );
+            frame.accept_native_rotation_turn(remaining);
+            if self.require_bound {
+                assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
+                    "the real source frame must pass its real existing requested-layout budget; no substitute bound");
+            }
+            match frame.step() {
+                SourcePreparationStep::Pending(frame) => {
+                    crate::source_rotation::Step::Pending(frame)
+                }
+                SourcePreparationStep::Refused(frame, reason) => {
+                    drop(frame);
+                    crate::source_rotation::Step::Refused(reason)
+                }
+                SourcePreparationStep::Complete {
+                    preparation,
+                    index,
+                    scan,
+                } => crate::source_rotation::Step::Complete((preparation, index, scan)),
+            }
+        }
+        fn bound(&self, frame: &Self::Frame, limit: usize) -> Option<usize> {
+            crate::heap_layout_bound::bound(frame, limit)
+        }
+        fn finish(
+            &mut self,
+            mut completed: Self::Completed,
+            remaining: Option<usize>,
+        ) -> Result<()> {
+            completed.0.accept_native_rotation_turn(remaining);
+            self.completed = Some(completed);
+            Ok(())
+        }
+        fn outcome(&mut self, _: SnapshotSource, result: Result<()>) {
+            if let Err(error) = result {
+                self.failure = Some(error);
+            }
+        }
+        fn monotonic(&self) -> Duration {
+            self.started.elapsed()
+        }
+    }
+    let source = frame.source;
+    let mut owner = Collect {
+        frame: Some(frame),
+        completed: None,
+        failure: None,
+        require_bound: require_frame_bound,
+        started: Instant::now(),
+        steps: 0,
+    };
+    // The original rotation calculates queue/parked/retained deductions. No
+    // independently fabricated full-budget argument reaches the native caller.
+    crate::source_rotation::run(&mut owner, &[source], crate::source_rotation::PARKED_BUDGET);
+    if let Some(error) = owner.failure {
+        return Err(error);
+    }
+    owner.completed.context("owned source completion")
 }
 /// This cycle's contract-5 permit, from its authenticated hint only. Never
 /// cached across cycles, so a revoked token takes effect on the next fetch;
@@ -4065,6 +4354,7 @@ fn prepare_sync_source(
         }
     }
     Ok(Some(SourcePreparation {
+        native_comparison_reservation: None,
         native_comparison_lease,
         prepared_claude_evidence: None,
         terminal_native_traversal: None,
@@ -4160,6 +4450,7 @@ fn finish_sync_source(
     retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
     let SourcePreparation {
+        mut native_comparison_reservation,
         mut native_comparison_lease,
         prepared_claude_evidence,
         terminal_native_traversal,
@@ -4207,15 +4498,33 @@ fn finish_sync_source(
         }
     }
     let mut comparison_completion = match native_comparison_controller {
-        Some(controller) => Some(
-            controller
-                .complete(&scan_result, terminal_native_traversal, comparison_current)
-                .map_err(|reason| anyhow!(reason))?,
-        ),
+        Some(controller) => match controller.complete_paid(
+            &scan_result,
+            terminal_native_traversal,
+            comparison_current,
+            &mut native_comparison_reservation,
+        ) {
+            Ok(completion) => Some(completion),
+            Err(reason) => {
+                if let Some(lease) = native_comparison_lease.as_mut() {
+                    lease.refuse_admission();
+                }
+                return Err(reason.into());
+            }
+        },
         None => {
             crate::snapshots::claude_native_comparison::Completion::base(terminal_native_traversal)
         }
     };
+    if let Some(completion) = comparison_completion.as_mut() {
+        completion.attach_reservation(native_comparison_reservation);
+        if let Err(reason) = completion.require_paid_recovery() {
+            if let Some(lease) = native_comparison_lease.as_mut() {
+                lease.refuse_admission();
+            }
+            return Err(reason.into());
+        }
+    }
     let client = &receipt_client;
     let codex_join_validator = scan_result.codex_joining_validator();
     let validate_joined = |snapshots: &[SnapshotItem]| -> Result<()> {
@@ -4383,20 +4692,10 @@ fn finish_sync_source(
         Vec::new()
     };
     if let Some(comparison) = comparison_completion.as_mut() {
-        comparison.capture_native_corrections(
-            &mut scan_result,
+        comparison.prepare_native_corrections(
+            &scan_result,
             &committed_index,
             &claude_authority_disposition,
-            |snapshot| {
-                effective_snapshot_upload_body_witness(
-                    snapshot,
-                    &upload_progress,
-                    cache_observations_enabled,
-                    activity_hint.snapshot_head_cas_required,
-                    &legacy_reconciliation_pending,
-                    &claude_authority_disposition,
-                )
-            },
         );
     }
     finalize_scan_after_policy_with_body_witness(
@@ -4404,14 +4703,18 @@ fn finish_sync_source(
         &mut scan_result,
         &mut index,
         |snapshot| {
-            effective_snapshot_upload_body_witness(
+            let witness = effective_snapshot_upload_body_witness(
                 snapshot,
                 &upload_progress,
                 cache_observations_enabled,
                 activity_hint.snapshot_head_cas_required,
                 &legacy_reconciliation_pending,
                 &claude_authority_disposition,
-            )
+            );
+            if let Some(comparison) = comparison_completion.as_mut() {
+                comparison.observe_native_correction(snapshot, &witness);
+            }
+            witness
         },
     );
     index.advance_empty_claude_proof_corrections(&scan_result);
@@ -4805,7 +5108,7 @@ fn finish_sync_source(
                 None,
                 comparison_completion
                     .as_mut()
-                    .and_then(|comparison| comparison.fallback.as_mut()),
+                    .map(NativeSelectedRestore::Paid),
             ) {
                 Ok(committable) => committable,
                 Err(error) => {
@@ -4918,7 +5221,7 @@ fn finish_sync_source(
                     None,
                     comparison_completion
                         .as_mut()
-                        .and_then(|comparison| comparison.fallback.as_mut()),
+                        .map(NativeSelectedRestore::Paid),
                 ) {
                     Ok(committable) => index = committable,
                     Err(checkpoint_error) => eprintln!(
@@ -5086,14 +5389,10 @@ fn finish_sync_source(
         &claude_cutoff_corrections,
         upload_fully_settled,
     );
-    if let Some(fallback) = comparison_completion
-        .as_mut()
-        .and_then(|comparison| comparison.fallback.as_mut())
-    {
-        fallback
-            .restore_selected(&mut index, &committed_index)
-            .map_err(|reason| anyhow!(reason))?;
-        upload_fully_settled = false;
+    if let Some(comparison) = comparison_completion.as_mut() {
+        if comparison.restore_selected_paid(&mut index, &committed_index)? {
+            upload_fully_settled = false;
+        }
     }
     backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
@@ -5439,6 +5738,149 @@ struct PreparedClaudeLocalEvidence {
 }
 
 impl PreparedClaudeLocalEvidence {
+    fn load_paid_eligible<'a>(
+        support_dir: &Path,
+        index: &ScanIndex,
+        roots: impl Iterator<Item = &'a str> + Clone,
+        paid: &mut crate::source_rotation::PaidReservation,
+        occupied: usize,
+    ) -> Option<Self> {
+        use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
+        if !heap_layout_bound::layout_supported() {
+            return None;
+        }
+        // The legacy exclusion validator needs the global owner universe.
+        // Early optional work covers E-empty only; final consumption still
+        // loads/validates the entire canonical cohort, including legacy roots.
+        let eligible = roots.filter(|root| {
+            crate::snapshots::claude_native_comparison::early_root_is_eligible(index, root)
+        });
+        let mut prepared = Self {
+            sessions: BTreeSet::new(),
+            api: Default::default(),
+            api_failed: false,
+            trace_rows: BTreeMap::new(),
+            traces: BTreeMap::new(),
+            healthy_roots: BTreeSet::new(),
+        };
+        let mut root_string_bytes = 0usize;
+        let mut retained_decoded_bytes = 0usize;
+        // Even an empty BTreeMap may own an allocated empty root according
+        // to the existing conservative layout contract. Fund that bound too;
+        // a first natural bootstrap has no retained family roots yet.
+        let mut retained_charge =
+            occupied.checked_add(heap_layout_bound::completed_bound(&prepared, usize::MAX)?)?;
+        if !paid.grow_for(retained_charge) || !paid.record_allocated(retained_charge) {
+            return None;
+        }
+        for root in eligible {
+            if prepared.sessions.contains(root) {
+                continue;
+            }
+            let loaded = (|| {
+                let count = prepared.sessions.len().checked_add(1)?;
+                let key_bytes = root_string_bytes.checked_add(root.len())?;
+                let mut infrastructure = Counter::new(usize::MAX);
+                heap_layout_bound::tree_nodes::<String, ()>(count, &mut infrastructure)?;
+                heap_layout_bound::tree_nodes::<String, ()>(count, &mut infrastructure)?;
+                heap_layout_bound::tree_nodes::<String, PreparedTraceRead>(
+                    count,
+                    &mut infrastructure,
+                )?;
+                heap_layout_bound::tree_nodes::<
+                    String,
+                    Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
+                >(count, &mut infrastructure)?;
+                crate::claude_local_otel::ClaudeApiEvidenceRead::paid_root_map_storage(
+                    count,
+                    &mut infrastructure,
+                )?;
+                // Six destination keys per root: sessions, health, trace rows,
+                // trace generation/report and both API maps. A report's own
+                // empty nodes remain included in retained_decoded_bytes.
+                infrastructure.add(key_bytes.checked_mul(6)?)?;
+                // One temporary root set for the existing canonical paid
+                // decoder. Its nodes/key overlap the destination containers.
+                heap_layout_bound::tree_nodes::<String, ()>(1, &mut infrastructure)?;
+                infrastructure.add(root.len())?;
+                let fixed = occupied
+                    .checked_add(infrastructure.bytes)?
+                    .checked_add(retained_decoded_bytes)?;
+                if !paid.grow_for(fixed) {
+                    return None;
+                }
+                let cohort = std::iter::once(root.to_owned()).collect::<BTreeSet<_>>();
+                let api = crate::claude_local_otel::ClaudeApiEvidenceRead::load_paid_for_roots(
+                    support_dir,
+                    &cohort,
+                    paid,
+                    fixed,
+                )?;
+                let api_bytes = heap_layout_bound::completed_bound(&api, usize::MAX)?;
+                let before_trace = fixed.checked_add(api_bytes)?;
+                let (mut report, generation) = crate::claude_local_otel::load_claude_trace_paid(
+                    support_dir,
+                    root,
+                    paid,
+                    before_trace,
+                )?;
+                let trace_bytes = heap_layout_bound::completed_bound(&report, usize::MAX)?;
+                let decoded = retained_decoded_bytes
+                    .checked_add(api_bytes)?
+                    .checked_add(trace_bytes)?;
+                let charge = occupied
+                    .checked_add(infrastructure.bytes)?
+                    .checked_add(decoded)?;
+                if !paid.permits(charge) {
+                    return None;
+                }
+                let healthy =
+                    report.is_complete() && api.strict_generation_matches(support_dir, root);
+                // No append/sort workspace or clone of decoded evidence: all
+                // destination nodes/keys were covered before decoding began.
+                prepared.api.move_disjoint_paid_root(api);
+                if healthy {
+                    prepared.healthy_roots.insert(root.to_owned());
+                }
+                if let Some(rows) = report.evidence.remove(root) {
+                    prepared.trace_rows.insert(root.to_owned(), rows);
+                }
+                prepared.traces.insert(
+                    root.to_owned(),
+                    PreparedTraceRead {
+                        generation: Some(generation),
+                        report,
+                    },
+                );
+                prepared.sessions.insert(root.to_owned());
+                paid.record_allocated(charge)
+                    .then_some((key_bytes, decoded, charge))
+            })();
+            let Some((keys, decoded, charge)) = loaded else {
+                // Keep already-paid healthy roots. A refused/unknown root
+                // contributes no eligibility; final canonical loading still
+                // covers it. Stop this optional batch rather than retrying all
+                // roots or dropping valid certificates from earlier roots.
+                let _ = paid.record_allocated(retained_charge);
+                paid.retire_speculation();
+                break;
+            };
+            root_string_bytes = keys;
+            retained_decoded_bytes = decoded;
+            retained_charge = charge;
+        }
+        let mut actual = Counter::new(usize::MAX);
+        prepared.completed_heap_bound(&mut actual)?;
+        if !paid.record_allocated(occupied.checked_add(actual.bytes)?) {
+            return None;
+        }
+        // All opened byte buffers, decoder workspaces and temporary cohorts
+        // have dropped. Preserve only the returned owner and recovery credit.
+        paid.retire_speculation();
+        Some(prepared)
+    }
+
+    #[cfg(test)]
     fn load(support_dir: &Path, native: &[SnapshotItem], index: &ScanIndex) -> Self {
         let sessions = claude_evidence_session_ids(native)
             .into_iter()
@@ -5532,19 +5974,23 @@ impl PreparedClaudeLocalEvidence {
             })
     }
 
+    #[cfg(test)]
     fn take_api(
         &mut self,
         support_dir: &Path,
     ) -> Result<crate::claude_local_otel::ClaudeApiEvidenceRead> {
-        if self.api_failed || !self.api.permissive_readset_is_current(support_dir) {
-            // Even permissive effort enrichment must not consume a stale
-            // preflight view after a moving native continuation yields.
-            return crate::claude_local_otel::ClaudeApiEvidenceRead::load(
-                support_dir,
-                self.sessions.clone(),
-            );
+        self.take_api_for_sessions(support_dir, &self.sessions.clone())
+    }
+
+    fn take_api_for_sessions(
+        &mut self,
+        support_dir: &Path,
+        session_ids: &BTreeSet<String>,
+    ) -> Result<crate::claude_local_otel::ClaudeApiEvidenceRead> {
+        if self.api_failed {
+            self.api = Default::default();
         }
-        Ok(std::mem::take(&mut self.api))
+        self.api.complete_permissive(support_dir, session_ids)
     }
 
     fn take_trace(
@@ -5709,7 +6155,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     };
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let api_load = match prepared.as_mut() {
-        Some(read) => read.take_api(support_dir),
+        Some(read) => read.take_api_for_sessions(support_dir, &session_ids),
         None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids),
     };
     match api_load {
@@ -5760,7 +6206,11 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     stats.paired_sidecar_root_count = usage_roots.len();
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
-    api_read.retain_roots(&usage_roots.iter().cloned().collect());
+    let paired_roots = usage_roots.iter().cloned().collect();
+    api_read.retain_roots(&paired_roots);
+    if let Some(early) = prepared.as_mut() {
+        api_read.move_remaining_for_strict(&mut early.api, &paired_roots);
+    }
     // Health is family-scoped: one malformed historical sidecar must make
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
@@ -18847,7 +19297,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 

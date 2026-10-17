@@ -146,7 +146,11 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
     type Source = SnapshotSource;
     type Frame = SourcePreparation;
     type Completed = (SourcePreparation, ScanIndex, SourceScanResult);
-    fn prepare(&mut self, source: SnapshotSource) -> Result<Option<SourcePreparation>> {
+    fn prepare(
+        &mut self,
+        source: SnapshotSource,
+        _remaining: Option<usize>,
+    ) -> Result<Option<SourcePreparation>> {
         assert_eq!(self.owner, std::thread::current().id());
         self.offered.push((source, self.now));
         let root = match source {
@@ -182,6 +186,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
                 .insert("opaque".into(), serde_json::json!({"opaque":true}));
         }
         Ok(Some(SourcePreparation {
+            native_comparison_reservation: None,
             native_comparison_lease: None,
             prepared_claude_evidence: None,
             terminal_native_traversal: None,
@@ -241,8 +246,10 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
     }
     fn step(
         &mut self,
-        frame: SourcePreparation,
+        mut frame: SourcePreparation,
+        remaining: Option<usize>,
     ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
+        frame.accept_native_rotation_turn(remaining);
         let pi = frame.source == SnapshotSource::Pi;
         let before = frame.scan.as_ref().unwrap().test_active_physical_lines();
         match frame.step() {
@@ -253,6 +260,10 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
                     self.line_count += after - before;
                 }
                 crate::source_rotation::Step::Pending(frame)
+            }
+            SourcePreparationStep::Refused(frame, reason) => {
+                drop(frame);
+                crate::source_rotation::Step::Refused(reason)
             }
             SourcePreparationStep::Complete {
                 preparation,
@@ -268,7 +279,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
         }
         bound
     }
-    fn finish(&mut self, completed: Self::Completed) -> Result<()> {
+    fn finish(&mut self, completed: Self::Completed, _remaining: Option<usize>) -> Result<()> {
         let (preparation, index, scan) = completed;
         let expected = &self.controls[preparation.source.api_slug()];
         assert_eq!(

@@ -150,6 +150,7 @@ struct RearmFixture {
     index_path: PathBuf,
     progress_path: PathBuf,
     request_identity: bool,
+    native_file_limit: usize,
     native_lifecycle:
         std::sync::Arc<crate::snapshots::claude_native_comparison::lifecycle::Lifecycle>,
 }
@@ -170,6 +171,7 @@ impl RearmFixture {
         let fixture = Self {
             case,
             request_identity: false,
+            native_file_limit: REARM_PAGE_FILES,
             native_lifecycle: std::sync::Arc::new(Default::default()),
             index_path: base.join("claude-scan-index.json"),
             progress_path: base.join("claude-upload-progress.json"),
@@ -298,13 +300,18 @@ impl RearmFixture {
         index: ScanIndex,
         collected_at: &str,
     ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+        let frame = self.native_preparation(index, collected_at);
+        collect_native_preparation_with_rotation(frame, true)
+    }
+
+    fn native_preparation(&self, index: ScanIndex, collected_at: &str) -> SourcePreparation {
         let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&self.root),
             index.clone(),
             collected_at,
             183,
-            REARM_PAGE_FILES,
+            self.native_file_limit,
             true, // Match the ordinary test scanner's artifact setting.
             Some(&self.support),
             &[],
@@ -330,7 +337,8 @@ impl RearmFixture {
         }))
         .unwrap();
         let status = test_agent_status(SourceKind::ClaudeCode);
-        let mut preparation = SourcePreparation {
+        SourcePreparation {
+            native_comparison_reservation: None,
             native_comparison_lease: Some(lease),
             prepared_claude_evidence: None,
             terminal_native_traversal: None,
@@ -364,20 +372,7 @@ impl RearmFixture {
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: Some(scan),
-        };
-        for _ in 0..1024 {
-            assert!(crate::heap_layout_bound::bound(&preparation, crate::source_rotation::PARKED_BUDGET).is_some(),
-                "the real source frame must pass its real existing requested-layout budget; no substitute bound");
-            match preparation.step() {
-                SourcePreparationStep::Pending(next) => preparation = next,
-                SourcePreparationStep::Complete {
-                    preparation,
-                    index,
-                    scan,
-                } => return (preparation, index, scan),
-            }
         }
-        panic!("same owned scanner did not complete within bounded fixture steps");
     }
 
     /// One page through the production stage order of `finish_sync_source`.
@@ -443,7 +438,12 @@ impl RearmFixture {
             match frame.native_comparison_controller.take() {
                 Some(controller) => Some(
                     controller
-                        .complete(&scan, frame.terminal_native_traversal.take(), current)
+                        .complete_paid(
+                            &scan,
+                            frame.terminal_native_traversal.take(),
+                            current,
+                            &mut frame.native_comparison_reservation,
+                        )
                         .unwrap(),
                 ),
                 None => crate::snapshots::claude_native_comparison::Completion::base(
@@ -453,6 +453,16 @@ impl RearmFixture {
         } else {
             None
         };
+        if let Some(completion) = comparison_completion.as_mut() {
+            completion.attach_reservation(
+                native_preparation
+                    .as_mut()
+                    .and_then(|frame| frame.native_comparison_reservation.take()),
+            );
+            completion
+                .require_paid_recovery()
+                .expect("actual same-token selected recovery reservation");
+        }
         // Narrow incremental owner measurement. This is not a total frame,
         // parser scratch, allocator or RSS bound. The actual supported layout
         // walker includes map nodes, string/vector capacity and moved terminal.
@@ -506,21 +516,7 @@ impl RearmFixture {
         let mut progress = test_upload_progress();
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         if let Some(comparison) = comparison_completion.as_mut() {
-            comparison.capture_native_corrections(
-                &mut scan,
-                &committed_index,
-                &disposition,
-                |snapshot| {
-                    effective_snapshot_upload_body_witness(
-                        snapshot,
-                        &progress,
-                        false,
-                        false,
-                        &BTreeSet::new(),
-                        &disposition,
-                    )
-                },
-            );
+            comparison.prepare_native_corrections(&scan, &committed_index, &disposition);
         }
         let comparison_before_upload = comparison_requested(&comparison_completion);
         if comparison_completion.is_some() {
@@ -538,14 +534,18 @@ impl RearmFixture {
             &mut scan,
             &mut index,
             |snapshot| {
-                effective_snapshot_upload_body_witness(
+                let witness = effective_snapshot_upload_body_witness(
                     snapshot,
                     &progress,
                     false,
                     false,
                     &BTreeSet::new(),
                     &disposition,
-                )
+                );
+                if let Some(comparison) = comparison_completion.as_mut() {
+                    comparison.observe_native_correction(snapshot, &witness);
+                }
+                witness
             },
         );
         let holds = LocalHoldSettlement::classify(
@@ -654,7 +654,7 @@ impl RearmFixture {
                 None,
                 comparison_completion
                     .as_mut()
-                    .and_then(|comparison| comparison.fallback.as_mut()),
+                    .map(NativeSelectedRestore::Paid),
             )
             .expect("checkpoint shed page");
             return RearmPage {
@@ -680,14 +680,13 @@ impl RearmFixture {
         let mut fully_settled = settlement.fully_settled;
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        if let Some(fallback) = comparison_completion
-            .as_mut()
-            .and_then(|comparison| comparison.fallback.as_mut())
-        {
-            fallback
-                .restore_selected(&mut index, &committed_index)
-                .unwrap();
-            fully_settled = false;
+        if let Some(comparison) = comparison_completion.as_mut() {
+            if comparison
+                .restore_selected_paid(&mut index, &committed_index)
+                .unwrap()
+            {
+                fully_settled = false;
+            }
         }
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
@@ -1298,6 +1297,7 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         base,
         case: "native-parity-independent-index",
         request_identity: source.request_identity,
+        native_file_limit: source.native_file_limit,
         native_lifecycle: std::sync::Arc::new(Default::default()),
     }
 }
@@ -1506,6 +1506,79 @@ fn native_comparison_novel_import_base_parity() {
         native_comparison_assert_old_bindings(&base_before, index);
     }
     writeln!(std::io::stderr().lock(),"native_comparison_novel_parity: parity_body_ran=true exact_same_physical_revisions=true independent_natural_bootstrap=true exact_offered_ACKed_bytes_head_collector_evidence_tags=true empty_tag_fixture=true old_A_selected_bodies_bindings_names_unchanged=true settled_coverage_false=true no_S_pending_owner_or_tag_evidence=true quiet_base3_candidate0=true import_reads_base4_candidate1=true later_quiet0=true historical_strict_fence_oracle=UNMET_SUPERSEDED installed_savings_proved=false").unwrap();
+}
+
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_actual_retention_refusal_preserves_checkpoint_and_latches_base() {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(
+            std::io::stderr().lock(),
+            "native_comparison_retention_refusal: supported_positive=UNEXECUTED"
+        )
+        .unwrap();
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut fixture = RearmFixture::new("native-target-retention-refusal");
+    // This separate fixture needs room for a real same-page native target.
+    // The original required oracle remains unchanged at REARM_PAGE_FILES=2.
+    fixture.native_file_limit = 8;
+    let mut bootstrap = false;
+    for hour in 8..14 {
+        let pages = fixture.generation(hour);
+        if fixture.native_lifecycle.retained_valid_for_test()
+            && pages.last().unwrap().fully_settled
+            && rearm_reads(&pages) == 0
+        {
+            bootstrap = true;
+            break;
+        }
+    }
+    assert!(
+        bootstrap,
+        "only actual native ACK/save/bootstrap can authorize targets"
+    );
+    const COPY: &str = "b7777777-7777-4777-8777-777777777777";
+    let copy = native_comparison_add_import(&fixture, COPY, "req_root_1");
+    let before_index = std::fs::read(&fixture.index_path).unwrap();
+    let read_progress = || match std::fs::read(&fixture.progress_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read actual fixture progress: {error}"),
+    };
+    let before_progress = read_progress();
+    let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    index.activate_upload_context("upload-context-rearm".into());
+    index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
+    let before = serde_json::to_value(&index).unwrap();
+    let frame = fixture.native_preparation(index, "2026-08-02T14:00:00Z");
+    let refusal = crate::snapshots::claude_native_comparison::target_unknown_allowance_for_test();
+    let error = try_collect_native_preparation_with_rotation(frame, true)
+        .err()
+        .expect("actual target retention must refuse an unknown allowance");
+    assert!(error
+        .downcast_ref::<crate::source_rotation::LocalRefusal>()
+        .is_some());
+    assert_eq!(refusal.hits(), 1, "one canonical target finish, no retry");
+    assert_eq!(std::fs::read(&fixture.index_path).unwrap(), before_index);
+    assert_eq!(read_progress(), before_progress);
+    assert!(!ScanIndex::load(&fixture.index_path)
+        .unwrap()
+        .files
+        .contains_key(copy.to_str().unwrap()));
+    assert!(!fixture.native_lifecycle.retained_valid_for_test());
+    drop(refusal);
+    fixture.native_lifecycle.discard_retained();
+    // A recovered real rotation allowance and later successful ordinary saves
+    // cannot renew the optional lifecycle after refusal.
+    for hour in 15..17 {
+        let pages = fixture.generation(hour);
+        assert!(!fixture.native_lifecycle.retained_valid_for_test());
+        native_comparison_assert_old_bindings(&before, &pages.last().unwrap().index);
+    }
+    writeln!(std::io::stderr().lock(), "native_comparison_retention_refusal: actual_SourcePreparation_rotation_target_finish=true actual_unknown_allowance_refused=true one_attempt=true no_completed_or_empty_census=true no_finish_offer=true prior_checkpoint_and_ACK_bytes_unchanged=true later_pages_recovered_budget_stay_BASE=true identity_controls=true selected_recovery_nonzero_debt_pressure_unproved=true").unwrap();
 }
 
 #[test]

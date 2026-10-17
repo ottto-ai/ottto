@@ -3,11 +3,12 @@
 use super::*;
 
 pub(crate) struct Completion {
+    reservation: Option<crate::source_rotation::PaidReservation>,
     pub(crate) window: Option<Box<WindowEligibility>>,
     pub(crate) fallback: Option<SelectedFallback>,
     native_plans: BTreeMap<String, NativePlan>,
     pending_corrections: Vec<PendingNativeCorrection>,
-    native_terminal: Option<Box<TerminalTraversal>>,
+    native_terminal: Option<NativeCensusCompletion>,
 }
 
 pub(super) struct NativePlan {
@@ -74,27 +75,89 @@ impl NativeCorrection {
 }
 
 impl Completion {
+    /// Both real selected-save callers use the same moving credit. Recovery
+    /// never requests new optional capacity after a body has been offered.
+    pub(crate) fn restore_selected_paid(
+        &mut self,
+        index: &mut ScanIndex,
+        previous: &ScanIndex,
+    ) -> Result<bool, crate::source_rotation::LocalRefusal> {
+        self.require_paid_recovery()?;
+        let Some(fallback) = self.fallback.as_mut() else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        let result = {
+            let reserved = self
+                .reservation
+                .as_ref()
+                .expect("checked moving recovery")
+                .recovery_bytes_for_test();
+            let (result, allocation) = crate::retry_allocation_probe::measure_process(|| {
+                fallback.restore_selected(index, previous)
+            });
+            assert!(
+                allocation.requested_peak_with_overlap <= reserved,
+                "actual selected recovery peak{} exceeds prepaid{}",
+                allocation.requested_peak_with_overlap,
+                reserved
+            );
+            eprintln!("native selected recovery: actual_requested_peak={} prepaid_peak={reserved} same_moving_credit=true", allocation.requested_peak_with_overlap);
+            result
+        };
+        #[cfg(not(test))]
+        let result = fallback.restore_selected(index, previous);
+        result.map_err(crate::source_rotation::LocalRefusal)?;
+        Ok(true)
+    }
+
+    pub(crate) fn require_paid_recovery(&self) -> Result<(), crate::source_rotation::LocalRefusal> {
+        if self.fallback.is_some()
+            && !self
+                .reservation
+                .as_ref()
+                .is_some_and(crate::source_rotation::PaidReservation::recovery_is_reserved)
+        {
+            return Err(crate::source_rotation::LocalRefusal(
+                "native comparison selected recovery lost its moving reservation",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn attach_reservation(
+        &mut self,
+        reservation: Option<crate::source_rotation::PaidReservation>,
+    ) {
+        assert!(self.reservation.is_none(), "one moving native reservation");
+        self.reservation = reservation;
+    }
     /// A revoked optimization permit still cannot discard an actual completed
     /// native census. No negative certificate or native correction is created.
     pub(crate) fn base(terminal: Option<Box<TerminalTraversal>>) -> Option<Self> {
         Some(Self {
+            reservation: None,
             window: None,
             fallback: None,
             native_plans: BTreeMap::new(),
             pending_corrections: Vec::new(),
-            native_terminal: Some(terminal?),
+            native_terminal: Some(terminal?.into_native_census()),
         })
     }
-    pub(super) fn native_terminal(&self) -> Option<&TerminalTraversal> {
-        self.native_terminal.as_deref().or_else(|| {
-            self.fallback
-                .as_ref()
-                .and_then(|fallback| fallback.terminal.as_deref())
-        })
+    pub(super) fn native_window(&self) -> Option<&str> {
+        self.native_terminal
+            .as_ref()
+            .map(|terminal| terminal.census_window_end.as_str())
+            .or_else(|| {
+                self.fallback
+                    .as_ref()
+                    .and_then(|fallback| fallback.terminal.as_deref())
+                    .map(|terminal| terminal.traversal.census_window_end.as_str())
+            })
     }
-    /// The ordinary terminal graph is needed only through the native fold.
-    /// Retire it before body preparation/upload. A fallback terminal has a
-    /// different lifetime: both selected-save restore seams still need it.
+    /// Normal completion has already dropped the traversal graph, retaining
+    /// only its moving window receipt through the native fold. A fallback has
+    /// a different lifetime: both selected-save seams need its full traversal.
     pub(crate) fn retire_native_fold_owner(&mut self) {
         drop(self.native_terminal.take());
     }
@@ -113,20 +176,20 @@ impl Completion {
         self.pending_corrections.len()
     }
 
-    /// Capture from the actual native result before the finalizer removes
-    /// semantic no-ops. This is a candidate, never an ACK/Skip/coverage fact.
-    pub(crate) fn capture_native_corrections(
+    /// Select candidates before the canonical finalizer removes semantic no-ops.
+    /// No fingerprint/body projection is computed here. The ordinary finalizer
+    /// supplies its exact current witness through observe_native_correction.
+    pub(crate) fn prepare_native_corrections(
         &mut self,
-        scan: &mut SourceScanResult,
+        scan: &SourceScanResult,
         previous: &ScanIndex,
         disposition: &ClaudeUsageAuthorityDisposition,
-        body_witness: impl Fn(&SnapshotItem) -> String,
     ) {
         self.pending_corrections.clear();
         let Some(window) = self.window.as_ref() else {
             return;
         };
-        for item in &mut scan.snapshots {
+        for item in &scan.snapshots {
             let Some(plan) = self.native_plans.get(&item.source_session_id) else {
                 continue;
             };
@@ -158,7 +221,6 @@ impl Completion {
             if window.correction_revoked_keys.contains(&pending.index_key) {
                 continue;
             }
-            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
             self.pending_corrections.push(PendingNativeCorrection {
                 key: pending.index_key.clone(),
                 plan: NativePlan {
@@ -166,9 +228,52 @@ impl Completion {
                     proof: plan.proof.clone(),
                     revision: plan.revision.clone(),
                 },
-                fingerprint: item.snapshot_fingerprint.clone(),
-                body_witness: body_witness(item),
+                fingerprint: String::new(),
+                body_witness: String::new(),
             });
+        }
+    }
+
+    /// Observe the existing finalizer projection, after its semantic hash was
+    /// recomputed. Repeated canonical checks must agree; a mismatch revokes this
+    /// optional candidate. No additional serialization or alternate body exists.
+    pub(crate) fn observe_native_correction(&mut self, item: &SnapshotItem, body_witness: &str) {
+        self.pending_corrections.retain_mut(|candidate| {
+            if candidate.plan.revision != item.source_file_fingerprint.as_deref().unwrap_or("")
+                || !claude_index_path_member_ref(Path::new(&candidate.key)).is_some_and(
+                    |identity| {
+                        identity.root == candidate.plan.root
+                            && identity.matches_member(&item.source_session_id)
+                    },
+                )
+            {
+                return true;
+            }
+            if candidate.fingerprint.is_empty() && candidate.body_witness.is_empty() {
+                candidate.fingerprint = item.snapshot_fingerprint.clone();
+                candidate.body_witness = body_witness.to_owned();
+                true
+            } else {
+                candidate.fingerprint == item.snapshot_fingerprint
+                    && candidate.body_witness == body_witness
+            }
+        });
+    }
+
+    /// Data-level primitive fixture has no physical source finalizer. The
+    /// actual pipeline and settlement regressions use its observer seam.
+    #[cfg(test)]
+    pub(crate) fn capture_native_corrections(
+        &mut self,
+        scan: &mut SourceScanResult,
+        previous: &ScanIndex,
+        disposition: &ClaudeUsageAuthorityDisposition,
+        body_witness: impl Fn(&SnapshotItem) -> String,
+    ) {
+        self.prepare_native_corrections(scan, previous, disposition);
+        for item in &mut scan.snapshots {
+            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+            self.observe_native_correction(item, &body_witness(item));
         }
     }
 
@@ -185,6 +290,9 @@ impl Completion {
             return;
         };
         for candidate in self.pending_corrections.drain(..) {
+            if candidate.fingerprint.is_empty() || candidate.body_witness.is_empty() {
+                continue; // No canonical finalizer projection was observed.
+            }
             let Some(exact_ack) = acknowledged(&candidate.fingerprint, &candidate.body_witness)
             else {
                 continue;
@@ -248,6 +356,106 @@ pub(crate) struct SelectedFallback {
 }
 
 impl Controller {
+    /// Price the existing constructor's new nodes, copied plan strings and
+    /// selected-key workspace before it consumes the controller. Retained
+    /// input and output overlap use this same reservation, not a finish pool.
+    pub(crate) fn complete_paid(
+        self,
+        scan: &SourceScanResult,
+        terminal: Option<Box<TerminalTraversal>>,
+        current: bool,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Result<Completion, crate::source_rotation::LocalRefusal> {
+        use crate::heap_layout_bound::{self, Counter};
+        let refuse = || {
+            crate::source_rotation::LocalRefusal(
+                "native comparison completion metadata cannot be prepaid before source offer",
+            )
+        };
+        let plan = (|| {
+            let paid = credit.as_mut()?;
+            let occupied = paid.allocated();
+            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            // This includes all moved certificates and the frozen input graph
+            // while output metadata is constructed. No input copy is made.
+            cost.add(heap_layout_bound::completed_bound(&self, usize::MAX)?)?;
+            if let Some(terminal) = terminal.as_ref() {
+                cost.add(heap_layout_bound::completed_bound(terminal, usize::MAX)?)?;
+            }
+            let plans = self
+                .qualification
+                .families
+                .values()
+                .try_fold(0usize, |n, f| n.checked_add(f.prior_native.len()))?;
+            heap_layout_bound::tree_nodes::<String, NativePlan>(plans, &mut cost)?;
+            for (root, family) in &self.qualification.families {
+                for (member, prior) in &family.prior_native {
+                    cost.add(member.len())?;
+                    cost.add(root.len())?;
+                    cost.add(family.proof.len())?;
+                    cost.add(prior.revision.len())?;
+                }
+            }
+            // into_window moves existing leaves into a compact buffer; its
+            // old and replacement buffers overlap during geometric growth.
+            restore_vec_peak::<(String, WindowRoot)>(self.qualification.families.len(), &mut cost)?;
+            cost.add(
+                std::mem::size_of::<WindowEligibility>()
+                    .checked_add(std::mem::align_of::<WindowEligibility>())?,
+            )?;
+            cost.add(scan.census_window_end.len())?;
+            let pending = scan.pending_finalization.len();
+            heap_layout_bound::tree_nodes::<String, ()>(pending, &mut cost)?; // withheld keys
+            heap_layout_bound::tree_nodes::<String, ()>(pending, &mut cost)?; // resolved sources
+            for entry in &scan.pending_finalization {
+                // Stored key + canonical root/member conversion workspace.
+                // Each field is a substring of the UTF-8 index path; the
+                // canonical formatted member may use old+new buffers too.
+                cost.add(entry.index_key.len().checked_mul(6)?)?;
+            }
+            let extra_sources = self
+                .qualification
+                .pending
+                .values()
+                .try_fold(0usize, |n, p| n.checked_add(p.sources.len()))?;
+            heap_layout_bound::tree_nodes::<String, ()>(extra_sources, &mut cost)?;
+            let targets = self.acquisition.known_rearm_candidates.len().checked_add(
+                self.qualification
+                    .pending
+                    .values()
+                    .try_fold(0usize, |n, p| n.checked_add(p.candidates.len()))?,
+            )?;
+            restore_vec_peak::<CandidateFile>(targets, &mut cost)?;
+            let peak = occupied.checked_add(cost.bytes)?;
+            paid.grow_for(peak).then_some((occupied, peak))
+        })();
+        let (occupied, prepaid) = plan.ok_or_else(refuse)?;
+        #[cfg(test)]
+        let result = {
+            let (result, allocation) = crate::retry_allocation_probe::measure_process(|| {
+                self.complete(scan, terminal, current)
+            });
+            assert!(
+                allocation.requested_peak_with_overlap <= prepaid - occupied,
+                "completion construction exceeds its same-owner prepayment"
+            );
+            eprintln!("native completion metadata: actual_requested_peak={} prepaid_extra={} no_input_clone=true same_moving_credit=true", allocation.requested_peak_with_overlap, prepaid - occupied);
+            result
+        };
+        #[cfg(not(test))]
+        let result = self.complete(scan, terminal, current);
+        #[cfg(not(test))]
+        let _ = prepaid;
+        let completion = result.map_err(crate::source_rotation::LocalRefusal)?;
+        let owned = heap_layout_bound::completed_bound(&completion, usize::MAX)
+            .and_then(|bytes| occupied.checked_add(bytes))
+            .ok_or_else(refuse)?;
+        if !credit.as_mut().ok_or_else(refuse)?.record_allocated(owned) {
+            return Err(refuse());
+        }
+        Ok(completion)
+    }
+
     /// Consume pending plans even when a target could not be queued. Disabling
     /// the optimization must not discard the dependency that caused fallback.
     pub(crate) fn complete(
@@ -256,6 +464,9 @@ impl Controller {
         terminal: Option<Box<TerminalTraversal>>,
         current: bool,
     ) -> Result<Completion, &'static str> {
+        if !self.qualification.metadata_accounted() {
+            return Err("native comparison metadata accounting is unknown");
+        }
         if !current || self.failed || self.awaiting_targets {
             for (_, plan) in std::mem::take(&mut self.qualification.pending) {
                 self.acquisition.unresolved_sources.extend(plan.sources);
@@ -287,6 +498,7 @@ impl Controller {
         }
         if !withheld_keys.is_empty() {
             return Ok(Completion {
+                reservation: None,
                 window: None,
                 native_plans: BTreeMap::new(),
                 pending_corrections: Vec::new(),
@@ -300,30 +512,31 @@ impl Controller {
                 }),
             });
         }
+        // Only fallback restoration needs the full graph. Retire it before
+        // allocating plans/window metadata, moving its existing window string.
+        let native_terminal = terminal.map(TerminalTraversal::into_native_census);
         let native_plans = self
             .qualification
             .families
             .iter()
             .flat_map(|(root, family)| {
-                family
-                    .prior_native_revisions
-                    .iter()
-                    .map(|(member, revision)| {
-                        (
-                            member.clone(),
-                            NativePlan {
-                                root: root.clone(),
-                                proof: claude_usage_family_witness_fingerprint(&family.witness),
-                                revision: revision.clone(),
-                            },
-                        )
-                    })
+                family.prior_native.iter().map(|(member, prior)| {
+                    (
+                        member.clone(),
+                        NativePlan {
+                            root: root.clone(),
+                            proof: family.proof.clone(),
+                            revision: prior.revision.clone(),
+                        },
+                    )
+                })
             })
             .collect();
         Ok(Completion {
+            reservation: None,
             native_plans,
             pending_corrections: Vec::new(),
-            native_terminal: terminal,
+            native_terminal,
             window: if current {
                 self.into_window(&scan.census_window_end)
             } else {
@@ -335,6 +548,239 @@ impl Controller {
 }
 
 impl SelectedFallback {
+    /// Price the existing selected-restore operations before any target is
+    /// queued. All current native files are included, so later policy/ACK
+    /// selection can only reduce the set. No index, key or body is cloned here.
+    /// The unchanged normal/partial subset writer remains authoritative.
+    pub(in crate::snapshots) fn recovery_peak<'a>(
+        index: &ScanIndex,
+        previous: &ScanIndex,
+        pending: &[PendingIndexFinalization],
+        targets: impl Iterator<Item = &'a CandidateFile> + Clone,
+        paid: &mut crate::source_rotation::PaidReservation,
+    ) -> Option<usize> {
+        use crate::heap_layout_bound::{self, Counter};
+        if !heap_layout_bound::layout_supported() {
+            return None;
+        }
+        // The only planning allocation is the canonical root/member pair for
+        // a prior marker lookup. Pay it before constructing either string.
+        let lookup_scratch = pending
+            .iter()
+            .map(|read| read.index_key.len())
+            .max()
+            .unwrap_or(0)
+            .checked_mul(2)?;
+        if !paid.grow_for(paid.allocated().checked_add(lookup_scratch)?) {
+            return None;
+        }
+        let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        let traversal = index.traversal.as_ref()?;
+        // A terminal checkpoint may have to outlive ordinary collection until
+        // selected recovery. It moves, but its extended lifetime is not free.
+        cost.add(heap_layout_bound::completed_bound(
+            traversal,
+            crate::source_rotation::PARKED_BUDGET,
+        )?)?;
+        let target_count = targets.clone().count();
+        let keys = pending.len().checked_add(target_count)?;
+        let mut affected = pending.len();
+        let mut maximum_key = 0usize;
+        for read in pending {
+            let key = &read.index_key;
+            maximum_key = maximum_key.max(key.len());
+            cost.add(key.len())?;
+            // The current final group/entity SHA may be replaced by policy.
+            // Its 64-byte digest is copied into the temporary affected set.
+            cost.add(64)?;
+            let current = index.file_snapshot_fingerprints.get(key);
+            affected = affected.checked_add(current.map_or(1, |fps| fps.len().max(1)))?;
+            if let Some(fps) = current {
+                for fp in fps {
+                    cost.add(fp.capacity().max(64))?;
+                }
+            } else {
+                cost.add(64)?;
+            }
+            if let Some(entry) = previous.files.get(key) {
+                restore_tree_insert_peak::<String, ScanIndexEntry>(
+                    index.files.len().checked_add(keys)?,
+                    1,
+                    &mut cost,
+                )?;
+                cost.add(key.len())?;
+                cost.add(heap_layout_bound::completed_bound(
+                    entry,
+                    crate::source_rotation::PARKED_BUDGET,
+                )?)?;
+            }
+            if let Some(fps) = previous.file_snapshot_fingerprints.get(key) {
+                restore_tree_insert_peak::<String, BTreeSet<String>>(
+                    index.file_snapshot_fingerprints.len().checked_add(keys)?,
+                    1,
+                    &mut cost,
+                )?;
+                cost.add(key.len())?;
+                cost.add(heap_layout_bound::completed_bound(
+                    fps,
+                    crate::source_rotation::PARKED_BUDGET,
+                )?)?;
+            }
+            // Exact prior entity set plus the prior group digest are the only
+            // old accepted/activity entries the restore can insert.
+            for fp in previous
+                .file_snapshot_fingerprints
+                .get(key)
+                .into_iter()
+                .flatten()
+                .chain(
+                    previous
+                        .files
+                        .get(key)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.as_ref()),
+                )
+            {
+                if let Some(activity) = previous.snapshot_activity_at.get(fp) {
+                    restore_tree_insert_peak::<String, Option<String>>(
+                        index.snapshot_activity_at.len().checked_add(keys)?,
+                        1,
+                        &mut cost,
+                    )?;
+                    cost.add(fp.len())?;
+                    cost.add(heap_layout_bound::completed_bound(
+                        activity,
+                        crate::source_rotation::PARKED_BUDGET,
+                    )?)?;
+                }
+                if previous.accepted_snapshot_fingerprints.contains(fp) {
+                    restore_tree_insert_peak::<String, ()>(
+                        index
+                            .accepted_snapshot_fingerprints
+                            .len()
+                            .checked_add(keys)?,
+                        1,
+                        &mut cost,
+                    )?;
+                    cost.add(fp.len())?;
+                }
+            }
+            if previous.confirmed_empty_files.contains(key) {
+                restore_tree_insert_peak::<String, ()>(
+                    index.confirmed_empty_files.len().checked_add(keys)?,
+                    1,
+                    &mut cost,
+                )?;
+                cost.add(key.len())?;
+            }
+            if let Some(value) = previous.terminal_jsonl_dispositions.get(key) {
+                restore_tree_insert_peak::<String, TerminalJsonlDisposition>(
+                    index.terminal_jsonl_dispositions.len().checked_add(keys)?,
+                    1,
+                    &mut cost,
+                )?;
+                cost.add(key.len())?;
+                cost.add(heap_layout_bound::completed_bound(
+                    value,
+                    crate::source_rotation::PARKED_BUDGET,
+                )?)?;
+            }
+            if let Some(identity) = claude_index_path_member_ref(Path::new(key)) {
+                let (_, member) = identity.into_owned();
+                if let Some(value) = previous.claude_owned_start_census.get(&member) {
+                    restore_tree_insert_peak::<String, ClaudeOwnedStartCensusWitness>(
+                        index.claude_owned_start_census.len().checked_add(keys)?,
+                        1,
+                        &mut cost,
+                    )?;
+                    cost.add(key.len())?; // root/member construction and moved key
+                    cost.add(heap_layout_bound::completed_bound(
+                        value,
+                        crate::source_rotation::PARKED_BUDGET,
+                    )?)?;
+                }
+            }
+        }
+        heap_layout_bound::tree_nodes::<String, ()>(affected, &mut cost)?;
+        for target in targets {
+            let path = target.path.to_str()?;
+            maximum_key = maximum_key.max(path.len());
+            // New priority path/root and dedup key; source candidates stay
+            // owned while these copies are built.
+            cost.add(target.path.capacity())?;
+            cost.add(target.scan_root.capacity())?;
+            cost.add(path.len())?;
+        }
+        heap_layout_bound::tree_nodes::<String, ()>(keys, &mut cost)?;
+        for read in pending {
+            let path = Path::new(&read.index_key);
+            let root = traversal
+                .scan_roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())?;
+            cost.add(read.index_key.len())?;
+            cost.add(root.capacity())?;
+        }
+        for path in &traversal.pending_candidates {
+            maximum_key = maximum_key.max(path.path.to_str()?.len());
+        }
+        cost.add(maximum_key)?; // one retain/dedup lookup key at a time
+        cost.add(lookup_scratch)?;
+        restore_vec_peak::<ScanTraversalPath>(
+            keys.checked_add(traversal.pending_candidates.len())?,
+            &mut cost,
+        )?;
+        // Preserve #585's paired empty-map rollback. The existing helper runs
+        // over all confirmed-empty keys; charge possible current-pass pairs
+        // under correction roots too, without modifying their state/rules.
+        if index.claude_authority_proof_correction_pending() {
+            let revision = index
+                .claude_usage_authority_quarantine
+                .values()
+                .flat_map(|record| record.member_source_file_fingerprints.values())
+                .chain(
+                    previous
+                        .claude_usage_authority_quarantine
+                        .values()
+                        .flat_map(|record| record.member_source_file_fingerprints.values()),
+                )
+                .map(String::len)
+                .max()
+                .unwrap_or(0)
+                .max(64);
+            let mut advances = 0usize;
+            let mut identity_scratch = index
+                .confirmed_empty_files
+                .iter()
+                .map(String::len)
+                .max()
+                .unwrap_or(0)
+                .checked_mul(2)?;
+            for key in index.files.keys() {
+                let Some(identity) = claude_index_path_member_ref(Path::new(key)) else {
+                    continue;
+                };
+                identity_scratch = identity_scratch.max(key.len().checked_mul(2)?);
+                if !index
+                    .claude_usage_authority_quarantine
+                    .get(identity.root)
+                    .is_some_and(|record| record.proof_correction.is_some())
+                {
+                    continue;
+                }
+                advances = advances.checked_add(1)?;
+                cost.add(identity.root.len())?;
+                cost.add(key.len())?; // member <= canonical path length
+                cost.add(key.len())?; // key
+                cost.add(revision)?;
+                cost.add(revision)?; // previous map value, if any
+            }
+            cost.add(identity_scratch)?;
+            restore_vec_peak::<ClaudeEmptyMapAdvance>(advances, &mut cost)?;
+        }
+        Some(cost.bytes)
+    }
+
     /// Called only after raw native observations have been recorded. A
     /// deferred file cannot be finalized as an empty or semantic-no-op file.
     pub(crate) fn withhold(&self, scan: &mut SourceScanResult) {
@@ -436,12 +882,12 @@ impl SelectedFallback {
             }
         }
         index.restore_claude_empty_map_advances(empty_advances);
-        let current = index.current_snapshot_fingerprints();
+        for current in index.current_snapshot_fingerprint_refs() {
+            affected_fingerprints.remove(current);
+        }
         for fp in affected_fingerprints {
-            if !current.contains(&fp) {
-                index.accepted_snapshot_fingerprints.remove(&fp);
-                index.snapshot_activity_at.remove(&fp);
-            }
+            index.accepted_snapshot_fingerprints.remove(&fp);
+            index.snapshot_activity_at.remove(&fp);
         }
         if index.traversal.is_none() {
             index.traversal = self.terminal.take().map(|terminal| terminal.traversal);
@@ -500,7 +946,44 @@ impl SelectedFallback {
     }
 }
 
-crate::heap_layout_bound::fields!(Completion; window, fallback, native_plans, pending_corrections, native_terminal);
+/// Existing Rust1.88/1.95 B=6 insertion can split at most one node per level
+/// plus a new root. Charge the existing full-node upper bound for every such
+/// allocation; never weaken the ordinary layout/version/visit guards.
+fn restore_tree_insert_peak<K, V>(
+    maximum_entries: usize,
+    operations: usize,
+    cost: &mut crate::heap_layout_bound::Counter,
+) -> Option<()> {
+    if operations == 0 {
+        return Some(());
+    }
+    let mut levels = 1usize;
+    let mut width = 1usize;
+    while width <= maximum_entries {
+        width = width.checked_mul(6)?;
+        levels = levels.checked_add(1)?;
+    }
+    crate::heap_layout_bound::tree_nodes::<K, V>(
+        levels.checked_add(1)?.checked_mul(operations)?,
+        cost,
+    )
+}
+
+/// New push/append buffer and its preceding growth buffer may overlap. This
+/// is a construction plan for the existing pinned Vec/VecDeque operations.
+fn restore_vec_peak<T>(length: usize, cost: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+    if length == 0 {
+        return Some(());
+    }
+    let capacity = length.max(4).checked_next_power_of_two()?;
+    cost.add(
+        capacity
+            .checked_add(capacity / 2)?
+            .checked_mul(std::mem::size_of::<T>())?,
+    )
+}
+
+crate::heap_layout_bound::fields!(Completion; reservation, window, fallback, native_plans, pending_corrections, native_terminal);
 crate::heap_layout_bound::fields!(NativePlan; root, proof, revision);
 crate::heap_layout_bound::fields!(NativeCorrection; root, proof, revision, fingerprint, body_witness, selected_fingerprint, selected_body_witness);
 crate::heap_layout_bound::fields!(PendingNativeCorrection; key, plan, fingerprint, body_witness);

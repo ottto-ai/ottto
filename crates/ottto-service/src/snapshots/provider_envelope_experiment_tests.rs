@@ -6,6 +6,512 @@ use super::*;
 type Api = crate::claude_local_otel::ClaudeLocalOtelLoadReport;
 type Trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport;
 
+#[test]
+fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth() {
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("UNEXECUTED target body retention: unsupported layout");
+        return;
+    }
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    for (short, unknown) in [(false, false), (true, false), (false, true)] {
+        let mut fixture = NativePreparationFixture::new();
+        // An actual controlled re-arm; the fixture's initial state would
+        // otherwise produce only ordinary unchanged Skips and no body.
+        let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
+        fixture
+            .index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let state = fixture.paused_with_limit(1);
+        assert_eq!(state.scanned_file_count, 1);
+        assert_eq!(state.snapshots.len(), 1);
+        let parsed = ParsedJsonlFile {
+            snapshots: state.snapshots,
+            report: JsonlReadReport::default(),
+            recognized_usage_drop_count: 0,
+            ownership_incomplete_file_count: 0,
+            zero_snapshot_usage_evidence: false,
+            dropped_usage_record_count: 0,
+            terminal_line_loss_count: 0,
+            state_only_blocked_session_ids: BTreeSet::new(),
+            codex_parent_session_ref: None,
+            codex_parent_ledger_identity_used: None,
+            codex_parent_resolution_pending: false,
+            codex_parent_ownership_ledger: None,
+        };
+        let mut payload = Counter::new(usize::MAX);
+        for snapshot in &parsed.snapshots {
+            snapshot.completed_heap_bound(&mut payload).unwrap();
+        }
+        let expected_extra = payload.bytes + std::mem::size_of::<SnapshotItem>();
+        let mut phase = claude_native_comparison::NativePhase::default();
+        let old = phase.owned_capture_bytes().unwrap();
+        let recovery = 256;
+        let mut paid = Some(
+            crate::source_rotation::PaidReservation::from_remainder(
+                Some(old + expected_extra + recovery - usize::from(short)),
+                old,
+                old,
+            )
+            .unwrap(),
+        );
+        assert!(paid.as_mut().unwrap().reserve_recovery(recovery));
+        if unknown {
+            paid.as_mut().unwrap().at_turn(None);
+        }
+        let expected_admission = !short && !unknown;
+        let mut retained = Vec::new();
+        let (admitted, allocations) = crate::retry_allocation_probe::measure_process(|| {
+            phase.retain_target_output(&parsed, &mut retained, &mut paid)
+        });
+        assert_eq!(admitted.is_ok(), expected_admission);
+        assert!(paid.as_ref().unwrap().permits_recovery_peak(old + recovery));
+        if !expected_admission {
+            assert_eq!(retained.capacity(), 0);
+            assert_eq!(
+                allocations.allocations, 0,
+                "refusal before optional destination growth"
+            );
+            assert_eq!(paid.as_ref().unwrap().allocated(), old);
+        } else {
+            assert_eq!(retained.capacity(), 1);
+            assert_eq!(paid.as_ref().unwrap().allocated(), old + expected_extra);
+            assert_eq!(phase.owned_capture_bytes().unwrap(), old + expected_extra);
+            phase.disable();
+            assert_eq!(
+                phase.owned_capture_bytes().unwrap(),
+                old + expected_extra,
+                "revocation cannot forget retained target storage"
+            );
+            assert_eq!(
+                allocations.requested_peak_with_overlap,
+                std::mem::size_of::<SnapshotItem>()
+            );
+        }
+        eprintln!("native target retention: one_byte_short={short} unknown_remainder={unknown} admitted={} planned_extra={expected_extra} destination_allocation={} protected_recovery=true component_only=true full_finish_metadata_unqualified=true", admitted.is_ok(), allocations.requested_peak_with_overlap);
+    }
+}
+
+#[test]
+fn native_comparison_borrowed_membership_matches_complete_physical_universe() {
+    let mut index = ScanIndex::default();
+    for ordinal in 0..2043 {
+        let root = format!("root-{ordinal:04}");
+        for path in [
+            format!("/project/{root}.jsonl"),
+            format!("/project/{root}/subagents/agent-a.jsonl"),
+        ] {
+            index.files.insert(path, manifest_index_entry(Some("body")));
+        }
+    }
+    for path in [
+        "/other/root-0001/subagents/agent-a.jsonl", // duplicate physical member
+        "/other/root-0002/subagents/agent-unexpected.jsonl",
+        "/other/missing-root/subagents/agent-a.jsonl",
+        "/other/root-0003/subagents/workflows/run/journal.jsonl", // excluded
+    ] {
+        index
+            .files
+            .insert(path.into(), manifest_index_entry(Some("body")));
+    }
+    let canonical = complete_claude_usage_family_members(&index);
+    let ((view, selected), allocations) = crate::retry_allocation_probe::measure_process(|| {
+        (
+            claude_native_comparison::MembershipView::capture(&index, |_| true).unwrap(),
+            claude_native_comparison::MembershipView::selected_count(&index, |_| true).unwrap(),
+        )
+    });
+    assert_eq!(allocations.allocations, 1);
+    assert_eq!(
+        allocations.requested_peak_with_overlap,
+        selected * std::mem::size_of::<ClaudeIndexPathMemberRef<'_>>()
+    );
+    for root in (0..2043)
+        .map(|n| format!("root-{n:04}"))
+        .chain(std::iter::once("missing-root".into()))
+    {
+        let expected = canonical.get(&root);
+        let members = expected
+            .cloned()
+            .unwrap_or_else(|| BTreeSet::from([root.clone()]));
+        let mut witness = ClaudeUsageFamilyWitness {
+            evidence_fingerprint: String::new(),
+            member_request_id_fingerprints: members
+                .into_iter()
+                .map(|m| (m, String::new()))
+                .collect(),
+            member_occurrence_fingerprints: BTreeMap::new(),
+            assigned_request_id_fingerprints: BTreeMap::new(),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        };
+        assert_eq!(view.matches(&root, &witness), expected.is_some(), "{root}");
+        if expected.is_some() {
+            witness
+                .member_request_id_fingerprints
+                .insert(format!("{root}_absent"), String::new());
+            assert!(
+                !view.matches(&root, &witness),
+                "missing indexed member: {root}"
+            );
+        }
+    }
+    eprintln!("native membership borrowed view: roots=2043 selected_paths={selected} requested_peak={} full_canonical_parity=true duplicate_missing_extra_paths_checked=true not_RSS=true", allocations.requested_peak_with_overlap);
+}
+
+#[test]
+fn native_comparison_borrowed_index_identity_matches_owned_path_oracle_without_allocating() {
+    fn reference(path: &Path) -> Option<(String, String)> {
+        if path.extension().and_then(|v| v.to_str()) != Some("jsonl")
+            || claude_transcript_excluded_from_snapshots(path)
+        {
+            return None;
+        }
+        if let Some(identity) = claude_subagent_identity(path) {
+            return Some((
+                identity.root_session_id.clone(),
+                identity.source_session_id(),
+            ));
+        }
+        let stem = path.file_stem()?.to_str().filter(|v| !v.is_empty())?;
+        Some((stem.to_owned(), stem.to_owned()))
+    }
+    let paths = [
+        "ordinary.jsonl",
+        "/project/root.jsonl",
+        "/project/root/subagents/agent-a.jsonl",
+        "/project/root/subagents/workflows/wf-a/agent-a.jsonl",
+        "/project/root/subagents/workflows/wf-a/nested/agent-b.jsonl",
+        "/project/root/subagents/workflows/wf-a/journal.jsonl",
+        "/project/root/subagents/nested/subagents/agent-c.jsonl",
+        "subagents/agent-a.jsonl",
+        "/subagents/agent-a.jsonl",
+        "/project/journal.jsonl",
+        "/project/root/subagents/../agent-a.jsonl",
+        "/project/root/subagents/agent-a.meta.json",
+        "/unicode-Ω/根/subagents/agent-一.jsonl",
+    ];
+    for path in paths {
+        assert_eq!(
+            claude_index_path_member_ref(Path::new(path)).map(|id| id.into_owned()),
+            reference(Path::new(path)),
+            "{path}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/project/root/subagents/\xff/agent-a.jsonl".to_vec(),
+        ));
+        assert_eq!(
+            claude_index_path_member_ref(&path).map(|id| id.into_owned()),
+            reference(&path)
+        );
+    }
+    let (_, allocation) = crate::retry_allocation_probe::measure(|| {
+        for path in paths {
+            std::hint::black_box(claude_index_path_member_ref(Path::new(path)));
+        }
+    });
+    assert_eq!(
+        allocation.allocations, 0,
+        "planning must not allocate a component vector or identity"
+    );
+}
+
+#[test]
+fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("UNEXECUTED paid native window import: unsupported layout");
+        return;
+    }
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    for one_byte_short in [false, true] {
+        let fixture = NativePreparationFixture::new();
+        let NativeWindowPage {
+            index,
+            scan,
+            window,
+            ..
+        } = native_window_page(&fixture);
+        let mut phase = claude_native_comparison::NativePhase::default();
+        let extra = phase.window_import_extra_for_test(&window, &index).unwrap();
+        let mut old = Counter::new(usize::MAX);
+        window.heap_bound(&mut old).unwrap();
+        let external = 137;
+        let recovery = 256;
+        let occupied = phase.owned_capture_bytes().unwrap() + old.bytes + external;
+        let limit = occupied + extra + recovery - usize::from(one_byte_short);
+        let mut paid = Some(
+            crate::source_rotation::PaidReservation::from_remainder(
+                Some(limit),
+                occupied,
+                occupied,
+            )
+            .unwrap(),
+        );
+        assert!(paid.as_mut().unwrap().reserve_recovery(recovery));
+        let unchanged = serde_json::to_vec(&index).unwrap();
+        let (imported, allocations) = crate::retry_allocation_probe::measure_process(|| {
+            phase.import_window_paid(Some(window), &index, &scan.census_window_end, &mut paid)
+        });
+        assert_eq!(imported, !one_byte_short);
+        assert_eq!(serde_json::to_vec(&index).unwrap(), unchanged);
+        assert!(allocations.requested_peak_with_overlap <= extra);
+        assert!(paid
+            .as_ref()
+            .unwrap()
+            .permits_recovery_peak(external + recovery));
+        if one_byte_short {
+            assert!(phase.disabled_for_test());
+            assert_eq!(allocations.allocations, 0);
+            assert_eq!(paid.as_ref().unwrap().allocated(), external);
+        } else {
+            assert_eq!(phase.capture_count_for_test(), 1);
+            assert_eq!(
+                paid.as_ref().unwrap().allocated(),
+                external + phase.owned_capture_bytes().unwrap()
+            );
+        }
+        eprintln!("native paid import: one_byte_short={one_byte_short} imported={imported} planned_extra={extra} measured_incremental_peak={} index_unchanged=true recovery_preserved=true", allocations.requested_peak_with_overlap);
+    }
+}
+
+#[test]
+fn native_comparison_paid_capture_population_reports_guard_viability_without_bypass() {
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("UNEXECUTED native descriptor population: unsupported layout");
+        return;
+    }
+    let mut index = ScanIndex {
+        upload_context_fingerprint: Some("synthetic-context".into()),
+        active_upload_context_fingerprint: Some("synthetic-context".into()),
+        ..Default::default()
+    };
+    let candidates = (0..2043)
+        .map(|ordinal| {
+            let path = PathBuf::from(format!("/synthetic/project/session-{ordinal}.jsonl"));
+            let mut entry = manifest_index_entry(Some("accepted-body"));
+            entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+            index.files.insert(local_index_key(&path), entry);
+            CandidateFile {
+                scan_root: PathBuf::from("/synthetic/project"),
+                path,
+                size_bytes: 1,
+                modified_unix_seconds: 2,
+                modified_unix_nanos: 3,
+                source_file_fingerprint: "source".into(),
+                legacy_source_file_fingerprint: String::new(),
+                legacy_config_reconciliation_required: false,
+                opened_object_identity: "synthetic-descriptor-not-opened-evidence".into(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut phase = claude_native_comparison::NativePhase::default();
+    let initial = phase.owned_capture_bytes().unwrap();
+    let budget = crate::source_rotation::PARKED_BUDGET;
+    // A descriptor/accounting component experiment, not a fabricated runtime
+    // lease or actual opened-Skip certificate. Pipeline proof uses rotation.
+    let mut credit = Some(
+        crate::source_rotation::PaidReservation::from_remainder(Some(budget), initial, initial)
+            .unwrap(),
+    );
+    assert!(credit.as_mut().unwrap().reserve_recovery(1024));
+    let started = std::time::Instant::now();
+    let mut attempted = 0;
+    let mut maximum_retained = 0;
+    let mut maximum_owned = initial;
+    let (_, allocation) = crate::retry_allocation_probe::measure(|| {
+        for candidate in &candidates {
+            attempted += 1;
+            phase.record_actual_skip_paid(&index, candidate, WINDOW, &mut credit);
+            maximum_retained = maximum_retained.max(phase.capture_count_for_test());
+            maximum_owned = maximum_owned.max(credit.as_ref().unwrap().allocated());
+            if !phase.capture_active() {
+                break;
+            }
+        }
+    });
+    let elapsed_us = started.elapsed().as_micros();
+    let refused = !phase.capture_active();
+    let mut unused = crate::heap_layout_bound::Counter::new(usize::MAX);
+    crate::heap_layout_bound::HeapLayoutBound::heap_bound(credit.as_ref().unwrap(), &mut unused)
+        .unwrap();
+    let prepaid_peak = credit
+        .as_ref()
+        .unwrap()
+        .allocated()
+        .checked_add(unused.bytes)
+        .unwrap();
+    assert!(
+        allocation.requested_peak_with_overlap <= prepaid_peak,
+        "capture transient allocation exceeds paid credit"
+    );
+    eprintln!("native capture allocation: requested_peak_with_overlap={} prepaid_peak={prepaid_peak} not_RSS=true", allocation.requested_peak_with_overlap);
+
+    if refused {
+        assert!(
+            phase.disabled_for_test(),
+            "unknown accounting cannot retain partial eligibility"
+        );
+    }
+    assert_eq!(index.files.len(), 2043);
+    assert_eq!(
+        maximum_retained, 2043,
+        "all descriptors must fit without bypassing the visit guard"
+    );
+    assert!(!refused);
+    assert!(maximum_owned <= budget);
+    assert!(credit
+        .as_ref()
+        .unwrap()
+        .permits_recovery_peak(initial + 1024));
+    eprintln!("native capture population viability: requested_population=2043 attempted={attempted} maximum_retained={maximum_retained} maximum_owned_charge={maximum_owned} budget={budget} refused={refused} elapsed_us={elapsed_us} native_skip_evidence=false component_only=true representative_runtime_coverage_unproved=true guard_unchanged=true");
+    // Actual new-descriptor pressure preserves earlier paid eligibility. A
+    // parse that cannot record its mandatory revocation instead fails closed.
+    credit.as_mut().unwrap().at_turn(Some(maximum_owned));
+    let mut extra = candidates[0].clone();
+    extra.path = PathBuf::from("/synthetic/project/extra.jsonl");
+    let mut entry = manifest_index_entry(Some("accepted-body"));
+    entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+    index.files.insert(local_index_key(&extra.path), entry);
+    phase.record_actual_skip_paid(&index, &extra, WINDOW, &mut credit);
+    assert!(phase.capture_active());
+    assert_eq!(phase.capture_count_for_test(), 2043);
+    assert!(!phase.record_parse_attempt_paid(&candidates[0], &mut credit));
+    assert!(phase.disabled_for_test());
+}
+
+#[test]
+fn native_comparison_selected_membership_sees_all_paths_without_unrelated_owned_graph() {
+    let mut index = ScanIndex::default();
+    for ordinal in 0..2048 {
+        let mut entry = manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = "s".repeat(4096);
+        index
+            .files
+            .insert(format!("/unrelated/u-{ordinal}.jsonl"), entry);
+    }
+    for path in [
+        "/project/healthy.jsonl",
+        "/project/healthy/subagents/agent-a.jsonl",
+        // Not in the initial target list, but still a required family member.
+        "/different-project/healthy/subagents/agent-unexpected.jsonl",
+        "/project/duplicated.jsonl",
+        "/project/duplicated/subagents/agent-a.jsonl",
+        "/different-project/duplicated/subagents/agent-a.jsonl",
+        "/project/missing-root/subagents/agent-a.jsonl",
+    ] {
+        index
+            .files
+            .insert(path.into(), manifest_index_entry(Some("body")));
+    }
+    let selected = BTreeSet::from(["healthy".into(), "duplicated".into(), "missing-root".into()]);
+    let (all, baseline) =
+        crate::retry_allocation_probe::measure(|| complete_claude_usage_family_members(&index));
+    let (scoped, allocated) = crate::retry_allocation_probe::measure(|| {
+        complete_claude_usage_family_members_matching(&index, Some(&selected))
+    });
+    for root in &selected {
+        assert_eq!(scoped.get(root), all.get(root));
+    }
+    assert!(scoped["healthy"].contains("healthy_agent-unexpected"));
+    assert!(
+        !scoped.contains_key("duplicated"),
+        "another project's duplicate must invalidate the family"
+    );
+    assert!(!scoped.contains_key("missing-root"));
+    assert_eq!(scoped.len(), 1);
+    assert!(allocated.requested_peak_with_overlap < baseline.requested_peak_with_overlap);
+    let base_source_bytes = index
+        .files
+        .values()
+        .map(|entry| entry.source_file_fingerprint.capacity())
+        .sum::<usize>();
+    assert!(base_source_bytes >= crate::source_rotation::PARKED_BUDGET);
+    eprintln!("native comparison membership scratch: unrelated_files=2048 borrowed_base_source_bytes={base_source_bytes} baseline_global_peak={} selected_peak={} selected_duplicate_outside_targets_rejected=true missing_root_rejected=true extra_member_visible=true final_global_fold_unchanged=true admission_unproved=true not_RSS=true", baseline.requested_peak_with_overlap, allocated.requested_peak_with_overlap);
+}
+
+#[test]
+fn native_comparison_selected_restore_membership_matches_canonical_without_global_set() {
+    let mut index = ScanIndex::default();
+    for ordinal in 0..2048 {
+        let key = format!("file-{ordinal}");
+        index.files.insert(
+            key.clone(),
+            manifest_index_entry(Some(&format!("legacy-{ordinal}"))),
+        );
+        if ordinal % 3 == 0 {
+            index.file_snapshot_fingerprints.insert(
+                key,
+                BTreeSet::from([format!("exact-{ordinal}"), "shared".into()]),
+            );
+        }
+    }
+    index
+        .files
+        .insert("empty".into(), manifest_index_entry(Some("shadowed-empty")));
+    index
+        .file_snapshot_fingerprints
+        .insert("empty".into(), BTreeSet::new());
+    index
+        .codex_state_only_snapshot_fingerprints
+        .insert("state".into(), "codex-state".into());
+    let queries = [
+        "exact-0",
+        "legacy-0",
+        "legacy-1",
+        "exact-2046",
+        "legacy-2047",
+        "shared",
+        "shadowed-empty",
+        "codex-state",
+        "absent",
+    ];
+    let (canonical, old) =
+        crate::retry_allocation_probe::measure(|| index.current_snapshot_fingerprints());
+    let expected = queries
+        .iter()
+        .filter(|fp| !canonical.contains(**fp))
+        .map(|fp| (*fp).to_owned())
+        .collect::<BTreeSet<_>>();
+    let ((unreferenced, visits), borrowed) = crate::retry_allocation_probe::measure(|| {
+        let mut affected = queries
+            .iter()
+            .map(|fp| (*fp).to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut visits = 0usize;
+        for current in index.current_snapshot_fingerprint_refs() {
+            visits += 1;
+            affected.remove(current);
+        }
+        (affected, visits)
+    });
+    assert_eq!(unreferenced, expected);
+    let expected_visits = index
+        .file_snapshot_fingerprints
+        .values()
+        .map(BTreeSet::len)
+        .sum::<usize>()
+        + index
+            .files
+            .keys()
+            .filter(|key| !index.file_snapshot_fingerprints.contains_key(*key))
+            .count()
+        + index.codex_state_only_snapshot_fingerprints.len();
+    assert_eq!(
+        visits, expected_visits,
+        "one universe pass, not affected bodies times the full index"
+    );
+    assert!(borrowed.requested_peak_with_overlap < old.requested_peak_with_overlap);
+    eprintln!("native comparison selected restore: unrelated_files=2048 affected_queries={} universe_visits={visits} old_global_requested_peak={} selected_set_requested_peak={} one_universe_pass=true exact_empty_overrides_legacy=true codex_state_preserved=true not_RSS=true", queries.len(), old.requested_peak_with_overlap, borrowed.requested_peak_with_overlap);
+}
+
 fn reports(root: &str, extra: bool) -> (Api, Trace) {
     let mut api = (1..=5)
         .map(|i| {
@@ -3165,12 +3671,10 @@ fn native_comparison_corrected_native_receipt_fixture(
         scan.snapshots[0].usage_accounting_contract.as_deref(),
         Some("session_exclusive_reported_usage:v1")
     );
-    completion.capture_native_corrections(
-        &mut scan,
-        &previous,
-        &disposition,
-        snapshot_upload_body_witness,
-    );
+    completion.prepare_native_corrections(&scan, &previous, &disposition);
+    for item in &mut scan.snapshots {
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+    }
     assert_eq!(
         completion.native_correction_count_for_test(),
         0,
@@ -3186,7 +3690,43 @@ fn native_comparison_corrected_native_receipt_fixture(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    let mut baseline_scan = scan.clone();
+    let mut baseline_index = index.clone();
+    let mut baseline_projections = 0;
+    finalize_scan_after_policy_with_body_witness(
+        SnapshotSource::ClaudeCode,
+        &mut baseline_scan,
+        &mut baseline_index,
+        |snapshot| {
+            baseline_projections += 1;
+            snapshot_upload_body_witness(snapshot)
+        },
+    );
+    let mut observed_projections = 0;
+    finalize_scan_after_policy_with_body_witness(
+        SnapshotSource::ClaudeCode,
+        &mut scan,
+        &mut index,
+        |snapshot| {
+            observed_projections += 1;
+            let witness = snapshot_upload_body_witness(snapshot);
+            completion.observe_native_correction(snapshot, &witness);
+            witness
+        },
+    );
+    assert_eq!(
+        observed_projections, baseline_projections,
+        "native receipts add no upload-body serialization"
+    );
+    assert_eq!(
+        serde_json::to_vec(&scan.snapshots).unwrap(),
+        serde_json::to_vec(&baseline_scan.snapshots).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_vec(&index).unwrap(),
+        serde_json::to_vec(&baseline_index).unwrap()
+    );
+
     if mode == "capture_only" {
         return (fixture, index, completion.window);
     }

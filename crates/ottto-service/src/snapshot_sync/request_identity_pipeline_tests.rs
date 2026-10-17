@@ -181,17 +181,8 @@ fn identity_pipeline_cycle(
         &mut oracle_index,
         None,
     );
-    let mut frame = preparation;
-    let (preparation, mut index, mut scan) = loop {
-        match frame.step() {
-            SourcePreparationStep::Pending(next) => frame = next,
-            SourcePreparationStep::Complete {
-                preparation,
-                index,
-                scan,
-            } => break (preparation, index, scan),
-        }
-    };
+    let (preparation, mut index, mut scan) =
+        collect_native_preparation_with_rotation(preparation, false);
     let scanned_index = index.clone();
     let prepared_before_body = preparation.prepared_claude_evidence.is_some();
     apply_claude_local_evidence_to_scan_with_prepared(
@@ -528,6 +519,7 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
     let mut completed = 0;
     let mut bootstrap_observed = false;
     let mut previous_context = None;
+    let mut last_index_path = None;
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
@@ -536,7 +528,7 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
     };
     for cycle in 0..=2 {
         cadence.next_due_cycle();
-        let mut frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
             prepare_sync_source(
                 &client,
                 &device,
@@ -586,16 +578,7 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
             }
         }
         previous_context = Some(context);
-        let (preparation, index, scan) = loop {
-            match frame.step() {
-                SourcePreparationStep::Pending(next) => frame = next,
-                SourcePreparationStep::Complete {
-                    preparation,
-                    index,
-                    scan,
-                } => break (preparation, index, scan),
-            }
-        };
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
         assert!(preparation.prepared_claude_evidence.is_some());
         assert!(scan.census_complete);
         assert_eq!(
@@ -627,6 +610,7 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         })
         .unwrap();
         let saved = ScanIndex::load(&index_path).unwrap();
+        last_index_path = Some(index_path);
         assert!(saved.generation > 0);
         assert!(
             daemon.native_comparison.retained_valid_for_test(),
@@ -698,5 +682,54 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         .unwrap()
         .allowed());
     drop(abandoned);
+    if crate::heap_layout_bound::layout_supported() {
+        // Reuse this actual saved proof and healthy opened sidecars to cover
+        // the loader's single resource boundary. This second synthetic root
+        // is only an input-admission fixture, never a native proof/permit.
+        let saved = ScanIndex::load(&last_index_path.unwrap()).unwrap();
+        let mut raw = serde_json::to_value(&saved).unwrap();
+        let witness = raw["claude_usage_family_witnesses"][IDENTITY_PIPELINE_ROOT].clone();
+        assert!(witness.is_object());
+        let refused_root = "unaffordable-optional-root";
+        raw["claude_usage_family_witnesses"][refused_root] = witness;
+        let index: ScanIndex = serde_json::from_value(raw).unwrap();
+        let path = support.join("local-otel/claude-code-effort").join(format!(
+            "{:x}.jsonl",
+            Sha256::digest(refused_root.as_bytes())
+        ));
+        std::fs::File::create(path)
+            .unwrap()
+            .set_len((crate::source_rotation::PARKED_BUDGET * 2) as u64)
+            .unwrap();
+        let allowance = crate::source_rotation::PARKED_BUDGET;
+        let mut paid =
+            crate::source_rotation::PaidReservation::from_remainder(Some(allowance), allowance, 0)
+                .unwrap();
+        let (prepared, allocation) = crate::retry_allocation_probe::measure_process(|| {
+            PreparedClaudeLocalEvidence::load_paid_eligible(
+                &support,
+                &index,
+                [IDENTITY_PIPELINE_ROOT, IDENTITY_PIPELINE_ROOT, refused_root].into_iter(),
+                &mut paid,
+                0,
+            )
+            .unwrap()
+        });
+        assert_eq!(prepared.sessions.len(), 1);
+        assert!(prepared.healthy_roots.contains(IDENTITY_PIPELINE_ROOT));
+        assert!(!prepared.sessions.contains(refused_root));
+        assert!(prepared.frozen_roots_are_current(
+            &support,
+            &BTreeSet::from([IDENTITY_PIPELINE_ROOT.to_owned()])
+        ));
+        // Unused capacity is retired at refusal. The initial reservation,
+        // not the final live charge, covered earlier decode overlap.
+        let prepaid = allowance;
+        assert!(
+            allocation.requested_peak_with_overlap <= prepaid,
+            "subset input construction must fit its actual paid reservation"
+        );
+        eprintln!("native paid evidence subset: requested_roots=2 retained_healthy=1 pressure_root_base=true duplicate_root_loaded_once=true actual_requested_peak={} prepaid_peak={prepaid} ordinary_final_cohort_unchanged=true not_RSS=true", allocation.requested_peak_with_overlap);
+    }
     writeln!(std::io::stderr().lock(), "native_comparison_source_bootstrap: actual_prepare_step_finish=true completed_saved_cycles={completed} actual_wire_ack=true next_real_preparation_allowed=true abandoned_preparation_revokes=true test_only_due_cadence_slot=true ordinary_post_finish_wait_verified=true backfill_to_normal_scope_revokes=true new_request_native_conjunction=true actual_positive_retained_layout_unproved=true").unwrap();
 }

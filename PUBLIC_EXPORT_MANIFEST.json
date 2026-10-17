@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 674,
-  "content_sha256": "458a50f26d619820a565a94ede0dca037824f5083993e349bac213b9dc6ee229",
+  "candidate_file_count": 676,
+  "content_sha256": "d786c56d02bfc51cacab07b812380b67ff7ba7736630f4fff3853eeb0584e083",
   "files": [
     {
       "executable": false,
@@ -783,8 +783,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel.rs",
-      "sha256": "9b8bb82caa4809d6798fb6dd8d7346ce29ccc81bed70f4bc1e1da0d6d6e4f1ac",
-      "size_bytes": 135125
+      "sha256": "2b3d6f744f40c5bd02507b8ae8f1a41a8910b17cacdb49fdb0e3bc35175ba26b",
+      "size_bytes": 154660
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/claude_local_otel/bounded_read.rs",
+      "sha256": "3676350f0be38a4755fea1db69243e096ae5c43afe3a5a363b2f211e7ddc8a0f",
+      "size_bytes": 18175
     },
     {
       "executable": false,
@@ -1105,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_bounded_native_tests.rs",
-      "sha256": "7b51a415d9952ac18e759cc321542d3c57687a783ae1998a466b9563e9dd5b6e",
-      "size_bytes": 28838
+      "sha256": "b43e8535769412b2b087c4141494c2494f8657df940bdb5bf3df166e739f4cde",
+      "size_bytes": 29118
     },
     {
       "executable": false,
@@ -1126,8 +1133,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_owned_rotation.rs",
-      "sha256": "c0e94a5526e7c732ea51350fe85a9e17b4966d647736b2c38cd3a23e527b2198",
-      "size_bytes": 19187
+      "sha256": "73355633f012689d6bdfe4a373ffe9fa343be978e9d27db97cf2ce4efcd7f078",
+      "size_bytes": 19581
     },
     {
       "executable": false,
@@ -1182,8 +1189,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "10860fbc594142106079891ce9ed2ce96b278395909a4e7ce67bd7f2f9d91c63",
-      "size_bytes": 791563
+      "sha256": "7bf7a9efbbdd97b550aa7aa3d0a43781701e014cbe268595777f626b7f35d650",
+      "size_bytes": 811093
     },
     {
       "executable": false,
@@ -1217,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p12_pipeline_original_tests.rs",
-      "sha256": "b54a22a6f1250f3f64d884fa7785d7bebcc678ec8413b8467bdc12a6626eee2d",
-      "size_bytes": 79320
+      "sha256": "1c6782e266f9fefae6352d4c3389f7e2b113bc2a3e2bddc80a2334bf84004124",
+      "size_bytes": 83098
     },
     {
       "executable": false,
@@ -1238,8 +1245,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs",
-      "sha256": "884141101c62e1599dc6e2aad4cb0cc92ad1287ae95fa703768d020d06087c11",
-      "size_bytes": 29034
+      "sha256": "4a057acf527e6e0600c7867848d148f6e37e7ed1599b828f3742f938a4026a9d",
+      "size_bytes": 31219
     },
     {
       "executable": false,
@@ -1252,8 +1259,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "4afbfb681e45567a96f3dca2f73d0e6cd76398c1ecbf79ed926735054599cf4c",
-      "size_bytes": 2504463
+      "sha256": "26bc98b24dbf377223efc6439f077615fe2b8d7017f64a54737fb520f0d47bcd",
+      "size_bytes": 2532801
     },
     {
       "executable": false,
@@ -1301,22 +1308,29 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison.rs",
-      "sha256": "f590a8c45888a673275072eb7f8d3efa00fd16f86d160f6042467f23efc1b3db",
-      "size_bytes": 52902
+      "sha256": "3b2754a7af07d32e93339d1753666ecb64ec36ffaa3e8f771144108a0987af22",
+      "size_bytes": 88133
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/lifecycle.rs",
-      "sha256": "d5e41c05d054026d550816375dcd656d2b4dd454a9cc8c51fc16cd6ff7b74b98",
-      "size_bytes": 6613
+      "sha256": "d70655cab8144f64270af9a37b0b91b038d64849d1ed97323be3ef757ef5b8a4",
+      "size_bytes": 8919
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_native_comparison/metadata.rs",
+      "sha256": "b5a29881ffb9448bb08489263e46aa3435bbb0399e7e117e793908a5db1cf2a4",
+      "size_bytes": 18373
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
-      "sha256": "194d6edc7d44b3381ba6361b7e66efa4bf9542b523d8931b513c1bd32ad639d2",
-      "size_bytes": 20786
+      "sha256": "dfaefd5a915f08d194fc60d377e90aa2d495e216c0833bfef75a6429caf5f5bc",
+      "size_bytes": 42240
     },
     {
       "executable": false,
@@ -1427,8 +1441,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "c2375231ef354e644dfb041de2855ff3288eb066c01baf2ee078d1840479f94a",
-      "size_bytes": 134550
+      "sha256": "7b9fca6b3ec935d12dc90beffcc9b59e33bbabf6b9595208a662d5ba99146969",
+      "size_bytes": 157656
     },
     {
       "executable": false,
@@ -1469,8 +1483,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/source_rotation.rs",
-      "sha256": "bcf2327aee1e414708bdf78788c2e809912e0b6096e68e9409b1502ab21c9718",
-      "size_bytes": 15985
+      "sha256": "77c0fb00ae110ebf64e43b7967e0634ca440d9fff06e0c067feb1db2f3a31379",
+      "size_bytes": 28789
     },
     {
       "executable": false,
@@ -4721,9 +4735,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-17T11:34:47+00:00",
+  "generated_at": "2026-10-17T19:51:00+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 675,
+  "output_file_count": 677,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4760,5 +4774,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "14118014d3d96959437fc1bc62fff9d811d7427a"
+  "source_commit": "c7c0f2ace00e101810c8fbcd1e6832f6c66e3157"
 }

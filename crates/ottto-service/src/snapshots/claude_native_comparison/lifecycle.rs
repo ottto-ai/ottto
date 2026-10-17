@@ -14,6 +14,7 @@ struct State {
     scope: Option<String>,
     valid: bool,
     window: Option<Box<WindowEligibility>>,
+    admission_refused: bool,
 }
 
 pub(crate) struct Lease {
@@ -89,10 +90,22 @@ impl Lifecycle {
 }
 
 impl Lease {
+    pub(crate) fn early_evidence_roots(&self) -> impl Iterator<Item = &str> + Clone {
+        self.window.as_ref().into_iter().flat_map(|window| {
+            window.roots.keys().map(String::as_str).chain(
+                window
+                    .native_corrections
+                    .values()
+                    .map(|receipt| receipt.root()),
+            )
+        })
+    }
     pub(crate) fn bind(&mut self, scope: String) {
         if let Ok(mut state) = self.owner.state.lock() {
             if self.generation == Some(state.generation) {
-                self.allowed = self.previous_valid && self.previous_scope.as_ref() == Some(&scope);
+                self.allowed = !state.admission_refused
+                    && self.previous_valid
+                    && self.previous_scope.as_ref() == Some(&scope);
                 state.scope = Some(scope.clone());
                 self.scope = Some(scope);
             }
@@ -119,6 +132,20 @@ impl Lease {
         self.window = None;
     }
 
+    /// A local retention refusal must not repeatedly re-read the same large
+    /// target. Conservative BASE for this process lifecycle; no timer, retry
+    /// grant or persisted suppression. Ordinary sources remain available.
+    pub(crate) fn refuse_admission(&mut self) {
+        self.revoke();
+        if let Ok(mut state) = self.owner.state.lock() {
+            if self.generation == Some(state.generation) {
+                state.admission_refused = true;
+                state.valid = false;
+                state.window = None;
+            }
+        }
+    }
+
     pub(crate) fn take_window(&mut self) -> Option<Box<WindowEligibility>> {
         if !self.allowed() {
             self.window = None;
@@ -134,10 +161,13 @@ impl Lease {
     ) {
         self.window = None;
         if self.selected_save && self.allowed() && !complete {
-            self.window = window.map(|mut window| {
-                window.retain_current(index);
-                window
-            });
+            if let Some(mut window) = window {
+                if !window.retain_current(index) {
+                    self.revoke();
+                    return;
+                }
+                self.window = Some(window);
+            }
             if self.window.as_ref().is_some_and(|window| {
                 crate::heap_layout_bound::bound(
                     window.as_ref(),
@@ -164,7 +194,8 @@ impl Lease {
     pub(crate) fn finish(mut self, clean: bool) {
         if let Ok(mut state) = self.owner.state.lock() {
             if self.generation == Some(state.generation) && self.scope == state.scope {
-                state.valid = clean
+                state.valid = !state.admission_refused
+                    && clean
                     && self.scope.is_some()
                     && self.selected_save
                     && (self.native_save || self.allowed);
@@ -192,6 +223,37 @@ impl Drop for Lease {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn native_comparison_local_refusal_latches_base_across_pages_and_cache_clear() {
+    let owner = Arc::new(Lifecycle::default());
+    let mut bootstrap = owner.begin();
+    bootstrap.bind("scope".into());
+    assert!(!bootstrap.allowed());
+    bootstrap.note_selected_save(true); // logical conjunction control only
+    bootstrap.finish(true);
+    let mut lease = owner.begin();
+    lease.bind("scope".into());
+    assert!(lease.allowed());
+    lease.refuse_admission();
+    assert!(!lease.allowed());
+    lease.finish(false);
+    owner.discard_retained();
+    for scope in ["scope", "scope", "another-context"] {
+        let mut later = owner.begin();
+        later.bind(scope.into());
+        assert!(!later.allowed());
+        later.note_selected_save(true);
+        later.finish(true);
+    }
+    assert!(!owner.retained_valid_for_test());
+    let fresh = Arc::new(Lifecycle::default());
+    let mut restarted = fresh.begin();
+    restarted.bind("scope".into());
+    assert!(!restarted.allowed(), "restart grants no comparison read");
+    restarted.finish(false);
+}
+
 crate::heap_layout_bound::fields!(Lifecycle; state);
-crate::heap_layout_bound::fields!(State; generation, scope, valid, window);
+crate::heap_layout_bound::fields!(State; generation, scope, valid, window, admission_refused);
 crate::heap_layout_bound::fields!(Lease; owner, generation, previous_scope, previous_valid, scope, allowed, selected_save, native_save, finished, window);
