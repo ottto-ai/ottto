@@ -317,7 +317,6 @@ impl Family {
 
     /// Persist and reload the index in the SAME process. A separate lifecycle
     /// restart control proves that disk state cannot restore a native receipt.
-
     fn reload(&mut self) {
         let path = self.state_dir.join("scan-index.json");
         self.index.save(&path).expect("save scan index");
