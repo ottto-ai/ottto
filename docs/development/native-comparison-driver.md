@@ -14,8 +14,11 @@ pass. Exact eligible negative evidence may suppress a redundant corrective
 rearm. A genuine possible-overlap or legacy-prefix hit withdraws that family's
 eligibility and invokes the existing selected fallback: withhold only current
 B/C bodies, restore their prior selected facts, invalidate A's source revisions
-and queue A before its dependents. Actual native observations still enter the
-single authoritative fold. Unknown native membership is BASE, not an invented
+and queue A before its dependents. On a genuine hit, the newest B/C usage can
+arrive one eligible source pass later (minutes); it is not lost, and previously
+accepted state stays visible meanwhile. The next pass offers or exactly refuses
+B/C after native comparison; a repeated hit cannot defer again. Actual native
+observations still enter the single authoritative fold. Unknown native membership is BASE, not an invented
 positive match or new withholding debt.
 
 A process-only family latch prevents repeated deferral: defer, then BASE until

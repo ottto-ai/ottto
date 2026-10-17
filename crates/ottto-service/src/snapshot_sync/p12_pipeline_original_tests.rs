@@ -1741,6 +1741,32 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
             .is_some_and(|path| family_keys.contains(path))),
         "all A members must be queued BEFORE deferred C, ahead of ordinary audits"
     );
+    let deferred_position = first
+        .iter()
+        .position(|page| page.parsed.contains(COPY))
+        .unwrap();
+    let next = first
+        .get(deferred_position + 1)
+        .expect("N+1 is the next actual source pass, not an eventual generation");
+    assert!(
+        next.parsed.is_superset(&family),
+        "N+1 natively reads all A before current B/C"
+    );
+    assert!(
+        !next.native_lease_allowed,
+        "N+1 is BASE under the family latch"
+    );
+    let next_copy = next
+        .scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == COPY)
+        .expect("COPY has an exact N+1 outcome");
+    assert!(
+        next.offered.contains(&next_copy.snapshot_fingerprint)
+            && next.uploaded.contains(&next_copy.snapshot_fingerprint),
+        "uninterrupted N+1 offers and ACKs COPY, never a second deferral"
+    );
     let duplicate_hash = format!("{:x}", Sha256::digest(b"req_root_1"));
     let mut compared = false;
     let mut completion_hour = 11;
@@ -1819,16 +1845,43 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut fixture = RearmFixture::new("native-copy-offer-interruption");
     fixture.native_file_limit = 4; // Eligible family; interruption follows deliberate C3 recovery.
+                                   // Reuse the existing restart cases for the essential N -> N+1 boundary;
+                                   // independent BASE history sees the same physical source and native input.
+    fixture.owned_base_preparation = true;
+    let baseline = restart.then(|| native_comparison_independent_history(&fixture));
+    if let Some(base) = baseline.as_ref() {
+        base.establish();
+    }
+    let native = crate::snapshots::claude_native_comparison::enable_for_test();
     fixture.establish();
     let quiet = fixture.generation(10);
     assert_eq!(rearm_reads(&quiet), 0);
     let before = serde_json::to_value(&quiet.last().unwrap().index).unwrap();
     const COPY: &str = "f6666666-6666-4666-8666-666666666666";
     let copy_path = native_comparison_add_import(&fixture, COPY, "req_root_1");
+    drop(native);
+    let baseline_outcome = baseline.as_ref().map(|base| {
+        let imported = base.generation(11);
+        let fp = imported
+            .iter()
+            .flat_map(|page| &page.scan.snapshots)
+            .find(|item| item.source_session_id == COPY)
+            .expect("ordinary BASE offers same copy")
+            .snapshot_fingerprint
+            .clone();
+        let followup = base.generation(12);
+        let saved = serde_json::to_value(&followup.last().unwrap().index).unwrap();
+        (
+            fp,
+            RearmFixture::family_heads(&followup.last().unwrap().index),
+            saved["claude_duplicate_request_owners"].clone(),
+        )
+    });
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut interruption = None;
+    let mut deferred_at = None;
     for number in 0..REARM_MAX_PAGES {
         let page = fixture.page_with_targeted_upload(
             &format!("2026-08-02T11:{number:02}:00Z"),
@@ -1838,7 +1891,29 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
         let copy = page.scan.snapshots.iter().find(|item| {
             item.source_session_id == COPY && page.offered.contains(&item.snapshot_fingerprint)
         });
+        if let Some(at) = deferred_at {
+            assert_eq!(
+                number,
+                at + 1,
+                "COPY must reach its offer on N+1, not an eventual retry"
+            );
+            assert!(copy.is_some(), "N+1 has no second C3 deferral");
+            assert!(
+                page.parsed.is_superset(&rearm_family_sessions()),
+                "A is actually read on N+1 before COPY"
+            );
+            assert!(
+                !page.native_lease_allowed,
+                "restart/latch N+1 has no optimization permit"
+            );
+        }
         if let Some(copy) = copy {
+            if let Some((base_copy, _, _)) = baseline_outcome.as_ref() {
+                assert_eq!(
+                    &copy.snapshot_fingerprint, base_copy,
+                    "restart N+1 exact copy head equals BASE throughout"
+                );
+            }
             assert!(!page.uploaded.contains(&copy.snapshot_fingerprint));
             assert_eq!(copy.first_turn_context_tokens, None);
             assert_eq!(copy.peak_context_fill_tokens, None);
@@ -1861,7 +1936,28 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
             interruption = Some(copy.snapshot_fingerprint.clone());
             break;
         }
+        if page.parsed.contains(COPY) {
+            assert!(
+                deferred_at.replace(number).is_none(),
+                "only one C3 deferral"
+            );
+            assert_eq!(RearmFixture::family_rearm_debt(&page.index), 3);
+            assert!(
+                serde_json::to_value(&page.index).unwrap()["files"]
+                    .get(copy_path.to_str().unwrap())
+                    .is_none(),
+                "N keeps new C uncommitted"
+            );
+            if restart {
+                fixture.native_lifecycle = std::sync::Arc::new(Default::default());
+                assert!(
+                    !fixture.native_lifecycle.retained_valid_for_test(),
+                    "restart BETWEEN N and N+1 is BASE; durable selected debt alone survives"
+                );
+            }
+        }
     }
+    assert!(deferred_at.is_some(), "actual initial C3 N was exercised");
     let interrupted_fp = interruption.expect("bounded actual copy offer reached and interrupted");
     if restart {
         // Fresh process owner only: keep the exact partial-save index and
@@ -1896,6 +1992,17 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
                     .accepted_snapshot_fingerprint_recorded(&interrupted_fp),
                 "the exact corrected copy body survives interruption and is durably ACKed"
             );
+            if let Some((_, base_heads, base_owners)) = baseline_outcome.as_ref() {
+                assert_eq!(
+                    &RearmFixture::family_heads(&last.index),
+                    base_heads,
+                    "restart recovery keeps exact BASE A heads"
+                );
+                assert_eq!(
+                    &saved["claude_duplicate_request_owners"], base_owners,
+                    "restart owner outcome equals BASE throughout"
+                );
+            }
             recovered = true;
             break;
         }
@@ -1904,7 +2011,7 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
         recovered,
         "partial selected debt/restart must recover within ordinary bounded generations"
     );
-    writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true N_defer_Nplus1_BASE_offer=true restart_between_N_Nplus1_checked={restart} exact_BASE_owner_outcome_checked={restart} actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
 }
 
 #[test]

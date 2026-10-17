@@ -3,7 +3,11 @@
 The current candidate uses selected C3 fallback on every genuine hit; no
 optional target bodies are acquired in that pass. Process-only family policy
 latched across selected saves guarantees BASE recovery and the existing bounded
-exit. Unknown native membership remains ordinary BASE. Optional local status
+exit. On a genuine hit the newest B/C usage can arrive one eligible source pass
+later (minutes), without loss; prior accepted state stays visible. Existing real
+hit/interruption controls assert that immediately next source pass reads A first
+and offers the copy; restart between those passes reaches the same exact owner
+outcome as independent BASE. Unknown native membership remains ordinary BASE. Optional local status
 reports conservative counts and unknown ages without a transcript/index walk.
 
 Current affected supported controls passed 89/0 with one historical oracle
