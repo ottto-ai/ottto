@@ -129,9 +129,12 @@ impl WithheldSessions {
             Kind::Empty | Kind::Refused => None,
         }
     }
+    pub(in crate::snapshots) fn preparation_available(&self) -> bool {
+        !matches!(self.kind, Kind::Refused)
+    }
     pub(crate) fn ensure_available(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !matches!(self.kind, Kind::Refused),
+            self.preparation_available(),
             "copied-request preparation resource refused before offer"
         );
         Ok(())

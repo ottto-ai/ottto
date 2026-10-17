@@ -1613,3 +1613,267 @@ fn copy_containment_actual_provenance_rejects_partial_missing_ambiguous_stale_an
         writeln!(std::io::stderr().lock(), "copy_containment_provenance_negative: case={case} matched={matched} no_completeness_upgrade=true native_body_debt_unchanged=true credit_retired=true cache_admission=false").unwrap();
     }
 }
+
+#[test]
+#[serial]
+fn copy_containment_actual_f1_f3_moves_held_native_sets_and_keeps_healthy_bytes() {
+    let fixture = IdentityPipelineHome::new();
+    let support = fixture.base.join("support-native-completion");
+    let (path, key) = copy_owner_seed(&fixture, &support);
+    let daemon = test_daemon("otm_test");
+    daemon.transcript_cache.require_copy_containment_for_test();
+    if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+        writeln!(std::io::stderr().lock(), "copy_containment_native_f1_f3: actual_unsupported_prepare_refused=true supported_move_credit_qualification_return_positive=UNEXECUTED cache_admission=false").unwrap();
+        return;
+    }
+    copy_provenance_append_own_revision(&key);
+    let (preparation, mut index, mut scan) =
+        copy_owner_complete_frame(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+    let revision = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == IDENTITY_PIPELINE_ROOT)
+        .unwrap()
+        .source_file_fingerprint
+        .clone()
+        .unwrap();
+    let mut oracle_index = index.try_clone_for_copy().unwrap();
+    let mut oracle_scan = scan.clone();
+    let permit =
+        cycle_request_identity_permit(SnapshotSource::ClaudeCode, &preparation.activity_hint);
+    // Clone control has no source-completion capability; same actual evidence
+    // and qualification still supply the exact monetary/identity byte oracle.
+    let (oracle_disposition, oracle_withheld, _) = apply_claude_local_evidence_to_scan_with_permit(
+        &support,
+        &mut oracle_scan,
+        &mut oracle_index,
+        permit,
+    );
+    let (disposition, withheld, _, completion) =
+        apply_claude_local_evidence_with_native_completion(&support, &mut scan, &mut index, permit);
+    assert_eq!(ScanIndex::copy_f1_provenance_receipt_for_test(), 2);
+    assert_eq!(completion.count_for_test(), 1);
+    let (before, after, allocations) = crate::snapshots::HeldNativeCompletion::movement_for_test();
+    assert_ne!(before, 0);
+    assert_eq!(before, after, "same native String allocation crossed F1");
+    assert_eq!(
+        allocations, 0,
+        "moving actual nodes/Strings allocates nothing"
+    );
+    assert_eq!(
+        completion.first_pointer_for_test().map(|p| p as usize),
+        Some(before)
+    );
+    assert!(completion.bound_for_test(
+        &fixture.home.join(".claude/projects"),
+        &key,
+        &revision,
+        IDENTITY_PIPELINE_ROOT
+    ));
+    assert!(!completion.bound_for_test(
+        &fixture.home.join(".claude/other"),
+        &key,
+        &revision,
+        IDENTITY_PIPELINE_ROOT
+    ));
+    assert!(!completion.bound_for_test(
+        &fixture.home.join(".claude/projects"),
+        &key,
+        &"f".repeat(64),
+        IDENTITY_PIPELINE_ROOT
+    ));
+    assert_eq!(
+        serde_json::to_vec(&scan.snapshots).unwrap(),
+        serde_json::to_vec(&oracle_scan.snapshots).unwrap()
+    );
+    assert_eq!(withheld, oracle_withheld);
+    assert_eq!(disposition, oracle_disposition);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != IDENTITY_PIPELINE_ROOT));
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == COPY_OWNER_HEALTHY
+            && !item.claude_usage_request_ids.is_empty()));
+    let credit = completion.credit_for_test();
+    assert!(credit > 0);
+    let reserved = daemon
+        .transcript_cache
+        .reserved_copy_bytes_for_test()
+        .unwrap();
+    daemon.transcript_cache.clear();
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(reserved)
+    );
+    assert_eq!(
+        completion.first_pointer_for_test().map(|p| p as usize),
+        Some(before)
+    );
+    // Later selected/save refusal cannot clear the returned input's lease or
+    // change the last durable debt. Retire escrow before normal required work.
+    let durable = std::fs::read(&path).unwrap();
+    daemon
+        .transcript_cache
+        .with_copy_credit_pressure_for_test(|| {
+            assert!(index
+                .try_committable_subset(
+                    &preparation.committed_index,
+                    &BTreeSet::new(),
+                    &BTreeMap::new()
+                )
+                .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), durable);
+            assert_eq!(
+                completion.first_pointer_for_test().map(|p| p as usize),
+                Some(before)
+            );
+        });
+    drop(completion);
+    assert!(
+        daemon
+            .transcript_cache
+            .reserved_copy_bytes_for_test()
+            .unwrap()
+            < reserved
+    );
+    crate::snapshots::finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "claude_code".into(),
+        machine_id: "otm_native_completion".into(),
+        collector_version: None,
+        snapshots: std::mem::take(&mut scan.snapshots),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let mut response = accepted_batch(request.snapshots.len());
+    response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+    for item in &request.snapshots {
+        assert!(item.context_curve.is_none() && item.cache_observations.is_none());
+        response.session_ids.push(item.source_session_id.clone());
+        response
+            .accepted_entities
+            .push(crate::snapshot_client::SnapshotEntityRef {
+                source_session_id: item.source_session_id.clone(),
+                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                occurrence_count: 1,
+                body_witness_version: Some(
+                    if item.usage_accounting_contract.as_deref()
+                        == Some("session_exclusive_reported_usage:v1")
+                    {
+                        8
+                    } else {
+                        7
+                    },
+                ),
+                body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                head_etag: None,
+                head_challenge: None,
+            });
+    }
+    response.validate_entity_ack(&request).unwrap();
+    scan.snapshots = request.snapshots;
+    drop((
+        scan,
+        index,
+        preparation,
+        oracle_scan,
+        oracle_index,
+        disposition,
+        oracle_disposition,
+    ));
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(0)
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_native_f1_f3: actual_prepare_native_fold_qualification_return=true inputs=1 same_native_string_allocation=true move_allocations=0 exact_binding=true healthy_bytes_equal=true held_not_offered=true input_credit_requested={credit} clear_pressure_lifetime=true exact_healthy_entity_ack=true credit_retired=true c5_emission_permitted={} cache_admission=false", permit.is_some()).unwrap();
+}
+
+#[test]
+#[serial]
+fn copy_containment_actual_native_escrow_refuses_without_move_or_debt_change() {
+    for case in ["ordinary", "pressure", "missing"] {
+        let fixture = IdentityPipelineHome::new();
+        let support = fixture.base.join("support-native-completion-refusal");
+        let (path, key) = copy_owner_seed(&fixture, &support);
+        let daemon = test_daemon("otm_test");
+        if case != "ordinary" {
+            daemon.transcript_cache.require_copy_containment_for_test();
+            if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+                writeln!(std::io::stderr().lock(), "copy_containment_native_escrow_refusal: case={case} actual_unsupported_prepare_refused=true supported_funding_missing_binding_positive=UNEXECUTED cache_admission=false").unwrap();
+                continue;
+            }
+        }
+        copy_provenance_append_own_revision(&key);
+        let (preparation, mut index, mut scan) =
+            copy_owner_complete_frame(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+        // Same production authoritative fold, exactly once. Pressure is applied
+        // AFTER producer funding to isolate the optional F1 extension refusal.
+        let disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_identity(
+            &mut scan,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            None,
+        );
+        assert!(index.copy_hold_count() > 0);
+        let before = serde_json::to_vec(&scan.snapshots).unwrap();
+        let debt = serde_json::to_value(&index).unwrap()["claude_copy_holds"].clone();
+        let native_count: usize = scan
+            .snapshots
+            .iter()
+            .map(|item| item.claude_usage_request_ids.len())
+            .sum();
+        if case == "missing" {
+            ScanIndex::copy_provenance_negative_for_test(&mut scan, "missing");
+        }
+        let completion = if case == "pressure" {
+            daemon
+                .transcript_cache
+                .with_copy_credit_pressure_for_test(|| {
+                    index.capture_copy_native_completion(&mut scan, &disposition)
+                })
+        } else {
+            index.capture_copy_native_completion(&mut scan, &disposition)
+        };
+        assert_eq!(completion.count_for_test(), 0);
+        assert_eq!(
+            scan.snapshots
+                .iter()
+                .map(|item| item.claude_usage_request_ids.len())
+                .sum::<usize>(),
+            native_count
+        );
+        assert_eq!(serde_json::to_vec(&scan.snapshots).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(&index).unwrap()["claude_copy_holds"],
+            debt
+        );
+        assert_eq!(
+            crate::snapshots::HeldNativeCompletion::movement_for_test(),
+            (0, 0, 0)
+        );
+        drop(completion);
+        assert!(!std::fs::read(&path).unwrap().is_empty());
+        disposition
+            .retain_copy_uploadable(&mut scan.snapshots)
+            .unwrap();
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != IDENTITY_PIPELINE_ROOT));
+        assert!(scan
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == COPY_OWNER_HEALTHY));
+        drop((scan, index, preparation, disposition));
+        assert_eq!(
+            daemon.transcript_cache.reserved_copy_bytes_for_test(),
+            Some(0)
+        );
+        writeln!(std::io::stderr().lock(), "copy_containment_native_escrow_refusal: case={case} actual_native_fold=true no_id_move=true body_debt_unchanged=true credit_retired=true cache_admission=false").unwrap();
+    }
+}

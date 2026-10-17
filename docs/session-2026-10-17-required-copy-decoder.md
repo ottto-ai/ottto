@@ -252,3 +252,40 @@ Supported paid positives must explicitly remain UNEXECUTED if the actual profile
 is unsupported. No local Cargo, model or reviewer ran for this checkpoint.
 This is provenance custody, not native-ID escrow/cache insertion, W4 delivery,
 durable hold drain, activation, release readiness or installed CPU/RSS proof.
+
+
+## Native input escrow through the actual return
+
+The inactive source now consumes the same parser provenance and exact matching
+implementation to extend held native ID storage across F1, qualification and
+the actual F3 return. Existing scope/generation/root/path/revision/session
+checks remain. Matching preserves original input ordinals in prepaid borrowed
+reference collectors. Before output backing or any ID move, the existing owner
+reserves the descriptor vector and the full requested-layout bound of each
+native set whose lifetime will extend. Only copied-withheld complete inputs
+move, using their actual BTreeSet nodes and String allocations. Healthy inputs
+stay in place through qualification. Missing, refused, ambiguous or unfunded
+input produces no escrow and does not alter body, debt or read eligibility.
+The optional producer-refusal predicate allocates no extra error.
+
+The returned owner is move-only. Its vector and ID graphs retire before source
+provenance and input reservations return. It survives the actual function
+return; the real source caller then drops it before later required upload or
+selection allocations. Standalone callers use the same implementation and
+retire at that boundary too. No cache insertion, lookup, callback or W4 wake is
+enabled, and no additional native read or settlement result consumes this
+escrow. It is not a memory/RSS or installed reread improvement claim.
+
+Two new actual-path tests are pending hosted CI. The integrated oracle uses
+real required preparation/parser/fold/qualification/return, verifies moved
+String allocation identity and zero allocations during the move, compares
+healthy body/disposition bytes against the capability-free clone control,
+checks exact root/revision binding and clear/pressure lifetime, and validates a
+synthetic exact entity ACK through the real validator after retiring input.
+It reports whether the actual fixture hint supplied an emission permit; it
+does not claim an enabled contract-5 branch when that permit is absent. Refusal
+controls use ordinary, missing-binding and actual shared-pool pressure after
+the production fold, checking native sets/body/debt stay unchanged and known
+copies remain withheld. Unsupported actual preparation still refuses, and
+supported paid positives must explicitly report UNEXECUTED. No local Cargo,
+model, reviewer, activation or runtime action was run.

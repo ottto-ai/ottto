@@ -4091,12 +4091,16 @@ fn finish_sync_source(
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
-        let (disposition, census_withheld, stats) = apply_claude_local_evidence_to_scan_with_permit(
-            support_dir,
-            &mut scan_result,
-            &mut index,
-            cycle_request_identity_permit(source, &activity_hint),
-        );
+        let (disposition, census_withheld, stats, native_completion) =
+            apply_claude_local_evidence_with_native_completion(
+                support_dir,
+                &mut scan_result,
+                &mut index,
+                cycle_request_identity_permit(source, &activity_hint),
+            );
+        // F3 owns the moved input through this return. Cache admission remains
+        // unqualified; retire it BEFORE later required upload/selection growth.
+        drop(native_completion);
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
                 "local snapshot sync: claude local evidence duration_ms={} counts={counts}",
@@ -5201,6 +5205,24 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
+    let (disposition, withheld, stats, completion) =
+        apply_claude_local_evidence_with_native_completion(support_dir, scan_result, index, permit);
+    drop(completion); // Standalone callers retain no optional input after F3.
+    (disposition, withheld, stats)
+}
+
+/// Contract-5 evidence is built only under this cycle's emission permit.
+fn apply_claude_local_evidence_with_native_completion(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+    crate::snapshots::HeldNativeCompletion,
+) {
     let emission_permitted = permit.is_some();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
@@ -5349,9 +5371,6 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         index,
         identity_evidence.as_ref(),
     );
-    // Exact complete-parser provenance only, consumed once at F1. This paid
-    // sidecar survives C5 lexically, but does not retain IDs or admit the cache.
-    let _copy_native_provenance = index.consume_copy_completion_provenance(scan_result);
     // Observation only at the real fold/filter boundary. Missing process
     // context/layout is None before walking. This omits preparation owners and
     // future C5 scratch/output, so it MUST NOT authorize optional cache capture.
@@ -5369,6 +5388,9 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
             crate::source_rotation::OVERLAP_BUDGET,
         );
     }
+    // At F1 move only complete withheld native sets, after their full extended
+    // lifetime is paid. Healthy sets stay in place through C5. No cache permit.
+    let native_completion = index.capture_copy_native_completion(scan_result, &disposition);
     // Keep all actual native observations through the authoritative fold;
     // withheld copies never reach C5 construction, name/account binding or POST.
     if disposition
@@ -5377,7 +5399,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
     {
         // Explicit pre-offer refusal is consumed by finish_sync_source before
         // binding, selection, upload or save. No C5/tag/identity work follows.
-        return (disposition, true, stats);
+        return (disposition, true, stats, native_completion);
     }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
@@ -5465,7 +5487,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
-    (disposition, census_withheld, stats)
+    (disposition, census_withheld, stats, native_completion)
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -16,6 +16,9 @@ use std::{
     },
 };
 
+mod escrow;
+pub(crate) use escrow::HeldNativeCompletion;
+
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 fn hash(domain: &str, parts: &[&[u8]]) -> [u8; 32] {
     let mut digest = Sha256::new();
@@ -237,12 +240,17 @@ impl Provenance {
             .sort_unstable_by_key(|m| (m.session, m.revision));
         SourceToken(Some(storage.generation))
     }
-    fn matches(&self, scan: &SourceScanResult, scope: [u8; 32], generation: NonZeroU64) -> usize {
+    fn valid_header(
+        &self,
+        scan: &SourceScanResult,
+        scope: [u8; 32],
+        generation: NonZeroU64,
+    ) -> bool {
         if !self.can_complete {
-            return 0;
+            return false;
         }
         let Some(storage) = &self.storage else {
-            return 0;
+            return false;
         };
         if storage.generation != generation
             || storage.scope != scope
@@ -252,8 +260,23 @@ impl Provenance {
                     &[scan.census_window_end.as_bytes()],
                 ))
         {
+            return false;
+        }
+        true
+    }
+    fn visit_matches(
+        &self,
+        scan: &SourceScanResult,
+        scope: [u8; 32],
+        generation: NonZeroU64,
+        mut visit: impl FnMut(usize, &Marker),
+    ) -> usize {
+        if !self.valid_header(scan, scope, generation) {
             return 0;
         }
+        let Some(storage) = &self.storage else {
+            return 0;
+        };
         let count = scan
             .pending_finalization
             .len()
@@ -271,7 +294,7 @@ impl Provenance {
                 bytes.checked_add(
                     scan.snapshots
                         .len()
-                        .checked_mul(std::mem::size_of::<&SnapshotItem>())?,
+                        .checked_mul(std::mem::size_of::<(usize, &SnapshotItem)>())?,
                 )
             })
             .and_then(|bytes| bytes.checked_mul(2))
@@ -287,13 +310,13 @@ impl Provenance {
         pending.extend(scan.pending_finalization.iter());
         pending.sort_unstable_by(|a, b| a.source_file_fingerprint.cmp(&b.source_file_fingerprint));
         let mut items = Vec::with_capacity(scan.snapshots.len());
-        items.extend(scan.snapshots.iter());
+        items.extend(scan.snapshots.iter().enumerate());
         items.sort_unstable_by(|a, b| {
-            (&a.source_session_id, &a.source_file_fingerprint)
-                .cmp(&(&b.source_session_id, &b.source_file_fingerprint))
+            (&a.1.source_session_id, &a.1.source_file_fingerprint)
+                .cmp(&(&b.1.source_session_id, &b.1.source_file_fingerprint))
         });
         let mut matched = 0;
-        for (position, item) in items.iter().enumerate() {
+        for (position, (source_position, item)) in items.iter().enumerate() {
             let Some(revision) = item.source_file_fingerprint.as_deref() else {
                 continue;
             };
@@ -301,12 +324,12 @@ impl Provenance {
                 .checked_sub(1)
                 .and_then(|p| items.get(p))
                 .is_some_and(|other| {
-                    other.source_session_id == item.source_session_id
-                        && other.source_file_fingerprint == item.source_file_fingerprint
+                    other.1.source_session_id == item.source_session_id
+                        && other.1.source_file_fingerprint == item.source_file_fingerprint
                 })
                 || items.get(position + 1).is_some_and(|other| {
-                    other.source_session_id == item.source_session_id
-                        && other.source_file_fingerprint == item.source_file_fingerprint
+                    other.1.source_session_id == item.source_session_id
+                        && other.1.source_file_fingerprint == item.source_file_fingerprint
                 });
             if duplicate {
                 continue;
@@ -356,6 +379,7 @@ impl Provenance {
             // joined record, never reconstructed from the index path/settings.
             if marker.path == path && marker.root != [0; 32] {
                 matched += 1;
+                visit(*source_position, marker);
             }
         }
         matched
@@ -407,13 +431,7 @@ impl ScanIndex {
                 context.provenance.seal(window)
             })
     }
-    /// The actual F1 call consumes this source token exactly once. Taking the
-    /// sidecar also prevents selected/partial/CAS copies from inheriting it.
-    /// Kept lexically through C5 only; not cache/native-ID admission yet.
-    pub(crate) fn consume_copy_completion_provenance(
-        &mut self,
-        scan: &mut SourceScanResult,
-    ) -> impl Sized {
+    fn take_source_provenance(&mut self, scan: &mut SourceScanResult) -> Option<PendingCompletion> {
         let scope = self.copy_native_completion_scope().map(|(scope, attempt)| {
             hash(
                 "copy_native_scope:v1",
@@ -425,22 +443,50 @@ impl ScanIndex {
             .as_mut()
             .map(|context| std::mem::take(&mut context.provenance));
         let generation = scan.copy_completion_token.0.take();
-        let matched = if scan.source == SnapshotSource::ClaudeCode {
-            provenance
-                .as_ref()
-                .zip(scope)
-                .zip(generation)
-                .map_or(0, |((p, scope), generation)| {
-                    p.matches(scan, scope, generation)
-                })
-        } else {
-            0
-        };
-        #[cfg(test)]
-        F1_RECEIPT.with(|value| value.set(matched));
-        let _ = matched;
-        provenance
+        let ((provenance, scope), generation) = provenance.zip(scope).zip(generation)?;
+        if scan.source != SnapshotSource::ClaudeCode
+            || !provenance.valid_header(scan, scope, generation)
+        {
+            return None;
+        }
+        Some(PendingCompletion {
+            provenance,
+            scope,
+            generation,
+        })
     }
+    /// Observation/test consumer of the same real source token and matcher.
+    /// It retains no IDs and cannot grant any cache/read permission.
+    pub(crate) fn consume_copy_completion_provenance(
+        &mut self,
+        scan: &mut SourceScanResult,
+    ) -> impl Sized {
+        let completion = self.take_source_provenance(scan);
+        let matched = completion
+            .as_ref()
+            .map_or(0, |completion| completion.visit_matches(scan, |_, _| {}));
+        record_f1_receipt(matched);
+        completion
+    }
+}
+struct PendingCompletion {
+    provenance: Provenance,
+    scope: [u8; 32],
+    generation: NonZeroU64,
+}
+impl PendingCompletion {
+    fn visit_matches(&self, scan: &SourceScanResult, visit: impl FnMut(usize, &Marker)) -> usize {
+        self.provenance
+            .visit_matches(scan, self.scope, self.generation, visit)
+    }
+    fn owner(&self) -> Option<&Arc<SharedCache>> {
+        Some(self.provenance.storage.as_ref()?.reservation.owner())
+    }
+}
+fn record_f1_receipt(matched: usize) {
+    #[cfg(test)]
+    F1_RECEIPT.with(|value| value.set(matched));
+    let _ = matched;
 }
 #[cfg(test)]
 thread_local! { static F1_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }

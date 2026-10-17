@@ -30,6 +30,7 @@ mod claude_copy_containment;
 pub(crate) use claude_copy_containment::accounting::{
     observe_owned_completion, BorrowedClaudeCompletion,
 };
+pub(crate) use claude_copy_containment::provenance::HeldNativeCompletion;
 pub(crate) use claude_copy_containment::status_slot::{
     prepay_control_status, CopyObservationState,
 };
