@@ -1171,6 +1171,9 @@ pub struct AgentRuntimeDefaults {
     pub priority_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Effort saved per model (Claude Code `modelSettings`), keyed by model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_effort_by_model: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1328,6 +1331,11 @@ impl AgentStatusSnapshot {
             defaults.sandbox_mode = safe_optional_text(defaults.sandbox_mode.take());
             defaults.machine_id = safe_optional_text(defaults.machine_id.take());
             defaults.provenance = safe_optional_text(defaults.provenance.take());
+            defaults.reasoning_effort_by_model =
+                std::mem::take(&mut defaults.reasoning_effort_by_model)
+                    .into_iter()
+                    .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
+                    .collect();
             defaults.selector_context = std::mem::take(&mut defaults.selector_context)
                 .into_iter()
                 .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
@@ -6732,6 +6740,10 @@ mod tests {
                     "service_tier".to_string(),
                     "codex.config.service_tier".to_string(),
                 )]),
+                reasoning_effort_by_model: BTreeMap::from([
+                    ("claude-opus-5-5".to_string(), "medium".to_string()),
+                    ("/Users/ron/.claude".to_string(), "high".to_string()),
+                ]),
                 ..Default::default()
             }),
         }
@@ -6831,6 +6843,10 @@ mod tests {
         );
         // Path-like config value is stripped by backend redaction.
         assert!(!runtime_defaults.selector_context.contains_key("leaked"));
+        assert_eq!(
+            runtime_defaults.reasoning_effort_by_model,
+            BTreeMap::from([("claude-opus-5-5".to_string(), "medium".to_string())])
+        );
     }
 
     fn status_display_fixture() -> AgentStatusSnapshot {
