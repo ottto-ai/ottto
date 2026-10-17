@@ -93,6 +93,7 @@ impl<'de> Deserialize<'de> for Holds {
 #[derive(Debug, Clone)]
 pub(crate) struct ScanContext {
     scope: String,
+    pub(super) provenance: super::provenance::Provenance,
     contexts: BTreeMap<String, Option<String>>,
     // One required semantic input, never a complete W5 or read permission.
     registered_slot_fingerprint: Option<String>,
@@ -105,7 +106,7 @@ pub(crate) struct ScanContext {
     hold_peer_limit_refusals: usize,
     withheld_candidates_observed: bool,
 }
-crate::heap_layout_bound::fields!(ScanContext; scope, contexts, registered_slot_fingerprint,
+crate::heap_layout_bound::fields!(ScanContext; scope, provenance, contexts, registered_slot_fingerprint,
     attempt_scope, parked, attempt_unavailable, attempt_repeated,
     hold_record_limit_refusals, hold_peer_limit_refusals, withheld_candidates_observed);
 
@@ -114,6 +115,7 @@ impl ScanContext {
         (digest_valid(&scope) && contexts.values().flatten().all(|value| digest_valid(value)))
             .then_some(Self {
                 scope,
+                provenance: super::provenance::Provenance::default(),
                 contexts,
                 registered_slot_fingerprint: None,
                 attempt_scope: None,
@@ -191,6 +193,11 @@ impl ScanIndex {
             .as_ref()?
             .registered_slot_fingerprint
             .as_deref()
+    }
+
+    pub(in crate::snapshots) fn copy_native_completion_scope(&self) -> Option<(&str, &str)> {
+        let context = self.active_copy_scan.as_ref()?;
+        Some((&context.scope, context.attempt_scope.as_deref()?))
     }
 
     pub(crate) fn attach_copy_scan_context(&mut self, context: ScanContext) {

@@ -78,6 +78,7 @@ impl ScanIndex {
         // Drop store/path and any local data before temporary is retired.
         drop(store);
         drop(temporary);
+        self.begin_copy_completion_provenance();
         Ok(())
     }
 }

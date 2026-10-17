@@ -5349,6 +5349,9 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         index,
         identity_evidence.as_ref(),
     );
+    // Exact complete-parser provenance only, consumed once at F1. This paid
+    // sidecar survives C5 lexically, but does not retain IDs or admit the cache.
+    let _copy_native_provenance = index.consume_copy_completion_provenance(scan_result);
     // Observation only at the real fold/filter boundary. Missing process
     // context/layout is None before walking. This omits preparation owners and
     // future C5 scratch/output, so it MUST NOT authorize optional cache capture.

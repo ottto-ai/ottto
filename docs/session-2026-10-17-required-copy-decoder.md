@@ -218,3 +218,37 @@ unsupported preparation refusal from supported execution; original positive
 assertions remain. The real profile guard is not broadened or bypassed.
 Source/tests await their own hosted CI. No local Cargo/model/review ran.
 Native moved-ID escrow/cache capture remains unimplemented and inactive.
+
+
+## Required parser-to-completion provenance
+
+The inactive required context now owns one private generation-scoped provenance
+sidecar, funded by the existing reservation before its Arc or vector backing is
+allocated. Complete native parser finalization records only fixed full digests
+of the actual candidate root/path, opened revision and parsed session. Aliases,
+incomplete parses and missing/unsupported/unfunded state supply no completion
+witness. No raw paths or native request IDs are retained by this carrier.
+PendingIndexFinalization remains unchanged; ordinary scans allocate no sidecar.
+
+SourceScanResult carries one inline process token. Its Clone drops the token;
+index/context clones share immutable paid metadata but cannot write, seal or
+claim source completion. Growth reserves before vector reallocation; a shared
+old version retains independent credit while a real fixed-digest copy is paid.
+All private Arc retirement frees its allocation header before returning credit.
+The original source seals once at completion. At F1, after the authoritative
+fold and before copy filtering, exact token/scope/window, complete opened-entry,
+path/revision/session and ambiguity checks consume that same carrier. Borrowed
+reference collectors are prepaid before allocation and sorted for bounded
+lookup work; no native-ID graph is cloned or walked. Metadata remains lexical
+through C5, then retires. Selected, cloned, reset and reloaded contexts cannot
+turn it into a different source completion. Optional failure changes no body,
+ACK, held debt, identity or read decision.
+
+Three new actual-path regressions cover ordinary no-carrier/no-allocation;
+actual required prepare/parse/final fold/F1, exact root binding, immutable paid
+clone lifetime, clear and healthy body parity; and partial/missing/ambiguous,
+revision/window/reset/selected/reload/pressure refusal. Hosted CI is pending.
+Supported paid positives must explicitly remain UNEXECUTED if the actual profile
+is unsupported. No local Cargo, model or reviewer ran for this checkpoint.
+This is provenance custody, not native-ID escrow/cache insertion, W4 delivery,
+durable hold drain, activation, release readiness or installed CPU/RSS proof.

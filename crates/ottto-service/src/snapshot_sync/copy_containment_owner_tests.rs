@@ -1421,3 +1421,195 @@ fn copy_containment_real_required_preparation_funding_refusal_preserves_debt_and
     assert_eq!(std::fs::read(&path).unwrap(), before);
     writeln!(std::io::stderr().lock(), "copy_containment_actual_paid_refusal: real_prepare_pressure_refused=true clone_selection_restore_refused=true debt_and_disk_unchanged=true all_credit_retired=true subsequent_real_prepare_succeeds=true no_ordinary_or_empty_fallback=true").unwrap();
 }
+
+fn copy_provenance_append_own_revision(key: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(key).unwrap();
+    writeln!(file, "{}", serde_json::json!({"type":"assistant",
+        "sessionId":IDENTITY_PIPELINE_ROOT,
+        "timestamp":(OffsetDateTime::now_utc() - TimeDuration::minutes(119)).format(&Rfc3339).unwrap(),
+        "requestId":"req_native_provenance_change", "message":{"id":"msg_native_provenance_change",
+            "model":"claude-haiku-4-5","usage":{"input_tokens":9,"output_tokens":2}}
+    })).unwrap();
+}
+
+#[test]
+#[serial]
+fn copy_containment_actual_provenance_default_has_no_carrier_or_f1_allocation() {
+    let fixture = IdentityPipelineHome::new();
+    let support = fixture.base.join("support-provenance-default");
+    let _seed = copy_owner_seed(&fixture, &support);
+    let daemon = test_daemon("otm_test");
+    let (mut index, mut scan) =
+        copy_owner_complete(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+    assert_eq!(index.copy_provenance_marker_count_for_test(), 0);
+    let before = serde_json::to_vec(&scan.snapshots).unwrap();
+    let (_, allocation) = crate::retry_allocation_probe::measure(|| {
+        drop(index.consume_copy_completion_provenance(&mut scan));
+    });
+    assert_eq!(allocation.allocations, 0);
+    assert_eq!(ScanIndex::copy_f1_provenance_receipt_for_test(), 0);
+    assert_eq!(serde_json::to_vec(&scan.snapshots).unwrap(), before);
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(0)
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_provenance_default: actual_prepare_scan=true carrier_allocations=0 f1_allocations=0 native_body_unchanged=true no_native_id_capture=true").unwrap();
+}
+
+#[test]
+#[serial]
+fn copy_containment_actual_parser_provenance_reaches_f1_with_immutable_paid_clone() {
+    let fixture = IdentityPipelineHome::new();
+    let support = fixture.base.join("support-provenance-actual");
+    let (path, key) = copy_owner_seed(&fixture, &support);
+    let daemon = test_daemon("otm_test");
+    daemon.transcript_cache.require_copy_containment_for_test();
+    if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+        writeln!(std::io::stderr().lock(), "copy_containment_provenance_f1: actual_unsupported_prepare_refused=true supported_parser_root_binding_paid_clone_C5_positive=UNEXECUTED").unwrap();
+        return;
+    }
+    copy_provenance_append_own_revision(&key);
+    let (preparation, mut index, mut scan) =
+        copy_owner_complete_frame(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+    assert_eq!(scan.scanned_file_count, 2);
+    assert_eq!(index.copy_provenance_marker_count_for_test(), 2);
+    let root = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == IDENTITY_PIPELINE_ROOT)
+        .unwrap();
+    assert!(index.copy_provenance_root_bound_for_test(
+        &fixture.home.join(".claude/projects"),
+        &key,
+        IDENTITY_PIPELINE_ROOT,
+        root.source_file_fingerprint.as_deref().unwrap()
+    ));
+    assert!(!index.copy_provenance_root_bound_for_test(
+        &fixture.home.join(".claude/other"),
+        &key,
+        IDENTITY_PIPELINE_ROOT,
+        root.source_file_fingerprint.as_deref().unwrap()
+    ));
+    // A real index copy shares immutable paid metadata. The cloned scan loses
+    // the one-source capability, so it cannot claim parser completeness again.
+    let mut control_index = index.try_clone_for_copy().unwrap();
+    let credit_before_clear = daemon
+        .transcript_cache
+        .reserved_copy_bytes_for_test()
+        .unwrap();
+    daemon.transcript_cache.clear();
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(credit_before_clear)
+    );
+    let mut control_scan = scan.clone();
+    let _ = apply_claude_local_evidence_to_scan(&support, &mut control_scan, &mut control_index);
+    assert_eq!(ScanIndex::copy_f1_provenance_receipt_for_test(), 0);
+    let _ = apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
+    assert_eq!(ScanIndex::copy_f1_provenance_receipt_for_test(), 2);
+    assert_eq!(index.copy_provenance_marker_count_for_test(), 0);
+    assert_eq!(
+        serde_json::to_vec(&scan.snapshots).unwrap(),
+        serde_json::to_vec(&control_scan.snapshots).unwrap()
+    );
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != IDENTITY_PIPELINE_ROOT));
+    let healthy = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == COPY_OWNER_HEALTHY)
+        .unwrap();
+    assert!(healthy.claude_usage_request_ids.contains("req_healthy_own"));
+    drop(index.consume_copy_completion_provenance(&mut scan));
+    assert_eq!(ScanIndex::copy_f1_provenance_receipt_for_test(), 0);
+    drop((scan, index, preparation, control_scan, control_index));
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(0)
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_provenance_f1: actual_prepare_parser_finish_fold_F1=true exact_root_path_revision_session=true marker_count=2 clone_capability=0 repeat_capability=0 healthy_bytes_equal=true held_stays_withheld=true credit_retired=true native_ids_not_captured=true").unwrap();
+}
+
+#[test]
+#[serial]
+fn copy_containment_actual_provenance_rejects_partial_missing_ambiguous_stale_and_pressure() {
+    for case in [
+        "partial",
+        "revision",
+        "ambiguous",
+        "missing",
+        "window",
+        "reset",
+        "pressure",
+        "selected",
+        "reload",
+    ] {
+        let fixture = IdentityPipelineHome::new();
+        let support = fixture.base.join("support-provenance-negative");
+        let (path, key) = copy_owner_seed(&fixture, &support);
+        let daemon = test_daemon("otm_test");
+        daemon.transcript_cache.require_copy_containment_for_test();
+        if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+            writeln!(std::io::stderr().lock(), "copy_containment_provenance_negative: case={case} actual_unsupported_prepare_refused=true supported_provenance_join_positive=UNEXECUTED_CAS_shed_not_claimed").unwrap();
+            continue;
+        }
+        copy_provenance_append_own_revision(&key);
+        let (preparation, mut index, mut scan) =
+            copy_owner_complete_frame(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+        assert_eq!(index.copy_provenance_marker_count_for_test(), 2);
+        let before = serde_json::to_vec(&scan.snapshots).unwrap();
+        let debt = serde_json::to_value(&index).unwrap()["claude_copy_holds"].clone();
+        match case {
+            "reset" => index.reset_copy_provenance_for_test(),
+            "pressure" | "selected" | "reload" => {}
+            other => ScanIndex::copy_provenance_negative_for_test(&mut scan, other),
+        }
+        if case == "selected" {
+            let mut selected = index
+                .try_committable_subset(
+                    &preparation.committed_index,
+                    &BTreeSet::new(),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            drop(selected.consume_copy_completion_provenance(&mut scan));
+            assert_eq!(ScanIndex::copy_f1_provenance_receipt_for_test(), 0);
+            drop(index.consume_copy_completion_provenance(&mut scan));
+        } else if case == "reload" {
+            let mut loaded =
+                ScanIndex::load_required_copy_index(&path, &daemon.transcript_cache).unwrap();
+            drop(loaded.consume_copy_completion_provenance(&mut scan));
+            assert_eq!(ScanIndex::copy_f1_provenance_receipt_for_test(), 0);
+            drop(index.consume_copy_completion_provenance(&mut scan));
+        } else if case == "pressure" {
+            daemon
+                .transcript_cache
+                .with_copy_credit_pressure_for_test(|| {
+                    drop(index.consume_copy_completion_provenance(&mut scan));
+                });
+        } else {
+            drop(index.consume_copy_completion_provenance(&mut scan));
+        }
+        let matched = ScanIndex::copy_f1_provenance_receipt_for_test();
+        if matches!(case, "partial" | "revision" | "ambiguous") {
+            assert!(matched <= 1);
+        } else {
+            assert_eq!(matched, 0);
+        }
+        assert_eq!(serde_json::to_vec(&scan.snapshots).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(&index).unwrap()["claude_copy_holds"],
+            debt
+        );
+        assert_eq!(index.copy_provenance_marker_count_for_test(), 0);
+        drop((scan, index, preparation));
+        assert_eq!(
+            daemon.transcript_cache.reserved_copy_bytes_for_test(),
+            Some(0)
+        );
+        writeln!(std::io::stderr().lock(), "copy_containment_provenance_negative: case={case} matched={matched} no_completeness_upgrade=true native_body_debt_unchanged=true credit_retired=true cache_admission=false").unwrap();
+    }
+}

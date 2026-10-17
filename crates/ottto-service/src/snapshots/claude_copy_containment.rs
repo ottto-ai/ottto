@@ -9,6 +9,7 @@ pub(in crate::snapshots) mod accounting;
 pub(in crate::snapshots) mod membership;
 pub(crate) mod pipeline;
 pub(in crate::snapshots) mod producer;
+pub(in crate::snapshots) mod provenance;
 pub(in crate::snapshots) mod required_prepare;
 // Inactive mechanical decoder/copy checkpoint. Production attachment awaits
 // complete native ownership and settlement qualification.

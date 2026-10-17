@@ -2859,6 +2859,8 @@ pub struct SnapshotSourceManifest {
 
 #[derive(Debug, Clone)]
 pub struct SourceScanResult {
+    // One inline process token; clones lose it. No ordinary backing allocation.
+    copy_completion_token: claude_copy_containment::provenance::SourceToken,
     pub source: SnapshotSource,
     pub backfill_window_days: u64,
     pub backfill_file_limit: usize,
@@ -2935,6 +2937,7 @@ impl SourceScanResult {
         use crate::heap_layout_bound::HeapLayoutBound;
         let Self {
             source,
+            copy_completion_token,
             backfill_window_days,
             backfill_file_limit,
             discovered_file_count,
@@ -2982,6 +2985,7 @@ impl SourceScanResult {
             return None;
         }
         // Scalar/inline fields already occupy the enclosing struct's slot.
+        copy_completion_token.completed_heap_bound(c)?;
         source.completed_heap_bound(c)?;
         backfill_window_days.completed_heap_bound(c)?;
         backfill_file_limit.completed_heap_bound(c)?;
@@ -13293,6 +13297,15 @@ impl OwnedSourceScan {
                         );
                     }
                 }
+                if source == SnapshotSource::ClaudeCode && parse_complete && aliases.is_empty() {
+                    index.record_copy_complete_native_input(
+                        &candidate,
+                        &source_file_fingerprint,
+                        &census_window_end,
+                        &parsed,
+                        file_limit,
+                    );
+                }
                 pending_finalization.push(PendingIndexFinalization {
                     sampled_audit_verified,
                     codex_pending_recovery: index
@@ -13765,8 +13778,11 @@ impl OwnedSourceScan {
                         snapshot.context_curve = None;
                     }
                 }
+                let copy_completion_token =
+                    index.seal_copy_completion_provenance(&census_window_end);
                 let scan = SourceScanResult {
                     source,
+                    copy_completion_token,
                     backfill_window_days,
                     backfill_file_limit: file_limit,
                     discovered_file_count,

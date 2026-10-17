@@ -170,6 +170,11 @@ impl SharedCache {
         while let Some(credit) = self.reserve_copy_bytes(1024) {
             pressure.push(credit);
         }
+        // Exhaust the sub-kilobyte remainder too: the provenance reference
+        // collector can legitimately require fewer than 1024 bytes.
+        while let Some(credit) = self.reserve_copy_bytes(1) {
+            pressure.push(credit);
+        }
         let result = run();
         drop(pressure);
         result
