@@ -473,8 +473,6 @@ mod tests {
         }
         assert!(projection_slot_peak(usize::MAX).is_none());
     }
-    use super::*;
-    use crate::snapshots::ScanIndex;
     #[test]
     fn copy_containment_control_observation_shape_is_borrowed_and_refuses_structural_drift() {
         let value = serde_json::json!({"kind":"claude_copy_containment", "current":true,

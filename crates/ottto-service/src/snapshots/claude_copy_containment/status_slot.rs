@@ -367,9 +367,6 @@ mod tests {
         assert_eq!(owner.reserved_copy_bytes_for_test(), Some(0));
         writeln!(std::io::stderr().lock(), "copy_containment_typed_status_slot: layout_supported=true persistent_requested_bytes={reserved} one_box=true in_place_updates_no_alloc=true equal_payload_id_stable=true invalid_replacement_keeps_old=true data_freed_before_credit=true").unwrap();
     }
-    use super::*;
-    use crate::snapshots::ScanIndex;
-    use std::io::Write as _;
 
     #[test]
     fn copy_containment_typed_status_projection_refusal_keeps_required_debt_and_private_record() {
