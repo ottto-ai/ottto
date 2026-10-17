@@ -672,13 +672,15 @@ mod tests {
     #[test]
     fn copy_containment_consumer_preflight_counts_legacy_and_fat_reference_boundaries() {
         use std::io::Write;
-        let mut index = ScanIndex::default();
-        index.claude_copy_holds = serde_json::from_value(serde_json::json!({
-            "legacy.jsonl": {"revision": {"version":1, "reason":"copied_overlap_unproven",
-                "source_revision":"a".repeat(64), "comparison_context":"b".repeat(64),
-                "first_observed_unix_seconds":null}, "peers":["c".repeat(64)]}
-        }))
-        .unwrap();
+        let mut index = ScanIndex {
+            claude_copy_holds: serde_json::from_value(serde_json::json!({
+                "legacy.jsonl": {"revision": {"version":1, "reason":"copied_overlap_unproven",
+                    "source_revision":"a".repeat(64), "comparison_context":"b".repeat(64),
+                    "first_observed_unix_seconds":null}, "peers":["c".repeat(64)]}
+            }))
+            .unwrap(),
+            ..ScanIndex::default()
+        };
         index.files.insert(
             "legacy.jsonl".to_string(),
             serde_json::from_value(serde_json::json!({

@@ -301,7 +301,6 @@ mod tests {
             assert_eq!(record.sequence, 17);
             assert!(!record.observed_at().is_empty());
             assert!(Record::new(observation, "unknown basis", 18).is_none());
-            drop(record);
         });
         assert_eq!(actual.allocations, 0);
         assert_eq!(actual.requested_live, 0);
