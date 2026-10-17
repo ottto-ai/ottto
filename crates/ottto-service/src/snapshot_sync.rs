@@ -45,6 +45,8 @@ use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
+mod rejection_log;
+
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -135,6 +137,7 @@ fn bootstrap_cache_heads(
             &mut accepted,
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
+            |item| Some(item.source_session_id.as_str()),
             |_| false,
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
@@ -4372,6 +4375,7 @@ fn finish_sync_source(
         &mut accepted,
         |snapshot| snapshot.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
+        |snapshot| Some(snapshot.source_session_id.as_str()),
         |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
@@ -5588,6 +5592,7 @@ where
         accepted,
         fingerprint,
         body_witness,
+        |_| None,
         |_| false,
         upload,
         persist,
@@ -5603,7 +5608,7 @@ enum SnapshotPageOutcome {
 // Scratch extraction only: the upload callback remains the existing canonical
 // preflight/token/ACK-validator/client-report boundary. No inventory pruning.
 #[allow(clippy::too_many_arguments)]
-fn attempt_snapshot_page<T, Fingerprint, BodyWitness, Upload, Persist>(
+fn attempt_snapshot_page<T, Fingerprint, BodyWitness, SessionId, Upload, Persist>(
     items: &[T],
     indices: &[usize],
     poison_scope: &str,
@@ -5611,6 +5616,7 @@ fn attempt_snapshot_page<T, Fingerprint, BodyWitness, Upload, Persist>(
     accepted: &mut u64,
     fingerprint: &Fingerprint,
     body_witness: &BodyWitness,
+    session_id: &SessionId,
     upload: &mut Upload,
     persist: &mut Persist,
 ) -> Result<SnapshotPageOutcome>
@@ -5618,6 +5624,7 @@ where
     T: Clone + Serialize,
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
+    SessionId: Fn(&T) -> Option<&str>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
@@ -5738,10 +5745,13 @@ where
         for entity in &response.rejected_entities {
             record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
             eprintln!(
-                "local snapshot entity rejected for {poison_scope}: reason={} permanent={}; \
+                "local snapshot entity rejected for {poison_scope}: reason={} permanent={} session_hash={}; \
                  accepted siblings checkpointed, rejected body retained in bounded quarantine",
                 entity.safe_reason(),
                 entity.permanent,
+                rejection_log::rejected_session_hash(
+                    items, indices, &entity.snapshot_fingerprint, fingerprint, session_id,
+                ),
             );
         }
     }
@@ -5783,6 +5793,7 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     T,
     Fingerprint,
     BodyWitness,
+    SessionId,
     BatchClass,
     Upload,
     Persist,
@@ -5793,6 +5804,7 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     accepted: &mut u64,
     fingerprint: Fingerprint,
     body_witness: BodyWitness,
+    session_id: SessionId,
     batch_class: BatchClass,
     mut upload: Upload,
     mut persist: Persist,
@@ -5801,6 +5813,7 @@ where
     T: Clone + Serialize,
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
+    SessionId: Fn(&T) -> Option<&str>,
     BatchClass: Fn(&T) -> bool,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
@@ -5957,6 +5970,7 @@ where
             accepted,
             &fingerprint,
             &body_witness,
+            &session_id,
             &mut upload,
             &mut persist,
         ) {
@@ -12797,6 +12811,7 @@ mod tests {
             &mut accepted,
             String::as_str,
             |item| item.clone(),
+            |_| None,
             |item| reconcile_class.contains(item),
             |batch| {
                 let is_reconcile = batch
@@ -17518,6 +17533,7 @@ mod tests {
                 &mut 0,
                 &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
                 &snapshot_upload_body_witness,
+                &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
                 &mut { upload },
                 &mut |p: &mut SnapshotUploadProgress| p.save(&self.progress_path),
             )
@@ -17761,6 +17777,7 @@ mod tests {
             &mut 0,
             &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
             &snapshot_upload_body_witness,
+            &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut |items| {
                 physical += 1;
                 same_source_fixture_ack(items)
