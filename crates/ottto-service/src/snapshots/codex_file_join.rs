@@ -1725,7 +1725,7 @@ pub(super) mod tests {
         for _ in 0..1000 {
             match owned.step(None) {
                 OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan } => return (index, scan),
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
             }
         }
         panic!("bounded native scan did not finish");
@@ -1914,7 +1914,7 @@ pub(super) mod tests {
         loop {
             match owned.step(None) {
                 OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan } => {
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
                     assert!(scan.snapshots.is_empty());
                     assert_eq!(scan.ownership_incomplete_file_count, 2);
                     assert!(index.files.is_empty());
@@ -2193,7 +2193,7 @@ pub(super) mod tests {
             }
             match owned.step(None) {
                 OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan } => {
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
                     assert!(rewritten);
                     assert!(scan.snapshots.is_empty());
                     assert_eq!(scan.ownership_incomplete_file_count, 2);
@@ -2291,6 +2291,7 @@ pub(super) mod tests {
                 OwnedSourceScanStep::Complete {
                     mut index,
                     mut scan,
+                    ..
                 } => {
                     assert!(added);
                     finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
@@ -2376,7 +2377,7 @@ pub(super) mod tests {
         for _ in 0..1000 {
             match owned.step(None) {
                 OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan } => return (index, scan),
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
             }
         }
         panic!("bounded native scan did not finish");

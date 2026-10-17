@@ -101,6 +101,7 @@ fn run_with_limit(
             OwnedSourceScanStep::Complete {
                 mut index,
                 mut scan,
+                ..
             } => {
                 apply_upload_policy(
                     source,
