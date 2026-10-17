@@ -13882,7 +13882,12 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
-                if comparison_target {
+                let target_finalization_credit = if comparison_target {
+                    if source != SnapshotSource::ClaudeCode || !aliases.is_empty() {
+                        return Err(crate::source_rotation::LocalRefusal(
+                            "native comparison target metadata source mismatch",
+                        ));
+                    }
                     if let Some(credit) = capture_credit.as_deref_mut() {
                         let admitted = native_comparison
                             .as_mut()
@@ -13895,8 +13900,54 @@ impl OwnedSourceScan {
                         // Error abandons collection; it is never finalized as
                         // an empty census or offered. Prior durable state stays.
                         admitted?;
-                    }
-                }
+                        let path_set_entries = index
+                            .files
+                            .len()
+                            .checked_add(residue_index_keys.len())
+                            .and_then(|n| n.checked_add(settled_residue_index_keys.len()))
+                            .and_then(|n| n.checked_add(census.observed_index_keys.len()))
+                            .and_then(|n| n.checked_add(index.confirmed_empty_files.len()))
+                            .and_then(|n| {
+                                n.checked_add(
+                                    index
+                                        .traversal
+                                        .as_ref()
+                                        .map_or(0, |t| t.observed_index_keys.len()),
+                                )
+                            })
+                            .and_then(|n| {
+                                n.checked_add(
+                                    index
+                                        .traversal
+                                        .as_ref()
+                                        .map_or(0, |t| t.residue.index_keys.len()),
+                                )
+                            })
+                            .ok_or(crate::source_rotation::LocalRefusal(
+                                "native target metadata path count overflow",
+                            ))?;
+                        Some(
+                            native_comparison
+                                .as_ref()
+                                .expect("checked target phase")
+                                .prepay_target_finalization_metadata(
+                                    claude_native_comparison::TargetFinalizationInputs {
+                                        candidate: &candidate,
+                                        revision: &source_file_fingerprint,
+                                        parsed: &parsed_file,
+                                        index,
+                                        pending: &mut pending_finalization,
+                                        path_set_entries,
+                                    },
+                                    credit,
+                                )?,
+                        )
+                    } else {
+                        None
+                    } // logical test adapter only
+                } else {
+                    None
+                };
                 let finalization_charge =
                     crate::heap_layout_bound::completed_bound(&parsed_file, copy_budget);
                 if finalization_charge.is_none() {
@@ -14275,6 +14326,17 @@ impl OwnedSourceScan {
                 // disclosed, so independently parsed sibling records remain usable.
                 if parse_complete {
                     snapshots.extend(parsed);
+                }
+                if let Some(bytes) = target_finalization_credit {
+                    native_comparison
+                        .as_mut()
+                        .expect("checked target phase")
+                        .retain_target_metadata(
+                            bytes,
+                            capture_credit
+                                .as_deref_mut()
+                                .expect("funded target metadata"),
+                        )?;
                 }
                 pending!();
             }
@@ -14906,7 +14968,7 @@ impl OwnedSourceScan {
             if let Some(phase) = native_comparison.as_mut() {
                 // This is an actual native acquisition attempt, before parser
                 // construction can fail or complete with no emitted entity.
-                if let Some(credit) = capture_credit {
+                if let Some(credit) = capture_credit.as_deref_mut() {
                     let captured = phase.record_parse_attempt_paid(&candidate, credit);
                     if !captured && comparison_target {
                         // The ordinary candidate was a Skip. Refuse this extra
@@ -14918,6 +14980,19 @@ impl OwnedSourceScan {
                     phase.record_parse_attempt(&candidate);
                 }
             }
+            let target_input_credit = if comparison_target {
+                match capture_credit.as_deref_mut() {
+                    Some(credit) => Some(
+                        native_comparison
+                            .as_ref()
+                            .expect("checked target phase")
+                            .prepay_target_input_metadata(&candidate, index, credit)?,
+                    ),
+                    None => None, // logical test adapter only
+                }
+            } else {
+                None
+            };
             scanned_file_count += 1;
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
@@ -14926,6 +15001,12 @@ impl OwnedSourceScan {
                     &candidate.path,
                 ));
             let source_file_fingerprint = candidate.source_file_fingerprint.clone();
+            if let Some(bytes) = target_input_credit {
+                native_comparison
+                    .as_mut()
+                    .expect("checked target phase")
+                    .retain_target_metadata(bytes, capture_credit.expect("funded target input"))?;
+            }
 
             let mut parser = match sampled_scan::new_source_parser(
                 opened_file,

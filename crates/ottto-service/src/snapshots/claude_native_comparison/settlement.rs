@@ -949,7 +949,7 @@ impl SelectedFallback {
 /// Existing Rust1.88/1.95 B=6 insertion can split at most one node per level
 /// plus a new root. Charge the existing full-node upper bound for every such
 /// allocation; never weaken the ordinary layout/version/visit guards.
-fn restore_tree_insert_peak<K, V>(
+pub(super) fn restore_tree_insert_peak<K, V>(
     maximum_entries: usize,
     operations: usize,
     cost: &mut crate::heap_layout_bound::Counter,

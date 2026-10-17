@@ -590,6 +590,223 @@ impl NativePhase {
         Ok(())
     }
 
+    /// Prepay the extra active target's copied revision/previous-body fields.
+    /// This runs immediately before the existing getters clone their strings;
+    /// only the unchanged ONE serial parser is inherited base memory.
+    pub(super) fn prepay_target_input_metadata(
+        &self,
+        candidate: &CandidateFile,
+        index: &ScanIndex,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Result<usize, crate::source_rotation::LocalRefusal> {
+        let refusal =
+            crate::source_rotation::LocalRefusal("native target input metadata cannot be prepaid");
+        let plan = (|| {
+            let key = candidate.path.to_str()?;
+            let entry = index.files.get(key)?;
+            let retained = candidate
+                .source_file_fingerprint
+                .len()
+                .checked_add(
+                    entry
+                        .last_snapshot_fingerprint
+                        .as_ref()
+                        .map_or(0, String::len),
+                )?
+                .checked_add(
+                    entry
+                        .last_upload_body_witness
+                        .as_ref()
+                        .map_or(0, String::len),
+                )?;
+            let paid = credit.as_mut()?;
+            // Each of the existing getters uses one local_index_key temporary,
+            // sequentially. No owned key universe or body clone is constructed.
+            paid.grow_for(
+                paid.allocated()
+                    .checked_add(retained)?
+                    .checked_add(key.len())?,
+            )
+            .then_some(retained)
+        })();
+        plan.ok_or(refusal)
+    }
+
+    pub(super) fn retain_target_metadata(
+        &mut self,
+        bytes: usize,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Result<(), crate::source_rotation::LocalRefusal> {
+        let refusal =
+            crate::source_rotation::LocalRefusal("native target metadata lost its prepayment");
+        let paid = credit.as_mut().ok_or(refusal)?;
+        let allocated = paid.allocated().checked_add(bytes).ok_or(refusal)?;
+        let retained = self
+            .retained_target_bytes
+            .checked_add(bytes)
+            .ok_or(refusal)?;
+        if !paid.record_allocated(allocated) {
+            return Err(refusal);
+        }
+        // Conservative custody through the phase: fields can move into the
+        // ordinary index/pending carrier, but are never granted twice later.
+        self.retained_target_bytes = retained;
+        paid.retire_speculation();
+        Ok(())
+    }
+
+    /// After the inherited current parser finishes, price the existing Claude
+    /// metadata operations before they copy any key/witness or grow a pending
+    /// buffer. This scalar remains unused credit until the canonical operations
+    /// below have completed; it is not a parallel metadata implementation.
+    pub(super) fn prepay_target_finalization_metadata(
+        &self,
+        inputs: TargetFinalizationInputs<'_>,
+        credit: &mut Option<crate::source_rotation::PaidReservation>,
+    ) -> Result<usize, crate::source_rotation::LocalRefusal> {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let refusal = crate::source_rotation::LocalRefusal(
+            "native target finalization metadata cannot be prepaid",
+        );
+        (|| {
+            let TargetFinalizationInputs {
+                candidate,
+                revision,
+                parsed,
+                index,
+                pending,
+                path_set_entries,
+            } = inputs;
+            let path = candidate.path.to_str()?;
+            let entry = index.files.get(path)?; // target is an exact existing Skip member
+                                                // Codex-only branches have different metadata ownership. They are
+                                                // never eligible targets and cannot borrow this Claude prepayment.
+            if !parsed.state_only_blocked_session_ids.is_empty()
+                || parsed.codex_parent_session_ref.is_some()
+                || parsed.codex_parent_ownership_ledger.is_some()
+                || parsed.codex_parent_resolution_pending
+            {
+                return None;
+            }
+            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            let length = pending.len().checked_add(1)?;
+            let old_capacity = pending.capacity();
+            let new_capacity = if length > old_capacity {
+                length.max(4).checked_next_power_of_two()?
+            } else {
+                old_capacity
+            };
+            let buffer_peak = if new_capacity > old_capacity {
+                new_capacity.checked_mul(std::mem::size_of::<PendingIndexFinalization>())?
+            } else {
+                0
+            };
+            let retained_buffer = new_capacity
+                .checked_sub(old_capacity)?
+                .checked_mul(std::mem::size_of::<PendingIndexFinalization>())?;
+            // Split paths are bounded by actual source-owned collection sizes,
+            // using the same pinned B-tree insertion planner as selected restore.
+            // One local residue/settled key; its durable residue only on loss;
+            // an observation only if the traversal does not already contain it;
+            // a confirmed-empty key only when this parser produced no body.
+            let residue = parsed.non_progressing_residue();
+            let observed_insert = index
+                .traversal
+                .as_ref()
+                .is_some_and(|traversal| !traversal.observed_index_keys.contains(path));
+            let path_inserts = 1usize
+                .checked_add(usize::from(residue))?
+                .checked_add(usize::from(observed_insert))?
+                .checked_add(usize::from(
+                    parsed.complete() && parsed.snapshots.is_empty(),
+                ))?;
+            settlement::restore_tree_insert_peak::<String, ()>(
+                path_set_entries.checked_add(1)?,
+                path_inserts,
+                &mut cost,
+            )?;
+            if parsed.snapshots.iter().any(|item| {
+                item.claude_context_curve_owned_start_proven
+                    && !index
+                        .claude_owned_start_census
+                        .contains_key(&item.source_session_id)
+            }) {
+                settlement::restore_tree_insert_peak::<String, ClaudeOwnedStartCensusWitness>(
+                    index.claude_owned_start_census.len().checked_add(1)?,
+                    1,
+                    &mut cost,
+                )?;
+            }
+            if parsed.terminal_loss().is_some() {
+                settlement::restore_tree_insert_peak::<String, TerminalJsonlDisposition>(
+                    index.terminal_jsonl_dispositions.len().checked_add(1)?,
+                    1,
+                    &mut cost,
+                )?;
+            }
+            // local key; residue; record key+stored clone; terminal key;
+            // root/member; traversal observation; confirmed-empty candidate.
+            cost.add(path.len().checked_mul(9)?)?;
+            let components = candidate
+                .path
+                .components()
+                .count()
+                .max(4)
+                .checked_next_power_of_two()?;
+            cost.add(
+                components
+                    .checked_add(components / 2)?
+                    .checked_mul(std::mem::size_of::<&str>())?,
+            )?;
+            cost.add(
+                path.len()
+                    .max(1)
+                    .checked_next_power_of_two()?
+                    .checked_mul(3)?,
+            )?; // formatted subagent id old/new buffers
+            cost.add(revision.len().checked_mul(3)?)?; // pending, marker, terminal disposition
+            cost.add(
+                parsed
+                    .snapshots
+                    .last()
+                    .map_or(0, |item| item.snapshot_fingerprint.len()),
+            )?;
+            cost.add(
+                entry
+                    .last_upload_body_witness
+                    .as_ref()
+                    .map_or(0, String::len),
+            )?; // canonical record clone
+            cost.add(
+                sampled_audit::UNVERIFIED_IDENTITY
+                    .len()
+                    .checked_add(1 + 20)?
+                    .checked_next_power_of_two()?,
+            )?;
+            cost.add(LOCAL_SCAN_INDEX_IDENTITY_VERSION.len())?; // full-audit replacement may overlap marker
+            cost.add(JSONL_TERMINAL_DISPOSITION_GENERATION.len())?;
+            parsed.terminal_loss().completed_heap_bound(&mut cost)?;
+            let paid = credit.as_mut()?;
+            if !paid.grow_for(
+                paid.allocated()
+                    .checked_add(cost.bytes)?
+                    .checked_add(buffer_peak)?,
+            ) {
+                return None;
+            }
+            if new_capacity > old_capacity {
+                pending
+                    .try_reserve_exact(new_capacity.checked_sub(pending.len())?)
+                    .ok()?;
+            }
+            // Preserve geometric growth, not one reallocation per file. Old
+            // buffer overlap is paid before reserve; only added capacity stays
+            // charged once the old buffer has been freed.
+            cost.bytes.checked_add(retained_buffer)
+        })()
+        .ok_or(refusal)
+    }
+
     fn prepay_capture(
         &self,
         candidate: &CandidateFile,
@@ -1575,6 +1792,15 @@ impl NativePhase {
             }));
         qualification
     }
+}
+
+pub(super) struct TargetFinalizationInputs<'a> {
+    pub(super) candidate: &'a CandidateFile,
+    pub(super) revision: &'a str,
+    pub(super) parsed: &'a ParsedJsonlFile,
+    pub(super) index: &'a ScanIndex,
+    pub(super) pending: &'a mut Vec<PendingIndexFinalization>,
+    pub(super) path_set_entries: usize,
 }
 
 /// Synchronous construction custody, borrowing the SAME moving reservation.
