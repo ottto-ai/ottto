@@ -79,6 +79,7 @@ fn actual_batches(
         &mut accepted,
         |item| item.fingerprint.as_str(),
         |item| item.fingerprint.clone(),
+        |_| None,
         |item| item.class,
         |batch| {
             batches.push(batch.iter().map(|item| item.ordinal).collect());
@@ -224,6 +225,7 @@ fn snapshot_packing_count_serialization_failure_keeps_local_error_and_no_upload(
         &mut accepted,
         |item| item.fingerprint.as_str(),
         |item| item.fingerprint.clone(),
+        |_| None,
         |_| false,
         |_| {
             uploads += 1;
