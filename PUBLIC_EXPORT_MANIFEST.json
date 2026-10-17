@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 660,
-  "content_sha256": "59074f6e1aad4862284bdb29b633f5ec7a45d8cbc49023229acd28a8974883fa",
+  "candidate_file_count": 662,
+  "content_sha256": "fc7a5018bdf9f57beaa530c2291a05b98462b247d7c2799621fc0cd89a189536",
   "files": [
     {
       "executable": false,
@@ -762,8 +762,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/bounded_snapshot_retry.rs",
-      "sha256": "fe7a61f2257ccfe9e29249ffe14b6eef46141bcfaf328290fd710577e4f0d912",
-      "size_bytes": 19917
+      "sha256": "f2a8749d3ed95f485547700265d49c090ab25b1cfe89e7c1008a014b83b6f952",
+      "size_bytes": 19995
     },
     {
       "executable": false,
@@ -1112,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_integrated_driver.rs",
-      "sha256": "b00063422bc158e7b0c4fe6b4dff4f7946d82058de53ecdee43a930a7f7ae8bc",
-      "size_bytes": 18399
+      "sha256": "9db4ea70afdbd7cc146d3dca621262ca98533fb47c295307e4299f7c4875b924",
+      "size_bytes": 18477
     },
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "7ea4360232e1f35350d48ba116f14428867f006471b18a00c5199841a463f87e",
-      "size_bytes": 767420
+      "sha256": "cccd4787da46ff267fdabafbced417bed1d7acbd1b57d062fc3038cfb0496b61",
+      "size_bytes": 768116
     },
     {
       "executable": false,
@@ -1210,8 +1210,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/packing_count_tests.rs",
-      "sha256": "fa3cb5c995912cb69041f1f21d72644745b1d21db9979eee0a9bf57e297079a3",
-      "size_bytes": 10540
+      "sha256": "ad70d9abd24292fb2ded745da990bc781fc741c8dba9f26ea164d59f06a8978f",
+      "size_bytes": 10576
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync/rejection_log.rs",
+      "sha256": "24a44a5fa61ea4a309352447bf5c04fdbb63cdee1820a814065bc4afb6840ce1",
+      "size_bytes": 3307
     },
     {
       "executable": false,
@@ -2878,6 +2885,13 @@
       "path": "docs/session-2026-10-17-snapshot-packing-memory.md",
       "sha256": "3c885494ec9d74298ba695784959a6cc62fe49ba28ff76316a11dd9987a90de4",
       "size_bytes": 1787
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-17-snapshot-rejection-session-hash.md",
+      "sha256": "8469fba0d62b9240dc96557d851a3e9387d2b2ea41aa609b523e6f862f4f1084",
+      "size_bytes": 1294
     },
     {
       "executable": false,
@@ -4625,7 +4639,7 @@
   ],
   "generated_at": "2026-10-17T00:29:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 661,
+  "output_file_count": 663,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
