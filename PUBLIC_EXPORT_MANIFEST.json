@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 676,
-  "content_sha256": "995423790b1030e98282275fd707d680e1666a76032b4a0bb39d06d7c031ea3a",
+  "content_sha256": "21a9ddfb188b38db8896d4c09acf6e40fe7b0f927996fa93da8cffe6167a43e8",
   "files": [
     {
       "executable": false,
@@ -1245,8 +1245,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs",
-      "sha256": "4a057acf527e6e0600c7867848d148f6e37e7ed1599b828f3742f938a4026a9d",
-      "size_bytes": 31219
+      "sha256": "ef4f52912bd2117a79642395efa5989b36382e90bf7ec8b13fde06abb2714fc2",
+      "size_bytes": 32021
     },
     {
       "executable": false,
@@ -1441,8 +1441,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "e94358d10a34c2b4f81ad9de2a6b44f297ade645b66d9f18ff9363cffdada5a7",
-      "size_bytes": 160736
+      "sha256": "6a8b25422a29fcc4511633dba2758d733e478a6ffc96af29caed7c099755aea5",
+      "size_bytes": 166831
     },
     {
       "executable": false,
@@ -2974,8 +2974,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-17-native-comparison-selected-fallback.md",
-      "sha256": "4f354d149f9f883a06a8f026785873658d7ea7c928ca58d63e1eb91f230f1756",
-      "size_bytes": 6804
+      "sha256": "d30b3f322230fb49b3884e16e428149122c1d00639f0e92ad5925c33badd8168",
+      "size_bytes": 7959
     },
     {
       "executable": false,
@@ -4735,7 +4735,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-17T22:15:09+00:00",
+  "generated_at": "2026-10-17T22:29:32+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 677,
   "public_roots": [
@@ -4774,5 +4774,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f791b5a524a1585ee3487f65f73093dd5ea32f4d"
+  "source_commit": "022b76c2ce306f6aaf293775e6870d1df86d18ee"
 }

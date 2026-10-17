@@ -24,6 +24,24 @@ The earlier source checkpoint is retained in Git history. No persisted schema,
 provider/account action, replay, release or installed-runtime change is part of
 this cut.
 
+## Hosted layout boundary correction
+
+Automatic CI39073854411 at f791b5a5 compiled and passed Clippy, public surface,
+dependency review and audit; service runtime was2969passed/29failed/25ignored.
+Individual mapping found28 positive-layout fixture preconditions attempted on
+an unsupported layout and one separate process-allocation probe counting other
+parallel tests (2038 allocations instead of its own one vector).
+
+The correction preserves all supported positive assertions and explicitly reports
+unsupported positive branches UNEXECUTED. Actual unsupported source preparation
+checks BASE body equality and no optional early rows. The window-layout control
+checks the real closed qualifier: zero certificates, unchanged selected index/no
+new debt and no process grant. The synchronous membership probe uses thread-local
+accounting, retaining exact one-allocation and peak assertions. No compiler/layout
+guard, budget, workflow or production behavior is weakened. Hosted unsupported
+results cannot be counted as positive-path acceptance. Supported1.95 revalidation
+passed88/0/1 (resource run not repeated); corrected exact-head CI is still required.
+
 ## Historical selected-fallback checkpoints
 
 # Native comparison selected fallback

@@ -3,6 +3,17 @@
 // checkpoint and locked save/load. It is NOT the complete two-phase scanner.
 use super::*;
 
+/// Physical positive preparation needs the validated container layout.
+/// Unsupported runs retain the separate BASE/refusal checks, never pretend
+/// that zero certificates exercised a positive path.
+fn native_positive_layout_for_test(name: &str) -> bool {
+    let supported = crate::heap_layout_bound::layout_supported();
+    if !supported {
+        writeln!(std::io::stderr().lock(), "native_comparison_layout: test={name} supported_positive=UNEXECUTED layout_supported=false no_guard_override=true").unwrap();
+    }
+    supported
+}
+
 type Api = crate::claude_local_otel::ClaudeLocalOtelLoadReport;
 type Trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport;
 
@@ -118,7 +129,9 @@ fn native_comparison_borrowed_membership_matches_complete_physical_universe() {
             .insert(path.into(), manifest_index_entry(Some("body")));
     }
     let canonical = complete_claude_usage_family_members(&index);
-    let ((view, selected), allocations) = crate::retry_allocation_probe::measure_process(|| {
+    // This synchronous operation spawns no work. Count this thread's actual
+    // allocation, not unrelated tests running concurrently on the hosted job.
+    let ((view, selected), allocations) = crate::retry_allocation_probe::measure(|| {
         (
             claude_native_comparison::MembershipView::capture(&index, |_| true).unwrap(),
             claude_native_comparison::MembershipView::selected_count(&index, |_| true).unwrap(),
@@ -1550,6 +1563,11 @@ impl Drop for NativePreparationFixture {
 
 #[test]
 fn native_comparison_actual_skip_freezes_retained_proof_before_body_fold() {
+    if !native_positive_layout_for_test(
+        "native_comparison_actual_skip_freezes_retained_proof_before_body_fold",
+    ) {
+        return;
+    }
     let fixture = NativePreparationFixture::new();
     let mut state = fixture.paused();
     assert_eq!(state.scanned_file_count, 0);
@@ -2200,6 +2218,11 @@ fn pause_native_comparison(mut state: OwnedSourceScan) -> OwnedSourceScan {
 
 #[test]
 fn native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences() {
+    if !native_positive_layout_for_test(
+        "native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences",
+    ) {
+        return;
+    }
     let mut fixture = NativePreparationFixture::new();
     let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
     fixture
@@ -2290,6 +2313,11 @@ fn native_comparison_positive_hit_fixture() -> (
 
 #[test]
 fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold() {
+    if !native_positive_layout_for_test(
+        "native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold",
+    ) {
+        return;
+    }
     let (_fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
     let scope_before = state.native_comparison_context().unwrap().to_owned();
     let requested_layout_bytes =
@@ -2347,6 +2375,11 @@ fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold()
 
 #[test]
 fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved() {
+    if !native_positive_layout_for_test(
+        "native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved",
+    ) {
+        return;
+    }
     let (_fixture, state, mut qualification) = native_comparison_positive_hit_fixture();
     let before = state.scanned_file_count;
     let (candidates, selection) = qualification.take_target_candidates(&state.snapshots, 1);
@@ -2363,6 +2396,11 @@ fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresol
 
 #[test]
 fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
+    if !native_positive_layout_for_test(
+        "native_comparison_replaced_target_keeps_safe_open_failure_visible",
+    ) {
+        return;
+    }
     let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
     let selection = state.acquire_native_comparison_targets(&mut qualification);
     assert_eq!(selection.queued, 2);
@@ -2540,6 +2578,11 @@ fn native_comparison_consumed_observations_preserve_unfiltered_base_fold() {
 
 #[test]
 fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
+    if !native_positive_layout_for_test(
+        "native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior",
+    ) {
+        return;
+    }
     let mut fixture = NativePreparationFixture::new();
     let c = "c3333333-3333-4333-8333-333333333333";
     let path = fixture.dir.join(format!("{c}.jsonl"));
@@ -2680,6 +2723,11 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
 
 #[test]
 fn native_comparison_acquisition_requires_actual_completed_target_reads() {
+    if !native_positive_layout_for_test(
+        "native_comparison_acquisition_requires_actual_completed_target_reads",
+    ) {
+        return;
+    }
     let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
     let selection = state.acquire_native_comparison_targets(&mut qualification);
     assert_eq!(selection.queued, 2);
@@ -2714,6 +2762,11 @@ fn native_comparison_acquisition_requires_actual_completed_target_reads() {
 
 #[test]
 fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() {
+    if !native_positive_layout_for_test(
+        "native_comparison_controller_moves_frozen_plan_across_native_target_yields",
+    ) {
+        return;
+    }
     let (fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
     let mut controller = claude_native_comparison::Controller::new(qualification);
     assert_eq!(
@@ -2754,6 +2807,11 @@ fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() 
 
 #[test]
 fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base() {
+    if !native_positive_layout_for_test(
+        "native_comparison_controller_generation_loss_or_insufficient_budget_uses_base",
+    ) {
+        return;
+    }
     for changed_pair in [true, false] {
         let (_fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
         if !changed_pair {
@@ -2787,6 +2845,11 @@ fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base
 
 #[test]
 fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
+    if !native_positive_layout_for_test(
+        "native_comparison_controller_replaced_target_cannot_complete_comparison",
+    ) {
+        return;
+    }
     let (fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
     let mut controller = claude_native_comparison::Controller::new(qualification);
     assert!(controller.advance(&mut state, true));
@@ -2815,6 +2878,11 @@ fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
 
 #[test]
 fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
+    if !native_positive_layout_for_test(
+        "native_comparison_failed_target_keeps_dependent_source_unresolved",
+    ) {
+        return;
+    }
     let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
     assert_eq!(
         state
@@ -2882,6 +2950,11 @@ fn native_comparison_ambiguous_index_member_withdraws_frozen_family() {
 
 #[test]
 fn native_comparison_family_parse_withdraws_skips_before_and_after_attempt() {
+    if !native_positive_layout_for_test(
+        "native_comparison_family_parse_withdraws_skips_before_and_after_attempt",
+    ) {
+        return;
+    }
     for parse_child in [false, true] {
         let mut fixture = NativePreparationFixture::new();
         let path = if parse_child {
@@ -3007,6 +3080,36 @@ fn native_window_page(fixture: &NativePreparationFixture) -> NativeWindowPage {
 
 #[test]
 fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
+    if !native_positive_layout_for_test(
+        "native_comparison_window_saved_graph_obeys_real_layout_gate",
+    ) {
+        // Exercise the actual closed qualifier on this layout, rather than
+        // fabricating a positive window merely to price it afterwards.
+        let fixture = NativePreparationFixture::new();
+        let mut state = fixture.paused_with_limit(1);
+        let before = serde_json::to_vec(&state.index).unwrap();
+        let healthy = BTreeSet::from([fixture.parent.clone()]);
+        let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+            api: &fixture.api.evidence,
+            trace: &fixture.trace.evidence,
+            healthy_roots: &healthy,
+        });
+        assert_eq!(
+            qualification.certified_member_count(),
+            0,
+            "unsupported layout mints no certificate"
+        );
+        assert_eq!(
+            serde_json::to_vec(&state.index).unwrap(),
+            before,
+            "closed qualification adds no persistent debt or selected mutation"
+        );
+        let owner = claude_native_comparison::lifecycle::Lifecycle::default();
+        assert!(!owner.retained_valid_for_test());
+        assert_eq!(owner.retained_bound(usize::MAX), Some(0));
+        writeln!(std::io::stderr().lock(), "native_comparison_unsupported_BASE: actual_qualification=true certificates=0 selected_index_unchanged=true grant=false empty_retained_bytes=0 positive_window=UNEXECUTED").unwrap();
+        return;
+    }
     let mut fixture = NativePreparationFixture::new();
     let scratch = crate::test_scratch::ScratchDir::new("native-window-layout");
     let path = scratch.join("index.json");
@@ -3058,6 +3161,11 @@ fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
 
 #[test]
 fn native_comparison_window_component_reconstructs_same_census_current_rows() {
+    if !native_positive_layout_for_test(
+        "native_comparison_window_component_reconstructs_same_census_current_rows",
+    ) {
+        return;
+    }
     let mut fixture = NativePreparationFixture::new();
     let page = native_window_page(&fixture);
     fixture.index = page.index;
@@ -3082,6 +3190,11 @@ fn native_comparison_window_component_reconstructs_same_census_current_rows() {
 
 #[test]
 fn native_comparison_window_later_parse_withdraws_carried_sibling() {
+    if !native_positive_layout_for_test(
+        "native_comparison_window_later_parse_withdraws_carried_sibling",
+    ) {
+        return;
+    }
     let mut fixture = NativePreparationFixture::new();
     let page = native_window_page(&fixture);
     let old_key = page.window.first_key_for_test().unwrap().to_owned();
@@ -3123,6 +3236,11 @@ fn native_comparison_window_later_parse_withdraws_carried_sibling() {
 
 #[test]
 fn native_comparison_window_proof_membership_empty_or_context_change_withdraws() {
+    if !native_positive_layout_for_test(
+        "native_comparison_window_proof_membership_empty_or_context_change_withdraws",
+    ) {
+        return;
+    }
     for control in 0..4 {
         let fixture = NativePreparationFixture::new();
         let mut page = native_window_page(&fixture);
@@ -3157,6 +3275,11 @@ fn native_comparison_window_proof_membership_empty_or_context_change_withdraws()
 
 #[test]
 fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base() {
+    if !native_positive_layout_for_test(
+        "native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base",
+    ) {
+        return;
+    }
     let mut fixture = NativePreparationFixture::new();
     let page = native_window_page(&fixture);
     let mut phase = claude_native_comparison::NativePhase::default();
@@ -3221,6 +3344,11 @@ fn native_comparison_window_scope_change_revokes_a_valid_saved_grant() {
 
 #[test]
 fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
+    if !native_positive_layout_for_test(
+        "native_comparison_window_unknown_lock_and_stale_generation_revoke",
+    ) {
+        return;
+    }
     let mut fixture = NativePreparationFixture::new();
     let scratch = crate::test_scratch::ScratchDir::new("native-window-lock-generation");
     let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
@@ -3257,6 +3385,11 @@ fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
 
 #[test]
 fn native_comparison_window_missing_current_rows_withdraws_until_window_end() {
+    if !native_positive_layout_for_test(
+        "native_comparison_window_missing_current_rows_withdraws_until_window_end",
+    ) {
+        return;
+    }
     for control in 0..3 {
         let mut fixture = NativePreparationFixture::new();
         let page = native_window_page(&fixture);
@@ -3313,6 +3446,11 @@ fn native_comparison_window_missing_current_rows_withdraws_until_window_end() {
 
 #[test]
 fn native_comparison_window_any_authority_quarantine_withdraws() {
+    if !native_positive_layout_for_test(
+        "native_comparison_window_any_authority_quarantine_withdraws",
+    ) {
+        return;
+    }
     for corrected in [false, true] {
         let fixture = NativePreparationFixture::new();
         let mut page = native_window_page(&fixture);
@@ -3483,6 +3621,11 @@ fn native_comparison_selected_fallback_fixture() -> (
 
 #[test]
 fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies() {
+    if !native_positive_layout_for_test(
+        "native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies",
+    ) {
+        return;
+    }
     let (fixture, mut index, scan, mut fallback, previous, path) =
         native_comparison_selected_fallback_fixture();
     let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
@@ -3517,6 +3660,11 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
 
 #[test]
 fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt() {
+    if !native_positive_layout_for_test(
+        "native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt",
+    ) {
+        return;
+    }
     let (fixture, index, scan, mut fallback, previous, path) =
         native_comparison_selected_fallback_fixture();
     let progress = fixture.dir.join("partial-progress.json");
@@ -3557,6 +3705,11 @@ fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exac
 
 #[test]
 fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() {
+    if !native_positive_layout_for_test(
+        "native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit",
+    ) {
+        return;
+    }
     let (_fixture, mut index, _scan, mut fallback, previous, path) =
         native_comparison_selected_fallback_fixture();
     let mut winner = previous.clone();
@@ -3809,6 +3962,11 @@ fn native_comparison_corrected_native_receipt_fixture(
 
 #[test]
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
+    if !native_positive_layout_for_test(
+        "native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save",
+    ) {
+        return;
+    }
     for mode in [
         "capture_only",
         "credit_refused",
@@ -3824,6 +3982,11 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
 
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
+    if !native_positive_layout_for_test(
+        "native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base",
+    ) {
+        return;
+    }
     for change in ["proof", "revision"] {
         let (fixture, mut index, window) =
             native_comparison_corrected_native_receipt_fixture("exact_ack");
@@ -3916,6 +4079,11 @@ fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before
 
 #[test]
 fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
+    if !native_positive_layout_for_test(
+        "native_comparison_deferred_policy_unknown_native_is_base_without_new_debt",
+    ) {
+        return;
+    }
     let fixture = NativePreparationFixture::new();
     let mut state = fixture.paused();
     let healthy = BTreeSet::from([fixture.parent.clone()]);

@@ -208,7 +208,19 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
     let cycle = identity_pipeline_cycle(&fixture, "native-preparation", "").unwrap();
-    assert!(cycle.prepared_before_body);
+    if crate::heap_layout_bound::layout_supported() {
+        assert!(cycle.prepared_before_body);
+    } else {
+        assert!(
+            !cycle.prepared_before_body,
+            "unsupported layout refuses optional early rows"
+        );
+        assert_eq!(
+            cycle.body, cycle.dark_oracle,
+            "unsupported preparation remains exact ordinary BASE"
+        );
+        writeln!(std::io::stderr().lock(), "native_comparison_real_prepare: unsupported_BASE_body_equal=true optional_early_rows=false positive_preparation=UNEXECUTED").unwrap();
+    }
     assert!(!cycle.snapshots.is_empty());
     assert!(cycle
         .snapshots
@@ -488,6 +500,10 @@ fn write_native_bootstrap_sidecars(fixture: &IdentityPipelineHome, support: &Pat
 #[serial]
 #[serial(source_cadences)]
 fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save() {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(std::io::stderr().lock(), "native_comparison_real_bootstrap: supported_positive=UNEXECUTED layout_supported=false; actual unsupported BASE preparation covered separately").unwrap();
+        return;
+    }
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
