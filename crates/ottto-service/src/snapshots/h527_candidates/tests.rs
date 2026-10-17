@@ -1,8 +1,9 @@
 use super::*;
 use crate::snapshots::{
-    claude_duplicate_request_owner, parse_claude_code_jsonl_file, snapshot_fingerprint,
-    ClaudeUsageFamilyWitness,
+    apply_upload_policy, claude_duplicate_request_owner, parse_claude_code_jsonl_file,
+    snapshot_fingerprint, ClaudeUsageFamilyWitness,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,6 +14,10 @@ const SESSION_EXCLUSIVE: &str = "session_exclusive_reported_usage:v1";
 const SHARED_COPY_REQUEST: &str = "req-shared-copy";
 const HELD_MIXED_FIXTURE: &str =
     include_str!("../../../../../fixtures/h527-candidates/held-mixed.v1.json");
+const UNQUALIFIED_REDACTED_FIXTURE: &str =
+    include_str!("../../../../../fixtures/h527-candidates/unqualified-redacted.v1.json");
+const REDACTED_BODY: &str = "<exact ordinary batch bytes>";
+const REDACTED_BODY_SHA256: &str = "<sha256 of exact ordinary batch bytes>";
 
 fn session_id(ordinal: u64) -> String {
     format!("{ordinal:08x}-0000-4000-8000-{ordinal:012x}")
@@ -129,6 +134,58 @@ fn mark_duplicate(index: &mut ScanIndex, request_id: &str, owner_session_id: &st
         ]);
 }
 
+fn upload_policy() -> SnapshotUploadPolicy {
+    SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        workspace_labels_enabled: false,
+        session_artifacts_enabled: false,
+        session_attribution_enabled: false,
+        session_attribution_labels_enabled: false,
+    }
+}
+
+/// Every member-scoped hold class plus members that pass every local check:
+/// 1-3 absent, 4-6 account-deferred, 7-9 authority-quarantined, 10-12 unproven
+/// and locally clean, 13-15 proven with an unexcluded duplicate, 16-18
+/// ambiguous. Items are post-policy, as the pipeline hands them over.
+fn mixed_scenario() -> (
+    Vec<SnapshotItem>,
+    ClaudeUsageAuthorityDisposition,
+    ScanIndex,
+) {
+    let mut disposition = complete_census();
+    disposition.defer_sessions((4..=6).map(session_id).collect());
+    disposition
+        .quarantined_source_session_ids
+        .extend((7..=9).map(session_id));
+    let mut index = ScanIndex::default();
+    let mut snapshots = Vec::new();
+    for ordinal in 10..=12 {
+        let request_a = format!("req-{ordinal}-a");
+        let request_b = format!("req-{ordinal}-b");
+        snapshots.push(parsed_item(
+            &session_id(ordinal),
+            &[request_a.as_str(), request_b.as_str()],
+        ));
+    }
+    for ordinal in 13..=15 {
+        let request_a = format!("req-{ordinal}-a");
+        snapshots.push(exclusive(parsed_item(
+            &session_id(ordinal),
+            &[request_a.as_str(), SHARED_COPY_REQUEST],
+        )));
+        mark_duplicate(&mut index, SHARED_COPY_REQUEST, &session_id(ordinal));
+    }
+    for ordinal in 16..=18 {
+        let request_a = format!("req-{ordinal}-a");
+        let item = parsed_item(&session_id(ordinal), &[request_a.as_str()]);
+        snapshots.push(item.clone());
+        snapshots.push(item);
+    }
+    apply_upload_policy(SnapshotSource::ClaudeCode, &mut snapshots, upload_policy());
+    (snapshots, disposition, index)
+}
+
 fn run_export(
     snapshots: &[SnapshotItem],
     disposition: &ClaudeUsageAuthorityDisposition,
@@ -141,6 +198,7 @@ fn run_export(
             upload_snapshots: snapshots,
             disposition,
             index,
+            upload_policy: upload_policy(),
         },
         &fixture_build(),
     )
@@ -235,35 +293,7 @@ fn reason_vocabulary_is_closed() {
 /// Every hold class that member-scoped evidence can produce, in one packet.
 #[test]
 fn held_mixed_packet_matches_committed_fixture() {
-    let mut disposition = complete_census();
-    disposition.defer_sessions((4..=6).map(session_id).collect());
-    disposition
-        .quarantined_source_session_ids
-        .extend((7..=9).map(session_id));
-    let mut index = ScanIndex::default();
-    let mut snapshots = Vec::new();
-    for ordinal in 10..=12 {
-        let request_a = format!("req-{ordinal}-a");
-        let request_b = format!("req-{ordinal}-b");
-        snapshots.push(parsed_item(
-            &session_id(ordinal),
-            &[request_a.as_str(), request_b.as_str()],
-        ));
-    }
-    for ordinal in 13..=15 {
-        let request_a = format!("req-{ordinal}-a");
-        snapshots.push(exclusive(parsed_item(
-            &session_id(ordinal),
-            &[request_a.as_str(), SHARED_COPY_REQUEST],
-        )));
-        mark_duplicate(&mut index, SHARED_COPY_REQUEST, &session_id(ordinal));
-    }
-    for ordinal in 16..=18 {
-        let request_a = format!("req-{ordinal}-a");
-        let item = parsed_item(&session_id(ordinal), &[request_a.as_str()]);
-        snapshots.push(item.clone());
-        snapshots.push(item);
-    }
+    let (snapshots, disposition, index) = mixed_scenario();
 
     let export = run_export(&snapshots, &disposition, &index);
 
@@ -274,7 +304,7 @@ fn held_mixed_packet_matches_committed_fixture() {
         (1, "missing_evidence", false),
         (4, "creator_hold", false),
         (7, "unknown_owner", false),
-        (10, "incomplete_census", true),
+        (10, "missing_evidence", true),
         (13, "unknown_owner", false),
         (16, "unknown_owner", false),
     ] {
@@ -324,7 +354,7 @@ fn unproven_usage_is_not_disqualifying_but_global_conservation_still_holds() {
     // Unproven, proven and exactly excluded bodies all pass every local check,
     // and all stay held: no evidence covers historical accepted bodies.
     for ordinal in 1..=3 {
-        assert_held_without_body(&packet_member(&export, ordinal), "incomplete_census");
+        assert_held_without_body(&packet_member(&export, ordinal), "missing_evidence");
         let report = report(&export, ordinal);
         assert_eq!(report["local_checks_passed"], Value::Bool(true));
         assert_eq!(report["global_conservation_evidence"], "unavailable");
@@ -398,6 +428,7 @@ fn manifest_scope_must_be_exact() {
         upload_snapshots: &[],
         disposition: &disposition,
         index: &index,
+        upload_policy: upload_policy(),
     };
     let refuse = |scope: OperatorScope, members: Vec<ApprovedMember>, expected: &str| {
         let error = build_candidate_export(&scope, &members, &evidence, &fixture_build())
@@ -443,6 +474,7 @@ fn export_binds_the_running_build_and_marks_unproven_fields() {
         upload_snapshots: &[],
         disposition: &disposition,
         index: &index,
+        upload_policy: upload_policy(),
     };
 
     let export = export_candidates(&scope(), &members(), &evidence).expect("export");
@@ -470,4 +502,192 @@ fn export_binds_the_running_build_and_marks_unproven_fields() {
     for ordinal in 1..=18 {
         assert_held_without_body(&packet_member(&export, ordinal), "missing_evidence");
     }
+
+    let artifact =
+        export_unqualified_candidates(&scope(), &members(), &evidence).expect("artifact");
+    let artifact: Value = serde_json::from_str(&artifact.json).expect("artifact json");
+    assert_eq!(artifact["collector_version"], collector_version());
+    assert_eq!(artifact["producer_binary_sha256"], sha256_hex(&binary));
+    for candidate in artifact["candidates"].as_array().expect("candidates") {
+        assert_eq!(candidate["body_status"], "no_upload_item");
+    }
+}
+
+fn unqualified_artifact(
+    snapshots: &[SnapshotItem],
+    disposition: &ClaudeUsageAuthorityDisposition,
+    index: &ScanIndex,
+) -> UnqualifiedArtifact {
+    build_unqualified_artifact(
+        &scope(),
+        &members(),
+        &PipelineEvidence {
+            upload_snapshots: snapshots,
+            disposition,
+            index,
+            upload_policy: upload_policy(),
+        },
+        &fixture_build(),
+    )
+    .expect("unqualified artifact")
+}
+
+/// The ordinary request a live upload would build for one item.
+fn ordinary_body(item: &SnapshotItem) -> String {
+    serde_json::to_string(&SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "claude_code".to_string(),
+        machine_id: MACHINE.to_string(),
+        collector_version: Some(fixture_build().collector_version),
+        snapshots: vec![item.clone()],
+        upload_policy: upload_policy(),
+        client_report: crate::client_report::ClientReport::empty(),
+    })
+    .expect("ordinary body")
+}
+
+#[test]
+fn unqualified_artifact_carries_ordinary_bytes_while_the_packet_stays_held() {
+    let (snapshots, disposition, index) = mixed_scenario();
+    let before = serde_json::to_value(&snapshots).expect("items json");
+
+    let artifact = unqualified_artifact(&snapshots, &disposition, &index);
+    let export = run_export(&snapshots, &disposition, &index);
+
+    assert_eq!(artifact.sha256, sha256_hex(artifact.json.as_bytes()));
+    let mut value: Value = serde_json::from_str(&artifact.json).expect("artifact json");
+    for ordinal in 10..=15 {
+        let candidate = &value["candidates"][usize::try_from(ordinal - 1).expect("ordinal")];
+        let item = snapshots
+            .iter()
+            .find(|item| item.source_session_id == session_id(ordinal))
+            .expect("item");
+        let body = candidate["unqualified_batch_request_json"]
+            .as_str()
+            .expect("body");
+        assert_eq!(body, ordinary_body(item));
+        assert_eq!(
+            candidate["unqualified_batch_request_sha256"],
+            sha256_hex(body.as_bytes())
+        );
+    }
+    // The unproven body stays unproven: no ownership contract is added.
+    let unproven: Value = serde_json::from_str(
+        value["candidates"][9]["unqualified_batch_request_json"]
+            .as_str()
+            .expect("body"),
+    )
+    .expect("body json");
+    assert!(unproven["snapshots"][0]
+        .get("usage_accounting_contract")
+        .is_none());
+    for candidate in value["candidates"].as_array_mut().expect("candidates") {
+        let candidate = candidate.as_object_mut().expect("candidate");
+        if candidate.contains_key("unqualified_batch_request_json") {
+            candidate.insert(
+                "unqualified_batch_request_json".to_string(),
+                json!(REDACTED_BODY),
+            );
+            candidate.insert(
+                "unqualified_batch_request_sha256".to_string(),
+                json!(REDACTED_BODY_SHA256),
+            );
+        }
+    }
+    let redacted = crate::canonical_json::canonicalize(&value).expect("canonical");
+    assert_eq!(
+        String::from_utf8(redacted).expect("utf8"),
+        UNQUALIFIED_REDACTED_FIXTURE.trim_end_matches('\n')
+    );
+    // The same inputs still produce an operator packet with no body at all.
+    for ordinal in 1..=18 {
+        let member = packet_member(&export, ordinal);
+        assert_eq!(member["disposition"], "held");
+        assert!(!member
+            .as_object()
+            .expect("member")
+            .keys()
+            .any(|key| key.contains("batch_request")));
+    }
+    assert_eq!(
+        serde_json::to_value(&snapshots).expect("items json"),
+        before
+    );
+}
+
+/// A strict local reading of the operator packet contract. SESSION's server
+/// owns the real rejection; this only pins that the two shapes cannot be
+/// confused on this side.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct OperatorPacketShape {
+    contract_version: String,
+    operation_id: String,
+    user_id: String,
+    organization_id: String,
+    device_id: String,
+    machine_id: String,
+    producer_revision: String,
+    producer_revision_source: String,
+    producer_binary_sha256: String,
+    collector_version: String,
+    unresolved_fields: Vec<String>,
+    scope_session_keys: Vec<String>,
+    members: Vec<OperatorMemberShape>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct OperatorMemberShape {
+    source_session_id: String,
+    session_key_sha256: String,
+    prior_refusal_body_witness: String,
+    disposition: String,
+    reason: String,
+    qualification_report_sha256: String,
+    cross_session_conservation: String,
+}
+
+fn parse_operator_packet(json: &str) -> Result<OperatorPacketShape, String> {
+    let packet: OperatorPacketShape =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    if packet.contract_version != CANDIDATES_CONTRACT_VERSION {
+        return Err(format!("contract {}", packet.contract_version));
+    }
+    Ok(packet)
+}
+
+#[test]
+fn unqualified_artifact_cannot_be_read_as_an_operator_packet() {
+    let (snapshots, disposition, index) = mixed_scenario();
+    let artifact = unqualified_artifact(&snapshots, &disposition, &index);
+    let export = run_export(&snapshots, &disposition, &index);
+
+    let packet = parse_operator_packet(&export.packet_json).expect("operator packet");
+    assert_eq!(packet.members.len(), MANIFEST_MEMBER_COUNT);
+    assert!(parse_operator_packet(&artifact.json).is_err());
+    // Relabelling the contract does not make the shapes compatible.
+    let mut relabelled: Value = serde_json::from_str(&artifact.json).expect("artifact json");
+    relabelled["contract_version"] = json!(CANDIDATES_CONTRACT_VERSION);
+    assert!(parse_operator_packet(&relabelled.to_string()).is_err());
+
+    let value: Value = serde_json::from_str(&artifact.json).expect("artifact json");
+    assert_eq!(
+        value["contract_version"],
+        UNQUALIFIED_CANDIDATES_CONTRACT_VERSION
+    );
+    assert_eq!(value["local_only"], Value::Bool(true));
+    assert_eq!(value["admission_authority"], "none");
+    assert!(value.get("members").is_none());
+    for candidate in value["candidates"].as_array().expect("candidates") {
+        assert_eq!(candidate["cross_session_conservation"], "unknown");
+        let keys = candidate.as_object().expect("candidate");
+        assert!(!keys.contains_key("disposition"));
+        assert!(!keys.contains_key("batch_request_json"));
+        assert!(!keys.contains_key("batch_request_sha256"));
+    }
+    assert!(!artifact.json.contains("\"eligible\""));
+    assert!(!artifact.json.contains("\"qualified\""));
 }

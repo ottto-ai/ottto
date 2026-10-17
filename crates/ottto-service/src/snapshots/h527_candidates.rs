@@ -17,13 +17,21 @@
 //!
 //! The operator manifest names members; it is never ownership proof, and no
 //! caller flag or report hash can upgrade conservation.
+//!
+//! A second, separate output exists for review only:
+//! `h527_unqualified_candidates:v1` carries each candidate's exact ordinary
+//! batch bytes so SOURCE can inspect whether proof is possible. It is local,
+//! has no admission authority, no eligible disposition and no `members` list,
+//! so it cannot be read as the operator packet.
 // The operator entry has no runtime caller until a reviewed read-only pipeline
 // seam supplies its inputs; tests drive it with synthetic pipeline values.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::{
     claude_request_id_set_fingerprint, claude_snapshot_family_root, collector_version,
-    ClaudeUsageAuthorityDisposition, ScanIndex, SnapshotItem, SnapshotSource,
+    validate_snapshot_batch_request, ClaudeUsageAuthorityDisposition, ScanIndex,
+    SnapshotBatchRequest, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
+    SNAPSHOT_SCHEMA_VERSION,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -32,7 +40,16 @@ use std::collections::BTreeSet;
 
 pub(crate) const CANDIDATES_CONTRACT_VERSION: &str = "h527_candidates:v1";
 pub(crate) const QUALIFICATION_REPORT_CONTRACT_VERSION: &str = "h527_candidate_qualification:v1";
+pub(crate) const UNQUALIFIED_CANDIDATES_CONTRACT_VERSION: &str = "h527_unqualified_candidates:v1";
 pub(crate) const MANIFEST_MEMBER_COUNT: usize = 18;
+/// Why nothing in the unqualified artifact may be admitted. Closed list.
+const UNQUALIFIED_ARTIFACT_GAPS: [&str; 5] = [
+    "cross_session_conservation_evidence_unavailable",
+    "prior_refusal_record_codec_not_frozen",
+    "prior_refusal_ledger_drift_recheck_unspecified",
+    "producer_revision_unverified",
+    "contract5_permit_provenance_unattested",
+];
 /// No interface supplies qualified evidence about historical accepted bodies.
 const GLOBAL_CONSERVATION_EVIDENCE: &str = "unavailable";
 /// The operator supplies the commit; this binary cannot prove it.
@@ -148,6 +165,8 @@ pub(crate) struct PipelineEvidence<'a> {
     pub(crate) upload_snapshots: &'a [SnapshotItem],
     pub(crate) disposition: &'a ClaudeUsageAuthorityDisposition,
     pub(crate) index: &'a ScanIndex,
+    /// The policy the pipeline applied; it is part of each item's envelope.
+    pub(crate) upload_policy: SnapshotUploadPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +295,143 @@ fn build_candidate_export(
     })
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct UnqualifiedArtifact {
+    /// Exact artifact bytes. Local review evidence only; never uploaded.
+    pub(crate) json: String,
+    pub(crate) sha256: String,
+}
+
+#[derive(Serialize)]
+struct UnqualifiedCandidates<'a> {
+    contract_version: &'static str,
+    local_only: bool,
+    admission_authority: &'static str,
+    operation_id: &'a str,
+    user_id: &'a str,
+    organization_id: &'a str,
+    device_id: &'a str,
+    machine_id: &'a str,
+    producer_revision: &'a str,
+    producer_revision_source: &'static str,
+    producer_binary_sha256: &'a str,
+    collector_version: &'a str,
+    scope_session_keys: Vec<&'a str>,
+    qualification_gaps: [&'static str; 5],
+    candidates: Vec<UnqualifiedCandidate<'a>>,
+}
+
+#[derive(Serialize)]
+struct UnqualifiedCandidate<'a> {
+    source_session_id: &'a str,
+    session_key_sha256: &'a str,
+    prior_refusal_body_witness: &'a str,
+    cross_session_conservation: &'static str,
+    operator_packet_reason: &'static str,
+    local_checks_passed: bool,
+    body_status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unqualified_batch_request_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unqualified_batch_request_sha256: Option<String>,
+}
+
+/// The local review artifact, with this running binary's version and digest.
+pub(crate) fn export_unqualified_candidates(
+    scope: &OperatorScope,
+    members: &[ApprovedMember],
+    evidence: &PipelineEvidence<'_>,
+) -> Result<UnqualifiedArtifact, String> {
+    build_unqualified_artifact(scope, members, evidence, &ProducerBuild::current()?)
+}
+
+/// Carries the ordinary bytes of every member that has exactly one upload item
+/// the pipeline did not withhold. The operator packet for the same inputs still
+/// holds every member without a body.
+fn build_unqualified_artifact(
+    scope: &OperatorScope,
+    members: &[ApprovedMember],
+    evidence: &PipelineEvidence<'_>,
+    producer: &ProducerBuild,
+) -> Result<UnqualifiedArtifact, String> {
+    validate_scope(scope)?;
+    validate_members(scope, members)?;
+    let mut candidates = Vec::with_capacity(members.len());
+    for member in members {
+        let facts = local_facts(member, evidence);
+        let (body_status, body) = if facts.account_deferred || facts.authority_quarantined {
+            ("pipeline_hold", None)
+        } else if facts.item_match_count > 1 {
+            ("ambiguous_upload_item", None)
+        } else if let Some(item) = facts.item {
+            let body = ordinary_batch_body(scope, item, evidence.upload_policy, producer)?;
+            ("unqualified_ordinary_batch", Some(body))
+        } else {
+            ("no_upload_item", None)
+        };
+        let body_sha256 = body.as_deref().map(|json| sha256_hex(json.as_bytes()));
+        candidates.push(UnqualifiedCandidate {
+            source_session_id: &member.source_session_id,
+            session_key_sha256: &member.session_key_sha256,
+            prior_refusal_body_witness: &member.prior_refusal_body_witness,
+            cross_session_conservation: "unknown",
+            operator_packet_reason: held_reason(&facts, evidence).as_str(),
+            local_checks_passed: local_failure(&facts, evidence).is_none(),
+            body_status,
+            unqualified_batch_request_json: body,
+            unqualified_batch_request_sha256: body_sha256,
+        });
+    }
+    let artifact = UnqualifiedCandidates {
+        contract_version: UNQUALIFIED_CANDIDATES_CONTRACT_VERSION,
+        local_only: true,
+        admission_authority: "none",
+        operation_id: &scope.operation_id,
+        user_id: &scope.user_id,
+        organization_id: &scope.organization_id,
+        device_id: &scope.device_id,
+        machine_id: &scope.machine_id,
+        producer_revision: &scope.producer_revision,
+        producer_revision_source: PRODUCER_REVISION_SOURCE,
+        producer_binary_sha256: &producer.binary_sha256,
+        collector_version: &producer.collector_version,
+        scope_session_keys: members
+            .iter()
+            .map(|member| member.session_key_sha256.as_str())
+            .collect(),
+        qualification_gaps: UNQUALIFIED_ARTIFACT_GAPS,
+        candidates,
+    };
+    let json = serde_json::to_string(&artifact)
+        .map_err(|error| format!("unqualified artifact encoding: {error}"))?;
+    let sha256 = sha256_hex(json.as_bytes());
+    Ok(UnqualifiedArtifact { json, sha256 })
+}
+
+/// One unchanged item through the ordinary daemon request and serializer: the
+/// same semantic envelope, entity-ACK declaration, head-CAS rule and
+/// validation as a live upload. The offline client report is empty, as in the
+/// snapshot audit's reproduction, because this process observed no delivery.
+fn ordinary_batch_body(
+    scope: &OperatorScope,
+    item: &SnapshotItem,
+    upload_policy: SnapshotUploadPolicy,
+    producer: &ProducerBuild,
+) -> Result<String, String> {
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: SnapshotSource::ClaudeCode.api_slug().to_string(),
+        machine_id: scope.machine_id.clone(),
+        collector_version: Some(producer.collector_version.clone()),
+        snapshots: vec![item.clone()],
+        upload_policy,
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    validate_snapshot_batch_request(&request)
+        .map_err(|error| format!("candidate body failed ordinary validation: {error}"))?;
+    serde_json::to_string(&request).map_err(|error| format!("candidate body encoding: {error}"))
+}
+
 #[derive(Default)]
 struct MemberFacts<'a> {
     item: Option<&'a SnapshotItem>,
@@ -314,10 +470,10 @@ fn local_facts<'a>(member: &ApprovedMember, evidence: &PipelineEvidence<'a>) -> 
     facts
 }
 
-/// The first local failure, else the global conservation gap. Local evidence
+/// The first local failure, else the missing global conservation proof. Local evidence
 /// can only disqualify; it never qualifies a member.
 fn held_reason(facts: &MemberFacts<'_>, evidence: &PipelineEvidence<'_>) -> HeldReason {
-    local_failure(facts, evidence).unwrap_or(HeldReason::IncompleteCensus)
+    local_failure(facts, evidence).unwrap_or(HeldReason::MissingEvidence)
 }
 
 fn local_failure(facts: &MemberFacts<'_>, evidence: &PipelineEvidence<'_>) -> Option<HeldReason> {
