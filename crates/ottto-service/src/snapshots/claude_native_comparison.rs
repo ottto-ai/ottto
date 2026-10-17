@@ -12,7 +12,29 @@ pub(crate) struct NegativeView<'a> {
     window: &'a WindowEligibility,
     lease: &'a lifecycle::Lease,
 }
+/// Borrow actual native completion independently of upload settlement. Neither
+/// a lease nor a possible-owner envelope can manufacture this moving owner.
+pub(crate) struct FoldView<'a> {
+    pub(super) negatives: Option<NegativeView<'a>>,
+    native_terminal: Option<&'a TerminalTraversal>,
+}
+impl FoldView<'_> {
+    pub(super) fn native_census_complete(&self, scan: &SourceScanResult) -> bool {
+        self.native_terminal.is_some_and(|terminal| {
+            scan.source == SnapshotSource::ClaudeCode
+                && terminal.traversal.census_window_end == scan.census_window_end
+                && scan.state_census_complete
+                && scan.sidecar_census_complete
+        })
+    }
+}
 impl Completion {
+    pub(crate) fn fold_view<'a>(&'a self, lease: Option<&'a lifecycle::Lease>) -> FoldView<'a> {
+        FoldView {
+            negatives: self.negatives(lease),
+            native_terminal: self.native_terminal(),
+        }
+    }
     pub(crate) fn negatives<'a>(
         &'a self,
         lease: Option<&'a lifecycle::Lease>,
@@ -138,9 +160,9 @@ pub(crate) struct PairedRows<'a> {
 }
 
 /// A single moving owner for the actual completed native traversal. It never
-/// enters SourceScanResult (which is Clone), a disk record, or a proof/permit.
-/// The future selected-state fallback must validate context before restoring it.
-/// Until that callback exists, finish simply drops this unused owner.
+/// enters SourceScanResult (which is Clone) or a disk record. It qualifies only
+/// native census completion, never uniqueness, a permit or upload settlement.
+/// Selected-state fallback validates context before restoring it.
 pub(crate) struct TerminalTraversal {
     traversal: ScanTraversalCheckpoint,
 }
@@ -149,12 +171,12 @@ impl TerminalTraversal {
         index: &mut ScanIndex,
         source: SnapshotSource,
         comparison_active: bool,
-        census_complete: bool,
+        native_census_complete: bool,
         census_window_end: &str,
     ) -> Option<Box<Self>> {
         if source != SnapshotSource::ClaudeCode
             || !comparison_active
-            || !census_complete
+            || !native_census_complete
             || !index.traversal.as_ref().is_some_and(|traversal| {
                 traversal.census_window_end == census_window_end
                     && !traversal.context_fingerprint.is_empty()
@@ -538,11 +560,20 @@ impl NativePhase {
     ) -> Qualification {
         assert!(self.ready(), "preflight must precede native finalization");
         let native_by_root = group_native_by_root(native);
+        let correction_roots = self
+            .native_corrections
+            .values()
+            .map(NativeCorrection::root)
+            .collect::<BTreeSet<_>>();
         let mut selected_roots = self
             .skips
             .values()
             .map(|skip| skip.root.clone())
             .chain(native_by_root.keys().cloned())
+            // The terminal page may contain neither a parse nor a Skip for a
+            // root corrected on an earlier page. Reconstruct its frozen P too;
+            // retaining this receipt never certifies an unchanged member.
+            .chain(correction_roots.iter().map(|root| (*root).to_owned()))
             .collect::<BTreeSet<_>>();
         let candidate_roots = selected_roots.clone();
         selected_roots.retain(|root| {
@@ -679,7 +710,10 @@ impl NativePhase {
                         .map(|revision| (item.source_session_id.clone(), revision.clone()))
                 })
                 .collect::<BTreeMap<_, _>>();
-            if !certified.is_empty() || !prior_native_revisions.is_empty() {
+            if !certified.is_empty()
+                || !prior_native_revisions.is_empty()
+                || correction_roots.contains(root.as_str())
+            {
                 let paired_roots = std::iter::once(root.clone())
                     // The shared reconstruction above verified these exact
                     // predecessor roots against the excluded-request owners.
@@ -705,6 +739,7 @@ impl NativePhase {
         qualification.native_corrections = std::mem::take(&mut self.native_corrections);
         qualification.native_corrections.retain(|key, receipt| {
             rows.healthy_roots.contains(receipt.root())
+                && qualification.families.contains_key(receipt.root())
                 && !qualification.correction_revoked_keys.contains(key)
                 && !qualification
                     .correction_forbidden_roots

@@ -259,10 +259,15 @@ impl Family {
             upload_policy: SnapshotUploadPolicy::default(),
             client_report: crate::client_report::ClientReport::empty(),
         };
+        let head_cas = request
+            .snapshots
+            .iter()
+            .any(|item| item.cache_observations.is_some());
         let refs = request.snapshots.iter().map(|item| {
             let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).expect("production public ACK mapping");
             serde_json::json!({"source_session_id":item.source_session_id,
                 "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
+                "head_etag":head_cas.then(||snapshot_upload_body_witness(item)),
                 "body_witness_version":version,"body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))})
         }).collect::<Vec<_>>();
         let response: crate::snapshot_client::SnapshotBatchResponse =
@@ -289,7 +294,7 @@ impl Family {
         self.index
             .record_accepted_snapshot_fingerprints(&acknowledgments.keys().cloned().collect());
         self.index
-            .save(&self.state_dir.join("native-unit-selected.json"))
+            .save(&self.state_dir.join("scan-index.json"))
             .unwrap();
         let fully_settled = disposition.quarantined_entity_count() == 0;
         if fully_settled && lease.allowed() {

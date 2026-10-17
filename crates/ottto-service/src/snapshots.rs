@@ -3899,8 +3899,15 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     index: &mut ScanIndex,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     observations: Option<ClaudeNativeObservations>,
-    negatives: Option<claude_native_comparison::NegativeView<'_>>,
+    comparison: Option<claude_native_comparison::FoldView<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
+    // A previous unsettled upload requires a clean followup before manifest /
+    // replay settlement, but cannot erase the actual healthy terminal native
+    // window. Fold those observations once before any recovered body can leave.
+    let native_census_complete = scan.census_complete
+        || comparison
+            .as_ref()
+            .is_some_and(|view| view.native_census_complete(scan));
     let current_files = if index.claude_usage_authority_quarantine.is_empty() {
         BTreeSet::new()
     } else {
@@ -3914,14 +3921,14 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         api_report,
         trace_report,
         index,
-        scan.census_complete,
+        native_census_complete,
         &scan.census_window_end,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
         MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
         identity,
         &current_files,
         observations,
-        negatives,
+        comparison.and_then(|view| view.negatives),
     )
 }
 
@@ -13967,7 +13974,7 @@ impl OwnedSourceScan {
                         index,
                         source,
                         native_comparison.is_some(),
-                        census_complete,
+                        raw_census_complete,
                         &census_window_end,
                     );
                     index.traversal = None;

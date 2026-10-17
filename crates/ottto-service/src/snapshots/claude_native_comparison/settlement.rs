@@ -7,6 +7,7 @@ pub(crate) struct Completion {
     pub(crate) fallback: Option<SelectedFallback>,
     native_plans: BTreeMap<String, NativePlan>,
     pending_corrections: Vec<PendingNativeCorrection>,
+    native_terminal: Option<Box<TerminalTraversal>>,
 }
 
 pub(super) struct NativePlan {
@@ -73,6 +74,24 @@ impl NativeCorrection {
 }
 
 impl Completion {
+    /// A revoked optimization permit still cannot discard an actual completed
+    /// native census. No negative certificate or native correction is created.
+    pub(crate) fn base(terminal: Option<Box<TerminalTraversal>>) -> Option<Self> {
+        Some(Self {
+            window: None,
+            fallback: None,
+            native_plans: BTreeMap::new(),
+            pending_corrections: Vec::new(),
+            native_terminal: Some(terminal?),
+        })
+    }
+    pub(super) fn native_terminal(&self) -> Option<&TerminalTraversal> {
+        self.native_terminal.as_deref().or_else(|| {
+            self.fallback
+                .as_ref()
+                .and_then(|fallback| fallback.terminal.as_deref())
+        })
+    }
     #[cfg(test)]
     pub(crate) fn native_correction_count_for_test(&self) -> usize {
         self.window
@@ -261,6 +280,7 @@ impl Controller {
                 window: None,
                 native_plans: BTreeMap::new(),
                 pending_corrections: Vec::new(),
+                native_terminal: None,
                 fallback: Some(SelectedFallback {
                     withheld_sources: self.acquisition.unresolved_sources,
                     withheld_keys,
@@ -293,6 +313,7 @@ impl Controller {
         Ok(Completion {
             native_plans,
             pending_corrections: Vec::new(),
+            native_terminal: terminal,
             window: if current {
                 self.into_window(&scan.census_window_end)
             } else {
@@ -469,7 +490,7 @@ impl SelectedFallback {
     }
 }
 
-crate::heap_layout_bound::fields!(Completion; window, fallback, native_plans, pending_corrections);
+crate::heap_layout_bound::fields!(Completion; window, fallback, native_plans, pending_corrections, native_terminal);
 crate::heap_layout_bound::fields!(NativePlan; root, proof, revision);
 crate::heap_layout_bound::fields!(NativeCorrection; root, proof, revision, fingerprint, body_witness, selected_fingerprint, selected_body_witness);
 crate::heap_layout_bound::fields!(PendingNativeCorrection; key, plan, fingerprint, body_witness);

@@ -4206,13 +4206,16 @@ fn finish_sync_source(
             lease.revoke();
         }
     }
-    let mut comparison_completion = native_comparison_controller
-        .map(|controller| {
+    let mut comparison_completion = match native_comparison_controller {
+        Some(controller) => Some(
             controller
                 .complete(&scan_result, terminal_native_traversal, comparison_current)
-                .map_err(|reason| anyhow!(reason))
-        })
-        .transpose()?;
+                .map_err(|reason| anyhow!(reason))?,
+        ),
+        None => {
+            crate::snapshots::claude_native_comparison::Completion::base(terminal_native_traversal)
+        }
+    };
     let client = &receipt_client;
     let codex_join_validator = scan_result.codex_joining_validator();
     let validate_joined = |snapshots: &[SnapshotItem]| -> Result<()> {
@@ -5829,7 +5832,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         index,
         identity_evidence.as_ref(),
         observations,
-        comparison.and_then(|comparison| comparison.negatives(lease)),
+        comparison.map(|comparison| comparison.fold_view(lease)),
     );
     if let Some(fallback) = comparison.and_then(|comparison| comparison.fallback.as_ref()) {
         fallback.after_native_fold(scan_result, index);
