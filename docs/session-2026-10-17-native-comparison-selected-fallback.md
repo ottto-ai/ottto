@@ -22,3 +22,33 @@ witness and process lease. It cannot feed Skip, envelope, ownership, coverage
 or tag evidence. Reparse, proof/context loss, poison/refusal, pending ACK and
 budget refusal use base behavior. Original helper integration and dedicated
 receipt controls remain unvalidated.
+
+
+## Exact validation and original adapters
+
+Published `887ef1a1`, CI `39019102727`: all four checks passed, service
+2,946 passed / 0 failed / 24 ignored, including all 44 native-comparison and
+five retained-budget cases. Normal and partial selected restoration, CAS loss,
+raw native duplicate conservation and the current lease/fallback controls passed.
+
+The subsequent supported Rust 1.95 synthetic run compiled 49 selected service
+cases: 45 passed and four failed. The two original bodies actually started,
+but a malformed synthetic ACK blocked them before their decisive assertions.
+Two new native-receipt controls failed at the same boundary. The constructors
+mistakenly used internal envelope versions as public ACK versions. The correction
+extracts the existing production public-version mapping unchanged and uses it
+in all three constructors; ACK validation remains strict. No corrected supported
+run exists. Hosted CI must validate this exact correction; a layout-unsupported
+original wrapper reports UNEXECUTED and does not establish original acceptance.
+
+The controlled-revision primitive oracle retains its original logical pages,
+parsed synthetic bodies, expectations and body bytes. It uses the actual
+native-conjunction/selected-save lifecycle and corrected-body receipt seam;
+it makes no physical source or performance claim. The separate pipeline oracle
+uses actual SourcePreparation, opened revisions and the existing frame budget.
+Both original bodies and the page-two bound remain unchanged. Data controls
+cover parse/pending/refused/wrong-body versus ACK/no-op, proof/revision/reparse
+and restart loss. A real constructor control checks existing queued empty-fp
+debt before audits after save/reload, without injecting paths or new eligibility.
+Production remains disabled; review, activation and installed performance are
+separate gates. No CPU/RSS improvement or release readiness is claimed.

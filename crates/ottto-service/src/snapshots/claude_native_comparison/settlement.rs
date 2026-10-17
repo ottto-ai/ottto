@@ -73,6 +73,12 @@ impl NativeCorrection {
 }
 
 impl Completion {
+    #[cfg(test)]
+    pub(crate) fn native_correction_count_for_test(&self) -> usize {
+        self.window
+            .as_ref()
+            .map_or(0, |window| window.native_corrections.len())
+    }
     /// Capture from the actual native result before the finalizer removes
     /// semantic no-ops. This is a candidate, never an ACK/Skip/coverage fact.
     pub(crate) fn capture_native_corrections(

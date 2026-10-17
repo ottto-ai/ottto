@@ -143,6 +143,8 @@ struct RearmFixture {
     support: PathBuf,
     index_path: PathBuf,
     progress_path: PathBuf,
+    native_lifecycle:
+        std::sync::Arc<crate::snapshots::claude_native_comparison::lifecycle::Lifecycle>,
 }
 
 impl RearmFixture {
@@ -160,6 +162,7 @@ impl RearmFixture {
         }
         let fixture = Self {
             case,
+            native_lifecycle: std::sync::Arc::new(Default::default()),
             index_path: base.join("claude-scan-index.json"),
             progress_path: base.join("claude-upload-progress.json"),
             base,
@@ -280,6 +283,92 @@ impl RearmFixture {
             .count()
     }
 
+    // Test adapter: retain the ACTUAL SourcePreparation/OwnedSourceScan and
+    // controller, rather than supplying certificates or synthetic lease bits.
+    fn native_page(
+        &self,
+        index: ScanIndex,
+        collected_at: &str,
+    ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+        let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&self.root),
+            index.clone(),
+            collected_at,
+            183,
+            REARM_PAGE_FILES,
+            false,
+            Some(&self.support),
+            &[],
+            false,
+            false,
+            false,
+        );
+        scan.enable_native_comparison();
+        let mut lease = self.native_lifecycle.begin();
+        if let Some(context) = scan.native_comparison_context() {
+            lease.bind(format!("oracle-native:{REARM_DESTINATION}:{context}"));
+        } else {
+            lease.revoke();
+        }
+        let hint = serde_json::from_value(serde_json::json!({
+            "source":"claude_code", "server_time":collected_at, "last_data_at":null,
+            "record_count_15m":0, "record_count_24h":0,
+            "local_usage_reconciliation_enabled":true, "backfill_window_days":183,
+            "recommended_scan_after":collected_at,
+        }))
+        .unwrap();
+        let status = test_agent_status(SourceKind::ClaudeCode);
+        let mut preparation = SourcePreparation {
+            native_comparison_lease: Some(lease),
+            prepared_claude_evidence: None,
+            terminal_native_traversal: None,
+            native_comparison_controller: None,
+            retry_authority: None,
+            source: SnapshotSource::ClaudeCode,
+            claude_scan_roots: Some(vec![self.root.clone()]),
+            account_witness: [7; 32],
+            scan_started_at: collected_at.to_owned(),
+            activity_hint: hint,
+            receipt_window_days: 183,
+            context_curve_enabled: false,
+            cache_observations_enabled: false,
+            scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
+                snapshots: vec![status.clone()],
+                source_health_snapshot: status,
+                codex_scan_homes: Vec::new(),
+                codex_home_bindings: Vec::new(),
+            }),
+            attribution_context: None,
+            upload_policy: SnapshotUploadPolicy::default(),
+            upload_destination_namespace: REARM_DESTINATION.to_owned(),
+            receipt_client: SnapshotApiClient::new("http://127.0.0.1:9".to_owned()),
+            index_path: self.index_path.clone(),
+            upload_progress_path: self.progress_path.clone(),
+            upload_progress: test_upload_progress(),
+            committed_index: index,
+            backfill_state: Default::default(),
+            backfill_pending: false,
+            replay_generation: "replay-generation-rearm".to_owned(),
+            legacy_reconciliation_pending: BTreeSet::new(),
+            active_legacy_reconciliation: BTreeSet::new(),
+            scan: Some(scan),
+        };
+        for _ in 0..1024 {
+            assert!(crate::heap_layout_bound::bound(&preparation, crate::source_rotation::PARKED_BUDGET).is_some(),
+                "the real source frame must pass its real existing requested-layout budget; no substitute bound");
+            match preparation.step() {
+                SourcePreparationStep::Pending(next) => preparation = next,
+                SourcePreparationStep::Complete {
+                    preparation,
+                    index,
+                    scan,
+                } => return (preparation, index, scan),
+            }
+        }
+        panic!("same owned scanner did not complete within bounded fixture steps");
+    }
+
     /// One page through the production stage order of `finish_sync_source`.
     fn page(&self, collected_at: &str, upload: RearmUpload) -> RearmPage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
@@ -287,23 +376,74 @@ impl RearmFixture {
         index.activate_effective_upload_body_witness_revision(
             EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
         );
-        let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
-            std::slice::from_ref(&self.root),
-            &mut index,
-            collected_at,
-            183,
-            REARM_PAGE_FILES,
-            &self.support,
-        )
-        .expect("scan bounded Claude page");
+        let (mut native_preparation, mut index, mut scan, committed_index) =
+            if crate::snapshots::claude_native_comparison::enabled() {
+                let (mut frame, index, scan) = self.native_page(index, collected_at);
+                let previous = std::mem::take(&mut frame.committed_index);
+                (Some(frame), index, scan, previous)
+            } else {
+                let committed_index = index.clone();
+                let scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
+                    std::slice::from_ref(&self.root),
+                    &mut index,
+                    collected_at,
+                    183,
+                    REARM_PAGE_FILES,
+                    &self.support,
+                )
+                .expect("scan bounded Claude page");
+                (None, index, scan, committed_index)
+            };
+        let mut comparison_completion = if let Some(frame) = native_preparation.as_mut() {
+            let current = frame
+                .native_comparison_controller
+                .as_ref()
+                .is_some_and(|controller| {
+                    frame
+                        .native_comparison_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.allowed())
+                        && frame
+                            .prepared_claude_evidence
+                            .as_ref()
+                            .is_some_and(|evidence| {
+                                evidence.frozen_roots_are_current(
+                                    &self.support,
+                                    controller.required_roots(),
+                                )
+                            })
+                });
+            if !current {
+                if let Some(lease) = frame.native_comparison_lease.as_mut() {
+                    lease.revoke();
+                }
+            }
+            frame.native_comparison_controller.take().map(|controller| {
+                controller
+                    .complete(&scan, frame.terminal_native_traversal.take(), current)
+                    .unwrap()
+            })
+        } else {
+            None
+        };
         let parsed = scan
             .snapshots
             .iter()
             .map(|item| item.source_session_id.clone())
             .collect();
-        let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        let (mut disposition, _, _) = if let Some(frame) = native_preparation.as_mut() {
+            apply_claude_local_evidence_to_scan_with_comparison(
+                &self.support,
+                &mut scan,
+                &mut index,
+                None,
+                frame.prepared_claude_evidence.take(),
+                comparison_completion.as_ref(),
+                frame.native_comparison_lease.as_ref(),
+            )
+        } else {
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
+        };
         let duplicate_census = disposition.duplicate_census;
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -320,6 +460,23 @@ impl RearmFixture {
         );
         let mut progress = test_upload_progress();
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
+        if let Some(comparison) = comparison_completion.as_mut() {
+            comparison.capture_native_corrections(
+                &mut scan,
+                &committed_index,
+                &disposition,
+                |snapshot| {
+                    effective_snapshot_upload_body_witness(
+                        snapshot,
+                        &progress,
+                        false,
+                        false,
+                        &BTreeSet::new(),
+                        &disposition,
+                    )
+                },
+            );
+        }
         finalize_scan_after_policy_with_body_witness(
             SnapshotSource::ClaudeCode,
             &mut scan,
@@ -356,7 +513,33 @@ impl RearmFixture {
                 match upload {
                     RearmUpload::Accept => {
                         uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                        Ok(accepted_batch(items.len()))
+                        if crate::snapshots::claude_native_comparison::enabled() {
+                            let request = SnapshotBatchRequest {
+                                schema_version:SNAPSHOT_SCHEMA_VERSION, source:"claude_code".to_owned(),
+                                machine_id:REARM_MACHINE_ID.to_owned(), collector_version:None,
+                                snapshots:items, upload_policy:SnapshotUploadPolicy::default(),
+                                client_report:crate::client_report::ClientReport::empty(),
+                            };
+                            let references=request.snapshots.iter().map(|item| {
+                                let version=crate::snapshot_client::snapshot_ack_body_witness_version(item).expect("production public ACK mapping");
+                                serde_json::json!({
+                                    "source_session_id":item.source_session_id,
+                                    "snapshot_fingerprint":item.snapshot_fingerprint, "occurrence_count":1,
+                                    "body_witness_version":version,
+                                    "body_witness_digest":version.map(|_|snapshot_upload_body_witness(item)),
+                                })
+                            }).collect::<Vec<_>>();
+                            let response:crate::snapshot_client::SnapshotBatchResponse=serde_json::from_value(serde_json::json!({
+                                "accepted":request.snapshots.len(), "sessions_reconciled":request.snapshots.len(),
+                                "session_ids":[], "disabled":false, "disabled_reason":null,
+                                "entity_ack_contract":"snapshot_entity_ack:v1", "accepted_entities":references,
+                                "unchanged_entities":[], "rejected_entities":[], "conflict_entities":[],
+                            })).unwrap();
+                            response.validate_entity_ack(&request).expect("exact actual offered-body ACK validator");
+                            Ok(response)
+                        } else {
+                            Ok(accepted_batch(items.len()))
+                        }
                     }
                     RearmUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,
@@ -373,7 +556,7 @@ impl RearmFixture {
             progress
                 .save(&self.progress_path)
                 .expect("persist upload progress");
-            checkpoint_partial_snapshot_index(
+            checkpoint_partial_snapshot_index_with_comparison(
                 &index,
                 &committed_index,
                 &progress,
@@ -383,6 +566,10 @@ impl RearmFixture {
                 &self.index_path,
                 &self.progress_path,
                 || Ok(()),
+                None,
+                comparison_completion
+                    .as_mut()
+                    .and_then(|comparison| comparison.fallback.as_mut()),
             )
             .expect("checkpoint shed page");
             return RearmPage {
@@ -398,9 +585,18 @@ impl RearmFixture {
         }
         assert_eq!(result, ResumableUploadResult::Completed);
         let settlement = settle_completed_upload(index, &committed_index, &progress, &holds);
-        let fully_settled = settlement.fully_settled;
+        let mut fully_settled = settlement.fully_settled;
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
+        if let Some(fallback) = comparison_completion
+            .as_mut()
+            .and_then(|comparison| comparison.fallback.as_mut())
+        {
+            fallback
+                .restore_selected(&mut index, &committed_index)
+                .unwrap();
+            fully_settled = false;
+        }
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -420,6 +616,58 @@ impl RearmFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
+        if let Some(frame) = native_preparation.as_mut() {
+            if fully_settled
+                && frame
+                    .native_comparison_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.allowed())
+            {
+                if let Some(comparison) = comparison_completion.as_mut() {
+                    comparison.note_native_corrections_after_save(
+                        &index,
+                        &committed_index,
+                        |fp, witness| {
+                            if progress.quarantined_fingerprints.contains_key(fp)
+                                || progress.permanent_rejections.contains_key(fp)
+                            {
+                                None
+                            } else {
+                                Some(
+                                    progress.accepted_fingerprints.contains(fp)
+                                        && progress
+                                            .accepted_body_witnesses
+                                            .get(fp)
+                                            .is_some_and(|actual| actual == witness),
+                                )
+                            }
+                        },
+                    );
+                }
+            }
+            if let Some(mut lease) = frame.native_comparison_lease.take() {
+                lease.note_selected_save(
+                    fully_settled
+                        && census_complete
+                        && crate::snapshots::claude_native_comparison::actual_native_conjunction(
+                            &disposition,
+                        ),
+                );
+                lease.stage_window_after_save(
+                    comparison_completion.and_then(|comparison| comparison.window),
+                    &index,
+                    census_complete,
+                );
+                lease.finish(
+                    fully_settled
+                        && crate::snapshots::claude_native_comparison::selected_page_is_clean(
+                            &scan,
+                            &index,
+                            &disposition,
+                        ),
+                );
+            }
+        }
         RearmPage {
             scan,
             duplicate_census,
@@ -832,4 +1080,17 @@ fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
 #[serial(source_manifests)]
 fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
     observe_base_prelude(true);
+}
+
+#[test]
+fn native_comparison_original_novel_import_oracle() {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    // Call the ORIGINAL function, including its original assertions and page2.
+    // Its own serial guard owns source_manifests; no nested serial lock here.
+    novel_import_recovers_after_owner_coverage_then_stops_reading();
+    writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: original_body_ran=true original_passed=true page_files=2 actual_SourcePreparation=true actual_existing_frame_budget=true exact_body_ACK_validator=true").unwrap();
 }

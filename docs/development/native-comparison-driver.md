@@ -483,3 +483,18 @@ comparison trigger, and a current process lease. Reparse/proof/context/error
 and budget refusal discard it. It never becomes Skip, S, ownership, coverage,
 tagging or wire evidence. Dedicated tests and original helper integration
 remain required; actual-Skip evidence is never fabricated for parsed members.
+
+
+## Original-oracle validation boundary
+
+The current adapters preserve both original function bodies and expectations.
+The primitive oracle keeps controlled revisions and logical pages; the pipeline
+oracle drives actual SourcePreparation and existing frame admission. Both use
+strict canonical-body ACK validation and normal selected-save receipt minting.
+An unsupported layout returns an explicit UNEXECUTED receipt, not original-test
+acceptance. A supported Rust 1.95 run compiled the adapters but failed at their
+synthetic ACK version construction before the original decisive assertions.
+The narrow correction shares the existing production public ACK version mapping;
+it changes no validator, wire version, cap or original assertion. Successful
+hosted execution of component/data controls is distinct from supported full-frame
+execution and from installed CPU, memory or responsiveness acceptance.

@@ -12285,13 +12285,39 @@ impl OwnedSourceScan {
         // Unknown/outside-page paths are not injected, and no deadline, source
         // fingerprint, census flag or budget is changed by selection.
         if source == SnapshotSource::ClaudeCode && claude_native_comparison::enabled() {
-            claude_native_comparison::select_recovery_before_audits(
-                &mut traversal.pending_candidates,
-                &mut pending_paths,
-                &index.files,
-                recovery_priority,
-                selection_limit,
-            );
+            if recovery_priority.is_empty() {
+                // Selected fallback persists A at the front of this SAME
+                // queue with existing empty-fp debt. A restarted process has
+                // no lease/certificate or separate recovery path list. Honor
+                // only that queued debt prefix before audits; never inject a
+                // path, scan for missing members or mint native eligibility.
+                while pending_paths.len() < selection_limit {
+                    let known_debt =
+                        traversal
+                            .pending_candidates
+                            .front()
+                            .is_some_and(|candidate| {
+                                index
+                                    .files
+                                    .get(&local_index_key(&candidate.path))
+                                    .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                            });
+                    if !known_debt {
+                        break;
+                    }
+                    if let Some(candidate) = traversal.pending_candidates.pop_front() {
+                        pending_paths.push(candidate);
+                    }
+                }
+            } else {
+                claude_native_comparison::select_recovery_before_audits(
+                    &mut traversal.pending_candidates,
+                    &mut pending_paths,
+                    &index.files,
+                    recovery_priority,
+                    selection_limit,
+                );
+            }
         }
         // Nonshipping candidate: exercise target priority at the actual
         // selection boundary, before audits, with the unchanged page cap.

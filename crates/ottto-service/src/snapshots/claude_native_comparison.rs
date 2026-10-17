@@ -243,6 +243,10 @@ struct WindowRoot {
     certified: BTreeMap<String, NormalSkip>,
 }
 impl WindowEligibility {
+    #[cfg(test)]
+    pub(super) fn native_correction_count_for_test(&self) -> usize {
+        self.native_corrections.len()
+    }
     fn root_is_current(root: &str, saved: &WindowRoot, index: &ScanIndex) -> bool {
         let Some(witness) = index.claude_usage_family_witnesses.get(root) else {
             return false;
@@ -377,15 +381,48 @@ impl NativePhase {
         if self.disabled {
             return;
         }
-        let key = local_index_key(&candidate.path);
+        self.record_parse_key(&candidate.path);
+    }
+
+    fn record_parse_key(&mut self, path: &Path) {
+        let key = local_index_key(path);
         self.parsed_keys.insert(key.clone());
         if self.native_corrections.remove(&key).is_some() {
             self.correction_revoked_keys.insert(key);
         }
-        if let Some((root, _)) = claude_index_path_family_member(&candidate.path) {
+        if let Some((root, _)) = claude_index_path_family_member(path) {
             self.skips.retain(|_, skip| skip.root != root);
             self.parsed_roots.insert(root);
         }
+    }
+
+    /// Logical-page unit adapter: the caller actually parsed each controlled
+    /// source revision. No physical opened-file, layout or Skip claim is made.
+    /// The full SourcePreparation oracle separately covers those boundaries.
+    #[cfg(test)]
+    pub(super) fn primitive_completion_for_test(
+        scan: &SourceScanResult,
+        index: &ScanIndex,
+        rows: PairedRows<'_>,
+        lease: &mut lifecycle::Lease,
+    ) -> Completion {
+        let mut phase = Self::default();
+        for pending in &scan.pending_finalization {
+            phase.record_parse_key(Path::new(&pending.index_key));
+        }
+        assert!(phase.import_window(lease.take_window(), index, &scan.census_window_end));
+        assert!(phase.pause_before_finalization());
+        let mut qualification =
+            phase.qualify(index, &scan.snapshots, &scan.census_window_end, rows);
+        let (targets, selection) = qualification.take_target_candidates(&scan.snapshots, 0);
+        assert!(targets.is_empty() && selection.unresolved_sources.is_empty());
+        assert_eq!(
+            selection.matched_roots, 0,
+            "this unit oracle has no cross-family targets"
+        );
+        Controller::new(qualification)
+            .complete(scan, None, lease.allowed())
+            .unwrap()
     }
 
     pub(super) fn record_actual_skip(

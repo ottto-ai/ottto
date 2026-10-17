@@ -32,6 +32,7 @@ struct Family {
     api_rows: Vec<ClaudeLocalOtelEvidence>,
     trace_rows: Vec<ClaudeTraceOwnershipEvidence>,
     index: ScanIndex,
+    native_lifecycle: std::sync::Arc<claude_native_comparison::lifecycle::Lifecycle>,
 }
 
 impl Family {
@@ -71,6 +72,7 @@ impl Family {
             api_rows,
             trace_rows,
             index,
+            native_lifecycle: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -92,6 +94,9 @@ impl Family {
         census_complete: bool,
         window: &str,
     ) -> ClaudeUsageAuthorityDisposition {
+        if claude_native_comparison::enabled() {
+            return self.native_unit_page(items, census_complete, window);
+        }
         let api_report = ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(self.root_session_id.clone(), self.api_rows.clone())]),
             health: Default::default(),
@@ -110,7 +115,209 @@ impl Family {
         )
     }
 
-    /// Persist the index and restart from disk, as a daemon restart would.
+    /// Controlled-R primitive oracle, not physical source/performance proof.
+    /// It preserves the original logical pages and calls the same frozen-P,
+    /// corrected-body ACK/no-op and selected-save receipt code as production.
+    fn native_unit_page(
+        &mut self,
+        items: &mut [SnapshotItem],
+        census_complete: bool,
+        window: &str,
+    ) -> ClaudeUsageAuthorityDisposition {
+        let api = ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(self.root_session_id.clone(), self.api_rows.clone())]),
+            health: Default::default(),
+        };
+        let trace = ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(self.root_session_id.clone(), self.trace_rows.clone())]),
+            ..Default::default()
+        };
+        // An empty real scan supplies only the typed result envelope. It does
+        // NOT supply native-read evidence, a traversal, eligibility or a grant.
+        let empty = self.state_dir.join("empty-container");
+        fs::create_dir_all(&empty).unwrap();
+        let mut scratch_index = ScanIndex::default();
+        let mut scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            &[empty],
+            &mut scratch_index,
+            window,
+            365,
+            2,
+            false,
+        )
+        .unwrap();
+        scan.census_complete = census_complete;
+        scan.census_window_end = window.to_owned();
+        scan.snapshots = items.to_vec();
+        let previous = self.index.clone();
+        scan.pending_finalization = items
+            .iter()
+            .map(|item| {
+                let key = [&self.parent_key, &self.child_key]
+                    .into_iter()
+                    .find(|key| {
+                        claude_index_path_family_member(Path::new(key))
+                            .is_some_and(|(_, member)| member == item.source_session_id)
+                    })
+                    .expect("exact parsed member key");
+                let old = &previous.files[key];
+                PendingIndexFinalization {
+                    sampled_audit_verified: false,
+                    codex_pending_recovery: false,
+                    index_key: key.clone(),
+                    source_file_fingerprint: item
+                        .source_file_fingerprint
+                        .clone()
+                        .expect("controlled parsed revision"),
+                    previous_snapshot_fingerprint: old.last_snapshot_fingerprint.clone(),
+                    previous_upload_body_witness: old.last_upload_body_witness.clone(),
+                    parse_complete: true,
+                    diagnostic_reason: FileReason::Complete,
+                    parsed_snapshot_count: 1,
+                    effective_upload_body_witness_revision: 0,
+                }
+            })
+            .collect();
+        let mut lease = self.native_lifecycle.begin();
+        lease.bind("primitive-native-unit".to_owned());
+        let healthy = BTreeSet::from([self.root_session_id.clone()]);
+        let mut completion = claude_native_comparison::NativePhase::primitive_completion_for_test(
+            &scan,
+            &self.index,
+            claude_native_comparison::PairedRows {
+                api: &api.evidence,
+                trace: &trace.evidence,
+                healthy_roots: &healthy,
+            },
+            &mut lease,
+        );
+        // Original primitive current-files premise is unchanged. This is the
+        // actual single fold, with no synthetic Skip or forced permission.
+        let disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
+            &mut scan.snapshots,
+            &api,
+            &trace,
+            &mut self.index,
+            census_complete,
+            window,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            None,
+            &BTreeSet::new(),
+            None,
+            completion.negatives(Some(&lease)),
+        );
+        items.clone_from_slice(&scan.snapshots);
+        completion.capture_native_corrections(
+            &mut scan,
+            &previous,
+            &disposition,
+            snapshot_upload_body_witness,
+        );
+        // A held member's prior entry/body is untouched. Never classify it as
+        // empty or ACKed simply because its current body cannot be offered.
+        let held = &disposition.quarantined_source_session_ids;
+        let held_keys = scan
+            .snapshots
+            .iter()
+            .filter(|item| held.contains(&item.source_session_id))
+            .filter_map(|item| {
+                scan.pending_finalization
+                    .iter()
+                    .find(|pending| {
+                        claude_index_path_family_member(Path::new(&pending.index_key))
+                            .is_some_and(|(_, member)| member == item.source_session_id)
+                    })
+                    .map(|pending| pending.index_key.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        disposition.retain_uploadable(&mut scan.snapshots);
+        scan.pending_finalization
+            .retain(|pending| !held_keys.contains(&pending.index_key));
+        for pending in &scan.pending_finalization {
+            let entry = self.index.files.get_mut(&pending.index_key).unwrap();
+            // Preserve a terminal proof's newly created rearm debt. Ordinary
+            // parse completion commits R only when the fold did not rearm it.
+            if !entry.source_file_fingerprint.is_empty() || !census_complete {
+                entry.source_file_fingerprint = pending.source_file_fingerprint.clone();
+            }
+            entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_owned());
+        }
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::ClaudeCode,
+            &mut scan,
+            &mut self.index,
+            snapshot_upload_body_witness,
+        );
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "claude_code".to_owned(),
+            machine_id: "otm_primitive_native_unit".to_owned(),
+            collector_version: None,
+            snapshots: scan.snapshots.clone(),
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let refs = request.snapshots.iter().map(|item| {
+            let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).expect("production public ACK mapping");
+            serde_json::json!({"source_session_id":item.source_session_id,
+                "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
+                "body_witness_version":version,"body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))})
+        }).collect::<Vec<_>>();
+        let response: crate::snapshot_client::SnapshotBatchResponse =
+            serde_json::from_value(serde_json::json!({
+                "accepted":request.snapshots.len(),"sessions_reconciled":request.snapshots.len(),
+                "session_ids":[],"disabled":false,"disabled_reason":null,
+                "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":refs,
+                "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[],
+            }))
+            .unwrap();
+        response
+            .validate_entity_ack(&request)
+            .expect("strict actual corrected-body ACK validator");
+        let acknowledgments = request
+            .snapshots
+            .iter()
+            .map(|item| {
+                (
+                    item.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(item),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.index
+            .record_accepted_snapshot_fingerprints(&acknowledgments.keys().cloned().collect());
+        self.index
+            .save(&self.state_dir.join("native-unit-selected.json"))
+            .unwrap();
+        let fully_settled = disposition.quarantined_entity_count() == 0;
+        if fully_settled && lease.allowed() {
+            completion.note_native_corrections_after_save(&self.index, &previous, |fp, witness| {
+                Some(
+                    acknowledgments
+                        .get(fp)
+                        .is_some_and(|actual| actual == witness),
+                )
+            });
+        }
+        lease.note_selected_save(
+            fully_settled && claude_native_comparison::actual_native_conjunction(&disposition),
+        );
+        lease.stage_window_after_save(completion.window, &self.index, census_complete);
+        // Logical-page cleanliness is solely this primitive's real native fold
+        // and exact ACK/save. No physical traversal cleanliness is fabricated.
+        lease.finish(
+            fully_settled
+                && !disposition.duplicate_census.census_invalid
+                && !disposition.duplicate_census.fence_after,
+        );
+        disposition
+    }
+
+    /// Persist and reload the index in the SAME process. A separate lifecycle
+    /// restart control proves that disk state cannot restore a native receipt.
+
     fn reload(&mut self) {
         let path = self.state_dir.join("scan-index.json");
         self.index.save(&path).expect("save scan index");
@@ -178,7 +385,6 @@ impl Drop for Family {
         let _ = fs::remove_dir_all(&self.state_dir);
     }
 }
-
 
 #[test]
 #[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
@@ -274,11 +480,33 @@ fn observe_base_prelude(experimental_base_exit: bool) {
     let mut child = family.child("2026-08-02T07:20:00Z", 2);
     family.page(&mut child, true, "2026-08-02T07:20:00Z");
     assert_eq!(family.witness(), first);
-    assert!(!family.armed(&key), "base re-proof re-arms the root; this is NOT the original oracle passing");
-    let mode = if experimental_base_exit { "experimental_base_exit_no_reuse" } else { "base_control" };
+    assert!(
+        !family.armed(&key),
+        "base re-proof re-arms the root; this is NOT the original oracle passing"
+    );
+    let mode = if experimental_base_exit {
+        "experimental_base_exit_no_reuse"
+    } else {
+        "base_control"
+    };
     writeln!(std::io::stderr().lock(), "p12_oracle: name=member_change_after_unchanged_proof_fails_closed_until_family_reparse mode={mode} status=BLOCKED_OPTIMIZED_PRELUDE original_expected_parent_armed=true observed_parent_armed=false original_oracle_passed=false downstream_assertions_executed=false").unwrap();
 }
 #[test]
-fn p12_member_change_base_control_reveals_unmet_original_prelude() { observe_base_prelude(false); }
+fn p12_member_change_base_control_reveals_unmet_original_prelude() {
+    observe_base_prelude(false);
+}
 #[test]
-fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() { observe_base_prelude(true); }
+fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
+    observe_base_prelude(true);
+}
+
+#[test]
+fn native_comparison_original_member_change_unit_oracle() {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
+        return;
+    }
+    let _native = claude_native_comparison::enable_for_test();
+    member_change_after_unchanged_proof_fails_closed_until_family_reparse();
+    writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: original_body_ran=true original_passed=true controlled_revision_unit=true physical_source_or_performance_proof=false strict_body_ACK_validator=true selected_save=true").unwrap();
+}

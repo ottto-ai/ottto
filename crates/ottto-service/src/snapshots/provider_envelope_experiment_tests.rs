@@ -3064,3 +3064,247 @@ fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() 
     assert_eq!(fs::read(&path).unwrap(), durable);
     writeln!(std::io::stderr().lock(), "native_comparison_fallback_failure: actual_index_CAS_loser_preserves_winner=true wrong_window_refused=true no_checkpoint_or_offer_success=true").unwrap();
 }
+
+fn native_comparison_corrected_native_receipt_fixture(
+    mode: &str,
+) -> (
+    NativePreparationFixture,
+    ScanIndex,
+    Option<Box<claude_native_comparison::WindowEligibility>>,
+) {
+    let mut fixture = if mode == "noop" {
+        let (mut fixture, accepted, _) =
+            native_comparison_corrected_native_receipt_fixture("exact_ack");
+        fixture.index = accepted; // Actual prior validated ACK and durable save.
+        fixture
+    } else {
+        NativePreparationFixture::new()
+    };
+    let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
+    fixture
+        .index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let previous = fixture.index.clone();
+    let mut state = fixture.paused_with_limit(1);
+    assert_eq!(
+        state.scanned_file_count, 1,
+        "actual native correction read, not a seeded Skip"
+    );
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    let mut controller = claude_native_comparison::Controller::new(qualification);
+    assert!(controller.advance(&mut state, true));
+    let (mut index, mut scan) = SelectionFixture::run(state);
+    assert!(
+        !scan.census_complete,
+        "an earlier bounded page, before terminal rearm"
+    );
+    let mut completion = controller.complete(&scan, None, true).unwrap();
+    let disposition = apply_claude_reported_usage_to_scan_with_identity(
+        &mut scan,
+        &fixture.api,
+        &fixture.trace,
+        &mut index,
+        None,
+    );
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(
+        scan.snapshots[0].usage_accounting_contract.as_deref(),
+        Some("session_exclusive_reported_usage:v1")
+    );
+    completion.capture_native_corrections(
+        &mut scan,
+        &previous,
+        &disposition,
+        snapshot_upload_body_witness,
+    );
+    assert_eq!(
+        completion.native_correction_count_for_test(),
+        0,
+        "parse/capture never mints a receipt"
+    );
+    let offered = scan.snapshots.clone();
+    let witnesses = offered
+        .iter()
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(item),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    if mode == "capture_only" {
+        return (fixture, index, completion.window);
+    }
+    if matches!(mode, "exact_ack" | "wrong_witness") {
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "claude_code".to_owned(),
+            machine_id: "otm_native_receipt".to_owned(),
+            collector_version: None,
+            snapshots: offered,
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let refs=request.snapshots.iter().map(|item| {
+            let version=crate::snapshot_client::snapshot_ack_body_witness_version(item).expect("production public ACK mapping");
+            serde_json::json!({"source_session_id":item.source_session_id,
+                "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
+                "body_witness_version":version,
+                "body_witness_digest":version.map(|_|if mode=="wrong_witness" {"f".repeat(64)}else{snapshot_upload_body_witness(item)}),
+            })
+        }).collect::<Vec<_>>();
+        let response:crate::snapshot_client::SnapshotBatchResponse=serde_json::from_value(serde_json::json!({
+            "accepted":request.snapshots.len(),"sessions_reconciled":request.snapshots.len(),
+            "session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1",
+            "accepted_entities":refs,"unchanged_entities":[],"rejected_entities":[],"conflict_entities":[],
+        })).unwrap();
+        let validation = response.validate_entity_ack(&request);
+        if mode == "wrong_witness" {
+            assert!(
+                validation.is_err(),
+                "same fp with a different body witness is not an ACK"
+            );
+        } else {
+            validation.unwrap();
+            let accepted = witnesses.keys().cloned().collect();
+            index.record_accepted_snapshot_fingerprints(&accepted);
+        }
+    }
+    if mode == "noop" {
+        assert_eq!(
+            previous.files[&key].last_upload_body_witness,
+            index.files[&key].last_upload_body_witness,
+            "no-op must be the exact previously ACKed grouped body"
+        );
+    }
+    let path = fixture.dir.join("native-correction-selected.json");
+    index.save(&path).unwrap();
+    completion.note_native_corrections_after_save(&index, &previous, |fp, witness| match mode {
+        "refused" => None,
+        "exact_ack" => Some(witnesses.get(fp).is_some_and(|actual| actual == witness)),
+        _ => Some(false),
+    });
+    let expected = usize::from(matches!(mode, "exact_ack" | "noop"));
+    assert_eq!(completion.native_correction_count_for_test(), expected);
+    assert!(serde_json::to_value(&index)
+        .unwrap()
+        .get("native_corrections")
+        .is_none());
+    writeln!(std::io::stderr().lock(),"native_comparison_native_receipt: mode={mode} actual_native_read=true frozen_proof=true body_ACK_validator_executed={} prior_exact_ACK={} selected_save=true minted={expected} Skip_or_envelope=false layout_admission=false", matches!(mode,"exact_ack"|"wrong_witness"),mode=="noop").unwrap();
+    (fixture, index, completion.window)
+}
+
+#[test]
+fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
+    for mode in [
+        "capture_only",
+        "pending",
+        "wrong_witness",
+        "refused",
+        "exact_ack",
+        "noop",
+    ] {
+        native_comparison_corrected_native_receipt_fixture(mode);
+    }
+}
+
+#[test]
+fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
+    for change in ["proof", "revision"] {
+        let (fixture, mut index, window) =
+            native_comparison_corrected_native_receipt_fixture("exact_ack");
+        let mut window = window.unwrap();
+        assert_eq!(window.native_correction_count_for_test(), 1);
+        if change == "proof" {
+            index
+                .claude_usage_family_witnesses
+                .get_mut(&fixture.parent)
+                .unwrap()
+                .evidence_fingerprint = "a different proof".to_owned();
+        } else {
+            let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
+            index.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
+        }
+        window.retain_current(&index);
+        assert_eq!(window.native_correction_count_for_test(), 0);
+    }
+    let (mut fixture, index, window) =
+        native_comparison_corrected_native_receipt_fixture("exact_ack");
+    fixture.index = index;
+    let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
+    fixture
+        .index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let mut state = fixture.paused_with_limit(1);
+    assert_eq!(state.scanned_file_count, 1);
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = state
+        .prepare_native_comparison_with_window(
+            claude_native_comparison::PairedRows {
+                api: &fixture.api.evidence,
+                trace: &fixture.trace.evidence,
+                healthy_roots: &healthy,
+            },
+            window,
+        )
+        .unwrap();
+    let controller = claude_native_comparison::Controller::new(qualification);
+    let window = controller.into_window(&state.census_window_end).unwrap();
+    assert_eq!(
+        window.native_correction_count_for_test(),
+        0,
+        "even same-revision native reparse revokes the old receipt"
+    );
+    let restarted = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut lease = restarted.begin();
+    lease.bind("same-source-destination-context".to_owned());
+    assert!(!lease.allowed());
+    assert!(lease.take_window().is_none());
+    writeln!(std::io::stderr().lock(),"native_comparison_native_receipt_revocation: changed_P_base=true changed_R_base=true same_R_reparse_drops=true restart_no_disk_receipt=true no_Skip_or_coverage_claim=true").unwrap();
+}
+
+#[test]
+fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before_audits() {
+    let fixture = SelectionFixture::new();
+    let mut index = fixture.previous.clone();
+    index
+        .files
+        .get_mut(&local_index_key(&fixture.paths[0]))
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    index.save(&fixture.index_path).unwrap();
+    let index = ScanIndex::load(&fixture.index_path).unwrap();
+    let base = fixture.prepare(index.clone(), 1);
+    assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
+    let _scope = claude_native_comparison::enable_for_test();
+    let native = fixture.prepare(index, 1); // ordinary constructor, NO supplied recovery list
+    assert_eq!(native.identified_candidates.len(), 1);
+    assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
+    let (index, scan) = SelectionFixture::run(native);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert!(index.files[&local_index_key(&fixture.paths[1])]
+        .audit_requires_full(sampled_scan::now_seconds()));
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .any(|p| p.path == fixture.paths[1]));
+    writeln!(std::io::stderr().lock(),"native_comparison_default_recovery_priority: actual_save_reload=true ordinary_constructor=true no_process_recovery_list=true known_empty_fp_queue_prefix_before_audits=true same_page_cap=true audit_debt_preserved=true no_new_native_eligibility=true").unwrap();
+}
