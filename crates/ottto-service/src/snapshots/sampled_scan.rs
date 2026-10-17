@@ -31,6 +31,10 @@ struct SharedState {
     // evict it on clear/pressure and then grant the same event another read.
     copy_attempts: BTreeSet<CopyAttempt>,
     copy_attempt_charge: usize,
+    // Outstanding required-decode/index leases are not optional cache entries.
+    // Clearing reductions must never refund a still-live index or decoder.
+    copy_reserved: usize,
+    copy_reservation_invalid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -78,6 +82,8 @@ impl SharedState {
             copy_membership: MembershipIndex::default(),
             copy_attempts: BTreeSet::new(),
             copy_attempt_charge: 0,
+            copy_reserved: 0,
+            copy_reservation_invalid: false,
         }
     }
     fn attempt_charge(&self) -> Option<usize> {
@@ -96,12 +102,18 @@ impl HeapLayoutBound for SharedState {
             copy_membership,
             copy_attempts: _,
             copy_attempt_charge: _,
+            copy_reserved,
+            copy_reservation_invalid,
         } = self;
+        if *copy_reservation_invalid {
+            return None;
+        }
         reductions.heap_bound(counter)?;
         // Includes conservative inline/root overhead twice if necessary. Never
         // replace this with a complete ID graph walk on every parser check.
         counter.add(copy_membership.current_charge(STATE_BYTES)?)?;
-        counter.add(self.attempt_charge()?)
+        counter.add(self.attempt_charge()?)?;
+        counter.add(*copy_reserved)
     }
 }
 impl Default for SharedCache {
@@ -127,6 +139,28 @@ impl HeapLayoutBound for SharedCache {
     }
 }
 impl SharedCache {
+    pub(in crate::snapshots) fn reserve_copy_bytes(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<CopyReservation> {
+        if !self.copy_containment_required()
+            || !super::claude_copy_containment::required_decode::profile_supported()
+        {
+            return None;
+        }
+        let mut reservation = CopyReservation {
+            owner: Arc::clone(self),
+            bytes: 0,
+        };
+        reservation.resize(bytes)?;
+        Some(reservation)
+    }
+
+    #[cfg(test)]
+    pub(in crate::snapshots) fn reserved_copy_bytes_for_test(&self) -> Option<usize> {
+        Some(self.inner.try_lock().ok()?.copy_reserved)
+    }
+
     pub(crate) fn copy_containment_required(&self) -> bool {
         self.copy_containment_required.load(Ordering::Relaxed)
     }
@@ -235,6 +269,9 @@ impl SharedCache {
             .map_err(|_| Refused::OwnerUnavailable)?;
         let resident = crate::heap_layout_bound::bound(&cache.reductions, STATE_BYTES)
             .ok_or(Refused::UnavailableLayout)?;
+        if cache.copy_reservation_invalid {
+            return Err(Refused::OwnerUnavailable);
+        }
         let heap_bytes = remaining
             .heap_bytes
             .min(STATE_BYTES)
@@ -242,6 +279,7 @@ impl SharedCache {
             .and_then(|bytes| bytes.checked_sub(resident))
             .and_then(|bytes| bytes.checked_sub(live_bytes))
             .and_then(|bytes| bytes.checked_sub(cache.attempt_charge()?))
+            .and_then(|bytes| bytes.checked_sub(cache.copy_reserved))
             .ok_or(Refused::HeapBudget)?;
         let held_slots = remaining
             .held_slots
@@ -278,8 +316,9 @@ impl SharedCache {
                     .current_charge(STATE_BYTES)
                     .and_then(|membership| membership.checked_add(live_bytes))
                     .and_then(|live| live.checked_add(cache.attempt_charge()?))
+                    .and_then(|live| live.checked_add(cache.copy_reserved))
                     .and_then(|live| live.checked_add(std::mem::size_of::<Self>()))
-                    .filter(|all_live| *all_live <= STATE_BYTES)
+                    .filter(|all_live| !cache.copy_reservation_invalid && *all_live <= STATE_BYTES)
                 else {
                     return;
                 };
@@ -295,6 +334,83 @@ impl SharedCache {
                         .insert_reserving_peak(key, retained, live_bytes);
                 }
             }
+        }
+    }
+}
+
+/// A move-only credit. No reservation is stored inside SharedState or an
+/// optional cache value, so its destructor never runs under that owner's lock.
+/// The value being paid for must be destroyed before this credit is returned.
+pub(in crate::snapshots) struct CopyReservation {
+    owner: Arc<SharedCache>,
+    bytes: usize,
+}
+impl std::fmt::Debug for CopyReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RequiredCopyReservation")
+    }
+}
+impl CopyReservation {
+    pub(in crate::snapshots) fn bytes(&self) -> usize {
+        self.bytes
+    }
+    pub(in crate::snapshots) fn owner(&self) -> &Arc<SharedCache> {
+        &self.owner
+    }
+    pub(in crate::snapshots) fn resize(&mut self, bytes: usize) -> Option<()> {
+        self.grow_or_resize(bytes, bytes)
+    }
+    /// A reader checks its prepaid scalar on every byte, but only grows credit
+    /// geometrically. Near the ceiling claim the available remainder once,
+    /// rather than retrying a failed doubling and taking the mutex per byte.
+    pub(in crate::snapshots) fn grow_to_fit(
+        &mut self,
+        minimum: usize,
+        preferred: usize,
+    ) -> Option<()> {
+        self.grow_or_resize(minimum, preferred.max(minimum))
+    }
+    fn grow_or_resize(&mut self, minimum: usize, preferred: usize) -> Option<()> {
+        let mut state = self.owner.inner.try_lock().ok()?;
+        let resident = crate::heap_layout_bound::bound(&*state, STATE_BYTES)?;
+        let room = STATE_BYTES
+            .checked_sub(resident.checked_sub(self.bytes)?)?
+            .checked_sub(std::mem::size_of::<SharedCache>())?;
+        let bytes = preferred.min(room);
+        if bytes < minimum {
+            return None;
+        }
+        let next = state
+            .copy_reserved
+            .checked_sub(self.bytes)?
+            .checked_add(bytes)?;
+        state.copy_reserved = next;
+        self.bytes = bytes;
+        Some(())
+    }
+    /// Transfer ownership without a refund/readmission race or an allocation.
+    pub(in crate::snapshots) fn split(&mut self, bytes: usize) -> Option<Self> {
+        let remaining = self.bytes.checked_sub(bytes)?;
+        let result = Self {
+            owner: Arc::clone(&self.owner),
+            bytes,
+        };
+        self.bytes = remaining;
+        Some(result)
+    }
+}
+impl Drop for CopyReservation {
+    fn drop(&mut self) {
+        // Poison is never cleared/admitted by this path. Retiring an already
+        // paid value still needs to return its exact credit after its data died.
+        let mut state = self
+            .owner
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match state.copy_reserved.checked_sub(self.bytes) {
+            Some(next) => state.copy_reserved = next,
+            None => state.copy_reservation_invalid = true,
         }
     }
 }

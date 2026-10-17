@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 pub(in crate::snapshots) mod accounting;
 pub(in crate::snapshots) mod membership;
 pub(crate) mod pipeline;
+// Inactive mechanical decoder/copy checkpoint. Production attachment awaits
+// complete native ownership and settlement qualification.
+#[allow(dead_code)]
+pub(in crate::snapshots) mod required_budget;
+#[allow(dead_code)]
+pub(in crate::snapshots) mod required_decode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativePairObservation {

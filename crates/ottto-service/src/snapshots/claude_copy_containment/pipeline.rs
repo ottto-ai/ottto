@@ -122,6 +122,11 @@ fn digest_valid(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 impl Holds {
+    /// Borrow only local ledger keys for selective physical-copy accounting.
+    /// No native IDs, ownership inference, allocation or new witness API.
+    pub(in crate::snapshots) fn entries_for_budget(&self) -> impl Iterator<Item = &String> {
+        self.entries.keys()
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -165,6 +170,7 @@ impl ScanIndex {
         let mut context = ScanContext::new(scope, BTreeMap::new())
             .ok_or_else(|| anyhow::anyhow!("invalid copied-request comparison scope"))?;
         context.registered_slot_fingerprint = registered_slot_fingerprint;
+        self.prepay_copy_context(&context)?;
         self.attach_copy_scan_context(context);
         Ok(())
     }
@@ -243,6 +249,7 @@ impl ScanIndex {
     }
     pub(crate) fn attach_copy_attempt_scope(&mut self, scope: String) -> anyhow::Result<()> {
         anyhow::ensure!(digest_valid(&scope), "invalid copied-request attempt scope");
+        self.prepay_copy_context(&scope)?;
         let context = self
             .active_copy_scan
             .as_mut()
