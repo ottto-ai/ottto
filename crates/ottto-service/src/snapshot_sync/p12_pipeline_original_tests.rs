@@ -112,6 +112,8 @@ enum RearmUpload {
     /// The server sheds the page's first batch; `finish_sync_source` then
     /// checkpoints only what the durable progress ledger accepted.
     Shed,
+    /// The request was offered, but no response/ACK reached the daemon.
+    AckLost,
 }
 
 struct RearmPage {
@@ -127,6 +129,9 @@ struct RearmPage {
     offered: BTreeSet<String>,
     /// Bodies the server acknowledged.
     uploaded: BTreeSet<String>,
+    native_correction_candidates: usize,
+    native_receipts: usize,
+    native_lease_allowed: bool,
 }
 
 /// The converged state that both re-arm rules reach after the first proof
@@ -477,6 +482,13 @@ impl RearmFixture {
                 },
             );
         }
+        let native_correction_candidates = comparison_completion.as_ref().map_or(0, |comparison| {
+            comparison.pending_native_correction_count_for_test()
+        });
+        let native_lease_allowed = native_preparation
+            .as_ref()
+            .and_then(|frame| frame.native_comparison_lease.as_ref())
+            .is_some_and(|lease| lease.allowed());
         finalize_scan_after_policy_with_body_witness(
             SnapshotSource::ClaudeCode,
             &mut scan,
@@ -515,10 +527,13 @@ impl RearmFixture {
                         uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
                         if crate::snapshots::claude_native_comparison::enabled() {
                             let request = SnapshotBatchRequest {
-                                schema_version:SNAPSHOT_SCHEMA_VERSION, source:"claude_code".to_owned(),
-                                machine_id:REARM_MACHINE_ID.to_owned(), collector_version:None,
-                                snapshots:items, upload_policy:SnapshotUploadPolicy::default(),
-                                client_report:crate::client_report::ClientReport::empty(),
+                                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                                source: "claude_code".to_owned(),
+                                machine_id: REARM_MACHINE_ID.to_owned(),
+                                collector_version: None,
+                                snapshots: items,
+                                upload_policy: SnapshotUploadPolicy::default(),
+                                client_report: crate::client_report::ClientReport::empty(),
                             };
                             let references=request.snapshots.iter().map(|item| {
                                 let version=crate::snapshot_client::snapshot_ack_body_witness_version(item).expect("production public ACK mapping");
@@ -535,7 +550,9 @@ impl RearmFixture {
                                 "entity_ack_contract":"snapshot_entity_ack:v1", "accepted_entities":references,
                                 "unchanged_entities":[], "rejected_entities":[], "conflict_entities":[],
                             })).unwrap();
-                            response.validate_entity_ack(&request).expect("exact actual offered-body ACK validator");
+                            response
+                                .validate_entity_ack(&request)
+                                .expect("exact actual offered-body ACK validator");
                             Ok(response)
                         } else {
                             Ok(accepted_batch(items.len()))
@@ -545,13 +562,26 @@ impl RearmFixture {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
                     })),
+                    RearmUpload::AckLost => Err(anyhow!(
+                        "synthetic request offered; response ACK unavailable"
+                    )),
                 }
             },
             |_| Ok(()),
-        )
-        .expect("in-process upload");
-        if upload == RearmUpload::Shed {
-            assert!(matches!(result, ResumableUploadResult::Shed { .. }));
+        );
+        if upload != RearmUpload::Accept {
+            match upload {
+                RearmUpload::Shed => {
+                    assert!(matches!(result, Ok(ResumableUploadResult::Shed { .. })))
+                }
+                RearmUpload::AckLost => assert!(result.is_err()),
+                RearmUpload::Accept => unreachable!(),
+            }
+            assert_eq!(accepted, 0);
+            assert!(progress.accepted_fingerprints.is_empty());
+            let native_receipts = comparison_completion.as_ref().map_or(0, |comparison| {
+                comparison.native_correction_count_for_test()
+            });
             let _ = std::fs::remove_file(&self.progress_path);
             progress
                 .save(&self.progress_path)
@@ -581,9 +611,15 @@ impl RearmFixture {
                 held: holds.held_fingerprints,
                 offered,
                 uploaded,
+                native_correction_candidates,
+                native_receipts,
+                native_lease_allowed,
             };
         }
-        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(
+            result.expect("in-process upload"),
+            ResumableUploadResult::Completed
+        );
         let settlement = settle_completed_upload(index, &committed_index, &progress, &holds);
         let mut fully_settled = settlement.fully_settled;
         let mut index = settlement.index;
@@ -616,6 +652,7 @@ impl RearmFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
+        let mut native_receipts = 0;
         if let Some(frame) = native_preparation.as_mut() {
             if fully_settled
                 && frame
@@ -645,6 +682,9 @@ impl RearmFixture {
                     );
                 }
             }
+            native_receipts = comparison_completion.as_ref().map_or(0, |comparison| {
+                comparison.native_correction_count_for_test()
+            });
             if let Some(mut lease) = frame.native_comparison_lease.take() {
                 lease.note_selected_save(
                     fully_settled
@@ -677,6 +717,9 @@ impl RearmFixture {
             held: holds.held_fingerprints,
             offered,
             uploaded,
+            native_correction_candidates,
+            native_receipts,
+            native_lease_allowed,
         }
     }
 
@@ -1093,4 +1136,84 @@ fn native_comparison_original_novel_import_oracle() {
     // Its own serial guard owns source_manifests; no nested serial lock here.
     novel_import_recovers_after_owner_coverage_then_stops_reading();
     writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: original_body_ran=true original_passed=true page_files=2 actual_SourcePreparation=true actual_existing_frame_budget=true exact_body_ACK_validator=true").unwrap();
+}
+
+fn native_comparison_interrupted_correction_is_terminal_base(upload: RearmUpload) {
+    let mode = match upload {
+        RearmUpload::Shed => "shed",
+        RearmUpload::AckLost => "pending_ack",
+        RearmUpload::Accept => unreachable!(),
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(std::io::stderr().lock(), "native_comparison_interrupted_correction: mode={mode} supported_positive=UNEXECUTED interrupted_body_ran=false terminal_base_proved=false").unwrap();
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let fixture = RearmFixture::new(if upload == RearmUpload::Shed {
+        "native-receipt-shed"
+    } else {
+        "native-receipt-pending-ack"
+    });
+    // The real initial bounded native census mints P and the save bootstraps
+    // permission. No index entry, Skip or allowed bit is seeded here.
+    let first = fixture.generation(8);
+    let terminal = first.last().unwrap();
+    assert!(terminal.scan.census_complete && terminal.fully_settled);
+    assert_eq!(
+        RearmFixture::family_rearm_debt(&terminal.index),
+        rearm_family_sessions().len()
+    );
+    assert!(fixture.native_lifecycle.retained_valid_for_test());
+    let root_key = RearmFixture::family_keys(&terminal.index)[REARM_ROOT].clone();
+    let before = serde_json::to_vec(&terminal.index.files[&root_key]).unwrap();
+    let interrupted = fixture.page("2026-08-02T09:00:00Z", upload);
+    assert!(
+        interrupted.native_lease_allowed,
+        "actual native conjunction+save, never forced permission"
+    );
+    assert!(
+        interrupted.native_correction_candidates > 0,
+        "actual frozen-P corrective native parse before the interruption"
+    );
+    assert!(!interrupted.offered.is_empty());
+    assert!(interrupted.uploaded.is_empty() && !interrupted.fully_settled);
+    assert_eq!(
+        interrupted.native_receipts, 0,
+        "offered/shed/pending ACK never mint"
+    );
+    assert_eq!(
+        serde_json::to_vec(&interrupted.index.files[&root_key]).unwrap(),
+        before,
+        "actual locked partial save preserves the previous selected body/rearm debt"
+    );
+    assert!(interrupted.index.bounded_sweep_had_unsettled_upload());
+    assert!(
+        !fixture.native_lifecycle.retained_valid_for_test(),
+        "abandoned error frame revokes its permit/window"
+    );
+    let followup = fixture.generation(10);
+    let terminal = followup.last().unwrap();
+    assert!(terminal.scan.census_complete);
+    assert!(followup.iter().all(|page| !page.native_lease_allowed),
+        "an interrupted window cannot renew permission before another terminal native conjunction and save");
+    assert_eq!(terminal.native_receipts, 0);
+    assert!(
+        terminal.index.files[&root_key]
+            .source_file_fingerprint
+            .is_empty(),
+        "without a valid same-window correction receipt the actual terminal fold uses base rearm"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_interrupted_correction: mode={mode} interrupted_body_ran=true actual_SourcePreparation=true actual_frame_bound=true actual_upload_callback=true actual_partial_CAS_save=true offered_without_ACK=true minted=0 old_body_debt_preserved=true permit_revoked=true actual_followup_terminal_base=true page_files=2 installed_performance_proof=false").unwrap();
+}
+
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_shed_corrective_parse_partial_save_and_terminal_use_base() {
+    native_comparison_interrupted_correction_is_terminal_base(RearmUpload::Shed);
+}
+
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_base() {
+    native_comparison_interrupted_correction_is_terminal_base(RearmUpload::AckLost);
 }

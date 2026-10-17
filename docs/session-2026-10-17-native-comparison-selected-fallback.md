@@ -66,3 +66,15 @@ not reset a traversal field, force a Skip or grant permission. This remains a
 data-level reparse/no-op component, not a lifecycle or full-pipeline receipt.
 Both original wrappers on the hosted unsupported layout reported UNEXECUTED;
 no original acceptance or corrected supported run exists.
+
+
+The next integration controls reuse the original pipeline helper's actual
+SourcePreparation, full existing frame-layout check, resumable uploader and
+locked partial checkpoint. They create the corrective parse from an ordinary
+first native census and selected save, not a seeded permission. A typed shed
+or a lost-response callback offers the body without ACK; the partial save must
+retain old selected body/debt, mint no receipt and revoke the abandoned frame's
+permit. Remaining pages must reach the real terminal decision on base behavior.
+The two cases are meaningful supported-layout tests; unsupported hosted branches
+explicitly report UNEXECUTED and prove no interruption outcome. No further
+local test invocation, layout fallback or production activation is implied.
