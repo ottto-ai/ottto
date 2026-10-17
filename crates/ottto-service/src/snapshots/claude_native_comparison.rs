@@ -2232,6 +2232,79 @@ struct PendingComparison {
     available: bool,
 }
 
+/// Temporary matching lives synchronously inside the existing moving credit.
+/// Conservatively record each prepaid construction as occupied until the whole
+/// selection returns, so nested latch/recovery pricing cannot spend it again.
+fn prepay_selection(
+    recovery: &mut Option<&mut RecoveryBudget<'_>>,
+    charged: &mut usize,
+    bytes: Option<usize>,
+) -> Result<(), crate::source_rotation::LocalRefusal> {
+    let Some(recovery) = recovery.as_mut() else {
+        return Ok(()); // Explicit logical prototype; never physical admission.
+    };
+    let refusal = crate::source_rotation::LocalRefusal(
+        "native comparison matching workspace cannot be prepaid",
+    );
+    let paid = recovery.credit.as_mut().ok_or(refusal)?;
+    let bytes = bytes.ok_or(refusal)?;
+    let owned = paid.allocated().checked_add(bytes).ok_or(refusal)?;
+    let next = charged.checked_add(bytes).ok_or(refusal)?;
+    if !paid.grow_for(owned) || !paid.record_allocated(owned) {
+        return Err(refusal);
+    }
+    *charged = next;
+    Ok(())
+}
+
+impl Qualification {
+    /// Largest per-item hash/Q5 workspace, reused across the page. Include both
+    /// request sets while difference collects, the occurrence-map witnesses and
+    /// formatting replacement slack. No input or scratch clone is constructed.
+    fn matching_workspace(&self, native: &[SnapshotItem]) -> Option<usize> {
+        use crate::heap_layout_bound::{self, Counter};
+        let mut maximum = 0;
+        for item in native {
+            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            let requests = item.claude_usage_request_ids.len();
+            heap_layout_bound::tree_nodes::<String, ()>(requests, &mut cost)?;
+            heap_layout_bound::tree_nodes::<String, ()>(requests, &mut cost)?;
+            cost.add(requests.checked_mul(256)?)?;
+            let occurrences = item.claude_usage_occurrences.len();
+            heap_layout_bound::tree_nodes::<String, ClaudeTranscriptUsageOccurrenceWitness>(
+                occurrences,
+                &mut cost,
+            )?;
+            cost.add(occurrences.checked_mul(128)?)?;
+            for occurrence in item.claude_usage_occurrences.values() {
+                cost.add(occurrence.model.as_ref().map_or(0, String::len))?;
+                cost.add(
+                    occurrence
+                        .selector
+                        .context
+                        .get("speed_mode")
+                        .map_or(0, String::len),
+                )?;
+                cost.add(occurrence.reasoning_effort.as_ref().map_or(0, String::len))?;
+            }
+            cost.add(claude_snapshot_family_root_ref(item).len())?;
+            cost.add(256)?; // two SHA-256 fingerprint formatting results/slack
+            maximum = maximum.max(cost.bytes);
+        }
+        let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        cost.add(maximum)?;
+        // possible_targets owns at most one key per retained eligible root.
+        heap_layout_bound::tree_nodes::<String, ()>(self.families.len(), &mut cost)?;
+        let mut longest = 0;
+        for root in self.families.keys() {
+            cost.add(root.len())?;
+            longest = longest.max(root.len());
+        }
+        cost.add(longest.checked_mul(2)?)?; // duplicate insert's temporary key
+        Some(cost.bytes)
+    }
+}
+
 /// Native acquisition only: not an owner, an accepted body, or a promise that
 /// the final exact fold can offer these sources. No Clone/serialization.
 #[derive(Default)]
@@ -2354,11 +2427,57 @@ impl Qualification {
         file_limit: usize,
         mut recovery: Option<&mut RecoveryBudget<'_>>,
     ) -> Result<(Vec<CandidateFile>, TargetSelection), crate::source_rotation::LocalRefusal> {
+        use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
+        let refusal = crate::source_rotation::LocalRefusal(
+            "native comparison matching ownership cannot be reconciled",
+        );
+        let before = if recovery.is_some() {
+            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            self.completed_heap_bound(&mut cost).ok_or(refusal)?;
+            cost.bytes
+        } else {
+            0
+        };
+        if let Some(recovery) = recovery.as_ref() {
+            recovery
+                .credit
+                .as_ref()
+                .and_then(|paid| paid.allocated().checked_sub(before))
+                .ok_or(refusal)?;
+        }
+        let old_ceiling = recovery.as_ref().and_then(|r| r.credit.as_ref()).map_or(
+            0,
+            crate::source_rotation::PaidReservation::allocation_ceiling,
+        );
+        let mut charged = 0;
+        if recovery.is_some() {
+            prepay_selection(
+                &mut recovery,
+                &mut charged,
+                self.matching_workspace(&native[frontier..]),
+            )?;
+        }
         let mut sources_by_root = BTreeMap::<String, BTreeSet<String>>::new();
         let mut result = TargetSelection::default();
         for item in &native[frontier..] {
             match self.possible_targets(item) {
                 Some(roots) => {
+                    if recovery.is_some() {
+                        let bytes = (|| {
+                            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+                            heap_layout_bound::tree_nodes::<String, BTreeSet<String>>(
+                                roots.len(),
+                                &mut cost,
+                            )?;
+                            heap_layout_bound::tree_nodes::<String, ()>(roots.len(), &mut cost)?;
+                            for root in &roots {
+                                cost.add(root.len())?;
+                                cost.add(item.source_session_id.len())?;
+                            }
+                            Some(cost.bytes)
+                        })();
+                        prepay_selection(&mut recovery, &mut charged, bytes)?;
+                    }
                     for root in roots {
                         sources_by_root
                             .entry(root)
@@ -2387,6 +2506,26 @@ impl Qualification {
         // need current native siblings to establish acquisition completeness.
         let mut native_by_root = BTreeMap::<String, Vec<&SnapshotItem>>::new();
         if !sources_by_root.is_empty() {
+            if recovery.is_some() {
+                let bytes = (|| {
+                    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+                    heap_layout_bound::tree_nodes::<String, Vec<&SnapshotItem>>(
+                        native.len(),
+                        &mut cost,
+                    )?;
+                    cost.add(
+                        native
+                            .len()
+                            .checked_mul(6)?
+                            .checked_mul(std::mem::size_of::<&SnapshotItem>())?,
+                    )?;
+                    for item in native {
+                        cost.add(claude_snapshot_family_root_ref(item).len())?;
+                    }
+                    Some(cost.bytes)
+                })();
+                prepay_selection(&mut recovery, &mut charged, bytes)?;
+            }
             for item in native {
                 let root = claude_snapshot_family_root(item);
                 if sources_by_root.contains_key(&root) {
@@ -2396,6 +2535,38 @@ impl Qualification {
         }
         let mut candidates = Vec::new();
         for (root, sources) in sources_by_root {
+            if recovery.is_some() {
+                let bytes = self.families.get(&root).and_then(|family| {
+                    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+                    // Includes moved target vectors, all frozen member strings
+                    // and old-plus-new plan ownership before removal below.
+                    family.completed_heap_bound(&mut cost)?;
+                    cost.add(cost.bytes)?;
+                    heap_layout_bound::tree_nodes::<String, PendingComparison>(1, &mut cost)?;
+                    let items = native_by_root.get(&root).map_or(&[][..], Vec::as_slice);
+                    heap_layout_bound::tree_nodes::<String, String>(
+                        family.certified.len().checked_add(items.len())?,
+                        &mut cost,
+                    )?;
+                    for skip in family.certified.values() {
+                        cost.add(skip.member.len())?;
+                        cost.add(skip.revision.len())?;
+                    }
+                    for item in items {
+                        cost.add(item.source_session_id.len())?;
+                        cost.add(item.source_file_fingerprint.as_ref().map_or(0, String::len))?;
+                    }
+                    heap_layout_bound::tree_nodes::<String, ()>(sources.len(), &mut cost)?;
+                    for source in &sources {
+                        cost.add(source.len())?;
+                    }
+                    cost.add(self.revoked_roots.merge_buffer_peak(1)?)?;
+                    cost.add(self.correction_forbidden_roots.merge_buffer_peak(1)?)?;
+                    cost.add(root.len().checked_mul(2)?)?;
+                    Some(cost.bytes)
+                });
+                prepay_selection(&mut recovery, &mut charged, bytes)?;
+            }
             // A possible hit withdraws S before any native attempt. It never
             // becomes an exact owner or renews the frozen prior-P shortcut.
             let Some(family) = self.families.remove(&root) else {
@@ -2481,6 +2652,23 @@ impl Qualification {
             );
         }
         result.queued = candidates.len();
+        if let Some(recovery) = recovery {
+            let paid = recovery.credit.as_mut().ok_or(refusal)?;
+            let mut after = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            self.completed_heap_bound(&mut after).ok_or(refusal)?;
+            candidates.completed_heap_bound(&mut after).ok_or(refusal)?;
+            result.completed_heap_bound(&mut after).ok_or(refusal)?;
+            let owned = paid
+                .allocated()
+                .checked_sub(charged)
+                .and_then(|external| external.checked_sub(before))
+                .and_then(|external| external.checked_add(after.bytes))
+                .ok_or(refusal)?;
+            if !paid.record_allocated(owned) {
+                return Err(refusal);
+            }
+            paid.release_temporary_peak(old_ceiling);
+        }
         Ok((candidates, result))
     }
 

@@ -30,6 +30,12 @@ unknown. No additional timer, retry, persisted field or upload queue is added.
 Prior accepted heads, bindings, names and own-evidence tags remain unchanged.
 New copies are neither committed nor confirmed empty before exact comparison.
 
+An intentional backend-backoff or negotiated-cadence wait starts no scan and
+preserves the prior process grant, window and successful-deferral history.
+Provider errors, policy withdrawal and abandoned actual scans still revoke
+reuse. Losing an older episode on abandonment forces process BASE rather than
+renewing its deferral allowance.
+
 The optional local `DaemonStatus.native_comparison` object contains scalar
 counts only, including deferred families, withheld candidates, candidates with
 no prior local ACK witness, known oldest age, unknown ages and BASE exits.
@@ -39,6 +45,10 @@ observations use absent counts rather than zero. The field is absent while the
 feature is inactive. Status does not walk transcripts or copy an index.
 
 Family-policy and correction descriptors use the existing moving reservation.
+Native hash/Q5 matching scratch, hit grouping and plan construction must also
+be prepaid from that same reservation before allocation, including no-hit
+pages. Temporary matching credit is reconciled only after construction; nested
+latch pricing cannot spend it, and mandatory recovery credit stays protected.
 Metadata refusal declines an optional receipt or selects BASE; it cannot weaken
 an ACK, release a held body or spend mandatory recovery credit. This is not a
 universal finish-stage or process RSS bound.

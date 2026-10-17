@@ -636,6 +636,41 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
             source_cadence_wait(SnapshotSource::ClaudeCode).is_some(),
             "successful real finish must still enforce ordinary cadence"
         );
+        let before_wait_bodies = server.bodies.lock().unwrap().len();
+        for _ in 0..2 {
+            let skipped = crate::agent_status_refresh::with_test_collection(collection(), || {
+                prepare_sync_source(
+                    &client,
+                    &device,
+                    "device-secret",
+                    SnapshotSource::ClaudeCode,
+                    "otm_test",
+                    &fixture.home,
+                    &support,
+                    &daemon,
+                    &mut transport,
+                    witness,
+                    false,
+                )
+            })
+            .unwrap();
+            assert!(
+                skipped.is_none(),
+                "real negotiated cadence performs no scan"
+            );
+            assert!(
+                daemon.native_comparison.retained_valid_for_test(),
+                "a cadence-only prepare must preserve the actual exact-ACK/save grant"
+            );
+            assert_eq!(
+                ScanIndex::load(last_index_path.as_ref().unwrap())
+                    .unwrap()
+                    .generation,
+                saved.generation
+            );
+            assert_eq!(server.bodies.lock().unwrap().len(), before_wait_bodies);
+        }
+        writeln!(std::io::stderr().lock(), "native_comparison_real_cadence: two_actual_prepare_waits=true no_scan_or_upload=true exact_saved_grant_retained=true index_generation_unchanged=true").unwrap();
         completed += 1;
         if cycle == 0 {
             // An ordinary new request, not a forced rearm or fake lease, gives

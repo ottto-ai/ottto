@@ -3971,11 +3971,6 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
-    // Capture before any fallible provider/destination/root work. Dropping an
-    // unfinished frame or returning early revokes reuse for the next cycle.
-    let mut native_comparison_lease = (source == SnapshotSource::ClaudeCode
-        && crate::snapshots::claude_native_comparison::enabled())
-    .then(|| daemon.native_comparison.begin());
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
         // would scan, re-derive and re-POST the same pages it just shed, which is
@@ -3989,6 +3984,12 @@ fn prepare_sync_source(
         );
         return Ok(None);
     }
+    // Capture before fallible provider/destination/root work. Errors and an
+    // abandoned scan revoke reuse; a normal cadence wait returns the untouched
+    // lease below. Backend backoff above starts no preparation at all.
+    let mut native_comparison_lease = (source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_native_comparison::enabled())
+    .then(|| daemon.native_comparison.begin());
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
@@ -4113,6 +4114,9 @@ fn prepare_sync_source(
             source.api_slug(),
             remaining.as_secs()
         );
+        if let Some(lease) = native_comparison_lease.take() {
+            lease.defer_without_scan();
+        }
         return Ok(None);
     }
 

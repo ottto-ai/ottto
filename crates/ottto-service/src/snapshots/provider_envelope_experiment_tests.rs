@@ -4111,8 +4111,10 @@ fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
     );
     let mut credit = crate::source_rotation::PaidReservation::from_remainder(
         Some(crate::source_rotation::PARKED_BUDGET),
-        0,
-        0,
+        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX).unwrap()
+            - std::mem::size_of_val(&qualification),
+        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX).unwrap()
+            - std::mem::size_of_val(&qualification),
     );
     let (targets, selection) = qualification
         .take_target_candidates_after(
@@ -4134,4 +4136,112 @@ fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
     assert_eq!(serde_json::to_vec(&generic).unwrap(), before_body);
     assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_index);
     eprintln!("native_comparison_deferred_unknown: decision_only=true unknown_ids_not_positive=true BASE_required=true new_debt=0 body_index_unchanged=true bootstrap_grant=false physical_liveness_claim=false");
+}
+
+#[test]
+fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation() {
+    if !native_positive_layout_for_test(
+        "native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation",
+    ) {
+        return;
+    }
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    for (hit, pressure, unknown) in [
+        (false, true, false),
+        (true, true, false),
+        (true, false, true),
+        (false, false, false),
+        (true, false, false),
+    ] {
+        let fixture = NativePreparationFixture::new();
+        let mut state = fixture.paused();
+        let healthy = BTreeSet::from([fixture.parent.clone()]);
+        let mut qualification =
+            state.prepare_native_comparison(claude_native_comparison::PairedRows {
+                api: &fixture.api.evidence,
+                trace: &fixture.trace.evidence,
+                healthy_roots: &healthy,
+            });
+        assert_eq!(qualification.certified_member_count(), 2);
+        let mut item = parse_claude_code_jsonl_file(
+            &fixture.dir.join(format!("{}.jsonl", fixture.parent)),
+            WINDOW,
+            hex64('e'),
+        )
+        .unwrap()
+        .remove(0);
+        item.source_session_id = "new-copy".into();
+        if !hit {
+            item.claude_usage_request_ids.clear();
+            item.claude_usage_request_ids
+                .insert("unique-request".into());
+            item.request_count = 1;
+        }
+        let body_before = serde_json::to_vec(&item).unwrap();
+        let mut before = Counter::new(usize::MAX);
+        qualification.completed_heap_bound(&mut before).unwrap();
+        let recovery_bytes = 512;
+        let limit = if pressure {
+            before.bytes + recovery_bytes
+        } else {
+            crate::source_rotation::PARKED_BUDGET
+        };
+        let mut paid = crate::source_rotation::PaidReservation::from_remainder(
+            Some(limit),
+            before.bytes,
+            before.bytes,
+        );
+        assert!(paid.as_mut().unwrap().reserve_recovery(recovery_bytes));
+        if unknown {
+            paid.as_mut().unwrap().at_turn(None);
+        }
+        let owner = std::sync::Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+        let mut lease = owner.begin();
+        lease.bind("logical-matching-budget".into());
+        let (outcome, allocations) = crate::retry_allocation_probe::measure(|| {
+            qualification.take_target_candidates_after(
+                std::slice::from_ref(&item),
+                0,
+                0,
+                &[],
+                8,
+                Some(&mut claude_native_comparison::RecoveryBudget {
+                    previous: &fixture.index,
+                    credit: &mut paid,
+                    lease: &mut lease,
+                }),
+            )
+        });
+        if pressure || unknown {
+            assert!(outcome.is_err());
+            assert_eq!(
+                allocations.allocations, 0,
+                "refuse before hash/Q5/group allocation, even without a hit"
+            );
+            assert_eq!(qualification.certified_member_count(), 2);
+            assert_eq!(paid.as_ref().unwrap().allocated(), before.bytes);
+        } else {
+            let (targets, selection) = outcome.unwrap();
+            assert!(targets.is_empty());
+            assert_eq!(selection.matched_roots > 0, hit);
+            assert_eq!(!selection.unresolved_sources.is_empty(), hit);
+            if !hit {
+                let mut after = Counter::new(usize::MAX);
+                qualification.completed_heap_bound(&mut after).unwrap();
+                targets.completed_heap_bound(&mut after).unwrap();
+                selection.completed_heap_bound(&mut after).unwrap();
+                assert_eq!(
+                    paid.as_ref().unwrap().allocated(),
+                    after.bytes,
+                    "scratch is released; only the conservative returned graph remains charged"
+                );
+            }
+        }
+        assert_eq!(
+            paid.as_ref().unwrap().recovery_bytes_for_test(),
+            recovery_bytes
+        );
+        assert_eq!(serde_json::to_vec(&item).unwrap(), body_before);
+        eprintln!("native_comparison_matching_budget: hit={hit} pressure={pressure} unknown={unknown} refused_before_alloc={} protected_recovery={recovery_bytes} input_unchanged=true", pressure || unknown);
+    }
 }

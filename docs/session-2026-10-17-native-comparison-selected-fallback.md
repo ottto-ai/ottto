@@ -26,6 +26,24 @@ this cut.
 
 ## Hosted layout boundary correction
 
+The corrected containing head041c4d86 passed all four checks in automatic
+CI39075336290; service2998passed/0failed/25ignored. Actual unsupported-layout
+BASE body parity and zero-certificate/no-new-debt checks ran. Positive reuse
+branches were explicitly UNEXECUTED on that compiler, with supported-toolchain
+evidence kept separate.
+
+Strict discovery returned two source-confirmed P2 findings but its report was
+invalid because code locations used absolute paths. It is not a clean review.
+The direct corrections preserve lifecycle state on intentional cadence waits
+and prepay native matching workspace before constructing hash/Q5/grouping
+collections. New regressions cover cadence/history preservation, actual
+prepare skips after exact ACK/save, pre-allocation refusal for hit/no-hit and
+unknown remainder, and protected recovery credit. The targeted supported
+Rust1.95 group passed90/0 with one historical oracle ignored, and affected
+Clippy passed. No resource benchmark was repeated. Corrected containing CI and
+the remaining focused sensitive review are pending; no further discovery is
+claimed. Final exact-head domain and parent approval remain required.
+
 Automatic CI39073854411 at f791b5a5 compiled and passed Clippy, public surface,
 dependency review and audit; service runtime was2969passed/29failed/25ignored.
 Individual mapping found28 positive-layout fixture preconditions attempted on

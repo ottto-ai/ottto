@@ -170,6 +170,27 @@ impl Lifecycle {
 }
 
 impl Lease {
+    /// No scan or context binding occurred. An intentional cadence wait is not
+    /// an abandoned scan: return the exact pre-prepare state without minting
+    /// a grant, clearing a latch or renewing a successful-deferral allowance.
+    pub(crate) fn defer_without_scan(mut self) {
+        if self.scope.is_none() && !self.selected_save && !self.policy_hit {
+            if let Ok(mut state) = self.owner.state.lock() {
+                if self.generation == Some(state.generation) && state.scope.is_none() {
+                    state.scope = self.previous_scope.take();
+                    state.valid = self.previous_valid && !state.admission_refused;
+                    state.window = self.window.take();
+                    state.policy = std::mem::take(&mut self.policy);
+                    state.published_policy = state.policy.summary();
+                    state.policy_in_flight = false;
+                    self.finished = true;
+                }
+            }
+        }
+        // A bound/changed/stale lease still follows the ordinary fail-closed
+        // Drop path; only an untouched preparation can restore its old state.
+    }
+
     pub(crate) fn early_evidence_roots(&self) -> impl Iterator<Item = &str> + Clone {
         self.window.as_ref().into_iter().flat_map(|window| {
             window.roots.keys().map(String::as_str).chain(
@@ -383,6 +404,10 @@ impl Drop for Lease {
                     // Save/offer failure after C3 still requires the next page
                     // to be BASE. Other abandoned leases revoke all ephemeral
                     // state; their existing durable A rearm is authoritative.
+                    // Forgetting an older episode cannot renew the per-process
+                    // successful-deferral bound after an unrelated failed scan.
+                    state.admission_refused |=
+                        !self.policy_hit && self.policy.summary().episode_history;
                     state.policy = if self.policy_hit {
                         std::mem::take(&mut self.policy)
                     } else {
@@ -394,6 +419,49 @@ impl Drop for Lease {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn native_comparison_cadence_wait_keeps_grant_and_deferral_history() {
+    // Logical lifecycle oracle only: no claim of native/bootstrap eligibility.
+    let owner = Arc::new(Lifecycle::default());
+    let mut initial = owner.begin();
+    initial.bind("same-context".into());
+    initial.policy.families.push((
+        "bounded-family".into(),
+        FamilyPolicy {
+            successful_deferrals: 2,
+            base_exit: true,
+            latched: true,
+            ..Default::default()
+        },
+    ));
+    initial.note_selected_save(true);
+    initial.finish(true);
+    for _ in 0..3 {
+        owner.begin().defer_without_scan();
+        assert!(owner.retained_valid_for_test());
+        assert_eq!(owner.status().base_exit_family_count, Some(1));
+        assert!(!owner.status().in_flight);
+    }
+    let mut actual_scan = owner.begin();
+    actual_scan.bind("same-context".into());
+    assert!(actual_scan.allowed());
+    assert_eq!(actual_scan.policy.families[0].1.successful_deferrals, 2);
+    assert!(actual_scan.policy.blocked("bounded-family"));
+    drop(actual_scan); // Actual abandonment still revokes, unlike a cadence wait.
+    assert!(!owner.retained_valid_for_test());
+    assert!(
+        owner.status().process_base_exit,
+        "abandonment must not renew an older episode's per-process bound"
+    );
+
+    let skipped = owner.begin();
+    owner.discard_retained(); // A racing reset cannot be undone by the old lease.
+    skipped.defer_without_scan();
+    assert!(!owner.retained_valid_for_test());
+    eprintln!("native_comparison_cadence: logical_lifecycle=true three_waits_preserve_grant_and_success_bound=true actual_abandonment_revokes=true stale_wait_cannot_restore=true");
 }
 
 #[cfg(test)]
