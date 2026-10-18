@@ -1025,7 +1025,7 @@ impl SessionStartState {
             .and_then(Path::to_str)
             .map(|dir| dir.trim_end_matches('/'));
         let mut trust_relative = str_at(record, "cwd")
-            .is_none_or(|dir| Some(dir.trim_end_matches('/')) == session_dir)
+            .map_or(true, |dir| Some(dir.trim_end_matches('/')) == session_dir)
             && match record.get("command") {
                 Some(Value::String(command)) => !shell_changes_directory(command),
                 Some(Value::Array(parts)) => !parts
@@ -2122,11 +2122,22 @@ mod tests {
             }
             if source == SnapshotSource::ClaudeCode {
                 // The parser resolves responses at finish; replay them.
-                for response in parser.claude_responses.values() {
+                let mut responses = parser
+                    .claude_responses
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                responses.sort_by_key(|response| response.sequence);
+                for response in responses
+                    .into_iter()
+                    .filter_map(|response| response.resolve())
+                {
                     shadow.note_claude_response(
                         response.sequence,
                         &response.usage,
-                        response.usage.effective_input_context(),
+                        response
+                            .computed_effective_input_context
+                            .unwrap_or_else(|| response.usage.effective_input_context()),
                         response.tool_uses.len(),
                     );
                 }
