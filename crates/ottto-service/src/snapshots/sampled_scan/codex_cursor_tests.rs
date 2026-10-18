@@ -339,6 +339,43 @@ fn overlong_envelope_row() -> Vec<u8> {
     .into_bytes()
 }
 
+/// E1 + E4: a withheld final record applied at a genuine EOF matches a
+/// read without an extent applying its trailing line, for a valid, a
+/// malformed and an overlong record (whose salvage E4 took early).
+#[test]
+fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
+    for last in [
+        br#"{"n":3}"#.to_vec(),
+        br#"{"n":"#.to_vec(),
+        overlong_envelope_row(),
+    ] {
+        let mut input = b"{\"n\":1}\n{\"n\":2}\n".to_vec();
+        input.extend_from_slice(&last);
+        let read = |cursor: bool| {
+            let mut reader =
+                BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()), 96, true);
+            if cursor {
+                reader.set_chunked_skip(32);
+                reader.set_extent_limit(input.len() as u64);
+            }
+            let mut seen = Vec::new();
+            while !matches!(
+                reader.step(|value| seen.push(value.clone())).unwrap(),
+                JsonlReaderStep::Complete(_)
+            ) {}
+            if cursor {
+                assert!(reader.sealed_fragment());
+                assert!(reader.apply_sealed_fragment(|value| seen.push(value.clone())));
+                assert!(!reader.sealed_fragment());
+                assert!(reader.buf.is_empty());
+                assert!(!reader.apply_sealed_fragment(|_| panic!("applied once")));
+            }
+            (seen, reader.report)
+        };
+        assert_eq!(read(true), read(false));
+    }
+}
+
 /// E4 (R2-H2): a paused cursor skip holds no prefix byte, so a pause never
 /// charges the salvage prefix, and its salvage (taken from the capped
 /// prefix when the skip first paused) is the envelope an unchunked read
@@ -1888,17 +1925,22 @@ fn live_job_charge_is_estimated_between_bounded_walks() {
     );
 }
 
-/// N2 (R1-B2): a quiescent file larger than B whose last record has no
-/// newline. The sealed cursor completion certifies `[0, s)` and never counts
-/// that record, but stages debt and records only `[0, s)` as read, so the next
-/// page tails it with main's EOF behavior: a valid record is counted once
-/// (matching main's unpaged read) and stays unverified with debt; a
-/// malformed one is reported as a line loss.
+/// E1 (R1-B1 = R2-B2): a quiescent file larger than B whose last record has
+/// no newline. At a genuine unchanged EOF (held FD stamp equal to the open
+/// stamp, reader at that extent) the job applies the buffered record with
+/// main's trailing-line rule, reading no byte: a valid record is counted
+/// once, on the certified page, and the file is verified like main's full
+/// read, so later pages skip it, also past the audit interval. No copy is
+/// kept: the applied record lies past the certified prefix `[0, s)`, so
+/// every such job is non-retainable and converges through the index alone.
+/// A malformed record is reported as a line loss.
 #[test]
-fn quiescent_unterminated_last_record_is_tailed_with_main_eof_behavior() {
+fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let clock = TestClock;
+    let interval = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
     let valid = {
         let mut line = token_line(41);
         line.pop();
@@ -1914,47 +1956,119 @@ fn quiescent_unterminated_last_record_is_tailed_with_main_eof_behavior() {
         let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
         let cache = Arc::new(SharedCache::default());
         with_test_limits(2048, 4096, 64, || {
+            let mut now = 1_900_000_000_u64;
             let mut index = ScanIndex::default();
-            let mut certified_page = None;
-            let mut after = Vec::new();
+            let mut completed = None;
             let mut malformed_lines = 0;
-            for page_number in 0..64 {
+            for _ in 0..64 {
+                clock.set(now);
                 let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
                 index = next;
-                if let Some(certified) = certified_page {
-                    malformed_lines += scan.malformed_json_line_count;
-                    if !scan.snapshots.is_empty() {
-                        after.push(fingerprints(&scan));
-                    }
-                    if page_number > certified + 3 {
-                        break;
-                    }
-                } else if counter(&cache, |c| c.jobs_certified) == 1 {
-                    certified_page = Some(page_number);
-                    assert!(
-                        index
-                            .files
-                            .get(&key)
-                            .is_some_and(ScanIndexEntry::has_unverified_source),
-                        "{case}: the withheld record is owed"
-                    );
+                malformed_lines += scan.malformed_json_line_count;
+                // A lossy (malformed) job ends uncertified, like main's
+                // lossy full read.
+                if counter(&cache, |c| c.jobs_certified + c.jobs_uncertified) == 1 {
+                    completed = Some(scan);
+                    break;
                 }
+                assert!(
+                    scan.snapshots.is_empty(),
+                    "{case}: a paused job publishes nothing"
+                );
+                now += 10;
             }
-            assert!(certified_page.is_some(), "{case}: {}", counters(&cache));
-            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 1, "{case}");
-            if case == "valid" {
-                assert_eq!(counter(&cache, |c| c.jobs_started), 1, "{case}: no loop");
-                assert_eq!(after, vec![fingerprints(&unpaged)], "{case}: counted once");
-                assert!(index
-                    .files
-                    .get(&key)
-                    .is_some_and(ScanIndexEntry::has_unverified_source));
-            } else {
+            let completed = completed.unwrap_or_else(|| panic!("{case}: {}", counters(&cache)));
+            assert_eq!(counter(&cache, |c| c.eof_record_applied), 1, "{case}");
+            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 0, "{case}");
+            assert!(cache.retained_checkpoint(&key).is_none(), "{case}: no copy");
+            if case == "malformed" {
+                assert_eq!(counter(&cache, |c| c.jobs_uncertified), 1, "{case}");
                 assert!(unpaged.malformed_json_line_count > 0, "main reports it");
                 assert!(malformed_lines > 0, "{case}: the loss is reported");
+                return;
             }
+            assert_eq!(counter(&cache, |c| c.jobs_certified), 1, "{case}");
+            assert_eq!(
+                fingerprints(&completed),
+                fingerprints(&unpaged),
+                "{case}: counted once, on the certified page"
+            );
+            assert!(
+                !index
+                    .files
+                    .get(&key)
+                    .is_some_and(ScanIndexEntry::has_unverified_source),
+                "{case}: verified like main's full read"
+            );
+            // No debt was staged, so crossing the audit interval re-reads
+            // nothing: the size decision skips the file.
+            for _ in 0..3 {
+                now += interval + 1;
+                clock.set(now);
+                let (next, scan, modes) =
+                    page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+                index = next;
+                assert!(scan.snapshots.is_empty(), "{case}: skipped");
+                assert_eq!(modes, (0, 0), "{case}: no read");
+            }
+            assert_eq!(counter(&cache, |c| c.jobs_started), 1, "{case}: no re-read");
         });
     }
+}
+
+/// E1: a file that grew during the job keeps its unterminated record
+/// withheld (the held FD is no longer the opened object); the next page
+/// tails it from `s`, so it is counted once, after its newline.
+#[test]
+fn grown_unterminated_last_record_stays_withheld() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let mut last = token_line(41);
+    last.pop();
+    fixture.append(SESSION, &last);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 4096, 64, || {
+        let mut index = ScanIndex::default();
+        let mut appended = false;
+        for _ in 0..64 {
+            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+            if !appended {
+                // Complete the record past the job's frozen extent.
+                fixture.append(SESSION, b"\n");
+                fixture.append(SESSION, &token_line(42));
+                appended = true;
+            }
+        }
+        assert!(appended);
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert_eq!(counter(&cache, |c| c.eof_record_applied), 0, "withheld");
+        let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+        let mut last_published = None;
+        for _ in 0..4 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if !scan.snapshots.is_empty() {
+                last_published = Some(fingerprints(&scan));
+            }
+        }
+        assert_eq!(
+            last_published,
+            Some(fingerprints(&unpaged)),
+            "the tail counts the record once"
+        );
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+    });
 }
 
 /// K7 as pure state: oldest waiter first, never-served files ahead of served

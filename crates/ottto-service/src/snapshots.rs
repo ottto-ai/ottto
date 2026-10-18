@@ -17330,6 +17330,11 @@ impl ParsedJsonlFile {
 
 // The native file parser owns all state needed between physical-line steps.
 // Finalization is separate: a line step is never file or upload authority.
+/// The reader `OwnedJsonlParser` owns (named once for `with_line_sink`).
+type ParserReader = BoundedJsonlReader<OpenedInput>;
+/// The parser's one per-line sink, as `with_line_sink` lends it.
+type LineSink<'a> = &'a mut dyn FnMut(&Value);
+
 struct OwnedJsonlParser {
     reader: BoundedJsonlReader<OpenedInput>,
     accumulator: SnapshotAccumulator,
@@ -17419,14 +17424,31 @@ impl OwnedJsonlParser {
     fn step(&mut self) -> Result<bool> {
         self.step_with_observer(|_| {})
     }
-    fn step_with_observer(&mut self, mut observe: impl FnMut(&Value)) -> Result<bool> {
+    fn step_with_observer(&mut self, observe: impl FnMut(&Value)) -> Result<bool> {
+        let step = self.with_line_sink(observe, |reader, sink| reader.step(sink))?;
+        Ok(matches!(step, JsonlReaderStep::Complete(_)))
+    }
+
+    /// E1: at a genuine unchanged EOF (proved by the cursor caller), apply a
+    /// withheld final record through the same line sink as every other line.
+    fn apply_sealed_fragment(&mut self) -> bool {
+        self.with_line_sink(|_| {}, |reader, sink| reader.apply_sealed_fragment(sink))
+    }
+
+    /// Run `drive` with the parser's one line sink (observer, tier replay,
+    /// usage-shape counters, `apply_line`).
+    fn with_line_sink<T>(
+        &mut self,
+        mut observe: impl FnMut(&Value),
+        drive: impl FnOnce(&mut ParserReader, LineSink<'_>) -> T,
+    ) -> T {
         let source = self.source;
         let accumulator = &mut self.accumulator;
         let recognized_usage_drop_count = &mut self.recognized_usage_drop_count;
         let positive_recognized_usage_count = &mut self.positive_recognized_usage_count;
         let positive_usage_evidence = &mut self.positive_usage_evidence;
         let apply_line = self.apply_line;
-        let step = self.reader.step(|value| {
+        let mut sink = |value: &Value| {
             observe(value);
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.observe(value);
@@ -17443,8 +17465,8 @@ impl OwnedJsonlParser {
                 *positive_usage_evidence |= json_has_positive_usage_evidence(value);
             }
             apply_line(value, accumulator);
-        })?;
-        Ok(matches!(step, JsonlReaderStep::Complete(_)))
+        };
+        drive(&mut self.reader, &mut sink)
     }
     #[allow(clippy::too_many_arguments)]
     fn finish(
@@ -17486,7 +17508,7 @@ impl OwnedJsonlParser {
         // Present only for a cursor job whose prefix certificate passed (S12).
         let sealed_prefix = bounded.sealed_prefix;
         // A cursor read withheld an unterminated final record (N2).
-        let sealed_fragment = bounded.sealed_fragment;
+        let sealed_fragment = bounded.sealed_fragment.is_some();
         let mut ownership_incomplete_file_count = 0;
         // The bounded reader cannot prove that a skipped physical line contained
         // no usage. Account one potential recognized usage record per line while
@@ -18046,10 +18068,14 @@ struct BoundedJsonlReader<R> {
     /// Physical bytes consumed from `reader`, including skipped bytes.
     consumed: u64,
     last_line_end: u64,
-    /// A frozen-extent read ended on an unterminated record. Those bytes were
-    /// neither delivered nor counted as a line, even when nothing past the
-    /// extent was visible yet.
-    sealed_fragment: bool,
+    /// A frozen-extent read ended on an unterminated record:
+    /// `Some((overflowed, early salvage))`. Those bytes were neither
+    /// delivered nor counted as a line, even when nothing past the extent was
+    /// visible yet. `buf` keeps them (bounded by `max_line_bytes`, the
+    /// salvage prefix when overflowed, unless E4 already took it) so a
+    /// genuine unchanged EOF can apply them with main's trailing-line rule
+    /// (E1).
+    sealed_fragment: Option<(bool, Option<EarlySalvage>)>,
     /// Set only after a cursor job's prefix certificate passed against its
     /// held FD: the identity `finish` may accept for a grown object (S12).
     sealed_prefix: Option<sampled_scan::codex_cursor::SealedPrefix>,
@@ -18071,7 +18097,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             extent_limit: None,
             consumed: 0,
             last_line_end: 0,
-            sealed_fragment: false,
+            sealed_fragment: None,
             sealed_prefix: None,
         }
     }
@@ -18105,7 +18131,27 @@ impl<R: BufRead> BoundedJsonlReader<R> {
     }
 
     fn sealed_fragment(&self) -> bool {
-        self.sealed_fragment
+        self.sealed_fragment.is_some()
+    }
+
+    /// E1, genuine unchanged EOF only (the caller proves it): apply the
+    /// withheld final record from the bytes already buffered, exactly as a
+    /// read without an extent applies its trailing line. No byte is read.
+    fn apply_sealed_fragment(&mut self, mut on_value: impl FnMut(&Value)) -> bool {
+        let Some((overflowed, early)) = self.sealed_fragment.take() else {
+            return false;
+        };
+        apply_physical_line(
+            &mut self.buf,
+            &mut self.report,
+            overflowed,
+            early,
+            self.max_line_bytes,
+            self.salvage_codex_envelope,
+            &mut on_value,
+        );
+        self.buf.clear();
+        true
     }
 
     fn step(&mut self, on_value: impl FnMut(&Value)) -> std::io::Result<JsonlReaderStep> {
@@ -18124,8 +18170,9 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         let result = self.read_step(on_value);
         // Values have been consumed synchronously and dropped. Retain only the
         // existing buffer capacity; no logical raw row survives this return.
-        // A paused overlong skip keeps no bytes (E4).
-        if self.skipping.is_none() {
+        // A paused overlong skip keeps no bytes (E4); a withheld final
+        // record keeps its bounded bytes (E1).
+        if self.skipping.is_none() && self.sealed_fragment.is_none() {
             self.buf.clear();
         }
         if let Err(error) = &result {
@@ -18225,7 +18272,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             // no byte beyond the extent is visible yet. It is never parsed,
             // counted or certified. Reads without an extent keep the normal
             // trailing-line behavior below, byte-identical to before.
-            self.sealed_fragment = true;
+            self.sealed_fragment = Some((overflowed, early));
             self.finished = true;
             return Ok(JsonlReaderStep::Complete(*report));
         }

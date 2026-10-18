@@ -432,6 +432,9 @@ pub(in crate::snapshots) struct Counters {
     /// A completion on a file that did not grow withheld an unterminated
     /// final record (N2): debt staged, the record left to main's EOF path.
     pub(in crate::snapshots) sealed_fragment_withheld: u64,
+    /// E1: a completion at genuine unchanged EOF applied its withheld final
+    /// record with main's trailing-line rule (strict finish identity).
+    pub(in crate::snapshots) eof_record_applied: u64,
     /// E2: a paused job ended because its path no longer named the held
     /// object or its evidence stayed unavailable for `UNAVAILABLE_RESUMES`.
     pub(in crate::snapshots) jobs_unavailable_ended: u64,
@@ -444,8 +447,8 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
     jobs_lost, jobs_deferred_inputs, jobs_start_unstartable, jobs_audit_restarted,
     jobs_finish_failed, jobs_frame_returned, deferred, deferred_rotation,
     deferred_next_generation, namespace_busy, cursor_disabled_unsupported_layout, audit_overdue,
-    audit_overdue_max_age_seconds, sealed_fragment_withheld, jobs_unavailable_ended,
-    memo_hits, memo_records, parked_hits);
+    audit_overdue_max_age_seconds, sealed_fragment_withheld, eof_record_applied,
+    jobs_unavailable_ended, memo_hits, memo_records, parked_hits);
 
 /// A `JoinStateBound` file waits here until its object or reduction
 /// dependencies change. Its job ran out of a build constant
@@ -1005,6 +1008,24 @@ pub(in crate::snapshots) fn finish_job(
     let grown = held
         .as_ref()
         .is_some_and(|held| held.extent > meta.stamp_open.extent);
+    // E1 (K4 amendment, parent ACK): at a genuine unchanged physical EOF (the
+    // held FD is exactly the opened object: dev, ino, length, mtime, ctime;
+    // and this read reached that length), the withheld final record is
+    // applied from the bytes already buffered, with main's trailing-line
+    // rule. No byte is read. Such a job gets no S12 grant below: strict
+    // finish identity covers the trailing bytes, so an append or replacement
+    // before publication refuses as on main. A grown file keeps it withheld.
+    let read_end = job
+        .parser
+        .reader
+        .acquisition
+        .as_ref()
+        .map_or(0, crate::transcript_acquisition::ReadPlan::start_offset)
+        .saturating_add(job.parser.reader.consumed_bytes());
+    let eof_applied = job.parser.reader.sealed_fragment()
+        && held.as_ref() == Some(&meta.stamp_open)
+        && read_end == meta.stamp_open.extent
+        && job.parser.apply_sealed_fragment();
     let parser = &mut job.parser;
     let lossy = parser.reader.lossy_prefix()
         || parser.reader.failure.is_some()
@@ -1076,6 +1097,9 @@ pub(in crate::snapshots) fn finish_job(
             if fragment.is_some() {
                 cursor.counters.sealed_fragment_withheld += 1;
             }
+            if eof_applied {
+                cursor.counters.eof_record_applied += 1;
+            }
         }
         Err(Some(PrefixRefusal::AuditDue)) => cursor.counters.jobs_audit_restarted += 1,
         Err(None) => cursor.counters.jobs_deferred_inputs += 1,
@@ -1092,7 +1116,7 @@ pub(in crate::snapshots) fn finish_job(
             cache.with_cursor(update);
         }
     }
-    if result.is_ok() {
+    if result.is_ok() && !eof_applied {
         // Only a passed certificate grants `finish` a grown object (S12).
         // A lossy (uncertified) job keeps main's strict finish identity:
         // if its file grew, the publication fails and the pending path
