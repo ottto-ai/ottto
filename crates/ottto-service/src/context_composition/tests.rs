@@ -394,7 +394,7 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
             "synthetic-secret",
             "synthetic-machine",
             &api,
-            &home,
+            std::slice::from_ref(&transcripts),
             &support,
             source,
         )
@@ -532,7 +532,7 @@ fn measure_synthetic_workspace() {
     };
     let start = Instant::now();
     let scans = discover_workspaces(
-        &root.join("transcripts"),
+        &[root.join("transcripts")],
         SystemTime::now(),
         Instant::now() + Duration::from_secs(300),
     )
@@ -1279,18 +1279,67 @@ fn discovery_incomplete_transcript_refuses_partial_workspace_set() {
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
-    let scans = discover_workspaces(&transcripts, SystemTime::now(), deadline).unwrap();
+    let roots = [transcripts.clone()];
+    let scans = discover_workspaces(&roots, SystemTime::now(), deadline).unwrap();
     assert_eq!(scans.len(), 1);
     assert_eq!(scans[0].workspace, workspace);
     fs::write(transcripts.join("unresolved.jsonl"), b"\xff\n").unwrap();
-    assert!(discover_workspaces(&transcripts, SystemTime::now(), deadline).is_err());
+    assert!(discover_workspaces(&roots, SystemTime::now(), deadline).is_err());
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn discovery_expired_budget_is_not_complete_empty_coverage() {
     let root = crate::test_scratch::private_dir("composition-discovery-expired");
-    assert!(discover_workspaces(&root, SystemTime::now(), Instant::now()).is_err());
+    assert!(discover_workspaces(&[root.clone()], SystemTime::now(), Instant::now()).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn discovery_spans_registered_roots_and_counts_each_transcript_once() {
+    let root = crate::test_scratch::private_dir("composition-discovery-roots");
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let default_root = root.join("default/projects");
+    let slot_root = root.join("slot/projects");
+    for dir in [&default_root, &slot_root] {
+        fs::create_dir_all(dir.join("-workspace")).unwrap();
+    }
+    let record = json!({"cwd": workspace}).to_string();
+    fs::write(default_root.join("-workspace/default-only.jsonl"), &record).unwrap();
+    fs::write(slot_root.join("-workspace/slot-only.jsonl"), &record).unwrap();
+    // The same session copied into both folders counts once: the newest copy.
+    let older = default_root.join("-workspace/copied.jsonl");
+    let newer = slot_root.join("-workspace/copied.jsonl");
+    fs::write(&older, &record).unwrap();
+    fs::write(&newer, &record).unwrap();
+    set_mtime(&older, SystemTime::now() - Duration::from_secs(60));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let scans = discover_workspaces(
+        &[default_root.clone(), slot_root.clone()],
+        SystemTime::now(),
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(scans.len(), 1);
+    let mut files = scans[0]
+        .files
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            default_root.join("-workspace/default-only.jsonl"),
+            newer,
+            slot_root.join("-workspace/slot-only.jsonl"),
+        ]
+    );
+    // The default folder alone is the pre-registration view.
+    let default_only = discover_workspaces(&[default_root], SystemTime::now(), deadline).unwrap();
+    assert_eq!(default_only[0].files.len(), 2);
     fs::remove_dir_all(root).unwrap();
 }
 
