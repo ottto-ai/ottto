@@ -3349,13 +3349,18 @@ mod tests {
     }
 
     /// A retained slot snapshot uses the same gate as the cache serve path:
-    /// the unused-account gate (38-42 min), also for a binding unused for
+    /// the unused-account gate plus one collection interval, also for a binding unused for
     /// hours (there is no longer idle slot).
     #[test]
     #[serial_test::serial]
     fn retained_snapshot_freshness_uses_the_unused_account_gate() {
         let harness = VariantHarness::new("idle-snapshot");
         let now = OffsetDateTime::now_utc();
+        let deadline = super::super::claude_oauth_usage_serve_gate_seconds(
+            harness.account,
+            harness.organization,
+            now.unix_timestamp() as u64,
+        );
         let snapshot_at = |age: u64| ottto_protocol::ClaudeConfigSlotQuotaSnapshotV1 {
             state: ottto_protocol::ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
             captured_at: rfc3339(now.unix_timestamp() as u64 - age),
@@ -3371,8 +3376,8 @@ mod tests {
                 now,
             )
         };
-        assert!(fresh(30 * 60), "30 min is inside the 38-42 min gate");
-        assert!(!fresh(45 * 60), "45 min is past the 38-42 min gate");
+        assert!(fresh(deadline), "the display deadline is inclusive");
+        assert!(!fresh(deadline + 1), "the collection allowance is bounded");
         write_claude_read_schedule(
             &harness.state_dir(),
             &ClaudeReadSchedule {
@@ -3381,7 +3386,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!fresh(45 * 60), "unused for hours: the same gate");
+        assert!(!fresh(deadline + 1), "unused for hours: the same deadline");
     }
 
     #[test]
