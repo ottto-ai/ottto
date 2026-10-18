@@ -43,6 +43,7 @@ pub(crate) struct NegativeView<'a> {
 pub(crate) struct FoldView<'a> {
     pub(super) negatives: Option<NegativeView<'a>>,
     native_window: Option<&'a str>,
+    pub(super) lease: Option<&'a lifecycle::Lease>,
 }
 impl FoldView<'_> {
     pub(super) fn native_census_complete(&self, scan: &SourceScanResult) -> bool {
@@ -59,6 +60,7 @@ impl Completion {
         FoldView {
             negatives: self.negatives(lease),
             native_window: self.native_window(),
+            lease,
         }
     }
     pub(crate) fn negatives<'a>(

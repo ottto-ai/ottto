@@ -3739,6 +3739,9 @@ impl SourcePreparation {
                                 &mut self.native_comparison_reservation,
                             ) {
                                 Ok(controller) => {
+                                    if let Some(lease) = self.native_comparison_lease.as_ref() {
+                                        lease.diagnostic.update(|d| d.controller_created = true);
+                                    }
                                     self.native_comparison_controller = Some(controller)
                                 }
                                 Err(_) => {
@@ -3990,6 +3993,14 @@ fn prepare_sync_source(
     let mut native_comparison_lease = (source == SnapshotSource::ClaudeCode
         && crate::snapshots::claude_native_comparison::enabled())
     .then(|| daemon.native_comparison.begin());
+    if source == SnapshotSource::ClaudeCode && native_comparison_lease.is_none() {
+        let diagnostic = crate::local_resource_diagnostics::NativeDecision::new();
+        diagnostic.update(|d| {
+            d.outcome =
+                crate::local_resource_diagnostics::NativeDecisionOutcome::DisabledBeforeLease
+        });
+        diagnostic.emit();
+    }
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
@@ -4525,6 +4536,11 @@ fn finish_sync_source(
                     evidence.frozen_roots_are_current(support_dir, controller.required_roots())
                 })
         });
+    if let Some(lease) = native_comparison_lease.as_ref() {
+        lease
+            .diagnostic
+            .update(|d| d.controller_current_at_finish = Some(comparison_current));
+    }
     if !comparison_current {
         if let Some(lease) = native_comparison_lease.as_mut() {
             lease.revoke();
@@ -4634,6 +4650,21 @@ fn finish_sync_source(
             crate::snapshots::claude_native_comparison::actual_native_conjunction(&disposition)
                 && !census_withheld
                 && scan_result.census_complete;
+        if let Some(lease) = native_comparison_lease.as_ref() {
+            let c = &disposition.duplicate_census;
+            lease.diagnostic.update(|d| {
+                d.bootstrap = Some(crate::local_resource_diagnostics::NativeBootstrap {
+                    native_census_complete: c.census_complete,
+                    coverage_complete: c.coverage_complete,
+                    census_valid: !c.census_invalid,
+                    fence_open: !c.fence_after,
+                    pending_occurrences_present: c.pending_occurrence_count > 0,
+                    transcript_ownership_complete: disposition.transcript_ownership_complete,
+                    scan_census_complete: scan_result.census_complete,
+                    not_withheld: !census_withheld,
+                })
+            });
+        }
         claude_authority_disposition = disposition;
         if census_withheld {
             backfill_succeeded = false;
@@ -5475,7 +5506,7 @@ fn finish_sync_source(
             .is_some_and(|lease| lease.allowed())
     {
         if let Some(comparison) = comparison_completion.as_mut() {
-            comparison.note_native_corrections_after_save(
+            let mint = comparison.note_native_corrections_after_save(
                 &index,
                 &committed_index,
                 |fp, witness| {
@@ -5495,9 +5526,15 @@ fn finish_sync_source(
                     }
                 },
             );
+            if let Some(lease) = native_comparison_lease.as_ref() {
+                lease.diagnostic.update(|d| d.correction_mint = Some(mint));
+            }
         }
     }
     if let Some(lease) = native_comparison_lease.as_mut() {
+        lease
+            .diagnostic
+            .update(|d| d.upload_fully_settled = Some(upload_fully_settled));
         lease.note_policy_settled(
             scan_result.census_complete,
             upload_fully_settled
