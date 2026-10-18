@@ -1289,6 +1289,10 @@ mod provider_envelope_experiment_tests {
     include!("provider_envelope_experiment_tests.rs");
 }
 
+mod witness_reconstruct_scope {
+    include!("witness_reconstruct_scope_tests.rs");
+}
+
 #[test]
 fn p12_experimental_base_exit_duplicate_fence_full_coverage_oracle() {
     let scope = envelope_selection_experiment::Scope::restart();
