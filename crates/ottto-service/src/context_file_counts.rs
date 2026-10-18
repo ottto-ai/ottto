@@ -97,6 +97,20 @@ pub(crate) fn salted_content_hash(salt: &[u8; 32], bytes: &[u8]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+/// The device salt for collectors without a support-dir handle (the snapshot
+/// pass), read once per process. Tests use a fixed salt and touch no files.
+pub(crate) fn device_salt() -> Option<[u8; 32]> {
+    #[cfg(test)]
+    {
+        Some([0x5a; 32])
+    }
+    #[cfg(not(test))]
+    {
+        static SALT: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+        *SALT.get_or_init(|| load_or_create_salt(&ottto_core::default_support_dir()))
+    }
+}
+
 pub(crate) fn load_or_create_salt(support_dir: &Path) -> Option<[u8; 32]> {
     let dir = support_dir.join("context-footprint");
     fs::create_dir_all(&dir).ok()?;

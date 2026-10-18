@@ -755,6 +755,7 @@ mod tests {
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
+            session_start: None,
             model_usage,
             usage_buckets: Vec::new(),
             cost: None,

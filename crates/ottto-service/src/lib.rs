@@ -15,6 +15,7 @@ pub(crate) mod claude_status_coverage;
 pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;
+mod codex_prelude;
 pub mod codex_prelude_footprint;
 mod codex_process_homes;
 mod codex_scan_diagnostics;
