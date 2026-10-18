@@ -3318,6 +3318,13 @@ fn upload_local_health_projection_reporting(
     machine_id: &str,
     daemon: &LocalDaemon,
 ) -> Result<()> {
+    if let Some(remaining) =
+        setup_run_refresh_hold_remaining(&setup_run_refresh_binding(device, device_secret))
+    {
+        // No request at all while held: the last `AuthRejected` upload event
+        // stays the latest one, so local health keeps reporting the rejection.
+        return Err(anyhow::Error::new(LocalHealthRefreshHeld { remaining }));
+    }
     match upload_local_health_projection_with(
         client,
         device,
@@ -3327,6 +3334,7 @@ fn upload_local_health_projection_reporting(
         daemon,
     ) {
         Ok(()) => {
+            clear_setup_run_refresh_hold();
             let _ = daemon.record_local_health_upload_succeeded();
             Ok(())
         }
@@ -3344,6 +3352,7 @@ fn upload_local_health_projection_reporting(
                 }
                 let _ = daemon
                     .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected);
+                note_setup_run_refresh_failed(&setup_run_refresh_binding(device, device_secret));
                 return Err(error.context(format!(
                     "refresh setup-run credentials after relay auth rejection failed: {refresh_error}"
                 )));
@@ -3357,10 +3366,17 @@ fn upload_local_health_projection_reporting(
                 daemon,
             ) {
                 Ok(()) => {
+                    clear_setup_run_refresh_hold();
                     let _ = daemon.record_local_health_upload_succeeded();
                     Ok(())
                 }
                 Err(retry_error) => {
+                    if local_health_upload_should_refresh_setup_run(&retry_error) {
+                        note_setup_run_refresh_failed(&setup_run_refresh_binding(
+                            device,
+                            device_secret,
+                        ));
+                    }
                     let _ = daemon.record_local_health_upload_failed(
                         local_health_upload_failure_kind(&retry_error),
                     );
@@ -3373,6 +3389,127 @@ fn upload_local_health_projection_reporting(
                 daemon.record_local_health_upload_failed(local_health_upload_failure_kind(&error));
             Err(error)
         }
+    }
+}
+
+/// First wait after a local health pass whose setup-run refresh did not
+/// restore authorization; it doubles per further failure up to the cap.
+const SETUP_RUN_REFRESH_HOLD_BASE: Duration = Duration::from_secs(120);
+const SETUP_RUN_REFRESH_HOLD_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// A local health pass skipped because the previous pass for the same device
+/// credential and setup-run binding was rejected and the refresh did not help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalHealthRefreshHeld {
+    remaining: Duration,
+}
+
+impl std::fmt::Display for LocalHealthRefreshHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "local health upload held after setup-run refresh failed; next attempt in {}s",
+            self.remaining.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for LocalHealthRefreshHeld {}
+
+/// Rejected-refresh streak for one binding. The backend does not yet type
+/// which rejections are permanent (revoked device, invalid secret) and which
+/// are recoverable (a paired run it can renew), so every rejection backs off
+/// on the same capped ladder and none is treated as final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetupRunRefreshHold {
+    binding: [u8; 32],
+    failures: u32,
+    until: Instant,
+}
+
+static SETUP_RUN_REFRESH_HOLD: OnceLock<Mutex<Option<SetupRunRefreshHold>>> = OnceLock::new();
+
+fn setup_run_refresh_hold() -> &'static Mutex<Option<SetupRunRefreshHold>> {
+    SETUP_RUN_REFRESH_HOLD.get_or_init(|| Mutex::new(None))
+}
+
+/// Digest of what a reattach or credential change replaces: the device id and
+/// secret, and the persisted setup run and API base. Kept in memory only.
+fn setup_run_refresh_binding(device: &LocalDeviceBinding, device_secret: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:setup-run-refresh-hold:v1\0");
+    digest.update(device.device_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(device_secret.as_bytes());
+    if let Some(connection) = FileConnectionStore::default().load().ok().flatten() {
+        digest.update(b"\0");
+        digest.update(connection.setup_run_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(connection.api_base_url.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn setup_run_refresh_hold_duration(failures: u32) -> Duration {
+    SETUP_RUN_REFRESH_HOLD_BASE
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(5))
+        .min(SETUP_RUN_REFRESH_HOLD_CAP)
+}
+
+/// Remaining wait for `binding`, or `None` when a pass may run. A hold for a
+/// different binding is dropped: the user reattached or the credential changed.
+fn setup_run_refresh_hold_remaining_at(
+    hold: &mut Option<SetupRunRefreshHold>,
+    binding: &[u8; 32],
+    now: Instant,
+) -> Option<Duration> {
+    let current = (*hold)?;
+    if &current.binding != binding {
+        *hold = None;
+        return None;
+    }
+    current
+        .until
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn note_setup_run_refresh_failed_at(
+    hold: &mut Option<SetupRunRefreshHold>,
+    binding: &[u8; 32],
+    now: Instant,
+) -> Duration {
+    let failures = match *hold {
+        Some(current) if &current.binding == binding => current.failures.saturating_add(1),
+        _ => 1,
+    };
+    let wait = setup_run_refresh_hold_duration(failures);
+    *hold = Some(SetupRunRefreshHold {
+        binding: *binding,
+        failures,
+        until: now + wait,
+    });
+    wait
+}
+
+fn setup_run_refresh_hold_remaining(binding: &[u8; 32]) -> Option<Duration> {
+    let mut hold = setup_run_refresh_hold().lock().ok()?;
+    setup_run_refresh_hold_remaining_at(&mut hold, binding, Instant::now())
+}
+
+fn note_setup_run_refresh_failed(binding: &[u8; 32]) {
+    if let Ok(mut hold) = setup_run_refresh_hold().lock() {
+        let wait = note_setup_run_refresh_failed_at(&mut hold, binding, Instant::now());
+        eprintln!(
+            "local health setup-run refresh rejected; next attempt in {}s",
+            wait.as_secs()
+        );
+    }
+}
+
+fn clear_setup_run_refresh_hold() {
+    if let Ok(mut hold) = setup_run_refresh_hold().lock() {
+        *hold = None;
     }
 }
 
@@ -3399,6 +3536,9 @@ fn local_health_upload_failure_kind(error: &anyhow::Error) -> LocalHealthUploadF
 }
 
 fn local_health_upload_can_wait_quietly(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
+        return true;
+    }
     let safe = safe_error(error);
     matches!(
         safe.as_str(),
@@ -8304,6 +8444,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     }
     if error.downcast_ref::<SnapshotEntityDeferred>().is_some() {
         return "local snapshot upload deferred by unsettled entities".to_string();
+    }
+    if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
+        return "local health upload held after setup-run refresh failed".to_string();
     }
     match snapshot_upload_error_class(error) {
         Some(SnapshotUploadErrorClass::LocalState) => {
@@ -14988,6 +15131,154 @@ mod tests {
             "otsr_fresh"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn setup_run_refresh_hold_backs_off_capped_and_resets_on_a_new_binding() {
+        let now = Instant::now();
+        let binding = [1u8; 32];
+        let mut hold = None;
+        assert_eq!(
+            setup_run_refresh_hold_remaining_at(&mut hold, &binding, now),
+            None
+        );
+
+        let waits = (0..7)
+            .map(|_| note_setup_run_refresh_failed_at(&mut hold, &binding, now).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(waits, vec![120, 240, 480, 960, 1800, 1800, 1800]);
+        assert_eq!(
+            setup_run_refresh_hold_remaining_at(&mut hold, &binding, now),
+            Some(SETUP_RUN_REFRESH_HOLD_CAP)
+        );
+        // A rejection is never final: once the wait passes, the pass runs again.
+        assert_eq!(
+            setup_run_refresh_hold_remaining_at(
+                &mut hold,
+                &binding,
+                now + SETUP_RUN_REFRESH_HOLD_CAP
+            ),
+            None
+        );
+        assert!(hold.is_some());
+
+        // A reattach or credential change drops the hold and restarts the ladder.
+        let reattached = [2u8; 32];
+        assert_eq!(
+            setup_run_refresh_hold_remaining_at(&mut hold, &reattached, now),
+            None
+        );
+        assert!(hold.is_none());
+        assert_eq!(
+            note_setup_run_refresh_failed_at(&mut hold, &reattached, now).as_secs(),
+            120
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn local_health_upload_holds_after_rejected_refresh_until_the_binding_changes() {
+        clear_setup_run_refresh_hold();
+        let root = test_dir("local-health-upload-refresh-hold");
+        let support_dir = root.join("support");
+        let secrets_dir = root.join("secrets");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rejecting backend");
+        let api_base_url = format!("http://{}", listener.local_addr().expect("local address"));
+        let server_captured = captured.clone();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_complete_http_request(&mut stream);
+                server_captured
+                    .lock()
+                    .expect("capture request")
+                    .push(request);
+                let body =
+                    r#"{"error":"AuthenticationError","detail":"Telemetry device is not active"}"#;
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileDeviceStore::default()
+            .save(&device)
+            .expect("save device");
+        let connection = |setup_run_id: &str| LocalConnectionBinding {
+            setup_run_id: setup_run_id.to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        FileConnectionStore::default()
+            .save(&connection("setup_rejected"))
+            .expect("save connection");
+        std::fs::write(
+            secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .expect("save device secret");
+        let daemon = test_daemon("otm_test");
+        let client = SnapshotApiClient::new(api_base_url.clone());
+        let pass = || {
+            upload_local_health_projection_reporting(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::Codex,
+                "otm_test",
+                &daemon,
+            )
+            .expect_err("a rejected device cannot upload")
+        };
+        let requests = || captured.lock().expect("captured requests").len();
+
+        let rejected = pass();
+        assert!(!local_health_upload_can_wait_quietly(&rejected));
+        assert_eq!(requests(), 2, "relay token, then one refresh");
+        assert!(matches!(
+            crate::latest_local_health_upload(&daemon.status_for_trusted_client().expect("status")),
+            Some(crate::LatestLocalHealthUpload::AuthRejected { .. })
+        ));
+
+        let held = pass();
+        assert!(held.downcast_ref::<LocalHealthRefreshHeld>().is_some());
+        assert!(local_health_upload_can_wait_quietly(&held));
+        assert_eq!(requests(), 2, "a held pass sends nothing");
+        // The rejection stays the latest recorded outcome while held.
+        assert!(matches!(
+            crate::latest_local_health_upload(&daemon.status_for_trusted_client().expect("status")),
+            Some(crate::LatestLocalHealthUpload::AuthRejected { .. })
+        ));
+
+        // Reattaching to another setup run is a real binding change.
+        FileConnectionStore::default()
+            .save(&connection("setup_reattached"))
+            .expect("save reattached connection");
+        pass();
+        let captured = captured.lock().expect("captured requests").clone();
+        assert_eq!(captured.len(), 4, "the reattached binding is tried again");
+        assert!(
+            captured[3].contains("POST /api/v1/setup-runs/setup_reattached/local-client/refresh")
+        );
+
+        clear_setup_run_refresh_hold();
         let _ = std::fs::remove_dir_all(root);
     }
 

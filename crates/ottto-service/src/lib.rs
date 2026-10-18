@@ -137,6 +137,8 @@ pub struct BackendErrorDetails {
     pub endpoint: String,
     pub status: Option<u16>,
     pub body_excerpt: Option<String>,
+    /// Stable machine code the error body named, when it named one.
+    pub reason_code: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

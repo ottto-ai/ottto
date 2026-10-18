@@ -385,7 +385,9 @@ struct ContextArgs {
         help = "Inclusive custom window end date"
     )]
     end_date: Option<String>,
-    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    // Unsupported: calendar windows use the account's saved timezone. Kept
+    // hidden so the daemon can refuse it with that reason.
+    #[arg(long, value_name = "TZ", hide = true)]
     timezone: Option<String>,
     #[arg(long, value_name = "SOURCE", help = "Source slug to filter context to")]
     source: Option<String>,
@@ -454,7 +456,9 @@ struct CostsArgs {
         help = "Inclusive custom window end date"
     )]
     end_date: Option<String>,
-    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    // Unsupported: calendar windows use the account's saved timezone. Kept
+    // hidden so the daemon can refuse it with that reason.
+    #[arg(long, value_name = "TZ", hide = true)]
     timezone: Option<String>,
     #[arg(long, value_name = "SOURCE", help = "Source slug to filter costs to")]
     source: Option<String>,
@@ -539,7 +543,9 @@ struct SessionsArgs {
         help = "Inclusive custom window end date"
     )]
     end_date: Option<String>,
-    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    // Unsupported: calendar windows use the account's saved timezone. Kept
+    // hidden so the daemon can refuse it with that reason.
+    #[arg(long, value_name = "TZ", hide = true)]
     timezone: Option<String>,
     #[arg(
         long,

@@ -3072,6 +3072,7 @@ fn agent_context(
     authorization: &RequestAuthorization,
     query: AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
+    reject_timezone_override(query.timezone.as_deref())?;
     let (api_base_url, connection, setup_run_token) =
         setup_run_agent_read_context(daemon, authorization, "ottto context")?;
     get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
@@ -3082,6 +3083,7 @@ fn agent_costs(
     authorization: &RequestAuthorization,
     query: AgentCostsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
+    reject_timezone_override(query.timezone.as_deref())?;
     let (api_base_url, connection, setup_run_token) =
         setup_run_agent_read_context(daemon, authorization, "ottto costs")?;
     get_agent_costs_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
@@ -3092,6 +3094,7 @@ fn agent_sessions(
     authorization: &RequestAuthorization,
     query: AgentSessionsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
+    reject_timezone_override(query.timezone.as_deref())?;
     let (api_base_url, connection, setup_run_token) =
         setup_run_agent_read_context(daemon, authorization, "ottto sessions")?;
     get_agent_sessions_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
@@ -3115,6 +3118,21 @@ fn agent_provider_impact(
     let (api_base_url, connection, setup_run_token) =
         setup_run_agent_read_context(daemon, authorization, "ottto provider-impact")?;
     get_agent_provider_impact_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+}
+
+const TIMEZONE_OVERRIDE_UNSUPPORTED: &str =
+    "--timezone is not supported. Ottto uses the timezone saved in your account settings for calendar windows.";
+
+/// Calendar windows follow the account's saved timezone; Ottto rejects an
+/// explicit `timezone=` query, so refuse it locally with that reason instead
+/// of forwarding a request that can only fail.
+fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError> {
+    if timezone.is_some_and(|value| !value.trim().is_empty()) {
+        return Err(LocalApiError::InvalidRequest(
+            TIMEZONE_OVERRIDE_UNSUPPORTED.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -6512,6 +6530,7 @@ fn claim_completion_response_unexpected(detail: &str) -> LocalApiError {
         endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
         status: None,
         body_excerpt: Some(detail.to_string()),
+        reason_code: None,
     })
 }
 
@@ -7599,6 +7618,12 @@ fn cli_error(error: LocalApiError) -> CliError {
                     RedactedValue::String(body_excerpt.clone()),
                 );
             }
+            if let Some(reason_code) = &backend.reason_code {
+                details.insert(
+                    "reason_code".to_string(),
+                    RedactedValue::String(reason_code.clone()),
+                );
+            }
             match backend.kind {
                 BackendErrorKind::Unreachable => CliErrorCode::BackendUnreachable,
                 BackendErrorKind::Rejected => CliErrorCode::BackendRejected,
@@ -7660,7 +7685,25 @@ fn cli_error_message(error: &LocalApiError) -> String {
             if body.contains("more than one active authority") {
                 return "This Mac has multiple active registrations. Choose Replace it on the browser claim page to revoke them and create one fresh device, then retry `ottto login` or `ottto setup`.".to_string();
             }
-            if body.contains("expired") {
+            match backend.reason_code.as_deref() {
+                Some("timezone_query_unsupported") => {
+                    return TIMEZONE_OVERRIDE_UNSUPPORTED.to_string();
+                }
+                Some("machine_filter_unsupported") => {
+                    return "Ottto can't filter this read to this Mac yet. Retry with --all-machines.".to_string();
+                }
+                // Typed Results refusals: a settled answer, not a setup failure.
+                Some(_) if backend.status == Some(422) => {
+                    return "Ottto can't answer this read yet.".to_string();
+                }
+                _ => {}
+            }
+            // Exact backend detail for a run Ottto no longer accepts. Other
+            // text that merely mentions expiry (a short-lived companion token
+            // the daemon refreshes, for example) is not a dead setup run.
+            if backend.status == Some(401)
+                && backend_error_detail(backend).as_deref() == Some("Setup run expired")
+            {
                 return "Setup run expired. Open the Ottto app from Ottto to attach an active setup run.".to_string();
             }
             if backend.status == Some(401) || backend.status == Some(403) {
@@ -7701,6 +7744,15 @@ fn cli_error_message(error: &LocalApiError) -> String {
         }
         _ => error.to_string(),
     }
+}
+
+/// The string `detail` of a JSON error body excerpt, if it has one.
+fn backend_error_detail(backend: &BackendErrorDetails) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(backend.body_excerpt.as_deref()?).ok()?;
+    value
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 fn bounded_display_text(value: &str, max_chars: usize) -> String {
@@ -15112,7 +15164,6 @@ fn agent_context_url(
     push_non_empty_query(&mut params, "range", query.range.as_deref());
     push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
     push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
-    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
     push_non_empty_query(&mut params, "source", query.source.as_deref());
     push_non_empty_query(&mut params, "machine_id", query.machine_id.as_deref());
     push_non_empty_query(
@@ -15156,7 +15207,6 @@ fn agent_costs_url(
     push_non_empty_query(&mut params, "range", query.range.as_deref());
     push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
     push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
-    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
     push_non_empty_query(&mut params, "source", query.source.as_deref());
     push_non_empty_query(&mut params, "machine_id", query.machine_id.as_deref());
     push_non_empty_query(
@@ -15192,7 +15242,6 @@ fn agent_sessions_url(
     push_non_empty_query(&mut params, "range", query.range.as_deref());
     push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
     push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
-    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
     push_non_empty_query(&mut params, "source", query.source.as_deref());
     push_non_empty_query(&mut params, "model", query.model.as_deref());
     push_non_empty_query(
@@ -15354,10 +15403,9 @@ fn backend_get_json_with_timeout<T: DeserializeOwned>(
 fn backend_error_from_ureq(url: &str, error: ureq::Error) -> LocalApiError {
     match error {
         ureq::Error::Status(status, response) => {
-            let body_excerpt = response
-                .into_string()
-                .ok()
-                .and_then(|body| safe_backend_body_excerpt(&body));
+            let body = response.into_string().ok();
+            let body_excerpt = body.as_deref().and_then(safe_backend_body_excerpt);
+            let reason_code = body.as_deref().and_then(backend_reason_code);
             LocalApiError::Backend(BackendErrorDetails {
                 kind: if status >= 500 {
                     BackendErrorKind::Unavailable
@@ -15367,6 +15415,7 @@ fn backend_error_from_ureq(url: &str, error: ureq::Error) -> LocalApiError {
                 endpoint: safe_backend_endpoint(url),
                 status: Some(status),
                 body_excerpt,
+                reason_code,
             })
         }
         ureq::Error::Transport(transport) if transport_error_timed_out(&transport) => {
@@ -15380,6 +15429,7 @@ fn backend_error_from_ureq(url: &str, error: ureq::Error) -> LocalApiError {
             endpoint: safe_backend_endpoint(url),
             status: None,
             body_excerpt: safe_backend_body_excerpt(&transport.to_string()),
+            reason_code: None,
         }),
     }
 }
@@ -15407,6 +15457,7 @@ fn backend_response_unexpected(url: &str, detail: String) -> LocalApiError {
         endpoint: safe_backend_endpoint(url),
         status: None,
         body_excerpt: safe_backend_body_excerpt(&detail),
+        reason_code: None,
     })
 }
 
@@ -15433,6 +15484,37 @@ fn safe_backend_endpoint(url: &str) -> String {
         return format!("{}{}{}", &endpoint[..identifier_start], replacement, suffix);
     }
     endpoint.to_string()
+}
+
+/// The stable machine code an Ottto error body names: a top-level `code`, a
+/// `detail.code`, or a `detail` that is itself a code
+/// (`{"detail":"timezone_query_unsupported"}`). Only short lowercase
+/// snake_case tokens qualify, so free-text detail never becomes a code.
+fn backend_reason_code(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let detail = value.get("detail");
+    let named = [
+        value.get("code"),
+        detail.and_then(|detail| detail.get("code")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .find(|code| is_backend_reason_code(code));
+    let code = named.or_else(|| {
+        detail
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| code.contains('_') && is_backend_reason_code(code))
+    })?;
+    Some(code.to_string())
+}
+
+fn is_backend_reason_code(value: &str) -> bool {
+    value.len() <= 64
+        && value.starts_with(|character: char| character.is_ascii_lowercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn safe_backend_body_excerpt(body: &str) -> Option<String> {
@@ -15697,6 +15779,7 @@ mod tests {
                 .to_string(),
             status: Some(401),
             body_excerpt: Some(excerpt),
+            reason_code: None,
         });
 
         let message = reattach_required_message(&error).expect("typed reattach message");
@@ -17444,6 +17527,7 @@ for line in sys.stdin:
             endpoint: "/api/v1/pi/sessions/import".to_string(),
             status: Some(403),
             body_excerpt: Some(r#"{"detail":"telemetry_disabled_by_admin"}"#.to_string()),
+            reason_code: None,
         });
         assert!(is_telemetry_disabled_by_admin_error(&error));
         let smoke = SmokeResult {
@@ -20894,6 +20978,7 @@ for line in sys.stdin:
             endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
             status: Some(404),
             body_excerpt: None,
+            reason_code: None,
         });
         assert!(backend_error_indicates_account_gone(&gone_404));
 
@@ -20902,6 +20987,7 @@ for line in sys.stdin:
             endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
             status: Some(401),
             body_excerpt: Some(r#"{"detail":"account_not_found"}"#.to_string()),
+            reason_code: None,
         });
         assert!(backend_error_indicates_account_gone(&gone_401));
 
@@ -20911,6 +20997,7 @@ for line in sys.stdin:
             endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
             status: Some(401),
             body_excerpt: Some(r#"{"detail":"setup run companion token expired"}"#.to_string()),
+            reason_code: None,
         });
         assert!(!backend_error_indicates_account_gone(&expired_401));
 
@@ -20920,6 +21007,7 @@ for line in sys.stdin:
             endpoint: "/api/v1/releases/latest".to_string(),
             status: Some(404),
             body_excerpt: None,
+            reason_code: None,
         });
         assert!(!backend_error_indicates_account_gone(&unrelated_404));
 
@@ -22292,7 +22380,7 @@ for line in sys.stdin:
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_context/local-client/agent-context?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=claude_code&machine_id=otm_test&source_plan_profile_id=profile_123&max_tokens=4000"
+            "https://api.ottto.net/api/v1/setup-runs/setup_context/local-client/agent-context?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=claude_code&machine_id=otm_test&source_plan_profile_id=profile_123&max_tokens=4000"
         );
     }
 
@@ -22325,7 +22413,7 @@ for line in sys.stdin:
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full"
+            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full"
         );
     }
 
@@ -22365,7 +22453,7 @@ for line in sys.stdin:
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_sessions/local-client/sessions?limit=25&cursor=next+123&range=today&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=codex&model=gpt-5.3+codex&billing_provider=openai&billing_channel=subscription&machine_id=otm_test&source_plan_profile_id=profile_123&min_cost=1.25&max_cost=7.5&sort_by=cost&sort_dir=desc&search=roadmap+review"
+            "https://api.ottto.net/api/v1/setup-runs/setup_sessions/local-client/sessions?limit=25&cursor=next+123&range=today&start_date=2026-06-01&end_date=2026-06-05&source=codex&model=gpt-5.3+codex&billing_provider=openai&billing_channel=subscription&machine_id=otm_test&source_plan_profile_id=profile_123&min_cost=1.25&max_cost=7.5&sort_by=cost&sort_dir=desc&search=roadmap+review"
         );
     }
 
@@ -29516,6 +29604,7 @@ X-API-Key = "otel_redacted"
             endpoint: "/api/v1/setup-runs/[id]/local-client/verification".to_string(),
             status: Some(401),
             body_excerpt: Some("Setup run companion token expired".to_string()),
+            reason_code: None,
         });
 
         let result = verification_result_for_backend_error(
@@ -29582,7 +29671,11 @@ X-API-Key = "otel_redacted"
             kind: BackendErrorKind::Rejected,
             endpoint: "/api/v1/setup-runs/[id]/local-client/scan-result".to_string(),
             status: Some(401),
-            body_excerpt: Some("Setup run expired request_id=req_private".to_string()),
+            body_excerpt: Some(
+                r#"{"error":"AuthenticationError","detail":"Setup run expired","request_id":"req_private"}"#
+                    .to_string(),
+            ),
+            reason_code: None,
         }));
 
         assert_eq!(
@@ -29601,6 +29694,7 @@ X-API-Key = "otel_redacted"
                 endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
                 status: Some(409),
                 body_excerpt: Some(body.to_string()),
+                reason_code: None,
             }))
         };
 
@@ -29648,6 +29742,7 @@ X-API-Key = "otel_redacted"
             endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
             status: Some(400),
             body_excerpt: Some(r#"{"detail":"Setup claim session is pending"}"#.to_string()),
+            reason_code: None,
         });
         assert!(auth_complete_error_is_pending(&pending));
 
@@ -29658,6 +29753,7 @@ X-API-Key = "otel_redacted"
             body_excerpt: Some(
                 "Existing installation authority requires an explicit relay device".to_string(),
             ),
+            reason_code: None,
         });
         assert!(!auth_complete_error_is_pending(&terminal));
     }
@@ -29886,6 +29982,124 @@ X-API-Key = "otel_redacted"
         assert_eq!(error.code.exit_code(), 61);
         assert!(error.retryable);
         assert!(error.message.contains("Timed out waiting for setup"));
+    }
+
+    #[test]
+    fn agent_reads_reject_timezone_override_before_contacting_ottto() {
+        let daemon = daemon().with_account(connected_account());
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let timezone = Some("America/Los_Angeles".to_string());
+        let results = [
+            agent_costs(
+                &daemon,
+                &authorization,
+                AgentCostsQuery {
+                    timezone: timezone.clone(),
+                    ..AgentCostsQuery::default()
+                },
+            ),
+            agent_sessions(
+                &daemon,
+                &authorization,
+                AgentSessionsQuery {
+                    timezone: timezone.clone(),
+                    ..AgentSessionsQuery::default()
+                },
+            ),
+            agent_context(
+                &daemon,
+                &authorization,
+                AgentContextQuery {
+                    timezone,
+                    ..AgentContextQuery::default()
+                },
+            ),
+        ];
+        for result in results {
+            let error = cli_error(result.expect_err("timezone override must be refused"));
+            assert_eq!(error.code, CliErrorCode::InvalidRequest);
+            assert!(error
+                .message
+                .contains("timezone saved in your account settings"));
+        }
+        assert!(reject_timezone_override(Some("  ")).is_ok());
+        assert!(reject_timezone_override(None).is_ok());
+    }
+
+    #[test]
+    fn backend_reason_codes_come_only_from_structured_fields() {
+        for (body, expected) in [
+            (
+                r#"{"error":"ResultsUnavailableError","detail":"Filtering by machine isn't available yet","request_id":"req_1","code":"machine_filter_unsupported"}"#,
+                Some("machine_filter_unsupported"),
+            ),
+            (
+                r#"{"detail":"timezone_query_unsupported"}"#,
+                Some("timezone_query_unsupported"),
+            ),
+            (
+                r#"{"detail":{"code":"reattach_required","message":"Reconnect"}}"#,
+                Some("reattach_required"),
+            ),
+            (r#"{"detail":"Setup run companion token expired"}"#, None),
+            (r#"{"detail":"expired"}"#, None),
+            (r#"{"code":"Not A Code"}"#, None),
+            ("Setup run expired machine_filter_unsupported", None),
+        ] {
+            assert_eq!(backend_reason_code(body).as_deref(), expected, "{body}");
+        }
+        assert_eq!(
+            backend_reason_code(&format!(r#"{{"code":"{}"}}"#, "a".repeat(65))),
+            None
+        );
+    }
+
+    #[test]
+    fn backend_reason_code_drives_the_message_and_incidental_expiry_text_does_not() {
+        let backend = |status: u16, body: &str| BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/setup-runs/[id]/local-client/costs".to_string(),
+            status: Some(status),
+            body_excerpt: Some(body.to_string()),
+            reason_code: backend_reason_code(body),
+        };
+
+        let machine = cli_error(LocalApiError::Backend(backend(
+            422,
+            r#"{"error":"ResultsUnavailableError","detail":"Filtering by machine isn't available yet","request_id":"req_1","code":"machine_filter_unsupported"}"#,
+        )));
+        assert_eq!(machine.code, CliErrorCode::BackendRejected);
+        assert_eq!(machine.code.exit_code(), 15);
+        assert!(!machine.retryable);
+        assert_eq!(
+            machine.details.get("reason_code"),
+            Some(&RedactedValue::String(
+                "machine_filter_unsupported".to_string()
+            ))
+        );
+        assert!(machine.message.contains("--all-machines"));
+
+        let retired = cli_error(LocalApiError::Backend(backend(
+            422,
+            r#"{"error":"PreviousPipelineRetiredError","detail":"Retired","request_id":"req_4","code":"previous_pipeline_retired"}"#,
+        )));
+        assert_eq!(retired.code.exit_code(), 15);
+        assert_eq!(retired.message, "Ottto can't answer this read yet.");
+
+        // A short-lived companion token that merely expired is not a dead run.
+        let token = cli_error(LocalApiError::Backend(backend(
+            401,
+            r#"{"error":"AuthenticationError","detail":"Setup run companion token expired","request_id":"req_2"}"#,
+        )));
+        assert_eq!(token.code, CliErrorCode::BackendRejected);
+        assert!(!token.details.contains_key("reason_code"));
+        assert!(!token.message.contains("Setup run expired"));
+
+        let expired = cli_error(LocalApiError::Backend(backend(
+            401,
+            r#"{"error":"AuthenticationError","detail":"Setup run expired","request_id":"req_3"}"#,
+        )));
+        assert!(expired.message.starts_with("Setup run expired."));
     }
 
     #[test]
