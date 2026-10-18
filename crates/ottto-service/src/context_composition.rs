@@ -1637,11 +1637,22 @@ fn build_report_for_scan(
     deadline: Instant,
 ) -> Option<WorkspaceReport> {
     let mut report = WorkspaceReport::new(window);
-    // Oldest first, so a resumed transcript's copied records meet the
-    // original's records already counted.
-    let mut files = scan.files.iter().collect::<Vec<_>>();
-    files.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    for (file, mtime) in files {
+    // A resumed or forked Claude transcript copies records with their
+    // original uuids and timestamps; the file that holds them first owns them.
+    // Creation time orders that even when the original is appended to later.
+    // Where it is unavailable, modification time is the fallback.
+    let mut files = scan
+        .files
+        .iter()
+        .map(|(file, mtime)| {
+            let created = fs::metadata(file)
+                .and_then(|metadata| metadata.created())
+                .unwrap_or(*mtime);
+            (created, file, mtime)
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    for (_, file, mtime) in files {
         if Instant::now() >= deadline {
             return None;
         }

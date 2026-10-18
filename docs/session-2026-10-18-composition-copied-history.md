@@ -13,10 +13,13 @@ own records start at its trigger turn. A legacy user fork, or a legacy
 subagent fork without a trigger turn, has no boundary in the file and is
 skipped whole.
 
-Claude: within one workspace, files are parsed oldest first and record uuids
-are remembered as 64-bit hashes (about 8 bytes per record, freed after the
-workspace). A record whose uuid was already counted is copied. A transcript
-made only of copied records is skipped.
+Claude: copied records keep their uuids and timestamps, so the file created
+first owns them. Within one workspace, files are parsed in creation-time order
+(modification time where creation time is unavailable), so an original that
+keeps working after a fork still owns its records. Record uuids are remembered
+as 64-bit hashes (about 8 bytes per record, freed after the workspace). A
+record whose uuid was already counted is copied. A transcript made only of
+copied records is skipped.
 
 A copied record adds no event, entered tokens, top-file count or session
 total. It still adds residency for the copying session's own requests, because
@@ -35,5 +38,9 @@ ordinal subagent forks with copied prefixes; 6 are paginated forks and 28
 created threads with local history only; none needed exclusion. 52 of 6,366
 Claude transcripts repeat records of another transcript, about 5% of record
 bytes.
+
+A workspace whose sessions are all excluded yields an empty report, which is
+not uploaded, so an earlier upload for it stays until replaced. That is the
+existing behavior for any empty report; no local session needed exclusion.
 
 Validation: focused tests run in CI (no local cargo run for this change).
