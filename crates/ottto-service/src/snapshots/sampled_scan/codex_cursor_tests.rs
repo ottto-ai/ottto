@@ -573,7 +573,10 @@ fn paged_singleton_matches_unpaged_read_across_scan_objects() {
                 "a paused job publishes nothing for its file"
             );
         }
-        panic!("cursor job did not complete within 64 pages");
+        panic!(
+            "cursor job did not complete within 64 pages: {}",
+            counters(&cache)
+        );
     });
     let counters = cache.with_cursor(|cursor| {
         (
@@ -606,6 +609,12 @@ fn uncached_scan_never_pages() {
 
 fn counter(cache: &SharedCache, read: fn(&Counters) -> u64) -> u64 {
     cache.with_cursor(|cursor| read(&cursor.counters)).unwrap()
+}
+
+fn counters(cache: &SharedCache) -> String {
+    cache
+        .with_cursor(|cursor| format!("{:?}", cursor.counters))
+        .unwrap_or_default()
 }
 
 fn pending_hint(index: &ScanIndex, path: &Path) -> Option<bool> {
@@ -677,7 +686,7 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         let (t_start, open_length) = opened.expect("a cursor job opened");
         let certified = cache
             .retained_checkpoint(&key)
-            .expect("certified prefix retained");
+            .unwrap_or_else(|| panic!("certified prefix retained: {}", counters(&cache)));
         // (i) `[0, s)` with `s <= L0`, verified at the read's start.
         assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
         assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0);
@@ -763,16 +772,17 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             next_line += 1;
             now += 600;
         }
-        assert_eq!(
-            completions.len(),
-            2,
-            "two audit completions within 64 pages"
-        );
+        assert_eq!(completions.len(), 2, "two audits: {}", counters(&cache));
         let (first, _) = completions[0];
         let (second, open_length) = completions[1];
         // The next audit opens right after a completion and publishes every
-        // `ceil(L/B)` pages (each page may overshoot B by one record).
-        assert!((second - first).abs_diff(open_length.div_ceil(B)) <= 1);
+        // `ceil(L/B)` pages; a page overshoots B by at most one record.
+        let record = token_line(next_line).len() as u64;
+        let pages = second - first;
+        assert!(
+            open_length.div_ceil(B + record) <= pages && pages <= open_length.div_ceil(B),
+            "{pages} pages for {open_length} bytes"
+        );
         assert_eq!(counter(&cache, |c| c.audit_overdue), 2);
         if !LEVER_GRACE {
             assert_eq!(tails, 0, "outcome D: no tails above L_max");
@@ -796,7 +806,11 @@ fn grown_member_with_in_place_head_edit_restarts_and_publishes_nothing() {
     with_test_limits(2048, 4096, 64, || {
         let (mut index, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
         assert!(scan.snapshots.is_empty());
-        assert!(!cache.cursor_slot_free(), "the job paused");
+        assert!(
+            !cache.cursor_slot_free(),
+            "the job paused: {}",
+            counters(&cache)
+        );
         // Same length, inside `[0, 4 KiB)`: `10:00:00` becomes `10:00:01`.
         let bytes = fs::read(&path).unwrap();
         let at = bytes
@@ -828,7 +842,12 @@ fn grown_member_with_in_place_head_edit_restarts_and_publishes_nothing() {
                 break;
             }
         }
-        assert_eq!(counter(&cache, |c| c.jobs_invalidated), 1);
+        assert_eq!(
+            counter(&cache, |c| c.jobs_invalidated),
+            1,
+            "{}",
+            counters(&cache)
+        );
         for _ in 0..32 {
             let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
             index = next;
@@ -836,7 +855,12 @@ fn grown_member_with_in_place_head_edit_restarts_and_publishes_nothing() {
                 break;
             }
         }
-        assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified),
+            1,
+            "{}",
+            counters(&cache)
+        );
         assert_eq!(counter(&cache, |c| c.jobs_started), 2);
         assert_eq!(counter(&cache, |c| c.jobs_member_changed), 0);
     });
@@ -923,7 +947,12 @@ fn namespace_change_evicts_paused_job_and_restarts_it() {
             Some(Arc::clone(&cache)),
             "ns-a",
         );
-        assert_eq!(paused_namespace(&cache).as_deref(), Some("ns-a"));
+        assert_eq!(
+            paused_namespace(&cache).as_deref(),
+            Some("ns-a"),
+            "{}",
+            counters(&cache)
+        );
         assert!(cache.cursor_charge() > 0);
         let (_, scan, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "ns-b");
         assert!(scan.snapshots.is_empty());

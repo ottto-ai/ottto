@@ -444,16 +444,16 @@ impl CursorLease {
         PauseEnd::Paused
     }
 
-    /// Free the slot this lease holds (if it still does), apply `update`
-    /// under the same lock, and disarm.
+    /// Apply `update` under the slot lock, then free the slot if this lease
+    /// still holds it (a pause has moved it to `Paused` by then), and disarm.
     fn end(mut self, update: impl FnOnce(&mut CursorState)) {
         let token = self.token;
         self.cache.with_cursor(|cursor| {
+            update(cursor);
             if matches!(cursor.slot, Slot::ActiveElsewhere { token: held } if held == token) {
                 cursor.slot = Slot::Empty;
                 cursor.slot_key = None;
             }
-            update(cursor);
         });
         self.armed = false;
     }
