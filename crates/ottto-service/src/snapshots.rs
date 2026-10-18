@@ -10339,10 +10339,12 @@ impl SnapshotAccumulator {
             self.codex_native_created_thread_valid = false;
         }
         // Every later task must start after this thread was created, and only
-        // once the first task has bound its turn.
-        if codex_is_task_started(value) && ordinal != Some(1) {
+        // once the first task has bound its turn. The cache tracker opens a turn
+        // for any `task_started` payload, so every envelope is checked here.
+        if string_eq_at(value, &["payload", "type"], "task_started") && ordinal != Some(1) {
             let turn_id = string_at(value, &["payload", "turn_id"]);
-            if self.codex_native_created_thread_first_turn_bound
+            if codex_is_task_started(value)
+                && self.codex_native_created_thread_first_turn_bound
                 && turn_id.is_some()
                 && self.codex_task_started_after_creation(value, timestamp_nanos)
             {
@@ -10361,7 +10363,12 @@ impl SnapshotAccumulator {
         let Some(total) = codex_total_usage(value) else {
             return;
         };
-        if !self.codex_parentless_turn_opened(self.latest_turn_id.as_deref()) {
+        // Same precedence as `apply_codex_owned_line`, which runs after this
+        // check: a turn named by the record wins over the running turn.
+        let usage_turn_id = string_at(value, &["turn_context", "payload", "turn_id"])
+            .or_else(|| string_at(value, &["payload", "turn_id"]))
+            .or_else(|| self.latest_turn_id.clone());
+        if !self.codex_parentless_turn_opened(usage_turn_id.as_deref()) {
             self.codex_native_created_thread_valid = false;
         }
         // Before any usage is counted, the first request's cumulative total must
@@ -53941,7 +53948,7 @@ mod tests {
         };
         type Configure = fn(&mut CodexTitleMetadata, &Path);
         let none: Configure = |_, _| {};
-        let cases: [(&str, String, Configure); 32] = [
+        let cases: [(&str, String, Configure); 34] = [
             (
                 "copied-counters",
                 edit(&|values| {
@@ -54008,6 +54015,21 @@ mod tests {
                 edit(&|values| {
                     values.insert(8, json!({"timestamp":clock.at(4_200),"type":"event_msg","payload":{"type":"agent_message","turn_id":foreign_turn}}));
                     renumber(values);
+                }),
+                none,
+            ),
+            (
+                "usage-names-foreign-turn",
+                edit(&|values| {
+                    values[9]["payload"]["turn_id"] = json!(foreign_turn);
+                }),
+                none,
+            ),
+            (
+                "task-start-outside-event-msg",
+                edit(&|values| {
+                    values[6]["type"] = json!("response_item");
+                    values[6]["payload"]["started_at"] = json!(clock.second(-3_600));
                 }),
                 none,
             ),
