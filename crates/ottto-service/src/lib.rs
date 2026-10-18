@@ -20,6 +20,7 @@ mod codex_scan_diagnostics;
 pub mod codex_sign_in;
 pub(crate) mod command_env;
 pub mod context_composition;
+mod context_file_counts;
 pub mod context_footprint;
 pub mod context_posture;
 pub mod control;
