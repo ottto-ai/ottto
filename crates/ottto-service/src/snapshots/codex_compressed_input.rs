@@ -1,0 +1,414 @@
+//! Bounded `.jsonl.zst` rollout input behind the one opened-object parser seam.
+//! Discovery does not enumerate compressed rollouts yet. Activation must also
+//! bind the header, plain/compressed twin identity and decoder credit at each
+//! open site before it constructs `OpenedInput::compressed`.
+#![cfg_attr(not(test), allow(dead_code))]
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read};
+use std::mem::size_of;
+use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
+
+/// Compressed bytes buffered from the File, and decoded bytes buffered for the
+/// line reader. Plain input keeps `BufReader::new`'s default capacity.
+const BUFFER_BYTES: usize = 8 * 1024;
+// Independent from the decoded-file limit: a small file may demand a huge window.
+const WINDOW_LOG: u32 = 23;
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// Decoder heap credit: the compressed input buffer plus twice zstd's own
+/// streaming bound for this window, covering old and new buffers that may
+/// coexist while a frame resizes them.
+fn decoder_reservation() -> io::Result<usize> {
+    // SAFETY: pure size query, no pointers or external state. Bound is for the
+    // same bundled zstd version and window limit used by this decoder.
+    let estimate =
+        unsafe { zstd::zstd_safe::zstd_sys::ZSTD_estimateDStreamSize(1usize << WINDOW_LOG) };
+    // SAFETY: zstd error classification is a pure integer query.
+    if unsafe { zstd::zstd_safe::zstd_sys::ZSTD_isError(estimate) } != 0 {
+        return Err(invalid("cannot bound compressed rollout decoder"));
+    }
+    estimate
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(BUFFER_BYTES))
+        .ok_or_else(|| invalid("compressed rollout reservation overflow"))
+}
+
+/// Credit a caller pays before `OpenedInput::compressed`: decoder heap, the
+/// boxed reader and its decoded-byte buffer. The JSONL line buffer and parsed
+/// accumulator stay charged by their existing owners.
+pub(super) fn compressed_input_credit() -> io::Result<usize> {
+    decoder_reservation()?
+        .checked_add(BUFFER_BYTES)
+        .and_then(|n| n.checked_add(size_of::<BufReader<BoundedDecoder<File>>>()))
+        .ok_or_else(|| invalid("compressed rollout credit overflow"))
+}
+
+/// Streaming decoder with sticky failure and an explicit decoded-byte budget.
+/// EOF is successful only after a complete frame (including checksum). Supports
+/// concatenated frames; a truncated last frame is never a successful prefix.
+pub(super) struct BoundedDecoder<R: Read> {
+    input: BufReader<R>,
+    context: DCtx<'static>,
+    reserved: usize,
+    remaining: u64,
+    frame_complete: bool,
+    failed: bool,
+}
+
+impl<R: Read> BoundedDecoder<R> {
+    fn new(input: R, decoded_limit: u64) -> io::Result<Self> {
+        let reserved = decoder_reservation()?;
+        let mut context = DCtx::try_create()
+            .ok_or_else(|| io::Error::other("compressed rollout decoder allocation failed"))?;
+        context
+            .set_parameter(DParameter::WindowLogMax(WINDOW_LOG))
+            .map_err(|_| invalid("cannot bound compressed rollout window"))?;
+        Ok(Self {
+            input: BufReader::with_capacity(BUFFER_BYTES, input),
+            context,
+            reserved,
+            remaining: decoded_limit,
+            frame_complete: false,
+            failed: false,
+        })
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.input.capacity().saturating_add(self.context.sizeof())
+    }
+
+    fn read_inner(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let bytes = self.input.fill_buf()?;
+            let input_ended = bytes.is_empty();
+            if input_ended && self.frame_complete {
+                return Ok(0);
+            }
+            let mut input = InBuffer::around(bytes);
+            // At the limit, probe one byte: a Take-style artificial EOF would
+            // incorrectly turn over-limit content into a complete JSONL body.
+            let mut probe = [0u8; 1];
+            let at_limit = self.remaining == 0;
+            let capacity = output
+                .len()
+                .min(self.remaining.min(usize::MAX as u64) as usize);
+            let mut out = if at_limit {
+                OutBuffer::around(&mut probe[..])
+            } else {
+                OutBuffer::around(&mut output[..capacity])
+            };
+            let hint = self
+                .context
+                .decompress_stream(&mut out, &mut input)
+                .map_err(|_| invalid("invalid compressed rollout frame"))?;
+            let consumed = input.pos;
+            let produced = out.pos();
+            self.input.consume(consumed);
+            self.frame_complete = hint == 0;
+            // The credit was paid before construction; never grow past it.
+            if self.retained_bytes() > self.reserved {
+                return Err(invalid("compressed rollout decoder exceeded its credit"));
+            }
+            if at_limit && produced != 0 {
+                return Err(invalid("compressed rollout decoded-byte limit"));
+            }
+            self.remaining -= produced as u64;
+            if produced != 0 {
+                return Ok(produced);
+            }
+            if consumed == 0 && !self.frame_complete {
+                let kind = if input_ended {
+                    io::ErrorKind::UnexpectedEof
+                } else {
+                    io::ErrorKind::InvalidData
+                };
+                return Err(io::Error::new(kind, "incomplete compressed rollout"));
+            }
+        }
+    }
+}
+
+impl<R: Read> Read for BoundedDecoder<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.failed {
+            return Err(invalid("compressed rollout previously failed"));
+        }
+        let result = self.read_inner(output);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}
+
+/// One securely opened handle throughout header/body parsing and final identity
+/// validation. Compressed input exposes decoded bytes, but never a seek API:
+/// sampled plain-file offsets cannot be applied to compressed data. Method
+/// names match the `BufReader<File>` calls the parser already makes.
+pub(super) enum OpenedInput {
+    Plain(BufReader<File>),
+    Compressed(Box<BufReader<BoundedDecoder<File>>>),
+}
+
+impl OpenedInput {
+    pub(super) fn plain(file: File) -> Self {
+        Self::Plain(BufReader::new(file))
+    }
+
+    /// `credit` must cover `compressed_input_credit()`. `decoded_limit` is the
+    /// sticky per-file cap on decoded bytes; reaching it with more content,
+    /// truncation, corruption or an oversized window fails the read.
+    pub(super) fn compressed(file: File, decoded_limit: u64, credit: usize) -> io::Result<Self> {
+        if credit < compressed_input_credit()? {
+            return Err(invalid("compressed rollout input was not prepaid"));
+        }
+        let decoder = BoundedDecoder::new(file, decoded_limit)?;
+        let decoded = BufReader::with_capacity(BUFFER_BYTES, decoder);
+        Ok(Self::Compressed(Box::new(decoded)))
+    }
+
+    pub(super) fn is_compressed(&self) -> bool {
+        matches!(self, Self::Compressed(_))
+    }
+
+    /// The original opened File: metadata and identity revalidation use it, so
+    /// no path is ever reopened. Never seek a compressed File before its
+    /// decoder reaches EOF.
+    pub(super) fn get_ref(&self) -> &File {
+        match self {
+            Self::Plain(reader) => reader.get_ref(),
+            Self::Compressed(reader) => reader.get_ref().input.get_ref(),
+        }
+    }
+
+    pub(super) fn get_mut(&mut self) -> &mut File {
+        match self {
+            Self::Plain(reader) => reader.get_mut(),
+            Self::Compressed(reader) => reader.get_mut().input.get_mut(),
+        }
+    }
+
+    pub(super) fn buffer(&self) -> &[u8] {
+        match self {
+            Self::Plain(reader) => reader.buffer(),
+            Self::Compressed(reader) => reader.buffer(),
+        }
+    }
+
+    /// Retained heap charge. Plain is exactly its buffer capacity; compressed
+    /// charges the box, the decoded buffer and the full decoder credit rather
+    /// than the decoder's current, lazily grown size.
+    pub(super) fn capacity(&self) -> usize {
+        match self {
+            Self::Plain(reader) => reader.capacity(),
+            Self::Compressed(reader) => {
+                let boxed = size_of::<BufReader<BoundedDecoder<File>>>();
+                boxed
+                    .saturating_add(reader.capacity())
+                    .saturating_add(reader.get_ref().reserved)
+            }
+        }
+    }
+}
+
+impl Read for OpenedInput {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(reader) => reader.read(output),
+            Self::Compressed(reader) => reader.read(output),
+        }
+    }
+}
+
+impl BufRead for OpenedInput {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        match self {
+            Self::Plain(reader) => reader.fill_buf(),
+            Self::Compressed(reader) => reader.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amount: usize) {
+        match self {
+            Self::Plain(reader) => reader.consume(amount),
+            Self::Compressed(reader) => reader.consume(amount),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use super::*;
+    use crate::transcript_acquisition::Scope;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    const NOW: &str = "2026-10-07T12:00:00Z";
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn decode(data: &[u8], limit: u64) -> io::Result<Vec<u8>> {
+        let mut reader = BoundedDecoder::new(data, limit)?;
+        let mut decoded = Vec::new();
+        let result = reader.read_to_end(&mut decoded).map(|_| decoded);
+        assert!(reader.retained_bytes() <= reader.reserved);
+        if result.is_err() {
+            assert!(reader.read_exact(&mut [0; 1]).is_err(), "failure is sticky");
+        }
+        result
+    }
+
+    #[test]
+    fn compressed_input_exact_limit_and_concatenated_frames() {
+        let plain = b"{\"type\":\"session_meta\"}\n{\"type\":\"event_msg\"}\n";
+        let mut encoded = zstd::stream::encode_all(&plain[..24], 1).unwrap();
+        encoded.extend(zstd::stream::encode_all(&plain[24..], 1).unwrap());
+        assert_eq!(decode(&encoded, plain.len() as u64).unwrap(), plain);
+    }
+
+    #[test]
+    fn compressed_input_refuses_truncation_overlimit_garbage_and_large_window() {
+        let encoded = zstd::stream::encode_all(&b"one\ntwo\n"[..], 1).unwrap();
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(b"junk");
+        let mut wide = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        wide.window_log(WINDOW_LOG + 1).unwrap();
+        wide.write_all(b"one\ntwo\n").unwrap();
+        let wide = wide.finish().unwrap();
+        for (data, limit) in [
+            (&encoded[..encoded.len() - 1], 8),
+            (&encoded[..], 7),
+            (&trailing[..], 8),
+            (&wide[..], 8),
+            (&[][..], 8),
+        ] {
+            assert!(decode(data, limit).is_err());
+        }
+    }
+
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    fn fixture(bytes: &[u8], suffix: &str) -> Fixture {
+        let path = std::env::temp_dir().join(format!(
+            "ottto-compressed-input-{}-{}{suffix}",
+            std::process::id(),
+            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::write(&path, bytes).unwrap();
+        Fixture(path)
+    }
+
+    // Same synthetic Codex shapes as transcript_acquisition_tests.
+    fn synthetic_rollout() -> Vec<u8> {
+        let mut rows = vec![json!({"type":"session_meta","payload":{"id":"compressed-fixture"}})];
+        for n in [100_u64, 250, 400] {
+            let usage = json!({"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10});
+            rows.push(json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
+                "payload":{"type":"token_count", "info":{"model":"gpt-synthetic",
+                "total_token_usage":usage, "last_token_usage":usage}}}));
+        }
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, &row).unwrap();
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn codex_parser(input: OpenedInput, path: &Path) -> OwnedJsonlParser {
+        OwnedJsonlParser::new_opened(
+            input,
+            path,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            Some(&CodexTitleMetadata::default()),
+            None,
+            None,
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    fn parse(mut parser: OwnedJsonlParser, expected: &str, path: &Path) -> Result<Value> {
+        while !parser.step()? {}
+        let parsed = parser.finish(
+            expected,
+            path,
+            NOW,
+            "compressed-input-fixture".into(),
+            Some(&CodexTitleMetadata::default()),
+            None,
+            None,
+        )?;
+        anyhow::ensure!(parsed.complete(), "fixture parse incomplete");
+        Ok(json!({
+            "report": format!("{:?}", parsed.report),
+            "snapshots": parsed.snapshots,
+        }))
+    }
+
+    #[test]
+    fn compressed_rollout_uses_the_same_parser_and_original_file() {
+        let plain = synthetic_rollout();
+        let split = plain.len() / 2;
+        let mut encoded = zstd::stream::encode_all(&plain[..split], 3).unwrap();
+        encoded.extend(zstd::stream::encode_all(&plain[split..], 3).unwrap());
+        let plain_file = fixture(&plain, ".jsonl");
+        let compressed_file = fixture(&encoded, ".jsonl.zst");
+        // One logical rollout path for both, so only the input kind differs.
+        let logical = &plain_file.0;
+        let credit = compressed_input_credit().unwrap();
+
+        let mut file = File::open(&plain_file.0).unwrap();
+        let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+        let parser = codex_parser(OpenedInput::plain(file), logical);
+        let oracle = parse(parser, &expected, logical).unwrap();
+
+        let mut file = File::open(&compressed_file.0).unwrap();
+        let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+        let unpaid = OpenedInput::compressed(file.try_clone().unwrap(), u64::MAX, credit - 1);
+        assert!(unpaid.is_err());
+        let input = OpenedInput::compressed(file, plain.len() as u64, credit).unwrap();
+        assert!(input.is_compressed());
+        assert_eq!(input.capacity(), credit);
+        // The parser holds the original opened object, never a reopened path.
+        assert_eq!(
+            input.get_ref().metadata().unwrap().len(),
+            encoded.len() as u64
+        );
+        let mut parser = codex_parser(input, logical);
+        // Physical-offset sampling and resume are refused for compressed input.
+        let scope = Scope("compressed".into());
+        let refused = parser.prepare_acquisition(None, &scope, None, 100);
+        assert!(refused.is_err());
+        assert!(parser.reader.acquisition.is_none());
+        assert_eq!(parse(parser, &expected, logical).unwrap(), oracle);
+    }
+
+    #[test]
+    fn compressed_rollout_over_its_decoded_limit_never_finalizes() {
+        let plain = synthetic_rollout();
+        let encoded = zstd::stream::encode_all(&plain[..], 3).unwrap();
+        let compressed_file = fixture(&encoded, ".jsonl.zst");
+        let path = &compressed_file.0;
+        let mut file = File::open(path).unwrap();
+        let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+        let credit = compressed_input_credit().unwrap();
+        // One byte short: every complete line before the cap still parses, but
+        // the stream fails instead of ending as a shorter complete body.
+        let input = OpenedInput::compressed(file, plain.len() as u64 - 1, credit).unwrap();
+        let error = parse(codex_parser(input, path), &expected, path).unwrap_err();
+        assert!(format!("{error:#}").contains("decoded-byte limit"));
+    }
+}
