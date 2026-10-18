@@ -683,6 +683,11 @@ pub struct AuthResetResponse {
     pub setup_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected_at: Option<Rfc3339Timestamp>,
+    /// Whether Ottto released this Mac's server registration during a cloud
+    /// reset. Absent for local-only resets and from older daemons; `false`
+    /// means the registration may still be active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_released: Option<bool>,
     pub message: StableMessage,
 }
 
