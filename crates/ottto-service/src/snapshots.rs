@@ -14273,95 +14273,39 @@ impl OwnedSourceScan {
                     !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
                 }) {
                     // Continuing the paused job is the highest scheduling class.
-                    if let Some((mut job, lease)) = context.cache.cursor_resume(&context.namespace)
-                    {
-                        let scope = job.sampling.as_ref().and_then(|_| {
-                            sampled_scan::reduction_dependencies(
-                                source,
-                                &job.candidate,
-                                &codex_title_metadata,
-                                &claude_title_metadata,
-                                claude_effort_support_dir_ref,
-                            )
-                            .map(|dependency| {
-                                context.file_scope(
-                                    source,
-                                    &job.candidate,
-                                    &dependency,
-                                    true,
-                                    context_curve_enabled,
-                                    index,
-                                )
-                            })
-                        });
-                        let counting =
-                            sampled_scan::codex_cursor::counting_view(&job.candidate, index);
-                        let verdict = sampled_scan::codex_cursor::revalidate(
-                            &mut job,
-                            sampled_scan::codex_cursor::ResumeInputs {
-                                codex: &codex_title_metadata,
-                                claude: &claude_title_metadata,
-                                support: claude_effort_support_dir_ref,
-                                traces: codex_turn_traces.clone(),
-                                parents: codex_parent_ownership_ledgers.clone(),
-                                inventory: codex_join_inventory.as_ref(),
-                                scope,
-                                counting,
-                            },
-                        );
-                        let debt = match verdict {
-                            sampled_scan::codex_cursor::Resume::Valid => {
-                                // This page also selected the job's path; read
-                                // it once, through the job, and keep it pending
-                                // so the census still waits if the job pauses.
-                                identified_candidates
-                                    .retain(|candidate| candidate.path != job.candidate.path);
-                                sampled_scan::codex_cursor::requeue(
-                                    index,
-                                    &codex_selected_flags,
-                                    &job.candidate,
-                                );
-                                codex_cursor_lease = Some(lease);
-                                active_file = Some(job);
-                                pending!();
-                            }
-                            // Unavailable evidence is not a member change: the
-                            // job waits in the slot, its path pending (K9).
-                            sampled_scan::codex_cursor::Resume::Unavailable => {
-                                match lease.defer(job) {
-                                    sampled_scan::codex_cursor::PauseEnd::Paused => None,
-                                    sampled_scan::codex_cursor::PauseEnd::StateBound(
-                                        job,
-                                        disclosure,
-                                    ) => Some((*job, disclosure)),
-                                }
-                            }
-                            sampled_scan::codex_cursor::Resume::Changed => context
-                                .cache
-                                .cursor_invalidate(lease, &job)
-                                .map(|disclosure| (job, disclosure)),
-                        };
-                        if let Some((job, disclosure)) = debt {
-                            // Strict debt (`JoinStateBound`, or `MemberChanged`
-                            // after repeated real invalidations).
-                            sampled_scan::codex_cursor::disclose_job_debt(
-                                &job,
-                                &disclosure,
-                                index,
-                                sampled_scan::codex_cursor::DisclosureTargets {
-                                    census: &mut census,
-                                    residue_index_keys: &mut residue_index_keys,
-                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                    codex_state_only_blocked_session_ids:
-                                        &mut codex_state_only_blocked_session_ids,
-                                    pending_finalization: &mut pending_finalization,
-                                },
-                            );
-                            sampled_scan::codex_cursor::dequeue(index, &job.candidate);
+                    match sampled_scan::codex_cursor::resume_paused_job(
+                        sampled_scan::codex_cursor::ResumeContext {
+                            source,
+                            sampling: context,
+                            codex: &codex_title_metadata,
+                            claude: &claude_title_metadata,
+                            support: claude_effort_support_dir_ref,
+                            context_curve_enabled,
+                            traces: codex_turn_traces.clone(),
+                            parents: codex_parent_ownership_ledgers.clone(),
+                            inventory: codex_join_inventory.as_ref(),
+                            flags: &codex_selected_flags,
+                        },
+                        index,
+                        &mut identified_candidates,
+                        sampled_scan::codex_cursor::DisclosureTargets {
+                            census: &mut census,
+                            residue_index_keys: &mut residue_index_keys,
+                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                            codex_state_only_blocked_session_ids:
+                                &mut codex_state_only_blocked_session_ids,
+                            pending_finalization: &mut pending_finalization,
+                        },
+                    ) {
+                        sampled_scan::codex_cursor::Resumed::Active(job, lease) => {
+                            codex_cursor_lease = Some(lease);
+                            active_file = Some(*job);
+                            pending!();
                         }
-                        // Otherwise its path is still pending; a later page
-                        // resumes or restarts it.
-                        pending!();
+                        // Deferred, invalidated or ended as strict debt: this
+                        // page is spent; a pending path resumes or restarts.
+                        sampled_scan::codex_cursor::Resumed::Spent => pending!(),
+                        sampled_scan::codex_cursor::Resumed::Idle => {}
                     }
                 }
             }

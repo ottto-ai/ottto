@@ -1578,6 +1578,111 @@ pub(in crate::snapshots) struct ResumeInputs<'a> {
     pub(in crate::snapshots) counting: String,
 }
 
+/// What the resuming scan supplies to `resume_paused_job`.
+pub(in crate::snapshots) struct ResumeContext<'a> {
+    pub(in crate::snapshots) source: SnapshotSource,
+    pub(in crate::snapshots) sampling: &'a super::Context,
+    pub(in crate::snapshots) codex: &'a CodexTitleMetadata,
+    pub(in crate::snapshots) claude: &'a ClaudeTitleMetadata,
+    pub(in crate::snapshots) support: Option<&'a Path>,
+    pub(in crate::snapshots) context_curve_enabled: bool,
+    pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
+    pub(in crate::snapshots) parents:
+        Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    pub(in crate::snapshots) inventory: Option<&'a codex_file_join::HeaderInventory>,
+    /// Selection flags of this page's Codex candidates (`requeue`).
+    pub(in crate::snapshots) flags: &'a BTreeMap<String, (bool, bool)>,
+}
+
+/// How `resume_paused_job` used the page.
+pub(in crate::snapshots) enum Resumed {
+    /// No paused job of this namespace.
+    Idle,
+    /// The revalidated job continues in this page under its lease.
+    Active(Box<OwnedActiveFile>, CursorLease),
+    /// Deferred, invalidated, or ended as strict debt: the page is spent.
+    Spent,
+}
+
+/// Resume this namespace's paused job and revalidate it (§p, K9). Kept out
+/// of `OwnedSourceScan::step` (never inlined) and boxed, so the job's moves
+/// do not grow that function's debug stack frame.
+#[inline(never)]
+pub(in crate::snapshots) fn resume_paused_job(
+    context: ResumeContext<'_>,
+    index: &mut ScanIndex,
+    identified_candidates: &mut VecDeque<CandidateFile>,
+    targets: DisclosureTargets<'_>,
+) -> Resumed {
+    let sampling = context.sampling;
+    let Some((job, lease)) = sampling.cache.cursor_resume(&sampling.namespace) else {
+        return Resumed::Idle;
+    };
+    let mut job = Box::new(job);
+    let scope = job.sampling.as_ref().and_then(|_| {
+        super::reduction_dependencies(
+            context.source,
+            &job.candidate,
+            context.codex,
+            context.claude,
+            context.support,
+        )
+        .map(|dependency| {
+            sampling.file_scope(
+                context.source,
+                &job.candidate,
+                &dependency,
+                true,
+                context.context_curve_enabled,
+                index,
+            )
+        })
+    });
+    let counting = counting_view(&job.candidate, index);
+    let verdict = revalidate(
+        &mut job,
+        ResumeInputs {
+            codex: context.codex,
+            claude: context.claude,
+            support: context.support,
+            traces: context.traces,
+            parents: context.parents,
+            inventory: context.inventory,
+            scope,
+            counting,
+        },
+    );
+    let debt = match verdict {
+        Resume::Valid => {
+            // This page also selected the job's path; read it once, through
+            // the job, and keep it pending so the census still waits if the
+            // job pauses.
+            identified_candidates.retain(|candidate| candidate.path != job.candidate.path);
+            requeue(index, context.flags, &job.candidate);
+            return Resumed::Active(job, lease);
+        }
+        // Unavailable evidence is not a member change: the job waits in the
+        // slot, its path pending (K9).
+        Resume::Unavailable => match lease.defer(*job) {
+            PauseEnd::Paused => None,
+            PauseEnd::StateBound(job, disclosure) => Some((job, disclosure)),
+        },
+        Resume::Changed => sampling
+            .cache
+            .cursor_invalidate(lease, &job)
+            .map(|disclosure| (job, disclosure)),
+    };
+    if let Some((job, disclosure)) = debt {
+        // Strict debt (`JoinStateBound`, or `MemberChanged` after repeated
+        // real invalidations).
+        disclose_job_debt(&job, &disclosure, index, targets);
+        dequeue(index, &job.candidate);
+    }
+    // Otherwise its path is still pending; a later page resumes or
+    // restarts it.
+    Resumed::Spent
+}
+
 /// The revalidation verdict at resume (K9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum Resume {
