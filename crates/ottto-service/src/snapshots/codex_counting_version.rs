@@ -108,7 +108,8 @@ pub(super) fn configure_singleton(
     candidate: &CandidateFile,
     index: &ScanIndex,
 ) {
-    // Inactive: no state, so Legacy parses and their heap charge are unchanged.
+    // Inactive: no state is allocated and Legacy output is unchanged; the
+    // accumulator keeps only its empty 8-byte slot.
     if CODEX_COUNTING_V2_CUTOVER_UNIX_MS.is_none() {
         return;
     }
