@@ -17629,13 +17629,14 @@ fn for_each_skill_md_reference(material: &str, mut on_name: impl FnMut(String)) 
             }
             continue; // MY_SKILL.md and similar are other files
         };
-        let token_start = directory
+        // Walk back only over the parent segment: segments of different
+        // matches are disjoint, so the whole scan stays linear.
+        let parent_start = directory
             .char_indices()
             .rev()
-            .find(|&(_, ch)| is_delimiter(ch))
+            .find(|&(_, ch)| ch == '/' || is_delimiter(ch))
             .map_or(0, |(at, ch)| at + ch.len_utf8());
-        let token = &directory[token_start..];
-        let parent = &token[token.rfind('/').map_or(0, |at| at + 1)..];
+        let parent = &directory[parent_start..];
         match bounded_activity_label(parent).filter(|name| name != "." && name != "..") {
             Some(name) => on_name(name),
             None => named_all = false,
@@ -28057,6 +28058,7 @@ mod tests {
             ("cat skills/x/SKILL.md", named(&["x"])),
             ("sed -n 1,40p r0/x/SKILL.md", named(&["x"])),
             ("cat /skills/a/README.md /skills/b/SKILL.md", named(&["b"])),
+            ("a/SKILL.md/b/SKILL.md", named(&["a", "b"])),
             ("cp /s/x/SKILL.md /s/x/SKILL.md.backup", named(&["x"])),
             ("{\"cmd\":\"cat '/r/skills/a/SKILL.md'\"}", named(&["a"])),
             ("cat\u{a0}x/SKILL.md", named(&["x"])),

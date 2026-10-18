@@ -346,6 +346,9 @@ impl SessionAttributionContext {
             }
         }
 
+        // Keyed case-insensitively: provider names arrive lowercased, while
+        // SKILL.md directory names keep their case, and one skill must not
+        // take two fact slots. Each fact still hashes its own spelling.
         let mut emitted_skills = BTreeSet::new();
         for skill in input.provider_skills.iter().take(MAX_SKILL_FACTS) {
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
@@ -360,11 +363,13 @@ impl SessionAttributionContext {
                     "direct",
                     &evidence_context,
                 );
-                emitted_skills.insert(skill.clone());
+                emitted_skills.insert(skill.to_ascii_lowercase());
             }
         }
         for skill in input.activity_skills {
-            if emitted_skills.len() >= MAX_SKILL_FACTS || emitted_skills.contains(skill) {
+            if emitted_skills.len() >= MAX_SKILL_FACTS
+                || emitted_skills.contains(&skill.to_ascii_lowercase())
+            {
                 continue;
             }
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
@@ -379,11 +384,13 @@ impl SessionAttributionContext {
                     "direct",
                     &evidence_context,
                 );
-                emitted_skills.insert(skill.clone());
+                emitted_skills.insert(skill.to_ascii_lowercase());
             }
         }
         if let Some(skill) = input.first_prompt.and_then(slash_skill_name) {
-            if emitted_skills.len() < MAX_SKILL_FACTS && !emitted_skills.contains(&skill) {
+            if emitted_skills.len() < MAX_SKILL_FACTS
+                && !emitted_skills.contains(&skill.to_ascii_lowercase())
+            {
                 if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
                     let display_label = skill_name_display_label(&skill);
                     push_labeled_fact(
@@ -2034,9 +2041,10 @@ mod tests {
             launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
         let provider_skills = BTreeSet::from(["shared-skill".to_string()]);
+        // Same skill as the invocation, spelled with its directory's case.
         let activity_skills = BTreeSet::from([
             "repo-task-lifecycle".to_string(),
-            "shared-skill".to_string(),
+            "Shared-Skill".to_string(),
         ]);
 
         let facts = context.grouping_facts(SessionAttributionGroupingInput {
