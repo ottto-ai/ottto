@@ -564,11 +564,16 @@ impl ProviderPriceLineKind {
 const PROVIDER_PRICE_LINES: &[(&str, u64, ProviderPriceLineKind)] = &[
     // OpenAI: 2x input and cache, 1.5x output for the whole request.
     ("gpt-5-4", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-5-4-pro", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-5-5", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-5-5-pro", 272_000, ProviderPriceLineKind::Tiered),
+    // GPT-5.6 Luna/Terra publish long rates; the catalog's missing threshold
+    // for them is a known catalog gap (COST, 2026-10-18), not a flat price.
     ("gpt-5-6-luna", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-5-6-sol", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-5-6-terra", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-6-astra", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-6-luna", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-6-sol", 272_000, ProviderPriceLineKind::Tiered),
     ("gpt-6-1-sol", 272_000, ProviderPriceLineKind::Tiered),
     // Anthropic: every Haiku 5.5 rate 5x above 100K.
@@ -52028,6 +52033,10 @@ mod tests {
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-6-astra",
+        "gpt-6-luna",
+        "openai/gpt-6-luna-2026-09-30",
+        "gpt-5.4-pro",
+        "gpt-5.5-pro-2026-05-01",
         "gpt-6-sol",
         "gpt-6.1-sol",
         "gpt-6.1-sol-2026-09-30",

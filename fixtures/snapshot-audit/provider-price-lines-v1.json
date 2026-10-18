@@ -44,6 +44,30 @@
     },
     {
       "kind": "tiered",
+      "model": "gpt-6-luna",
+      "raw_model": "gpt-6-luna",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-luna",
+      "raw_model": "openai/gpt-6-luna-2026-09-30",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-4-pro",
+      "raw_model": "gpt-5.4-pro",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-5-pro",
+      "raw_model": "gpt-5.5-pro-2026-05-01",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
       "model": "gpt-6-sol",
       "raw_model": "gpt-6-sol",
       "tokens": 272000
@@ -167,7 +191,17 @@
     },
     {
       "kind": "tiered",
+      "model": "gpt-5-4-pro",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
       "model": "gpt-5-5",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-5-pro",
       "tokens": 272000
     },
     {
@@ -188,6 +222,11 @@
     {
       "kind": "tiered",
       "model": "gpt-6-astra",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-luna",
       "tokens": 272000
     },
     {
