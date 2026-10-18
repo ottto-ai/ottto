@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 694,
-  "content_sha256": "99c73007ed6fe417a362a73a4e199e374434a5dcc62b660afb0c4c3184229804",
+  "candidate_file_count": 695,
+  "content_sha256": "33c4042483d4caa62b4a7e16d2d6c1a2037aa32913ac1070c2250047f415e173",
   "files": [
     {
       "executable": false,
@@ -1266,8 +1266,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5a64926b789e15ac0c09e41a1e3693d4ad7554adf7fa11a38deea4d4ad911a68",
-      "size_bytes": 2636817
+      "sha256": "ee2d5a52b1870de6d70dd45cd138f5c4d6335dac6b5cadd5bf5fd8731f8a97d5",
+      "size_bytes": 2637738
     },
     {
       "executable": false,
@@ -1497,8 +1497,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/witness_reconstruct_scope_tests.rs",
-      "sha256": "2da898aba7800f69630b348c8f3983bb150e140156a5be1c18fc8687ad5a6cad",
-      "size_bytes": 6895
+      "sha256": "0e9d2e41e9aafcb02e6e2fb1240010ca96506b299e5dc96e7153da829378a00c",
+      "size_bytes": 9831
     },
     {
       "executable": false,
@@ -3018,6 +3018,13 @@
       "path": "docs/session-2026-10-17-snapshot-rejection-session-hash.md",
       "sha256": "8469fba0d62b9240dc96557d851a3e9387d2b2ea41aa609b523e6f862f4f1084",
       "size_bytes": 1294
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-claude-join-row-retention.md",
+      "sha256": "78a4fdafc3107a99779ba4b42531399531755aa3a6e508cd2f70627433ea4264",
+      "size_bytes": 1483
     },
     {
       "executable": false,
@@ -4861,9 +4868,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T19:40:35+00:00",
+  "generated_at": "2026-10-18T20:27:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 695,
+  "output_file_count": 696,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4900,5 +4907,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "58a43ff7e0bc771ab89d439652e589328a897bc9"
+  "source_commit": "4fae2e042bc87aecd96bd9a6a0cc82878b1bc976"
 }
