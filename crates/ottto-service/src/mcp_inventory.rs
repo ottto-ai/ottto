@@ -271,7 +271,9 @@ struct ClaudeLoadingEnv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoadingPolicy {
     Claude {
+        home: PathBuf,
         version: Option<String>,
+        /// The user-scope settings `env`.
         env: ClaudeLoadingEnv,
     },
     Codex {
@@ -284,8 +286,9 @@ impl LoadingPolicy {
     fn read(home: &Path, source: SnapshotSource) -> Self {
         match source {
             SnapshotSource::ClaudeCode => LoadingPolicy::Claude {
+                home: home.to_path_buf(),
                 version: claude_client_version(home),
-                env: claude_loading_env(home),
+                env: claude_loading_env(&claude_user_settings(home)),
             },
             SnapshotSource::Codex => LoadingPolicy::Codex {
                 version: codex_client_version(home),
@@ -312,8 +315,25 @@ impl LoadingPolicy {
 
     fn decide(&self, server: &ConfiguredServer) -> LoadingDecision {
         match self {
-            LoadingPolicy::Claude { version, env } => {
-                claude_loading_decision(env, server.always_load, version.as_deref())
+            LoadingPolicy::Claude { home, version, env } => {
+                // A server declared in a project loads under that project's
+                // settings, which override the user's. A user-scope server
+                // keeps the user settings: the inventory cannot tell which
+                // project a session runs in.
+                let project_env = server
+                    .config_dir
+                    .as_deref()
+                    .filter(|dir| *dir != home.as_path())
+                    .map(|dir| {
+                        let mut files = claude_user_settings(home);
+                        files.extend(claude_project_settings(dir));
+                        claude_loading_env(&files)
+                    });
+                claude_loading_decision(
+                    project_env.as_ref().unwrap_or(env),
+                    server.always_load,
+                    version.as_deref(),
+                )
             }
             LoadingPolicy::Codex { version } => codex_loading_decision(version.as_deref()),
             LoadingPolicy::Unsupported => {
@@ -407,15 +427,28 @@ fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
     ))
 }
 
-/// Read the deferral settings from the user's Claude Code settings `env`
-/// (`settings.json`, then `settings.local.json`, which wins).
-fn claude_loading_env(home: &Path) -> ClaudeLoadingEnv {
-    let mut merged: BTreeMap<String, String> = BTreeMap::new();
-    for settings in [
+/// The user's Claude Code settings files, lowest precedence first.
+fn claude_user_settings(home: &Path) -> Vec<PathBuf> {
+    vec![
         home.join(".claude").join("settings.json"),
         home.join(".claude").join("settings.local.json"),
-    ] {
-        let Some(value) = load_json(&settings) else {
+    ]
+}
+
+/// A project's Claude Code settings files, lowest precedence first.
+fn claude_project_settings(project_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        project_dir.join(".claude").join("settings.json"),
+        project_dir.join(".claude").join("settings.local.json"),
+    ]
+}
+
+/// Read the deferral settings from Claude Code settings `env` blocks; a later
+/// file overrides an earlier one, as in the client.
+fn claude_loading_env(settings_files: &[PathBuf]) -> ClaudeLoadingEnv {
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    for settings in settings_files {
+        let Some(value) = load_json(settings) else {
             continue;
         };
         let Some(env) = value.get("env").and_then(Value::as_object) else {
@@ -3009,6 +3042,55 @@ url = "https://unset.test/mcp"
             "https://relay.example.test/v1"
         ));
         assert!(!is_first_party_anthropic_url("http://localhost:8080"));
+    }
+
+    #[test]
+    fn loading_policy_applies_project_settings_to_project_servers() {
+        let home = test_home("loading-policy-project");
+        let project = home.join("proj");
+        fs::create_dir_all(project.join(".claude")).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            json!({
+                "lastReleaseNotesSeen": "2.1.300",
+                "mcpServers": { "global": { "command": "g" } },
+                "projects": {
+                    project.to_string_lossy(): { "mcpServers": { "local": { "command": "l" } } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            project.join(".mcp.json"),
+            json!({ "mcpServers": { "shared": { "command": "s" } } }).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            project.join(".claude").join("settings.json"),
+            json!({ "env": { "ENABLE_TOOL_SEARCH": "true" } }).to_string(),
+        )
+        .unwrap();
+        // The project's settings.local.json wins over its settings.json.
+        fs::write(
+            project.join(".claude").join("settings.local.json"),
+            json!({ "env": { "ENABLE_TOOL_SEARCH": "false" } }).to_string(),
+        )
+        .unwrap();
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        let configured = discover_claude_code(&home);
+        let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
+        apply_loading_policy(&mut servers, &configured, &policy);
+        let by_name = |name: &str| servers.iter().find(|s| s.server == name).unwrap();
+        for name in ["local", "shared"] {
+            assert_eq!(by_name(name).loading_mode, "always_on", "{name}");
+            assert_eq!(by_name(name).loading_mode_basis, "tool_search_disabled");
+            assert!(!by_name(name).loading_mode_inferred);
+        }
+        // A user-scope server keeps the user settings (none: client default).
+        assert_eq!(by_name("global").loading_mode, "on_demand");
+        assert_eq!(by_name("global").loading_mode_basis, "client_default");
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
