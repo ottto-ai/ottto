@@ -14382,6 +14382,9 @@ impl OwnedSourceScan {
                         if let Some(lease) = codex_cursor_lease.take() {
                             lease.complete(&local_index_key(&active.candidate.path), false);
                         }
+                        if active.cursor.is_some() {
+                            sampled_scan::codex_cursor::dequeue(index, &active.candidate);
+                        }
                         census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
                     }
@@ -14470,6 +14473,7 @@ impl OwnedSourceScan {
                         if let Some(lease) = codex_cursor_lease.take() {
                             lease.complete(&local_index_key(&active.candidate.path), false);
                         }
+                        sampled_scan::codex_cursor::dequeue(index, &active.candidate);
                     }
                     active_file = Some(active);
                     pending!();
@@ -14485,6 +14489,7 @@ impl OwnedSourceScan {
                     if let Some(lease) = codex_cursor_lease.take() {
                         lease.complete(&local_index_key(&active.candidate.path), clean);
                     }
+                    sampled_scan::codex_cursor::dequeue(index, &active.candidate);
                 }
                 let memo_candidate = active
                     .hold_offset

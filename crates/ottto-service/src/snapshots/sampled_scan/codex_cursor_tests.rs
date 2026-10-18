@@ -214,6 +214,12 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     // Growth past the refused offset cannot cure the hold: still a hit.
     temp.append(b"{\"n\":3}\n");
     assert!(entry.matches("digest", &file, Some("ledger-1".into())));
+    // A hit expires after the audit interval, so an unsampled repair is seen.
+    let mut expired = entry.clone();
+    expired.recorded_at = expired
+        .recorded_at
+        .saturating_sub(crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS);
+    assert!(!expired.matches("digest", &file, Some("ledger-1".into())));
     // A rewritten prefix is a miss (re-read).
     fs::write(&temp.0, b"{\"n\":9}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
     assert!(!entry.matches("digest", &file, Some("ledger-1".into())));
@@ -247,6 +253,13 @@ fn singleton_memo_is_bounded_lru_with_frozen_charges() {
     assert!(charged >= frozen);
     memo.remove("key-0");
     assert!(!memo.entries.contains_key("key-0"));
+    // A cache reset drops every memo entry with the paused slot.
+    let cache = SharedCache::default();
+    cache.memo_record("key".into(), entry);
+    assert!(cache.memo_lookup("key").is_some());
+    cache.clear();
+    assert!(cache.memo_lookup("key").is_none());
+    assert!(cache.cursor_slot_free());
 }
 
 fn codex_line(value: Value) -> Vec<u8> {
@@ -363,6 +376,11 @@ fn paged_singleton_matches_unpaged_read_across_scan_objects() {
                 .with_cursor(|cursor| cursor.counters.jobs_completed)
                 .unwrap();
             if completed > 0 {
+                // The attempt consumed the path that held the census.
+                assert!(index
+                    .traversal
+                    .as_ref()
+                    .map_or(true, |traversal| traversal.pending_candidates.is_empty()));
                 return scan;
             }
             assert!(

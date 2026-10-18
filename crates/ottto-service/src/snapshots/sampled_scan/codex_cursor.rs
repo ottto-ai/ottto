@@ -390,6 +390,20 @@ impl SharedCache {
         .unwrap_or(0)
     }
 
+    /// Cache reset: drop a paused job and every memo entry. An active job
+    /// keeps its slot; its lease releases it.
+    pub(super) fn cursor_clear(&self) {
+        self.with_cursor(|cursor| {
+            if matches!(cursor.slot, Slot::Paused(_)) {
+                cursor.slot = Slot::Empty;
+                cursor.slot_key = None;
+                cursor.slot_charge = 0;
+                cursor.counters.jobs_lost += 1;
+            }
+            cursor.memo = SingletonMemo::default();
+        });
+    }
+
     pub(in crate::snapshots) fn cursor_slot_free(&self) -> bool {
         self.with_cursor(|cursor| matches!(cursor.slot, Slot::Empty))
             .unwrap_or(false)
@@ -428,6 +442,16 @@ impl SharedCache {
         dependencies: Option<String>,
         owner: Option<String>,
     ) -> Option<CursorLease> {
+        // Resume revalidates every priority decision; without the witness
+        // set (unsampled or overflowed) the file is read unpaged instead.
+        if job
+            .parser
+            .accumulator
+            .codex_observed_priority_turns
+            .is_none()
+        {
+            return None;
+        }
         let stamp_open = OpenStamp::capture(job.parser.reader.reader.get_ref()).ok()?;
         let key = local_index_key(&job.candidate.path);
         let token = self.with_cursor(|cursor| {
@@ -474,6 +498,13 @@ impl SharedCache {
                 .as_ref()
                 .map_or(true, |meta| meta.namespace != namespace.0)
             {
+                // The account, destination or reduction settings changed
+                // since the pause: that job can never resume. Free the slot;
+                // its path is still pending, so this namespace restarts it.
+                cursor.slot = Slot::Empty;
+                cursor.slot_key = None;
+                cursor.slot_charge = 0;
+                cursor.counters.jobs_lost += 1;
                 return None;
             }
             let token = cursor.next_token;
@@ -564,6 +595,17 @@ pub(in crate::snapshots) fn requeue(
     });
 }
 
+/// The cursor attempt for this file ended in this page: remove the path that
+/// held the census, as an ordinary read would have. Retries then follow the
+/// existing residue and failure handling.
+pub(in crate::snapshots) fn dequeue(index: &mut ScanIndex, candidate: &CandidateFile) {
+    if let Some(traversal) = index.traversal.as_mut() {
+        traversal
+            .pending_candidates
+            .retain(|pending| pending.path != candidate.path);
+    }
+}
+
 /// Inventory members sharing this file's owner (1 for a singleton, 0 when
 /// the file has no header witness).
 pub(in crate::snapshots) fn owner_members(
@@ -639,10 +681,12 @@ pub(in crate::snapshots) fn revalidate(
     let accumulator = &mut job.parser.accumulator;
     accumulator.codex_turn_traces = inputs.traces;
     accumulator.codex_parent_ownership_ledgers = inputs.parents;
+    // A discarded witness set (too many turns) cannot prove earlier
+    // priority decisions still hold: restart instead.
     accumulator
         .codex_observed_priority_turns
         .as_ref()
-        .map_or(true, |observed| {
+        .is_some_and(|observed| {
             observed.iter().all(|(turn, priority)| {
                 *priority
                     == accumulator
@@ -720,10 +764,15 @@ pub(in crate::snapshots) struct MemoEntry {
     /// is peer evidence that can cure an ambiguous-fork hold.
     parent: Option<(String, Option<String>)>,
     disclosure: Disclosure,
+    /// Unix seconds at record. The witness samples cannot see an in-place
+    /// repair elsewhere in the prefix, so a hit expires after the sampled
+    /// audit interval and the file is read in full again.
+    recorded_at: u64,
     used: u64,
     charge: usize,
 }
-crate::heap_layout_bound::fields!(MemoEntry; digest, live, parent, disclosure, used, charge);
+crate::heap_layout_bound::fields!(MemoEntry; digest, live, parent, disclosure, recorded_at, used,
+    charge);
 
 impl MemoEntry {
     pub(in crate::snapshots) fn new(
@@ -737,6 +786,7 @@ impl MemoEntry {
             live,
             parent,
             disclosure,
+            recorded_at: super::now_seconds(),
             used: 0,
             charge: 0,
         }
@@ -750,8 +800,9 @@ impl MemoEntry {
         self.parent.as_ref().map(|(parent, _)| parent.as_str())
     }
 
-    /// Every wake dependency is unchanged and the live witness still holds
-    /// at the refused offset. Growth past that offset is a hit.
+    /// Every wake dependency is unchanged, the live witness still holds at
+    /// the refused offset, and the entry is younger than the audit interval.
+    /// Growth past that offset is a hit.
     pub(in crate::snapshots) fn matches(
         &self,
         digest: &str,
@@ -759,6 +810,8 @@ impl MemoEntry {
         parent_ledger: Option<String>,
     ) -> bool {
         self.digest == digest
+            && super::now_seconds().saturating_sub(self.recorded_at)
+                < crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS
             && self
                 .parent
                 .as_ref()

@@ -44,6 +44,7 @@ impl SharedCache {
         if let Ok(mut cache) = self.inner.lock() {
             cache.clear();
         }
+        self.cursor_clear();
     }
     pub(super) fn take(
         &self,
