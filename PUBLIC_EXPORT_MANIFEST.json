@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 681,
-  "content_sha256": "d14003e9737a3fb8141ebfcfe4a92b1c2f1d61f31276d837210ab8942da32f38",
+  "candidate_file_count": 682,
+  "content_sha256": "d9603aec3cfe4ddce64e45b12fa66c286a3b9f99a6f1eec60d5068b8b2d7928c",
   "files": [
     {
       "executable": false,
@@ -720,8 +720,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/codex_saved_quota.rs",
-      "sha256": "cb13d21326f4b028d0388ab9c2c75ba64f909f8ec587112c0aa28e3897926206",
-      "size_bytes": 72284
+      "sha256": "02c93090a53c227a06f67c0636184949570f9210fb071751f9a615d4cad0667d",
+      "size_bytes": 99931
     },
     {
       "executable": false,
@@ -3008,6 +3008,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-18-codex-same-login-shared-read.md",
+      "sha256": "9a09bd07aac11a506f6379acb427b404e6b8d347c1f47860619f9309c7dbd4a7",
+      "size_bytes": 3211
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-18-composition-copied-history.md",
       "sha256": "6309169f715968ef4a75e6214d742acf763f47c10510a480c80982f8f67903f6",
       "size_bytes": 2605
@@ -4770,9 +4777,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T11:43:44+00:00",
+  "generated_at": "2026-10-18T11:58:05+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 682,
+  "output_file_count": 683,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4809,5 +4816,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f684b41de08334089043e2a204c23c27b482fd39"
+  "source_commit": "84a234678526595a623ecca1caecc7e9d0c07240"
 }
