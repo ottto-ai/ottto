@@ -371,6 +371,70 @@ fn codex_v2_pending_row_cap_flushes_once_without_double_count() {
 }
 
 #[test]
+fn codex_v2_reopened_closed_turn_never_regains_native_authority() {
+    let usage = [3_000, 0, 0, 300, 30, 3_300];
+    let values = [
+        header(POST),
+        started("2026-10-18T10:00:01Z", "turn-1"),
+        context("2026-10-18T10:00:02Z", "turn-1"),
+        ui("2026-10-18T10:00:10Z", usage, usage),
+        started("2026-10-18T10:00:11Z", "turn-1"),
+        native("2026-10-18T10:00:12Z", "turn-1", "resp-1", usage, usage),
+        completed("2026-10-18T10:00:20Z", "turn-1"),
+    ];
+    let mut previous = [0; 5];
+    for end in 1..=values.len() {
+        let money = v2(&values[..end]).money();
+        assert!(money
+            .iter()
+            .zip(&previous)
+            .all(|(now, before)| now >= before));
+        previous = money;
+    }
+    let counted = v2(&values);
+    assert_eq!(counted.money(), five(usage));
+    let counters = counted.counters();
+    assert_eq!(counters.turn_reopened, 1);
+    assert_eq!(counters.native_after_turn_closed, 1);
+    assert_eq!(counters.native_counted, 0);
+    assert_eq!(legacy(&values).money(), five(usage));
+}
+
+#[test]
+fn codex_v2_oversized_row_content_flushes_like_the_row_cap() {
+    let usage = [2_000, 0, 0, 200, 20, 2_200];
+    let model = "m".repeat(codex_usage_occurrence::MAX_PENDING_ROW_CONTENT_BYTES);
+    let mut oversized = ui("2026-10-18T10:00:10Z", usage, usage);
+    oversized["payload"]["info"]["model"] = json!(model);
+    let values = [
+        header(POST),
+        started("2026-10-18T10:00:01Z", "turn-1"),
+        context("2026-10-18T10:00:02Z", "turn-1"),
+        oversized,
+    ];
+    let flushed = v2(&values);
+    assert_eq!(
+        flushed.money(),
+        five(usage),
+        "published at once, not staged"
+    );
+    assert_eq!(flushed.counters().pending_overflow_flushes, 1);
+    let mut values = values.to_vec();
+    values.push(native(
+        "2026-10-18T10:00:11Z",
+        "turn-1",
+        "resp-1",
+        usage,
+        usage,
+    ));
+    values.push(completed("2026-10-18T10:00:20Z", "turn-1"));
+    let counted = v2(&values);
+    assert_eq!(counted.money(), five(usage));
+    assert_eq!(counted.counters().native_after_ui_flush, 1);
+    assert_eq!(legacy(&values).money(), five(usage));
+}
+
+#[test]
 fn codex_v2_overlapping_native_counts_only_uncovered_part() {
     let first = [100, 0, 0, 10, 0, 110];
     let second_usage = [100, 0, 0, 10, 0, 110];
@@ -629,8 +693,8 @@ fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
     }
     let counting = accumulator.codex_counting.as_deref().unwrap();
     assert_eq!(counting.open_turn_ui_pending().unwrap().0, rows as u64);
-    // Fixed state: four ids at their byte caps (response 256, turn 128).
-    let fixed = std::mem::size_of::<codex_usage_occurrence::CodexCounting>() + 2 * 256 + 2 * 128;
+    let fixed = std::mem::size_of::<codex_usage_occurrence::CodexCounting>()
+        + codex_usage_occurrence::max_fixed_heap_bytes();
     let bound = fixed + codex_usage_occurrence::max_pending_heap_bytes();
     let charged = crate::heap_layout_bound::bound(counting, usize::MAX).unwrap();
     assert!(charged <= bound, "charged {charged} > stated bound {bound}");

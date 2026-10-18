@@ -21,6 +21,9 @@ pub(super) const MAX_PENDING_ROWS: usize = 64;
 /// staged state has a schema bound without a resource-dependent decision.
 pub(super) const MAX_PENDING_ROW_CONTENT_BYTES: usize = 4096;
 const MAX_TURN_ID_BYTES: usize = 128;
+/// Recently closed turn ids kept for closure finality. A native or a
+/// `task_started` for one of them can never reopen native authority.
+pub(super) const MAX_CLOSED_TURN_IDS: usize = 64;
 const MAX_RESPONSE_ID_BYTES: usize = 256;
 
 /// `input, cached_input, cache_write_input, output, reasoning_output, total`.
@@ -31,7 +34,8 @@ pub(super) struct CodexCounting {
     evidence: AckEvidence,
     cutover_unix_ms: Option<i64>,
     version: Option<CountingVersion>,
-    reducer: Option<OccurrenceReducer>,
+    /// Boxed: a Legacy decision keeps only the pointer slot.
+    reducer: Option<Box<OccurrenceReducer>>,
 }
 
 impl CodexCounting {
@@ -44,14 +48,16 @@ impl CodexCounting {
         }
     }
 
-    #[cfg(test)]
+    /// Local, content-free receipts for the diagnostics owner to fold in
+    /// before the accumulator is consumed (no consumer yet: activation gate).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn counters(&self) -> Option<&OccurrenceCounters> {
         self.reducer.as_ref().map(|reducer| &reducer.counters)
     }
 
     /// UI money staged in a still-open UI-only turn: visible local debt,
     /// never published on a timer.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn open_turn_ui_pending(&self) -> Option<(u64, UsageTotals)> {
         let turn = self.reducer.as_ref()?.turn.as_ref()?;
         let mut usage = UsageTotals::default();
@@ -92,7 +98,8 @@ struct OccurrenceReducer {
     line_ui: Option<(T6, T6)>,
     /// `None` is an unbound span.
     turn: Option<BoundTurn>,
-    last_closed_turn: Option<String>,
+    /// Oldest first, at most `MAX_CLOSED_TURN_IDS`.
+    closed_turns: VecDeque<String>,
     counters: OccurrenceCounters,
 }
 
@@ -166,6 +173,7 @@ pub(super) struct OccurrenceCounters {
     pub(super) v2_cumulative_base_uncounted: u64,
     pub(super) v2_cumulative_base_uncounted_usage: T6,
     pub(super) turn_closure_mismatch: u64,
+    pub(super) turn_reopened: u64,
     pub(super) pending_overflow_flushes: u64,
 }
 
@@ -374,7 +382,7 @@ impl SnapshotAccumulator {
     }
 
     fn codex_occurrence(&mut self) -> Option<&mut OccurrenceReducer> {
-        self.codex_counting.as_mut()?.reducer.as_mut()
+        self.codex_counting.as_mut()?.reducer.as_deref_mut()
     }
 
     /// Runs for every owned Codex line before the shared UI usage path. The
@@ -393,7 +401,7 @@ impl SnapshotAccumulator {
                 codex_counting_version::decide(value, counting.evidence, counting.cutover_unix_ms);
             counting.version = Some(version);
             if version == CountingVersion::V2 {
-                counting.reducer = Some(OccurrenceReducer::default());
+                counting.reducer = Some(Box::default());
             }
         }
         let Some(reducer) = counting.reducer.as_mut() else {
@@ -407,7 +415,15 @@ impl SnapshotAccumulator {
                 let turn_id = string_at(value, &["payload", "turn_id"])
                     .filter(|id| !id.is_empty() && id.len() <= MAX_TURN_ID_BYTES);
                 if let Some(reducer) = self.codex_occurrence() {
-                    reducer.turn = turn_id.map(|id| BoundTurn {
+                    // Closure is final: a recently closed id reopens only as an
+                    // unbound span (Legacy UI, natives 0), never as a new turn.
+                    let reopened = turn_id
+                        .as_ref()
+                        .is_some_and(|id| reducer.closed_turns.contains(id));
+                    if reopened {
+                        reducer.counters.turn_reopened += 1;
+                    }
+                    reducer.turn = turn_id.filter(|_| !reopened).map(|id| BoundTurn {
                         id,
                         native: false,
                         ui_published: false,
@@ -446,7 +462,10 @@ impl SnapshotAccumulator {
             pending,
             ..
         } = turn;
-        reducer.last_closed_turn = Some(id);
+        if reducer.closed_turns.len() >= MAX_CLOSED_TURN_IDS {
+            reducer.closed_turns.pop_front();
+        }
+        reducer.closed_turns.push_back(id);
         if !native && !ui_published {
             self.publish_codex_pending(&pending);
         }
@@ -495,7 +514,11 @@ impl SnapshotAccumulator {
                 }
             }
             None => {
-                if native.turn_id.is_some() && native.turn_id == reducer.last_closed_turn {
+                if native
+                    .turn_id
+                    .as_ref()
+                    .is_some_and(|turn| reducer.closed_turns.contains(turn))
+                {
                     reducer.counters.native_after_turn_closed += 1;
                     add_t6(
                         &mut reducer.counters.native_after_turn_closed_usage,
@@ -844,6 +867,17 @@ fn pending_row_content_bytes(
     .fold(0usize, usize::saturating_add)
 }
 
+/// Heap charge of the fixed reducer state at its id caps: the boxed reducer,
+/// two response ids, the open turn id and the closed-turn ring.
+#[cfg(test)]
+pub(super) const fn max_fixed_heap_bytes() -> usize {
+    std::mem::size_of::<OccurrenceReducer>()
+        + std::mem::align_of::<OccurrenceReducer>()
+        + 2 * MAX_RESPONSE_ID_BYTES
+        + MAX_TURN_ID_BYTES
+        + MAX_CLOSED_TURN_IDS * (std::mem::size_of::<String>() + MAX_TURN_ID_BYTES)
+}
+
 /// Requested-layout charge of a maximal staged turn: 64 rows at the content
 /// cap, each with full selector maps, plus the outer row map's nodes.
 #[cfg(test)]
@@ -861,10 +895,10 @@ pub(super) const fn max_pending_heap_bytes() -> usize {
 }
 
 crate::heap_layout_bound::fields!(CodexCounting; evidence, cutover_unix_ms, version, reducer);
-crate::heap_layout_bound::fields!(OccurrenceReducer; epoch, last_native, prev_ui, native_since_prev_ui, line_ui, turn, last_closed_turn, counters);
+crate::heap_layout_bound::fields!(OccurrenceReducer; epoch, last_native, prev_ui, native_since_prev_ui, line_ui, turn, closed_turns, counters);
 crate::heap_layout_bound::fields!(Epoch; base, hwm, first_id, contiguous);
 crate::heap_layout_bound::fields!(LastNative; id, usage, after);
 crate::heap_layout_bound::fields!(UiTuple; last, total, last_t6, total_t6);
 crate::heap_layout_bound::fields!(BoundTurn; id, native, ui_published, staged_events, pending);
 crate::heap_layout_bound::fields!(PendingRow; selector_context, selector_sources, usage, events, first_activity_at, last_activity_at);
-crate::heap_layout_bound::fields!(OccurrenceCounters; native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, pending_overflow_flushes);
+crate::heap_layout_bound::fields!(OccurrenceCounters; native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, pending_overflow_flushes);
