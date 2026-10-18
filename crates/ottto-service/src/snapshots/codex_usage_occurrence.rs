@@ -164,7 +164,6 @@ impl CodexCounting {
 
     /// A retained reduction may continue under fresh evidence only when that
     /// evidence would have selected the same rule (B handoff H4).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn reusable_under(&self, fresh: &CodexCounting) -> bool {
         self.cutover_unix_ms == fresh.cutover_unix_ms
             && match self.version {

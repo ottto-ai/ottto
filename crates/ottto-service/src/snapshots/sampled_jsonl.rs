@@ -85,6 +85,16 @@ impl OwnedJsonlParser {
                 // is not the same as a prefix without markers.
                 && old.state.accumulator.claude_request_identity_capture
                     == self.accumulator.claude_request_identity_capture
+                // A retained reduction continues only under the counting rule
+                // this parse's own evidence selects. Both unset while inactive.
+                && match (
+                    old.state.accumulator.codex_counting.as_deref(),
+                    self.accumulator.codex_counting.as_deref(),
+                ) {
+                    (None, None) => true,
+                    (Some(old), Some(fresh)) => old.reusable_under(fresh),
+                    _ => false,
+                }
                 && (self.source != SnapshotSource::Codex
                     || old
                         .state
