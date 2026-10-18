@@ -288,7 +288,10 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // codex v39 finds SKILL.md references with the shared path extractor (any
 // skills root, nested `.system`/synced layouts, relative paths, filename
 // boundaries) and emits capability marker v2 when every reference was named.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v39";
+// codex v40 stamps each response's long-context price bucket
+// (`context_bucket` short/long against `provider_long_context_price_line`) on
+// that response's usage row, so usage splits per hour and model by price tier.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v40";
 const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
@@ -373,6 +376,31 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // codex v34 revisits retained rollouts once for the v39 skill extractor and the
 // v2 capability marker; unchanged sessions then converge as semantic no-ops.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v34";
+// The v40 long-context price bucket restates recent history once. Only a
+// rollout last modified on or after the price-line effective date can hold a
+// request the bucket applies to, so exactly those files are revisited; older
+// rollouts are never re-read for it. Inside a revisited file only requests
+// dated on or after that instant gain a bucket, so older hours re-parse to the
+// rows they already had. The instant is fixed, not relative to now, so the
+// revisit set never moves and nothing is revisited twice.
+const CODEX_CONTEXT_BUCKET_REVISIT: &str = "codex_context_bucket_revisit:v1";
+const CODEX_CONTEXT_BUCKET_REVISIT_FROM_UNIX_NANOS: u64 =
+    PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS * 1_000_000_000;
+
+/// Scan identity folded into one candidate's file fingerprint: the source's
+/// identity plus the bounded Codex price-bucket revisit for recent rollouts.
+fn candidate_scan_identity(source: SnapshotSource, modified_unix_nanos: u64) -> String {
+    if source == SnapshotSource::Codex
+        && modified_unix_nanos >= CODEX_CONTEXT_BUCKET_REVISIT_FROM_UNIX_NANOS
+    {
+        format!(
+            "{};{CODEX_CONTEXT_BUCKET_REVISIT}",
+            source.scan_identity_version()
+        )
+    } else {
+        source.scan_identity_version().to_string()
+    }
+}
 // v28 revisits Claude history once because the v34 MCP-tool selector changes
 // transcript-derived session semantics for operators who enabled attribution
 // capture. Sessions parsed with capture off remain semantic no-ops.
@@ -497,6 +525,70 @@ pub const SNAPSHOT_MANIFEST_SCOPE: &str = "semantic_activity_window";
 /// coding-agents-observability backend/app/services/telemetry_cost_projector.py
 /// and backend/app/domain/pricing/selector_context.py.
 pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
+
+/// Provider prompt-length price lines: the one table every source stamps its
+/// per-request `context_bucket` from. A request whose prompt is strictly over
+/// its model's line bills ALL of that request's tokens at the provider's
+/// long-context rate, so the request is stamped `long`; at or under the line it
+/// is stamped `short`. The prompt counts uncached input, cache reads and cache
+/// writes (Codex `input_tokens` already includes its cached prefix).
+///
+/// - Claude Haiku 5.5: 100K (every rate 5x above it).
+/// - OpenAI GPT-5.4 and later, and GPT-6.x: 272K (2x input and cache, 1.5x
+///   output).
+///
+/// Every other model has flat pricing at any prompt length and returns `None`:
+/// Codex stamps no bucket, and flat Claude models keep the 200K analysis line
+/// above. MUST stay in lockstep with the pricing catalog's
+/// `context_bucket_threshold_tokens` for these models.
+fn provider_long_context_price_line(model: &str) -> Option<u64> {
+    const CLAUDE_HAIKU_5_5_PRICE_LINE_TOKENS: u64 = 100_000;
+    const OPENAI_LONG_CONTEXT_PRICE_LINE_TOKENS: u64 = 272_000;
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_prefix("openai/").unwrap_or(&model);
+    if model.starts_with("claude-haiku-5-5") {
+        return Some(CLAUDE_HAIKU_5_5_PRICE_LINE_TOKENS);
+    }
+    let version = model.strip_prefix("gpt-")?;
+    let version = version.split('-').next().unwrap_or_default();
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = match parts.next() {
+        Some(minor) => minor.parse::<u32>().ok()?,
+        None => 0,
+    };
+    (major > 5 || (major == 5 && minor >= 4)).then_some(OPENAI_LONG_CONTEXT_PRICE_LINE_TOKENS)
+}
+
+/// Requests the provider price lines apply to: those whose own usage time is on
+/// or after 2026-09-01T00:00:00Z (the start of the previous month at release).
+/// Earlier usage keeps exactly the rows it had, even when its file is re-read,
+/// so restating the price split never touches older history.
+const PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS: u64 = 1_788_220_800;
+
+/// One request's price bucket from its prompt size, its model and its own usage
+/// timestamp. `None` when the model has no provider price line, the request is
+/// older than the effective date, or the time or size is unknown: an unmeasured
+/// request is never silently short.
+pub(crate) fn provider_context_bucket(
+    model: &str,
+    prompt_tokens: u64,
+    observed_at: Option<&str>,
+) -> Option<&'static str> {
+    if prompt_tokens == 0
+        || observed_at.and_then(rfc3339_unix_seconds)?
+            < PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS
+    {
+        return None;
+    }
+    provider_long_context_price_line(model).map(|line| {
+        if prompt_tokens > line {
+            "long"
+        } else {
+            "short"
+        }
+    })
+}
 // Generous ceilings: scanning is incremental (per-file fingerprint) and
 // streaming, so a larger history is a one-time backfill cost with bounded
 // memory. The finite caps still guard a pathological ~/.codex.
@@ -10978,12 +11070,25 @@ impl SnapshotAccumulator {
                 .computed_effective_input_context
                 .unwrap_or_else(|| response.usage.effective_input_context());
             if !response.selector.context.contains_key("context_bucket") {
-                let context_bucket =
-                    if effective_input_context > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
-                        "long"
-                    } else {
-                        "short"
-                    };
+                // A model with a provider price line (Haiku 5.5) is stamped
+                // against that line; flat-priced models keep the 200K line.
+                let context_bucket = response
+                    .model
+                    .as_deref()
+                    .and_then(|model| {
+                        provider_context_bucket(
+                            model,
+                            effective_input_context,
+                            response.terminal_timestamp.as_deref(),
+                        )
+                    })
+                    .unwrap_or(
+                        if effective_input_context > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
+                            "long"
+                        } else {
+                            "short"
+                        },
+                    );
                 response.selector.insert(
                     "context_bucket",
                     context_bucket.to_string(),
@@ -18559,6 +18664,27 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 accumulator.latest_turn_id.as_deref(),
             )
         });
+        // Stamp this response's long-context price bucket on the same per-line
+        // selector, after the tier replay key above (which must not change): a
+        // prompt over the model's provider line bills the whole request at the
+        // long rate. The size is the already-parsed per-response
+        // `last_token_usage.input_tokens`; no price line, no stamp.
+        if !usage_selector.context.contains_key("context_bucket") {
+            let bucket = model
+                .as_deref()
+                .or(accumulator.latest_model.as_deref())
+                .zip(codex_last_turn_input_context(value))
+                .and_then(|(model, prompt_tokens)| {
+                    provider_context_bucket(model, prompt_tokens, timestamp.as_deref())
+                });
+            if let Some(bucket) = bucket {
+                usage_selector.insert(
+                    "context_bucket",
+                    bucket.to_string(),
+                    "derived_from_last_token_usage",
+                );
+            }
+        }
         let last_usage = codex_last_usage(value);
         let usage_event_identity = codex_usage_event_identity(value);
         let admitted = accumulator.set_cumulative_usage_with_selector(
@@ -22224,6 +22350,9 @@ fn scan_traversal_context_fingerprint(
     // resumable; reviewed scan/open identity changes start a fresh bounded
     // traversal so every pre-existing candidate is reconsidered.
     update_length_prefixed(&mut digest, source.scan_identity_version().as_bytes());
+    if source == SnapshotSource::Codex {
+        update_length_prefixed(&mut digest, CODEX_CONTEXT_BUCKET_REVISIT.as_bytes());
+    }
     update_length_prefixed(&mut digest, LOCAL_SCAN_INDEX_IDENTITY_VERSION.as_bytes());
     update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
     update_length_prefixed(
@@ -23443,7 +23572,7 @@ fn open_and_identify_scan_candidate(
         &candidate.path,
         candidate.size_bytes,
         candidate.modified_unix_nanos,
-        source.scan_identity_version(),
+        &candidate_scan_identity(source, candidate.modified_unix_nanos),
         &session_sidecar_fingerprint,
         &candidate.opened_object_identity,
     );
@@ -51756,6 +51885,177 @@ mod tests {
         // Item totals reconcile with the row sum.
         assert_eq!(item.input_tokens, 14);
         assert_eq!(item.output_tokens, 8);
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn bucket_of(row: &SnapshotModelUsage) -> Option<&str> {
+        row.selector_context
+            .get("context_bucket")
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn provider_price_lines_are_one_model_aware_table_from_the_effective_date() {
+        let now = Some("2026-10-01T00:00:00Z");
+        assert_eq!(
+            provider_long_context_price_line("claude-haiku-5-5"),
+            Some(100_000)
+        );
+        for model in [
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "openai/gpt-6-luna",
+            "gpt-5.6-luna",
+            "gpt-5.4",
+        ] {
+            assert_eq!(
+                provider_long_context_price_line(model),
+                Some(272_000),
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-opus-5-5",
+            "claude-haiku-4-5-20251001",
+            "gpt-5.3-codex",
+            "o3",
+        ] {
+            assert_eq!(provider_long_context_price_line(model), None, "{model}");
+        }
+        // Strict `>`: the line itself is short.
+        assert_eq!(
+            provider_context_bucket("gpt-6.1-sol", 272_000, now),
+            Some("short")
+        );
+        assert_eq!(
+            provider_context_bucket("gpt-6.1-sol", 272_001, now),
+            Some("long")
+        );
+        // Older, undated or empty requests are never stamped.
+        assert_eq!(
+            provider_context_bucket("gpt-6.1-sol", 400_000, Some("2026-08-31T23:59:59Z")),
+            None
+        );
+        assert_eq!(provider_context_bucket("gpt-6.1-sol", 400_000, None), None);
+        assert_eq!(provider_context_bucket("gpt-6.1-sol", 0, now), None);
+        // Only rollouts modified from the effective date join the one-shot revisit.
+        let from = CODEX_CONTEXT_BUCKET_REVISIT_FROM_UNIX_NANOS;
+        assert_eq!(
+            candidate_scan_identity(SnapshotSource::Codex, from - 1),
+            CODEX_SCAN_IDENTITY_VERSION
+        );
+        assert_ne!(
+            candidate_scan_identity(SnapshotSource::Codex, from),
+            CODEX_SCAN_IDENTITY_VERSION
+        );
+        assert_eq!(
+            candidate_scan_identity(SnapshotSource::ClaudeCode, from),
+            CLAUDE_CODE_SCAN_IDENTITY_VERSION
+        );
+    }
+
+    #[test]
+    fn codex_usage_splits_per_request_at_the_272k_price_line() {
+        // gpt-6.1-sol: a 300K prompt (mostly cached) bills the whole request
+        // long; a prompt exactly at 272K stays short; a pre-effective-date
+        // request keeps its unbucketed row.
+        let path = temp_file("codex-long-context-bucket");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019ee443-4c18-71c3-843e-847232f69400\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6.1-sol\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":400000,\"cached_input_tokens\":0,\"output_tokens\":7},\"last_token_usage\":{\"input_tokens\":400000,\"cached_input_tokens\":0,\"output_tokens\":7}}}}\n",
+                "{\"timestamp\":\"2026-10-01T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":700000,\"cached_input_tokens\":290000,\"output_tokens\":107},\"last_token_usage\":{\"input_tokens\":300000,\"cached_input_tokens\":290000,\"output_tokens\":100}}}}\n",
+                "{\"timestamp\":\"2026-10-01T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":972000,\"cached_input_tokens\":560000,\"output_tokens\":157},\"last_token_usage\":{\"input_tokens\":272000,\"cached_input_tokens\":270000,\"output_tokens\":50}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file_with_title_metadata(
+            &path,
+            "2026-10-01T11:00:00Z",
+            "codex-long-bucket-fingerprint".to_string(),
+            &CodexTitleMetadata::default(),
+            None,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.model_usage.len(), 3, "{:?}", item.model_usage);
+        let row = |bucket: Option<&str>| {
+            item.model_usage
+                .iter()
+                .find(|row| bucket_of(row) == bucket)
+                .unwrap_or_else(|| panic!("row for {bucket:?}"))
+        };
+        let (older, long, short) = (row(None), row(Some("long")), row(Some("short")));
+        assert_eq!((older.output_tokens, older.request_count), (7, 1));
+        assert_eq!((long.output_tokens, long.request_count), (100, 1));
+        assert_eq!(long.cache_read_tokens, 290_000);
+        assert_eq!((short.output_tokens, short.request_count), (50, 1));
+        for row in [long, short] {
+            assert_eq!(
+                row.selector_sources
+                    .get("context_bucket")
+                    .map(String::as_str),
+                Some("derived_from_last_token_usage")
+            );
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_haiku_5_5_uses_its_100k_price_line_and_flat_models_keep_200k() {
+        // Per request, before hourly aggregation: Haiku 5.5 at 100K stays
+        // short, 150K and 200K are long; Opus at 150K stays short (200K
+        // analysis line).
+        let line = |n: u32, model: &str, input: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-10-01T09:0{n}:00Z\",\"sessionId\":\"haiku-tier\",\"requestId\":\"req_011CbU3R6JKp2myJL8gtuRp{n}\",\"message\":{{\"id\":\"msg_01VYXWshPjnW6L97x52sQb{n}\",\"model\":\"{model}\",\"usage\":{{\"input_tokens\":{input},\"output_tokens\":{n}}}}}}}\n"
+            )
+        };
+        let path = temp_file("claude-haiku-price-line");
+        fs::write(
+            &path,
+            [
+                line(1, "claude-haiku-5-5", 100_000),
+                line(2, "claude-haiku-5-5", 150_000),
+                line(3, "claude-haiku-5-5", 200_000),
+                line(4, "claude-opus-5-5", 150_000),
+            ]
+            .concat(),
+        )
+        .expect("write fixture");
+
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-10-01T10:00:00Z",
+            "haiku-price-line-fingerprint".to_string(),
+        )
+        .expect("parse");
+        let rows = &items[0].model_usage;
+        let find = |model: &str, bucket: &str| {
+            rows.iter()
+                .find(|row| row.model == model && bucket_of(row) == Some(bucket))
+                .unwrap_or_else(|| panic!("{model} {bucket}: {rows:?}"))
+        };
+        let haiku_short = find("claude-haiku-5-5", "short");
+        assert_eq!(
+            (haiku_short.input_tokens, haiku_short.request_count),
+            (100_000, 1)
+        );
+        let haiku_long = find("claude-haiku-5-5", "long");
+        assert_eq!(
+            (haiku_long.input_tokens, haiku_long.request_count),
+            (350_000, 2)
+        );
+        let opus = find("claude-opus-5-5", "short");
+        assert_eq!((opus.input_tokens, opus.request_count), (150_000, 1));
 
         let _ = fs::remove_file(path);
     }
