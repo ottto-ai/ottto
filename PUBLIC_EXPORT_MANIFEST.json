@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 697,
-  "content_sha256": "3d88415654aa05b67d96772908a49f218305bc680cc9776755f29112fdcbf721",
+  "candidate_file_count": 698,
+  "content_sha256": "9f87859882db7e7cb7fa32ee1ef3aecf62ea66d53f3a3fb0f78f61e053475695",
   "files": [
     {
       "executable": false,
@@ -1133,8 +1133,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_live_native_tests.rs",
-      "sha256": "3cfec8f57e5dd65784529d963d8a073a6c2c4e746981a88ffc0750f23ba7a106",
-      "size_bytes": 25195
+      "sha256": "2b904f510cb8247e67cc94218e458e07a714e08a13aa4a9dd3081ec9f18030d4",
+      "size_bytes": 26983
     },
     {
       "executable": false,
@@ -3106,6 +3106,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-18-retry-live-fixture-synchronization.md",
+      "sha256": "a1b02f13aa7c8e40ef241c5fd2bf8c672f96e49686d35040c14c315d15cd78e2",
+      "size_bytes": 1595
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-18-sampled-acquisition-causal-diagnostics.md",
       "sha256": "7f3e819aba1b9b5181ea22b2cd7b28e34819c0991413a0ef8f657f2be3c9e058",
       "size_bytes": 3035
@@ -4882,9 +4889,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T21:38:48+00:00",
+  "generated_at": "2026-10-18T23:34:17+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 698,
+  "output_file_count": 699,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4921,5 +4928,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "8b4c4d05900a2dd58660f8f1df936c66d6d52b11"
+  "source_commit": "fbec701fd19dd00a146330aac40d0a0bf1c0d15a"
 }
