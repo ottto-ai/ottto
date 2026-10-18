@@ -34,6 +34,8 @@ pub(crate) use tests::output as claude_request_account_output;
 mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
+#[cfg(test)]
+mod claude_thinking_tokens_tests;
 mod context_curve;
 #[cfg(test)]
 mod launch_demand_tests;
@@ -6026,7 +6028,10 @@ fn claude_api_matches_transcript_occurrence(
     row.input_tokens == occurrence.input_tokens
         && row.output_tokens == occurrence.output_tokens
         && row.cache_read_tokens == occurrence.cache_read_tokens
-        && row.reasoning_output_tokens == occurrence.reasoning_output_tokens
+        && claude_api_reasoning_matches(
+            row.reasoning_output_tokens,
+            occurrence.reasoning_output_tokens,
+        )
         && api_cache_creation == transcript_cache_creation
         && occurrence
             .model
@@ -6034,6 +6039,13 @@ fn claude_api_matches_transcript_occurrence(
             .map_or(true, |model| model == row.model)
         && speed_matches
         && effort_matches
+}
+
+/// Claude Code's `api_request` event carries no thinking count, so the sidecar
+/// reports 0 while the transcript holds the real count. Only a count the
+/// sidecar actually reported must equal the transcript's.
+fn claude_api_reasoning_matches(reported: u64, transcript: u64) -> bool {
+    reported == 0 || reported == transcript
 }
 
 fn claude_family_request_ids_are_disjoint(pending: &ClaudeAccountFamilyPending) -> bool {
@@ -6989,8 +7001,10 @@ fn prepare_claude_reported_usage_with_credit<
             if row.input_tokens != occurrence.usage.input_tokens
                 || row.output_tokens != occurrence.usage.output_tokens
                 || row.cache_read_tokens != occurrence.usage.cache_read_tokens
-                || Some(occurrence.usage.reasoning_output_tokens)
-                    != Some(row.reasoning_output_tokens)
+                || !claude_api_reasoning_matches(
+                    row.reasoning_output_tokens,
+                    occurrence.usage.reasoning_output_tokens,
+                )
                 || api_cache_creation != transcript_cache_creation
                 || occurrence
                     .model
@@ -20161,19 +20175,28 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         return None;
     }
     let (cache_5m, cache_1h) = claude_code_cache_creation_split(root);
+    let output_tokens = u64_at(root, &["output_tokens"])
+        .or_else(|| u64_at(root, &["outputTokens"]))
+        .unwrap_or_default();
+    // Claude Code writes the thinking count as
+    // `output_tokens_details.thinking_tokens`, a part of `output_tokens`.
+    // Early streamed rows can briefly report more thinking than output, so
+    // clamp to the record's own output.
+    let reasoning_output_tokens = u64_at(root, &["reasoning_output_tokens"])
+        .or_else(|| u64_at(root, &["output_tokens_details", "thinking_tokens"]))
+        .unwrap_or_default()
+        .min(output_tokens);
     let usage = UsageTotals {
         input_tokens: u64_at(root, &["input_tokens"])
             .or_else(|| u64_at(root, &["inputTokens"]))
             .unwrap_or_default(),
-        output_tokens: u64_at(root, &["output_tokens"])
-            .or_else(|| u64_at(root, &["outputTokens"]))
-            .unwrap_or_default(),
+        output_tokens,
         cache_read_tokens: u64_at(root, &["cache_read_input_tokens"])
             .or_else(|| u64_at(root, &["cache_read_tokens"]))
             .unwrap_or_default(),
         cache_creation_5m_tokens: cache_5m,
         cache_creation_1h_tokens: cache_1h,
-        reasoning_output_tokens: u64_at(root, &["reasoning_output_tokens"]).unwrap_or_default(),
+        reasoning_output_tokens,
         unattributed_total_tokens: 0,
         request_count: 1,
         costs: UsageCosts::default(),
