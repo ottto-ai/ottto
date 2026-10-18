@@ -16409,7 +16409,8 @@ impl OwnedSourceScan {
                         .get_ref()
                         .metadata()
                         .is_ok_and(|metadata| {
-                            metadata.len() > sampled_scan::codex_cursor::Limits::current().singleton
+                            metadata.len()
+                                > sampled_scan::codex_cursor::Limits::current().singleton()
                         })
                 {
                     // N1 (K9): the state or sidecar census is incomplete, so

@@ -77,6 +77,11 @@ impl Limits {
             skip_chunk: SKIP_CHUNK_BYTES,
         }
     }
+
+    /// Files above this size are read by the cursor, never as one pass.
+    pub(in crate::snapshots) fn singleton(&self) -> u64 {
+        self.singleton
+    }
 }
 
 #[cfg(test)]
