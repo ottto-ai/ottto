@@ -456,7 +456,7 @@ fn is_first_party_anthropic_url(url: &str) -> bool {
     }
     let without_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
     let host = without_scheme
-        .split(|c| matches!(c, '/' | '?' | '#'))
+        .split(['/', '?', '#'])
         .next()
         .unwrap_or_default()
         .rsplit('@')

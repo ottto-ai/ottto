@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 679,
-  "content_sha256": "4dd7c66dc16fcd444ffc5771ea1d8d74c51179a63e9ff575799b9983bfbf602e",
+  "content_sha256": "e337dc56165de41efc7793d219cc8c891b978bc5740c59844247fb4dbcce0d1d",
   "files": [
     {
       "executable": false,
@@ -1028,8 +1028,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/mcp_inventory.rs",
-      "sha256": "1ae323a52f4ac3033bce79f11a4711bca96f87a16599a697191d014f33aa1c7f",
-      "size_bytes": 155178
+      "sha256": "839ae0c6e2f4407ce31da00042ec78a0084d58d84bdc4587fd968d919efa19e3",
+      "size_bytes": 155161
     },
     {
       "executable": false,
