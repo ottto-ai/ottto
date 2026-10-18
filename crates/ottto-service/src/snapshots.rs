@@ -53925,6 +53925,8 @@ mod tests {
         // Created threads are forks to the sampled tail cache, so an admitted
         // parentless file is never tail-retained: each change is a full re-parse.
         // A tail resume would otherwise reuse the bound thread-history extent.
+        // Every other reduction conjunct holds, so `codex_is_fork` alone is the
+        // gate; a change that retains created threads must fail here.
         let root = temp_dir("codex-parentless-not-retained");
         let path = root.join(format!("rollout-{PARENTLESS_CHILD}.jsonl"));
         let body = jsonl_body(&values);
@@ -53942,10 +53944,17 @@ mod tests {
             true,
         )
         .expect("retention parser");
+        // A sampled full read observes priority turns, as `prepare_acquisition` does.
+        parser.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
         while !parser.step().expect("step retention parser") {}
+        assert!(parser.accumulator.codex_parent_session_ref.is_none());
+        assert!(parser.accumulator.codex_sidecar_parent.is_none());
         assert!(parser.accumulator.codex_usage_accounting_complete());
         assert!(parser.accumulator.codex_is_fork);
         assert!(!sampled_scan::compatible_reduction(&parser.accumulator));
+        let mut not_fork = parser.accumulator.clone();
+        not_fork.codex_is_fork = false;
+        assert!(sampled_scan::compatible_reduction(&not_fork));
         drop(parser);
         let _ = fs::remove_dir_all(root);
 
@@ -54024,7 +54033,7 @@ mod tests {
         };
         type Configure = fn(&mut CodexTitleMetadata, &Path);
         let none: Configure = |_, _| {};
-        let cases: [(&str, String, Configure); 42] = [
+        let cases: [(&str, String, Configure); 43] = [
             (
                 "copied-counters",
                 edit(&|values| {
@@ -54196,6 +54205,17 @@ mod tests {
                 "history-base-present",
                 edit(&|values| {
                     values[0]["payload"]["history_base"] = json!({"cursor":"external"});
+                }),
+                none,
+            ),
+            (
+                // Guard (a) alone: no later record supplies any lineage.
+                "header-source-absent",
+                edit(&|values| {
+                    values[0]["payload"]
+                        .as_object_mut()
+                        .expect("header payload")
+                        .remove("source");
                 }),
                 none,
             ),
