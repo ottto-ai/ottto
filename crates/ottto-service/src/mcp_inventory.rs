@@ -329,11 +329,17 @@ impl LoadingPolicy {
                         files.extend(claude_project_settings(dir));
                         claude_loading_env(&files)
                     });
-                claude_loading_decision(
-                    project_env.as_ref().unwrap_or(env),
-                    server.always_load,
-                    version.as_deref(),
-                )
+                let effective = project_env.as_ref().unwrap_or(env);
+                let decision =
+                    claude_loading_decision(effective, server.always_load, version.as_deref());
+                // The inventory carries one auto threshold (the user's). A
+                // project threshold that differs cannot be resolved with it.
+                if decision.basis == "tool_search_auto"
+                    && tool_search_auto_pct(effective) != tool_search_auto_pct(env)
+                {
+                    return LoadingDecision::configured("unknown", "tool_search_auto_project");
+                }
+                decision
             }
             LoadingPolicy::Codex { version } => codex_loading_decision(version.as_deref()),
             LoadingPolicy::Unsupported => {
@@ -3090,6 +3096,21 @@ url = "https://unset.test/mcp"
         // A user-scope server keeps the user settings (none: client default).
         assert_eq!(by_name("global").loading_mode, "on_demand");
         assert_eq!(by_name("global").loading_mode_basis, "client_default");
+
+        // A project auto threshold other than the user's (the one the
+        // inventory carries) stays unresolved.
+        fs::write(
+            project.join(".claude").join("settings.local.json"),
+            json!({ "env": { "ENABLE_TOOL_SEARCH": "auto:5" } }).to_string(),
+        )
+        .unwrap();
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        assert_eq!(policy.tool_search_auto_pct(), None);
+        let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
+        apply_loading_policy(&mut servers, &configured, &policy);
+        let local = servers.iter().find(|s| s.server == "local").unwrap();
+        assert_eq!(local.loading_mode, "unknown");
+        assert_eq!(local.loading_mode_basis, "tool_search_auto_project");
         let _ = fs::remove_dir_all(&home);
     }
 
