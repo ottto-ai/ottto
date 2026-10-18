@@ -9,6 +9,10 @@ const MODEL: &str = "claude-opus-4-1";
 const PEER_SESSION: &str = "aaaaaaaa-0000-4000-8000-00000000peer";
 const FORK_CHILD_SESSION: &str = "aaaaaaaa-0000-4000-8000-0000000fork";
 const HELD_SESSION: &str = "aaaaaaaa-0000-4000-8000-0000000held";
+const CHAIN_MIDDLE_SESSION: &str = "aaaaaaaa-0000-4000-8000-0000000mid1";
+const CHAIN_TAIL_SESSION: &str = "aaaaaaaa-0000-4000-8000-0000000tail";
+const ABSENT_SESSION: &str = "aaaaaaaa-0000-4000-8000-0000absent";
+const COPY_HOLDER_SESSION: &str = "aaaaaaaa-0000-4000-8000-0000copier";
 
 fn session_id(ordinal: u64) -> String {
     format!("{ordinal:08x}-0000-4000-8000-{ordinal:012x}")
@@ -30,6 +34,15 @@ type Request<'a> = (&'a str, u64, u64, u64);
 
 fn assistant_line(session: &str, minute: usize, request: Request<'_>) -> Value {
     let (request_id, input, output, cache_read) = request;
+    let mut usage = json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "cache_read_input_tokens": cache_read,
+    });
+    // Fast mode is premium-priced; the estimate must refuse it.
+    if request_id == "req-b2-hash" {
+        usage["speed"] = json!("fast");
+    }
     json!({
         "timestamp": format!("2026-09-02T06:{:02}:00Z", minute + 1),
         "type": "assistant",
@@ -39,11 +52,7 @@ fn assistant_line(session: &str, minute: usize, request: Request<'_>) -> Value {
             "id": format!("msg-{request_id}"),
             "role": "assistant",
             "model": MODEL,
-            "usage": {
-                "input_tokens": input,
-                "output_tokens": output,
-                "cache_read_input_tokens": cache_read,
-            },
+            "usage": usage,
             "content": [{"type": "text", "text": "synthetic"}],
         },
     })
@@ -78,7 +87,11 @@ fn write_transcript(path: &Path, session: &str, requests: &[Request<'_>]) {
 /// - targets 4 and 5 share `req-b2-hash`; neither is ACK-ordered;
 /// - a fork child copies target 6's `req-t06-a` with a fork marker;
 /// - a peer under the held root shares target 7's `req-t07-b`;
-/// - a replica of target 2 under the held root repeats its `req-b2-ack`.
+/// - a replica of target 2 under the held root repeats its `req-b2-ack`;
+/// - a two-hop fork chain re-copies target 8's `req-t08-a` (no exclusion);
+/// - a fork copy of target 9 carries a non-target id (no hold);
+/// - a fork copy names an absent source for target 10's `req-t10-a`, the
+///   conservative exclusion.
 fn target_requests(ordinal: u64) -> Vec<(String, u64, u64, u64)> {
     let own = |suffix: &str, input: u64| (format!("req-t{ordinal:02}-{suffix}"), input, 2, 100);
     match ordinal {
@@ -90,7 +103,7 @@ fn target_requests(ordinal: u64) -> Vec<(String, u64, u64, u64)> {
         3 => vec![own("a", 30), ("req-b2-ack".to_string(), 300, 30, 0)],
         4 => vec![own("a", 40), ("req-b2-hash".to_string(), 400, 40, 0)],
         5 => vec![own("a", 50), ("req-b2-hash".to_string(), 400, 40, 0)],
-        6 | 7 => vec![own("a", 60), own("b", 70)],
+        6 | 7 | 10 => vec![own("a", 60), own("b", 70)],
         _ => vec![own("a", 7 + ordinal)],
     }
 }
@@ -101,7 +114,9 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let root = crate::test_scratch::private_dir("h527-producer");
+    // Target paths must be canonical (macOS temp dirs resolve under /private).
+    let root = fs::canonicalize(crate::test_scratch::private_dir("h527-producer"))
+        .expect("canonical scratch");
     let projects = root.join("projects");
     let held = root.join("held");
     let mut targets = Vec::new();
@@ -152,6 +167,45 @@ fn fixture() -> Fixture {
             .join(format!("{}.jsonl", session_id(2))),
         &session_id(2),
         &[("req-t02-a", 20, 2, 100), ("req-b2-ack", 300, 30, 0)],
+    );
+    // Target 8 -> middle -> tail: the tail's copy names the middle session.
+    fn fork_copy(session: &str, named: &str, request: Request<'_>, uuid: &str) -> Value {
+        let mut line = assistant_line(session, 0, request);
+        line["forkedFrom"] = json!({"sessionId": named, "messageUuid": format!("src-{uuid}")});
+        line["uuid"] = json!(uuid);
+        line
+    }
+    for (session, named) in [
+        (CHAIN_MIDDLE_SESSION, session_id(8)),
+        (CHAIN_TAIL_SESSION, CHAIN_MIDDLE_SESSION.to_string()),
+    ] {
+        write_lines(
+            &projects.join("proj-c").join(format!("{session}.jsonl")),
+            &[
+                fork_copy(session, &named, ("req-t08-a", 15, 2, 100), session),
+                assistant_line(session, 1, ("req-chain-own", 3, 1, 0)),
+            ],
+        );
+    }
+    // A copy, from a fork of target 9, of a record target 9 itself inherited.
+    write_lines(
+        &projects
+            .join("proj-c")
+            .join(format!("{COPY_HOLDER_SESSION}.jsonl")),
+        &[
+            fork_copy(
+                COPY_HOLDER_SESSION,
+                &session_id(9),
+                ("req-not-a-target", 4, 1, 0),
+                "copy-9",
+            ),
+            fork_copy(
+                COPY_HOLDER_SESSION,
+                ABSENT_SESSION,
+                ("req-t10-a", 17, 2, 100),
+                "copy-absent",
+            ),
+        ],
     );
     write_transcript(
         &held.join(format!("{HELD_SESSION}.jsonl")),
@@ -309,7 +363,25 @@ fn producer_excludes_each_overlap_once_and_reconciles_ordinary_bodies() {
         );
         total_excluded += excluded(report).len();
     }
-    assert_eq!(total_excluded, 4);
+    assert_eq!(total_excluded, 5);
+    let manifest = &artifact["input_manifest"];
+    // Target 6's fork child and both chain copies. The copy naming target 9
+    // carries no target's id, so it never enters the census.
+    assert_eq!(manifest["inherited_copy_resolved_line_count"], 3);
+    assert_eq!(
+        target_report(&artifact, 9)["candidate_status"],
+        "computed_unqualified"
+    );
+    assert_eq!(manifest["inherited_copy_absent_source_line_count"], 1);
+    assert!(excluded(target_report(&artifact, 8)).is_empty());
+    let [witness] = excluded(target_report(&artifact, 10)).as_slice() else {
+        panic!("one exclusion")
+    };
+    assert_eq!(witness["cause"], "inherited_from_absent_source");
+    assert_eq!(
+        witness["peer_owner_session_sha256"],
+        sha256_hex(ABSENT_SESSION.as_bytes())
+    );
 
     let target_1 = target_report(&artifact, 1);
     let [witness] = excluded(target_1).as_slice() else {
@@ -385,11 +457,16 @@ fn producer_excludes_each_overlap_once_and_reconciles_ordinary_bodies() {
     };
     assert!(excluded(target_report(&artifact, keeper)).is_empty());
     assert_eq!(excluded(target_report(&artifact, dropper)).len(), 1);
+    // The dropped request is fast mode, which the model|bucket rates cannot price.
+    let estimate = &target_report(&artifact, dropper)["exclusion_estimate"];
+    assert_eq!(estimate["excluded_catalog_cost_usd"], Value::Null);
+    assert_eq!(estimate["unavailable_reason"], "unpriced_dimension");
 
     // A fork-marked copy belongs to its named source session: no exclusion.
     let target_6 = target_report(&artifact, 6);
     assert!(excluded(target_6).is_empty());
-    assert_eq!(target_6["same_session_peer_line_count"], 1);
+    // It is resolved after the census, not read as target 6's own replica.
+    assert_eq!(target_6["same_session_peer_line_count"], 0);
     // A peer under the held root still excludes.
     let [witness] = excluded(target_report(&artifact, 7)).as_slice() else {
         panic!("one exclusion")
@@ -478,7 +555,13 @@ fn producer_holds_every_target_without_a_body_on_unknown_or_capped_peers() {
         artifact["input_manifest"]["cumulative_peer_bytes_read"],
         broken_line.len()
     );
-    for (input, reason) in [(unknown, "incomplete_census"), (capped, "cap_overflow")] {
+    let mut unrooted = fixture.input.clone();
+    unrooted.peer_roots.retain(|root| root.class != "projects");
+    for (input, reason) in [
+        (unknown, "incomplete_census"),
+        (unrooted, "incomplete_census"),
+        (capped, "cap_overflow"),
+    ] {
         let output = produce(&input, &"0".repeat(64), &fixture_build()).expect("produce");
         let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");
         assert_eq!(artifact["global_coverage"]["complete"], false);

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 686,
-  "content_sha256": "3ce73a80f3be74926424d38d435510db64b0a8976c14b7b171aba1bc83687d8f",
+  "content_sha256": "51bdec769b8084a3dce533037f5465d5c36dccebe66d287f8e7b8665b9575a29",
   "files": [
     {
       "executable": false,
@@ -1413,15 +1413,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/h527_candidates/producer.rs",
-      "sha256": "abca956852af675b72e86f37f0877fd8eef7d025941c1600d7194675852aa5d5",
-      "size_bytes": 80121
+      "sha256": "ffc995d82ceca80f207913e6c3d6fa86bed17fc015f61947936191cb611f72ce",
+      "size_bytes": 86391
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/h527_candidates/producer/tests.rs",
-      "sha256": "0a8815a0a67579bc49936fac45ff8f681719cd5ef73b65ffa5360ab7e20cef42",
-      "size_bytes": 18901
+      "sha256": "b1e8e40cbdc12fa45165b9e37a3f87986a97064d7a29d111c72752ddd926983f",
+      "size_bytes": 22477
     },
     {
       "executable": false,
@@ -3009,8 +3009,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-17-h527-candidate-exporter.md",
-      "sha256": "cca85d3070f2cbcbcf38ea09ec62c1018aa03017444807ae3c9cf9a8112d9994",
-      "size_bytes": 16462
+      "sha256": "b41c3632b3f654c5df17a220c57fe0417e7da43e3d62ff73ddd8c9475c3121d0",
+      "size_bytes": 17865
     },
     {
       "executable": false,

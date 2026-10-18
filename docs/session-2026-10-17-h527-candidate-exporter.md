@@ -120,7 +120,7 @@ Fixture `fixtures/h527-candidates/held-mixed.v1.json` is the exact packet for a 
 ottto-service h527-produce --input <bundle.json> --out-dir <new private dir>
 ```
 
-It changes no daemon, discovery, scan-index, upload or runtime path. It reads only the files the bundle names, never follows symlinks, and writes only into a new `0700` output directory.
+It changes no daemon, discovery, scan-index, upload or runtime path. It reads only the files the bundle names and writes only into a new `0700` output directory. It does not follow symlinks while walking peer roots. Each target `transcript_path` must already be canonical, so the parser and the unchanged-file checks read the same path.
 
 Input `h527_producer_input:v1` (strict, unknown fields refused, at most 4 MiB):
 
@@ -139,16 +139,20 @@ Input `h527_producer_input:v1` (strict, unknown fields refused, at most 4 MiB):
 Steps:
 
 1. Each target is parsed with the unchanged Claude parser. A target is held unless the parse is complete, it yields exactly one item, every counted request carries a native id, and totals equal the sum of its per-request usage. A held target's request ids still take part in step 3.
-2. Every `.jsonl` file under the peer roots is streamed once. Native request ids are compared exactly, in memory, against all targets. Fork-copied lines belong to the session they name. A subagent transcript belongs to its path identity; any other file belongs to its first named session, as in the parser.
+2. Every `.jsonl` file under the peer roots is streamed once. Native request ids are compared exactly, in memory, against all targets. A subagent transcript belongs to its path identity; any other file belongs to its first named session, as in the parser.
+   - A fork-copied line is never counted in its own file, so it is not evidence that anyone counts the id. Each one is resolved after the whole census is read:
+     - If the session it names is a target, or owns a scanned peer transcript, the copy is ignored and counted.
+     - If the named source is absent, the copy is conservative peer evidence. It is disclosed as `inherited_from_absent_source`.
+   - The census must include a `projects` root, and every target must lie under a scanned root; otherwise coverage is unknown.
    - These leave coverage unknown, and every target is then held without a body: a cap overflow, a file changed during the read, an unreadable file, a compressed transcript, an unparseable line carrying a request id key, an invalid fork marker, or a symlink leaving the roots.
-   - A target's own replica that carries an id the target lacks is held as an unknown owner.
+   - A target's own replica (owned lines, not fork copies) that carries an id the target lacks is held as an unknown owner.
    - A target's own replica that repeats an id the target counts is not peer evidence. When other targets share that id, the share stays between targets, and B2 allocates it.
    - Bytes are charged as they are read, so a failed or growing file still spends the cumulative byte budget.
 3. B2 counting allocation is fixed for the whole batch before any body or money exists:
    - An id seen in any peer is excluded from every target.
    - An id shared only by targets is kept by the lowest `b2_first_ack_order`, else by the smaller `session_key_sha256`.
    - The allocation digest is recorded. B2 is counting only; it is not ownership.
-4. Each target is re-parsed with the same parser, dropping only the lines of its excluded ids. The producer then checks exactly: kept ids, per-request usage, item totals = original − excluded, and usage rows. The ordinary daemon serializer writes the one-item body. Any mismatch holds the target.
+4. Each target is re-parsed with the same parser, dropping only the lines of its excluded ids. The producer then checks exactly: kept ids, per-request usage, item totals = original − excluded, and usage rows. It also checks that account evidence, titles, workspace and repository identity, and origin are unchanged. The ordinary daemon serializer writes the one-item body. Any mismatch holds the target.
 5. A receipt is written for each kept shared request: the keeping root, `untagged`, and its starting subscription unchanged. The producer applies no Contract-5 permit. A body that carries request evidence is held as unsupported, and allocation-driven name changes must be zero.
 
 Outputs (`0600`, created new):
@@ -158,9 +162,9 @@ Outputs (`0600`, created new):
   - unqualified bodies and their hashes, SI receipts
   - qualification gaps, and the pipeline stages not reproduced
 - `candidate-bundle.json`: the frozen operator packet. All 18 members are held with `missing_evidence` and carry no body fields. Each member's `qualification_report_sha256` binds its target report.
-- `disclosures.json`: only when `catalog_prices` is supplied. These are `LocalExclusionDisclosure` records with the copy screen `not_run`. `excluded_catalog_cost_usd` is an exporter estimate at catalog prices, not canonical money. When prices are missing or a model is unpriced, there is no estimate; it is never shown as zero.
-- `summary.json`: content-free counts and hashes.
+- `disclosures.json`: only when `catalog_prices` is supplied. These are `LocalExclusionDisclosure` records with the copy screen `not_run`. `excluded_catalog_cost_usd` is an exporter estimate at catalog prices, not canonical money. Rates are keyed by `model|context_bucket` only, so a request with any non-default pricing selector (fast mode, a non-standard service tier, batch, or a region) is `unpriced_dimension`. When prices are missing or a model or dimension is unpriced, there is no estimate; it is never shown as zero. Each record also carries `target_binding_sha256` = sha256(`session_key_sha256` + newline + `disclosure_sha256`), because the frozen record names only the batch scope.
+- `summary.json`: content-free counts and hashes. It is written last, so a directory without it is an incomplete run.
 
 Not reproduced, and disclosed in each artifact: Contract-5 local evidence and permit, account binding, desktop title metadata, attribution context, backfill cutoff, and cache-head identity. These bodies are therefore identity-less and untagged. If SOURCE or SI need pipeline-identical overlays, the dependency is the pre-upload phase of the sync pipeline, not this producer.
 
-Tests: `producer/tests.rs` drives 18 synthetic targets and peer roots. They cover a peer exclusion, a B2 first-ACK keeper, a hash keeper, a held-root peer and a fork child. They check that each body equals the parse of a transcript with the excluded line physically removed. Further checks cover the receipt, the held packet, the estimate, determinism, refusing an existing output directory, and holds on a compressed peer or a capped census.
+Tests: `producer/tests.rs` drives 18 synthetic targets and peer roots. They cover a peer exclusion, a B2 first-ACK keeper, a hash keeper, a held-root peer, a target replica, a fork child, a two-hop fork chain, a copy from an absent source, and a fast-mode request left unpriced. They check that each body equals the parse of a transcript with the excluded line physically removed. Further checks cover the receipt, the held packet, the estimate, determinism, refusing an existing output directory, and holds on a compressed peer, a census with no projects root, or a capped census. They also check that a failed read is charged to the byte budget.

@@ -580,6 +580,18 @@ struct PeerHit {
     peer_file_index: usize,
     owner_session_sha256: Option<String>,
     line_count: u64,
+    /// The only evidence is a fork-copied line whose named source session has
+    /// no transcript in the census.
+    inherited_from_absent_source: bool,
+}
+
+/// A fork-copied line carrying a request some target counts. The parser never
+/// counts it in its own file, so it is not evidence that any session counts
+/// the id; it is resolved after the whole census is read.
+struct InheritedCopy {
+    request_id: String,
+    named_session: Option<String>,
+    peer_file_index: usize,
 }
 
 #[derive(Default)]
@@ -601,9 +613,14 @@ struct PeerScan {
     /// and other targets share. That overlap is between targets, so B2
     /// allocates it; the replica is not independent peer evidence.
     shared_target_replica_line_count: u64,
-    /// Per target: id-bearing usage lines naming the target's own session whose
-    /// id the target does not count.
+    /// Per target: owned (not fork-copied) id-bearing usage lines naming the
+    /// target's own session whose id the target does not count.
     replica_divergent_ids: Vec<BTreeSet<String>>,
+    inherited: Vec<InheritedCopy>,
+    /// Sessions that own at least one scanned peer transcript.
+    owning_sessions: BTreeSet<String>,
+    inherited_resolved_line_count: u64,
+    inherited_absent_source_line_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,6 +863,8 @@ pub(crate) fn produce(
             "target_file_occurrences_under_peer_roots": peers.target_file_occurrences,
             "peer_unidentified_usage_line_count": peers.unidentified_usage_line_count,
             "shared_target_replica_line_count": peers.shared_target_replica_line_count,
+            "inherited_copy_resolved_line_count": peers.inherited_resolved_line_count,
+            "inherited_copy_absent_source_line_count": peers.inherited_absent_source_line_count,
             "peer_unidentified_usage_note": "usage lines without a native request id cannot be compared; disclosed, not excluded",
         },
         "global_coverage": {
@@ -896,9 +915,17 @@ pub(crate) fn produce(
                     },
                 };
                 let record = local_exclusion_disclosure_json(&scope, &members, &summary)?;
+                let disclosure_sha256 = sha256_hex(record.as_bytes());
+                // The frozen record names only the batch scope; this binds it
+                // to its target.
+                let target_binding_sha256 = sha256_hex(
+                    format!("{}\n{disclosure_sha256}", members[index].session_key_sha256)
+                        .as_bytes(),
+                );
                 records.push(json!({
                     "session_key_sha256": members[index].session_key_sha256,
-                    "disclosure_sha256": sha256_hex(record.as_bytes()),
+                    "disclosure_sha256": disclosure_sha256,
+                    "target_binding_sha256": target_binding_sha256,
                     "disclosure_json": record,
                 }));
             }
@@ -1041,6 +1068,10 @@ fn target_file(path: &Path) -> TargetFile {
         error: Some(error),
     };
     let canonical_path = match fs::canonicalize(path) {
+        Ok(canonical) if canonical != path => {
+            // The parser and the unchanged-file checks must read one path.
+            return unreadable("transcript_path is not canonical".to_string());
+        }
         Ok(path) if path.is_file() => path,
         Ok(_) => return unreadable("not a regular file".to_string()),
         Err(error) => return unreadable(error.to_string()),
@@ -1274,10 +1305,17 @@ fn scan_peers(
                     continue;
                 };
                 if metadata.file_type().is_symlink() {
+                    // Covered only when the walk reaches the same content under
+                    // a transcript name.
+                    let names_transcript = |path: &Path| {
+                        path.file_name()
+                            .is_some_and(|name| name.to_string_lossy().ends_with(".jsonl"))
+                    };
                     let covered = fs::canonicalize(&path).is_ok_and(|resolved| {
                         canonical_roots
                             .iter()
                             .any(|(_, root)| resolved.starts_with(root))
+                            && (!names_transcript(&path) || names_transcript(&resolved))
                     });
                     if covered {
                         scan.covered_symlink_count += 1;
@@ -1384,7 +1422,65 @@ fn scan_peers(
             "bytes_read": root_bytes,
         }));
     }
+    // A census that never read a target's own tree cannot see its peers.
+    if !canonical_roots
+        .iter()
+        .any(|(class, _)| *class == "projects")
+    {
+        coverage
+            .unknown
+            .push("no projects root was scanned".to_string());
+    }
+    for file in targets {
+        if let Some(path) = &file.canonical_path {
+            if !canonical_roots
+                .iter()
+                .any(|(_, root)| path.starts_with(root))
+            {
+                coverage.unknown.push(format!(
+                    "target {} is under no scanned peer root",
+                    file.path_sha256
+                ));
+            }
+        }
+    }
+    resolve_inherited_copies(&mut scan, &holders, &session_index);
     scan
+}
+
+/// A fork-copied line names its direct source session. When that session's
+/// transcript is in the census (a target or a scanned peer), the copy adds
+/// nothing: the owned line, if any, already produced its evidence. Only a
+/// copy whose named source is absent is kept, as conservative peer evidence.
+fn resolve_inherited_copies(
+    scan: &mut PeerScan,
+    holders: &BTreeMap<&str, Vec<usize>>,
+    session_index: &BTreeMap<&str, usize>,
+) {
+    for copy in std::mem::take(&mut scan.inherited) {
+        let present = copy.named_session.as_deref().is_some_and(|session| {
+            session_index.contains_key(session) || scan.owning_sessions.contains(session)
+        });
+        if present {
+            scan.inherited_resolved_line_count += 1;
+            continue;
+        }
+        scan.inherited_absent_source_line_count += 1;
+        for &target in holders.get(copy.request_id.as_str()).into_iter().flatten() {
+            scan.hits[target]
+                .entry(copy.request_id.clone())
+                .or_insert_with(|| PeerHit {
+                    peer_file_index: copy.peer_file_index,
+                    owner_session_sha256: copy
+                        .named_session
+                        .as_deref()
+                        .map(|session| sha256_hex(session.as_bytes())),
+                    line_count: 0,
+                    inherited_from_absent_source: true,
+                })
+                .line_count += 1;
+        }
+    }
 }
 
 /// Stream one peer transcript. Returns its byte count and content hash;
@@ -1398,8 +1494,8 @@ fn scan_peer_file(
     originals: &[TargetParse],
     scan: &mut PeerScan,
 ) -> Result<(u64, String), String> {
-    let before = fs::metadata(path).map_err(|error| format!("stat: {error}"))?;
     let file = File::open(path).map_err(|error| format!("open: {error}"))?;
+    let before = file.metadata().map_err(|error| format!("stat: {error}"))?;
     let mut reader = BufReader::new(file);
     let mut digest = Sha256::new();
     let mut total = 0_u64;
@@ -1461,11 +1557,23 @@ fn scan_peer_file(
             continue;
         }
         let owner = match provenance {
-            ClaudeForkLineProvenance::Inherited => value
-                .get("forkedFrom")
-                .and_then(|forked| forked.get("sessionId").or_else(|| forked.get("session_id")))
-                .and_then(Value::as_str)
-                .map(|session| session.trim().to_string()),
+            ClaudeForkLineProvenance::Inherited => {
+                if holders.contains_key(request_id.as_str()) {
+                    scan.inherited.push(InheritedCopy {
+                        request_id,
+                        named_session: value
+                            .get("forkedFrom")
+                            .and_then(|forked| {
+                                forked.get("sessionId").or_else(|| forked.get("session_id"))
+                            })
+                            .and_then(Value::as_str)
+                            .map(|session| session.trim().to_string())
+                            .filter(|session| !session.is_empty()),
+                        peer_file_index: file_index,
+                    });
+                }
+                continue;
+            }
             ClaudeForkLineProvenance::Invalid => {
                 return Err("malformed fork marker on a request line".to_string());
             }
@@ -1511,11 +1619,18 @@ fn scan_peer_file(
                         .as_deref()
                         .map(|owner| sha256_hex(owner.as_bytes())),
                     line_count: 0,
+                    inherited_from_absent_source: false,
                 })
                 .line_count += 1;
         }
     }
-    let after = fs::metadata(path).map_err(|error| format!("stat: {error}"))?;
+    if let Some(owner) = subagent_session.or(file_session) {
+        scan.owning_sessions.insert(owner);
+    }
+    let after = reader
+        .get_ref()
+        .metadata()
+        .map_err(|error| format!("stat: {error}"))?;
     if before.len() != total
         || after.len() != total
         || before.modified().ok() != after.modified().ok()
@@ -1764,7 +1879,11 @@ fn build_target(
                         ),
                     );
                 };
-                witness["cause"] = json!("peer_overlap");
+                witness["cause"] = json!(if hit.inherited_from_absent_source {
+                    "inherited_from_absent_source"
+                } else {
+                    "peer_overlap"
+                });
                 witness["peer_path_sha256"] = peer_path_sha256;
                 witness["peer_owner_session_sha256"] = json!(hit.owner_session_sha256);
                 witness["peer_line_count"] = json!(hit.line_count);
@@ -2020,8 +2139,24 @@ fn allocation_identity_changes(original: &SnapshotItem, rebuilt: &SnapshotItem) 
             .filter_map(|row| row.account_identifier_hash.clone())
             .collect::<BTreeSet<_>>()
     };
+    let names = |item: &SnapshotItem| {
+        (
+            item.session_display_name.clone(),
+            item.session_display_name_source.clone(),
+            item.workspace_hash.clone(),
+            item.workspace_display_label.clone(),
+            item.workspace_label_source.clone(),
+            item.repository_hash.clone(),
+            item.repository_label.clone(),
+            item.repository_identity_source.clone(),
+            item.workspace_kind.clone(),
+            item.originator.clone(),
+        )
+    };
     u64::from(original.session_account_evidence != rebuilt.session_account_evidence)
         + u64::from(accounts(original) != accounts(rebuilt))
+        + u64::from(names(original) != names(rebuilt))
+        + u64::from(original.origin != rebuilt.origin)
 }
 
 /// Exact decimal catalog estimate over the excluded requests.
@@ -2041,6 +2176,18 @@ fn estimate_dollars(
         let usage = &occurrence.usage;
         if usage.reasoning_output_tokens > 0 || usage.unattributed_total_tokens > 0 {
             return Err("unpriced_dimension");
+        }
+        // Rates are keyed by model and context bucket only; any other
+        // non-default pricing selector would be priced wrongly.
+        for (field, value) in &occurrence.selector.context {
+            let default = match field.as_str() {
+                "service_tier" | "speed_mode" | "batch_mode" | "mode" => value == "standard",
+                "region_mode" => matches!(value.as_str(), "global" | "not_available"),
+                _ => true,
+            };
+            if !default {
+                return Err("unpriced_dimension");
+            }
         }
         let model = occurrence.model.as_deref().ok_or("unpriced_model")?;
         let bucket = occurrence
