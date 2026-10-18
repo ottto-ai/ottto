@@ -179,13 +179,20 @@ pub(in crate::snapshots) struct JobMeta {
     owner: Option<String>,
     counting: &'static str,
     pages: u32,
+    /// The paused charge could not be bounded once; the job then finishes
+    /// unpaged in this page instead of re-walking its state every line.
+    pause_refused: bool,
 }
 crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, dependencies, owner,
-    counting, pages);
+    counting, pages, pause_refused);
 
 impl JobMeta {
     pub(in crate::snapshots) fn stamp_open(&self) -> &OpenStamp {
         &self.stamp_open
+    }
+
+    pub(in crate::snapshots) fn pausable(&self) -> bool {
+        !self.pause_refused
     }
 }
 
@@ -313,6 +320,9 @@ impl CursorLease {
         let inputs = job.parser.take_live_reduction_inputs();
         let Some(charge) = crate::heap_layout_bound::bound(&job, STATE_BYTES) else {
             job.parser.restore_live_reduction_inputs(inputs);
+            if let Some(meta) = job.cursor.as_mut() {
+                meta.pause_refused = true;
+            }
             self.cache
                 .with_cursor(|cursor| cursor.counters.unpaged_fallbacks += 1);
             return Err(Box::new((self, job)));
@@ -472,6 +482,7 @@ impl SharedCache {
             dependencies,
             owner,
             pages: 1,
+            pause_refused: false,
         });
         Some(CursorLease {
             cache: Arc::clone(self),

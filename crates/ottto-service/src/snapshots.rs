@@ -14354,7 +14354,10 @@ impl OwnedSourceScan {
                 }
                 match stepped {
                     Ok(false) => {
-                        if active.cursor.is_some()
+                        if active
+                            .cursor
+                            .as_ref()
+                            .is_some_and(sampled_scan::codex_cursor::JobMeta::pausable)
                             && codex_page
                                 .cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
                         {
