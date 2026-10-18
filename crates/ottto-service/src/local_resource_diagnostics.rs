@@ -222,8 +222,90 @@ pub(crate) struct ReadCounts {
     pub(crate) unchanged_selections: usize,
     pub(crate) completed_native_bytes: u64,
     pub(crate) completed_guard_bytes: u64,
+    pub(crate) acquisition_admission: AcquisitionAdmission,
     pub(crate) page_events: PageEvents,
     pub(crate) index_state_at_page_end: IndexState,
+}
+
+/// Fixed page totals, not per-file history. Unassessed is attempts - assessed;
+/// a short-circuited gate is never reported as a known false result.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct AssessedBool {
+    assessed: usize,
+    matched: usize,
+}
+impl AssessedBool {
+    pub(crate) fn observe(&mut self, value: bool) {
+        self.assessed = self.assessed.saturating_add(1);
+        self.matched = self.matched.saturating_add(usize::from(value));
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct AcquisitionAdmission {
+    pub(crate) attempts: usize,
+    pub(crate) cache_lookup_miss_unknown_origin: usize,
+    pub(crate) retained_entry: AssessedBool,
+    pub(crate) owning_header_current: AssessedBool,
+    pub(crate) state_census_complete: AssessedBool,
+    pub(crate) sidecar_census_complete: AssessedBool,
+    pub(crate) reduction_dependencies_available: AssessedBool,
+    pub(crate) index_entry_present: AssessedBool,
+    pub(crate) audit_metadata_supported: AssessedBool,
+    pub(crate) protected_history: AssessedBool,
+    pub(crate) forced_family: AssessedBool,
+    pub(crate) comparison_target: AssessedBool,
+    pub(crate) parent_proof_required: AssessedBool,
+    pub(crate) audit_debt_present: AssessedBool,
+    pub(crate) audit_slot_available: AssessedBool,
+    pub(crate) sampling_allowed: AssessedBool,
+    pub(crate) retained_entry_rejected_by_eligibility: usize,
+    pub(crate) prepare_started: usize,
+    pub(crate) prepare_failed: usize,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for AcquisitionAdmission {
+    const INLINE_ONLY: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// Existing audit point, using already computed final/previous fingerprints.
+/// Additive aliases retain their meaning; neither comparison is an audit-policy
+/// benefit verdict (a suffix or policy change can also change either witness).
+pub(crate) fn sampled_audit_comparison(
+    source: &str,
+    semantic: (Option<&str>, Option<&str>),
+    additive: (Option<&str>, Option<&str>),
+) {
+    #[derive(Serialize)]
+    struct Counts {
+        body_comparison_available: bool,
+        effective_body_changed: bool,
+        semantic_comparison_available: bool,
+        semantic_changed: bool,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "sampled_audit_comparison",
+        source: Source::from_slug(source),
+        observation: Observation {
+            observed_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+            wall_elapsed_us: 0,
+            shared_process_cpu_delta_us: None,
+            process_lifetime_max_rss_bytes: None,
+            process_lifetime_max_rss_before_bytes: None,
+        },
+        counts: Counts {
+            body_comparison_available: additive.1.is_some(),
+            effective_body_changed: additive.0 != additive.1,
+            semantic_comparison_available: semantic.1.is_some(),
+            semantic_changed: semantic.0 != semantic.1,
+        },
+    });
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct PageEvents {
@@ -388,12 +470,37 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 mod tests {
     use super::*;
     fn max_read_counts() -> ReadCounts {
+        let gate = AssessedBool {
+            assessed: usize::MAX,
+            matched: usize::MAX,
+        };
         ReadCounts {
             full_selections: (usize::MAX / 11) * 11,
             tail_selections: usize::MAX,
             unchanged_selections: usize::MAX,
             completed_native_bytes: u64::MAX,
             completed_guard_bytes: u64::MAX,
+            acquisition_admission: AcquisitionAdmission {
+                attempts: usize::MAX,
+                cache_lookup_miss_unknown_origin: usize::MAX,
+                retained_entry: gate,
+                owning_header_current: gate,
+                state_census_complete: gate,
+                sidecar_census_complete: gate,
+                reduction_dependencies_available: gate,
+                index_entry_present: gate,
+                audit_metadata_supported: gate,
+                protected_history: gate,
+                forced_family: gate,
+                comparison_target: gate,
+                parent_proof_required: gate,
+                audit_debt_present: gate,
+                audit_slot_available: gate,
+                sampling_allowed: gate,
+                retained_entry_rejected_by_eligibility: usize::MAX,
+                prepare_started: usize::MAX,
+                prepare_failed: usize::MAX,
+            },
             page_events: PageEvents {
                 full_reasons: FullReasons([usize::MAX / 11; 11]),
                 priority_full_replays: usize::MAX,
@@ -735,7 +842,14 @@ mod tests {
         assert_eq!(records[3]["source"], "unknown");
         for record in records {
             let text = serde_json::to_string(&record).unwrap();
-            assert!(text.len() < 2048);
+            // Fixed page gate totals extend this local diagnostic record only;
+            // upload/finish records and all runtime resource caps stay unchanged.
+            let limit = if record["stage"] == "native_collection_page" {
+                4096
+            } else {
+                2048
+            };
+            assert!(text.len() < limit);
             assert!(!text.contains("secret/path"));
             assert!(!text.contains("cycle_peak"));
             assert_eq!(record["schema_version"], SCHEMA_VERSION);
