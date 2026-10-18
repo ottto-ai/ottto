@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 693,
-  "content_sha256": "95c779e8aa4fd0e8cee379223f56adf48f29ffcbe7f7f92fac0c1ad2d8eef732",
+  "candidate_file_count": 694,
+  "content_sha256": "99c73007ed6fe417a362a73a4e199e374434a5dcc62b660afb0c4c3184229804",
   "files": [
     {
       "executable": false,
@@ -1014,8 +1014,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics.rs",
-      "sha256": "bfc90495cd9c2ea4b18b00686fac356cbf8edd2acf0c8003a5506891b1b7a70f",
-      "size_bytes": 31993
+      "sha256": "d0d75230a93aecd57c909b90231ea9679de6c385d556f5f69a1cd16bcf63db5c",
+      "size_bytes": 40446
     },
     {
       "executable": false,
@@ -1196,8 +1196,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "3d29b0e343e2927f0917b7f57c5b6e6874e56c8a640b3da29613c68da485aed8",
-      "size_bytes": 815146
+      "sha256": "8283a7051137be17073d93a3604d7d951965766285cec2351e84a43856752972",
+      "size_bytes": 820405
     },
     {
       "executable": false,
@@ -1266,8 +1266,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "63508d1778319b57ba1a96582d425346379e2365393ecf6d0ff01f174de2167d",
-      "size_bytes": 2635485
+      "sha256": "5a64926b789e15ac0c09e41a1e3693d4ad7554adf7fa11a38deea4d4ad911a68",
+      "size_bytes": 2636817
     },
     {
       "executable": false,
@@ -1315,15 +1315,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison.rs",
-      "sha256": "e991a06f9c2af134b925fa709ef3a1caac9d33d61d3982c1efdbafdb3ad737ea",
-      "size_bytes": 122313
+      "sha256": "df3878cff2f6c0bc72aea633fed44ddc2dcb648b1039336e460ec15b81ca639a",
+      "size_bytes": 122740
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/lifecycle.rs",
-      "sha256": "ecc2a07f2c8d724729ee5b858f6e59ee3db2712c02daaf64ca2376cf4b48ce9c",
-      "size_bytes": 33781
+      "sha256": "9c5e28b68b3745b01c9e67adb97ea6dedc5af03067b15c6db68ee8aa6c99b0bc",
+      "size_bytes": 35702
     },
     {
       "executable": false,
@@ -1336,8 +1336,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
-      "sha256": "65e60d89c7ecd6d10a827d9cae2c91beb2cce6acd65ee1cf48ea1a090fc84018",
-      "size_bytes": 59256
+      "sha256": "c4c6a22805129de08b9f721cae4c33bee598a6d27b78488e4ea77b41a20b0bae",
+      "size_bytes": 59711
     },
     {
       "executable": false,
@@ -1441,8 +1441,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/p12_usage_original_tests.rs",
-      "sha256": "d68778048cb1bf9ab0d5e8d0a316ce0d23fae9c9d942613477399d182147b28d",
-      "size_bytes": 22618
+      "sha256": "458e8f100325dc120972ed90ee1f0b3a9b0787032419830ec2fb1f287b1e09e6",
+      "size_bytes": 22624
     },
     {
       "executable": false,
@@ -3060,6 +3060,13 @@
       "path": "docs/session-2026-10-18-context-footprint-file-counts.md",
       "sha256": "690425f613faf1c6febd14b454ec45cf6f73b7abf67338eb04aef313f9be79c8",
       "size_bytes": 1564
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-native-comparison-page-decisions.md",
+      "sha256": "a5f54c79f8809648538a091196befa26f9ef4c581e7ab9d0ce8f3b8150d7ebaa",
+      "size_bytes": 4862
     },
     {
       "executable": false,
@@ -4854,9 +4861,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T18:24:54+00:00",
+  "generated_at": "2026-10-18T19:40:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 694,
+  "output_file_count": 695,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4893,5 +4900,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "09f0e8a6b98e1bbd24faa0ed878056a6aab42ce7"
+  "source_commit": "58a43ff7e0bc771ab89d439652e589328a897bc9"
 }
