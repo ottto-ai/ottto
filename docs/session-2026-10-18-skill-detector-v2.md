@@ -28,6 +28,13 @@
   was named, else `agent_capability_usage:v1`. v2 keeps v1's capability counts;
   it only adds "the skill detector saw everything it could name". No new wire
   field. The backend must admit v2 before this ships.
+- **One spelling per skill.** The backend turns uploaded
+  `activity_summary.skills` names into `skill_id` facts by hashing their exact
+  bytes and skipping hashes it already has. So the summary uploads, for a
+  reference to an invoked skill, the invocation's lowercased spelling (the one
+  its fact hashes), and a second casing of a referenced skill (`Foo/SKILL.md`
+  after `foo/SKILL.md`) is not stored; the first spelling wins. Admission then
+  keeps one fact per skill without a backend change.
 - **Bounded memory.** Activity skills stop at 33 (wire cap 32 + 1, so the backend
   still sees truncation); provider skills stop at 9 (fact cap 8 + 1).
   `MAX_SKILL_FACTS` names the shared 8-fact cap in `session_attribution.rs`.
@@ -45,7 +52,8 @@
 
 - `skill_md_references_name_every_layout_and_flag_unnamed_ones`: extractor table.
 - `claude_skill_evidence_separates_invocations_from_references`: Skill + marker
-  dedupe, plugin/relative paths, `.backup` lookalike, Edit ignored, no tool
+  dedupe, plugin/relative paths, `.backup` lookalike, Edit ignored, casing
+  variants upload one spelling (the invocation's for an invoked skill), no tool
   counts, no path upload, unnamed → v1, 33/9 bounds, wire cap 32.
 - `codex_unnamed_skill_reference_keeps_capability_marker_v1`, and the existing
   Codex activity test now covers `.system` and asserts v2.
@@ -54,21 +62,51 @@
   (one with a skill, one empty) once with the same content hash and usage, then
   settles; labels-off policy still strips skill names.
 
-## Measured cost (debug test build, same frozen local corpus, 3 runs each)
+## Measured cost (release builds, `ottto-service snapshot-audit`)
 
-Corpus: 581 Claude files (1.47 GB, 227 sessions), 68 Codex files (1.47 GB,
-61 sessions). Whole-process CPU of the parse, main vs this change:
+One release build of main and one of this change, run through the existing
+`snapshot-audit` command (production scanner, isolated audit state directory,
+no upload). Frozen local corpus: 626 Claude files (1.50 GB, 258 sessions) and
+75 Codex files (1.50 GB, 67 sessions). For the measurement only, both builds
+got the same uncommitted two-line audit tweak: allow the private upload payload
+for Claude, and an env switch that turns attribution, labels and titles on so
+skill facts and names reach the payload. Default policy (all off) unless noted.
+User CPU from `/usr/bin/time -l`; runs alternate main/change to remove drift.
 
-| | main (s) | change (s) | delta |
-|---|---|---|---|
-| Claude, all files | 68.9 / 71.2 / 69.9 | 69.6 / 68.3 / 69.4 | −1.2% (noise) |
-| Codex, all files | 35.1 / 36.1 / 34.8 | 34.8 / 35.2 / 34.9 | −1.0% (noise) |
-| Claude largest file (185 MB) | 11.0 / 11.8 / 11.3 | 10.8 / 10.9 / 10.7 | noise |
-| Codex largest file (514 MB) | 8.4 / 8.9 / 8.5 | 8.5 / 8.4 / 8.6 | noise |
+| # | what | main | change | delta |
+|---|---|---|---|---|
+| M1 | Claude full scan, user CPU (6 runs) | 10.31 s | 10.25 s | −0.6% |
+| M1 | Codex full scan, user CPU (4 runs) | 7.93 s | 7.78 s | −1.9% |
+| M1 | scanner-stage peak RSS, median (Claude / Codex) | 145.7 / 62.4 MB | 146.2 / 63.1 MB | +0.5 / +0.7 MB |
+| M2 | append one record to the largest Claude file (186 MB), rescan, user CPU (8 runs) | 1.212 s | 1.234 s | +1.8% (one run-to-run stdev is ~0.04 s) |
+| M2 | same, largest Codex file (521 MB) (6 runs) | 4.02 s | 3.98 s | −1.0% |
+| M4 | audit state directory after scans (Claude / Codex) | 536,632 / 86,264 B | 536,632 / 86,264 B | 0 B, no new files |
 
-- Peak RSS of the run: 128.9 MB main, 127.4 MB change (no increase).
-- Serialized `activity_summary`: Claude +6.3 KB over 227 sessions (~28 B each),
-  Codex +0.2 KB. Sessions with skills: Claude 0 → 88, Codex 14 → 19.
-- Marker: Claude 208/227 v2, Codex 58/61 v2; the rest saw an unnamed reference.
-- No new files or background work; the scan index keeps its row count.
-- One-time: every retained session republishes once after upgrade.
+The rescan after an append re-reads the whole changed file (1 Claude file; 5
+Codex files, of which 4 are ownership-incomplete residue re-derived every
+generation in both builds).
+
+**M3, one-time upgrade.** First scan of the change over main's settled state:
+
+| | Claude | Codex |
+|---|---|---|
+| files parsed (all, 1.50 GB each) | 622 / 622 | 75 / 75 |
+| sessions republished | 258 / 258 | 67 / 67 |
+| upload JSON, policy off | 3,649,398 B (gzip 322,582) | 1,451,989 B (gzip 158,240) |
+| upload JSON, attribution + labels on | 4,143,445 B (gzip 451,214) | 1,559,148 B (gzip 184,991) |
+| second scan: files parsed / sessions published | 0 / 0 | 4 residue / 0 |
+
+Every retained session republishes once (the parser version is in the revision
+hash, so this includes sessions whose marker stays v1), then the next scan is a
+no-op. Against a fresh main scan, the change adds 0 B of upload JSON with the
+policy off (marker string has the same length) and +99,102 B for Claude
+(+384 B per session, +2.5%) / +4,499 B for Codex with attribution and labels on.
+
+Signal with attribution and labels on: Claude `skill_id` facts 21 → 258
+(15 → 97 sessions), summary names 0 → 264 (94 sessions); Codex facts 81 → 92.
+Marker v2: Claude 237/258, Codex 64/67; the rest saw an unnamed reference.
+Replaying backend admission's promotion on the change's payloads (same HMAC,
+same caps) adds 0 new skill facts in both sources, and no session holds two
+casings of one skill.
+
+The scan index keeps its size and file count; no background work is added.

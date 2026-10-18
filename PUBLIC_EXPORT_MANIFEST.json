@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 685,
-  "content_sha256": "1f77f6d34dacdb6d08893e8ee8f0509ad7b0ef4d42034459192d9196657d6f9c",
+  "candidate_file_count": 686,
+  "content_sha256": "50611dff8317b54f07cc25bc6568ff5a24cafe691ee4c1b96fcadcf4444b1b2a",
   "files": [
     {
       "executable": false,
@@ -1154,8 +1154,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/session_attribution.rs",
-      "sha256": "1701a399d4569c4ff8d922ecd767cfb2534bfadb11e050a79503c8ee01fd1f7c",
-      "size_bytes": 96551
+      "sha256": "e4d35305c52b476e441623515b690d79b37147ed4909f0217add254c5d79b009",
+      "size_bytes": 97220
     },
     {
       "executable": false,
@@ -1259,8 +1259,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "424245780a9da45450acefadb8ab01a1f8b016abba5f2dfab5a7ae61884dd6ea",
-      "size_bytes": 2610712
+      "sha256": "ee8d4c6c4aa4872b84615665f459174b5619b126dbcb7cdee345c06fea2ee107",
+      "size_bytes": 2628795
     },
     {
       "executable": false,
@@ -3050,6 +3050,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-18-skill-detector-v2.md",
+      "sha256": "c64008b93ab5cca8accbd54a02623a7e4613cacf2a78e1f7ec46b73275a4475b",
+      "size_bytes": 6939
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-18-traversal-transition-diagnostics.md",
       "sha256": "8dabdfd62eb617c96fd26e68fe1a9eeb82bf5f14ae7a5807e28af23b1cc278d7",
       "size_bytes": 2033
@@ -3632,7 +3639,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/collector-status/census-residue-scan-status-v1.json",
-      "sha256": "b045f191a30bb08602ffacceda560c6ea8bd2d4fd5ea05f78f4df63bae35927c",
+      "sha256": "5aab5897fad814215baac096c80acb6bc29d838eb6fc8c7007ba8d7e8a2cdbaa",
       "size_bytes": 2381
     },
     {
@@ -4164,28 +4171,28 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/body-witness-ack-normalization-v1.json",
-      "sha256": "ca5b09fd30a55cd4ec91653739e94bc3124c7eec66b9535a488c736131231631",
+      "sha256": "8a767105539ff51c913c951c1ddb476a3a1c0fb375c842c7d2df6ed221d95595",
       "size_bytes": 16342
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache-observations-v1-manifest.json",
-      "sha256": "447c8e968031f97ac266040ce4a035fb2ab906e6513790f5476e3962544137e6",
+      "sha256": "ed65221022feb0e50d192866964817285a765b1e53101164c6c5c6e8a8be661d",
       "size_bytes": 1623
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache_observation_claude_v1.json",
-      "sha256": "9d6c55ece14ea76e43074f4ba092a9bc84b965d5435298f4686400f5228cc8e6",
+      "sha256": "96d2229feddcdcc6882ccebdf58910c4dd315e8f98bc8a4a0e6e6e339cd19b78",
       "size_bytes": 8860
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache_observation_codex_v1.json",
-      "sha256": "34f8f3884693276ba4b847471d2a9b0729f631917192e460fbd7a03b15133597",
+      "sha256": "4fd70ed562c121b4a189be027f506495bf7e0f2e04e7887bdcc59d4f6277bb6f",
       "size_bytes": 10459
     },
     {
@@ -4199,28 +4206,28 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/claude-original-source-corpus-v1.json",
-      "sha256": "d393b06d39be71e5fd3360d69db966f755055c57de3e4b198231753c928bbf12",
+      "sha256": "9cc0612154254619c9a2452a0315e9a5326adb6db56ea8eefbba6ebaa7dfc486",
       "size_bytes": 179395
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-golden.json",
-      "sha256": "e06d52c34239498044550178042f5a58548aa2842bf5628d9f09ccd2620506bb",
+      "sha256": "21d0d2434268cb1d357ea927b615784ab9535923998f811312b651a3075c2317",
       "size_bytes": 3045
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-manifest.json",
-      "sha256": "79123ef758d166eca52d3647cbb2003cac6c4fe5e6020f9846bdc6bdea8a33ed",
+      "sha256": "45d3c305b0e1bdd2f57548636bfb2524b9fb65521e286f7cd025f12261c9508c",
       "size_bytes": 1777
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-max-fractional.json",
-      "sha256": "f21bce301ae91f7d448c10cd4ec0b546a17e47c04ccfbe493cabdfaf44c0ab70",
+      "sha256": "6e24a91375a971b4e2fb48525b8bd35ef7c3c46956452e52521e74688accccb0",
       "size_bytes": 65507
     },
     {
@@ -4241,7 +4248,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "b50dfb9433bc9dea250b630e73fc08e0ac0d3be8b9d45e1afc4848fb23ecbb0c",
+      "sha256": "5b3bb6708a90403ebfba0301abc4ea08c4163f6ffb7c4dc6b2b82c7c61149eca",
       "size_bytes": 218514
     },
     {
@@ -4798,9 +4805,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T13:50:59+00:00",
+  "generated_at": "2026-10-18T14:20:08+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 686,
+  "output_file_count": 687,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4837,5 +4844,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7c5742301231f81397af7ea7ad7467f900c073ce"
+  "source_commit": "afa5243441bc2970c1c708e571e520d1578a58d2"
 }
