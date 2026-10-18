@@ -159,15 +159,18 @@ pub(crate) fn phase_peak() -> usize {
     PHASE_PEAK.with(Cell::get)
 }
 
-// Independent all-thread audit. The fixed table allocates no Rust heap and
-// leaves System/Layouts untouched. Only pointers born inside this scope are
+// Independent born-in-scope audits. The fixed tables allocate no Rust heap and
+// leave System/Layouts untouched. Only pointers born inside this scope are
 // charged: freeing a pre-existing allocation cannot hide a later peak. Charge
 // realloc's old+new overlap conservatively even when System grows in place.
+// The process table charges every thread. The caller table charges only the
+// measuring thread's allocations; a free on any thread retires a charged
+// pointer exactly, and unrelated threads' allocations are never charged.
 mod process {
     use super::Stats;
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
-    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    use std::sync::{Mutex, MutexGuard};
     const SLOTS: usize = 65_536;
     #[derive(Clone, Copy)]
     struct Entry {
@@ -186,7 +189,7 @@ mod process {
         stats: Stats,
         entries: [Entry; SLOTS],
     }
-    static AUDIT: Mutex<Audit> = Mutex::new(Audit {
+    const IDLE: Audit = Audit {
         active: false,
         overflow: false,
         stats: Stats {
@@ -200,7 +203,27 @@ mod process {
             usable_peak_with_overlap: 0,
         },
         entries: [EMPTY; SLOTS],
-    });
+    };
+    struct Table {
+        active: AtomicBool,
+        audit: Mutex<Audit>,
+    }
+    static PROCESS: Table = Table {
+        active: AtomicBool::new(false),
+        audit: Mutex::new(IDLE),
+    };
+    static CALLER: Table = Table {
+        active: AtomicBool::new(false),
+        audit: Mutex::new(IDLE),
+    };
+    // One caller-thread audit at a time; others wait rather than share stats.
+    static CALLER_GATE: Mutex<()> = Mutex::new(());
+    thread_local! {
+        static CALLER_THREAD: Cell<bool> = const { Cell::new(false) };
+    }
+    fn on_caller_thread() -> bool {
+        CALLER_THREAD.try_with(Cell::get).unwrap_or(false)
+    }
     impl Audit {
         fn lookup(&self, pointer: usize) -> Option<usize> {
             let first = (pointer >> 4).wrapping_mul(0x9e3779b1) % SLOTS;
@@ -249,23 +272,82 @@ mod process {
                 self.entries[slot].pointer = 1;
             }
         }
+        fn reallocated(&mut self, old: usize, new: usize, requested: usize, usable: usize) {
+            self.stats.requested_peak = self
+                .stats
+                .requested_peak
+                .max(self.stats.requested_live as usize + requested);
+            self.stats.usable_peak = self
+                .stats
+                .usable_peak
+                .max(self.stats.usable_live as usize + usable);
+            self.remove(old);
+            self.insert(new, requested, usable);
+        }
+    }
+    impl Table {
+        /// Locked active audit, or None while this table is idle.
+        fn active(&self) -> Option<MutexGuard<'_, Audit>> {
+            if !self.active.load(Ordering::Relaxed) {
+                return None;
+            }
+            let audit = self.audit.lock().unwrap_or_else(|p| p.into_inner());
+            if audit.active {
+                Some(audit)
+            } else {
+                None
+            }
+        }
+        fn measure<T>(&self, f: impl FnOnce() -> T) -> (T, Stats) {
+            {
+                let mut audit = self.audit.lock().unwrap_or_else(|p| p.into_inner());
+                if audit.active {
+                    drop(audit);
+                    panic!("native allocation audit already active");
+                }
+                audit.entries.fill(EMPTY);
+                audit.stats = Stats::default();
+                audit.overflow = false;
+                audit.active = true;
+                self.active.store(true, Ordering::Release);
+            }
+            struct Stop<'a>(&'a Table);
+            impl Drop for Stop<'_> {
+                fn drop(&mut self) {
+                    self.0.active.store(false, Ordering::Release);
+                    self.0
+                        .audit
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .active = false;
+                }
+            }
+            let stop = Stop(self);
+            let result = f();
+            drop(stop);
+            let (overflow, stats) = {
+                let audit = self.audit.lock().unwrap_or_else(|p| p.into_inner());
+                (audit.overflow, audit.stats)
+            };
+            assert!(!overflow, "native allocation audit table overflow");
+            (result, stats)
+        }
     }
     pub(super) fn allocated(pointer: *mut u8, requested: usize, usable: usize) {
-        if !ACTIVE.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
-        if audit.active {
+        if let Some(mut audit) = PROCESS.active() {
             audit.insert(pointer as usize, requested, usable);
+        }
+        if on_caller_thread() {
+            if let Some(mut audit) = CALLER.active() {
+                audit.insert(pointer as usize, requested, usable);
+            }
         }
     }
     pub(super) fn deallocated(pointer: *mut u8) {
-        if !ACTIVE.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
-        if audit.active {
-            audit.remove(pointer as usize);
+        for table in [&PROCESS, &CALLER] {
+            if let Some(mut audit) = table.active() {
+                audit.remove(pointer as usize);
+            }
         }
     }
     pub(super) unsafe fn reallocate(
@@ -274,62 +356,65 @@ mod process {
         requested: usize,
     ) -> *mut u8 {
         use std::alloc::{GlobalAlloc, System};
-        if !ACTIVE.load(Ordering::Relaxed) {
+        // Keep the table locks (always process, then caller) across System's
+        // native realloc: another thread may immediately reuse the old address
+        // after System frees it.
+        let (mut process, mut caller) = (PROCESS.active(), CALLER.active());
+        if process.is_none() && caller.is_none() {
             return System.realloc(old, layout, requested);
         }
-        // Keep the table lock across System's native realloc: another thread
-        // may immediately reuse the old address after System frees it.
-        let mut audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
         let new = System.realloc(old, layout, requested);
-        if audit.active && !new.is_null() {
+        if !new.is_null() {
             let usable = super::usable(new.cast(), requested);
-            audit.stats.requested_peak = audit
-                .stats
-                .requested_peak
-                .max(audit.stats.requested_live as usize + requested);
-            audit.stats.usable_peak = audit
-                .stats
-                .usable_peak
-                .max(audit.stats.usable_live as usize + usable);
-            audit.remove(old as usize);
-            audit.insert(new as usize, requested, usable);
+            if let Some(audit) = process.as_deref_mut() {
+                audit.reallocated(old as usize, new as usize, requested, usable);
+            }
+            if let Some(audit) = caller.as_deref_mut() {
+                if on_caller_thread() {
+                    audit.reallocated(old as usize, new as usize, requested, usable);
+                } else {
+                    // The old pointer is retired; an unrelated thread owns the new one.
+                    audit.remove(old as usize);
+                }
+            }
         }
         new
     }
     pub(super) fn measure<T>(f: impl FnOnce() -> T) -> (T, Stats) {
-        {
-            let mut audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
-            if audit.active {
-                drop(audit);
-                panic!("native allocation audit already active");
-            }
-            audit.entries.fill(EMPTY);
-            audit.stats = Stats::default();
-            audit.overflow = false;
-            audit.active = true;
-            ACTIVE.store(true, Ordering::Release);
-        }
-        struct Stop;
-        impl Drop for Stop {
+        PROCESS.measure(f)
+    }
+    pub(super) fn measure_caller<T>(f: impl FnOnce() -> T) -> (T, Stats) {
+        // Fail closed instead of deadlocking on the gate this thread holds.
+        assert!(
+            !on_caller_thread(),
+            "caller-thread allocation audit already active on this thread"
+        );
+        let _gate = CALLER_GATE.lock().unwrap_or_else(|p| p.into_inner());
+        struct Leave;
+        impl Drop for Leave {
             fn drop(&mut self) {
-                ACTIVE.store(false, Ordering::Release);
-                AUDIT.lock().unwrap_or_else(|p| p.into_inner()).active = false;
+                CALLER_THREAD.with(|caller| caller.set(false));
             }
         }
-        let stop = Stop;
-        let result = f();
-        drop(stop);
-        let (overflow, stats) = {
-            let audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
-            (audit.overflow, audit.stats)
-        };
-        assert!(!overflow, "native allocation audit table overflow");
-        (result, stats)
+        CALLER.measure(|| {
+            CALLER_THREAD.with(|caller| caller.set(true));
+            let _leave = Leave;
+            f()
+        })
     }
 }
 
 pub(crate) fn measure_process<T>(f: impl FnOnce() -> T) -> (T, Stats) {
     process::measure(f)
+}
+
+/// Born-in-scope audit of allocations made by the calling thread only. Unlike
+/// `measure`, freeing pre-existing storage cannot hide a later peak; unlike
+/// `measure_process`, other threads' allocations are never charged, so it is
+/// safe in parallel test runs. Use only for synchronous closures that hand no
+/// allocation to another thread. Not reentrant on one thread.
+pub(crate) fn measure_caller_thread<T>(f: impl FnOnce() -> T) -> (T, Stats) {
+    process::measure_caller(f)
 }
 
 #[cfg(test)]
@@ -400,6 +485,45 @@ mod tests {
         unsafe {
             drop(Box::from_raw(leaked));
         }
+    }
+
+    // Parallel-safe: the caller table never charges another thread.
+    #[test]
+    fn caller_thread_audit_keeps_born_peak_and_excludes_other_threads() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let pre_existing = Box::new([0u8; 4096]);
+        let mut grown = Vec::<u8>::with_capacity(64);
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let worker = {
+            let (stop, ticks) = (stop.clone(), ticks.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(std::hint::black_box(Box::new([0u8; 65_536])));
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let ((), audit) = measure_caller_thread(|| {
+            drop(pre_existing); // Cannot offset the growth below.
+            let born = std::hint::black_box(Box::new([0u8; 256]));
+            // Pre-existing buffer: only its new side is charged.
+            grown.reserve_exact(1024);
+            // The unrelated thread allocates while this window is open.
+            let seen = ticks.load(Ordering::Relaxed);
+            while ticks.load(Ordering::Relaxed) < seen + 2 {
+                std::hint::spin_loop();
+            }
+            drop(born);
+        });
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert_eq!(audit.requested_peak_with_overlap, 256 + 1024);
+        assert_eq!(audit.requested_live, 1024);
+        assert_eq!((audit.allocations, audit.deallocations), (2, 1));
+        assert!(audit.usable_peak_with_overlap >= audit.requested_peak_with_overlap);
+        drop(grown);
     }
 
     fn formatless(s: Stats) -> (isize, isize, usize, usize, usize, usize, usize, usize) {

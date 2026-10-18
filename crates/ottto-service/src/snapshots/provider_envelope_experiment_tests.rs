@@ -274,12 +274,10 @@ fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once(
         assert!(paid.as_mut().unwrap().reserve_recovery(recovery));
         let unchanged = serde_json::to_vec(&index).unwrap();
         // Synchronous on this thread (no spawn, channel or pool in the call
-        // chain), so thread-local accounting excludes parallel tests. Unlike
-        // the born-in-scope process audit, it nets frees and the old side of
-        // reallocations of storage that existed before the call: the peak is
-        // this thread's actual incremental heap, not an upper bound on new
-        // allocations alone.
-        let (imported, allocations) = crate::retry_allocation_probe::measure(|| {
+        // chain). The import drops the pre-existing window, so keep
+        // born-in-scope accounting (that free cannot hide a later peak) but
+        // charge only this thread, excluding parallel tests' allocations.
+        let (imported, allocations) = crate::retry_allocation_probe::measure_caller_thread(|| {
             phase.import_window_paid(Some(window), &index, &scan.census_window_end, &mut paid)
         });
         assert_eq!(imported, !one_byte_short);
