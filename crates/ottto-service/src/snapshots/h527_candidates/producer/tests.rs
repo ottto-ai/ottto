@@ -544,17 +544,52 @@ fn producer_holds_every_target_without_a_body_on_unknown_or_capped_peers() {
     let broken_line = b"{\"requestId\": \"req-t01-a\", truncated\n";
     fs::write(broken.join("broken.jsonl"), broken_line).expect("write");
     let mut failed = fixture.input.clone();
-    failed.peer_roots = vec![InputPeerRoot {
+    failed.peer_roots.push(InputPeerRoot {
         class: "other".to_string(),
         path: broken,
-    }];
+    });
     let output = produce(&failed, &"0".repeat(64), &fixture_build()).expect("produce");
     let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");
-    assert_eq!(artifact["global_coverage"]["complete"], false);
+    let unknown_causes = |artifact: &Value| {
+        artifact["global_coverage"]["unknown"]
+            .as_array()
+            .expect("unknown")
+            .iter()
+            .map(|cause| cause.as_str().expect("cause").to_string())
+            .collect::<Vec<_>>()
+    };
+    let [cause]: [String; 1] = unknown_causes(&artifact).try_into().expect("one cause");
+    assert!(
+        cause.ends_with("unparseable line with a request id key"),
+        "{cause}"
+    );
+    let broken_bytes = artifact["input_manifest"]["peer_files"]
+        .as_array()
+        .expect("peer files")
+        .iter()
+        .find(|file| file.get("unknown").is_some())
+        .expect("failed peer file");
+    assert!(broken_bytes.get("size_bytes").is_none());
+    let read_ok = artifact["input_manifest"]["peer_files"]
+        .as_array()
+        .expect("peer files")
+        .iter()
+        .filter_map(|file| file["size_bytes"].as_u64())
+        .sum::<u64>();
     assert_eq!(
         artifact["input_manifest"]["cumulative_peer_bytes_read"],
-        broken_line.len()
+        read_ok + broken_line.len() as u64
     );
+    // One target outside every scanned root, with a projects root present.
+    let mut outside = fixture.input.clone();
+    let stray = fixture.root.join("stray").join("t18.jsonl");
+    fs::create_dir_all(stray.parent().expect("parent")).expect("mkdir");
+    fs::copy(&outside.targets[17].transcript_path, &stray).expect("copy");
+    outside.targets[17].transcript_path = stray;
+    let output = produce(&outside, &"0".repeat(64), &fixture_build()).expect("produce");
+    let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");
+    let [cause]: [String; 1] = unknown_causes(&artifact).try_into().expect("one cause");
+    assert!(cause.ends_with("is under no scanned peer root"), "{cause}");
     let mut unrooted = fixture.input.clone();
     unrooted.peer_roots.retain(|root| root.class != "projects");
     for (input, reason) in [

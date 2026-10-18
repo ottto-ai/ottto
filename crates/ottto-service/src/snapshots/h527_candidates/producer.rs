@@ -2181,7 +2181,10 @@ fn estimate_dollars(
         // non-default pricing selector would be priced wrongly.
         for (field, value) in &occurrence.selector.context {
             let default = match field.as_str() {
-                "service_tier" | "speed_mode" | "batch_mode" | "mode" => value == "standard",
+                "service_tier" | "speed_mode" | "mode" => value == "standard",
+                "batch_mode" => value == "false",
+                // Cloud gateways (regional endpoints) are not catalog-priced.
+                "gateway_provider" => value == "anthropic",
                 "region_mode" => matches!(value.as_str(), "global" | "not_available"),
                 _ => true,
             };
