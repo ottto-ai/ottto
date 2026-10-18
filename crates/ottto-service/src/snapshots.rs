@@ -46,6 +46,7 @@ mod sampled_jsonl;
 pub(crate) mod sampled_scan;
 #[cfg(test)]
 mod transcript_acquisition_tests;
+mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
@@ -14855,6 +14856,23 @@ impl OwnedSourceScan {
                     || restart_after_hints
                     || parent_resolution_restart
                 {
+                    traversal_transition::retiring(
+                        source,
+                        index.generation,
+                        &traversal_snapshot,
+                        raw_census_complete,
+                        CensusGates {
+                            discovery_done: traversal_discovery_done,
+                            traversal_healthy,
+                            frozen_generation: clean_frozen_generation,
+                            state_complete: state_census_complete,
+                            sidecar_complete: sidecar_census_complete,
+                            reconciliation_complete,
+                            parent_restart: parent_resolution_restart,
+                            clean_followup: needs_clean_followup,
+                            census_complete,
+                        },
+                    );
                     terminal_native_traversal = claude_native_comparison::TerminalTraversal::take(
                         index,
                         source,
@@ -22017,6 +22035,16 @@ fn ensure_bounded_traversal(
         0
     };
 
+    // Capture only fixed counters before the existing reset/rearm. A missing
+    // prior traversal does not explain why it was removed; the retirement
+    // record, when available, supplies that independent witness.
+    let mut transition = traversal_transition::Starting::capture(
+        index,
+        collected_at,
+        prior_traversal_context_matches,
+        retry_attempt,
+    );
+
     // A prior partially settled page may have advanced its traversal past an
     // entity whose replacement was not accepted. Finishing that generation
     // deliberately leaves this marker set and drops the traversal so the next
@@ -22066,7 +22094,10 @@ fn ensure_bounded_traversal(
                 rearmed_file_count
             );
         }
+        transition.stale_pending_families = stale_pending_roots.len();
+        transition.rearmed_index_files = rearmed_file_count;
     }
+    transition.emit(source);
 
     let mut census = ScanCensus::default();
     let resolved_roots = roots
