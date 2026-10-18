@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 689,
-  "content_sha256": "6cd448279310152b5a9f1fe0b421932a764a43a4a7c34506ecfbcb503f44b302",
+  "candidate_file_count": 690,
+  "content_sha256": "f70e6c0c2fc46cd6e690666000745fce929d16530054782162dd1c079386d9de",
   "files": [
     {
       "executable": false,
@@ -1329,8 +1329,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
-      "sha256": "1719555c3bc5473e0e78fff945950345191b5058d5a6b69fe96e990b028c9b80",
-      "size_bytes": 59014
+      "sha256": "65e60d89c7ecd6d10a827d9cae2c91beb2cce6acd65ee1cf48ea1a090fc84018",
+      "size_bytes": 59256
     },
     {
       "executable": false,
@@ -3067,6 +3067,13 @@
       "path": "docs/session-2026-10-18-sampled-acquisition-causal-diagnostics.md",
       "sha256": "7f3e819aba1b9b5181ea22b2cd7b28e34819c0991413a0ef8f657f2be3c9e058",
       "size_bytes": 3035
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-selected-recovery-allocation-audit.md",
+      "sha256": "44e06605fd4554b3b32cbb0e76cdfbc7a26017eb17dd0965c2104ae7b69a43b2",
+      "size_bytes": 1638
     },
     {
       "executable": false,
@@ -4826,9 +4833,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T15:23:42+00:00",
+  "generated_at": "2026-10-18T17:46:45+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 690,
+  "output_file_count": 691,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4865,5 +4872,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "54a3a941f00f619ceee9f08b794af6cfccb92683"
+  "source_commit": "6d8ae69dce5cb754852971a83076fc4ed35fd7da"
 }
