@@ -444,7 +444,10 @@ impl SharedCache {
     ) -> Option<CursorLease> {
         // Resume revalidates every priority decision; without the witness
         // set (unsampled or overflowed) the file is read unpaged instead.
-        job.parser.accumulator.codex_observed_priority_turns.as_ref()?;
+        job.parser
+            .accumulator
+            .codex_observed_priority_turns
+            .as_ref()?;
         let stamp_open = OpenStamp::capture(job.parser.reader.reader.get_ref()).ok()?;
         let key = local_index_key(&job.candidate.path);
         let token = self.with_cursor(|cursor| {
