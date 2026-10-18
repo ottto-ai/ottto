@@ -9820,9 +9820,26 @@ impl SnapshotAccumulator {
             .map(|identity| {
                 let thread = metadata.state_threads.get(identity.as_str());
                 let rollout_extent = metadata.rollout_extents.get(identity.as_str()).copied();
+                let parent = metadata
+                    .family_position(identity.as_str())
+                    .map(|(parent, _, _)| parent);
+                let created_thread = metadata.state_created_threads.contains(identity.as_str());
+                // A created thread without a trusted parent can be admitted only
+                // from its own file proof. Its creation time is usable solely when
+                // no lineage evidence exists at all and the state row positively
+                // locates this whole rollout (path plus thread-history extent).
+                // Otherwise withhold it, so no native creation witness can start.
+                let parentless_creation_bound = created_thread
+                    && parent.is_none()
+                    && !metadata.spawn_parents.contains_key(identity.as_str())
+                    && !metadata.spawn_parent_conflicts.contains(identity.as_str())
+                    && rollout_extent.is_some()
+                    && thread
+                        .and_then(|thread| thread.rollout_path.as_deref())
+                        .is_some_and(|path| !path.is_empty());
                 CodexPathSidecarCandidate {
                     recorded_evidence: metadata.has_identity_evidence(identity.as_str()),
-                    created_thread: metadata.state_created_threads.contains(identity.as_str()),
+                    created_thread,
                     identity_conflict: metadata.identity_conflicts.contains(identity.as_str()),
                     detail_incomplete: metadata.state_census_unscoped_incomplete
                         || metadata.sidecar_census_unscoped_incomplete,
@@ -9832,12 +9849,12 @@ impl SnapshotAccumulator {
                         thread,
                         rollout_extent,
                     ),
-                    parent: metadata
-                        .family_position(identity.as_str())
-                        .map(|(parent, _, _)| parent),
-                    child_created_at_nanos: thread
+                    child_created_at_nanos: (parent.is_some() || parentless_creation_bound)
+                        .then_some(thread)
+                        .flatten()
                         .and_then(|thread| thread.created_at.as_deref())
                         .and_then(rfc3339_unix_nanos),
+                    parent,
                     projected_next_ordinal: rollout_extent.map(|extent| extent.next_ordinal),
                     identity,
                 }
@@ -9893,6 +9910,12 @@ impl SnapshotAccumulator {
             return;
         }
         let Some(parent) = candidate.parent else {
+            if candidate.created_thread {
+                // Parentless candidate: the seed withheld the creation time unless
+                // lineage is provably absent and the row locates this whole file.
+                self.codex_sidecar_child_created_at_nanos = candidate.child_created_at_nanos;
+                self.codex_sidecar_projected_next_ordinal = candidate.projected_next_ordinal;
+            }
             return;
         };
         self.codex_sidecar_child_created_at_nanos = candidate.child_created_at_nanos;
@@ -10039,13 +10062,31 @@ impl SnapshotAccumulator {
                 self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
                 return;
             }
-            if let Some(header_nanos) = trusted_parent.as_ref().and_then(|_| {
-                codex_native_created_thread_header(
-                    value,
-                    source_session_id.as_deref(),
-                    self.codex_sidecar_child_created_at_nanos,
-                )
-            }) {
+            // Without a trusted parent, a created thread is admitted only from its
+            // own file proof: a state-declared row bound to this file, no lineage
+            // in the header, and the UUID identity of the path, the first physical
+            // record and the header all agreeing. The stream conjuncts follow in
+            // `validate_parentless_created_thread_record`.
+            let parentless = trusted_parent.is_none()
+                && self.codex_sidecar_parent.is_none()
+                && state_declares_created_thread
+                && forked_from_id.is_none()
+                && codex_header_declares_no_parent(meta)
+                && source_session_id
+                    .as_deref()
+                    .is_some_and(codex_identity_is_uuid_shaped)
+                && self.codex_creator_header_id == source_session_id
+                && self.codex_resolved_path_identity == source_session_id;
+            if let Some(header_nanos) = (trusted_parent.is_some() || parentless)
+                .then(|| {
+                    codex_native_created_thread_header(
+                        value,
+                        source_session_id.as_deref(),
+                        self.codex_sidecar_child_created_at_nanos,
+                    )
+                })
+                .flatten()
+            {
                 self.codex_ordinal_expected = Some(0);
                 self.codex_native_created_thread_header_nanos = Some(header_nanos);
                 self.codex_native_created_thread_last_nanos = Some(header_nanos);
@@ -10222,25 +10263,14 @@ impl SnapshotAccumulator {
             Some(1) => {
                 let turn_id = string_at(value, &["payload", "turn_id"]);
                 let trace_id = string_at(value, &["payload", "trace_id"]);
-                let started_at = u64_at(value, &["payload", "started_at"]);
-                let sidecar_second = self
-                    .codex_sidecar_child_created_at_nanos
-                    .and_then(|value| u64::try_from(value.div_euclid(1_000_000_000)).ok());
-                let record_second = timestamp_nanos
-                    .and_then(|value| u64::try_from(value.div_euclid(1_000_000_000)).ok());
-                let valid = string_eq_at(value, &["type"], "event_msg")
-                    && string_eq_at(value, &["payload", "type"], "task_started")
+                let valid = codex_is_task_started(value)
                     && turn_id
                         .as_deref()
                         .is_some_and(codex_identity_is_uuid_shaped)
                     && trace_id.as_deref().is_some_and(|value| {
                         value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
                     })
-                    && started_at
-                        .zip(sidecar_second.zip(record_second))
-                        .is_some_and(|(started, (spawned, recorded))| {
-                            started >= spawned && started <= recorded
-                        });
+                    && self.codex_task_started_after_creation(value, timestamp_nanos);
                 if valid {
                     self.codex_native_created_thread_task_turn_id = turn_id;
                 } else {
@@ -10264,6 +10294,103 @@ impl SnapshotAccumulator {
             }
             Some(_) | None => {}
         }
+        if self.codex_parentless_created_thread() {
+            self.validate_parentless_created_thread_record(value, ordinal, timestamp_nanos);
+        }
+    }
+
+    /// A provider task's own `started_at` second lies between the state row's
+    /// creation second and the second the record was written. Copies carry
+    /// their original payload time, so this binds a task to this thread.
+    fn codex_task_started_after_creation(
+        &self,
+        value: &Value,
+        timestamp_nanos: Option<i128>,
+    ) -> bool {
+        let started_at = u64_at(value, &["payload", "started_at"]);
+        let sidecar_second = self
+            .codex_sidecar_child_created_at_nanos
+            .and_then(|value| u64::try_from(value.div_euclid(1_000_000_000)).ok());
+        let record_second =
+            timestamp_nanos.and_then(|value| u64::try_from(value.div_euclid(1_000_000_000)).ok());
+        started_at
+            .zip(sidecar_second.zip(record_second))
+            .is_some_and(|(started, (spawned, recorded))| started >= spawned && started <= recorded)
+    }
+
+    /// Created thread admitted without a trusted parent. The parented path
+    /// always records its trusted parent here while configuring the header.
+    fn codex_parentless_created_thread(&self) -> bool {
+        self.codex_ownership_boundary == CodexOwnershipBoundary::NativeCreatedThread
+            && self.codex_parent_session_ref.is_none()
+    }
+
+    /// Extra stream conjuncts for a parentless created thread, which has no
+    /// parent ledger to exclude copied history. Any failure holds the file.
+    fn validate_parentless_created_thread_record(
+        &mut self,
+        value: &Value,
+        ordinal: Option<u64>,
+        timestamp_nanos: Option<i128>,
+    ) {
+        // Only the line-0 header may describe the session. A later header is a
+        // copy or a re-emission and cannot be attributed safely.
+        if codex_session_meta_payload(value).is_some() && self.codex_owned_record_seen {
+            self.codex_native_created_thread_valid = false;
+        }
+        // Every later task must start after this thread was created, and only
+        // once the first task has bound its turn.
+        if codex_is_task_started(value) && ordinal != Some(1) {
+            let turn_id = string_at(value, &["payload", "turn_id"]);
+            if self.codex_native_created_thread_first_turn_bound
+                && turn_id.is_some()
+                && self.codex_task_started_after_creation(value, timestamp_nanos)
+            {
+                self.codex_native_created_thread_task_turn_id = turn_id;
+            } else {
+                self.codex_native_created_thread_valid = false;
+            }
+        }
+        // Turn contexts and usage must belong to a turn this file opened.
+        if string_eq_at(value, &["type"], "turn_context") {
+            let turn_id = string_at(value, &["payload", "turn_id"]);
+            if !self.codex_parentless_turn_opened(turn_id.as_deref()) {
+                self.codex_native_created_thread_valid = false;
+            }
+        }
+        let Some(total) = codex_total_usage(value) else {
+            return;
+        };
+        if !self.codex_parentless_turn_opened(self.latest_turn_id.as_deref()) {
+            self.codex_native_created_thread_valid = false;
+        }
+        // Before any usage is counted, the first request's cumulative total must
+        // equal that request: nothing was accumulated before it in this thread.
+        // All-zero pairs are context estimates; `request_count` is a parser
+        // default, not provider data, so only token fields are compared.
+        if codex_usage_token_fields(&self.accepted_usage_totals) == [0; 5] {
+            let total = codex_usage_token_fields(&total);
+            let last = codex_last_usage(value).map(|last| codex_usage_token_fields(&last));
+            if (total != [0; 5] || last.is_some_and(|last| last != [0; 5])) && last != Some(total) {
+                self.codex_native_created_thread_valid = false;
+            }
+        }
+    }
+
+    /// Finalization conjuncts for a parentless created thread: the thread-history
+    /// projection proved this file is the whole thread, every physical record was
+    /// read under one header, and a first request was actually checked.
+    fn codex_parentless_proof_complete(&self) -> bool {
+        self.codex_sidecar_projected_next_ordinal.is_some()
+            && !self.codex_creator_evidence_conflicted
+            && codex_usage_token_fields(&self.accepted_usage_totals) != [0; 5]
+    }
+
+    fn codex_parentless_turn_opened(&self, turn_id: Option<&str>) -> bool {
+        turn_id.is_some_and(|turn_id| {
+            self.codex_native_created_thread_task_turn_id.as_deref() == Some(turn_id)
+                || self.cache_active_turns.contains(turn_id)
+        })
     }
 
     fn buffer_codex_boundary_record(&mut self, value: &Value) {
@@ -10334,6 +10461,8 @@ impl SnapshotAccumulator {
                         .unwrap_or(true)
                     && self.codex_native_created_thread_task_turn_id.is_some()
                     && self.codex_native_created_thread_first_turn_bound
+                    && (self.codex_parent_session_ref.is_some()
+                        || self.codex_parentless_proof_complete())
             }
             CodexOwnershipBoundary::AwaitingLegacyTrigger
             | CodexOwnershipBoundary::AwaitingParentPrefix
@@ -16075,6 +16204,15 @@ impl OwnedJsonlParser {
             accumulator.dropped_usage_record_count as usize;
         recognized_usage_drop_count =
             recognized_usage_drop_count.saturating_add(accumulator_dropped_usage_record_count);
+        // A parentless created thread is proven only by its complete physical
+        // stream. Record an unread line before the ownership decision so the file
+        // is held as ownership-incomplete (the generic marking below is too late).
+        if source == SnapshotSource::Codex
+            && !report.complete()
+            && accumulator.codex_parentless_created_thread()
+        {
+            accumulator.codex_creator_evidence_conflicted = true;
+        }
         let codex_ownership_incomplete =
             source == SnapshotSource::Codex && !accumulator.codex_usage_accounting_complete();
         let codex_parent_resolution_pending =
@@ -17488,6 +17626,30 @@ fn codex_native_created_thread_header(
             CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS,
         ))
     .then_some(record_nanos)
+}
+
+/// A parentless created thread's header must not name a parent or a
+/// structured spawn source; such lineage would be untrusted and contradictory.
+fn codex_header_declares_no_parent(meta: &Value) -> bool {
+    meta.get("parent_thread_id").is_none_or(Value::is_null)
+        && !meta.get("source").is_some_and(Value::is_object)
+}
+
+fn codex_is_task_started(value: &Value) -> bool {
+    string_eq_at(value, &["type"], "event_msg")
+        && string_eq_at(value, &["payload", "type"], "task_started")
+}
+
+/// Provider token fields only. `request_count` is a parser default when
+/// Codex omits it, so it never decides cumulative/request equality.
+fn codex_usage_token_fields(usage: &UsageTotals) -> [u64; 5] {
+    [
+        usage.input_tokens,
+        usage.cache_read_tokens,
+        usage.cache_creation_5m_tokens,
+        usage.output_tokens,
+        usage.reasoning_output_tokens,
+    ]
 }
 
 fn codex_sidecar_rollout_file_matches(
@@ -20184,6 +20346,10 @@ impl CodexTitleMetadata {
                         .contains(source_session_id.as_str())
                     {
                         "conflict"
+                    } else if self.spawn_parents.contains_key(source_session_id.as_str()) {
+                        // An edge whose ancestor chain cannot be resolved is still
+                        // lineage evidence and must reselect a parentless file.
+                        "unresolved"
                     } else {
                         ""
                     }
@@ -20203,6 +20369,7 @@ impl CodexTitleMetadata {
     fn load_from_roots(roots: &[PathBuf]) -> Self {
         let mut metadata = Self::default();
         let mut legacy_sidecar_parts = Vec::new();
+        let mut parentless_ineligible = BTreeSet::new();
         let mut codex_dirs = BTreeSet::new();
         for root in roots {
             if let Some(parent) = root.parent() {
@@ -20246,6 +20413,7 @@ impl CodexTitleMetadata {
                 &mut metadata.spawn_parents,
                 &mut metadata.spawn_parent_conflicts,
                 &mut metadata.identity_conflicts,
+                &mut parentless_ineligible,
             );
             metadata.local_diagnostics.spawn_edges.observe_root(
                 &spawn_census,
@@ -20309,6 +20477,16 @@ impl CodexTitleMetadata {
             }
             if metadata.identity_conflicts.len() != index_conflicts_before {
                 metadata.sidecar_census_incomplete = true;
+            }
+        }
+        // Unresolvable lineage evidence blocks only parentless admission. A
+        // parent recorded by any home wins, and an id without a parent never
+        // appears in a descendant's ancestor walk, so lineage is unaffected.
+        for child in parentless_ineligible {
+            if metadata.state_created_threads.contains(child.as_str())
+                && !metadata.spawn_parents.contains_key(child.as_str())
+            {
+                metadata.spawn_parent_conflicts.insert(child);
             }
         }
         metadata.legacy_sidecar_fingerprint = sha256_hex_owned(&legacy_sidecar_parts);
@@ -20712,12 +20890,18 @@ fn load_codex_rollout_extents(
     Ok(())
 }
 
+/// `parentless_ineligible` collects ids whose lineage evidence exists but could
+/// not be resolved here (delegation text the strict parser refused, an unknown
+/// `first_user_message`, a malformed edge row, or no edge table). The caller
+/// applies it only after every home is loaded, and only to ids that still have
+/// no parent, so it can never remove a parent recorded elsewhere.
 fn load_codex_sqlite_spawn_edges(
     path: &Path,
     state_created_threads: &mut BTreeSet<String>,
     spawn_parents: &mut BTreeMap<String, String>,
     spawn_parent_conflicts: &mut BTreeSet<String>,
     identity_conflicts: &mut BTreeSet<String>,
+    parentless_ineligible: &mut BTreeSet<String>,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -20751,6 +20935,7 @@ fn load_codex_sqlite_spawn_edges(
         })
         .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
     let mut raw_created_ids_by_key = BTreeMap::new();
+    let mut created_in_database = Vec::new();
     for row in rows {
         let (raw_child, first_user_message) = row
             .context(crate::codex_scan_diagnostics::LoaderStage::Row)
@@ -20767,6 +20952,13 @@ fn load_codex_sqlite_spawn_edges(
             continue;
         }
         state_created_threads.insert(child.clone());
+        created_in_database.push(child.clone());
+        if first_user_message
+            .as_deref()
+            .is_none_or(codex_created_thread_mentions_delegation)
+        {
+            parentless_ineligible.insert(child.clone());
+        }
         if let Some(parent) = first_user_message
             .as_deref()
             .and_then(|message| codex_created_thread_parent(&child, message))
@@ -20777,6 +20969,8 @@ fn load_codex_sqlite_spawn_edges(
 
     let columns = sqlite_table_columns(&connection, "thread_spawn_edges")?;
     if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
+        // Without the edge table, a missing edge is not evidence of no parent.
+        parentless_ineligible.extend(created_in_database);
         return Ok(());
     }
     let mut statement = connection
@@ -20817,9 +21011,20 @@ fn load_codex_sqlite_spawn_edges(
         }
         if !parent.is_empty() && !child.is_empty() && parent != child {
             record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
+        } else if !child.is_empty() {
+            // A self or empty-parent edge is broken lineage, not its absence.
+            parentless_ineligible.insert(child);
         }
     }
     Ok(())
+}
+
+/// Any delegation wrapper text, wherever it appears and in any case, is
+/// lineage evidence. Only the strict parser above may turn it into a parent.
+fn codex_created_thread_mentions_delegation(first_user_message: &str) -> bool {
+    first_user_message
+        .to_ascii_lowercase()
+        .contains("<codex_delegation")
 }
 
 fn record_codex_spawn_parent(
@@ -53396,6 +53601,7 @@ mod tests {
             &mut spawn_parents,
             &mut spawn_conflicts,
             &mut identity_conflicts,
+            &mut BTreeSet::new(),
         )
         .expect("a scoped collision retains unrelated created classifications");
         assert!(created_threads.is_empty());
@@ -53454,6 +53660,1005 @@ mod tests {
             .codex_state_only_snapshot_fingerprints
             .insert(lowercase.to_ascii_uppercase(), "upper".to_string());
         assert!(!conflicting.canonicalize_codex_identity_keys());
+    }
+
+    const PARENTLESS_CHILD: &str = "01a04e10-49cf-7460-9fd7-f7dbfd2f05e4";
+
+    /// Parentless fixtures must agree with the rollout file's real birth time,
+    /// so every timestamp is derived from one whole-second base near now.
+    struct ParentlessClock {
+        base_ms: i64,
+    }
+
+    impl ParentlessClock {
+        fn now() -> Self {
+            let ms = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("time")
+                    .as_millis(),
+            )
+            .expect("fixture time");
+            Self {
+                base_ms: ms - ms % 1_000,
+            }
+        }
+
+        fn at(&self, offset_ms: i64) -> String {
+            bounded_rfc3339_millis(self.base_ms + offset_ms).expect("fixture timestamp")
+        }
+
+        fn second(&self, offset_seconds: i64) -> u64 {
+            u64::try_from(self.base_ms / 1_000 + offset_seconds).expect("fixture second")
+        }
+    }
+
+    fn parentless_turn(child_id: &str, turn: u64) -> String {
+        format!("{}-5000-7000-8000-{turn:012}", &child_id[..8])
+    }
+
+    fn parentless_task_started(
+        clock: &ParentlessClock,
+        child_id: &str,
+        turn: u64,
+        at_ms: i64,
+    ) -> Value {
+        json!({"timestamp":clock.at(at_ms),"type":"event_msg","payload":{"type":"task_started","turn_id":parentless_turn(child_id, turn),"trace_id":"0123456789abcdef0123456789abcdef","started_at":clock.second(at_ms / 1_000)}})
+    }
+
+    fn parentless_turn_context(
+        clock: &ParentlessClock,
+        child_id: &str,
+        turn: u64,
+        at_ms: i64,
+    ) -> Value {
+        json!({"timestamp":clock.at(at_ms),"type":"turn_context","payload":{"turn_id":parentless_turn(child_id, turn),"model":"gpt-5.6-sol"}})
+    }
+
+    fn renumber(values: &mut [Value]) {
+        for (ordinal, value) in values.iter_mut().enumerate() {
+            value["ordinal"] = json!(ordinal);
+        }
+    }
+
+    /// Mirrors report §A: a long-lived Desktop created thread with no recorded
+    /// parent, a paginated external history cursor, a compaction and a counter
+    /// reset. Usage is Σ last = (200, 160, 11, 3) over three requests.
+    fn parentless_created_thread_values(clock: &ParentlessClock, child_id: &str) -> Vec<Value> {
+        let mut values = vec![
+            json!({"timestamp":clock.at(500),"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":clock.at(0),"history_mode":"paginated","history_base":{"cursor":"external"},"thread_source":"agent_created_thread","source":"vscode","originator":"Codex Desktop","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}}),
+            parentless_task_started(clock, child_id, 1, 501),
+            parentless_turn_context(clock, child_id, 1, 1_000),
+            codex_test_token_line(
+                &clock.at(2_000),
+                None,
+                (120, 100, 6, 2),
+                Some((120, 100, 6, 2)),
+            ),
+            json!({"timestamp":clock.at(3_000),"type":"compacted","payload":{"replacement_history":[]}}),
+            json!({"timestamp":clock.at(3_500),"type":"event_msg","payload":{"type":"task_complete","turn_id":parentless_turn(child_id, 1)}}),
+            parentless_task_started(clock, child_id, 2, 4_000),
+            parentless_turn_context(clock, child_id, 2, 4_100),
+            codex_test_token_line(&clock.at(5_000), None, (50, 40, 3, 1), Some((50, 40, 3, 1))),
+            codex_test_token_line(&clock.at(6_000), None, (80, 60, 5, 1), Some((30, 20, 2, 0))),
+        ];
+        renumber(&mut values);
+        values
+    }
+
+    fn jsonl_body(values: &[Value]) -> String {
+        values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    /// Parses through the production file parser with a trusted state row that
+    /// declares the thread created, binds this rollout path and its complete
+    /// thread-history extent, and records no lineage at all.
+    fn parse_parentless_created_thread(
+        name: &str,
+        child_id: &str,
+        clock: &ParentlessClock,
+        body: &str,
+        configure: impl FnOnce(&mut CodexTitleMetadata, &Path),
+    ) -> ParsedJsonlFile {
+        let root = temp_dir(name);
+        let path = root.join(format!("rollout-{child_id}.jsonl"));
+        fs::write(&path, body).expect("write parentless created-thread fixture");
+        let next_ordinal = body
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| u64_at(&value, &["ordinal"]))
+            .max()
+            .map_or(0, |ordinal| ordinal + 1);
+        let key = resolve_codex_identity(child_id);
+        let mut metadata = CodexTitleMetadata::default();
+        metadata.state_created_threads.insert(key.clone());
+        metadata.state_threads.insert(
+            key.clone(),
+            CodexStateThread {
+                tokens_used: 1,
+                created_at: Some(clock.at(0)),
+                rollout_path: Some(path.to_string_lossy().into_owned()),
+                ..CodexStateThread::default()
+            },
+        );
+        metadata.rollout_extents.insert(
+            key,
+            CodexRolloutExtent {
+                next_byte_offset: fs::metadata(&path).expect("stat fixture").len(),
+                next_ordinal,
+            },
+        );
+        configure(&mut metadata, &path);
+        let mut file = File::open(&path).expect("open parentless fixture");
+        let identity =
+            opened_object_identity(SnapshotSource::Codex, &mut file).expect("identify fixture");
+        let parsed = parse_opened_jsonl_file(
+            file,
+            &identity,
+            &path,
+            &clock.at(3_600_000),
+            "fp".to_string(),
+            SnapshotSource::Codex,
+            apply_codex_line,
+            Some(&metadata),
+            None,
+            None,
+            Some(Arc::new(Mutex::new(BTreeMap::new()))),
+            true,
+            None,
+            true,
+        )
+        .expect("parse parentless created-thread fixture");
+        let _ = fs::remove_dir_all(root);
+        parsed
+    }
+
+    fn assert_parentless_admitted(parsed: &ParsedJsonlFile, tokens: (u64, u64, u64, u64, u64)) {
+        assert!(parsed.complete(), "{parsed:#?}");
+        assert_eq!(parsed.ownership_incomplete_file_count, 0);
+        let item = parsed.snapshots.first().expect("parentless snapshot");
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens,
+                item.request_count,
+            ),
+            tokens
+        );
+        let origin = item.origin.as_ref().expect("origin");
+        // No lineage is invented for a thread without a trusted parent.
+        assert_eq!(origin.parent_session_ref, None);
+        assert_eq!(
+            origin.thread_source.as_deref(),
+            Some("agent_created_thread")
+        );
+    }
+
+    fn assert_parentless_held(parsed: &ParsedJsonlFile, case: &str, session_id: &str) {
+        assert!(parsed.snapshots.is_empty(), "{case}: {parsed:#?}");
+        assert_eq!(parsed.ownership_incomplete_file_count, 1, "{case}");
+        assert!(
+            parsed
+                .state_only_blocked_session_ids
+                .contains(&resolve_codex_identity(session_id)),
+            "{case}: {:?}",
+            parsed.state_only_blocked_session_ids
+        );
+    }
+
+    #[test]
+    fn codex_created_thread_parentless_admits_only_its_own_proven_history() {
+        let clock = ParentlessClock::now();
+        let values = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
+        let parsed = parse_parentless_created_thread(
+            "codex-parentless-admit",
+            PARENTLESS_CHILD,
+            &clock,
+            &jsonl_body(&values),
+            |_, _| {},
+        );
+        assert_parentless_admitted(&parsed, (200, 160, 11, 3, 3));
+        let item = &parsed.snapshots[0];
+        assert_eq!(item.compaction_count, Some(1));
+        assert!(
+            item.session_account_evidence.is_some(),
+            "native own creator"
+        );
+
+        // First-request equality ignores the parser-defaulted request count.
+        let mut request_count_only = values.clone();
+        request_count_only[3]["payload"]["info"]["total_token_usage"]["request_count"] = json!(5);
+        // An all-zero context estimate before the first request is not a request.
+        let mut zero_first = values.clone();
+        zero_first.insert(
+            3,
+            codex_test_token_line(&clock.at(1_500), None, (0, 0, 0, 0), Some((0, 0, 0, 0))),
+        );
+        renumber(&mut zero_first);
+        for (case, values) in [
+            ("request-count", request_count_only),
+            ("zero-first", zero_first),
+        ] {
+            let parsed = parse_parentless_created_thread(
+                format!("codex-parentless-admit-{case}").as_str(),
+                PARENTLESS_CHILD,
+                &clock,
+                &jsonl_body(&values),
+                |_, _| {},
+            );
+            assert_parentless_admitted(&parsed, (200, 160, 11, 3, 3));
+        }
+
+        // Tail growth keeps the proof; a re-emitted header does not.
+        let mut grown = values.clone();
+        grown.push(parentless_task_started(&clock, PARENTLESS_CHILD, 3, 7_000));
+        grown.push(parentless_turn_context(&clock, PARENTLESS_CHILD, 3, 7_100));
+        grown.push(codex_test_token_line(
+            &clock.at(8_000),
+            None,
+            (90, 66, 7, 2),
+            Some((10, 6, 2, 1)),
+        ));
+        renumber(&mut grown);
+        let parsed = parse_parentless_created_thread(
+            "codex-parentless-tail-growth",
+            PARENTLESS_CHILD,
+            &clock,
+            &jsonl_body(&grown),
+            |_, _| {},
+        );
+        assert_parentless_admitted(&parsed, (210, 166, 13, 4, 4));
+        let mut reheader = grown;
+        let header = reheader[0].clone();
+        reheader.push(header);
+        renumber(&mut reheader);
+        let parsed = parse_parentless_created_thread(
+            "codex-parentless-tail-reheader",
+            PARENTLESS_CHILD,
+            &clock,
+            &jsonl_body(&reheader),
+            |_, _| {},
+        );
+        assert_parentless_held(&parsed, "appended header", PARENTLESS_CHILD);
+    }
+
+    #[test]
+    fn codex_created_thread_parentless_holds_every_unproven_shape() {
+        let clock = ParentlessClock::now();
+        let base = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
+        let foreign_turn = "01a02589-5000-7000-8000-000000000009";
+        let edit = |change: &dyn Fn(&mut Vec<Value>)| {
+            let mut values = base.clone();
+            change(&mut values);
+            jsonl_body(&values)
+        };
+        type Configure = fn(&mut CodexTitleMetadata, &Path);
+        let none: Configure = |_, _| {};
+        let cases: [(&str, String, Configure); 32] = [
+            (
+                "copied-counters",
+                edit(&|values| {
+                    values[3] = codex_test_token_line(
+                        &clock.at(2_000),
+                        Some(3),
+                        (220, 180, 16, 4),
+                        Some((120, 100, 6, 2)),
+                    );
+                }),
+                none,
+            ),
+            (
+                "first-usage-lacks-last",
+                edit(&|values| {
+                    values[3] =
+                        codex_test_token_line(&clock.at(2_000), Some(3), (120, 100, 6, 2), None);
+                }),
+                none,
+            ),
+            (
+                "zero-total-positive-last",
+                edit(&|values| {
+                    values[3] = codex_test_token_line(
+                        &clock.at(2_000),
+                        Some(3),
+                        (0, 0, 0, 0),
+                        Some((120, 100, 6, 2)),
+                    );
+                }),
+                none,
+            ),
+            (
+                "positive-total-zero-last",
+                edit(&|values| {
+                    values[3] = codex_test_token_line(
+                        &clock.at(2_000),
+                        Some(3),
+                        (120, 100, 6, 2),
+                        Some((0, 0, 0, 0)),
+                    );
+                }),
+                none,
+            ),
+            (
+                "copied-task-with-old-start",
+                edit(&|values| {
+                    let mut copied = parentless_task_started(&clock, PARENTLESS_CHILD, 7, 4_000);
+                    copied["payload"]["started_at"] = json!(clock.second(-3_600));
+                    values[6] = copied;
+                    renumber(values);
+                }),
+                none,
+            ),
+            (
+                "turn-never-opened",
+                edit(&|values| {
+                    values[7]["payload"]["turn_id"] = json!(foreign_turn);
+                }),
+                none,
+            ),
+            (
+                "usage-under-foreign-turn",
+                edit(&|values| {
+                    values.insert(8, json!({"timestamp":clock.at(4_200),"type":"event_msg","payload":{"type":"agent_message","turn_id":foreign_turn}}));
+                    renumber(values);
+                }),
+                none,
+            ),
+            (
+                "ordinal-gap",
+                edit(&|values| {
+                    values.remove(4);
+                }),
+                none,
+            ),
+            (
+                "ordinal-backward",
+                edit(&|values| {
+                    values[5]["ordinal"] = json!(3);
+                }),
+                none,
+            ),
+            (
+                "ordinal-duplicate",
+                edit(&|values| {
+                    let duplicate = values[3].clone();
+                    values.insert(4, duplicate);
+                }),
+                none,
+            ),
+            (
+                "ordinal-missing",
+                edit(&|values| {
+                    values[4].as_object_mut().expect("record").remove("ordinal");
+                }),
+                none,
+            ),
+            (
+                "header-not-line-zero",
+                edit(&|values| {
+                    values.insert(0, json!({"timestamp":clock.at(400),"type":"event_msg","payload":{"type":"agent_message"}}));
+                    renumber(values);
+                }),
+                none,
+            ),
+            (
+                "header-ordinal-missing",
+                edit(&|values| {
+                    values[0].as_object_mut().expect("header").remove("ordinal");
+                }),
+                none,
+            ),
+            (
+                "retrograde-timestamp",
+                edit(&|values| {
+                    values[5]["timestamp"] = json!(clock.at(1_500));
+                }),
+                none,
+            ),
+            (
+                "zero-usage",
+                edit(&|values| {
+                    values.truncate(3);
+                }),
+                none,
+            ),
+            (
+                "forked-from",
+                edit(&|values| {
+                    values[0]["payload"]["forked_from_id"] =
+                        json!("01a02589-5e24-7f10-8a93-a0c1968d8a3a");
+                }),
+                none,
+            ),
+            (
+                "meta-parent-thread",
+                edit(&|values| {
+                    values[0]["payload"]["parent_thread_id"] =
+                        json!("01a02589-5e24-7f10-8a93-a0c1968d8a3a");
+                }),
+                none,
+            ),
+            (
+                "subagent-source",
+                edit(&|values| {
+                    values[0]["payload"]["source"] = json!({"subagent":{"thread_spawn":{"parent_thread_id":"01a02589-5e24-7f10-8a93-a0c1968d8a3a"}}});
+                }),
+                none,
+            ),
+            (
+                "later-header-other-id",
+                edit(&|values| {
+                    let mut copied = values[0].clone();
+                    copied["payload"]["id"] = json!("01a02589-5e24-7f10-8a93-a0c1968d8a3a");
+                    copied["payload"]["session_id"] = json!("01a02589-5e24-7f10-8a93-a0c1968d8a3a");
+                    copied["timestamp"] = json!(clock.at(3_000));
+                    values[4] = copied;
+                    renumber(values);
+                }),
+                none,
+            ),
+            (
+                "later-header-same-id",
+                edit(&|values| {
+                    let mut copied = values[0].clone();
+                    copied["timestamp"] = json!(clock.at(3_000));
+                    values[4] = copied;
+                    renumber(values);
+                }),
+                none,
+            ),
+            (
+                "rollout-not-declared",
+                edit(&|values| {
+                    values[0]["payload"]["thread_source"] = json!("user");
+                }),
+                none,
+            ),
+            ("state-not-declared", jsonl_body(&base), |metadata, _| {
+                metadata.state_created_threads.clear();
+            }),
+            (
+                "state-rollout-path-missing",
+                jsonl_body(&base),
+                |metadata, _| {
+                    for thread in metadata.state_threads.values_mut() {
+                        thread.rollout_path = None;
+                    }
+                },
+            ),
+            (
+                "state-rollout-path-other",
+                jsonl_body(&base),
+                |metadata, path| {
+                    for thread in metadata.state_threads.values_mut() {
+                        thread.rollout_path =
+                            Some(path.with_extension("other").to_string_lossy().into_owned());
+                    }
+                },
+            ),
+            ("extent-missing", jsonl_body(&base), |metadata, _| {
+                metadata.rollout_extents.clear()
+            }),
+            (
+                "extent-ordinal-mismatch",
+                jsonl_body(&base),
+                |metadata, _| {
+                    for extent in metadata.rollout_extents.values_mut() {
+                        extent.next_ordinal += 1;
+                    }
+                },
+            ),
+            ("identity-conflict", jsonl_body(&base), |metadata, _| {
+                metadata
+                    .identity_conflicts
+                    .insert(PARENTLESS_CHILD.to_string());
+            }),
+            ("spawn-conflict", jsonl_body(&base), |metadata, _| {
+                metadata
+                    .spawn_parent_conflicts
+                    .insert(PARENTLESS_CHILD.to_string());
+            }),
+            (
+                "edge-with-conflicted-ancestor",
+                jsonl_body(&base),
+                |metadata, _| {
+                    let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+                    metadata
+                        .spawn_parents
+                        .insert(PARENTLESS_CHILD.to_string(), parent.to_string());
+                    metadata.spawn_parents.insert(
+                        parent.to_string(),
+                        "01a02588-5e24-7f10-8a93-a0c1968d8a3a".to_string(),
+                    );
+                    metadata.spawn_parent_conflicts.insert(parent.to_string());
+                },
+            ),
+            (
+                "unscoped-classification-failure",
+                jsonl_body(&base),
+                |metadata, _| {
+                    metadata.created_thread_census_unscoped_incomplete = true;
+                },
+            ),
+            (
+                "garbage-before-header",
+                format!("not json\n{}", jsonl_body(&base)),
+                none,
+            ),
+            ("crash-tail", format!("{}{{", jsonl_body(&base)), none),
+        ];
+        for (case, body, configure) in cases {
+            let parsed = parse_parentless_created_thread(
+                format!("codex-parentless-hold-{case}").as_str(),
+                PARENTLESS_CHILD,
+                &clock,
+                &body,
+                configure,
+            );
+            assert_parentless_held(&parsed, case, PARENTLESS_CHILD);
+        }
+
+        // Only UUID provider identities can be bound without a parent.
+        let non_uuid = "Provider-Session-Parentless";
+        let values = parentless_created_thread_values(&clock, PARENTLESS_CHILD)
+            .into_iter()
+            .map(|mut value| {
+                if value["type"] == "session_meta" {
+                    value["payload"]["id"] = json!(non_uuid);
+                    value["payload"]["session_id"] = json!(non_uuid);
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let parsed = parse_parentless_created_thread(
+            "codex-parentless-hold-non-uuid",
+            non_uuid,
+            &clock,
+            &jsonl_body(&values),
+            |_, _| {},
+        );
+        assert_parentless_held(&parsed, "non-uuid", non_uuid);
+    }
+
+    #[test]
+    fn codex_created_thread_parentless_equality_is_not_required_with_a_trusted_parent() {
+        // Parented created threads keep their existing proof: a first request
+        // whose cumulative total exceeds it is still admitted.
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let turn_id = "01a03e99-5000-7000-8000-000000000001";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+        ];
+        let child = vec![
+            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","source":"vscode"}}),
+            json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
+            json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":turn_id,"model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:03Z",
+                Some(3),
+                (100, 80, 10, 2),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+        let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+            "codex-parented-unequal-first-request",
+            child_id,
+            parent_id,
+            &child,
+            &parent,
+            true,
+        );
+        assert!(parsed.complete(), "{parsed:#?}");
+        let item = parsed.snapshots.first().expect("parented snapshot");
+        assert_eq!((item.input_tokens, item.request_count), (12, 1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_created_thread_parentless_lineage_marking_never_removes_a_parent() {
+        let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let grandchild = "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4";
+        let seed = |codex_dir: &Path, message: Option<&str>, edges: Option<&[(&str, &str)]>| {
+            fs::create_dir_all(codex_dir.join("sessions")).expect("create sessions");
+            let database =
+                Connection::open(codex_dir.join("state_5.sqlite")).expect("open state db");
+            database
+                .execute_batch(
+                    "CREATE TABLE threads (\
+                        id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                        thread_source TEXT, first_user_message TEXT\
+                    );",
+                )
+                .expect("create threads");
+            database
+                .execute(
+                    "INSERT INTO threads VALUES (?1, 'Child', 0, 'agent_created_thread', ?2)",
+                    rusqlite::params![child, message],
+                )
+                .expect("seed child");
+            if let Some(edges) = edges {
+                database
+                    .execute_batch(
+                        "CREATE TABLE thread_spawn_edges (\
+                            parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+                        );",
+                    )
+                    .expect("create edges");
+                for (parent, child) in edges {
+                    database
+                        .execute(
+                            "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                            rusqlite::params![parent, child],
+                        )
+                        .expect("seed edge");
+                }
+            }
+        };
+
+        // (i) Delegation text the strict parser refuses does not discard a valid
+        // edge from the same database.
+        let home = temp_dir("codex-parentless-marking-same-db");
+        let codex_dir = home.join(".codex");
+        seed(
+            &codex_dir,
+            Some("Context first <CODEX_DELEGATION> malformed"),
+            Some(&[(parent, child)]),
+        );
+        let metadata =
+            CodexTitleMetadata::load_from_roots(std::slice::from_ref(&codex_dir.join("sessions")));
+        assert_eq!(
+            metadata
+                .family_position(child)
+                .map(|(parent, _, _)| parent)
+                .as_deref(),
+            Some(parent)
+        );
+        assert!(!metadata.spawn_parent_conflicts.contains(child));
+        let _ = fs::remove_dir_all(home);
+
+        // (ii) A home without an edge table never removes a parent recorded by
+        // another home, whichever home loads first.
+        for (edgeless, with_edge) in [("a-home", "b-home"), ("b-home", "a-home")] {
+            let home = temp_dir("codex-parentless-marking-two-homes");
+            seed(
+                &home.join(edgeless).join(".codex"),
+                Some("plain prompt"),
+                None,
+            );
+            seed(
+                &home.join(with_edge).join(".codex"),
+                Some("plain prompt"),
+                Some(&[(parent, child), (child, grandchild)]),
+            );
+            let roots = [
+                home.join("a-home/.codex/sessions"),
+                home.join("b-home/.codex/sessions"),
+            ];
+            let metadata = CodexTitleMetadata::load_from_roots(&roots);
+            assert_eq!(
+                metadata
+                    .family_position(child)
+                    .map(|(parent, _, _)| parent)
+                    .as_deref(),
+                Some(parent),
+                "{edgeless}"
+            );
+            assert_eq!(
+                metadata
+                    .family_position(grandchild)
+                    .map(|(_, root, depth)| (root, depth)),
+                Some((parent.to_string(), 2)),
+                "{edgeless}"
+            );
+            assert!(
+                !metadata.spawn_parent_conflicts.contains(child),
+                "{edgeless}"
+            );
+            let _ = fs::remove_dir_all(home);
+        }
+
+        // A marked parentless id keeps its descendants' lineage, and broken or
+        // unknown lineage marks only the created thread itself.
+        let descendant = [(child, grandchild)];
+        let self_edge = [(child, child), (child, grandchild)];
+        let empty_parent = [("", child), (child, grandchild)];
+        let cases: [(&str, Option<&str>, Option<&[(&str, &str)]>); 4] = [
+            ("no-edge-table", Some("plain prompt"), None),
+            ("null-message", None, Some(&descendant)),
+            ("self-edge", Some("plain prompt"), Some(&self_edge)),
+            (
+                "empty-parent-edge",
+                Some("plain prompt"),
+                Some(&empty_parent),
+            ),
+        ];
+        for (case, message, edges) in cases {
+            let home = temp_dir("codex-parentless-marking-descendants");
+            let codex_dir = home.join(".codex");
+            seed(&codex_dir, message, edges);
+            let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(
+                &codex_dir.join("sessions"),
+            ));
+            assert!(metadata.spawn_parent_conflicts.contains(child), "{case}");
+            if edges.is_some() {
+                assert_eq!(
+                    metadata.family_position(grandchild),
+                    Some((child.to_string(), child.to_string(), 1)),
+                    "{case}"
+                );
+            }
+            let _ = fs::remove_dir_all(home);
+        }
+
+        // An edge whose ancestor chain cannot be resolved changes the sidecar
+        // fingerprint, so an indexed parentless rollout is reselected.
+        let mut unresolved = CodexTitleMetadata::default();
+        unresolved.state_created_threads.insert(child.to_string());
+        let without_edge = unresolved.session_sidecar_fingerprint(child);
+        unresolved
+            .spawn_parents
+            .insert(child.to_string(), parent.to_string());
+        unresolved
+            .spawn_parents
+            .insert(parent.to_string(), grandchild.to_string());
+        unresolved.spawn_parent_conflicts.insert(parent.to_string());
+        assert_eq!(unresolved.family_position(child), None);
+        assert_ne!(unresolved.session_sidecar_fingerprint(child), without_edge);
+    }
+
+    #[test]
+    fn codex_created_thread_parentless_production_lineage_controls() {
+        let home = temp_dir("codex-parentless-production");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions");
+        let clock = ParentlessClock::now();
+        let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let admitted = "01a04e11-49cf-7460-9fd7-f7dbfd2f05e4";
+        let wrapped = "01a04e12-49cf-7460-9fd7-f7dbfd2f05e4";
+        let unknown = "01a04e13-49cf-7460-9fd7-f7dbfd2f05e4";
+        let ordinary = "01a04e14-49cf-7460-9fd7-f7dbfd2f05e4";
+        let state = Connection::open(codex_dir.join("state_5.sqlite")).expect("open state db");
+        state
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                    thread_source TEXT, first_user_message TEXT, created_at_ms INTEGER,\
+                    rollout_path TEXT\
+                );\
+                CREATE TABLE thread_spawn_edges (\
+                    parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+                );",
+            )
+            .expect("create state schema");
+        let history =
+            Connection::open(codex_dir.join("thread_history_1.sqlite")).expect("open history db");
+        history
+            .execute_batch(
+                "CREATE TABLE thread_history_projection_state (\
+                    thread_id TEXT NOT NULL, next_rollout_byte_offset INTEGER NOT NULL,\
+                    next_rollout_ordinal INTEGER NOT NULL\
+                );",
+            )
+            .expect("create history schema");
+        let write = |id: &str, values: &[Value], source: &str, message: Option<&str>| {
+            let path = sessions_dir.join(format!("rollout-{id}.jsonl"));
+            fs::write(&path, jsonl_body(values)).expect("write rollout");
+            state
+                .execute(
+                    "INSERT INTO threads VALUES (?1, 'Thread', 1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        source,
+                        message,
+                        clock.base_ms,
+                        path.to_string_lossy().into_owned()
+                    ],
+                )
+                .expect("seed thread row");
+            history
+                .execute(
+                    "INSERT INTO thread_history_projection_state VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        id,
+                        i64::try_from(fs::metadata(&path).expect("stat").len()).expect("len"),
+                        i64::try_from(values.len()).expect("ordinals")
+                    ],
+                )
+                .expect("seed extent");
+        };
+        for (id, message) in [
+            (admitted, Some("Build the weekly report")),
+            (
+                wrapped,
+                Some("Note: <Codex_Delegation> header was rewritten"),
+            ),
+            (unknown, None),
+        ] {
+            write(
+                id,
+                &parentless_created_thread_values(&clock, id),
+                "agent_created_thread",
+                message,
+            );
+        }
+        let mut ordinary_values = parentless_created_thread_values(&clock, ordinary);
+        ordinary_values[0]["payload"]["thread_source"] = json!("user");
+        write(ordinary, &ordinary_values, "user", Some("plain prompt"));
+
+        let scan = |label: &str| {
+            let mut index = ScanIndex::default();
+            let scan = scan_source_roots(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions_dir),
+                &mut index,
+                &clock.at(3_600_000),
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+            (scan, index)
+        };
+        let item = |scan: &SourceScanResult, id: &str| {
+            scan.snapshots
+                .iter()
+                .find(|item| item.source_session_id == id)
+                .cloned()
+        };
+
+        let (first, index) = scan("first");
+        let admitted_item = item(&first, admitted).expect("parentless snapshot");
+        assert_eq!(
+            (admitted_item.input_tokens, admitted_item.request_count),
+            (200, 3)
+        );
+        assert_eq!(
+            admitted_item
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.parent_session_ref.clone()),
+            None
+        );
+        assert!(!index
+            .codex_state_only_blocked_session_ids
+            .contains(admitted));
+        assert!(item(&first, ordinary).is_some());
+        for held in [wrapped, unknown] {
+            assert!(item(&first, held).is_none(), "{held}");
+            assert!(
+                index.codex_state_only_blocked_session_ids.contains(held),
+                "{held}"
+            );
+        }
+        assert_eq!(first.ownership_incomplete_file_count, 2);
+
+        // A parent recorded later re-derives the same usage under real lineage.
+        state
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                rusqlite::params![parent, admitted],
+            )
+            .expect("record later parent");
+        let (second, _) = scan("parent-arrives");
+        let parented = item(&second, admitted).expect("parented snapshot");
+        assert_eq!(
+            (parented.input_tokens, parented.request_count),
+            (admitted_item.input_tokens, admitted_item.request_count)
+        );
+        let origin = parented.origin.as_ref().expect("origin");
+        assert_eq!(origin.parent_session_ref.as_deref(), Some(parent));
+        assert_eq!(origin.thread_source.as_deref(), Some("subagent"));
+
+        // Without an edge table, absence of an edge is unknown: created threads
+        // hold while the ordinary thread in the same database is unaffected.
+        state
+            .execute_batch("DROP TABLE thread_spawn_edges;")
+            .expect("drop edge table");
+        let (third, _) = scan("edge-table-missing");
+        assert!(item(&third, admitted).is_none());
+        assert!(item(&third, ordinary).is_some());
+        drop(state);
+        drop(history);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_created_thread_parentless_segments_stay_held_until_joined_proof() {
+        let clock = ParentlessClock::now();
+        let values = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
+        for (case, second_member) in [
+            ("continuation", values[6..].to_vec()),
+            ("complete-copy", values.clone()),
+        ] {
+            let home = temp_dir("codex-parentless-segments");
+            let sessions_dir = home.join(".codex").join("sessions");
+            fs::create_dir_all(&sessions_dir).expect("create sessions");
+            let first = sessions_dir.join(format!("rollout-{PARENTLESS_CHILD}.jsonl"));
+            let segment = sessions_dir.join("rollout-01a04e1f-49cf-7460-9fd7-f7dbfd2f05e4.jsonl");
+            let mut continuation = vec![values[0].clone()];
+            continuation.extend(second_member);
+            fs::write(&first, jsonl_body(&values[..6])).expect("write first segment");
+            // The first segment alone satisfies every parentless conjunct.
+            let state = Connection::open(home.join(".codex/state_5.sqlite")).expect("state db");
+            state
+                .execute_batch(
+                    "CREATE TABLE threads (\
+                        id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                        thread_source TEXT, first_user_message TEXT, created_at_ms INTEGER,\
+                        rollout_path TEXT\
+                    );\
+                    CREATE TABLE thread_spawn_edges (\
+                        parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+                    );",
+                )
+                .expect("create state schema");
+            state
+                .execute(
+                    "INSERT INTO threads VALUES (?1, 'Thread', 1, 'agent_created_thread', 'Plan', ?2, ?3)",
+                    rusqlite::params![
+                        PARENTLESS_CHILD,
+                        clock.base_ms,
+                        first.to_string_lossy().into_owned()
+                    ],
+                )
+                .expect("seed state row");
+            let history =
+                Connection::open(home.join(".codex/thread_history_1.sqlite")).expect("history db");
+            history
+                .execute_batch(
+                    "CREATE TABLE thread_history_projection_state (\
+                        thread_id TEXT NOT NULL, next_rollout_byte_offset INTEGER NOT NULL,\
+                        next_rollout_ordinal INTEGER NOT NULL\
+                    );",
+                )
+                .expect("create history schema");
+            history
+                .execute(
+                    "INSERT INTO thread_history_projection_state VALUES (?1, ?2, 6)",
+                    rusqlite::params![
+                        PARENTLESS_CHILD,
+                        i64::try_from(fs::metadata(&first).expect("stat").len()).expect("len")
+                    ],
+                )
+                .expect("seed extent");
+            drop(state);
+            drop(history);
+            fs::write(
+                &segment,
+                jsonl_body(if case == "complete-copy" {
+                    &values[..6]
+                } else {
+                    &continuation
+                }),
+            )
+            .expect("write second segment");
+            let mut index = ScanIndex::default();
+            let scan = scan_source_roots(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions_dir),
+                &mut index,
+                &clock.at(3_600_000),
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("scan segmented parentless thread");
+            assert!(
+                scan.snapshots
+                    .iter()
+                    .all(|item| item.source_session_id != PARENTLESS_CHILD),
+                "{case}: {scan:#?}"
+            );
+            // The join refuses the ordinal-bearing group and holds both members.
+            assert_eq!(scan.ownership_incomplete_file_count, 2, "{case}: {scan:#?}");
+            let _ = fs::remove_dir_all(home);
+        }
     }
 
     #[test]
