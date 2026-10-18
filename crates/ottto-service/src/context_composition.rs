@@ -54,7 +54,7 @@ const COLLECTOR_VERSION: &str = "context-composition-0.1.0";
 const COUNTER_SOURCE: &str = "context_composition_v1";
 /// Local cache identity only. Bump when parsing/classification/ordering changes
 /// without a methodology or collector-version change; never a wire field.
-const COMPOSITION_PARSER_VERSION: &str = "context-composition-parser-v1";
+const COMPOSITION_PARSER_VERSION: &str = "context-composition-parser-v2";
 /// Aggregate rows bucket by the UTC calendar day. `time` in this crate has no
 /// timezone database (formatting/parsing features only) and local-offset lookup
 /// is unsound in a multithreaded daemon, so UTC is the deterministic,
@@ -1011,11 +1011,16 @@ pub(crate) fn parse_codex_session(
                 let role = p.get("role").and_then(Value::as_str).unwrap_or("");
                 if role == "developer" || role == "user" {
                     let (text, images) = extract_blocks_text_and_images(p.get("content"));
-                    if role == "developer" {
+                    let harness_text = if role == "developer" {
+                        text
+                    } else {
+                        codex_injected_user_text(p)
+                    };
+                    if role == "developer" || !harness_text.is_empty() {
                         report.record(
                             &session_id,
                             Category::HarnessAttachments,
-                            estimate_text_tokens(&text),
+                            estimate_text_tokens(&harness_text),
                             mult,
                             0,
                             None,
@@ -1043,6 +1048,46 @@ pub(crate) fn parse_codex_session(
 
     report.note_session_start(&session_id, session_min_ts);
     Ok(())
+}
+
+/// Codex labels each user-role content block with a `content_item_kinds`
+/// entry. Only `user.*` blocks are typed by the person; every other kind
+/// (`agents_md.instructions`, `environments.environment_context`, ...) is
+/// harness-injected and enters context like a developer message. Rollouts
+/// without labels fall back to the injected-block text prefixes.
+const CODEX_INJECTED_USER_PREFIXES: [&str; 3] = [
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<user_instructions>",
+];
+
+fn codex_injected_user_text(payload: &serde_json::Map<String, Value>) -> String {
+    let Some(blocks) = payload.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let kinds = payload
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|meta| meta.get("content_item_kinds"))
+        .and_then(Value::as_array)
+        .filter(|kinds| kinds.len() == blocks.len());
+    let mut texts: Vec<&str> = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let injected = match kinds {
+            Some(kinds) => kinds[index]
+                .as_str()
+                .is_some_and(|kind| !kind.starts_with("user.")),
+            None => CODEX_INJECTED_USER_PREFIXES
+                .iter()
+                .any(|prefix| text.trim_start().starts_with(prefix)),
+        };
+        if injected {
+            texts.push(text);
+        }
+    }
+    texts.join("\n")
 }
 
 fn is_truthy_json(value: &Value) -> bool {
