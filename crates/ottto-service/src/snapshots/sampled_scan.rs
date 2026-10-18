@@ -269,7 +269,13 @@ impl OwnedSourceScan {
             // refreshed on reuse, and are absent from every retained copy.
             // All active owned parser/acquisition/path/receipt state stays charged.
             let inputs = active.parser.take_live_reduction_inputs();
-            let bound = crate::heap_layout_bound::bound(active, remaining);
+            // A cursor job's state grows past the ordinary walk's visit limit
+            // (usage hours, witnesses); charge it by bytes like its pause (N3).
+            let bound = if active.cursor.is_some() {
+                crate::heap_layout_bound::completed_bound(active, remaining)
+            } else {
+                crate::heap_layout_bound::bound(active, remaining)
+            };
             active.parser.restore_live_reduction_inputs(inputs);
             bound
         });

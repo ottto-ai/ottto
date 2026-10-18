@@ -648,6 +648,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
             if inputs != "parents" {
                 let traces = Arc::new(CodexTurnTraceMap {
                     priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
+                    incomplete: false,
                 });
                 assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
                 scan.codex_turn_traces = Some(traces);
@@ -1022,6 +1023,7 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
         priority_turns: BTreeSet::from(["unrelated-turn".into()]),
+        incomplete: false,
     }));
     assert_eq!(
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
@@ -1031,6 +1033,7 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
         priority_turns: BTreeSet::from(["this-turn".into()]),
+        incomplete: false,
     }));
     assert!(matches!(
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),

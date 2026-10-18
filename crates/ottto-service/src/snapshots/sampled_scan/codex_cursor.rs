@@ -21,7 +21,9 @@
 use super::super::*;
 use super::{SharedCache, STATE_BYTES};
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-use crate::transcript_acquisition::{Checkpoint, FullReason, PrefixRefusal, Scope, SAMPLE_BYTES};
+use crate::transcript_acquisition::{
+    AuditDebt, Checkpoint, FullReason, PrefixRefusal, Scope, AUDIT_INTERVAL_SECONDS, SAMPLE_BYTES,
+};
 use std::os::unix::fs::FileExt;
 
 /// Decoded bytes one cursor job may consume per page (B).
@@ -253,6 +255,12 @@ pub(in crate::snapshots) struct SealedPrefix {
 }
 crate::heap_layout_bound::fields!(SealedPrefix; dev, ino, extent);
 
+impl JobMeta {
+    pub(in crate::snapshots) fn census_trusted(&self) -> bool {
+        self.census_trusted
+    }
+}
+
 impl SealedPrefix {
     pub(in crate::snapshots) fn holds(&self, file: &File) -> bool {
         OpenStamp::capture(file).is_ok_and(|now| {
@@ -275,10 +283,13 @@ pub(in crate::snapshots) struct JobMeta {
     counting: String,
     /// The census generation this job started in (K7 fence).
     fence: Option<String>,
+    /// The state and sidecar census were complete at start. A cursor-only
+    /// job (N1) keeps no checkpoint, copy or verification at completion.
+    census_trusted: bool,
     pages: u32,
 }
 crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, dependencies,
-    owner, counting, fence, pages);
+    owner, counting, fence, census_trusted, pages);
 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
@@ -368,6 +379,9 @@ pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) audit_overdue: u64,
     /// Largest `now - due` of such a completion, in seconds.
     pub(in crate::snapshots) audit_overdue_max_age_seconds: u64,
+    /// A completion on a file that did not grow withheld an unterminated
+    /// final record (N2): debt staged, the record left to main's EOF path.
+    pub(in crate::snapshots) sealed_fragment_withheld: u64,
     pub(in crate::snapshots) memo_hits: u64,
     pub(in crate::snapshots) memo_records: u64,
     pub(in crate::snapshots) parked_hits: u64,
@@ -377,7 +391,7 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
     jobs_lost, jobs_deferred_inputs, jobs_start_unstartable, jobs_audit_restarted,
     jobs_finish_failed, jobs_frame_returned, deferred, deferred_rotation,
     deferred_next_generation, namespace_busy, cursor_disabled_unsupported_layout, audit_overdue,
-    audit_overdue_max_age_seconds, memo_hits, memo_records, parked_hits);
+    audit_overdue_max_age_seconds, sealed_fragment_withheld, memo_hits, memo_records, parked_hits);
 
 /// A `JoinStateBound` file waits here until its object or reduction
 /// dependencies change. Its job ran out of a build constant
@@ -674,6 +688,17 @@ pub(in crate::snapshots) struct Publication {
     overdue_age: Option<u64>,
 }
 
+/// A completed attempt on a file that did not grow withheld an unterminated
+/// record after `offset` (N2). The sealed completion never counts it, so the
+/// index must not treat the full length as read: the caller stages `debt`
+/// and, when it retained the prefix copy, records the entry at `offset` so
+/// the next page tails `[offset, L)` with main's EOF behavior.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::snapshots) struct SealedFragment {
+    pub(in crate::snapshots) offset: u64,
+    pub(in crate::snapshots) debt: AuditDebt,
+}
+
 /// How a cursor job's attempt ended at its frozen extent (§e.2 with C1).
 pub(in crate::snapshots) enum JobEnd {
     /// `[0, s)` is certified; `grown` is true when bytes were appended past
@@ -682,12 +707,14 @@ pub(in crate::snapshots) enum JobEnd {
         checkpoint: Checkpoint,
         grown: bool,
         publication: Publication,
+        fragment: Option<SealedFragment>,
     },
     /// Every object check held but the read was lossy: publish uncertified
     /// with debt staged, exactly like today's lossy full read.
     Uncertified {
         grown: bool,
         publication: Publication,
+        fragment: Option<SealedFragment>,
     },
     /// Nothing from this attempt is published or committed and its path
     /// stays pending: a necessary invalidation (replacement, shrink,
@@ -700,24 +727,29 @@ pub(in crate::snapshots) enum JobEnd {
     MemberChanged(Disclosure),
 }
 
-/// The paused job's requested-layout charge (K1): the job walked once, plus
-/// its exact priority-witness map (turn-key strings and tree capacity),
-/// walked per entry so its length is bounded by bytes alone and never by the
-/// walk's visit limit. None when the map is absent (a job that could never
-/// revalidate) or the charge exceeds `STATE_BYTES`.
-fn paused_charge(job: &mut OwnedActiveFile) -> Option<usize> {
-    let witnesses = job
-        .parser
+/// The paused job's requested-layout charge (K1, N3): the whole job walked
+/// with `completed_bound` (live source-wide inputs already removed), so every
+/// collection element (turn-key witnesses, usage hours, capability buckets)
+/// gets its own visit budget and the job is limited by bytes (`STATE_BYTES`)
+/// alone, never by the walk's visit limit. A pause is a completion-only
+/// composition: it runs once per page, never per line. None when the witness
+/// map is absent (a job that could never revalidate) or the charge exceeds
+/// `STATE_BYTES`.
+pub(in crate::snapshots) fn paused_charge(job: &OwnedActiveFile) -> Option<usize> {
+    job.parser
         .accumulator
         .codex_observed_priority_turns
-        .take()?;
-    let total = crate::heap_layout_bound::bound(&*job, STATE_BYTES).and_then(|rest| {
-        let map =
-            crate::heap_layout_bound::completed_bound(&witnesses, STATE_BYTES.checked_sub(rest)?)?;
-        rest.checked_add(map)
-    });
-    job.parser.accumulator.codex_observed_priority_turns = Some(witnesses);
-    total
+        .as_ref()?;
+    crate::heap_layout_bound::completed_bound(job, STATE_BYTES)
+}
+
+/// Request `max(len, 64 KiB)` reader-buffer capacity before a slot charge
+/// (parent shrink ACK). Every live byte, including a skip's salvage prefix,
+/// is kept; the charge then walks the actual resulting capacity, which the
+/// allocator may leave larger. Shrinking never certifies, publishes, clears
+/// debt or grants read budget.
+pub(in crate::snapshots) fn shrink_paused_buffer(buf: &mut Vec<u8>) {
+    buf.shrink_to(buf.len().max(PAUSED_BUFFER_BYTES));
 }
 
 impl CursorLease {
@@ -743,11 +775,9 @@ impl CursorLease {
     fn suspend(self, mut job: OwnedActiveFile, count: fn(&mut Counters)) -> PauseEnd {
         // The slot charge walks the reader buffer's capacity (S3); shrink it
         // first so one overlong record cannot pin `max_line_bytes`.
-        let keep = job.parser.reader.buf.len().max(PAUSED_BUFFER_BYTES);
-        job.parser.reader.buf.shrink_to(keep);
+        shrink_paused_buffer(&mut job.parser.reader.buf);
         let inputs = job.parser.take_live_reduction_inputs();
-        let admitted =
-            paused_charge(&mut job).filter(|charge| self.cache.cursor_make_room(*charge));
+        let admitted = paused_charge(&job).filter(|charge| self.cache.cursor_make_room(*charge));
         let Some(charge) = admitted else {
             job.parser.restore_live_reduction_inputs(inputs);
             let owner = job.cursor.as_ref().and_then(|meta| meta.owner.clone());
@@ -783,8 +813,9 @@ impl CursorLease {
     /// Frame drop (K12): an intact job returns to the slot. A job that no
     /// longer fits is lost; its path is still pending, so it restarts.
     fn return_job(self, mut job: OwnedActiveFile) {
+        shrink_paused_buffer(&mut job.parser.reader.buf);
         drop(job.parser.take_live_reduction_inputs());
-        match paused_charge(&mut job).filter(|charge| self.cache.cursor_make_room(*charge)) {
+        match paused_charge(&job).filter(|charge| self.cache.cursor_make_room(*charge)) {
             Some(charge) => self.store(job, charge, |counters| counters.jobs_frame_returned += 1),
             None => self.end(|cursor| cursor.counters.jobs_lost += 1),
         }
@@ -915,11 +946,13 @@ pub(in crate::snapshots) fn finish_job(
     let now = super::now_seconds();
     let counting_holds = counting_reusable(&parser.accumulator, &meta.counting, counting_now);
     let mut frozen_end = None;
+    let mut read_start = 0;
     // `Err(None)`: evidence unavailable at emission (K9), not a refusal.
     let result = match (parser.reader.acquisition.take(), current_scope) {
         (Some(_), Some(_)) if !counting_holds => Err(Some(PrefixRefusal::Dependency)),
         (Some(plan), Some(scope)) => {
-            let consumed_end = plan.start_offset().saturating_add(consumed);
+            read_start = plan.start_offset();
+            let consumed_end = read_start.saturating_add(consumed);
             frozen_end = parser
                 .reader
                 .extent_limit
@@ -940,12 +973,24 @@ pub(in crate::snapshots) fn finish_job(
             FullReason::InvalidCheckpoint,
         ))),
     };
+    // N2: on a quiescent file the withheld record will not be completed by
+    // an append; its bytes stay owed. The deadline is the read's own audit
+    // cadence (verified = start), so this never loops faster than audits.
+    let fragment = (parser.reader.sealed_fragment() && !grown).then(|| SealedFragment {
+        offset: read_start.saturating_add(parser.reader.last_complete_line_end()),
+        debt: AuditDebt {
+            due_unix_seconds: meta.started.saturating_add(AUDIT_INTERVAL_SECONDS),
+        },
+    });
     let key = rotation_key(&meta.namespace, &meta.key);
     let mut member_changed = false;
     let update = |cursor: &mut CursorState| match &result {
         Ok(_) | Err(Some(PrefixRefusal::Lossy)) => {
             cursor.invalidations.remove(&meta.key);
             cursor.rotation.complete(&key, meta.fence.as_deref());
+            if fragment.is_some() {
+                cursor.counters.sealed_fragment_withheld += 1;
+            }
         }
         Err(Some(PrefixRefusal::AuditDue)) => cursor.counters.jobs_audit_restarted += 1,
         Err(None) => cursor.counters.jobs_deferred_inputs += 1,
@@ -984,6 +1029,7 @@ pub(in crate::snapshots) fn finish_job(
                     certified: true,
                     overdue_age,
                 },
+                fragment,
             }
         }
         Err(Some(PrefixRefusal::Lossy)) => JobEnd::Uncertified {
@@ -992,6 +1038,7 @@ pub(in crate::snapshots) fn finish_job(
                 certified: false,
                 overdue_age: None,
             },
+            fragment,
         },
         Err(_) if member_changed => JobEnd::MemberChanged(strict_disclosure(
             job,
@@ -1226,6 +1273,7 @@ impl SharedCache {
         namespace: &Scope,
         dependencies: Option<String>,
         owner: Option<String>,
+        census_trusted: bool,
         index: &ScanIndex,
     ) -> std::result::Result<CursorLease, StartRefusal> {
         let key = local_index_key(&job.candidate.path);
@@ -1294,6 +1342,7 @@ impl SharedCache {
             started: super::now_seconds(),
             dependencies,
             owner,
+            census_trusted,
             pages: 1,
         });
         Ok(CursorLease {
@@ -1607,6 +1656,11 @@ pub(in crate::snapshots) fn revalidate(
                 *priority == traces.is_some_and(|traces| traces.is_priority_turn(turn))
             });
             if !decisions_hold {
+                // R2-H1: a failed or capped trace load cannot prove a
+                // decision changed; the job waits for complete evidence.
+                if traces.is_some_and(|traces| traces.is_incomplete()) {
+                    return Resume::Unavailable;
+                }
                 return Resume::Changed;
             }
         }
@@ -1647,6 +1701,23 @@ pub(in crate::snapshots) fn held_monotone(accumulator: &SnapshotAccumulator) -> 
         }
         _ => false,
     }
+}
+
+/// R1-H1: a parentless created thread held for a missing sidecar projection
+/// may be cured by an append, when the sidecar's rollout extent is ahead of
+/// the flushed file and the file catches up. Its memo entry hits only on the
+/// exact recorded stamp, so any growth re-reads it.
+pub(in crate::snapshots) fn growth_may_cure(accumulator: &SnapshotAccumulator) -> bool {
+    matches!(
+        accumulator.codex_ownership_boundary,
+        CodexOwnershipBoundary::NativeCreatedThread
+    ) && accumulator.codex_parent_session_ref.is_none()
+        && accumulator.codex_sidecar_projected_next_ordinal.is_none()
+}
+
+/// Memo key: namespace and path, like rotation keys (R1-M1).
+pub(in crate::snapshots) fn memo_key(namespace: &Scope, key: &str) -> String {
+    rotation_key(&namespace.0, key)
 }
 
 /// Every hold except an ambiguous fork (cured by peer parent evidence, which
@@ -1803,12 +1874,15 @@ pub(in crate::snapshots) struct MemoEntry {
     /// `sidecar_fingerprint` when recorded, for holds sidecar evidence can
     /// cure (`sidecar_wakes`).
     sidecar: Option<String>,
+    /// The hold may be cured by the file catching up with its sidecar
+    /// extent (`growth_may_cure`): only the exact recorded stamp is a hit.
+    exact_stamp: bool,
     disclosure: Disclosure,
     used: u64,
     charge: usize,
 }
-crate::heap_layout_bound::fields!(MemoEntry; digest, live, stamp, parent, sidecar, disclosure,
-    used, charge);
+crate::heap_layout_bound::fields!(MemoEntry; digest, live, stamp, parent, sidecar, exact_stamp,
+    disclosure, used, charge);
 
 impl MemoEntry {
     pub(in crate::snapshots) fn new(
@@ -1825,10 +1899,17 @@ impl MemoEntry {
             stamp,
             parent,
             sidecar,
+            exact_stamp: false,
             disclosure,
             used: 0,
             charge: 0,
         }
+    }
+
+    /// R1-H1: a hold an append can cure never matches a grown file.
+    pub(in crate::snapshots) fn growth_may_cure(mut self, growth_may_cure: bool) -> Self {
+        self.exact_stamp = growth_may_cure;
+        self
     }
 
     pub(in crate::snapshots) fn disclosure(&self) -> &Disclosure {
@@ -1851,8 +1932,13 @@ impl MemoEntry {
         sidecar_now: &str,
     ) -> Option<OpenStamp> {
         let now = OpenStamp::capture(file).ok()?;
+        let stamp_holds = if self.exact_stamp {
+            self.stamp == now
+        } else {
+            self.stamp.append_compatible(&now)
+        };
         (self.digest == digest
-            && self.stamp.append_compatible(&now)
+            && stamp_holds
             && self
                 .parent
                 .as_ref()

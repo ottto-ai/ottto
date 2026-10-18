@@ -201,6 +201,19 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
                 // A paused skip delivers and counts nothing.
                 assert_eq!(reader.report.physical_line_count, 1);
                 assert!(reader.buf.len() <= 64);
+                if partials == 1 {
+                    // Pause-time shrink (parent ACK): a grown buffer is cut
+                    // back to `max(len, 64 KiB)` with every live byte and the
+                    // skip state kept; the slot charge walks the actual
+                    // capacity, which the rest of this read then reuses.
+                    reader.buf.reserve(1 << 20);
+                    let live = reader.buf.clone();
+                    shrink_paused_buffer(&mut reader.buf);
+                    assert_eq!(reader.buf, live);
+                    assert!(reader.skipping);
+                    assert!(reader.buf.capacity() >= live.len().max(PAUSED_BUFFER_BYTES));
+                    assert!(reader.buf.capacity() < 1 << 20);
+                }
             }
             JsonlReaderStep::Line => break,
             JsonlReaderStep::Complete(_) => panic!("overlong line must finish"),
@@ -527,8 +540,20 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     assert!(caught_up_entry
         .matches("digest", &file, None, &conflict)
         .is_none());
+    // R1-H1: a missing projection may also mean the sidecar extent is ahead
+    // of the flushed file, which an append cures: that entry hits only on
+    // its exact stamp, and any growth re-reads it.
+    assert!(growth_may_cure(&held));
+    let ahead = entry(Some(caught_up.clone())).growth_may_cure(growth_may_cure(&held));
+    assert!(ahead.matches("digest", &file, None, &caught_up).is_some());
+    temp.append(b"{\"n\":3}\n");
+    assert!(ahead.matches("digest", &file, None, &caught_up).is_none());
+    assert!(caught_up_entry
+        .matches("digest", &file, None, &caught_up)
+        .is_some());
     // A fork hold is cured by peer parent evidence only.
     held.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+    assert!(!growth_may_cure(&held));
     assert!(!sidecar_wakes(&held));
     let fork = entry(sidecar_wakes(&held).then(|| recorded.clone()));
     assert!(fork.matches("digest", &file, None, &caught_up).is_some());
@@ -653,6 +678,14 @@ fn token_line(n: u64) -> Vec<u8> {
     )
 }
 
+/// `2026-09-24T00:00:00Z` plus `hour` hours and `minute` minutes (RFC 3339).
+fn hour_stamp(hour: u64, minute: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp((1_790_208_000 + hour * 3600 + minute * 60) as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
 const SESSION_B: &str = "019fa111-2222-7333-8444-666666666666";
 
 struct ScanRoot {
@@ -727,7 +760,20 @@ fn page_at(
     namespace: &str,
     collected_at: &str,
 ) -> (ScanIndex, SourceScanResult, Modes) {
+    page_with(fixture, index, cache, namespace, collected_at, |_| {})
+}
+
+/// `page_at` with `tweak` applied to the fresh scan object (census flags).
+fn page_with(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: Option<Arc<SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    tweak: impl Fn(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Modes) {
     let mut scan = codex_scan(fixture, index, collected_at);
+    tweak(&mut scan);
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
     }
@@ -1431,6 +1477,244 @@ fn frame_drop_mid_job_returns_job_to_slot() {
     });
 }
 
+/// N3 (R2-N-B1): a session larger than B with 320 distinct active usage
+/// hours, three models and efforts and two capability surfaces per hour
+/// outgrows the ordinary walk's 4,096-visit limit. Its pause charge is the
+/// byte-limited completed walk, so it pauses, resumes, certifies and
+/// publishes once instead of parking as `JoinStateBound`.
+#[test]
+fn many_hour_session_pauses_past_the_walk_visit_limit_and_publishes_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const HOURS: u64 = 320;
+    let models = ["fixture-model-a", "fixture-model-b", "fixture-model-c"];
+    let efforts = ["low", "medium", "high"];
+    let surfaces = ["chrome", "iab"];
+    let fixture = ScanRoot::new(0);
+    let mut body = Vec::new();
+    for hour in 0..HOURS {
+        let model = models[(hour % 3) as usize];
+        let turn_id = format!("01a03e98-5000-7000-8000-{hour:012}");
+        body.extend(codex_line(
+            json!({"timestamp": hour_stamp(hour, 1), "type": "turn_context",
+            "payload": {"turn_id": turn_id, "model": model,
+                "effort": efforts[(hour % 3) as usize]}}),
+        ));
+        for (minute, backend) in surfaces.iter().enumerate() {
+            body.extend(codex_line(
+                json!({"timestamp": hour_stamp(hour, 2 + minute as u64), "type": "event_msg",
+                "payload": {"type": "mcp_tool_call_end",
+                    "invocation": {"server": "node_repl", "tool": "js"},
+                    "result": {"Ok": {"_meta": {"codex/toolSurface":
+                        {"kind": "browserUse", "backend": backend}}}}}}),
+            ));
+        }
+        let n = hour + 1;
+        body.extend(codex_line(
+            json!({"timestamp": hour_stamp(hour, 10), "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"model": model,
+            "total_token_usage": {"input_tokens": n * 100, "cached_input_tokens": n * 50,
+                "output_tokens": n * 10},
+            "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 50,
+                "output_tokens": 10}}}}),
+        ));
+    }
+    fixture.append(SESSION, &body);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    assert!(!unpaged.snapshots.is_empty());
+    let cache = Arc::new(SharedCache::default());
+    let mut widest_hours = 0;
+    let mut ordinary_walk_refused = false;
+    let mut publishing_pages = 0;
+    let paged = with_test_limits(32 * 1024, 16 * 1024, 1024, || {
+        let mut index = ScanIndex::default();
+        let mut published = None;
+        for _ in 0..256 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            let held = cache.with_cursor(|cursor| match &cursor.slot {
+                Slot::Paused(job) => (
+                    job.parser.accumulator.usage_buckets.len(),
+                    crate::heap_layout_bound::bound(&**job, STATE_BYTES).is_none(),
+                ),
+                Slot::Empty | Slot::ActiveElsewhere { .. } => (0, false),
+            });
+            let (hours, refused) = held.unwrap_or((0, false));
+            widest_hours = widest_hours.max(hours);
+            ordinary_walk_refused |= refused;
+            if !scan.snapshots.is_empty() {
+                publishing_pages += 1;
+                published = Some(scan);
+            }
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                let (_, again) = page(&fixture, index, Some(Arc::clone(&cache)));
+                assert!(again.snapshots.is_empty(), "published once");
+                return published.expect("the certified read publishes");
+            }
+        }
+        panic!("many-hour job did not certify: {}", counters(&cache));
+    });
+    assert!(
+        widest_hours >= 256,
+        "a pause held {widest_hours} usage hours"
+    );
+    assert!(
+        ordinary_walk_refused,
+        "the fixture outgrows the ordinary walk's visit limit"
+    );
+    assert_eq!(publishing_pages, 1);
+    assert_eq!(counter(&cache, |c| c.jobs_state_bound), 0);
+    assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+    assert!(counter(&cache, |c| c.jobs_paused) > 0);
+    assert_eq!(
+        counter(&cache, |c| c.jobs_resumed),
+        counter(&cache, |c| c.jobs_paused)
+    );
+    assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
+}
+
+/// N1 (R1-B1 = R2-N-B2): while the sidecar census is incomplete main still
+/// reads and publishes a large file, only unverified. A file larger than the
+/// singleton budget pages as a cursor-only job (no retained state), publishes
+/// once with main's fingerprints and index verification, keeps no copy, and
+/// its path is consumed so the traversal can finish.
+#[test]
+fn incomplete_sidecar_census_pages_cursor_only_and_publishes_unverified() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let incomplete = |scan: &mut OwnedSourceScan| scan.sidecar_census_complete = false;
+    let (main_index, unpaged, _) = page_with(
+        &fixture,
+        ScanIndex::default(),
+        None,
+        "cursor-fixture",
+        NOW,
+        incomplete,
+    );
+    assert!(!unpaged.snapshots.is_empty());
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        let mut published = Vec::new();
+        for _ in 0..64 {
+            let (next, scan, _) = page_with(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                incomplete,
+            );
+            index = next;
+            if !scan.snapshots.is_empty() {
+                published.push(fingerprints(&scan));
+            }
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert!(counter(&cache, |c| c.jobs_paused) > 0, "it paged");
+        assert_eq!(counter(&cache, |c| c.jobs_deferred_inputs), 0);
+        assert_eq!(published, vec![fingerprints(&unpaged)], "published once");
+        assert!(cache.retained_checkpoint(&key).is_none(), "no copy kept");
+        let marker = |index: &ScanIndex| {
+            index
+                .files
+                .get(&key)
+                .map(|entry| entry.scan_identity_version.clone())
+        };
+        assert_eq!(marker(&index), marker(&main_index), "main's trust rule");
+        assert!(!index
+            .files
+            .get(&key)
+            .is_some_and(ScanIndexEntry::has_unverified_source));
+        assert!(index
+            .traversal
+            .as_ref()
+            .map_or(true, |traversal| traversal.pending_candidates.is_empty()));
+    });
+}
+
+/// N2 (R1-B2): a quiescent file larger than B whose last record has no
+/// newline. The sealed cursor completion certifies `[0, s)` and never counts
+/// that record, but stages debt and records only `[0, s)` as read, so the next
+/// page tails it with main's EOF behavior: a valid record is counted once
+/// (matching main's unpaged read) and stays unverified with debt; a
+/// malformed one is reported as a line loss.
+#[test]
+fn quiescent_unterminated_last_record_is_tailed_with_main_eof_behavior() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let valid = {
+        let mut line = token_line(41);
+        line.pop();
+        line
+    };
+    let malformed =
+        br#"{"timestamp":"2026-10-07T10:30:00Z","type":"event_msg","payload":"#.to_vec();
+    for (case, last) in [("valid", valid), ("malformed", malformed)] {
+        let fixture = ScanRoot::new(40);
+        fixture.append(SESSION, &last);
+        let path = fixture.file(SESSION);
+        let key = local_index_key(&path);
+        let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 4096, 64, || {
+            let mut index = ScanIndex::default();
+            let mut certified_page = None;
+            let mut after = Vec::new();
+            let mut malformed_lines = 0;
+            for page_number in 0..64 {
+                let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+                index = next;
+                if certified_page.is_some() {
+                    malformed_lines += scan.malformed_json_line_count;
+                    if !scan.snapshots.is_empty() {
+                        after.push(fingerprints(&scan));
+                    }
+                    if page_number > certified_page.unwrap() + 3 {
+                        break;
+                    }
+                } else if counter(&cache, |c| c.jobs_certified) == 1 {
+                    certified_page = Some(page_number);
+                    assert!(
+                        index
+                            .files
+                            .get(&key)
+                            .is_some_and(ScanIndexEntry::has_unverified_source),
+                        "{case}: the withheld record is owed"
+                    );
+                }
+            }
+            assert!(certified_page.is_some(), "{case}: {}", counters(&cache));
+            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 1, "{case}");
+            if case == "valid" {
+                assert_eq!(counter(&cache, |c| c.jobs_started), 1, "{case}: no loop");
+                assert_eq!(after, vec![fingerprints(&unpaged)], "{case}: counted once");
+                assert!(index
+                    .files
+                    .get(&key)
+                    .is_some_and(ScanIndexEntry::has_unverified_source));
+            } else {
+                assert!(unpaged.malformed_json_line_count > 0, "main reports it");
+                assert!(malformed_lines > 0, "{case}: the loss is reported");
+            }
+        });
+    }
+}
+
 /// K7 as pure state: oldest waiter first, never-served files ahead of served
 /// ones (an overdue audit is aged behind waiting large files), inactive
 /// waiters do not block, and one completed attempt per census generation.
@@ -1507,41 +1791,50 @@ fn accumulator_heap_bound_at_measured_event_counts() {
         ("C-af9d28a0", 8_134, 8_174, 0, 53, false),
         ("D-c61fd635", 4_771, 4_783, 1_164, 70, false),
     ];
+    // Realistic span (R2-N-B1): events spread over the largest measured
+    // session's 265 active usage hours, so usage and activity buckets grow
+    // like a long session's instead of sharing one hour.
+    const HOURS: usize = 265;
     for (case, first, native, turns, compactions, token_counts) in cases {
-        let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        let mut body = codex_line(json!({"timestamp": hour_stamp(0, 0),
             "type": "session_meta", "payload": {"id": SESSION}}));
         let events = first + native + turns + compactions;
         for event in 0..events {
+            let stamp = hour_stamp((event * HOURS / events) as u64, 10);
             let line = if event % (events / compactions.max(1)).max(1) == 0
                 && event / (events / compactions.max(1)).max(1) < compactions
             {
-                codex_line(
-                    json!({"timestamp": "2026-10-07T10:10:00Z", "type": "compacted",
-                    "payload": {"replacement_history": []}}),
-                )
+                codex_line(json!({"timestamp": stamp, "type": "compacted",
+                    "payload": {"replacement_history": []}}))
             } else if turns > 0 && event % (events / turns).max(1) == 1 {
-                codex_line(
-                    json!({"timestamp": "2026-10-07T10:10:00Z", "type": "turn_context",
-                    "payload": {"turn_id": format!("turn-{event}"), "model": "fixture-model"}}),
-                )
+                codex_line(json!({"timestamp": stamp, "type": "turn_context",
+                    "payload": {"turn_id": format!("turn-{event}"), "model": "fixture-model"}}))
             } else if event % 2 == 0 {
                 if token_counts {
-                    token_line(event as u64 + 1)
+                    let n = event as u64 + 1;
+                    codex_line(json!({"timestamp": stamp, "type": "event_msg",
+                        "payload": {"type": "token_count", "info": {"model": "fixture-model",
+                        "total_token_usage": {"input_tokens": n * 100,
+                            "cached_input_tokens": n * 50, "output_tokens": n * 10},
+                        "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 50,
+                            "output_tokens": 10}}}}))
                 } else {
-                    codex_line(json!({"timestamp": "2026-10-07T10:10:00Z",
+                    codex_line(json!({"timestamp": stamp,
                         "type": "event_msg", "payload": {"type": "agent_message",
                         "message": "synthetic"}}))
                 }
             } else {
-                codex_line(json!({"timestamp": "2026-10-07T10:10:00Z",
+                codex_line(json!({"timestamp": stamp,
                     "type": "response_item", "payload": {"type": "message",
                     "role": "assistant", "content": [{"type": "output_text",
                     "text": "synthetic"}]}}))
             };
             body.extend(line);
         }
-        body.extend(codex_line(json!({"timestamp": "2026-10-07T10:20:00Z",
-            "big": "x".repeat(MAX_JSONL_LINE_BYTES + 1)})));
+        body.extend(codex_line(
+            json!({"timestamp": hour_stamp(HOURS as u64, 20),
+            "big": "x".repeat(MAX_JSONL_LINE_BYTES + 1)}),
+        ));
         let temp = Temp::new("sizing", &body);
         let mut parser = OwnedJsonlParser::new(
             File::open(&temp.0).unwrap(),
@@ -1555,33 +1848,42 @@ fn accumulator_heap_bound_at_measured_event_counts() {
             true,
         )
         .unwrap();
+        // The pause charge is the completed walk (N3); it must exist.
         let mut peak = None::<usize>;
         let mut first_pause = None::<usize>;
         let mut steps = 0_usize;
         while !parser.step().unwrap() {
             steps += 1;
             if steps % 2_048 == 0 {
-                let bound = crate::heap_layout_bound::bound(&parser, usize::MAX);
+                let bound = crate::heap_layout_bound::completed_bound(&parser, usize::MAX);
+                assert!(bound.is_some(), "{case}: mid-read completed walk refused");
                 first_pause = first_pause.or(bound);
                 peak = peak.max(bound);
             }
         }
-        let accumulator = crate::heap_layout_bound::bound(&parser.accumulator, usize::MAX);
-        let walked = crate::heap_layout_bound::bound(&parser, usize::MAX);
+        let accumulator =
+            crate::heap_layout_bound::completed_bound(&parser.accumulator, usize::MAX);
+        let walked = crate::heap_layout_bound::completed_bound(&parser, usize::MAX);
+        let ordinary = crate::heap_layout_bound::bound(&parser, usize::MAX);
         let buffer = parser.reader.buf.capacity();
+        let hours = parser.accumulator.usage_buckets.len();
         eprintln!(
-            "CODEX_SIZING case={case} events={events} final_parser={walked:?} \
-             peak_parser={peak:?} accumulator={accumulator:?} reader_buffer_capacity={buffer} \
-             over_line_cap={}",
+            "CODEX_SIZING case={case} events={events} usage_hours={hours} final_parser={walked:?} \
+             ordinary_walk={ordinary:?} peak_parser={peak:?} accumulator={accumulator:?} \
+             reader_buffer_capacity={buffer} over_line_cap={}",
             parser.reader.report.over_line_cap_count
         );
         assert_eq!(parser.reader.report.over_line_cap_count, 1);
-        if let (Some(walked), Some(accumulator)) = (walked, accumulator) {
-            // The paused charge walks the reader buffer with the accumulator.
-            assert!(walked >= accumulator.saturating_add(buffer));
-        }
-        if let (Some(first), Some(peak)) = (first_pause, peak) {
-            assert!(peak >= first);
-        }
+        let walked = walked.unwrap_or_else(|| panic!("{case}: completed parser walk refused"));
+        let accumulator =
+            accumulator.unwrap_or_else(|| panic!("{case}: completed accumulator walk refused"));
+        // The paused charge walks the reader buffer with the accumulator.
+        assert!(walked >= accumulator.saturating_add(buffer));
+        assert!(
+            walked <= STATE_BYTES,
+            "{case}: {walked} exceeds STATE_BYTES"
+        );
+        let (first, peak) = first_pause.zip(peak).expect("the read paused");
+        assert!(peak >= first);
     }
 }

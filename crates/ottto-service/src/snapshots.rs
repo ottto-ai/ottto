@@ -9585,11 +9585,19 @@ fn load_claude_desktop_session_title(
 #[derive(Debug, Clone, Default)]
 struct CodexTurnTraceMap {
     priority_turns: BTreeSet<String>,
+    /// A present trace DB failed to load, or its row cap was reached: absent
+    /// turns are unknown, not standard (R2-H1). A paged job treats a flipped
+    /// decision under such a map as unavailable evidence, never a change.
+    incomplete: bool,
 }
 
 impl CodexTurnTraceMap {
     fn is_priority_turn(&self, turn_id: &str) -> bool {
         self.priority_turns.contains(turn_id)
+    }
+
+    fn is_incomplete(&self) -> bool {
+        self.incomplete
     }
 }
 
@@ -14565,6 +14573,7 @@ impl OwnedSourceScan {
                 // certificate; an invalidated attempt publishes nothing.
                 let mut cursor_certificate = None;
                 let mut cursor_publication = None;
+                let mut cursor_fragment = None;
                 if let Some(context) = sampling.as_ref().filter(|_| active.cursor.is_some()) {
                     let current_scope = sampled_scan::reduction_dependencies(
                         source,
@@ -14585,6 +14594,12 @@ impl OwnedSourceScan {
                     });
                     let counting_now =
                         sampled_scan::codex_cursor::counting_view(&active.candidate, index);
+                    let census_trusted = state_census_complete
+                        && sidecar_census_complete
+                        && active
+                            .cursor
+                            .as_ref()
+                            .is_some_and(sampled_scan::codex_cursor::JobMeta::census_trusted);
                     // The certificate re-reads two samples from the held FD (M3).
                     codex_page.charge(true, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                     match sampled_scan::codex_cursor::finish_job(
@@ -14598,23 +14613,38 @@ impl OwnedSourceScan {
                             checkpoint,
                             grown,
                             publication,
+                            fragment,
                         } => {
+                            // N2: a withheld record keeps the path pending, so
+                            // the next page tails it from `s`.
                             sampled_scan::codex_cursor::release_path(
                                 index,
                                 &active.candidate,
-                                grown,
+                                grown || fragment.is_some(),
                             );
-                            cursor_certificate = Some(Some(checkpoint));
+                            // N1: a cursor-only job (census incomplete at start
+                            // or now) publishes like main's unsampled read: the
+                            // certificate fenced the object, but no checkpoint,
+                            // copy or verification is kept.
+                            cursor_certificate = Some(Some(checkpoint).filter(|_| census_trusted));
                             cursor_publication = Some(publication);
+                            cursor_fragment = fragment;
                         }
-                        sampled_scan::codex_cursor::JobEnd::Uncertified { grown, publication } => {
+                        sampled_scan::codex_cursor::JobEnd::Uncertified {
+                            grown,
+                            publication,
+                            fragment,
+                        } => {
+                            // N2: a withheld record keeps the path pending, so
+                            // the next page tails it from `s`.
                             sampled_scan::codex_cursor::release_path(
                                 index,
                                 &active.candidate,
-                                grown,
+                                grown || fragment.is_some(),
                             );
                             cursor_certificate = Some(None);
                             cursor_publication = Some(publication);
+                            cursor_fragment = fragment;
                         }
                         // Its path is still pending: the next page re-bootstraps.
                         sampled_scan::codex_cursor::JobEnd::Restart => pending!(),
@@ -14690,7 +14720,9 @@ impl OwnedSourceScan {
                                 .map(|ledger| ledger.opened_object_identity.clone());
                             (parent, ledger)
                         });
-                    Some((digest, live, stamp, parent, sidecar))
+                    let growth_may_cure =
+                        sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator);
+                    Some((digest, live, stamp, parent, sidecar, growth_may_cure))
                 });
                 let OwnedActiveFile {
                     comparison_target,
@@ -15058,34 +15090,48 @@ impl OwnedSourceScan {
                         && recognized_usage_drop_count == 0
                         && dropped_usage_record_count == 0;
                     match memo_candidate.filter(|_| held) {
-                        Some((digest, live, stamp, parent, sidecar)) => context.cache.memo_record(
-                            index_key.clone(),
-                            sampled_scan::codex_cursor::MemoEntry::new(
-                                digest,
-                                live,
-                                stamp,
-                                parent,
-                                sidecar,
-                                sampled_scan::codex_cursor::Disclosure {
-                                    reason: sampled_scan::codex_cursor::DebtReason::HeldTerminal,
-                                    ownership_incomplete_file_count,
-                                    zero_snapshot_usage_evidence,
-                                    state_only_blocked_session_ids: parsed_file
-                                        .state_only_blocked_session_ids
-                                        .iter()
-                                        .cloned()
-                                        .collect(),
-                                    diagnostic_reason,
-                                    parsed_snapshot_count: parsed_file.snapshots.len(),
-                                },
-                            ),
-                        ),
-                        None => context.cache.memo_forget(&index_key),
+                        Some((digest, live, stamp, parent, sidecar, growth_may_cure)) => {
+                            context.cache.memo_record(
+                                sampled_scan::codex_cursor::memo_key(
+                                    &context.namespace,
+                                    &index_key,
+                                ),
+                                sampled_scan::codex_cursor::MemoEntry::new(
+                                    digest,
+                                    live,
+                                    stamp,
+                                    parent,
+                                    sidecar,
+                                    sampled_scan::codex_cursor::Disclosure {
+                                        reason:
+                                            sampled_scan::codex_cursor::DebtReason::HeldTerminal,
+                                        ownership_incomplete_file_count,
+                                        zero_snapshot_usage_evidence,
+                                        state_only_blocked_session_ids: parsed_file
+                                            .state_only_blocked_session_ids
+                                            .iter()
+                                            .cloned()
+                                            .collect(),
+                                        diagnostic_reason,
+                                        parsed_snapshot_count: parsed_file.snapshots.len(),
+                                    },
+                                )
+                                .growth_may_cure(growth_may_cure),
+                            )
+                        }
+                        None => context
+                            .cache
+                            .memo_forget(&sampled_scan::codex_cursor::memo_key(
+                                &context.namespace,
+                                &index_key,
+                            )),
                     }
                 }
-                let source_verified = completed_acquisition
-                    .as_ref()
-                    .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
+                // N2: a withheld final record is owed, never verified.
+                let source_verified = cursor_fragment.is_none()
+                    && completed_acquisition
+                        .as_ref()
+                        .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
                     || (file_sampling.is_none()
                         && state_census_complete
                         && sidecar_census_complete
@@ -15189,6 +15235,7 @@ impl OwnedSourceScan {
                     .map(|snapshot| snapshot.snapshot_fingerprint.clone());
                 let parsed_snapshot_count = parsed.len();
                 let sampled_audit_verified = parse_complete
+                    && cursor_fragment.is_none()
                     && completed_acquisition
                         .as_ref()
                         .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
@@ -15261,7 +15308,20 @@ impl OwnedSourceScan {
                     } else {
                         ScanParseOutcome::ConfirmedEmpty
                     };
-                    index.record(candidate, last_snapshot_fingerprint, outcome);
+                    // N2: with the certified prefix copy retained, the entry
+                    // records only `[0, s)` as read, so the next page tails
+                    // the withheld record with main's EOF behavior. Without a
+                    // copy it records the length read and the staged debt
+                    // re-selects it at the audit cadence.
+                    let mut recorded = candidate;
+                    if let Some(fragment) = cursor_fragment.filter(|_| {
+                        completed_acquisition
+                            .as_ref()
+                            .is_some_and(|completed| completed.reduction.is_some())
+                    }) {
+                        recorded.size_bytes = fragment.offset;
+                    }
+                    index.record(recorded, last_snapshot_fingerprint, outcome);
                     // Native settlement accepts disclosed terminal row loss, even
                     // though that acquisition cannot certify a verified prefix.
                     // Its sampled publication still owes the prepared deadline;
@@ -15291,6 +15351,13 @@ impl OwnedSourceScan {
                         }
                     } else if source_verified {
                         index.complete_full_audit(&index_key, &source_file_fingerprint);
+                    }
+                    if let Some(fragment) = cursor_fragment {
+                        index.stage_sampled_audit(
+                            &index_key,
+                            &source_file_fingerprint,
+                            fragment.debt,
+                        );
                     }
                     if let Some(completed) = completed_acquisition {
                         if let Some(context) = sampling.as_ref() {
@@ -16024,7 +16091,10 @@ impl OwnedSourceScan {
                 .filter(|_| source == SnapshotSource::Codex)
             {
                 let key = local_index_key(&candidate.path);
-                if let Some(entry) = context.cache.memo_lookup(&key) {
+                // Keyed per namespace (R1-M1): the digest carries the upload
+                // context, so concurrent namespaces must not evict each other.
+                let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
+                if let Some(entry) = context.cache.memo_lookup(&memo_key) {
                     // The match re-reads two samples of the held file (M3).
                     codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                     let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
@@ -16065,7 +16135,7 @@ impl OwnedSourceScan {
                         // An append cannot cure this hold and no wake
                         // dependency changed: disclose the same terminal
                         // debt again at zero transcript bytes.
-                        context.cache.memo_hit(&key, stamp);
+                        context.cache.memo_hit(&memo_key, stamp);
                         let keep_previous = decision != CandidateDecision::ReconcileLegacy
                             && !index
                                 .effective_upload_body_witness_revision_requires_adoption(&key);
@@ -16093,7 +16163,7 @@ impl OwnedSourceScan {
                         );
                         pending!();
                     }
-                    context.cache.memo_forget(&key);
+                    context.cache.memo_forget(&memo_key);
                 }
                 // A parked `JoinStateBound` file is not read again until it
                 // is replaced, shrunk or edited, or its reduction dependencies
@@ -16233,6 +16303,9 @@ impl OwnedSourceScan {
             };
             let mut file_sampling = None;
             let mut retained_offset = None;
+            // Counted once the page actually reads the file (R2-M3): a fence
+            // or deferral below does not inflate the read diagnostics.
+            let mut planned_mode = None;
             if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
                 let retained = context.cache.take(&key);
@@ -16373,12 +16446,77 @@ impl OwnedSourceScan {
                             .acquisition
                             .as_ref()
                             .and_then(|plan| plan.metrics().audit_due);
-                        context.record_mode(mode, audit_due);
+                        planned_mode = Some((mode, audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             key,
                             scope,
                             mode,
                             audit_due,
+                        });
+                    }
+                } else if source == SnapshotSource::Codex
+                    && owning_header_is_current
+                    && crate::heap_layout_bound::layout_supported()
+                    && parser
+                        .reader
+                        .reader
+                        .get_ref()
+                        .metadata()
+                        .is_ok_and(|metadata| {
+                            metadata.len() > sampled_scan::codex_cursor::Limits::current().singleton
+                        })
+                {
+                    // N1 (K9): the state or sidecar census is incomplete, so
+                    // main's trust rule refuses verification and retention,
+                    // yet main still reads and publishes this file. A file
+                    // larger than the singleton budget therefore pages as a
+                    // cursor-only job: a fresh `Full` acquisition with no
+                    // retained state and no debt input, used only for the
+                    // job's object certificate. Its completion keeps no
+                    // checkpoint and no copy, so it is never source-verified.
+                    let reduction_sidecar = sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    );
+                    context
+                        .admission
+                        .reduction_dependencies_available
+                        .observe(reduction_sidecar.is_some());
+                    if let Some(reduction_sidecar) = reduction_sidecar {
+                        let scope = context.file_scope(
+                            source,
+                            &candidate,
+                            &reduction_sidecar,
+                            true,
+                            context_curve_enabled,
+                            index,
+                        );
+                        context.admission.prepare_started =
+                            context.admission.prepare_started.saturating_add(1);
+                        let mode = match parser.prepare_acquisition(
+                            None,
+                            &scope,
+                            None,
+                            sampled_scan::now_seconds(),
+                        ) {
+                            Ok(mode) => mode,
+                            Err(_) => {
+                                context.admission.prepare_failed =
+                                    context.admission.prepare_failed.saturating_add(1);
+                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                pending!();
+                            }
+                        };
+                        sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
+                        planned_mode = Some((mode, None));
+                        file_sampling = Some(sampled_scan::Active {
+                            key,
+                            scope,
+                            mode,
+                            audit_due: None,
                         });
                     }
                 }
@@ -16451,6 +16589,7 @@ impl OwnedSourceScan {
                             &context.namespace,
                             dependencies,
                             owner,
+                            state_census_complete && sidecar_census_complete,
                             index,
                         ) {
                             Ok(lease) => {
@@ -16464,12 +16603,18 @@ impl OwnedSourceScan {
                                 codex_cursor_lease = Some(lease);
                                 false
                             }
-                            // Incomplete inputs defer as `InProgress`: the path
-                            // stays pending, nothing is marked unreadable (K9).
-                            Err(
-                                sampled_scan::codex_cursor::StartRefusal::Busy
-                                | sampled_scan::codex_cursor::StartRefusal::InputsUnavailable,
-                            ) => true,
+                            // The slot frees when its job ends: wait in turn.
+                            Err(sampled_scan::codex_cursor::StartRefusal::Busy) => true,
+                            // N1: no acquisition even cursor-only (no current
+                            // owning header or no reduction dependencies, where
+                            // main holds the file too). Never requeued: the
+                            // path is processed for this generation with a
+                            // retryable cause, so discovery finishes and the
+                            // bounded unhealthy retry starts the next one.
+                            Err(sampled_scan::codex_cursor::StartRefusal::InputsUnavailable) => {
+                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                pending!();
+                            }
                             Err(sampled_scan::codex_cursor::StartRefusal::Unstartable) => {
                                 // Never an unbounded in-page read of a file
                                 // larger than the singleton budget.
@@ -16497,6 +16642,9 @@ impl OwnedSourceScan {
                     );
                     pending!();
                 }
+            }
+            if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
+                context.record_mode(mode, audit_due);
             }
             active_file = Some(active);
             pending!();
@@ -21948,7 +22096,11 @@ impl CodexTurnTraceMap {
                 codex_dir.join("logs_2.sqlite"),
                 codex_dir.join("sqlite").join("logs_2.sqlite"),
             ] {
-                load_codex_logs2_priority_turns(&db_path, since_epoch, &mut map.priority_turns);
+                map.incomplete |= !load_codex_logs2_priority_turns(
+                    &db_path,
+                    since_epoch,
+                    &mut map.priority_turns,
+                );
             }
         }
         map
@@ -21964,13 +22116,15 @@ fn codex_logs2_since_epoch(backfill_window_days: u64) -> i64 {
     now.saturating_sub(span) as i64
 }
 
+/// False when a present DB could not be read completely (open, prepare,
+/// query or row error, or the row cap reached); a missing DB is complete.
 fn load_codex_logs2_priority_turns(
     path: &Path,
     since_epoch: i64,
     priority_turns: &mut BTreeSet<String>,
-) {
+) -> bool {
     if !path.exists() {
-        return;
+        return true;
     }
     // URI `mode=ro` so a WAL database with a concurrent writer is safe to read.
     let uri = format!("file:{}?mode=ro", path.to_string_lossy());
@@ -21978,7 +22132,7 @@ fn load_codex_logs2_priority_turns(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     ) else {
-        return;
+        return false;
     };
     let _ = connection.busy_timeout(std::time::Duration::from_millis(
         CODEX_LOGS2_BUSY_TIMEOUT_MS,
@@ -21991,19 +22145,27 @@ fn load_codex_logs2_priority_turns(
          WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
          ORDER BY ts DESC LIMIT ?2",
     ) else {
-        return;
+        return false;
     };
     let Ok(rows) = statement.query_map(
         rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
         |row| row.get::<_, String>(0),
     ) else {
-        return;
+        return false;
     };
-    for body in rows.flatten() {
+    let mut complete = true;
+    let mut read = 0_u64;
+    for body in rows {
+        let Ok(body) = body else {
+            complete = false;
+            continue;
+        };
+        read += 1;
         if let Some(turn_id) = codex_logs2_priority_turn_from_body(&body) {
             priority_turns.insert(turn_id);
         }
     }
+    complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
 
 /// Parse one `feedback_log_body` row. Returns the `turn_id` when the row is a
@@ -61517,7 +61679,7 @@ crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ord
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
-crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns);
+crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count,
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
