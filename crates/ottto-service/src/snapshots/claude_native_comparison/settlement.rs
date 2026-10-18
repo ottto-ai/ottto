@@ -426,7 +426,10 @@ impl Completion {
                 .as_ref()
                 .expect("checked moving recovery")
                 .recovery_bytes_for_test();
-            let (result, allocation) = crate::retry_allocation_probe::measure_process(|| {
+            // Selected recovery is synchronous on this thread: map/set/path
+            // updates spawn no work and transfer no allocations to a worker.
+            // Audit its born-in-scope peak, excluding unrelated parallel tests.
+            let (result, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
                 fallback.restore_selected(index, previous)
             });
             assert!(
