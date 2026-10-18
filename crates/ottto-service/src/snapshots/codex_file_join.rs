@@ -777,6 +777,8 @@ pub(super) struct GroupReader {
     receipt_scope: String,
     legacy_expected: BTreeMap<String, String>,
     legacy_baselines: Vec<LegacyBaseline>,
+    /// Counting acknowledgement evidence of every member entry (COST rule 2).
+    counting_evidence: codex_counting_version::AckEvidence,
 }
 impl GroupReader {
     pub(super) fn new(members: Vec<CandidateFile>) -> Result<Self> {
@@ -811,6 +813,7 @@ impl GroupReader {
             receipt_scope: String::new(),
             legacy_expected: BTreeMap::new(),
             legacy_baselines: Vec::new(),
+            counting_evidence: codex_counting_version::AckEvidence::None,
         })
     }
     pub(super) fn configure_receipts(&mut self, index: &ScanIndex) {
@@ -818,6 +821,11 @@ impl GroupReader {
             .active_upload_context_fingerprint
             .clone()
             .unwrap_or_default();
+        self.counting_evidence = codex_counting_version::AckEvidence::of_view(
+            self.members
+                .iter()
+                .filter_map(|member| index.files.get(&local_index_key(&member.path))),
+        );
         for member in &self.members {
             let key = local_index_key(&member.path);
             if let Some(entry) = index.files.get(&key) {
@@ -1093,7 +1101,7 @@ impl GroupReader {
                 parser.accumulator.latest_reasoning_effort = None;
                 parser.accumulator.latest_turn_id = None;
             } else {
-                self.parser = Some(OwnedJsonlParser::new(
+                let mut parser = OwnedJsonlParser::new(
                     file,
                     &member.path,
                     SnapshotSource::Codex,
@@ -1103,7 +1111,13 @@ impl GroupReader {
                     ledgers,
                     artifacts,
                     context_curve,
-                )?);
+                )?;
+                // One counting state for the whole group; later members keep it.
+                codex_counting_version::configure_group_once(
+                    &mut parser.accumulator,
+                    self.counting_evidence,
+                );
+                self.parser = Some(parser);
             }
             let previous = self
                 .previous_receipts
@@ -1222,7 +1236,7 @@ impl GroupReader {
         Ok((parser, last, self.members, self.applied_receipts))
     }
 }
-crate::heap_layout_bound::fields!(GroupReader; launch_owner, members, proofs, identified, proof_reader, proof, records, replay_order, canonical_order, proof_prefix_matched, replay_member, parser, replay_digest, report, applied_receipts, previous_receipts, receipt_scope, legacy_expected, legacy_baselines);
+crate::heap_layout_bound::fields!(GroupReader; launch_owner, members, proofs, identified, proof_reader, proof, records, replay_order, canonical_order, proof_prefix_matched, replay_member, parser, replay_digest, report, applied_receipts, previous_receipts, receipt_scope, legacy_expected, legacy_baselines, counting_evidence);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Tokens([u64; 6]);
@@ -1775,6 +1789,54 @@ pub(super) mod tests {
             "an acknowledged group needs no new upload"
         );
         assert_eq!(restarted.semantic_noop_count, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn counting_v2_group_is_configured_once_and_folded_once() {
+        let (root, _) = fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        for (name, rows) in [
+            ("a", member(owner, "r-a", 100, 100)),
+            ("b", member(owner, "r-b", 200, 300)),
+        ] {
+            let body = rows
+                .into_iter()
+                .map(|mut row| {
+                    if row["type"] == "session_meta" {
+                        row["payload"]["timestamp"] = json!("2026-10-01T10:00:00Z");
+                    }
+                    serde_json::to_string(&row).unwrap() + "\n"
+                })
+                .collect::<String>();
+            fs::write(root.join("sessions").join(format!("{name}.jsonl")), body).unwrap();
+        }
+        let keys = ["a", "b"]
+            .map(|name| local_index_key(&root.join("sessions").join(format!("{name}.jsonl"))));
+        let (legacy_index, legacy) = scan(&root, ScanIndex::default(), 2);
+        let _cutover = codex_counting_version::TestCutover::set(0);
+        let (index, counted) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
+        let receipts = counted.local_codex_diagnostics.unwrap().codex_counting_v2;
+        assert_eq!(receipts.v2_sessions, 1, "a joined group folds once");
+        // One carried accumulator saw both members' records.
+        assert_eq!(receipts.native_outside_open_turn, 2);
+        assert_eq!(receipts.ui_in_unbound_span, 2);
+        for key in &keys {
+            assert!(index.files[key].codex_counting_v2, "V2 marks every member");
+            assert!(!legacy_index.files[key].codex_counting_v2);
+        }
+        assert_eq!(
+            legacy
+                .local_codex_diagnostics
+                .unwrap()
+                .codex_counting_v2
+                .v2_sessions,
+            0
+        );
+        for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
+            assert_eq!(counted.input_tokens, legacy.input_tokens);
+            assert_eq!(counted.input_tokens, 300);
+        }
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

@@ -693,8 +693,9 @@ pub(crate) struct CodexScanDiagnostics {
     pub quarantine_count: u64,
     pub sample_offset: u64,
     pub lineage: [Option<RecoveryLineage>; LINEAGE_SAMPLES],
-    /// Codex usage-counting V2 receipts of this scan's finalized singleton
-    /// parses. All zero while V2 is inactive.
+    /// Codex usage-counting V2 receipts of this scan's finished parses: a
+    /// singleton, or a joined group's single replay parse, each folded once.
+    /// All zero while V2 is inactive.
     pub codex_counting_v2: CountingV2Receipts,
 }
 
@@ -729,20 +730,25 @@ pub(crate) struct CountingV2Receipts {
     pub v2_cumulative_base_uncounted_usage: [u64; 6],
     pub turn_closure_mismatch: u64,
     pub turn_reopened: u64,
+    /// Closed-turn filter hits outside the exact recent ring: an older
+    /// closure or a false positive. Natives there count 0 (usage below).
+    pub closed_filter_hit_unconfirmed: u64,
+    pub closed_filter_hit_unconfirmed_native_usage: [u64; 6],
     pub pending_overflow_flushes: u64,
-    /// Visible local debt: sessions ending this parse inside a still-open
-    /// UI-only turn, their staged UI events and staged usage.
-    pub open_turn_ui_pending_sessions: u64,
-    pub open_turn_ui_pending_events: u64,
-    pub open_turn_ui_pending_usage: [u64; 6],
+    /// Visible local debt, only for the scan that parsed it: sessions ending
+    /// this parse inside a still-open UI-only turn, their staged UI events and
+    /// staged usage. Not carried to later scans.
+    pub open_turn_ui_pending_sessions_this_scan: u64,
+    pub open_turn_ui_pending_events_this_scan: u64,
+    pub open_turn_ui_pending_usage_this_scan: [u64; 6],
     /// Open turns whose staged usage sum overflowed; never folded as zero.
-    pub open_turn_ui_pending_unsummable: u64,
+    pub open_turn_ui_pending_unsummable_this_scan: u64,
 }
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
 crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, unreadable_causes, quarantine_count, sample_offset, lineage, codex_counting_v2);
-crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, pending_overflow_flushes, open_turn_ui_pending_sessions, open_turn_ui_pending_events, open_turn_ui_pending_usage, open_turn_ui_pending_unsummable);
+crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
@@ -891,11 +897,13 @@ mod tests {
             v2_cumulative_base_uncounted_usage: max,
             turn_closure_mismatch: u64::MAX,
             turn_reopened: u64::MAX,
+            closed_filter_hit_unconfirmed: u64::MAX,
+            closed_filter_hit_unconfirmed_native_usage: max,
             pending_overflow_flushes: u64::MAX,
-            open_turn_ui_pending_sessions: u64::MAX,
-            open_turn_ui_pending_events: u64::MAX,
-            open_turn_ui_pending_usage: max,
-            open_turn_ui_pending_unsummable: u64::MAX,
+            open_turn_ui_pending_sessions_this_scan: u64::MAX,
+            open_turn_ui_pending_events_this_scan: u64::MAX,
+            open_turn_ui_pending_usage_this_scan: max,
+            open_turn_ui_pending_unsummable_this_scan: u64::MAX,
         };
         let bytes = serde_json::to_vec_pretty(&diagnostics).unwrap();
         assert!(bytes.len() < MAX_LOCAL_DIAGNOSTIC_BYTES);

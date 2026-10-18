@@ -12,6 +12,42 @@ use super::*;
 /// instant after the group parser path is configured; never a moving time.
 pub(super) const CODEX_COUNTING_V2_CUTOVER_UNIX_MS: Option<i64> = None;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CUTOVER_UNIX_MS: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The compiled cutover.
+#[cfg(not(test))]
+fn cutover_unix_ms() -> Option<i64> {
+    CODEX_COUNTING_V2_CUTOVER_UNIX_MS
+}
+
+/// Tests may substitute a cutover on their own thread.
+#[cfg(test)]
+fn cutover_unix_ms() -> Option<i64> {
+    TEST_CUTOVER_UNIX_MS
+        .with(std::cell::Cell::get)
+        .or(CODEX_COUNTING_V2_CUTOVER_UNIX_MS)
+}
+
+/// Activates a cutover for scan-level tests on this thread until dropped.
+#[cfg(test)]
+pub(super) struct TestCutover;
+#[cfg(test)]
+impl TestCutover {
+    pub(super) fn set(cutover_unix_ms: i64) -> Self {
+        TEST_CUTOVER_UNIX_MS.with(|cell| cell.set(Some(cutover_unix_ms)));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for TestCutover {
+    fn drop(&mut self) {
+        TEST_CUTOVER_UNIX_MS.with(|cell| cell.set(None));
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CountingVersion {
     Legacy,
@@ -31,18 +67,20 @@ pub(super) enum AckEvidence {
 
 impl AckEvidence {
     /// The session view: the candidate entry plus any twin/alias/member
-    /// entries the caller owns. One V2 mark decides; otherwise any ACK fact
-    /// keeps the session Legacy.
+    /// entries the caller owns (COST rule 2). Any Legacy-acknowledged entry
+    /// (ACK facts without a V2 mark) forces Legacy, whatever else is marked;
+    /// otherwise any V2 mark selects V2; entries without ACK facts are neutral.
     pub(super) fn of_view<'a>(entries: impl IntoIterator<Item = &'a ScanIndexEntry>) -> Self {
-        let mut acknowledged = false;
+        let mut marked = false;
         for entry in entries {
             if entry.codex_counting_v2 {
-                return Self::V2Marked;
+                marked = true;
+            } else if entry_has_ack_evidence(entry) {
+                return Self::LegacyAcked;
             }
-            acknowledged |= entry_has_ack_evidence(entry);
         }
-        if acknowledged {
-            Self::LegacyAcked
+        if marked {
+            Self::V2Marked
         } else {
             Self::None
         }
@@ -110,15 +148,23 @@ pub(super) fn configure_singleton(
 ) {
     // Inactive: no state is allocated and Legacy output is unchanged; the
     // accumulator keeps only its empty 8-byte slot.
-    if CODEX_COUNTING_V2_CUTOVER_UNIX_MS.is_none() {
+    let Some(cutover) = cutover_unix_ms() else {
         return;
-    }
+    };
     let evidence = AckEvidence::of_view(index.files.get(&local_index_key(&candidate.path)));
-    configure(
-        &mut parser.accumulator,
-        evidence,
-        CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
-    );
+    configure(&mut parser.accumulator, evidence, Some(cutover));
+}
+
+/// Joined-group replay parser: configured once, from the group's evidence,
+/// on its fresh accumulator. The accumulator carried across members is never
+/// reconfigured, so no member resets V2 state mid-session.
+pub(super) fn configure_group_once(accumulator: &mut SnapshotAccumulator, evidence: AckEvidence) {
+    let Some(cutover) = cutover_unix_ms() else {
+        return;
+    };
+    if accumulator.codex_counting.is_none() {
+        configure(accumulator, evidence, Some(cutover));
+    }
 }
 
 pub(super) fn configure(

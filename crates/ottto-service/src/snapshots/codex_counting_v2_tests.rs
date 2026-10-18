@@ -398,6 +398,52 @@ fn codex_v2_reopened_closed_turn_never_regains_native_authority() {
     assert_eq!(counters.native_after_turn_closed, 1);
     assert_eq!(counters.native_counted, 0);
     assert_eq!(legacy(&values).money(), five(usage));
+
+    // Far beyond the exact ring: the filter still holds turn-1 closed. The
+    // hit is unconfirmed, its native counts 0, and UI in the span keeps the
+    // unbound rule, so V2 equals Legacy and nothing is counted twice.
+    let at = |second: usize| {
+        format!(
+            "2026-10-18T{:02}:{:02}:{:02}Z",
+            11 + second / 3_600,
+            second / 60 % 60,
+            second % 60
+        )
+    };
+    let step = [100, 0, 0, 10, 1, 110];
+    let mut values = values.to_vec();
+    let mut total = usage;
+    let later_turns = 4 * codex_usage_occurrence::MAX_CLOSED_TURN_IDS;
+    for index in 0..later_turns {
+        let turn = format!("turn-later-{index}");
+        total = sum(total, step);
+        values.extend([
+            started(&at(4 * index), &turn),
+            context(&at(4 * index + 1), &turn),
+            ui(&at(4 * index + 2), step, total),
+            completed(&at(4 * index + 3), &turn),
+        ]);
+    }
+    let late = [7_000, 0, 0, 700, 70, 7_700];
+    let end = 4 * later_turns;
+    values.extend([
+        started(&at(end), "turn-1"),
+        native(&at(end + 1), "turn-1", "resp-2", late, sum(usage, late)),
+        ui(&at(end + 2), step, sum(total, step)),
+        completed(&at(end + 3), "turn-1"),
+    ]);
+    let counted = v2(&values);
+    let counters = counted.counters();
+    assert_eq!(counters.turn_reopened, 1);
+    assert_eq!(
+        counters.closed_filter_hit_unconfirmed, 2,
+        "started + native"
+    );
+    assert_eq!(counters.closed_filter_hit_unconfirmed_native_usage, late);
+    assert_eq!(counters.native_counted, 0);
+    assert_eq!(counters.ui_in_unbound_span, 1);
+    assert_eq!(counted.money(), legacy(&values).money());
+    assert_eq!(counted.money(), five(sum(total, step)));
 }
 
 #[test]
@@ -602,6 +648,10 @@ fn codex_counting_ack_bool_survives_twin_alias_and_rekeyed_entries() {
         AckEvidence::of_view([&unacknowledged_twin]),
         AckEvidence::None
     );
+    // COST rule 2: any Legacy ACK dominates any V2 mark, in either order.
+    for view in [[&marked, &legacy_acked], [&legacy_acked, &marked]] {
+        assert_eq!(AckEvidence::of_view(view), AckEvidence::LegacyAcked);
+    }
     // Re-keyed (migrate) and re-recorded (alias) entries keep the mark with
     // their acknowledged fingerprint.
     let path = PathBuf::from("/synthetic/sessions/rollout.jsonl");
@@ -734,17 +784,17 @@ fn codex_v2_receipts_reach_local_diagnostics_with_open_turn_debt() {
     assert_eq!(receipts.v2_sessions, 1);
     assert_eq!(receipts.native_after_turn_closed, 1);
     assert_eq!(receipts.native_after_turn_closed_usage, usage);
-    assert_eq!(receipts.open_turn_ui_pending_sessions, 1);
-    assert_eq!(receipts.open_turn_ui_pending_events, 1);
-    assert_eq!(receipts.open_turn_ui_pending_usage, staged);
-    assert_eq!(receipts.open_turn_ui_pending_unsummable, 0);
+    assert_eq!(receipts.open_turn_ui_pending_sessions_this_scan, 1);
+    assert_eq!(receipts.open_turn_ui_pending_events_this_scan, 1);
+    assert_eq!(receipts.open_turn_ui_pending_usage_this_scan, staged);
+    assert_eq!(receipts.open_turn_ui_pending_unsummable_this_scan, 0);
     let journal = serde_json::to_value(CodexScanDiagnostics {
         codex_counting_v2: receipts,
         ..Default::default()
     })
     .unwrap();
     assert_eq!(
-        journal["codex_counting_v2"]["open_turn_ui_pending_usage"],
+        journal["codex_counting_v2"]["open_turn_ui_pending_usage_this_scan"],
         json!(staged)
     );
     assert_eq!(

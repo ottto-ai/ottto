@@ -14206,7 +14206,8 @@ impl OwnedSourceScan {
                 };
                 let codex_counting_v2 = parser.accumulator.codex_counting_v2();
                 // Counting receipts reach the scan's local diagnostics only
-                // when this parse finishes.
+                // when this parse finishes: once per finished active file (a
+                // joined group is one).
                 let mut codex_counting_receipts = census.codex_counting_v2;
                 if let Some(counting) = parser.accumulator.codex_counting.as_deref() {
                     counting.fold_receipts(&mut codex_counting_receipts);
@@ -14636,6 +14637,9 @@ impl OwnedSourceScan {
                             }
                             entry.codex_joined_member_set = joined_marker.clone();
                             entry.codex_protected_owner = protected_owner.clone();
+                            // Set only by a V2 decision; a Legacy group clears
+                            // any stale mark with the ACK it rewrites.
+                            entry.codex_counting_v2 = codex_counting_v2;
                         }
                     }
                 }

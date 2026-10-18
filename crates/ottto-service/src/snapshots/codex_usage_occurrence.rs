@@ -25,6 +25,14 @@ const MAX_TURN_ID_BYTES: usize = 128;
 /// Recently closed turn ids kept for closure finality. A native or a
 /// `task_started` for one of them can never reopen native authority.
 pub(super) const MAX_CLOSED_TURN_IDS: usize = 64;
+/// Counting-contract size of the per-session filter of EVERY closed turn id
+/// (COST round 2): 8 KiB, four bit positions per id from SHA-256 (no process
+/// seed), so membership is a pure function of the record prefix. It has no
+/// false negatives; a hit outside the exact ring is unconfirmed (a reopen
+/// beyond 64 closures, or a false positive) and only zeroes natives.
+pub(super) const CLOSED_TURN_FILTER_BYTES: usize = 8 * 1024;
+const CLOSED_TURN_FILTER_HASHES: usize = 4;
+const CLOSED_TURN_FILTER_WORDS: usize = CLOSED_TURN_FILTER_BYTES / 8;
 const MAX_RESPONSE_ID_BYTES: usize = 256;
 
 /// `input, cached_input, cache_write_input, output, reasoning_output, total`.
@@ -148,17 +156,31 @@ impl CodexCounting {
         count(&mut into.turn_closure_mismatch, c.turn_closure_mismatch);
         count(&mut into.turn_reopened, c.turn_reopened);
         count(
+            &mut into.closed_filter_hit_unconfirmed,
+            c.closed_filter_hit_unconfirmed,
+        );
+        usage(
+            &mut into.closed_filter_hit_unconfirmed_native_usage,
+            &c.closed_filter_hit_unconfirmed_native_usage,
+        );
+        count(
             &mut into.pending_overflow_flushes,
             c.pending_overflow_flushes,
         );
         let Some(turn) = reducer.turn.as_ref().filter(|turn| turn.staged_events > 0) else {
             return;
         };
-        count(&mut into.open_turn_ui_pending_sessions, 1);
-        count(&mut into.open_turn_ui_pending_events, turn.staged_events);
+        count(&mut into.open_turn_ui_pending_sessions_this_scan, 1);
+        count(
+            &mut into.open_turn_ui_pending_events_this_scan,
+            turn.staged_events,
+        );
         match self.open_turn_ui_pending() {
-            Some((_, staged)) => usage(&mut into.open_turn_ui_pending_usage, &totals_t6(&staged)),
-            None => count(&mut into.open_turn_ui_pending_unsummable, 1),
+            Some((_, staged)) => usage(
+                &mut into.open_turn_ui_pending_usage_this_scan,
+                &totals_t6(&staged),
+            ),
+            None => count(&mut into.open_turn_ui_pending_unsummable_this_scan, 1),
         }
     }
 
@@ -192,6 +214,8 @@ struct OccurrenceReducer {
     turn: Option<BoundTurn>,
     /// Oldest first, at most `MAX_CLOSED_TURN_IDS`.
     closed_turns: VecDeque<String>,
+    /// Every closed turn id; allocated at the first closure, never cleared.
+    closed_filter: Option<ClosedTurnFilter>,
     counters: OccurrenceCounters,
 }
 
@@ -266,6 +290,8 @@ pub(super) struct OccurrenceCounters {
     pub(super) v2_cumulative_base_uncounted_usage: T6,
     pub(super) turn_closure_mismatch: u64,
     pub(super) turn_reopened: u64,
+    pub(super) closed_filter_hit_unconfirmed: u64,
+    pub(super) closed_filter_hit_unconfirmed_native_usage: T6,
     pub(super) pending_overflow_flushes: u64,
 }
 
@@ -281,6 +307,63 @@ enum Staging {
     Staged,
     Dropped,
     Overflow,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    No,
+    /// In the exact ring of recent closures.
+    Recent,
+    /// Filter hit only: an older closure or a false positive.
+    Unconfirmed,
+}
+
+#[derive(Clone)]
+struct ClosedTurnFilter(Box<[u64; CLOSED_TURN_FILTER_WORDS]>);
+
+impl ClosedTurnFilter {
+    fn new() -> Self {
+        Self(Box::new([0; CLOSED_TURN_FILTER_WORDS]))
+    }
+
+    fn positions(turn_id: &str) -> [usize; CLOSED_TURN_FILTER_HASHES] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex_closed_turn:v1\0");
+        hasher.update(turn_id.as_bytes());
+        let digest = hasher.finalize();
+        let mut positions = [0; CLOSED_TURN_FILTER_HASHES];
+        for (index, position) in positions.iter_mut().enumerate() {
+            // 16 bits address exactly the filter's 8 KiB * 8 bits.
+            *position = usize::from(u16::from_be_bytes([
+                digest[2 * index],
+                digest[2 * index + 1],
+            ]));
+        }
+        positions
+    }
+
+    fn insert(&mut self, turn_id: &str) {
+        for position in Self::positions(turn_id) {
+            self.0[position / 64] |= 1 << (position % 64);
+        }
+    }
+
+    fn contains(&self, turn_id: &str) -> bool {
+        Self::positions(turn_id)
+            .into_iter()
+            .all(|position| self.0[position / 64] & (1 << (position % 64)) != 0)
+    }
+}
+
+/// One fixed allocation, charged in one visit (not one per word).
+impl crate::heap_layout_bound::HeapLayoutBound for ClosedTurnFilter {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(
+            std::mem::size_of::<[u64; CLOSED_TURN_FILTER_WORDS]>()
+                + std::mem::align_of::<[u64; CLOSED_TURN_FILTER_WORDS]>(),
+        )
+    }
 }
 
 fn strict_t6(value: &Value) -> Option<T6> {
@@ -464,6 +547,20 @@ impl OccurrenceReducer {
         self.prev_ui = tuple;
         self.native_since_prev_ui = false;
     }
+
+    fn closed(&self, turn_id: &str) -> Closed {
+        if self.closed_turns.iter().any(|closed| closed == turn_id) {
+            Closed::Recent
+        } else if self
+            .closed_filter
+            .as_ref()
+            .is_some_and(|filter| filter.contains(turn_id))
+        {
+            Closed::Unconfirmed
+        } else {
+            Closed::No
+        }
+    }
 }
 
 impl SnapshotAccumulator {
@@ -507,21 +604,25 @@ impl SnapshotAccumulator {
                 let turn_id = string_at(value, &["payload", "turn_id"])
                     .filter(|id| !id.is_empty() && id.len() <= MAX_TURN_ID_BYTES);
                 if let Some(reducer) = self.codex_occurrence() {
-                    // Closure is final: a recently closed id reopens only as an
-                    // unbound span (Legacy UI, natives 0), never as a new turn.
-                    let reopened = turn_id
-                        .as_ref()
-                        .is_some_and(|id| reducer.closed_turns.contains(id));
-                    if reopened {
-                        reducer.counters.turn_reopened += 1;
+                    // Closure is final: a closed id reopens only as an unbound
+                    // span (Legacy UI, natives 0), never as a new turn.
+                    let closed = turn_id
+                        .as_deref()
+                        .map_or(Closed::No, |id| reducer.closed(id));
+                    match closed {
+                        Closed::Recent => reducer.counters.turn_reopened += 1,
+                        Closed::Unconfirmed => reducer.counters.closed_filter_hit_unconfirmed += 1,
+                        Closed::No => {}
                     }
-                    reducer.turn = turn_id.filter(|_| !reopened).map(|id| BoundTurn {
-                        id,
-                        native: false,
-                        ui_published: false,
-                        staged_events: 0,
-                        pending: OwnedMap::new(),
-                    });
+                    reducer.turn = turn_id
+                        .filter(|_| closed == Closed::No)
+                        .map(|id| BoundTurn {
+                            id,
+                            native: false,
+                            ui_published: false,
+                            staged_events: 0,
+                            pending: OwnedMap::new(),
+                        });
                 }
             }
             Some("task_complete" | "turn_aborted") => {
@@ -554,6 +655,10 @@ impl SnapshotAccumulator {
             pending,
             ..
         } = turn;
+        reducer
+            .closed_filter
+            .get_or_insert_with(ClosedTurnFilter::new)
+            .insert(&id);
         if reducer.closed_turns.len() >= MAX_CLOSED_TURN_IDS {
             reducer.closed_turns.pop_front();
         }
@@ -606,23 +711,26 @@ impl SnapshotAccumulator {
                 }
             }
             None => {
-                if native
+                let closed = native
                     .turn_id
-                    .as_ref()
-                    .is_some_and(|turn| reducer.closed_turns.contains(turn))
-                {
-                    reducer.counters.native_after_turn_closed += 1;
-                    add_t6(
+                    .as_deref()
+                    .map_or(Closed::No, |turn| reducer.closed(turn));
+                let (count, usage) = match closed {
+                    Closed::Recent => (
+                        &mut reducer.counters.native_after_turn_closed,
                         &mut reducer.counters.native_after_turn_closed_usage,
-                        &native.usage,
-                    );
-                } else {
-                    reducer.counters.native_outside_open_turn += 1;
-                    add_t6(
+                    ),
+                    Closed::Unconfirmed => (
+                        &mut reducer.counters.closed_filter_hit_unconfirmed,
+                        &mut reducer.counters.closed_filter_hit_unconfirmed_native_usage,
+                    ),
+                    Closed::No => (
+                        &mut reducer.counters.native_outside_open_turn,
                         &mut reducer.counters.native_outside_open_turn_usage,
-                        &native.usage,
-                    );
-                }
+                    ),
+                };
+                *count += 1;
+                add_t6(usage, &native.usage);
                 money = [0; 6];
             }
         }
@@ -961,7 +1069,7 @@ fn pending_row_content_bytes(
 }
 
 /// Heap charge of the fixed reducer state at its id caps: the boxed reducer,
-/// two response ids, the open turn id and the closed-turn ring.
+/// two response ids, the open turn id, the closed-turn ring and the filter.
 #[cfg(test)]
 pub(super) const fn max_fixed_heap_bytes() -> usize {
     std::mem::size_of::<OccurrenceReducer>()
@@ -969,6 +1077,8 @@ pub(super) const fn max_fixed_heap_bytes() -> usize {
         + 2 * MAX_RESPONSE_ID_BYTES
         + MAX_TURN_ID_BYTES
         + MAX_CLOSED_TURN_IDS * (std::mem::size_of::<String>() + MAX_TURN_ID_BYTES)
+        + CLOSED_TURN_FILTER_BYTES
+        + std::mem::align_of::<u64>()
 }
 
 /// Requested-layout charge of a maximal staged turn: 64 rows at the content
@@ -988,10 +1098,10 @@ pub(super) const fn max_pending_heap_bytes() -> usize {
 }
 
 crate::heap_layout_bound::fields!(CodexCounting; evidence, cutover_unix_ms, version, reducer);
-crate::heap_layout_bound::fields!(OccurrenceReducer; epoch, last_native, prev_ui, native_since_prev_ui, line_ui, turn, closed_turns, counters);
+crate::heap_layout_bound::fields!(OccurrenceReducer; epoch, last_native, prev_ui, native_since_prev_ui, line_ui, turn, closed_turns, closed_filter, counters);
 crate::heap_layout_bound::fields!(Epoch; base, hwm, first_id, contiguous);
 crate::heap_layout_bound::fields!(LastNative; id, usage, after);
 crate::heap_layout_bound::fields!(UiTuple; last, total, last_t6, total_t6);
 crate::heap_layout_bound::fields!(BoundTurn; id, native, ui_published, staged_events, pending);
 crate::heap_layout_bound::fields!(PendingRow; selector_context, selector_sources, usage, events, first_activity_at, last_activity_at);
-crate::heap_layout_bound::fields!(OccurrenceCounters; native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, pending_overflow_flushes);
+crate::heap_layout_bound::fields!(OccurrenceCounters; native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes);
