@@ -23,7 +23,7 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::snapshots::{
     bounded_compaction_timestamps, SnapshotItem, SnapshotModelUsage, SnapshotSource,
-    SnapshotUploadPolicy,
+    SnapshotUploadPolicy, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
 };
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
@@ -408,6 +408,9 @@ fn active_session_from_snapshot(
         subscription_product: attribution
             .as_ref()
             .and_then(|value| value.subscription_product.clone()),
+        account_withheld_reason: account_withheld_reason(snapshot)
+            .filter(|_| attribution.is_none())
+            .map(str::to_string),
         account_attribution_source: attribution.map(|value| value.source),
         latest_model,
         latest_reasoning_effort,
@@ -588,6 +591,11 @@ fn account_attribution(
             "snapshot_account_identity",
         ));
     }
+    // The session's own requests already name several accounts: a parent's or
+    // the current login's single account must never stand in for them.
+    if account_withheld_reason(snapshot) == Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS) {
+        return None;
+    }
     match lineage_account_attribution(snapshot, status) {
         EvidenceResolution::Resolved(lineage) => return Some(lineage),
         EvidenceResolution::Conflict => return None,
@@ -614,6 +622,17 @@ fn account_attribution(
         subscription_product: account.subscription_product.clone(),
         source: "current_login_at_reconciliation".to_string(),
     })
+}
+
+/// The request-evidence pass's withheld reason, while it still describes the
+/// snapshot: every usage row is still unattributed, as that pass left it.
+fn account_withheld_reason(snapshot: &SnapshotItem) -> Option<&'static str> {
+    let reason = snapshot.claude_account_withheld_reason?;
+    matches!(
+        exact_snapshot_account_hash(snapshot),
+        EvidenceResolution::Missing
+    )
+    .then_some(reason)
 }
 
 enum EvidenceResolution<T> {
@@ -1684,6 +1703,70 @@ mod tests {
     }
 
     #[test]
+    fn explains_withheld_accounts_without_widening_attribution() {
+        let mut status = test_status();
+        status.account = Some(test_current_account("current_login_hash"));
+        status.plan_observations.push(test_plan_observation(
+            "parent",
+            "parent_hash",
+            AgentStatusConfidence::High,
+        ));
+
+        // Several accounts on the session's own requests: neither the parent's
+        // nor the current login's single account may stand in for them.
+        let mut mixed = test_snapshot("mixed", "2026-07-19T10:04:00Z");
+        mixed
+            .attribution_facts
+            .push(direct_fact("parent_session_ref", "parent"));
+        mixed.claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &mixed, Some(&status));
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+        assert_eq!(
+            active.account_withheld_reason.as_deref(),
+            Some("multiple_accounts")
+        );
+
+        // Incomplete evidence only explains; the existing fallbacks are
+        // unchanged, and an attributed card never carries a reason.
+        let mut incomplete = test_snapshot("incomplete", "2026-07-19T10:04:00Z");
+        incomplete.claude_account_withheld_reason =
+            Some(crate::snapshots::CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE);
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &incomplete, Some(&status));
+        assert_eq!(
+            active.account_attribution_source.as_deref(),
+            Some("current_login_at_reconciliation")
+        );
+        assert_eq!(active.account_withheld_reason, None);
+        let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &incomplete, None);
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(
+            active.account_withheld_reason.as_deref(),
+            Some("incomplete_request_evidence")
+        );
+
+        // A reason no longer describes rows a later pass attributed.
+        let mut attributed = mixed.clone();
+        for row in &mut attributed.model_usage {
+            row.account_identifier_hash = Some("family_hash".to_string());
+        }
+        for bucket in &mut attributed.usage_buckets {
+            for row in &mut bucket.model_usage {
+                row.account_identifier_hash = Some("family_hash".to_string());
+            }
+        }
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &attributed, Some(&status));
+        assert_eq!(
+            active.account_identifier_hash.as_deref(),
+            Some("family_hash")
+        );
+        assert_eq!(active.account_withheld_reason, None);
+    }
+
+    #[test]
     fn classifies_subagent_for_truthful_title_fallback() {
         let mut snapshot = test_snapshot("subagent", "2026-07-19T10:04:00Z");
         snapshot.session_display_name = None;
@@ -2175,6 +2258,7 @@ mod tests {
             request_evidence: Vec::new(),
             request_identity_refusals: 0,
             claude_org_markers: None,
+            claude_account_withheld_reason: None,
             source_session_id: session_id.to_string(),
             snapshot_fingerprint: format!("fp-{session_id}"),
             status: "active".to_string(),

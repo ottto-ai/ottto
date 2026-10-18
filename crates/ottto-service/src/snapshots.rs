@@ -1548,7 +1548,21 @@ pub struct SnapshotItem {
     /// for contract-5 transcript bases. Never serialized or uploaded.
     #[serde(skip)]
     pub(crate) claude_org_markers: Option<Box<claude_request_identity::OrgMarkers>>,
+    /// Local-only, content-free reason the Claude request-evidence pass left
+    /// this snapshot's account unset (`CLAUDE_ACCOUNT_WITHHELD_*`). Explains the
+    /// local active-session card only; never serialized, uploaded or used as
+    /// account evidence.
+    #[serde(skip)]
+    pub(crate) claude_account_withheld_reason: Option<&'static str>,
 }
+
+/// Request evidence for this session's own billed requests names more than one
+/// account, so no single account may stand for its cumulative usage.
+pub(crate) const CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS: &str = "multiple_accounts";
+/// Request evidence names exactly one account, but it does not cover every
+/// billed request, so the account stays unproven.
+pub(crate) const CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE: &str =
+    "incomplete_request_evidence";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SnapshotUsageBucket {
@@ -6743,6 +6757,28 @@ fn apply_claude_account_evidence(
                 && (evidence_covers_snapshot || request_ids_cover_snapshot))))
         .then(|| evidence_hashes.first().map(|value| (*value).to_string()))
         .flatten();
+    // Explanation only: the account decision above is final and unchanged.
+    item.claude_account_withheld_reason = if target.is_some() {
+        None
+    } else if evidence_hashes.len() > 1 {
+        // The sidecar's root session id also carries auxiliary and child
+        // requests, so a second account counts only when it appears on this
+        // entity's own billed request ids. Reached only for multi-account
+        // evidence; stops at the second owned account.
+        let mut owned_hash = None;
+        checked_evidence
+            .iter()
+            .filter(|row| item.claude_usage_request_ids.contains(&row.request_id))
+            .filter_map(|row| row.account_identifier_hash.as_deref())
+            .any(|hash| *owned_hash.get_or_insert(hash) != hash)
+            .then_some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS)
+    } else {
+        (evidence_hashes.len() == 1
+            && !has_unidentified_request
+            && !has_legacy_unchecked_request
+            && existing_hashes.is_empty())
+        .then_some(CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE)
+    };
     set_claude_account_hash(item, target)
 }
 
@@ -12045,6 +12081,7 @@ impl SnapshotAccumulator {
             request_evidence: Vec::new(),
             request_identity_refusals: 0,
             claude_org_markers: self.claude_org_markers,
+            claude_account_withheld_reason: None,
             session_account_evidence,
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),
@@ -16949,6 +16986,7 @@ fn codex_state_only_snapshot(
         request_evidence: Vec::new(),
         request_identity_refusals: 0,
         claude_org_markers: None,
+        claude_account_withheld_reason: None,
         source_session_id: source_session_id.to_string(),
         snapshot_fingerprint: String::new(),
         status: "final".to_string(),
@@ -38565,6 +38603,7 @@ mod tests {
             request_evidence: Vec::new(),
             request_identity_refusals: 0,
             claude_org_markers: None,
+            claude_account_withheld_reason: None,
             source_session_id: "artifact-session".to_string(),
             snapshot_fingerprint: String::new(),
             status: "final".to_string(),
@@ -41257,6 +41296,7 @@ mod tests {
             .model_usage
             .iter()
             .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str())));
+        assert_eq!(items[0].claude_account_withheld_reason, None);
 
         // Negative control: one missing billed request must remain unknown even
         // though the sidecar's other rows all name one account. If the new
@@ -41274,16 +41314,41 @@ mod tests {
             .model_usage
             .iter()
             .all(|row| row.account_identifier_hash.is_none()));
+        assert_eq!(
+            incomplete_items[0].claude_account_withheld_reason,
+            Some(CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE)
+        );
+        assert!(serde_json::to_value(&incomplete_items[0])
+            .expect("serialize snapshot")
+            .get("claude_account_withheld_reason")
+            .is_none());
 
         let mut conflicting_rows = with_prompt_suggestion["claude-request-id-1"].clone();
         conflicting_rows[2].account_identifier_hash = Some("b".repeat(64));
         let conflicting = BTreeMap::from([("claude-request-id-1".to_string(), conflicting_rows)]);
-        let mut conflicting_items = parsed;
+        let mut conflicting_items = parsed.clone();
         apply_claude_effort_evidence(&mut conflicting_items, &conflicting);
         assert!(conflicting_items[0]
             .model_usage
             .iter()
             .all(|row| row.account_identifier_hash.is_none()));
+        // The second account is only on an auxiliary request outside this
+        // entity's billed request ids: withheld, but not "multiple accounts".
+        assert_eq!(conflicting_items[0].claude_account_withheld_reason, None);
+
+        let mut owned_mix_rows = with_prompt_suggestion["claude-request-id-1"].clone();
+        owned_mix_rows[1].account_identifier_hash = Some("b".repeat(64));
+        let owned_mix = BTreeMap::from([("claude-request-id-1".to_string(), owned_mix_rows)]);
+        let mut owned_mix_items = parsed;
+        apply_claude_effort_evidence(&mut owned_mix_items, &owned_mix);
+        assert!(owned_mix_items[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+        assert_eq!(
+            owned_mix_items[0].claude_account_withheld_reason,
+            Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS)
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -58220,6 +58285,7 @@ mod tests {
             request_evidence: Vec::new(),
             request_identity_refusals: 0,
             claude_org_markers: None,
+            claude_account_withheld_reason: None,
             source_session_id: "claude-vertex-session-1".to_string(),
             snapshot_fingerprint: "a".repeat(32),
             status: "final".to_string(),
@@ -59658,6 +59724,7 @@ mod tests {
                 request_evidence: Vec::new(),
                 request_identity_refusals: 0,
                 claude_org_markers: None,
+                claude_account_withheld_reason: None,
                 source_session_id: "claude-vertex-session-1".to_string(),
                 snapshot_fingerprint: "a".repeat(32),
                 status: "final".to_string(),
@@ -61807,7 +61874,7 @@ crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, activity_summary, tool_usage, tool_usage_truncated, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers);
+crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, activity_summary, tool_usage, tool_usage_truncated, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
 crate::heap_layout_bound::fields!(SnapshotModelUsage; model, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, reasoning_effort, unattributed_total_tokens, request_count, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
