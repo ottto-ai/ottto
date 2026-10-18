@@ -31,9 +31,13 @@ pub(crate) mod claude_request_identity;
 pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
+#[cfg(test)]
+mod codex_counting_v2_tests;
+mod codex_counting_version;
 mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
+mod codex_usage_occurrence;
 mod context_curve;
 #[cfg(test)]
 mod launch_demand_tests;
@@ -2243,6 +2247,12 @@ pub struct ScanIndexEntry {
     pub codex_captured_tier_receipt_required: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub codex_captured_uncommitted: bool,
+    /// Local-only Codex counting version of this entry's published body: set
+    /// by a V2 writer together with `last_snapshot_fingerprint`, so selected
+    /// saves, held-key restores and committable subsets move both as one entry.
+    /// Older binaries drop it; an acknowledged entry without it stays Legacy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_counting_v2: bool,
 }
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
@@ -9534,6 +9544,9 @@ struct SnapshotAccumulator {
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
     codex_tier_replay: Option<codex_file_join::TierReplay>,
+    // Usage-counting V2 state. `None` (unconfigured) and a Legacy decision
+    // keep today's counting byte for byte.
+    codex_counting: Option<Box<codex_usage_occurrence::CodexCounting>>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
     codex_session_meta_seen: bool,
@@ -9747,6 +9760,7 @@ impl SnapshotAccumulator {
             codex_turn_traces: None,
             codex_observed_priority_turns: None,
             codex_tier_replay: None,
+            codex_counting: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             codex_session_meta_seen: false,
@@ -11334,6 +11348,18 @@ impl SnapshotAccumulator {
         // Per-turn reasoning effort tier (Codex), attached to the same usage row.
         effort: Option<String>,
     ) -> Option<UsageTotals> {
+        if self.codex_counting_v2() {
+            return self.set_codex_v2_cumulative_usage(
+                model,
+                usage,
+                last_usage,
+                usage_event_identity,
+                selector,
+                timestamp,
+                implicit_request_count,
+                effort,
+            );
+        }
         let resolved_model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -14178,6 +14204,7 @@ impl OwnedSourceScan {
                         .as_deref()
                         .map(resolve_codex_identity)
                 };
+                let codex_counting_v2 = parser.accumulator.codex_counting_v2();
                 let mut parsed_file = match parser.finish(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -14550,6 +14577,11 @@ impl OwnedSourceScan {
                         ScanParseOutcome::ConfirmedEmpty
                     };
                     index.record(candidate, last_snapshot_fingerprint, outcome);
+                    // The counting version travels in the same entry as the
+                    // fingerprint it describes; no separate save can split them.
+                    if let Some(entry) = index.files.get_mut(&index_key) {
+                        entry.codex_counting_v2 = codex_counting_v2;
+                    }
                     // Native settlement accepts disclosed terminal row loss, even
                     // though that acquisition cannot certify a verified prefix.
                     // Its sampled publication still owes the prepared deadline;
@@ -18449,6 +18481,9 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.last_turn_context_tokens = Some(context_tokens);
         }
     }
+    // Usage-counting V2 (configured parsers only): version decision on the
+    // first owned record, turn lifecycle and native `token_usage_record`s.
+    accumulator.observe_codex_counting_line(value, timestamp.as_deref(), &selector);
     if let Some(usage) = codex_total_usage(value) {
         // Codex cumulative totals carry request_count as a session-wide count.
         // When the field is missing the parser defaults it to 1 so deltas
@@ -26172,6 +26207,10 @@ impl ScanIndex {
             .files
             .get(&key)
             .map_or(0, |entry| entry.effective_upload_body_witness_revision);
+        let codex_counting_v2 = self
+            .files
+            .get(&key)
+            .is_some_and(|entry| entry.codex_counting_v2);
         self.files.insert(
             key,
             ScanIndexEntry {
@@ -26191,6 +26230,7 @@ impl ScanIndex {
                 codex_captured_tier_receipt: None,
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
+                codex_counting_v2,
             },
         );
     }
@@ -26216,6 +26256,12 @@ impl ScanIndex {
             .and_then(ScanIndexEntry::unverified_deadline)
             .map(sampled_audit::marker)
             .unwrap_or_else(|| LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        // Carried like the body witness; a configured singleton parse then
+        // sets it to that parse's decided version.
+        let codex_counting_v2 = self
+            .files
+            .get(&key)
+            .is_some_and(|entry| entry.codex_counting_v2);
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
@@ -26235,6 +26281,7 @@ impl ScanIndex {
                 codex_captured_tier_receipt: None,
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
+                codex_counting_v2,
             },
         );
         match parse_outcome {
@@ -29005,6 +29052,7 @@ mod tests {
                     codex_captured_tier_receipt: None,
                     codex_captured_tier_receipt_required: false,
                     codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -30301,6 +30349,7 @@ mod tests {
                     codex_captured_tier_receipt: None,
                     codex_captured_tier_receipt_required: false,
                     codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
                 },
             )]),
             file_snapshot_fingerprints: BTreeMap::from([(
@@ -30745,6 +30794,7 @@ mod tests {
                     codex_captured_tier_receipt: None,
                     codex_captured_tier_receipt_required: false,
                     codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -30838,6 +30888,7 @@ mod tests {
                     codex_captured_tier_receipt: None,
                     codex_captured_tier_receipt_required: false,
                     codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -30898,6 +30949,7 @@ mod tests {
                     codex_captured_tier_receipt: None,
                     codex_captured_tier_receipt_required: false,
                     codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -30945,6 +30997,7 @@ mod tests {
                     codex_captured_tier_receipt: None,
                     codex_captured_tier_receipt_required: false,
                     codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -30989,6 +31042,7 @@ mod tests {
                     codex_captured_tier_receipt: None,
                     codex_captured_tier_receipt_required: false,
                     codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -36574,6 +36628,7 @@ mod tests {
             codex_captured_tier_receipt: None,
             codex_captured_tier_receipt_required: false,
             codex_captured_uncommitted: false,
+            codex_counting_v2: false,
         };
 
         let mut index = ScanIndex {
@@ -55887,6 +55942,7 @@ mod tests {
                 codex_captured_tier_receipt: None,
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
+                codex_counting_v2: false,
             },
         );
         let frozen_census_paths = BTreeSet::from([local_index_key(&parent_path)]);
@@ -56923,6 +56979,7 @@ mod tests {
                 codex_captured_tier_receipt: None,
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
+                codex_counting_v2: false,
             },
         );
         let a = binding(&home_a, "account-a");
@@ -58444,6 +58501,7 @@ mod tests {
             codex_captured_tier_receipt: None,
             codex_captured_tier_receipt_required: false,
             codex_captured_uncommitted: false,
+            codex_counting_v2: false,
         }
     }
 
@@ -59088,6 +59146,7 @@ mod tests {
                 codex_captured_tier_receipt: None,
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
+                codex_counting_v2: false,
             },
         );
         let manifest = index
@@ -60082,7 +60141,7 @@ crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paire
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons);
 crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted);
+crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
@@ -60093,7 +60152,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
