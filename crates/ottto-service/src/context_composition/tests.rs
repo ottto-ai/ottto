@@ -303,8 +303,10 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
     let mut bytes = record(&damaged);
     bytes.extend_from_slice(b"\n\xff\n");
     fs::write(&bad_file, bytes).unwrap();
-    // Discovery resolves the valid first cwd; the newest report then fails.
-    set_mtime(&bad_file, SystemTime::now() + Duration::from_secs(1));
+    // Both are settled. Discovery resolves the valid first cwd; the newest
+    // report then fails.
+    set_mtime(&good_file, SystemTime::now() - 2 * SETTLE_WINDOW);
+    set_mtime(&bad_file, SystemTime::now() - SETTLE_WINDOW);
     let source = SnapshotSource::ClaudeCode;
     let source_label = agent_source_label(source);
     let bad_cache_file = cache_path(
@@ -1358,6 +1360,55 @@ fn discovery_spans_registered_roots_and_counts_each_transcript_once() {
     // The default folder alone is the pre-registration view.
     let default_only = discover_workspaces(&[default_root], SystemTime::now(), deadline).unwrap();
     assert_eq!(default_only[0].files.len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_transcript_does_not_fence_the_settled_files_of_its_workspace() {
+    let root = crate::test_scratch::private_dir("composition-settle-window");
+    let workspace = root.join("workspace");
+    let transcripts = root.join("transcripts");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&transcripts).unwrap();
+    let record = json!({"type":"attachment","cwd":workspace,
+        "timestamp":iso_utc(OffsetDateTime::now_utc()),"attachment":{"content":"evidence"}})
+    .to_string();
+    let settled = transcripts.join("settled.jsonl");
+    let live = transcripts.join("live.jsonl");
+    fs::write(&settled, &record).unwrap();
+    fs::write(&live, &record).unwrap();
+    set_mtime(&settled, SystemTime::now() - 2 * SETTLE_WINDOW);
+
+    let now = SystemTime::now();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut scans = discover_workspaces(std::slice::from_ref(&transcripts), now, deadline).unwrap();
+    let mut scan = scans.remove(0);
+    assert_eq!(scan.files.len(), 2);
+    // The live session appends between discovery and the signature check.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&live)
+        .unwrap()
+        .write_all(format!("\n{record}").as_bytes())
+        .unwrap();
+    set_mtime(&live, now + Duration::from_secs(1));
+    assert!(workspace_files_signature(&scan.files, deadline).is_err());
+
+    retain_settled_files(&mut scan.files, now);
+    assert_eq!(
+        scan.files.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        [&settled]
+    );
+    let signature = workspace_files_signature(&scan.files, deadline).unwrap();
+    let report = build_report_for_scan(
+        &scan,
+        &signature,
+        SnapshotSource::ClaudeCode,
+        wide_window(),
+        deadline,
+    )
+    .unwrap();
+    assert!(build_request(&report, &workspace, "machine", "claude-code", false).is_some());
     fs::remove_dir_all(root).unwrap();
 }
 

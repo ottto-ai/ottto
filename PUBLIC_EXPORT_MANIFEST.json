@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 682,
-  "content_sha256": "3047e32fd8257e0532702e2e765b82b998f6615c5f7cb2102c098049da350ea6",
+  "candidate_file_count": 683,
+  "content_sha256": "97514b4c6e2dbd1db4f7c05d4a4b8b98066bd1579658e46b70b011e4e1537dff",
   "files": [
     {
       "executable": false,
@@ -888,15 +888,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition.rs",
-      "sha256": "7baf4136c0c7e7fc36feaf09cf6584c6e1ec47ab424568d7df14224bb49f2710",
-      "size_bytes": 77243
+      "sha256": "834c84c77cbfa0e60234ac41f454c15931bf676fff1ffaf077e881ff766eae94",
+      "size_bytes": 77936
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/tests.rs",
-      "sha256": "878053a729c1367efbe72c97d859139a56a4b73e42c5ea0609ba76a3bc989c59",
-      "size_bytes": 68272
+      "sha256": "cb8586839aacdf9c7a6332dcbd9734ba87a317acf2ad5470fe962f0882d095b3",
+      "size_bytes": 70282
     },
     {
       "executable": false,
@@ -3029,6 +3029,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-18-composition-settle-window.md",
+      "sha256": "041c2b4bf18c9de25ceafd40c2c162ec090cce8e717f4c9b972bb9f3815f172c",
+      "size_bytes": 1352
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-18-page-scoped-witness-reconstruction.md",
       "sha256": "e7fc1d9eea0a208f34f52f1afb9ed154a71cc66d930b8e6ba5e6c9e075a081f7",
       "size_bytes": 2396
@@ -4779,7 +4786,7 @@
   ],
   "generated_at": "2026-10-18T12:32:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 683,
+  "output_file_count": 684,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
