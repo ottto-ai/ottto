@@ -907,6 +907,25 @@ struct UploadCacheEntry {
     identity: String,
     request_sha256: String,
     posted_at: String,
+    /// Rollout whose prelude was uploaded; until a newer start or the weekly
+    /// refresh, its scope needs no slot in a cycle.
+    #[serde(default)]
+    rollout: Option<String>,
+}
+
+/// Reads the upload cache entry still fresh for this destination.
+fn fresh_upload(
+    support_dir: &Path,
+    identity: &str,
+    workspace_hash: &str,
+) -> Option<UploadCacheEntry> {
+    let entry = fs::read(upload_cache_path(support_dir, workspace_hash))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<UploadCacheEntry>(&bytes).ok())?;
+    let fresh = OffsetDateTime::parse(&entry.posted_at, &Rfc3339)
+        .map(|posted| (OffsetDateTime::now_utc() - posted).whole_seconds() < MAX_STALENESS_SECS)
+        .unwrap_or(false);
+    (entry.identity == identity && fresh).then_some(entry)
 }
 
 fn upload_cache_path(support_dir: &Path, workspace_hash: &str) -> PathBuf {
@@ -953,7 +972,7 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
     let roots = registered_scan_roots(SnapshotSource::Codex, home)?;
     let salt = load_or_create_salt(support_dir);
     let deadline = Instant::now() + CYCLE_BUDGET;
-    let candidates = select_candidates(&roots, support_dir, deadline);
+    let candidates = select_candidates(&roots, support_dir, &identity, deadline);
     let (mut uploaded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for (file, workspace, codex_home) in candidates {
         if Instant::now() >= deadline {
@@ -977,7 +996,14 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
             skipped += 1;
             continue;
         };
-        match upload_if_changed(&client, &relay_token, support_dir, &identity, &request) {
+        match upload_if_changed(
+            &client,
+            &relay_token,
+            support_dir,
+            &identity,
+            &request,
+            &file,
+        ) {
             Ok(true) => uploaded += 1,
             Ok(false) => skipped += 1,
             Err(error) => {
@@ -1004,6 +1030,7 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
 fn select_candidates(
     roots: &[PathBuf],
     support_dir: &Path,
+    identity: &str,
     deadline: Instant,
 ) -> Vec<(PathBuf, PathBuf, PathBuf)> {
     let mut files = Vec::new();
@@ -1094,7 +1121,14 @@ fn select_candidates(
         let Some(codex_home) = homes.get(path.as_str()) else {
             continue;
         };
-        if seen_scopes.insert(scope) {
+        if !seen_scopes.insert(scope) {
+            continue;
+        }
+        // Already uploaded and not yet due: leave the slot to other scopes,
+        // so more than the per-cycle limit of repositories all get measured.
+        let uploaded = fresh_upload(support_dir, identity, &sha256_hex(&[cwd.as_str()]))
+            .is_some_and(|entry| entry.rollout.as_deref() == Some(path.as_str()));
+        if !uploaded {
             chosen.push((PathBuf::from(path), workspace, codex_home.clone()));
         }
     }
@@ -1115,18 +1149,24 @@ fn upload_if_changed(
     support_dir: &Path,
     identity: &str,
     request: &ContextFootprintIngestRequest,
+    rollout: &Path,
 ) -> Result<bool> {
     let hash = request_content_hash_for_request(request)?;
     let path = upload_cache_path(support_dir, &request.workspace_hash);
     let now = OffsetDateTime::now_utc();
-    let cached = fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<UploadCacheEntry>(&bytes).ok());
-    if let Some(entry) = cached {
-        let fresh = OffsetDateTime::parse(&entry.posted_at, &Rfc3339)
-            .map(|posted| (now - posted).whole_seconds() < MAX_STALENESS_SECS)
-            .unwrap_or(false);
-        if entry.identity == identity && entry.request_sha256 == hash && fresh {
+    let rollout = rollout.to_string_lossy().into_owned();
+    if let Some(entry) = fresh_upload(support_dir, identity, &request.workspace_hash) {
+        if entry.request_sha256 == hash {
+            if entry.rollout.as_deref() != Some(rollout.as_str()) {
+                // Same payload from a newer start: remember it, no upload.
+                write_json_atomic(
+                    &path,
+                    &UploadCacheEntry {
+                        rollout: Some(rollout),
+                        ..entry
+                    },
+                );
+            }
             return Ok(false);
         }
     }
@@ -1139,6 +1179,7 @@ fn upload_if_changed(
             identity: identity.to_string(),
             request_sha256: hash,
             posted_at: now.format(&Rfc3339).unwrap_or_default(),
+            rollout: Some(rollout),
         },
     );
     Ok(true)

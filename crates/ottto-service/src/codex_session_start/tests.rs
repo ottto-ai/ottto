@@ -506,7 +506,7 @@ fn newest_session_start_wins_over_recent_activity() {
         ],
     );
     let deadline = Instant::now() + Duration::from_secs(60);
-    let chosen = select_candidates(&roots, &support, deadline);
+    let chosen = select_candidates(&roots, &support, "dest", deadline);
     assert_eq!(chosen.len(), 1);
     assert!(chosen[0].0.ends_with("rollout-newer.jsonl"));
     // Read against the home that wrote it (its user file, skills, config).
@@ -514,7 +514,26 @@ fn newest_session_start_wins_over_recent_activity() {
     // The index makes the next cycle read nothing new and choose the same.
     let index = read_index(&support);
     assert_eq!(index.files.len(), 3);
-    assert_eq!(select_candidates(&roots, &support, deadline), chosen);
+    assert_eq!(
+        select_candidates(&roots, &support, "dest", deadline),
+        chosen
+    );
+    // Once that start is uploaded (and not yet due), the scope frees its
+    // per-cycle slot for other repositories; another destination still needs it.
+    write_json_atomic(
+        &upload_cache_path(&support, &sha256_hex(&[cwd.as_str()])),
+        &UploadCacheEntry {
+            identity: "dest".to_string(),
+            request_sha256: "h".to_string(),
+            posted_at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
+            rollout: Some(chosen[0].0.to_string_lossy().into_owned()),
+        },
+    );
+    assert!(select_candidates(&roots, &support, "dest", deadline).is_empty());
+    assert_eq!(
+        select_candidates(&roots, &support, "other", deadline),
+        chosen
+    );
 }
 
 #[test]
