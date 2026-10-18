@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 690,
-  "content_sha256": "f70e6c0c2fc46cd6e690666000745fce929d16530054782162dd1c079386d9de",
+  "candidate_file_count": 693,
+  "content_sha256": "0b75f176b7cbb95b1fbbd0e372723bbb9706b429688259f259d8119bac4a3884",
   "files": [
     {
       "executable": false,
@@ -901,9 +901,16 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/context_file_counts.rs",
+      "sha256": "070a9b389ef072d49312204978d72a0cb458b1a98c86c9278affab84faaee688",
+      "size_bytes": 8125
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "8d1fcddb045866497625fa7a8e0fe9282d64f4350f003dc395103407063cac79",
-      "size_bytes": 87612
+      "sha256": "3de5e0c82cd479fde6b8837fa0c498346447fe040eaf1e9c3ddbb10350e371d1",
+      "size_bytes": 93000
     },
     {
       "executable": false,
@@ -993,8 +1000,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "cfc466ef24c73b24593679e1e0d47ec070e63a5bf7d82f77ceb714cf1031096a",
-      "size_bytes": 349311
+      "sha256": "d17a0cd5db17694a6d47e4a2deb4fa8d8671f6579ce20a363ab0649e0f857023",
+      "size_bytes": 349336
     },
     {
       "executable": false,
@@ -3050,6 +3057,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-18-context-footprint-file-counts.md",
+      "sha256": "690425f613faf1c6febd14b454ec45cf6f73b7abf67338eb04aef313f9be79c8",
+      "size_bytes": 1564
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-18-page-scoped-witness-reconstruction.md",
       "sha256": "e7fc1d9eea0a208f34f52f1afb9ed154a71cc66d930b8e6ba5e6c9e075a081f7",
       "size_bytes": 2396
@@ -3669,6 +3683,13 @@
       "path": "fixtures/collector-status/census-residue-scan-status-v1.json",
       "sha256": "5aab5897fad814215baac096c80acb6bc29d838eb6fc8c7007ba8d7e8a2cdbaa",
       "size_bytes": 2381
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/context-footprint/file-counts-v1.json",
+      "sha256": "148fd3730fd604ddcd1f93e43737696a92b126173d4476358d3f197c078226af",
+      "size_bytes": 677
     },
     {
       "executable": false,
@@ -4833,9 +4854,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T17:46:45+00:00",
+  "generated_at": "2026-10-18T18:24:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 691,
+  "output_file_count": 694,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4872,5 +4893,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "6d8ae69dce5cb754852971a83076fc4ed35fd7da"
+  "source_commit": "09f0e8a6b98e1bbd24faa0ed878056a6aab42ce7"
 }
