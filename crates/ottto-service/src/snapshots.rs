@@ -10065,12 +10065,14 @@ impl SnapshotAccumulator {
             // Without a trusted parent, a created thread is admitted only from its
             // own file proof: a state-declared row bound to this file, no lineage
             // in the header, and the UUID identity of the path, the first physical
-            // record and the header all agreeing. The stream conjuncts follow in
-            // `validate_parentless_created_thread_record`.
+            // record and the header all agreeing. A `history_base` can name another
+            // session's file, so it is lineage evidence too. The stream conjuncts
+            // follow in `validate_parentless_created_thread_record`.
             let parentless = trusted_parent.is_none()
                 && self.codex_sidecar_parent.is_none()
                 && state_declares_created_thread
                 && forked_from_id.is_none()
+                && !has_history_base
                 && codex_header_declares_no_parent(meta)
                 && source_session_id
                     .as_deref()
@@ -10263,13 +10265,21 @@ impl SnapshotAccumulator {
             Some(1) => {
                 let turn_id = string_at(value, &["payload", "turn_id"]);
                 let trace_id = string_at(value, &["payload", "trace_id"]);
+                // Codex omits `trace_id` on most parentless created threads. Their
+                // anti-copy proof is the start bound, the UUID turn binding and the
+                // first-request equality, so only that path accepts an absent id;
+                // a present one must always be well formed.
+                let trace_id_valid = match trace_id.as_deref() {
+                    Some(value) => {
+                        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }
+                    None => self.codex_parentless_created_thread(),
+                };
                 let valid = codex_is_task_started(value)
                     && turn_id
                         .as_deref()
                         .is_some_and(codex_identity_is_uuid_shaped)
-                    && trace_id.as_deref().is_some_and(|value| {
-                        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    })
+                    && trace_id_valid
                     && self.codex_task_started_after_creation(value, timestamp_nanos);
                 if valid {
                     self.codex_native_created_thread_task_turn_id = turn_id;
@@ -10386,10 +10396,13 @@ impl SnapshotAccumulator {
 
     /// Finalization conjuncts for a parentless created thread: the thread-history
     /// projection proved this file is the whole thread, every physical record was
-    /// read under one header, and a first request was actually checked.
+    /// read under one header, a first request was actually checked, and no record
+    /// supplied lineage the sidecar never trusted.
     fn codex_parentless_proof_complete(&self) -> bool {
         self.codex_sidecar_projected_next_ordinal.is_some()
             && !self.codex_creator_evidence_conflicted
+            && self.origin.parent_session_ref.is_none()
+            && self.origin.source_subagent != Some(true)
             && codex_usage_token_fields(&self.accepted_usage_totals) != [0; 5]
     }
 
@@ -17635,13 +17648,14 @@ fn codex_native_created_thread_header(
     .then_some(record_nanos)
 }
 
-/// A parentless created thread's header must not name a parent or a
-/// structured spawn source; such lineage would be untrusted and contradictory.
+/// A parentless created thread's header must not name a parent and must carry
+/// a plain string source. A structured source is spawn lineage, and an absent
+/// one would let a later record supply that lineage instead.
 fn codex_header_declares_no_parent(meta: &Value) -> bool {
     meta.get("parent_thread_id")
         .unwrap_or(&Value::Null)
         .is_null()
-        && !meta.get("source").is_some_and(Value::is_object)
+        && meta.get("source").is_some_and(Value::is_string)
 }
 
 fn codex_is_task_started(value: &Value) -> bool {
@@ -20355,7 +20369,11 @@ impl CodexTitleMetadata {
                         .contains(source_session_id.as_str())
                     {
                         "conflict"
-                    } else if self.spawn_parents.contains_key(source_session_id.as_str()) {
+                    } else if self.spawn_parents.contains_key(source_session_id.as_str())
+                        && self
+                            .state_created_threads
+                            .contains(source_session_id.as_str())
+                    {
                         // An edge whose ancestor chain cannot be resolved is still
                         // lineage evidence and must reselect a parentless file.
                         "unresolved"
@@ -53713,7 +53731,7 @@ mod tests {
         turn: u64,
         at_ms: i64,
     ) -> Value {
-        json!({"timestamp":clock.at(at_ms),"type":"event_msg","payload":{"type":"task_started","turn_id":parentless_turn(child_id, turn),"trace_id":"0123456789abcdef0123456789abcdef","started_at":clock.second(at_ms / 1_000)}})
+        json!({"timestamp":clock.at(at_ms),"type":"event_msg","payload":{"type":"task_started","turn_id":parentless_turn(child_id, turn),"started_at":clock.second(at_ms / 1_000)}})
     }
 
     fn parentless_turn_context(
@@ -53731,12 +53749,13 @@ mod tests {
         }
     }
 
-    /// Mirrors report §A: a long-lived Desktop created thread with no recorded
-    /// parent, a paginated external history cursor, a compaction and a counter
-    /// reset. Usage is Σ last = (200, 160, 11, 3) over three requests.
+    /// Mirrors report §A in the dominant real shape: a long-lived Desktop created
+    /// thread with no recorded parent, no `history_base`, no `trace_id`, a
+    /// compaction and a counter reset. Usage is Σ last = (200, 160, 11, 3) over
+    /// three requests.
     fn parentless_created_thread_values(clock: &ParentlessClock, child_id: &str) -> Vec<Value> {
         let mut values = vec![
-            json!({"timestamp":clock.at(500),"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":clock.at(0),"history_mode":"paginated","history_base":{"cursor":"external"},"thread_source":"agent_created_thread","source":"vscode","originator":"Codex Desktop","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}}),
+            json!({"timestamp":clock.at(500),"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":clock.at(0),"history_mode":"paginated","thread_source":"agent_created_thread","source":"vscode","originator":"Codex Desktop","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}}),
             parentless_task_started(clock, child_id, 1, 501),
             parentless_turn_context(clock, child_id, 1, 1_000),
             codex_test_token_line(
@@ -53778,31 +53797,7 @@ mod tests {
         let root = temp_dir(name);
         let path = root.join(format!("rollout-{child_id}.jsonl"));
         fs::write(&path, body).expect("write parentless created-thread fixture");
-        let next_ordinal = body
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter_map(|value| u64_at(&value, &["ordinal"]))
-            .max()
-            .map_or(0, |ordinal| ordinal + 1);
-        let key = resolve_codex_identity(child_id);
-        let mut metadata = CodexTitleMetadata::default();
-        metadata.state_created_threads.insert(key.clone());
-        metadata.state_threads.insert(
-            key.clone(),
-            CodexStateThread {
-                tokens_used: 1,
-                created_at: Some(clock.at(0)),
-                rollout_path: Some(path.to_string_lossy().into_owned()),
-                ..CodexStateThread::default()
-            },
-        );
-        metadata.rollout_extents.insert(
-            key,
-            CodexRolloutExtent {
-                next_byte_offset: fs::metadata(&path).expect("stat fixture").len(),
-                next_ordinal,
-            },
-        );
+        let mut metadata = parentless_metadata(&path, child_id, clock, body);
         configure(&mut metadata, &path);
         let mut file = File::open(&path).expect("open parentless fixture");
         let identity =
@@ -53826,6 +53821,42 @@ mod tests {
         .expect("parse parentless created-thread fixture");
         let _ = fs::remove_dir_all(root);
         parsed
+    }
+
+    /// Trusted state row declaring the thread created, bound to `path`, with the
+    /// complete thread-history extent of `body` and no lineage at all.
+    fn parentless_metadata(
+        path: &Path,
+        child_id: &str,
+        clock: &ParentlessClock,
+        body: &str,
+    ) -> CodexTitleMetadata {
+        let next_ordinal = body
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| u64_at(&value, &["ordinal"]))
+            .max()
+            .map_or(0, |ordinal| ordinal + 1);
+        let key = resolve_codex_identity(child_id);
+        let mut metadata = CodexTitleMetadata::default();
+        metadata.state_created_threads.insert(key.clone());
+        metadata.state_threads.insert(
+            key.clone(),
+            CodexStateThread {
+                tokens_used: 1,
+                created_at: Some(clock.at(0)),
+                rollout_path: Some(path.to_string_lossy().into_owned()),
+                ..CodexStateThread::default()
+            },
+        );
+        metadata.rollout_extents.insert(
+            key,
+            CodexRolloutExtent {
+                next_byte_offset: fs::metadata(path).expect("stat fixture").len(),
+                next_ordinal,
+            },
+        );
+        metadata
     }
 
     fn assert_parentless_admitted(parsed: &ParsedJsonlFile, tokens: (u64, u64, u64, u64, u64)) {
@@ -53882,6 +53913,33 @@ mod tests {
             "native own creator"
         );
 
+        // Created threads are forks to the sampled tail cache, so an admitted
+        // parentless file is never tail-retained: each change is a full re-parse.
+        // A tail resume would otherwise reuse the bound thread-history extent.
+        let root = temp_dir("codex-parentless-not-retained");
+        let path = root.join(format!("rollout-{PARENTLESS_CHILD}.jsonl"));
+        let body = jsonl_body(&values);
+        fs::write(&path, &body).expect("write retention fixture");
+        let metadata = parentless_metadata(&path, PARENTLESS_CHILD, &clock, &body);
+        let mut parser = OwnedJsonlParser::new(
+            File::open(&path).expect("open retention fixture"),
+            &path,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            Some(&metadata),
+            None,
+            Some(Arc::new(Mutex::new(BTreeMap::new()))),
+            true,
+            true,
+        )
+        .expect("retention parser");
+        while !parser.step().expect("step retention parser") {}
+        assert!(parser.accumulator.codex_usage_accounting_complete());
+        assert!(parser.accumulator.codex_is_fork);
+        assert!(!sampled_scan::compatible_reduction(&parser.accumulator));
+        drop(parser);
+        let _ = fs::remove_dir_all(root);
+
         // First-request equality ignores the parser-defaulted request count.
         let mut request_count_only = values.clone();
         request_count_only[3]["payload"]["info"]["total_token_usage"]["request_count"] = json!(5);
@@ -53892,9 +53950,14 @@ mod tests {
             codex_test_token_line(&clock.at(1_500), None, (0, 0, 0, 0), Some((0, 0, 0, 0))),
         );
         renumber(&mut zero_first);
+        // An absent `trace_id` is the dominant real shape; a present one must be
+        // well formed and is admitted the same way.
+        let mut trace_id_present = values.clone();
+        trace_id_present[1]["payload"]["trace_id"] = json!("0123456789abcdef0123456789abcdef");
         for (case, values) in [
             ("request-count", request_count_only),
             ("zero-first", zero_first),
+            ("trace-id-present", trace_id_present),
         ] {
             let parsed = parse_parentless_created_thread(
                 format!("codex-parentless-admit-{case}").as_str(),
@@ -53906,7 +53969,8 @@ mod tests {
             assert_parentless_admitted(&parsed, (200, 160, 11, 3, 3));
         }
 
-        // Tail growth keeps the proof; a re-emitted header does not.
+        // A grown file, re-parsed in full, keeps the proof; a re-emitted header
+        // does not.
         let mut grown = values.clone();
         grown.push(parentless_task_started(&clock, PARENTLESS_CHILD, 3, 7_000));
         grown.push(parentless_turn_context(&clock, PARENTLESS_CHILD, 3, 7_100));
@@ -53918,7 +53982,7 @@ mod tests {
         ));
         renumber(&mut grown);
         let parsed = parse_parentless_created_thread(
-            "codex-parentless-tail-growth",
+            "codex-parentless-grown-file-reparse",
             PARENTLESS_CHILD,
             &clock,
             &jsonl_body(&grown),
@@ -53930,7 +53994,7 @@ mod tests {
         reheader.push(header);
         renumber(&mut reheader);
         let parsed = parse_parentless_created_thread(
-            "codex-parentless-tail-reheader",
+            "codex-parentless-grown-file-reheader",
             PARENTLESS_CHILD,
             &clock,
             &jsonl_body(&reheader),
@@ -53951,7 +54015,7 @@ mod tests {
         };
         type Configure = fn(&mut CodexTitleMetadata, &Path);
         let none: Configure = |_, _| {};
-        let cases: [(&str, String, Configure); 34] = [
+        let cases: [(&str, String, Configure); 39] = [
             (
                 "copied-counters",
                 edit(&|values| {
@@ -54074,6 +54138,15 @@ mod tests {
                 none,
             ),
             (
+                // H4 alone: the header keeps ordinal 0 but is not the first
+                // physical record, so it cannot own the creator identity.
+                "header-behind-unordered-record",
+                edit(&|values| {
+                    values.insert(0, json!({"timestamp":clock.at(400),"type":"event_msg","payload":{"type":"agent_message"}}));
+                }),
+                none,
+            ),
+            (
                 "header-ordinal-missing",
                 edit(&|values| {
                     values[0].as_object_mut().expect("header").remove("ordinal");
@@ -54107,6 +54180,42 @@ mod tests {
                 edit(&|values| {
                     values[0]["payload"]["parent_thread_id"] =
                         json!("01a02589-5e24-7f10-8a93-a0c1968d8a3a");
+                }),
+                none,
+            ),
+            (
+                "history-base-present",
+                edit(&|values| {
+                    values[0]["payload"]["history_base"] = json!({"cursor":"external"});
+                }),
+                none,
+            ),
+            (
+                // A header without a source would let a later record supply
+                // spawn lineage the sidecar never trusted.
+                "header-source-absent-later-subagent-source",
+                edit(&|values| {
+                    values[0]["payload"]
+                        .as_object_mut()
+                        .expect("header payload")
+                        .remove("source");
+                    values.insert(8, json!({"timestamp":clock.at(4_200),"type":"event_msg","payload":{"type":"agent_message","source":{"subagent":{"thread_spawn":{"parent_thread_id":"01a02589-5e24-7f10-8a93-a0c1968d8a3a"}}}}}));
+                    renumber(values);
+                }),
+                none,
+            ),
+            (
+                "trace-id-malformed",
+                edit(&|values| {
+                    values[1]["payload"]["trace_id"] = json!("not-a-32-hex-trace-id");
+                }),
+                none,
+            ),
+            (
+                // Only the later task's start predates creation; turn 2 is kept.
+                "later-task-old-start-only",
+                edit(&|values| {
+                    values[6]["payload"]["started_at"] = json!(clock.second(-3_600));
                 }),
                 none,
             ),
@@ -54285,6 +54394,23 @@ mod tests {
         let item = parsed.snapshots.first().expect("parented snapshot");
         assert_eq!((item.input_tokens, item.request_count), (12, 1));
         let _ = fs::remove_dir_all(root);
+
+        // Only the parentless path accepts an absent `trace_id`.
+        let mut without_trace = child.clone();
+        without_trace[1]["payload"]
+            .as_object_mut()
+            .expect("task payload")
+            .remove("trace_id");
+        let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+            "codex-parented-trace-id-absent",
+            child_id,
+            parent_id,
+            &without_trace,
+            &parent,
+            true,
+        );
+        assert!(parsed.snapshots.is_empty(), "{parsed:#?}");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -54439,6 +54565,22 @@ mod tests {
         unresolved.spawn_parent_conflicts.insert(parent.to_string());
         assert_eq!(unresolved.family_position(child), None);
         assert_ne!(unresolved.session_sidecar_fingerprint(child), without_edge);
+
+        // An ordinary session never takes the parentless path, so the same
+        // unresolved edge leaves its fingerprint unchanged.
+        let mut ordinary = CodexTitleMetadata::default();
+        let ordinary_without_edge = ordinary.session_sidecar_fingerprint(child);
+        ordinary
+            .spawn_parents
+            .insert(child.to_string(), parent.to_string());
+        ordinary
+            .spawn_parents
+            .insert(parent.to_string(), grandchild.to_string());
+        ordinary.spawn_parent_conflicts.insert(parent.to_string());
+        assert_eq!(
+            ordinary.session_sidecar_fingerprint(child),
+            ordinary_without_edge
+        );
     }
 
     #[test]
@@ -54510,12 +54652,11 @@ mod tests {
             ),
             (unknown, None),
         ] {
-            write(
-                id,
-                &parentless_created_thread_values(&clock, id),
-                "agent_created_thread",
-                message,
-            );
+            // The parented path still requires a well-formed `trace_id`; the
+            // later parent edge below re-derives this thread through it.
+            let mut values = parentless_created_thread_values(&clock, id);
+            values[1]["payload"]["trace_id"] = json!("0123456789abcdef0123456789abcdef");
+            write(id, &values, "agent_created_thread", message);
         }
         let mut ordinary_values = parentless_created_thread_values(&clock, ordinary);
         ordinary_values[0]["payload"]["thread_source"] = json!("user");
