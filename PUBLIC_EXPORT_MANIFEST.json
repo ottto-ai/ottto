@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 690,
-  "content_sha256": "976d5acc9d599cb90679d2ef362817c29918336537dcfd50fef050ba0586e88a",
+  "candidate_file_count": 694,
+  "content_sha256": "f8fce240f7418cb00c6c65f970c6be99ad11519a830bfd4eab5fa3089daf2390",
   "files": [
     {
       "executable": false,
@@ -90,8 +90,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "c0404d15cb039d5cd6285c280907285974a73cfc33df95a70beb3e59653214f6",
-      "size_bytes": 54422
+      "sha256": "164e32b205150433507be8f9fc3122ab085354e35e8ef2cdd223c8b0df33b5a1",
+      "size_bytes": 55592
     },
     {
       "executable": false,
@@ -468,8 +468,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "49382d03cb6e2b4bfbd13d7e37e64660533591014c2cc666311184bd5a62299e",
-      "size_bytes": 184839
+      "sha256": "01488639b1c98120177c8ea86187bc456738c917d7f131f5037bab90a9ef2051",
+      "size_bytes": 185843
     },
     {
       "executable": false,
@@ -615,8 +615,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "bd2a97d4ca0b135aa81bc51073e1352c7e0880f66efa79fc3f21223a6f5c8ab4",
-      "size_bytes": 343013
+      "sha256": "b323ee67d653e636da9d022808dd193ccb997384a8d705db6eff43ddeae48fff",
+      "size_bytes": 343320
     },
     {
       "executable": false,
@@ -901,9 +901,16 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/context_file_counts.rs",
+      "sha256": "070a9b389ef072d49312204978d72a0cb458b1a98c86c9278affab84faaee688",
+      "size_bytes": 8125
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "8d1fcddb045866497625fa7a8e0fe9282d64f4350f003dc395103407063cac79",
-      "size_bytes": 87612
+      "sha256": "3de5e0c82cd479fde6b8837fa0c498346447fe040eaf1e9c3ddbb10350e371d1",
+      "size_bytes": 93000
     },
     {
       "executable": false,
@@ -916,8 +923,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "17360993dc5e4ffac7487e6163a36462a730c0feca40a57dada69bc4551f379d",
-      "size_bytes": 1259122
+      "sha256": "8e48f0a483a1694dec703658c82c103a64e0dd7f33b565a170289a1dd001874e",
+      "size_bytes": 1277292
     },
     {
       "executable": false,
@@ -993,8 +1000,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "cfc466ef24c73b24593679e1e0d47ec070e63a5bf7d82f77ceb714cf1031096a",
-      "size_bytes": 349311
+      "sha256": "279a379795d8ac97f0225004db9969a8cce1a75c4164343bf4d9c2f823d94dae",
+      "size_bytes": 349371
     },
     {
       "executable": false,
@@ -1329,8 +1336,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
-      "sha256": "1719555c3bc5473e0e78fff945950345191b5058d5a6b69fe96e990b028c9b80",
-      "size_bytes": 59014
+      "sha256": "65e60d89c7ecd6d10a827d9cae2c91beb2cce6acd65ee1cf48ea1a090fc84018",
+      "size_bytes": 59256
     },
     {
       "executable": false,
@@ -3057,6 +3064,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-18-context-footprint-file-counts.md",
+      "sha256": "690425f613faf1c6febd14b454ec45cf6f73b7abf67338eb04aef313f9be79c8",
+      "size_bytes": 1564
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-18-page-scoped-witness-reconstruction.md",
       "sha256": "e7fc1d9eea0a208f34f52f1afb9ed154a71cc66d930b8e6ba5e6c9e075a081f7",
       "size_bytes": 2396
@@ -3074,6 +3088,13 @@
       "path": "docs/session-2026-10-18-sampled-acquisition-causal-diagnostics.md",
       "sha256": "7f3e819aba1b9b5181ea22b2cd7b28e34819c0991413a0ef8f657f2be3c9e058",
       "size_bytes": 3035
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-selected-recovery-allocation-audit.md",
+      "sha256": "44e06605fd4554b3b32cbb0e76cdfbc7a26017eb17dd0965c2104ae7b69a43b2",
+      "size_bytes": 1638
     },
     {
       "executable": false,
@@ -3121,8 +3142,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/troubleshooting.md",
-      "sha256": "b4229525e68fb83cdc3b308e59c2b553f4c6248a4b61346d1a94ba7f52015bfb",
-      "size_bytes": 5905
+      "sha256": "38d6bded5da3aeb41b19da270c9cdda750e1382cf914145c4b25db1c70f3c14a",
+      "size_bytes": 6207
     },
     {
       "executable": false,
@@ -3485,8 +3506,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
-      "sha256": "e575786d615b1270d0ee0bb5dead4860c01ba3324b4e50c70bb68cf7d058881a",
-      "size_bytes": 27680
+      "sha256": "269fc3ef6ca0a3c9cb1c9611468db11eca123b26ec17a1d25e481a326a0a5af3",
+      "size_bytes": 27720
     },
     {
       "executable": false,
@@ -3669,6 +3690,13 @@
       "path": "fixtures/collector-status/census-residue-scan-status-v1.json",
       "sha256": "5aab5897fad814215baac096c80acb6bc29d838eb6fc8c7007ba8d7e8a2cdbaa",
       "size_bytes": 2381
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/context-footprint/file-counts-v1.json",
+      "sha256": "148fd3730fd604ddcd1f93e43737696a92b126173d4476358d3f197c078226af",
+      "size_bytes": 677
     },
     {
       "executable": false,
@@ -4833,9 +4861,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T19:31:14+00:00",
+  "generated_at": "2026-10-18T19:39:50+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 691,
+  "output_file_count": 695,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4872,5 +4900,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "26328fad1b6bfcb21475e4350a1749e088e371be"
+  "source_commit": "d8f1d553cf6d84c55bfaf544e00ce46e4dfb9591"
 }

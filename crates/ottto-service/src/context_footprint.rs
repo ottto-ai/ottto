@@ -7,6 +7,7 @@
 //! `AgentContextStatus`/`context_live`, which reflects active session load from
 //! statusLine `context_window`.
 
+use crate::context_file_counts::{load_or_create_salt, measure_file, FileCounts};
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
@@ -63,6 +64,11 @@ struct ContextFootprintItemInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     relative_path: Option<String>,
     loading_mode: String,
+    #[serde(flatten)]
+    file_counts: FileCounts,
+    // Preserve the original /context path only until measurement. Never upload it.
+    #[serde(skip)]
+    local_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -329,6 +335,7 @@ fn harvest_recent_workspaces(
     }
 
     let env = SpawnEnv::resolve();
+    let salt = load_or_create_salt(support_dir);
     let deadline = Instant::now() + CONTEXT_CYCLE_BUDGET;
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
@@ -347,6 +354,8 @@ fn harvest_recent_workspaces(
             &env,
             workspace_labels_enabled,
             include_mcp_servers,
+            home,
+            salt.as_ref(),
         ) {
             Ok(request) => {
                 match upload_if_changed(client, relay_token, support_dir, identity, &request) {
@@ -399,6 +408,8 @@ fn build_request_for_workspace(
     env: &SpawnEnv,
     workspace_labels_enabled: bool,
     include_mcp_servers: bool,
+    home: &Path,
+    salt: Option<&[u8; 32]>,
 ) -> Result<ContextFootprintIngestRequest> {
     let stdout = run_claude_context(workspace, env, include_mcp_servers)?;
     let value: Value = serde_json::from_str(&stdout)
@@ -422,6 +433,7 @@ fn build_request_for_workspace(
     let workspace_text = workspace.to_string_lossy();
     let workspace_hash = sha256_hex(&[workspace_text.as_ref()]);
     let repository_identity = resolve_repository_identity(workspace, workspace_labels_enabled);
+    measure_memory_files(&mut parsed, workspace, home, salt);
     let config_hash = request_content_hash(&parsed)?;
     Ok(ContextFootprintIngestRequest {
         agent_source: "claude-code".to_string(),
@@ -892,7 +904,37 @@ fn parse_memory_file_row(cells: &[String]) -> Option<ContextFootprintItemInput> 
         source,
         relative_path,
         loading_mode: "always_on".to_string(),
+        file_counts: FileCounts::default(),
+        local_path: Some(PathBuf::from(raw_path.trim_matches('`'))),
     })
+}
+
+fn measure_memory_files(
+    parsed: &mut ParsedContextFootprint,
+    workspace: &Path,
+    home: &Path,
+    salt: Option<&[u8; 32]>,
+) {
+    for item in &mut parsed.memory_files {
+        let Some(raw_path) = item.local_path.take() else {
+            continue;
+        };
+        let path = if let Ok(relative) = raw_path.strip_prefix("~") {
+            home.join(relative)
+        } else if raw_path.is_absolute() {
+            raw_path
+        } else {
+            workspace.join(raw_path)
+        };
+        let auto_memory = item
+            .source
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case("AutoMem"))
+            && path.file_name().is_some_and(|name| name == "MEMORY.md");
+        if let Some(counts) = measure_file(&path, auto_memory, salt) {
+            item.file_counts = counts;
+        }
+    }
 }
 
 fn parse_named_item_row(cells: &[String], kind: &str) -> Option<ContextFootprintItemInput> {
@@ -910,6 +952,8 @@ fn parse_named_item_row(cells: &[String], kind: &str) -> Option<ContextFootprint
         source,
         relative_path: None,
         loading_mode: "always_on".to_string(),
+        file_counts: FileCounts::default(),
+        local_path: None,
     })
 }
 
@@ -2037,6 +2081,82 @@ mod tests {
         assert!(!encoded.contains("/Users/example"));
         let encoded_mcp = serde_json::to_string(&parsed.mcp_tools).unwrap();
         assert!(!encoded_mcp.contains("description"));
+    }
+
+    #[test]
+    fn file_counts_resolve_original_paths_and_trigger_upload_after_token_plateau() {
+        let dir = temp_dir("context-footprint-counts");
+        let home = dir.join("home");
+        let workspace = dir.join("repo");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let memory_path = home.join("MEMORY.md");
+        fs::write(&memory_path, "x\n".repeat(201)).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "synthetic private instruction").unwrap();
+        fs::write(home.join(".claude/CLAUDE.md"), "synthetic user instruction").unwrap();
+        let markdown = format!("**Tokens:** 10k / 200k (5%)\n### Memory Files\n| AutoMem | {} | 6k |\n| Project | AGENTS.md | 1k |\n| User | ~/.claude/CLAUDE.md | 1k |", memory_path.display());
+        let mut parsed = parse_context_markdown(&markdown).unwrap();
+        measure_memory_files(&mut parsed, &workspace, &home, Some(&[7; 32]));
+        assert_eq!(parsed.memory_files[0].file_counts.loaded_lines, Some(200));
+        assert_eq!(
+            parsed.memory_files[0].file_counts.truncated_by_limit,
+            Some(true)
+        );
+        assert_eq!(parsed.memory_files[1].file_counts.file_bytes, Some(29));
+        assert_eq!(parsed.memory_files[2].file_counts.file_bytes, Some(26));
+        let before = request_content_hash(&parsed).unwrap();
+        let mut request = sample_request();
+        request.memory_files = parsed.memory_files.clone();
+        let before_upload = request_content_hash_for_request(&request).unwrap();
+        fs::write(&memory_path, "x\n".repeat(202)).unwrap();
+        let mut changed = parse_context_markdown(&markdown).unwrap();
+        measure_memory_files(&mut changed, &workspace, &home, Some(&[7; 32]));
+        assert_ne!(before, request_content_hash(&changed).unwrap());
+        request.memory_files = changed.memory_files.clone();
+        assert_ne!(
+            before_upload,
+            request_content_hash_for_request(&request).unwrap()
+        );
+        let encoded = serde_json::to_string(&changed.memory_files).unwrap();
+        assert!(!encoded.contains("synthetic"));
+        assert!(!encoded.contains(&dir.to_string_lossy().to_string()));
+        assert!(!encoded.contains("local_path"));
+        assert!(encoded.contains("file_chars"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn context_file_counts_generated_wire_fixture() {
+        let dir = temp_dir("context-counts-wire");
+        let path = dir.join("MEMORY.md");
+        fs::write(&path, "x\n".repeat(300)).unwrap();
+        let mut parsed = parse_context_markdown(
+            "**Tokens:** 10k / 200k (5%)\n### Memory Files\n| AutoMem | MEMORY.md | 6k |",
+        )
+        .unwrap();
+        measure_memory_files(&mut parsed, &dir, &dir, Some(&[7; 32]));
+        let actual = json!({
+            "contract_version": "context_footprint_file_counts:v1",
+            "max_file_bytes": crate::context_file_counts::MAX_FILE_BYTES,
+            "character_unit": "utf16",
+            "auto_memory_limit": {"lines": crate::context_file_counts::AUTO_MEMORY_LIMIT.0,
+                "chars": crate::context_file_counts::AUTO_MEMORY_LIMIT.1},
+            "hash_scheme": "sha256(ottto-context-file-v1\\0 || device_salt_32_bytes || file_bytes):hex64",
+            "item": &parsed.memory_files[0],
+        });
+        if let Some(output) = std::env::var_os("OTTTO_CONTEXT_COUNTS_FIXTURE_OUTPUT") {
+            fs::write(
+                output,
+                serde_json::to_string_pretty(&actual).unwrap() + "\n",
+            )
+            .unwrap();
+        }
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/context-footprint/file-counts-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

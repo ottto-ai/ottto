@@ -5390,7 +5390,13 @@ fn auth_switch_account(
     let identity_reservation = reserve_identity_mutation(true)?;
     let staged = daemon.take_staged_account_switch(claim_code)?;
     if staged.relay_device_credential_preparation_id.is_none() {
-        disconnect_previous_binding_best_effort(daemon);
+        disconnect_previous_binding_best_effort(
+            daemon,
+            staged
+                .relay_device
+                .as_ref()
+                .map(|device| device.device_id.as_str()),
+        );
     }
     match install_staged_account_switch(daemon, &staged, &identity_reservation) {
         Ok(response) => Ok(response),
@@ -5409,7 +5415,11 @@ fn auth_switch_account(
 /// (401/404), the token may be unrefreshable, or the network may be down. The
 /// switch proceeds either way; the backend reconciles a dangling setup run on
 /// its side.
-fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon) {
+///
+/// The request also asks the server to release the previous device
+/// registration, unless the incoming binding reuses the same device id: a
+/// release must never revoke the credential the switch is about to install.
+fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon, incoming_device_id: Option<&str>) {
     let connection = match daemon.connection_for_authorized_client() {
         Ok(Some(connection)) => connection,
         Ok(None) | Err(_) => return,
@@ -5420,13 +5430,22 @@ fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon) {
     let Ok(api_base_url) = validated_api_base_url(Some(connection.api_base_url.as_str())) else {
         return;
     };
-    if let Err(error) =
-        disconnect_setup_run_with_refresh(&api_base_url, &connection, &setup_run_token)
-    {
+    let release =
+        load_device_release_proof().filter(|proof| releasable_on_switch(proof, incoming_device_id));
+    if let Err(error) = disconnect_setup_run_with_refresh(
+        &api_base_url,
+        &connection,
+        &setup_run_token,
+        release.as_ref(),
+    ) {
         eprintln!(
             "ottto-service: account switch: cloud disconnect of previous binding skipped: {error}"
         );
     }
+}
+
+fn releasable_on_switch(proof: &DeviceReleaseProof, incoming_device_id: Option<&str>) -> bool {
+    incoming_device_id.map_or(true, |incoming| incoming != proof.device_id)
 }
 
 fn install_staged_account_switch(
@@ -5474,7 +5493,10 @@ fn install_staged_account_switch(
         };
         // Only now may the old local/cloud binding be disconnected: every
         // earlier failure cut retained usable old authority.
-        disconnect_previous_binding_best_effort(daemon);
+        disconnect_previous_binding_best_effort(
+            daemon,
+            Some(confirmed_pending.device.device_id.as_str()),
+        );
         Some((confirmed_pending, candidate_secret))
     } else {
         None
@@ -6521,12 +6543,6 @@ fn auth_reset(
     local_only: bool,
     forget_installation: bool,
 ) -> Result<AuthResetResponse, LocalApiError> {
-    if forget_installation && !local_only {
-        return Err(LocalApiError::InvalidRequest(
-            "--forget-installation requires --local-only; this reset does not mutate cloud state"
-                .to_string(),
-        ));
-    }
     require_authorized_local_client(daemon, authorization)?;
     // Both ordinary and explicit local-only logout clear the account/device
     // authority needed for exact backend cleanup, so neither may strand an
@@ -6537,15 +6553,19 @@ fn auth_reset(
     if !local_only {
         let connection = daemon
             .connection_for_authorized_client()?
-            .ok_or_else(cloud_logout_requires_connection_error)?;
+            .ok_or_else(|| cloud_logout_requires_connection_error(forget_installation))?;
         let setup_run_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
             .load()
-            .map_err(|_| cloud_logout_requires_connection_error())?;
+            .map_err(|_| cloud_logout_requires_connection_error(forget_installation))?;
         let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
+        // Read the release proof before any local deletion below; the server
+        // revokes this Mac's registration only when both halves authenticate.
+        let release = load_device_release_proof();
         cloud_disconnect = Some(disconnect_setup_run_with_refresh(
             &api_base_url,
             &connection,
             &setup_run_token,
+            release.as_ref(),
         )?);
     }
 
@@ -6588,25 +6608,53 @@ fn auth_reset(
     reset.disconnected_at = cloud_disconnect
         .as_ref()
         .map(|disconnect| disconnect.disconnected_at.clone());
-    reset.message = StableMessage {
-        code: if forget_installation {
-            "installation_forgotten".to_string()
-        } else if local_only {
-            "local_disconnect_complete".to_string()
-        } else {
-            "cloud_disconnect_complete".to_string()
-        },
-        text: if forget_installation {
-            "Installation identity, account scope, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing."
-                .to_string()
-        } else if local_only {
-            "Active local credentials were cleared without changing cloud state; prior device proof was retained securely for reconnection."
-                .to_string()
-        } else {
-            "This Mac was disconnected from Ottto.".to_string()
-        },
-    };
+    reset.device_released = cloud_disconnect
+        .as_ref()
+        .map(|disconnect| disconnect.device_released);
+    reset.message = auth_reset_message(forget_installation, reset.device_released);
     Ok(reset)
+}
+
+/// `device_released` is `None` for a local-only reset, which never contacts
+/// Ottto, and the server's answer for a cloud reset.
+fn auth_reset_message(forget_installation: bool, device_released: Option<bool>) -> StableMessage {
+    const NOT_RELEASED: &str = "Ottto did not confirm releasing this Mac's server registration, so it may still be active; the account that owns it can disconnect this Mac on its Apps page (Disconnect).";
+    const STILL_REGISTERED: &str = "This Mac is still registered to the previous Ottto account on the server, so a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
+    const FORGOTTEN: &str = "Installation identity, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing.";
+    let (code, text) = match (forget_installation, device_released) {
+        (true, None) => (
+            "installation_forgotten",
+            format!("Ottto was not contacted. {FORGOTTEN} {STILL_REGISTERED}"),
+        ),
+        (true, Some(true)) => (
+            "installation_forgotten",
+            format!(
+                "This Mac was disconnected from Ottto and its server registration was released. {FORGOTTEN}"
+            ),
+        ),
+        (true, Some(false)) => (
+            "installation_forgotten",
+            format!("This Mac was disconnected from Ottto. {NOT_RELEASED} {FORGOTTEN}"),
+        ),
+        (false, None) => (
+            "local_disconnect_complete",
+            "Active local credentials were cleared without changing cloud state; prior device proof was retained securely for reconnection."
+                .to_string(),
+        ),
+        (false, Some(true)) => (
+            "cloud_disconnect_complete",
+            "This Mac was disconnected from Ottto and its server registration was released."
+                .to_string(),
+        ),
+        (false, Some(false)) => (
+            "cloud_disconnect_complete",
+            format!("This Mac was disconnected from Ottto. {NOT_RELEASED}"),
+        ),
+    };
+    StableMessage {
+        code: code.to_string(),
+        text,
+    }
 }
 
 fn forget_installation_state_locked() -> Result<(), LocalApiError> {
@@ -6702,11 +6750,14 @@ fn cloud_session_cleanup_is_confirmed(grant: &crate::cloud_sessions::CloudSessio
         }
 }
 
-fn cloud_logout_requires_connection_error() -> LocalApiError {
-    LocalApiError::InvalidRequest(
+fn cloud_logout_requires_connection_error(forget_installation: bool) -> LocalApiError {
+    LocalApiError::InvalidRequest(if forget_installation {
+        "logout --forget-installation requires an active Ottto cloud connection to release this Mac's server registration; use --local-only --forget-installation only to clear local state without updating Ottto"
+            .to_string()
+    } else {
         "logout requires an active Ottto cloud connection; use --local-only only to clear local state without updating Ottto"
-            .to_string(),
-    )
+            .to_string()
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -8283,6 +8334,58 @@ struct SetupRunDisconnectResponse {
     #[allow(dead_code)]
     client_disconnected: bool,
     disconnected_at: String,
+    /// True only when the server authenticated the release proof and revoked
+    /// this Mac's device registration. Older servers omit the field.
+    #[serde(default)]
+    device_released: bool,
+}
+
+/// This Mac's active relay-device id and secret, presented on a cloud
+/// disconnect so the server can release the device registration. Read before
+/// any local deletion. Secret; redacted from `Debug` and never logged.
+struct DeviceReleaseProof {
+    device_id: String,
+    device_secret: String,
+}
+
+impl std::fmt::Debug for DeviceReleaseProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceReleaseProof")
+            .field("device_id", &self.device_id)
+            .field("device_secret", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Load the active device id and secret together. The server rejects one
+/// without the other, so a missing or unreadable half yields no proof.
+fn load_device_release_proof() -> Option<DeviceReleaseProof> {
+    let device = FileDeviceStore::default().load().ok().flatten()?;
+    let device_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+        .load()
+        .ok()?;
+    device_release_proof(device.device_id, device_secret)
+}
+
+fn device_release_proof(device_id: String, device_secret: String) -> Option<DeviceReleaseProof> {
+    if device_id.trim().is_empty() || device_secret.is_empty() {
+        return None;
+    }
+    Some(DeviceReleaseProof {
+        device_id,
+        device_secret,
+    })
+}
+
+fn setup_run_disconnect_body(release: Option<&DeviceReleaseProof>) -> serde_json::Value {
+    match release {
+        Some(release) => json!({
+            "reason": "logout",
+            "release_device_id": release.device_id,
+            "release_device_secret": release.device_secret,
+        }),
+        None => json!({ "reason": "logout" }),
+    }
 }
 
 /// Mint a fresh `setup_run_token` for the current run using the daemon's
@@ -8540,8 +8643,9 @@ fn disconnect_setup_run_with_refresh(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
+    release: Option<&DeviceReleaseProof>,
 ) -> Result<SetupRunDisconnectResponse, LocalApiError> {
-    match disconnect_setup_run_local_client(api_base_url, connection, setup_run_token) {
+    match disconnect_setup_run_local_client(api_base_url, connection, setup_run_token, release) {
         Ok(response) => Ok(response),
         Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
             let refreshed = refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
@@ -8549,6 +8653,7 @@ fn disconnect_setup_run_with_refresh(
                 api_base_url,
                 &refreshed.connection,
                 &refreshed.setup_run_token,
+                release,
             )
         }
         Err(other) => Err(other),
@@ -8559,15 +8664,20 @@ fn disconnect_setup_run_local_client(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
+    release: Option<&DeviceReleaseProof>,
 ) -> Result<SetupRunDisconnectResponse, LocalApiError> {
+    // SECURITY: a release proof carries the long-lived device secret. Gate the
+    // base through the trusted-base validator here as well, so no caller can
+    // send the secret to a base read from tampered on-disk state.
+    let api_base_url = validated_api_base_url(Some(api_base_url))?;
     let url = api_url_with_base(
-        api_base_url,
+        &api_base_url,
         &format!(
             "/api/v1/setup-runs/{}/local-client/disconnect",
             connection.setup_run_id
         ),
     );
-    let body = json!({ "reason": "logout" });
+    let body = setup_run_disconnect_body(release);
     backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
@@ -22146,6 +22256,294 @@ for line in sys.stdin:
             .connection_for_authorized_client()
             .expect("connection lookup")
             .is_some());
+    }
+
+    #[test]
+    fn disconnect_body_carries_release_proof_only_when_both_halves_exist() {
+        let proof =
+            device_release_proof("device_release".to_string(), "secret-release".to_string())
+                .expect("complete proof");
+        assert_eq!(
+            setup_run_disconnect_body(Some(&proof)),
+            json!({
+                "reason": "logout",
+                "release_device_id": "device_release",
+                "release_device_secret": "secret-release",
+            })
+        );
+        assert_eq!(
+            setup_run_disconnect_body(None),
+            json!({ "reason": "logout" })
+        );
+        assert!(device_release_proof(String::new(), "secret-release".to_string()).is_none());
+        assert!(device_release_proof("device_release".to_string(), String::new()).is_none());
+        assert!(!format!("{proof:?}").contains("secret-release"));
+    }
+
+    #[test]
+    fn account_switch_never_releases_the_incoming_device() {
+        let proof = device_release_proof("device_old".to_string(), "secret-old".to_string())
+            .expect("complete proof");
+        assert!(releasable_on_switch(&proof, None));
+        assert!(releasable_on_switch(&proof, Some("device_new")));
+        assert!(!releasable_on_switch(&proof, Some("device_old")));
+    }
+
+    #[test]
+    fn disconnect_response_device_released_defaults_false_for_older_servers() {
+        let legacy: SetupRunDisconnectResponse = serde_json::from_str(
+            r#"{"setup_run_id":"run","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z"}"#,
+        )
+        .expect("legacy disconnect response");
+        assert!(!legacy.device_released);
+        let released: SetupRunDisconnectResponse = serde_json::from_str(
+            r#"{"setup_run_id":"run","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z","device_released":true}"#,
+        )
+        .expect("release disconnect response");
+        assert!(released.device_released);
+    }
+
+    #[test]
+    fn auth_reset_messages_state_whether_the_server_registration_was_released() {
+        let local_forget = auth_reset_message(true, None);
+        assert_eq!(local_forget.code, "installation_forgotten");
+        assert!(local_forget.text.contains("Ottto was not contacted"));
+        assert!(local_forget
+            .text
+            .contains("still registered to the previous Ottto account"));
+        assert!(local_forget.text.contains("(Disconnect)"));
+        assert!(local_forget
+            .text
+            .contains("`ottto logout --forget-installation --confirm` without --local-only"));
+        assert!(!local_forget.text.contains("account scope"));
+
+        let cloud_forget = auth_reset_message(true, Some(true));
+        assert_eq!(cloud_forget.code, "installation_forgotten");
+        assert!(cloud_forget
+            .text
+            .contains("server registration was released"));
+        assert!(!cloud_forget.text.contains("still registered"));
+
+        let cloud_forget_unreleased = auth_reset_message(true, Some(false));
+        assert!(cloud_forget_unreleased.text.contains("may still be active"));
+
+        let cloud = auth_reset_message(false, Some(true));
+        assert_eq!(cloud.code, "cloud_disconnect_complete");
+        assert!(cloud.text.contains("server registration was released"));
+        let cloud_unreleased = auth_reset_message(false, Some(false));
+        assert_eq!(cloud_unreleased.code, "cloud_disconnect_complete");
+        assert!(cloud_unreleased.text.contains("may still be active"));
+
+        assert_eq!(
+            auth_reset_message(false, None).code,
+            "local_disconnect_complete"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cloud_forget_installation_releases_device_before_forgetting() {
+        let root = telemetry_key_store_root("cloud-forget-installation");
+        let support_root = root.join("support");
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(support_root.join("snapshots/destinations/old")).unwrap();
+        fs::create_dir_all(&secret_root).unwrap();
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileMachineStore::default()
+            .save(&LocalMachineBinding {
+                machine_id: "otm_original".to_string(),
+                installation_id: "oti_original".to_string(),
+                hardware_uuid: None,
+            })
+            .unwrap();
+        FileAccountStore::default()
+            .save(&connected_account())
+            .unwrap();
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_cloud_forget".to_string(),
+                machine_id: Some("otm_original".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device-secret-cloud-forget")
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("setup-token-cloud-forget")
+            .unwrap();
+        fs::write(
+            support_root.join("snapshots/destinations/old/codex-scan-index.json"),
+            b"receipt",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind release backend");
+        let address = listener.local_addr().expect("release backend address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept release");
+            let request = read_complete_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"run_cloud_forget","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z","device_released":true}"#,
+            );
+            request
+        });
+        let api_base_url = format!("http://{address}");
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
+        let connection = LocalConnectionBinding {
+            setup_run_id: "run_cloud_forget".to_string(),
+            setup_run_token_expires_at: "2026-10-18T13:00:00Z".to_string(),
+            machine_id: Some("otm_original".to_string()),
+            claim_code: None,
+            api_base_url,
+        };
+        FileConnectionStore::default().save(&connection).unwrap();
+
+        let response = handle_request(
+            &daemon()
+                .with_account(connected_account())
+                .with_connection(Some(connection)),
+            LocalControlRequest {
+                request_id: "req_cloud_forget_installation".to_string(),
+                protocol_version: ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: false,
+                    forget_installation: true,
+                },
+            },
+        );
+        let request = server.join().expect("release backend");
+
+        assert!(response.ok, "{response:?}");
+        assert!(request
+            .starts_with("POST /api/v1/setup-runs/run_cloud_forget/local-client/disconnect "));
+        let body: serde_json::Value =
+            serde_json::from_str(http_request_body(&request)).expect("disconnect body");
+        assert_eq!(
+            body,
+            json!({
+                "reason": "logout",
+                "release_device_id": "device_cloud_forget",
+                "release_device_secret": "device-secret-cloud-forget",
+            })
+        );
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["cloud_disconnected"], true);
+        assert_eq!(payload["device_released"], true);
+        assert_eq!(payload["message"]["code"], "installation_forgotten");
+        assert!(!payload.to_string().contains("device-secret-cloud-forget"));
+        assert!(FileMachineStore::default().load().unwrap().is_none());
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert!(KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .is_err());
+        assert!(!support_root.join("snapshots").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn cloud_logout_without_device_secret_sends_no_release_proof() {
+        let root = telemetry_key_store_root("cloud-logout-no-release");
+        let support_root = root.join("support");
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(&support_root).unwrap();
+        fs::create_dir_all(&secret_root).unwrap();
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_without_secret".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("setup-token-no-release")
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind disconnect backend");
+        let address = listener.local_addr().expect("disconnect backend address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept disconnect");
+            let request = read_complete_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"run_no_release","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z"}"#,
+            );
+            request
+        });
+        let api_base_url = format!("http://{address}");
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
+
+        let response = handle_request(
+            &daemon()
+                .with_account(connected_account())
+                .with_connection(Some(LocalConnectionBinding {
+                    setup_run_id: "run_no_release".to_string(),
+                    setup_run_token_expires_at: "2026-10-18T13:00:00Z".to_string(),
+                    machine_id: Some("machine_test".to_string()),
+                    claim_code: None,
+                    api_base_url,
+                })),
+            LocalControlRequest {
+                request_id: "req_cloud_logout_no_release".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: false,
+                    forget_installation: false,
+                },
+            },
+        );
+        let request = server.join().expect("disconnect backend");
+
+        assert!(response.ok, "{response:?}");
+        let body: serde_json::Value =
+            serde_json::from_str(http_request_body(&request)).expect("disconnect body");
+        assert_eq!(body, json!({ "reason": "logout" }));
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["device_released"], false);
+        assert_eq!(payload["message"]["code"], "cloud_disconnect_complete");
+        assert!(payload["message"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("may still be active")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn cloud_forget_installation_without_connection_points_to_local_only_forget() {
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_cloud_forget_unconnected".to_string(),
+                protocol_version: ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: false,
+                    forget_installation: true,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert!(error.message.contains("--local-only --forget-installation"));
     }
 
     #[test]
