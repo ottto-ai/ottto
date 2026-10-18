@@ -417,7 +417,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   id and secret, read before any local deletion, so Ottto can release the Mac's
   server registration; the response reports `device_released`, and `false`
   (or an older server that omits it) means the registration may still be
-  active until its account removes the Mac on the Apps page (Start fresh). An
+  active until its account disconnects the Mac on the Apps page (Disconnect). An
   account switch sends the same release for the previous device unless the new
   binding reuses that device id. `local_only=true` is reserved for emergency local
   cleanup when the backend cannot be reached or the website state is stale.
@@ -448,7 +448,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   without contacting Ottto, so the server registration is not released: this
   Mac stays registered to the old Ottto account, and a different account can
   connect it only after the old account removes this Mac on its Apps page
-  (Start fresh).
+  (Disconnect).
 - `ottto uninstall` requires `--confirm`, warns about receipt and first-sweep
   loss, and accepts `--backup-state <directory>` to export only those receipts
   and first-sweep state first (never relay credentials or account secrets).

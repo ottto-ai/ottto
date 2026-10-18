@@ -154,7 +154,7 @@ complete.
 Cloud logout also releases this Mac's server registration when the response
 reports `device_released: true`. Local-only cleanup never does: the Mac stays
 registered to the old Ottto account until that account removes it on its Apps
-page (Start fresh), and only then can a different account connect it.
+page (Disconnect), and only then can a different account connect it.
 
 ## Support Bundle
 

@@ -6618,8 +6618,8 @@ fn auth_reset(
 /// `device_released` is `None` for a local-only reset, which never contacts
 /// Ottto, and the server's answer for a cloud reset.
 fn auth_reset_message(forget_installation: bool, device_released: Option<bool>) -> StableMessage {
-    const NOT_RELEASED: &str = "Ottto did not confirm releasing this Mac's server registration, so it may still be active; the account that owns it can remove this Mac on its Apps page (Start fresh).";
-    const STILL_REGISTERED: &str = "This Mac is still registered to the previous Ottto account on the server, so a different account can connect it only after the previous account removes this Mac on its Apps page (Start fresh). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
+    const NOT_RELEASED: &str = "Ottto did not confirm releasing this Mac's server registration, so it may still be active; the account that owns it can disconnect this Mac on its Apps page (Disconnect).";
+    const STILL_REGISTERED: &str = "This Mac is still registered to the previous Ottto account on the server, so a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
     const FORGOTTEN: &str = "Installation identity, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing.";
     let (code, text) = match (forget_installation, device_released) {
         (true, None) => (
@@ -22311,7 +22311,7 @@ for line in sys.stdin:
         assert!(local_forget
             .text
             .contains("still registered to the previous Ottto account"));
-        assert!(local_forget.text.contains("Start fresh"));
+        assert!(local_forget.text.contains("(Disconnect)"));
         assert!(local_forget
             .text
             .contains("`ottto logout --forget-installation --confirm` without --local-only"));
