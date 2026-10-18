@@ -39,6 +39,8 @@ const MAX_HELD_INSTRUCTION_BYTES: usize = MAX_HELD_BYTES / 2;
 const MAX_HELD_COLLECTION_BYTES: usize = MAX_HELD_BYTES - MAX_HELD_INSTRUCTION_BYTES - 1024;
 const MAX_SHELL_PATH_TOKENS: usize = 16;
 const MAX_PATH_BYTES: usize = 512;
+/// Tool call ids are short; a longer one is not tracked.
+const MAX_CALL_ID_BYTES: usize = 256;
 const MAX_TOOL_LABEL_CHARS: usize = 64;
 const WINDOW_REQUESTS: usize = 3;
 /// Claude Code appends this line to the request-1 auto-memory entry when it
@@ -300,6 +302,36 @@ fn shell_path_tokens(command: &str) -> impl Iterator<Item = &str> {
         .take(MAX_SHELL_PATH_TOKENS)
 }
 
+/// True when a shell command may change its working directory, so its
+/// relative paths cannot be shown to be inside the session's checkout.
+fn shell_changes_directory(command: &str) -> bool {
+    command
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '`'))
+        .any(|word| {
+            matches!(word, "cd" | "pushd" | "popd" | "chdir" | "-C")
+                || [
+                    "--directory",
+                    "--git-dir",
+                    "--work-tree",
+                    "-chdir",
+                    "--cwd",
+                    "--prefix",
+                ]
+                .iter()
+                .any(|flag| word.starts_with(flag))
+        })
+}
+
+/// A Claude response spanning several model requests (`usage.iterations[]`):
+/// its counters are not request 1's and later ordinals shift.
+fn claude_multi_request(value: &Value) -> bool {
+    value
+        .pointer("/message/usage/iterations")
+        .or_else(|| value.pointer("/usage/iterations"))
+        .and_then(Value::as_array)
+        .is_some_and(|iterations| iterations.len() > 1)
+}
+
 fn is_repo_relative(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
@@ -309,8 +341,13 @@ fn is_repo_relative(path: &str) -> bool {
 
 /// `(key, repo-relative path)`: the key is the repo-relative path when the file
 /// is inside the session's working directory (a lexical prefix test), else
-/// the path as written, which can only travel hashed.
-fn normalize_path(raw: &str, cwd: Option<&Path>) -> Option<(String, Option<String>)> {
+/// the path as written, which can only travel hashed. A relative path counts
+/// as inside only when `trust_relative` (its base is the session directory).
+fn normalize_path(
+    raw: &str,
+    cwd: Option<&Path>,
+    trust_relative: bool,
+) -> Option<(String, Option<String>)> {
     let raw = raw.trim();
     let raw = raw.strip_prefix("./").unwrap_or(raw);
     if raw.is_empty() || raw.len() > MAX_PATH_BYTES {
@@ -329,7 +366,7 @@ fn normalize_path(raw: &str, cwd: Option<&Path>) -> Option<(String, Option<Strin
     }
     Some((
         raw.to_string(),
-        is_repo_relative(raw).then(|| raw.to_string()),
+        (trust_relative && is_repo_relative(raw)).then(|| raw.to_string()),
     ))
 }
 
@@ -471,6 +508,11 @@ pub(super) struct SessionStartState {
     files_untracked: u64,
     /// Collection bytes charged against `MAX_HELD_COLLECTION_BYTES`.
     held_bytes: usize,
+    /// A Claude Bash command changed directory; the shell keeps that cwd, so
+    /// later relative shell paths are no longer known to be in the checkout.
+    shell_moved: bool,
+    /// An opening Claude response spanned several requests.
+    collapsed_requests: bool,
 }
 
 crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, output_tokens);
@@ -478,7 +520,7 @@ crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest
 crate::heap_layout_bound::fields!(ConfigDigest; a, b, len);
 crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
 crate::heap_layout_bound::fields!(OpeningFileState; ordinal, request, tool, repo_path, instruction_segments, chars, reads, client_loaded, truncated);
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, calls, last_codex_call, files, files_untracked, held_bytes);
+crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
 
 impl SessionStartState {
     pub(super) fn note_user_turn(&mut self) {
@@ -553,6 +595,13 @@ impl SessionStartState {
     ) {
         if self.client_version.is_none() {
             self.note_client_version(str_at(value, "version"));
+        }
+        // Response 3 can finish after the freeze; check through it.
+        if responses <= WINDOW_REQUESTS as u64
+            && !self.collapsed_requests
+            && claude_multi_request(value)
+        {
+            self.collapsed_requests = true;
         }
         if self.frozen {
             return;
@@ -770,6 +819,9 @@ impl SessionStartState {
                 continue;
             }
             let input = item.get("input").unwrap_or(&Value::Null);
+            if name == "Bash" && str_at(input, "command").is_some_and(shell_changes_directory) {
+                self.shell_moved = true;
+            }
             let paths: Vec<&str> = match name {
                 "Read" | "Edit" | "Write" | "MultiEdit" => {
                     str_at(input, "file_path").into_iter().collect()
@@ -785,7 +837,8 @@ impl SessionStartState {
                 _ => Vec::new(),
             };
             self.open_call(id, response, name);
-            self.add_call_paths(id, paths, cwd);
+            let trust_relative = !self.shell_moved;
+            self.add_call_paths(id, paths, cwd, trust_relative);
         }
     }
 
@@ -875,7 +928,7 @@ impl SessionStartState {
                         (str_at(payload, "call_id"), str_at(payload, "name"))
                     {
                         self.open_call(id, response, name);
-                        self.last_codex_call = Some(id.to_string());
+                        self.last_codex_call = self.calls.contains_key(id).then(|| id.to_string());
                     }
                 }
             }
@@ -959,6 +1012,22 @@ impl SessionStartState {
         {
             return;
         }
+        // Each Codex command runs in a fresh shell at its own `cwd`; relative
+        // paths are in the checkout only when that is the session directory
+        // and the command does not change directory.
+        let session_dir = cwd
+            .and_then(Path::to_str)
+            .map(|dir| dir.trim_end_matches('/'));
+        let mut trust_relative = str_at(record, "cwd")
+            .is_none_or(|dir| Some(dir.trim_end_matches('/')) == session_dir)
+            && match record.get("command") {
+                Some(Value::String(command)) => !shell_changes_directory(command),
+                Some(Value::Array(parts)) => !parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(shell_changes_directory),
+                _ => true,
+            };
         let mut paths = Vec::new();
         for item in record
             .get("parsed_cmd")
@@ -966,17 +1035,15 @@ impl SessionStartState {
             .into_iter()
             .flatten()
         {
-            match (
-                str_at(item, "type"),
-                str_at(item, "path"),
-                str_at(item, "cmd"),
-            ) {
+            let command = str_at(item, "cmd");
+            trust_relative &= !command.is_some_and(shell_changes_directory);
+            match (str_at(item, "type"), str_at(item, "path"), command) {
                 (Some("read"), Some(path), _) => paths.push(path),
                 (Some("unknown"), _, Some(command)) => paths.extend(shell_path_tokens(command)),
                 _ => {}
             }
         }
-        self.add_call_paths(call_id, paths, cwd);
+        self.add_call_paths(call_id, paths, cwd, trust_relative);
     }
 
     /// One admitted Codex usage record with a positive input.
@@ -1011,7 +1078,7 @@ impl SessionStartState {
     }
 
     fn open_call(&mut self, id: &str, response: u8, name: &str) {
-        if self.calls.contains_key(id) {
+        if id.len() > MAX_CALL_ID_BYTES || self.calls.contains_key(id) {
             return;
         }
         let call = OpeningCall {
@@ -1024,14 +1091,20 @@ impl SessionStartState {
         }
     }
 
-    fn add_call_paths(&mut self, call_id: &str, paths: Vec<&str>, cwd: Option<&Path>) {
+    fn add_call_paths(
+        &mut self,
+        call_id: &str,
+        paths: Vec<&str>,
+        cwd: Option<&Path>,
+        trust_relative: bool,
+    ) {
         let Some(call) = self.calls.get(call_id) else {
             return;
         };
         let (request, tool) = (call.response + 1, call.tool.clone());
         let mut keys = Vec::new();
         for raw in paths.iter().take(MAX_SHELL_PATH_TOKENS) {
-            let Some((key, repo_path)) = normalize_path(raw, cwd) else {
+            let Some((key, repo_path)) = normalize_path(raw, cwd, trust_relative) else {
                 continue;
             };
             let segments = self
@@ -1093,7 +1166,7 @@ impl SessionStartState {
         request: u8,
         cwd: Option<&Path>,
     ) {
-        let Some((key, repo_path)) = normalize_path(raw, cwd) else {
+        let Some((key, repo_path)) = normalize_path(raw, cwd, true) else {
             return;
         };
         let segments = self
@@ -1162,23 +1235,29 @@ impl SessionStartState {
         }
         start.user_turn_count = (self.user_turns > 0).then_some(u64::from(self.user_turns));
         start.instruction_load_cut = self.instruction_load_cut;
-        if let Some(first) = self.requests[0] {
+        // Collapsed responses leave no request index: keep only request-1
+        // parts, which come from the logged request itself.
+        let requests = if self.collapsed_requests {
+            [None; WINDOW_REQUESTS]
+        } else {
+            self.requests
+        };
+        if let Some(first) = requests[0] {
             start.first_request_uncached_input_tokens = Some(first.uncached_input_tokens);
             start.first_request_cache_read_tokens = Some(first.cache_read_tokens);
             start.first_request_cache_write_5m_tokens = first.cache_write_5m_tokens;
             start.first_request_cache_write_1h_tokens = first.cache_write_1h_tokens;
         }
-        let observed = self
-            .requests
+        let observed = requests
             .iter()
             .take_while(|request| request.is_some())
             .count();
         if observed > 0 {
             start.opening_request_count = Some(observed as u64);
-            start.request_2_context_tokens = self.requests[1].map(|r| r.context_tokens);
-            start.request_3_context_tokens = self.requests[2].map(|r| r.context_tokens);
+            start.request_2_context_tokens = requests[1].map(|r| r.context_tokens);
+            start.request_3_context_tokens = requests[2].map(|r| r.context_tokens);
             start.opening_output_tokens = Some(
-                self.requests[..2]
+                requests[..2]
                     .iter()
                     .flatten()
                     .map(|r| r.output_tokens)
@@ -1819,22 +1898,124 @@ mod tests {
         );
         assert_eq!(instruction_segments("guide.md", "nothing"), 0);
         assert_eq!(
-            normalize_path("/w/repo/a/b.rs", Some(Path::new("/w/repo"))),
+            normalize_path("/w/repo/a/b.rs", Some(Path::new("/w/repo")), true),
             Some(("a/b.rs".to_string(), Some("a/b.rs".to_string())))
         );
         assert_eq!(
-            normalize_path("/w/repo-other/b.rs", Some(Path::new("/w/repo"))),
+            normalize_path("/w/repo-other/b.rs", Some(Path::new("/w/repo")), true),
             Some(("/w/repo-other/b.rs".to_string(), None))
         );
         assert_eq!(
-            normalize_path("../up.rs", None),
+            normalize_path("../up.rs", None, true),
             Some(("../up.rs".to_string(), None))
         );
+        assert_eq!(
+            normalize_path("a/b.rs", None, false),
+            Some(("a/b.rs".to_string(), None))
+        );
+        assert!(shell_changes_directory("cd /tmp && cat x.md"));
+        assert!(shell_changes_directory("(pushd d; ls)"));
+        assert!(shell_changes_directory("git -C ../other status"));
+        assert!(!shell_changes_directory("cat docs/cdn.md"));
         assert_eq!(
             shell_path_tokens("sed -n 1,5p a/b.md | grep x > out.txt").collect::<Vec<_>>(),
             ["a/b.md", "out.txt"]
         );
         assert_eq!(json_units(&json!({"a": [1, "\u{1f600}"]})), 16);
+    }
+
+    #[test]
+    fn relative_shell_paths_after_a_directory_change_stay_private() {
+        let cwd = Path::new("/w/repo");
+        let mut state = SessionStartState {
+            instructions: Some("Notes live in customer-plan.md and docs/guide.md".to_string()),
+            ..SessionStartState::default()
+        };
+        let bash = |id: &str, command: &str| {
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}})
+        };
+        state.observe_claude_line(&bash("t1", "cat docs/guide.md"), 1, Some(cwd));
+        state.observe_claude_line(
+            &bash("t2", "cd /private/notes && cat customer-plan.md"),
+            1,
+            Some(cwd),
+        );
+        // Claude's shell keeps the new directory for later calls too.
+        state.observe_claude_line(&bash("t3", "cat other/customer-plan.md"), 2, Some(cwd));
+        state.note_claude_response(0, &UsageTotals::default(), 1, 2);
+        let mut start = state
+            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .expect("measured");
+        start.apply_upload_policy(true, false);
+        let shown = start
+            .opening_files
+            .iter()
+            .map(|file| file.repo_path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(shown, [Some("docs/guide.md")]);
+        assert_eq!(start.opening_file_overflow, Some(2));
+
+        // Codex: a command at another cwd, or one that changes directory.
+        let mut codex = measured_codex_state();
+        codex.instructions = Some("customer-plan.md docs/guide.md".to_string());
+        for (id, record) in [
+            (
+                "c1",
+                json!({"cwd": "/private/notes", "parsed_cmd": [{"type": "read", "cmd": "cat customer-plan.md", "path": "customer-plan.md"}]}),
+            ),
+            (
+                "c2",
+                json!({"cwd": "/w/repo/", "command": ["bash", "-lc", "cd .. && cat docs/guide.md"], "parsed_cmd": [{"type": "read", "cmd": "cat docs/guide.md", "path": "docs/guide.md"}]}),
+            ),
+        ] {
+            codex.open_call(id, 2, "exec_command");
+            codex.codex_parsed_command(id, &record, Some(cwd));
+        }
+        let mut start = codex
+            .finish(true, CODEX_PARTS_METHOD, None, Some(&SALT))
+            .expect("measured");
+        start.apply_upload_policy(true, false);
+        assert!(start.opening_files.is_empty());
+        assert_eq!(start.opening_file_overflow, Some(2));
+    }
+
+    #[test]
+    fn collapsed_claude_responses_drop_request_indexed_facts() {
+        let mut state = SessionStartState::default();
+        state.observe_claude_line(
+            &json!({"type": "assistant", "version": "2.1.300", "message": {"id": "m1", "usage": {
+                "input_tokens": 3, "iterations": [{"input_tokens": 5}, {"input_tokens": 3}]}}}),
+            1,
+            None,
+        );
+        state.note_claude_response(
+            0,
+            &UsageTotals {
+                input_tokens: 3,
+                ..UsageTotals::default()
+            },
+            3,
+            0,
+        );
+        let start = state
+            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .expect("client version");
+        assert_eq!(start.client_version.as_deref(), Some("2.1.300"));
+        assert_eq!(start.opening_request_count, None);
+        assert_eq!(start.first_request_uncached_input_tokens, None);
+    }
+
+    #[test]
+    fn oversized_call_ids_are_not_retained() {
+        let mut state = measured_codex_state();
+        let id = "x".repeat(300 * 1024);
+        state.observe_codex_line(
+            &json!({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": id}}),
+            None,
+        );
+        assert!(state.calls.is_empty());
+        assert!(state.last_codex_call.is_none());
     }
 
     /// Cost receipt over local transcripts listed in
