@@ -108,6 +108,10 @@ pub(super) fn configure_singleton(
     candidate: &CandidateFile,
     index: &ScanIndex,
 ) {
+    // Inactive: no state, so Legacy parses and their heap charge are unchanged.
+    if CODEX_COUNTING_V2_CUTOVER_UNIX_MS.is_none() {
+        return;
+    }
     let evidence = AckEvidence::of_view(index.files.get(&local_index_key(&candidate.path)));
     configure(
         &mut parser.accumulator,
