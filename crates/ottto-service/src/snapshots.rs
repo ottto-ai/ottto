@@ -3995,6 +3995,13 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    // A reconstructed family is read only for this call's items (rebuild and
+    // posture below); the witness retain already keeps every earlier root.
+    // Reconstructing other witnesses cloned their API rows for no reader.
+    let item_roots = snapshots
+        .iter()
+        .map(claude_snapshot_family_root)
+        .collect::<BTreeSet<_>>();
     if census_complete && reports_healthy {
         let legacy_exclusions = derive_claude_legacy_usage_exclusions(
             &complete_families,
@@ -4046,7 +4053,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         reconstructed = index
             .claude_usage_family_witnesses
             .iter()
-            .filter(|(root_session_id, _)| !proven.contains_key(*root_session_id))
+            .filter(|(root_session_id, _)| {
+                item_roots.contains(*root_session_id) && !proven.contains_key(*root_session_id)
+            })
             .filter_map(|(root_session_id, witness)| {
                 reconstruct_claude_usage_family(
                     root_session_id,
@@ -4084,6 +4093,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         reconstructed = index
             .claude_usage_family_witnesses
             .iter()
+            .filter(|(root_session_id, _)| item_roots.contains(*root_session_id))
             .filter_map(|(root_session_id, witness)| {
                 reconstruct_claude_usage_family(
                     root_session_id,
