@@ -7,8 +7,10 @@
 //!
 //! Unlike `context_footprint` (a point-in-time `/context` snapshot of static
 //! config), this surface is a per-day *composition* aggregate derived from a
-//! deterministic scan of the local transcript files
-//! (`~/.claude/projects/<slug>/*.jsonl` and `~/.codex/sessions/**/*.jsonl`).
+//! deterministic scan of the local transcript files under the same roots the
+//! session sink reads (`~/.claude/projects` plus registered Claude config
+//! folders; `~/.codex/sessions`, `archived_sessions` and accepted Codex slot
+//! homes).
 //!
 //! The measurement methodology is a straight Rust port of the reference
 //! implementation `context_composition_audit.py` and its `methodology.md`; the
@@ -1379,7 +1381,7 @@ struct WorkspaceScan {
 }
 
 fn discover_workspaces(
-    root_dir: &Path,
+    roots: &[PathBuf],
     now: SystemTime,
     deadline: Instant,
 ) -> Result<Vec<WorkspaceScan>> {
@@ -1387,8 +1389,10 @@ fn discover_workspaces(
         return Err(anyhow!("workspace discovery budget expired"));
     }
     let mut files = Vec::new();
-    collect_recent_jsonl_files(root_dir, now, &mut files);
-    files.sort_by_key(|item| std::cmp::Reverse(item.1));
+    for root in roots {
+        collect_recent_jsonl_files(root, now, &mut files);
+    }
+    let files = newest_copy_per_file_name(files);
 
     // Map each transcript to a single workspace (its first resolvable cwd).
     let mut by_cwd: BTreeMap<String, WorkspaceScan> = BTreeMap::new();
@@ -1441,6 +1445,30 @@ fn discover_workspaces(
         return Err(anyhow!("workspace discovery budget expired"));
     }
     Ok(out)
+}
+
+/// Registered roots can hold one transcript twice: a copied account folder, or
+/// a rollout present in both `sessions` and `archived_sessions`. Transcript
+/// file names carry the session id, so each counts once, keeping the newest
+/// copy. Output is newest first, ties broken by path.
+fn newest_copy_per_file_name(mut files: Vec<(PathBuf, SystemTime)>) -> Vec<(PathBuf, SystemTime)> {
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut seen = std::collections::BTreeSet::new();
+    files.retain(|(path, _)| seen.insert(transcript_copy_key(path)));
+    files
+}
+
+/// Claude subagent ids are unique only within their parent session
+/// (`<session>/subagents/agent-<id>.jsonl`), so that key keeps the parent.
+fn transcript_copy_key(path: &Path) -> Vec<std::ffi::OsString> {
+    let name = path.file_name().map(|name| name.to_os_string());
+    let session = path
+        .parent()
+        .filter(|dir| dir.file_name() == Some(std::ffi::OsStr::new("subagents")))
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map(|session| session.to_os_string());
+    session.into_iter().chain(name).collect()
 }
 
 fn file_date(mtime: SystemTime) -> Date {
@@ -1692,13 +1720,26 @@ fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
             continue;
         }
         any_source = true;
+        // A partial root list would rebuild workspaces without the missing
+        // transcripts and replace their last good aggregates. Skip instead.
+        let roots = match crate::snapshot_roots::registered_scan_roots(source, home) {
+            Ok(roots) => roots,
+            Err(error) => {
+                eprintln!(
+                    "context composition harvest skipped for {}: {}",
+                    agent_source_label(source),
+                    crate::snapshot_sync::safe_error(&error)
+                );
+                continue;
+            }
+        };
         if let Err(error) = harvest_source(
             &client,
             &device,
             &device_secret,
             &machine_id,
             &api_base_url,
-            home,
+            &roots,
             support_dir,
             source,
         ) {
@@ -1728,7 +1769,7 @@ fn harvest_source(
     device_secret: &str,
     machine_id: &str,
     api_base_url: &str,
-    home: &Path,
+    roots: &[PathBuf],
     support_dir: &Path,
     source: SnapshotSource,
 ) -> Result<()> {
@@ -1753,14 +1794,12 @@ fn harvest_source(
 
     let deadline = Instant::now() + CONTEXT_COMPOSITION_CYCLE_BUDGET;
     let now = SystemTime::now();
-    let root_dir = match source {
-        SnapshotSource::ClaudeCode => home.join(".claude").join("projects"),
-        SnapshotSource::Codex => home.join(".codex").join("sessions"),
-        _ => return Ok(()),
-    };
+    if !matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
+        return Ok(());
+    }
     // An unresolved transcript can change grouping and full-replacement scope.
     // Abort before uploads or cache writes; retain last-good workspace data.
-    let workspaces = discover_workspaces(&root_dir, now, deadline)?;
+    let workspaces = discover_workspaces(roots, now, deadline)?;
     if workspaces.is_empty() {
         return Ok(());
     }
