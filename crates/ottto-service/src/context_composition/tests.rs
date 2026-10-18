@@ -922,6 +922,68 @@ fn codex_user_message_image_counted_text_skipped() {
 }
 
 // -------------------------------------------------------------------------
+// Codex injects AGENTS.md and environment context as USER-role messages.
+// Labeled non-`user.*` blocks are harness; typed `user.text` stays skipped
+// even when it looks like an injected block.
+//   ord1 agents_md + ord2 environment harness @res{4}=1; ord3 typed skipped.
+// -------------------------------------------------------------------------
+const CODEX_AGENTS_MD: &str =
+    "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nRULES\n</INSTRUCTIONS>";
+const CODEX_ENVIRONMENT: &str = "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>";
+
+#[test]
+fn codex_labeled_injected_user_blocks_are_harness() {
+    let recs = vec![
+        json!({"type":"session_meta","payload":{"id":"cinj"}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":CODEX_AGENTS_MD}],
+            "internal_chat_message_metadata_passthrough":{"content_item_kinds":["agents_md.instructions"]}}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":CODEX_ENVIRONMENT}],
+            "internal_chat_message_metadata_passthrough":{"content_item_kinds":["environments.environment_context"]}}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"# AGENTS.md instructions typed by the person"}],
+            "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}}}),
+        json!({"type":"response_item","payload":{"type":"function_call","name":"exec","call_id":"c1","arguments":"{}"}}),
+        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"OUT"}}),
+    ];
+    let mut report = WorkspaceReport::new(wide_window());
+    let fallback = Date::from_calendar_date(2026, Month::July, 19).unwrap();
+    let path = write_jsonl("codexinj", &recs);
+    parse_codex_session(&path, &mut report, fallback).unwrap();
+    let _ = fs::remove_file(&path);
+    let expected = estimate_text_tokens(CODEX_AGENTS_MD) + estimate_text_tokens(CODEX_ENVIRONMENT);
+    assert_eq!(
+        report.category_totals(Category::HarnessAttachments),
+        (2, expected, expected, 0)
+    );
+}
+
+// Unlabeled (older) rollouts fall back to the injected-block prefixes, per
+// block, so typed text in the same message is still skipped.
+#[test]
+fn codex_unlabeled_injected_user_blocks_use_prefixes() {
+    let recs = vec![
+        json!({"type":"session_meta","payload":{"id":"cleg"}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":CODEX_AGENTS_MD},
+            {"type":"input_text","text":"please fix the bug"}]}}),
+        json!({"type":"response_item","payload":{"type":"function_call","name":"exec","call_id":"c1","arguments":"{}"}}),
+        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"OUT"}}),
+    ];
+    let mut report = WorkspaceReport::new(wide_window());
+    let fallback = Date::from_calendar_date(2026, Month::July, 19).unwrap();
+    let path = write_jsonl("codexleg", &recs);
+    parse_codex_session(&path, &mut report, fallback).unwrap();
+    let _ = fs::remove_file(&path);
+    let expected = estimate_text_tokens(CODEX_AGENTS_MD);
+    assert_eq!(
+        report.category_totals(Category::HarnessAttachments),
+        (1, expected, expected, 0)
+    );
+}
+
+// -------------------------------------------------------------------------
 // Primitives.
 // -------------------------------------------------------------------------
 #[test]
