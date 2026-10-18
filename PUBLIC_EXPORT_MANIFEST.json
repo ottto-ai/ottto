@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 686,
-  "content_sha256": "50611dff8317b54f07cc25bc6568ff5a24cafe691ee4c1b96fcadcf4444b1b2a",
+  "candidate_file_count": 687,
+  "content_sha256": "1bbbb34b6933ecd19dc4e5cdaedc1595bce487130145e7eab3c5b01f9e07bf67",
   "files": [
     {
       "executable": false,
@@ -1007,8 +1007,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics.rs",
-      "sha256": "cf96789a02131bc7b7258586a5ac2d436baf08b64be53f4e1a35919d9f37e277",
-      "size_bytes": 27333
+      "sha256": "bfc90495cd9c2ea4b18b00686fac356cbf8edd2acf0c8003a5506891b1b7a70f",
+      "size_bytes": 31993
     },
     {
       "executable": false,
@@ -1259,8 +1259,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "ee8d4c6c4aa4872b84615665f459174b5619b126dbcb7cdee345c06fea2ee107",
-      "size_bytes": 2628795
+      "sha256": "63508d1778319b57ba1a96582d425346379e2365393ecf6d0ff01f174de2167d",
+      "size_bytes": 2635485
     },
     {
       "executable": false,
@@ -1462,15 +1462,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "aa566f84c7d6e0d6b564631a530664ac1ca7fb55abde35a7bf2bfaa2993f1f4b",
-      "size_bytes": 13117
+      "sha256": "a9875b141e2f463c82923188ecd3fb91e2d1f525ca04f6af9665094b679c18ec",
+      "size_bytes": 13258
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "c814ff60ca57c8921731627185692db78c02c800db64e2055da03458fc57977c",
-      "size_bytes": 71874
+      "sha256": "58c369aaa4780ca3353975deeb99dcf91159690cc4b378dec2b666fc4a978cca",
+      "size_bytes": 74367
     },
     {
       "executable": false,
@@ -3046,6 +3046,13 @@
       "path": "docs/session-2026-10-18-page-scoped-witness-reconstruction.md",
       "sha256": "e7fc1d9eea0a208f34f52f1afb9ed154a71cc66d930b8e6ba5e6c9e075a081f7",
       "size_bytes": 2396
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-sampled-acquisition-causal-diagnostics.md",
+      "sha256": "7f3e819aba1b9b5181ea22b2cd7b28e34819c0991413a0ef8f657f2be3c9e058",
+      "size_bytes": 3035
     },
     {
       "executable": false,
@@ -4805,9 +4812,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T14:20:08+00:00",
+  "generated_at": "2026-10-18T14:46:51+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 687,
+  "output_file_count": 688,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4844,5 +4851,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "afa5243441bc2970c1c708e571e520d1578a58d2"
+  "source_commit": "b113119e49b530e36c543df9d1c18280b8a4490f"
 }
