@@ -8679,6 +8679,10 @@ struct ClaudeDesktopTitleIndexEntry {
     /// this one with the app's `start_session` tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     spawned_from_desktop_session_id: Option<String>,
+    /// `spawnedFrom` is present but its session id is missing or malformed:
+    /// the starting session is unknown, which is not the same as none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    spawned_from_unresolved: bool,
 }
 
 /// Directory identity is original only for a native, unimported session. Desktop's
@@ -8935,6 +8939,7 @@ impl ClaudeTitleMetadata {
                             || previous.desktop_session_id != entry.desktop_session_id
                             || previous.spawned_from_desktop_session_id
                                 != entry.spawned_from_desktop_session_id
+                            || previous.spawned_from_unresolved != entry.spawned_from_unresolved
                     });
                     index
                         .claude_desktop_title_files
@@ -8951,6 +8956,7 @@ impl ClaudeTitleMetadata {
                         .is_some_and(|entry| {
                             entry.desktop_session_id.is_some()
                                 || entry.spawned_from_desktop_session_id.is_some()
+                                || entry.spawned_from_unresolved
                         });
                     index
                         .claude_desktop_title_files
@@ -9063,9 +9069,9 @@ impl ClaudeTitleMetadata {
     }
 }
 
-/// Deepest desktop spawn chain followed. Real chains are a few levels; the
-/// bound matches the backend's `spawn_depth` limit and stops a pathological or
-/// cyclic store.
+/// Deepest desktop spawn chain reported with a root and depth. Real chains are
+/// a few levels; the bound matches the backend's `spawn_depth` limit. Deeper
+/// chains keep their direct edge only.
 const MAX_CLAUDE_DESKTOP_SPAWN_DEPTH: usize = 9;
 
 /// What the store says about one session's starting session.
@@ -9091,6 +9097,7 @@ fn claude_desktop_spawn_lineage<'a>(
 ) -> BTreeMap<String, ClaudeDesktopSpawnLineage> {
     let mut cli_by_desktop: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut parent_desktop_by_cli: BTreeMap<&str, BTreeSet<Option<&str>>> = BTreeMap::new();
+    let mut unresolved_parent: BTreeSet<&str> = BTreeSet::new();
     for entry in entries {
         if let Some(desktop_id) = entry.desktop_session_id.as_deref() {
             cli_by_desktop
@@ -9102,11 +9109,17 @@ fn claude_desktop_spawn_lineage<'a>(
             .entry(entry.cli_session_id.as_str())
             .or_default()
             .insert(entry.spawned_from_desktop_session_id.as_deref());
+        if entry.spawned_from_unresolved {
+            unresolved_parent.insert(entry.cli_session_id.as_str());
+        }
     }
     let resolve = |session: &str| -> ClaudeDesktopSpawnParent<'_> {
         let Some(parents) = parent_desktop_by_cli.get(session) else {
             return ClaudeDesktopSpawnParent::Unresolved;
         };
+        if unresolved_parent.contains(session) {
+            return ClaudeDesktopSpawnParent::Unresolved;
+        }
         match parents.iter().copied().collect::<Vec<_>>()[..] {
             [None] => ClaudeDesktopSpawnParent::Root,
             [Some(parent_desktop_id)] => {
@@ -9139,14 +9152,17 @@ fn claude_desktop_spawn_lineage<'a>(
                         // The child is on a cycle: no edge it is part of is real.
                         continue 'children;
                     }
-                    if depth >= MAX_CLAUDE_DESKTOP_SPAWN_DEPTH || !seen.insert(next) {
+                    // The walk is bounded by `seen`, not by the depth cap, so
+                    // cycle membership is decided at any length.
+                    if !seen.insert(next) {
                         break None;
                     }
                     root = next;
                     depth += 1;
                 }
             }
-        };
+        }
+        .filter(|(_, depth)| *depth <= MAX_CLAUDE_DESKTOP_SPAWN_DEPTH);
         lineage.insert(
             child.to_string(),
             ClaudeDesktopSpawnLineage {
@@ -9417,6 +9433,10 @@ fn load_claude_desktop_session_title(
         string_at(&value, &["sessionId"]).filter(|id| is_claude_desktop_session_id(id));
     let spawned_from_desktop_session_id = string_at(&value, &["spawnedFrom", "sessionId"])
         .filter(|id| is_claude_desktop_session_id(id));
+    let spawned_from_unresolved = spawned_from_desktop_session_id.is_none()
+        && value
+            .get("spawnedFrom")
+            .is_some_and(|value| !value.is_null());
     Ok(Some(ClaudeDesktopTitleIndexEntry {
         cli_session_id,
         title,
@@ -9425,6 +9445,7 @@ fn load_claude_desktop_session_title(
         original_identity,
         desktop_session_id,
         spawned_from_desktop_session_id,
+        spawned_from_unresolved,
     }))
 }
 
@@ -48889,6 +48910,7 @@ mod tests {
             original_identity: None,
             desktop_session_id: Some(desktop.to_string()),
             spawned_from_desktop_session_id: spawned_from.map(str::to_string),
+            spawned_from_unresolved: false,
         }
     }
 
@@ -48983,6 +49005,60 @@ mod tests {
         // The cycle members themselves get no edge at all.
         assert!(!lineage.contains_key("x1"));
         assert!(!lineage.contains_key("x2"));
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_treats_malformed_spawned_from_as_unknown() {
+        let mut malformed = desktop_spawn_entry("p-bad", "local_p_bad", None);
+        malformed.spawned_from_unresolved = true;
+        let entries = [
+            malformed,
+            desktop_spawn_entry("c-bad", "local_c_bad", Some("local_p_bad")),
+        ];
+        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        assert_eq!(
+            lineage.get("c-bad"),
+            Some(&ClaudeDesktopSpawnLineage {
+                parent_session_id: "p-bad".to_string(),
+                root_session_id: None,
+                spawn_depth: None,
+            })
+        );
+        assert!(!lineage.contains_key("p-bad"));
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_drops_cycles_longer_than_the_depth_cap() {
+        let length = MAX_CLAUDE_DESKTOP_SPAWN_DEPTH + 2;
+        let entries = (0..length)
+            .map(|position| {
+                let parent = format!("local_a{}", (position + 1) % length);
+                desktop_spawn_entry(
+                    &format!("a{position}"),
+                    &format!("local_a{position}"),
+                    Some(&parent),
+                )
+            })
+            .collect::<Vec<_>>();
+        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        assert!(lineage.is_empty(), "{lineage:?}");
+
+        // A long acyclic chain keeps every direct edge; only depth is capped.
+        let chain = (0..length)
+            .map(|position| {
+                let parent = (position > 0).then(|| format!("local_b{}", position - 1));
+                desktop_spawn_entry(
+                    &format!("b{position}"),
+                    &format!("local_b{position}"),
+                    parent.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let lineage = claude_desktop_spawn_lineage(chain.iter());
+        assert_eq!(lineage.len(), length - 1);
+        assert_eq!(lineage["b9"].spawn_depth, Some(9));
+        assert_eq!(lineage["b10"].spawn_depth, None);
+        assert_eq!(lineage["b10"].parent_session_id, "b9");
     }
 
     #[test]
@@ -58299,7 +58375,7 @@ crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier
 crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before);
 crate::heap_layout_bound::fields!(ClaudeDesktopIdentityEvidence; account_identifier_hash, provider_workspace_hash, source_created_at, imported);
 crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id, root_session_id, spawn_depth);
-crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id);
+crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
 crate::heap_layout_bound::fields!(ClaudeDuplicateRequestOwner; root_session_id_hash, source_session_id_hash);
 crate::heap_layout_bound::fields!(ClaudeOwnedStartCensusWitness; marker_source_file_fingerprint, verified_source_file_fingerprint, emitted_source_file_fingerprint);
 crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded);
