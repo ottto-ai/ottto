@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 682,
-  "content_sha256": "d9603aec3cfe4ddce64e45b12fa66c286a3b9f99a6f1eec60d5068b8b2d7928c",
+  "content_sha256": "3047e32fd8257e0532702e2e765b82b998f6615c5f7cb2102c098049da350ea6",
   "files": [
     {
       "executable": false,
@@ -720,8 +720,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/codex_saved_quota.rs",
-      "sha256": "02c93090a53c227a06f67c0636184949570f9210fb071751f9a615d4cad0667d",
-      "size_bytes": 99931
+      "sha256": "9da86872d60d1ee731523a3e90e3f7e8705b48e146624b7fde6ad600da05c065",
+      "size_bytes": 106264
     },
     {
       "executable": false,
@@ -3009,8 +3009,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-18-codex-same-login-shared-read.md",
-      "sha256": "9a09bd07aac11a506f6379acb427b404e6b8d347c1f47860619f9309c7dbd4a7",
-      "size_bytes": 3211
+      "sha256": "b5c94691ad576d42b3c6be79e8d1ba451992f4279173a17a2ef8770e56e6cadf",
+      "size_bytes": 4174
     },
     {
       "executable": false,
@@ -4777,7 +4777,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T11:58:05+00:00",
+  "generated_at": "2026-10-18T12:32:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 683,
   "public_roots": [

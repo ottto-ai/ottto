@@ -566,8 +566,9 @@ fn serve_saved_at(
     now: u64,
 ) -> Result<CodexUsageProbe, CodexQuotaFailure> {
     let current = login_mark(home, home_trust);
-    let own = serve_saved_copy(read_saved_at(support_dir, home).as_ref(), &current, now);
-    let shared = || serve_same_login_reading(support_dir, home, &current, now);
+    let saved = read_saved_at(support_dir, home);
+    let own = serve_saved_copy(saved.as_ref(), &current, now);
+    let shared = || serve_same_login_reading(support_dir, home, saved.as_ref(), &current, now);
     match own {
         Ok(own) => Ok(match shared() {
             Some(shared) if shared.observed_at > own.observed_at => shared.probe,
@@ -580,26 +581,44 @@ fn serve_saved_at(
     }
 }
 
-/// The reading of the home that reads for `home`, while both homes' current
-/// credentials and that reading name the same account and workspace and its
-/// latest read did not fail. Never reads the provider.
+/// The reading of the home that reads for `home`, while both homes hold the
+/// same account and workspace ([`held_binding`]), that reading names them,
+/// and its latest read did not fail. Never reads the provider.
 fn serve_same_login_reading(
     support_dir: &Path,
     home: &Path,
+    saved: Option<&SavedCodexQuota>,
     current: &LoginMark,
     now: u64,
 ) -> Option<ServedReading> {
-    let binding = current.binding.as_ref()?;
+    let binding = held_binding(saved, current)?;
     let (reader, reader_trust) = same_login_reader(support_dir, home)?;
     let reader_current = login_mark(&reader, reader_trust);
-    if reader_current.binding.as_ref() != Some(binding) {
+    let reader_saved = read_saved_at(support_dir, &reader)?;
+    if held_binding(Some(&reader_saved), &reader_current).as_ref() != Some(&binding)
+        || reader_saved.binding().as_ref() != Some(&binding)
+        || !latest_read_succeeded(&reader_saved)
+    {
         return None;
     }
-    let saved = read_saved_at(support_dir, &reader)?;
-    if saved.binding().as_ref() != Some(binding) || !latest_read_succeeded(&saved) {
-        return None;
+    serve_saved_copy(Some(&reader_saved), &reader_current, now).ok()
+}
+
+/// The account and workspace a home holds now, from local files only: the
+/// ones its credential names, or, when it names none (its id token lives an
+/// hour, and only a read refreshes it), its saved reading's while its latest
+/// read did not fail and `auth.json` is unchanged since that read. An
+/// unchanged file still holds the login the provider validated, so this never
+/// takes one login for another.
+fn held_binding(saved: Option<&SavedCodexQuota>, current: &LoginMark) -> Option<String> {
+    if let Some(binding) = current.binding.as_ref() {
+        return Some(binding.clone());
     }
-    serve_saved_copy(Some(&saved), &reader_current, now).ok()
+    let saved = saved.filter(|saved| latest_read_succeeded(saved))?;
+    let reading = saved.reading.as_ref()?;
+    (reading.login.auth.is_some() && reading.login.auth == current.auth)
+        .then(|| saved.binding())
+        .flatten()
 }
 
 fn serve_saved_copy(
@@ -740,7 +759,7 @@ fn read_and_save_at(
     // retry it on every tick.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read))
         .unwrap_or_else(|_| Err(CODEX_QUOTA_READ_PANICKED.to_string()));
-    let finished_at = current_unix_seconds().max(now);
+    let finished_at = read_finished_at(support_dir, now);
     let after = login_mark(home, home_trust);
     // A login that changed while the read ran leaves the reading unsaved: it
     // cannot be told which login it belongs to. The attempt then records the
@@ -783,6 +802,23 @@ fn read_and_save_at(
     }
     write_saved_at(support_dir, home, &next);
     Some(result)
+}
+
+/// When a read finished: the wall clock, never before the trigger's clock.
+#[cfg(not(test))]
+fn read_finished_at(_support_dir: &Path, now: u64) -> u64 {
+    current_unix_seconds().max(now)
+}
+
+/// As in the daemon, except under a support dir whose test pinned reads to
+/// finish at the trigger's clock, so a slow run cannot shift its schedule.
+#[cfg(test)]
+fn read_finished_at(support_dir: &Path, now: u64) -> u64 {
+    if tests::reads_finish_at_trigger_clock(support_dir) {
+        now
+    } else {
+        current_unix_seconds().max(now)
+    }
 }
 
 /// The refresh interval of a home.
@@ -1034,15 +1070,16 @@ fn scheduled_home(
 }
 
 /// The login a home may share with another home: its saved reading's account
-/// and workspace, while its current credential names the same ones and its
-/// latest read did not fail. `None`: the home is read on its own.
+/// and workspace, while it still holds them ([`held_binding`]) and its latest
+/// read did not fail. `None`: the home is read on its own.
 fn shareable_binding(support_dir: &Path, home: &ScheduledHome) -> Option<String> {
     let saved = read_saved_at(support_dir, &home.home)?;
     if !latest_read_succeeded(&saved) {
         return None;
     }
     let binding = saved.binding()?;
-    (login_mark(&home.home, home.trust).binding.as_ref() == Some(&binding)).then_some(binding)
+    (held_binding(Some(&saved), &login_mark(&home.home, home.trust)).as_ref() == Some(&binding))
+        .then_some(binding)
 }
 
 /// For each home, the index of the home that reads for it: itself, or, for
@@ -2100,17 +2137,37 @@ mod tests {
         assert!(process_scan_due(10_000 + 3_600, 10_000));
     }
 
-    /// Write a credential that names `user` in `workspace`.
-    fn sign_in_home(home: &Path, user: &str, workspace: &str) {
+    /// Support dirs whose reads finish at the trigger's clock.
+    fn pinned_support_dirs() -> MutexGuard<'static, BTreeSet<PathBuf>> {
+        static PINNED: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+        PINNED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) fn reads_finish_at_trigger_clock(support_dir: &Path) -> bool {
+        pinned_support_dirs().contains(support_dir)
+    }
+
+    /// Write a credential that names `user` in `workspace`, with an id token
+    /// that expires `id_token_lifetime` seconds from now (in the past when
+    /// negative) and an access token that lives 30 days.
+    fn sign_in_home_with_id_token_lifetime(
+        home: &Path,
+        user: &str,
+        workspace: &str,
+        id_token_lifetime: i64,
+    ) {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         use std::os::unix::fs::PermissionsExt;
-        let jwt = |user: &str, workspace: &str| {
+        let jwt = |user: &str, workspace: &str, lifetime: i64| {
             let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
             let payload = URL_SAFE_NO_PAD.encode(
                 serde_json::json!({
                     "iss": "https://auth.openai.com",
                     "aud": "synthetic-client",
-                    "exp": OffsetDateTime::now_utc().unix_timestamp() + 30 * 86_400,
+                    "exp": OffsetDateTime::now_utc().unix_timestamp() + lifetime,
                     "https://api.openai.com/auth": {
                         "chatgpt_user_id": user,
                         "chatgpt_account_id": workspace,
@@ -2126,8 +2183,8 @@ mod tests {
             &auth,
             serde_json::json!({
                 "tokens": {
-                    "access_token": jwt(user, workspace),
-                    "id_token": jwt(user, workspace),
+                    "access_token": jwt(user, workspace, 30 * 86_400),
+                    "id_token": jwt(user, workspace, id_token_lifetime),
                 },
                 "account_id": workspace,
             })
@@ -2147,7 +2204,7 @@ mod tests {
     }
 
     /// Homes on the schedule with fake provider reads that answer for each
-    /// home's current login, and count.
+    /// home's current login, and count. Reads finish at the round's clock.
     struct SameLoginFixture {
         root: PathBuf,
         /// (name, ownership, home)
@@ -2160,6 +2217,7 @@ mod tests {
     impl SameLoginFixture {
         fn new(label: &str, homes: &[(&'static str, bool, &str, &str)]) -> Self {
             let root = scratch(label);
+            pinned_support_dirs().insert(root.clone());
             let fixture = Self {
                 homes: homes
                     .iter()
@@ -2208,8 +2266,18 @@ mod tests {
         }
 
         fn sign_in(&self, name: &str, user: &str, workspace: &str) {
+            self.sign_in_with_id_token_lifetime(name, user, workspace, 30 * 86_400);
+        }
+
+        fn sign_in_with_id_token_lifetime(
+            &self,
+            name: &str,
+            user: &str,
+            workspace: &str,
+            id_token_lifetime: i64,
+        ) {
             let home = self.home(name).clone();
-            sign_in_home(&home, user, workspace);
+            sign_in_home_with_id_token_lifetime(&home, user, workspace, id_token_lifetime);
             self.logins
                 .lock()
                 .unwrap()
@@ -2291,6 +2359,7 @@ mod tests {
 
     impl Drop for SameLoginFixture {
         fn drop(&mut self) {
+            pinned_support_dirs().remove(&self.root);
             let _ = std::fs::remove_dir_all(&self.root);
         }
     }
@@ -2309,7 +2378,7 @@ mod tests {
                 ("other", false, "user-b", "workspace-a"),
             ],
         );
-        let start = current_unix_seconds() + 30;
+        let start = current_unix_seconds();
         // Nothing read yet: nothing is known to be shared.
         assert_eq!(
             fixture.round(start, false, &[]),
@@ -2371,7 +2440,7 @@ mod tests {
                 ("slot", false, "user-a", "workspace-b"),
             ],
         );
-        let start = current_unix_seconds() + 30;
+        let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "slot"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
         assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["slot"]);
@@ -2382,6 +2451,85 @@ mod tests {
         let (refresh, reads) = fixture.refresh(start + 17 * 60);
         assert_eq!((refresh.read, refresh.rate_limited), (2, 0));
         assert_eq!(reads, ["default", "slot"]);
+    }
+
+    /// The slot's id token expired an hour after its own read, while its
+    /// `auth.json` is unchanged since then: it still holds the login it read,
+    /// so it stays shared, is served the default home's fresh reading, and is
+    /// read by itself only for the keep-alive.
+    #[test]
+    fn a_twin_whose_id_token_expired_stays_shared_until_its_keepalive() {
+        let fixture = SameLoginFixture::new(
+            "same-login-expired-id-token",
+            &[
+                ("default", true, "user-a", "workspace-a"),
+                ("twin", false, "user-a", "workspace-a"),
+            ],
+        );
+        fixture.sign_in_with_id_token_lifetime("twin", "user-a", "workspace-a", -60);
+        assert_eq!(
+            login_mark(fixture.home("twin"), fixture.trust("twin")).binding,
+            None
+        );
+        let start = current_unix_seconds();
+        assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
+        assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
+        assert!(fixture.round(start + 15 * 60, false, &[]).is_empty());
+        assert_eq!(fixture.round(start + 20 * 60, false, &[]), ["default"]);
+        assert_eq!(fixture.round(start + 35 * 60, false, &[]), ["default"]);
+        // Fresh, although the slot's own reading is 35 minutes old.
+        let served = fixture.served("twin", start + 35 * 60);
+        assert_eq!(served.response_completed_at, Some(rfc3339(start + 35 * 60)));
+        assert!(served
+            .quota_windows
+            .iter()
+            .all(|window| window.freshness == AgentQuotaWindowFreshness::Fresh));
+
+        let day = start + SAME_LOGIN_KEEPALIVE_SECONDS;
+        assert!(!fixture
+            .round(day - 60, false, &[])
+            .contains(&"twin".to_string()));
+        assert!(fixture.round(day, false, &[]).contains(&"twin".to_string()));
+    }
+
+    /// The slot's `auth.json` is rewritten after its read and names no login:
+    /// it may hold another one now, so it is never served the default home's
+    /// reading, and it is back on its own schedule.
+    #[test]
+    fn a_rewritten_credential_that_names_no_login_ends_the_sharing() {
+        let fixture = SameLoginFixture::new(
+            "same-login-rewritten-unnamed",
+            &[
+                ("default", true, "user-a", "workspace-a"),
+                ("twin", false, "user-a", "workspace-a"),
+            ],
+        );
+        fixture.sign_in_with_id_token_lifetime("twin", "user-a", "workspace-a", -60);
+        let start = current_unix_seconds();
+        assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
+        assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
+        assert_eq!(
+            fixture.served_at("twin", start + 5 * 60 + 10),
+            Ok(rfc3339(start + 5 * 60))
+        );
+
+        fixture.sign_in_with_id_token_lifetime("twin", "user-a", "workspace-a", -60);
+        std::fs::File::options()
+            .write(true)
+            .open(fixture.home("twin").join("auth.json"))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        assert_eq!(
+            fixture.served_at("twin", start + 5 * 60 + 30),
+            Err(CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
+        assert!(fixture.round(start + 15 * 60 - 1, false, &[]).is_empty());
+        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["twin"]);
+        assert_eq!(
+            fixture.served_at("twin", start + 15 * 60),
+            Ok(rfc3339(start + 15 * 60))
+        );
     }
 
     /// When the default home signs into another account, the slot no longer
@@ -2397,7 +2545,7 @@ mod tests {
                 ("twin", false, "user-a", "workspace-a"),
             ],
         );
-        let start = current_unix_seconds() + 30;
+        let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
         assert_eq!(
@@ -2434,7 +2582,7 @@ mod tests {
                 ("twin", false, "user-a", "workspace-a"),
             ],
         );
-        let start = current_unix_seconds() + 30;
+        let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
         fixture.failing.lock().unwrap().insert("default");
@@ -2472,7 +2620,7 @@ mod tests {
                 ("twin", false, "user-a", "workspace-a"),
             ],
         );
-        let start = current_unix_seconds() + 30;
+        let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
         fixture.failing.lock().unwrap().insert("twin");
         let day = start + SAME_LOGIN_KEEPALIVE_SECONDS;
@@ -2497,7 +2645,7 @@ mod tests {
                 ("other", false, "user-b", "workspace-a"),
             ],
         );
-        let start = current_unix_seconds() + 30;
+        let start = current_unix_seconds();
         assert_eq!(
             fixture.round(start, false, &[]),
             ["default", "other", "twin"]
@@ -2527,7 +2675,7 @@ mod tests {
                 ("twin", false, "user-a", "workspace-a"),
             ],
         );
-        let start = current_unix_seconds() + 30;
+        let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
 
