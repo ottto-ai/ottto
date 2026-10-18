@@ -1791,8 +1791,8 @@ pub(super) mod tests {
         assert_eq!(restarted.semantic_noop_count, 2);
         fs::remove_dir_all(root).unwrap();
     }
-    #[test]
-    fn counting_v2_group_is_configured_once_and_folded_once() {
+    /// The two-member fixture with creation times, so a cutover can select V2.
+    fn counting_v2_fixture() -> (PathBuf, [String; 2]) {
         let (root, _) = fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         for (name, rows) in [
@@ -1812,6 +1812,57 @@ pub(super) mod tests {
         }
         let keys = ["a", "b"]
             .map(|name| local_index_key(&root.join("sessions").join(format!("{name}.jsonl"))));
+        (root, keys)
+    }
+    /// The selected local ACK facts the counting mark must move with.
+    fn local_ack(
+        entry: &ScanIndexEntry,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        (
+            entry.last_snapshot_fingerprint.clone(),
+            entry.last_upload_body_witness.clone(),
+            entry.codex_joined_member_set.clone(),
+            entry.codex_protected_owner.clone(),
+        )
+    }
+    /// Finalizes one scan, saves its selected index and reloads it.
+    fn save_selected(
+        root: &Path,
+        mut working: ScanIndex,
+        mut result: SourceScanResult,
+        previous: &ScanIndex,
+        hold_owner: Option<&str>,
+    ) -> ScanIndex {
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        if let Some(owner) = hold_owner {
+            result.hold_codex_groups(
+                &mut working,
+                previous,
+                &BTreeSet::from([resolve_codex_identity(owner)]),
+                "synthetic counting hold",
+            );
+        }
+        result.finish_codex_capture_boundary(&mut working);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        let path = root.join("index.json");
+        working
+            .committable_subset(previous, &accepted, &BTreeMap::new())
+            .save(&path)
+            .unwrap();
+        ScanIndex::load(&path).unwrap()
+    }
+    #[test]
+    fn counting_v2_group_is_configured_once_and_folded_once() {
+        let (root, keys) = counting_v2_fixture();
         let (legacy_index, legacy) = scan(&root, ScanIndex::default(), 2);
         let _cutover = codex_counting_version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
@@ -1836,6 +1887,52 @@ pub(super) mod tests {
         for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
             assert_eq!(counted.input_tokens, legacy.input_tokens);
             assert_eq!(counted.input_tokens, 300);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn counting_v2_member_mark_moves_only_with_the_selected_saved_ack() {
+        let (root, keys) = counting_v2_fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let previous = {
+            let _cutover = codex_counting_version::TestCutover::set(0);
+            let (index, result) = scan(&root, ScanIndex::default(), 2);
+            save_selected(&root, index, result, &ScanIndex::default(), None)
+        };
+        for key in &keys {
+            assert!(previous.files[key].codex_counting_v2, "saved V2 ACK");
+            assert!(previous.files[key].last_snapshot_fingerprint.is_some());
+        }
+        // New content, parsed by an inactive build: a Legacy group decision.
+        let path = root.join("sessions/b.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        for row in member(owner, "r-c", 200, 500).into_iter().skip(1) {
+            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
+        }
+        fs::write(&path, text).unwrap();
+        let legacy_scan = || {
+            let (working, result) = scan(&root, previous.clone(), 2);
+            for key in &keys {
+                assert!(!working.files[key].codex_counting_v2);
+            }
+            (working, result)
+        };
+        // A held group restores the old mark with the old ACK in saved state.
+        let (working, result) = legacy_scan();
+        let held = save_selected(&root, working, result, &previous, Some(owner));
+        for key in &keys {
+            assert!(held.files[key].codex_counting_v2, "mark kept with its ACK");
+            assert_eq!(local_ack(&held.files[key]), local_ack(&previous.files[key]));
+        }
+        // Paired control: the selected save records false with the new facts.
+        let (working, result) = legacy_scan();
+        let settled = save_selected(&root, working, result, &previous, None);
+        for key in &keys {
+            assert!(!settled.files[key].codex_counting_v2, "false with new ACK");
+            assert_ne!(
+                settled.files[key].last_snapshot_fingerprint,
+                previous.files[key].last_snapshot_fingerprint
+            );
         }
         fs::remove_dir_all(root).unwrap();
     }
