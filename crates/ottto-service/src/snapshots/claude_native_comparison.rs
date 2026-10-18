@@ -45,7 +45,16 @@ pub(crate) struct FoldView<'a> {
     native_window: Option<&'a str>,
     pub(super) lease: Option<&'a lifecycle::Lease>,
 }
-impl FoldView<'_> {
+impl<'a> FoldView<'a> {
+    /// Observe an executed BASE fold even without a native completion. This
+    /// carries no negative permission and cannot complete a native census.
+    pub(crate) fn observation_only(lease: &'a lifecycle::Lease) -> Self {
+        Self {
+            negatives: None,
+            native_window: None,
+            lease: Some(lease),
+        }
+    }
     pub(super) fn native_census_complete(&self, scan: &SourceScanResult) -> bool {
         self.native_window.is_some_and(|window| {
             scan.source == SnapshotSource::ClaudeCode

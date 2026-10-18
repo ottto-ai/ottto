@@ -6408,7 +6408,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         observations,
         comparison
             .as_deref()
-            .map(|comparison| comparison.fold_view(lease)),
+            .map(|comparison| comparison.fold_view(lease))
+            .or_else(|| {
+                lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
+            }),
     );
     if let Some(fallback) = comparison
         .as_deref()
@@ -8418,6 +8421,86 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::snapshots::finalize_scan_after_policy;
+    #[test]
+    fn native_comparison_decision_records_bounded_base_fold_without_completion() {
+        use crate::snapshots::claude_native_comparison::{lifecycle, Completion};
+        let root = crate::test_scratch::ScratchDir::new("native-decision-base-fold");
+        let transcripts = root.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        for id in ["bounded-a", "bounded-b"] {
+            let row = json!({"timestamp":"2026-10-18T12:00:00Z", "sessionId":id, "requestId":format!("req-{id}"), "message":{"id":format!("msg-{id}"), "model":"claude-opus-4-8", "usage":{"input_tokens":42,"output_tokens":1}}});
+            std::fs::write(transcripts.join(format!("{id}.jsonl")), format!("{row}\n")).unwrap();
+        }
+        let mut index = ScanIndex::default();
+        index.generation = 17;
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            &[transcripts],
+            &mut index,
+            "2026-10-18T12:05:00Z",
+            183,
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(scan.scanned_file_count, 1);
+        assert!(!scan.census_complete, "actual bounded BASE page");
+        let mut completion = Completion::base(None);
+        assert!(completion.is_none(), "no terminal native traversal exists");
+        let mut baseline_index = index.clone();
+        let mut baseline_scan = scan.clone();
+        let support = root.join("support");
+        let baseline = try_apply_claude_local_evidence_to_scan_with_comparison(
+            &support,
+            &mut baseline_scan,
+            &mut baseline_index,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let owner = std::sync::Arc::new(lifecycle::Lifecycle::default());
+        let (candidate, rows) = crate::local_resource_diagnostics::capture(|| {
+            let mut lease = owner.begin();
+            lease.bind_scope(lifecycle::Scope::from_arguments(format_args!(
+                "bounded-base"
+            )));
+            assert!(!lease.allowed());
+            try_apply_claude_local_evidence_to_scan_with_comparison(
+                &support,
+                &mut scan,
+                &mut index,
+                None,
+                None,
+                completion.as_mut(),
+                Some(&lease),
+            )
+            .unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["counts"]["fold_index_generation"], 17);
+        assert!(rows[0]["counts"]["terminal_rearm"].is_null());
+        assert!(!owner.retained_valid_for_test());
+        assert_eq!(candidate.0, baseline.0);
+        assert_eq!(candidate.1, baseline.1);
+        assert_eq!(
+            serde_json::to_value(&index).unwrap(),
+            serde_json::to_value(&baseline_index).unwrap()
+        );
+        assert_eq!(
+            scan.snapshots
+                .iter()
+                .map(snapshot_upload_body_witness)
+                .collect::<Vec<_>>(),
+            baseline_scan
+                .snapshots
+                .iter()
+                .map(snapshot_upload_body_witness)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn machine_icon_cache_preserves_missing_null_and_blank_echoes() {
         let root = crate::test_scratch::ScratchDir::new("machine-icon-cache");

@@ -55,3 +55,10 @@ the maximum-width record fixture is bounded below4KiB. Regressions distinguish
 unreached/abandoned boundaries from an actual saved and retained lifecycle,
 including a zero-deferral retained permit. The lifecycle fixture is logical;
 it does not claim supported native-path execution or installed CPU/RSS savings.
+
+An executed bounded BASE fold is observed even when no optional comparison
+completion or terminal native traversal exists. Its observation-only view
+carries the lease diagnostic, no negatives and no native census completion.
+The regression runs an actual one-file bounded page from two transcripts,
+checks the fold generation is recorded, and compares disposition, selected
+index and canonical body witnesses with the ordinary BASE control.
