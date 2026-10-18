@@ -181,7 +181,6 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
         reader.step(|value| seen.push(value.clone())).unwrap(),
         JsonlReaderStep::Line
     );
-    assert_eq!(reader.record_start_offset(), 0);
     assert_eq!(reader.last_complete_line_end(), 8);
     assert!(!reader.lossy_prefix());
     let mut partials = 0;
@@ -198,7 +197,6 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
         }
     }
     assert!(partials > 0, "the skip paused at least once");
-    assert_eq!(reader.record_start_offset(), 8);
     assert_eq!(reader.last_complete_line_end(), second);
     assert_eq!(reader.report.over_line_cap_count, 1);
     assert!(reader.lossy_prefix());
@@ -206,7 +204,6 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
         reader.step(|value| seen.push(value.clone())).unwrap(),
         JsonlReaderStep::Line
     );
-    assert_eq!(reader.record_start_offset(), second);
     assert!(matches!(
         reader.step(|value| seen.push(value.clone())).unwrap(),
         JsonlReaderStep::Complete(_)
@@ -216,6 +213,70 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
     assert_eq!(reader.last_complete_line_end(), frozen);
     assert_eq!(reader.report.physical_line_count, 3);
     assert_eq!(seen, vec![json!({"n":1}), json!({"n":2})]);
+}
+
+/// Parent S5 "Critical" (R1-B4): at sealed cursor completion a final record
+/// without its newline at or before the frozen extent is never parsed,
+/// counted or certified, even when no byte beyond the extent is visible.
+/// A read without an extent keeps today's trailing-line behavior.
+#[test]
+fn sealed_completion_withholds_unterminated_record_even_at_end_of_file() {
+    let mut input = b"{\"n\":1}\n{\"n\":2}\n".to_vec();
+    let sealed = input.len() as u64;
+    input.extend_from_slice(b"{\"n\":3}");
+    let read = |extent: Option<u64>| {
+        let mut reader =
+            BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()), 64, false);
+        if let Some(extent) = extent {
+            reader.set_extent_limit(extent);
+        }
+        let mut seen = Vec::new();
+        loop {
+            match reader.step(|value| seen.push(value.clone())).unwrap() {
+                JsonlReaderStep::Line | JsonlReaderStep::Partial => {}
+                JsonlReaderStep::Complete(report) => return (seen, report, reader),
+            }
+        }
+    };
+    // The file ends exactly at the extent: nothing beyond it is visible.
+    let (seen, report, reader) = read(Some(input.len() as u64));
+    assert_eq!(seen, vec![json!({"n":1}), json!({"n":2})]);
+    assert!(reader.sealed_fragment());
+    assert_eq!(report.physical_line_count, 2);
+    assert_eq!(report.parsed_json_line_count, 2);
+    assert_eq!(reader.last_complete_line_end(), sealed);
+    assert!(reader.consumed_bytes() > reader.last_complete_line_end());
+    // Unchanged non-cursor trailing-line behavior: the last line is parsed.
+    let (seen, report, reader) = read(None);
+    assert_eq!(seen, vec![json!({"n":1}), json!({"n":2}), json!({"n":3})]);
+    assert!(!reader.sealed_fragment());
+    assert_eq!(report.physical_line_count, 3);
+    assert_eq!(report.parsed_json_line_count, 3);
+}
+
+/// S12 (R1-B5): `finish` honours a grown object only for the identity the
+/// passed certificate proved, and only while the held FD is still that
+/// object and no shorter than the frozen extent.
+#[test]
+fn sealed_prefix_grant_holds_only_for_the_certified_object() {
+    let temp = Temp::new("prefix-grant", b"{\"a\":1}\n");
+    let file = File::open(&temp.0).unwrap();
+    let open = OpenStamp::capture(&file).unwrap();
+    let grant = SealedPrefix {
+        dev: open.dev,
+        ino: open.ino,
+        extent: open.extent,
+    };
+    assert!(grant.holds(&file));
+    temp.append(b"{\"b\":2}\n");
+    assert!(grant.holds(&file), "growth past the frozen extent");
+    assert!(!SealedPrefix {
+        extent: open.extent + 1_000,
+        ..grant
+    }
+    .holds(&file));
+    let other = Temp::new("prefix-grant-other", b"{\"a\":1}\n{\"b\":2}\n");
+    assert!(!grant.holds(&File::open(&other.0).unwrap()));
 }
 
 #[test]

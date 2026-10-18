@@ -198,7 +198,32 @@ impl OpenStamp {
     /// Same object, no shrink, and no equal-length in-place change. Growth
     /// is compatible: appended bytes are outside the frozen extent.
     fn append_compatible(&self, now: &Self) -> bool {
-        self.dev == now.dev && self.ino == now.ino && (now.extent > self.extent || now == self)
+        self.same_object(now) && (now.extent > self.extent || now == self)
+    }
+
+    fn same_object(&self, other: &Self) -> bool {
+        self.dev == other.dev && self.ino == other.ino
+    }
+}
+
+/// The identity a cursor job proved against its held FD when its prefix
+/// certificate passed (S12). Only `finish_job` sets it, on `Certified` or
+/// lossy-with-intact-samples `Uncertified`; `finish` then accepts a grown
+/// object only while the held FD is still this dev/ino and at least the
+/// frozen extent long.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct SealedPrefix {
+    dev: u64,
+    ino: u64,
+    extent: u64,
+}
+crate::heap_layout_bound::fields!(SealedPrefix; dev, ino, extent);
+
+impl SealedPrefix {
+    pub(in crate::snapshots) fn holds(&self, file: &File) -> bool {
+        OpenStamp::capture(file).is_ok_and(|now| {
+            now.dev == self.dev && now.ino == self.ino && now.extent >= self.extent
+        })
     }
 }
 
@@ -551,9 +576,14 @@ pub(in crate::snapshots) fn finish_job(
             parser.accumulator.dropped_usage_record_count,
         );
     let consumed = parser.reader.consumed_bytes();
+    let mut frozen_end = None;
     let result = match (parser.reader.acquisition.take(), current_scope) {
         (Some(plan), Some(scope)) => {
             let consumed_end = plan.start_offset().saturating_add(consumed);
+            frozen_end = parser
+                .reader
+                .extent_limit
+                .map(|limit| plan.start_offset().saturating_add(limit));
             plan.commit_sealed_prefix(
                 parser.reader.reader.get_mut(),
                 path_same_object,
@@ -589,6 +619,15 @@ pub(in crate::snapshots) fn finish_job(
         None => {
             cache.with_cursor(update);
         }
+    }
+    if matches!(result, Ok(_) | Err(PrefixRefusal::Lossy)) {
+        // Every object check passed against the held FD: the only grant
+        // `finish` honours for a grown object (S12).
+        job.parser.reader.sealed_prefix = frozen_end.map(|extent| SealedPrefix {
+            dev: meta.stamp_open.dev,
+            ino: meta.stamp_open.ino,
+            extent,
+        });
     }
     match result {
         Ok(checkpoint) => JobEnd::Certified { checkpoint, grown },
@@ -630,6 +669,11 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
     let Some(meta) = job.cursor.as_mut() else {
         return false;
     };
+    if !meta.stamp_open.same_object(&stamp_open) {
+        // The replay reopened the path onto another object: replacement
+        // during the fallback must not publish under this job's identity.
+        return false;
+    }
     job.parser
         .reader
         .set_chunked_skip(Limits::current().skip_chunk);

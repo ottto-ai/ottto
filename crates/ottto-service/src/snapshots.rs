@@ -17251,8 +17251,8 @@ impl OwnedJsonlParser {
         } = self;
         let mut reader = bounded.reader;
         let report = bounded.report;
-        // Only a resumable cursor job freezes its extent (S6).
-        let cursor_frozen_extent = bounded.extent_limit.is_some();
+        // Present only for a cursor job whose prefix certificate passed (S12).
+        let sealed_prefix = bounded.sealed_prefix;
         let mut ownership_incomplete_file_count = 0;
         // The bounded reader cannot prove that a skipped physical line contained
         // no usage. Account one potential recognized usage record per line while
@@ -17262,12 +17262,15 @@ impl OwnedJsonlParser {
             recognized_usage_drop_count.saturating_add(report.over_line_cap_count);
         let observed_after_read = opened_object_identity(source, reader.get_mut())
             .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
-        // A cursor job read only up to the extent frozen at open; appended
-        // bytes belong to the next tail, so its object may have grown. Its
-        // caller already proved same dev/ino, no shrink, no same-size edit,
-        // unchanged held-FD samples and scope (`commit_sealed_prefix`) and
-        // discarded the result otherwise.
-        if observed_after_read != expected_opened_object_identity && !cursor_frozen_extent {
+        // A cursor job read only up to its frozen extent; appended bytes
+        // belong to the next tail, so its object may have grown. Only a job
+        // whose prefix certificate passed against the held FD carries
+        // `sealed_prefix` (same dev/ino, no shrink, no same-size edit, held-FD
+        // samples, scope), and the held FD must still be that dev/ino and at
+        // least the frozen extent long. Every other read keeps exact equality.
+        let certified_grown_prefix =
+            sealed_prefix.is_some_and(|prefix| prefix.holds(reader.get_ref()));
+        if observed_after_read != expected_opened_object_identity && !certified_grown_prefix {
             return Err(anyhow::anyhow!(
                 "opened snapshot candidate changed while it was parsed"
             ));
@@ -17806,11 +17809,14 @@ struct BoundedJsonlReader<R> {
     extent_limit: Option<u64>,
     /// Physical bytes consumed from `reader`, including skipped bytes.
     consumed: u64,
-    record_start: u64,
     last_line_end: u64,
-    /// The extent limit cut an unterminated record that continues past it.
-    /// Those bytes were neither delivered nor counted as a line.
+    /// A frozen-extent read ended on an unterminated record. Those bytes were
+    /// neither delivered nor counted as a line, even when nothing past the
+    /// extent was visible yet.
     sealed_fragment: bool,
+    /// Set only after a cursor job's prefix certificate passed against its
+    /// held FD: the identity `finish` may accept for a grown object (S12).
+    sealed_prefix: Option<sampled_scan::codex_cursor::SealedPrefix>,
 }
 
 impl<R: BufRead> BoundedJsonlReader<R> {
@@ -17828,9 +17834,9 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             skipping: false,
             extent_limit: None,
             consumed: 0,
-            record_start: 0,
             last_line_end: 0,
             sealed_fragment: false,
+            sealed_prefix: None,
         }
     }
 
@@ -17841,21 +17847,15 @@ impl<R: BufRead> BoundedJsonlReader<R> {
     }
 
     /// Freeze the readable extent (sealed-live mode). Bytes appended after
-    /// the extent belong to a later read; an unterminated record cut by the
-    /// extent is withheld, never parsed as a truncated line.
+    /// the extent belong to a later read; an unterminated record at the
+    /// extent is withheld, never parsed or counted, whether or not bytes past
+    /// the extent are visible yet.
     fn set_extent_limit(&mut self, limit: u64) {
         self.extent_limit = Some(limit.max(self.consumed));
     }
 
     fn consumed_bytes(&self) -> u64 {
         self.consumed
-    }
-
-    /// Start offset of the record the last `Line` step delivered.
-    // Tests only: S6 certifies `Samples::sealed_offset`, not record starts.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn record_start_offset(&self) -> u64 {
-        self.record_start
     }
 
     /// End offset of the last newline-terminated record consumed.
@@ -17906,16 +17906,12 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         let report = &mut self.report;
         let max_line_bytes = self.max_line_bytes;
         let salvage_codex_envelope = self.salvage_codex_envelope;
-        if !self.skipping {
-            self.record_start = self.consumed;
-        }
         // Accumulate one line, bounded to `max_line_bytes`. `line_complete`
         // tracks whether we reached a newline (vs. EOF) so we can stop the
         // outer loop on a trailing partial line.
         let mut line_complete = false;
         let mut overflowed = self.skipping;
         let mut skipped_this_step = 0_usize;
-        let mut beyond_extent = false;
         let reached_eof = loop {
             let raw = reader.fill_buf()?;
             let allowed = self.extent_limit.map_or(raw.len(), |limit| {
@@ -17924,7 +17920,6 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                     .min(raw.len())
             });
             if allowed == 0 {
-                beyond_extent = !raw.is_empty();
                 break true;
             }
             let available = &raw[..allowed];
@@ -17979,9 +17974,16 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             }
         };
         self.skipping = false;
-        if reached_eof && beyond_extent && (overflowed || !buf.is_empty()) && !line_complete {
-            // The frozen extent cut a record that continues past it. It is an
-            // unfinished record for this read, not a malformed line.
+        if reached_eof
+            && self.extent_limit.is_some()
+            && (overflowed || !buf.is_empty())
+            && !line_complete
+        {
+            // Sealed cursor completion (S5): a record without its newline at
+            // or before the frozen extent is unfinished for this read, even if
+            // no byte beyond the extent is visible yet. It is never parsed,
+            // counted or certified. Reads without an extent keep the normal
+            // trailing-line behavior below, byte-identical to before.
             self.sealed_fragment = true;
             self.finished = true;
             return Ok(JsonlReaderStep::Complete(*report));
@@ -61454,9 +61456,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
             skipping,
             extent_limit,
             consumed,
-            record_start,
             last_line_end,
             sealed_fragment,
+            sealed_prefix,
         } = self;
         c.add(reader.capacity())?;
         buf.heap_bound(c)?;
@@ -61470,9 +61472,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
         skipping.heap_bound(c)?;
         extent_limit.heap_bound(c)?;
         consumed.heap_bound(c)?;
-        record_start.heap_bound(c)?;
         last_line_end.heap_bound(c)?;
         sealed_fragment.heap_bound(c)?;
+        sealed_prefix.heap_bound(c)?;
         acquisition.heap_bound(c)
     }
 }
