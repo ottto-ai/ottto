@@ -1830,9 +1830,11 @@ pub(super) mod tests {
             entry.codex_protected_owner.clone(),
         )
     }
-    /// Finalizes one scan, saves its selected index and reloads it.
+    /// Finalizes one scan, saves its selected index over `file` (compare-and-
+    /// swap against the generation it was loaded at) and reloads it.
     fn save_selected(
         root: &Path,
+        file: &str,
         mut working: ScanIndex,
         mut result: SourceScanResult,
         previous: &ScanIndex,
@@ -1853,7 +1855,7 @@ pub(super) mod tests {
             .iter()
             .map(|item| item.snapshot_fingerprint.clone())
             .collect::<BTreeSet<_>>();
-        let path = root.join("index.json");
+        let path = root.join(file);
         working
             .committable_subset(previous, &accepted, &BTreeMap::new())
             .save(&path)
@@ -1896,11 +1898,16 @@ pub(super) mod tests {
         let previous = {
             let _cutover = codex_counting_version::TestCutover::set(0);
             let (index, result) = scan(&root, ScanIndex::default(), 2);
-            save_selected(&root, index, result, &ScanIndex::default(), None)
+            save_selected(&root, "v2.json", index, result, &ScanIndex::default(), None)
         };
         for key in &keys {
             assert!(previous.files[key].codex_counting_v2, "saved V2 ACK");
             assert!(previous.files[key].last_snapshot_fingerprint.is_some());
+        }
+        // The held and settled outcomes are alternatives: each starts from its
+        // own copy of the saved index the cycle loaded.
+        for file in ["held.json", "settled.json"] {
+            fs::copy(root.join("v2.json"), root.join(file)).unwrap();
         }
         // New content, parsed by an inactive build: a Legacy group decision.
         let path = root.join("sessions/b.jsonl");
@@ -1918,14 +1925,14 @@ pub(super) mod tests {
         };
         // A held group restores the old mark with the old ACK in saved state.
         let (working, result) = legacy_scan();
-        let held = save_selected(&root, working, result, &previous, Some(owner));
+        let held = save_selected(&root, "held.json", working, result, &previous, Some(owner));
         for key in &keys {
             assert!(held.files[key].codex_counting_v2, "mark kept with its ACK");
             assert_eq!(local_ack(&held.files[key]), local_ack(&previous.files[key]));
         }
         // Paired control: the selected save records false with the new facts.
         let (working, result) = legacy_scan();
-        let settled = save_selected(&root, working, result, &previous, None);
+        let settled = save_selected(&root, "settled.json", working, result, &previous, None);
         for key in &keys {
             assert!(!settled.files[key].codex_counting_v2, "false with new ACK");
             assert_ne!(
