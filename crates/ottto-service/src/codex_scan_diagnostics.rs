@@ -693,11 +693,56 @@ pub(crate) struct CodexScanDiagnostics {
     pub quarantine_count: u64,
     pub sample_offset: u64,
     pub lineage: [Option<RecoveryLineage>; LINEAGE_SAMPLES],
+    /// Codex usage-counting V2 receipts of this scan's finalized singleton
+    /// parses. All zero while V2 is inactive.
+    pub codex_counting_v2: CountingV2Receipts,
+}
+
+/// Content-free, fixed-size Codex usage-counting V2 receipts, summed with
+/// saturation. Usage vectors are `input, cached_input, cache_write_input,
+/// output, reasoning_output, total`.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct CountingV2Receipts {
+    pub v2_sessions: u64,
+    pub native_counted: u64,
+    pub native_not_authority: u64,
+    pub native_restated: u64,
+    pub native_inside_holed_coverage: u64,
+    pub native_inside_holed_coverage_usage: [u64; 6],
+    pub native_chain_gap: u64,
+    pub native_chain_overlap: u64,
+    pub native_chain_overlap_covered: [u64; 6],
+    pub native_epoch_reset: u64,
+    pub native_conflict: u64,
+    pub native_outside_open_turn: u64,
+    pub native_outside_open_turn_usage: [u64; 6],
+    pub native_after_turn_closed: u64,
+    pub native_after_turn_closed_usage: [u64; 6],
+    pub native_after_ui_flush: u64,
+    pub native_after_ui_flush_usage: [u64; 6],
+    pub ui_equal_total_repeat: u64,
+    pub ui_equal_total_repeat_usage: [u64; 6],
+    pub ui_in_native_turn_not_counted: u64,
+    pub ui_in_native_turn_not_counted_usage: [u64; 6],
+    pub ui_in_unbound_span: u64,
+    pub v2_cumulative_base_uncounted: u64,
+    pub v2_cumulative_base_uncounted_usage: [u64; 6],
+    pub turn_closure_mismatch: u64,
+    pub turn_reopened: u64,
+    pub pending_overflow_flushes: u64,
+    /// Visible local debt: sessions ending this parse inside a still-open
+    /// UI-only turn, their staged UI events and staged usage.
+    pub open_turn_ui_pending_sessions: u64,
+    pub open_turn_ui_pending_events: u64,
+    pub open_turn_ui_pending_usage: [u64; 6],
+    /// Open turns whose staged usage sum overflowed; never folded as zero.
+    pub open_turn_ui_pending_unsummable: u64,
 }
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, unreadable_causes, quarantine_count, sample_offset, lineage, codex_counting_v2);
+crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, pending_overflow_flushes, open_turn_ui_pending_sessions, open_turn_ui_pending_events, open_turn_ui_pending_usage, open_turn_ui_pending_unsummable);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
@@ -818,6 +863,40 @@ mod tests {
         lineage.associated_file_count = u64::MAX;
         lineage.final_body_revision = u64::MAX;
         diagnostics.lineage = [Some(lineage); LINEAGE_SAMPLES];
+        let max = [u64::MAX; 6];
+        diagnostics.codex_counting_v2 = CountingV2Receipts {
+            v2_sessions: u64::MAX,
+            native_counted: u64::MAX,
+            native_not_authority: u64::MAX,
+            native_restated: u64::MAX,
+            native_inside_holed_coverage: u64::MAX,
+            native_inside_holed_coverage_usage: max,
+            native_chain_gap: u64::MAX,
+            native_chain_overlap: u64::MAX,
+            native_chain_overlap_covered: max,
+            native_epoch_reset: u64::MAX,
+            native_conflict: u64::MAX,
+            native_outside_open_turn: u64::MAX,
+            native_outside_open_turn_usage: max,
+            native_after_turn_closed: u64::MAX,
+            native_after_turn_closed_usage: max,
+            native_after_ui_flush: u64::MAX,
+            native_after_ui_flush_usage: max,
+            ui_equal_total_repeat: u64::MAX,
+            ui_equal_total_repeat_usage: max,
+            ui_in_native_turn_not_counted: u64::MAX,
+            ui_in_native_turn_not_counted_usage: max,
+            ui_in_unbound_span: u64::MAX,
+            v2_cumulative_base_uncounted: u64::MAX,
+            v2_cumulative_base_uncounted_usage: max,
+            turn_closure_mismatch: u64::MAX,
+            turn_reopened: u64::MAX,
+            pending_overflow_flushes: u64::MAX,
+            open_turn_ui_pending_sessions: u64::MAX,
+            open_turn_ui_pending_events: u64::MAX,
+            open_turn_ui_pending_usage: max,
+            open_turn_ui_pending_unsummable: u64::MAX,
+        };
         let bytes = serde_json::to_vec_pretty(&diagnostics).unwrap();
         assert!(bytes.len() < MAX_LOCAL_DIAGNOSTIC_BYTES);
         let text = String::from_utf8(bytes).unwrap();

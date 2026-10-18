@@ -9,6 +9,7 @@
 //! is a monotone function of the record prefix: nothing is ever subtracted.
 use super::codex_counting_version::{self, AckEvidence, CountingVersion};
 use super::*;
+use crate::codex_scan_diagnostics::CountingV2Receipts;
 use crate::owned_heap::OwnedMap;
 
 /// Counting-contract row cap for one open turn's staged UI money. Changing it
@@ -57,7 +58,6 @@ impl CodexCounting {
 
     /// UI money staged in a still-open UI-only turn: visible local debt,
     /// never published on a timer.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn open_turn_ui_pending(&self) -> Option<(u64, UsageTotals)> {
         let turn = self.reducer.as_ref()?.turn.as_ref()?;
         let mut usage = UsageTotals::default();
@@ -67,6 +67,99 @@ impl CodexCounting {
             }
         }
         Some((turn.staged_events, usage))
+    }
+
+    /// Adds this parse's receipts and open-turn debt to the scan's local
+    /// diagnostics. A Legacy decision adds nothing.
+    pub(super) fn fold_receipts(&self, into: &mut CountingV2Receipts) {
+        let Some(reducer) = self.reducer.as_deref() else {
+            return;
+        };
+        let count = |slot: &mut u64, value: u64| *slot = slot.saturating_add(value);
+        let usage = |slot: &mut T6, value: &T6| {
+            for (slot, value) in slot.iter_mut().zip(value) {
+                *slot = slot.saturating_add(*value);
+            }
+        };
+        let c = &reducer.counters;
+        count(&mut into.v2_sessions, 1);
+        count(&mut into.native_counted, c.native_counted);
+        count(&mut into.native_not_authority, c.native_not_authority);
+        count(&mut into.native_restated, c.native_restated);
+        count(
+            &mut into.native_inside_holed_coverage,
+            c.native_inside_holed_coverage,
+        );
+        usage(
+            &mut into.native_inside_holed_coverage_usage,
+            &c.native_inside_holed_coverage_usage,
+        );
+        count(&mut into.native_chain_gap, c.native_chain_gap);
+        count(&mut into.native_chain_overlap, c.native_chain_overlap);
+        usage(
+            &mut into.native_chain_overlap_covered,
+            &c.native_chain_overlap_covered,
+        );
+        count(&mut into.native_epoch_reset, c.native_epoch_reset);
+        count(&mut into.native_conflict, c.native_conflict);
+        count(
+            &mut into.native_outside_open_turn,
+            c.native_outside_open_turn,
+        );
+        usage(
+            &mut into.native_outside_open_turn_usage,
+            &c.native_outside_open_turn_usage,
+        );
+        count(
+            &mut into.native_after_turn_closed,
+            c.native_after_turn_closed,
+        );
+        usage(
+            &mut into.native_after_turn_closed_usage,
+            &c.native_after_turn_closed_usage,
+        );
+        count(&mut into.native_after_ui_flush, c.native_after_ui_flush);
+        usage(
+            &mut into.native_after_ui_flush_usage,
+            &c.native_after_ui_flush_usage,
+        );
+        count(&mut into.ui_equal_total_repeat, c.ui_equal_total_repeat);
+        usage(
+            &mut into.ui_equal_total_repeat_usage,
+            &c.ui_equal_total_repeat_usage,
+        );
+        count(
+            &mut into.ui_in_native_turn_not_counted,
+            c.ui_in_native_turn_not_counted,
+        );
+        usage(
+            &mut into.ui_in_native_turn_not_counted_usage,
+            &c.ui_in_native_turn_not_counted_usage,
+        );
+        count(&mut into.ui_in_unbound_span, c.ui_in_unbound_span);
+        count(
+            &mut into.v2_cumulative_base_uncounted,
+            c.v2_cumulative_base_uncounted,
+        );
+        usage(
+            &mut into.v2_cumulative_base_uncounted_usage,
+            &c.v2_cumulative_base_uncounted_usage,
+        );
+        count(&mut into.turn_closure_mismatch, c.turn_closure_mismatch);
+        count(&mut into.turn_reopened, c.turn_reopened);
+        count(
+            &mut into.pending_overflow_flushes,
+            c.pending_overflow_flushes,
+        );
+        let Some(turn) = reducer.turn.as_ref().filter(|turn| turn.staged_events > 0) else {
+            return;
+        };
+        count(&mut into.open_turn_ui_pending_sessions, 1);
+        count(&mut into.open_turn_ui_pending_events, turn.staged_events);
+        match self.open_turn_ui_pending() {
+            Some((_, staged)) => usage(&mut into.open_turn_ui_pending_usage, &totals_t6(&staged)),
+            None => count(&mut into.open_turn_ui_pending_unsummable, 1),
+        }
     }
 
     /// A retained reduction may continue under fresh evidence only when that
@@ -695,6 +788,7 @@ impl SnapshotAccumulator {
                     reducer.counters.pending_overflow_flushes += 1;
                     let turn = reducer.turn.as_mut()?;
                     turn.ui_published = true;
+                    turn.staged_events = 0;
                     let pending = std::mem::replace(&mut turn.pending, OwnedMap::new());
                     self.publish_codex_pending(&pending);
                 }

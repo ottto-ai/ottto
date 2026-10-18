@@ -699,3 +699,57 @@ fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
     let charged = crate::heap_layout_bound::bound(counting, usize::MAX).unwrap();
     assert!(charged <= bound, "charged {charged} > stated bound {bound}");
 }
+
+#[test]
+fn codex_v2_receipts_reach_local_diagnostics_with_open_turn_debt() {
+    use crate::codex_scan_diagnostics::{CodexScanDiagnostics, CountingV2Receipts};
+    let usage = [3_000, 0, 0, 300, 30, 3_300];
+    let staged = [1_000, 0, 0, 100, 10, 1_100];
+    let values = [
+        header(POST),
+        started("2026-10-18T10:00:01Z", "turn-1"),
+        context("2026-10-18T10:00:02Z", "turn-1"),
+        ui("2026-10-18T10:00:10Z", usage, usage),
+        completed("2026-10-18T10:00:20Z", "turn-1"),
+        native("2026-10-18T10:00:21Z", "turn-1", "resp-late", usage, usage),
+        started("2026-10-18T10:00:30Z", "turn-2"),
+        context("2026-10-18T10:00:31Z", "turn-2"),
+        ui("2026-10-18T10:00:40Z", staged, sum(usage, staged)),
+    ];
+    let fold = |evidence| {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        codex_counting_version::configure(&mut accumulator, evidence, Some(CUTOVER));
+        for value in &values {
+            apply_codex_line(value, &mut accumulator);
+        }
+        let mut receipts = CountingV2Receipts::default();
+        accumulator
+            .codex_counting
+            .as_deref()
+            .unwrap()
+            .fold_receipts(&mut receipts);
+        receipts
+    };
+    let receipts = fold(AckEvidence::None);
+    assert_eq!(receipts.v2_sessions, 1);
+    assert_eq!(receipts.native_after_turn_closed, 1);
+    assert_eq!(receipts.native_after_turn_closed_usage, usage);
+    assert_eq!(receipts.open_turn_ui_pending_sessions, 1);
+    assert_eq!(receipts.open_turn_ui_pending_events, 1);
+    assert_eq!(receipts.open_turn_ui_pending_usage, staged);
+    assert_eq!(receipts.open_turn_ui_pending_unsummable, 0);
+    let journal = serde_json::to_value(CodexScanDiagnostics {
+        codex_counting_v2: receipts,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        journal["codex_counting_v2"]["open_turn_ui_pending_usage"],
+        json!(staged)
+    );
+    assert_eq!(
+        serde_json::to_value(fold(AckEvidence::LegacyAcked)).unwrap(),
+        serde_json::to_value(CountingV2Receipts::default()).unwrap(),
+        "a Legacy decision folds nothing"
+    );
+}
