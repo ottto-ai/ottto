@@ -319,7 +319,10 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // v39 records skill evidence from the tool walk: `Skill` tool input as an
 // invocation, SKILL.md paths read by `Read`/`Bash` as references (shared
 // extractor with Codex), and capability marker v2 when every reference was named.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v39";
+// v40 reads `output_tokens_details.thinking_tokens` into `reasoning_output_tokens`
+// (clamped to `output_tokens`). Scan identity is unchanged: only changed
+// transcripts re-parse, so a 0 under v39 means "not read", not "no thinking".
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v40";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -39967,7 +39970,7 @@ mod tests {
         )])
     }
 
-    fn complete_api_row(
+    pub(super) fn complete_api_row(
         parent: &str,
         request_id: &str,
         sequence: u64,
@@ -40001,7 +40004,7 @@ mod tests {
         row
     }
 
-    fn complete_trace_row(
+    pub(super) fn complete_trace_row(
         parent: &str,
         request_id: &str,
         agent_id: &str,
@@ -58426,7 +58429,7 @@ mod tests {
         );
     }
 
-    fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
+    pub(super) fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
         ScanIndexEntry {
             size_bytes: 1,
             modified_unix_seconds: 2,

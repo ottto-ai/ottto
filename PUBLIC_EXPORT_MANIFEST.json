@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 690,
-  "content_sha256": "fd0041de8c69cb37bdaa63feb8245e413d2697b6672d47e0959a16dd914094cb",
+  "content_sha256": "976d5acc9d599cb90679d2ef362817c29918336537dcfd50fef050ba0586e88a",
   "files": [
     {
       "executable": false,
@@ -930,8 +930,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/detected_uses.rs",
-      "sha256": "d1c9240c75d88b3d45888a6c5b44e358ae3968a96f456fe86e00f4603bb26107",
-      "size_bytes": 30272
+      "sha256": "93525ddced66a392e520f9fd182ae8d654c3a1561ce86b99a77cb3b26ba4e4aa",
+      "size_bytes": 30985
     },
     {
       "executable": false,
@@ -1259,8 +1259,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "1c082a0dd298d88a342f917a1cfd6c3681c1bc2a105adb6dc5a7c03bc8649280",
-      "size_bytes": 2636511
+      "sha256": "c59c993fa29beb053c2907d169cf5c8154756b04f9108e3ddba4b6200ce8f8b2",
+      "size_bytes": 2636781
     },
     {
       "executable": false,
@@ -1371,8 +1371,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_thinking_tokens_tests.rs",
-      "sha256": "1309c24c4cf47fcae0e5131e5ada85ecbefb702bc8dd8d2102d7ca99c8aaf783",
-      "size_bytes": 4478
+      "sha256": "c38e2710322fca19e392d9769d47e4c5811282b901a83351bc70bf882a40de02",
+      "size_bytes": 15010
     },
     {
       "executable": false,
@@ -4199,21 +4199,21 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/body-witness-ack-normalization-v1.json",
-      "sha256": "8a767105539ff51c913c951c1ddb476a3a1c0fb375c842c7d2df6ed221d95595",
+      "sha256": "229138abba949337e9ad7d89525e5967cdb9ded3be8f2770321541d4cf5e0d36",
       "size_bytes": 16342
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache-observations-v1-manifest.json",
-      "sha256": "ed65221022feb0e50d192866964817285a765b1e53101164c6c5c6e8a8be661d",
+      "sha256": "99bd046385a99a4ca742ef8a38417994157de778dc304f2fbf4a0f3159fc612f",
       "size_bytes": 1623
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache_observation_claude_v1.json",
-      "sha256": "96d2229feddcdcc6882ccebdf58910c4dd315e8f98bc8a4a0e6e6e339cd19b78",
+      "sha256": "8c9a58cc6d5388b28858822d7325c2568c1d3d6ac337a2975b41ea78844494dd",
       "size_bytes": 8860
     },
     {
@@ -4234,21 +4234,21 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/claude-original-source-corpus-v1.json",
-      "sha256": "9cc0612154254619c9a2452a0315e9a5326adb6db56ea8eefbba6ebaa7dfc486",
+      "sha256": "22f174d5d4fbed3e914b54cc21885354d281b5043de7b31547c2b5ee70618050",
       "size_bytes": 179395
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-golden.json",
-      "sha256": "21d0d2434268cb1d357ea927b615784ab9535923998f811312b651a3075c2317",
+      "sha256": "fff76c45a28ba76d0f19ab52a0279dcabb7303f6956b28aee05f7e20e0e9f78b",
       "size_bytes": 3045
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-manifest.json",
-      "sha256": "45d3c305b0e1bdd2f57548636bfb2524b9fb65521e286f7cd025f12261c9508c",
+      "sha256": "9d7674401b983d5284b628c112f64871c16401c8b9d6ab500f9ae0bd7f3e38b2",
       "size_bytes": 1777
     },
     {
@@ -4276,7 +4276,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "5b3bb6708a90403ebfba0301abc4ea08c4163f6ffb7c4dc6b2b82c7c61149eca",
+      "sha256": "de5c8e0e805895fae579bfc9ed5edc34372deb778aee4c1ed72bcdf595461f19",
       "size_bytes": 218514
     },
     {
@@ -4833,7 +4833,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T17:43:39+00:00",
+  "generated_at": "2026-10-18T19:31:14+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 691,
   "public_roots": [
@@ -4872,5 +4872,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bfb37ea74398086006d759782c3d0936ed2cd9c9"
+  "source_commit": "26328fad1b6bfcb21475e4350a1749e088e371be"
 }
