@@ -5445,7 +5445,7 @@ fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon, incoming_device
 }
 
 fn releasable_on_switch(proof: &DeviceReleaseProof, incoming_device_id: Option<&str>) -> bool {
-    incoming_device_id.is_none_or(|incoming| incoming != proof.device_id)
+    incoming_device_id.map_or(true, |incoming| incoming != proof.device_id)
 }
 
 fn install_staged_account_switch(
