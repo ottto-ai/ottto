@@ -10,12 +10,15 @@ Claude roots are the default folder plus registered config folders, as in the
 sink. Codex roots are `sessions` and `archived_sessions` under the default
 home and under each accepted slot home, read from slot registrations without
 credentials. Running-process Codex homes are not probed: composition runs
-daily and has no status collection. If the Claude registry cannot be read,
-composition logs it and keeps the default roots.
+daily and has no status collection. If a registry or an accepted slot home
+cannot be read, composition skips that source for the cycle and keeps its
+last good aggregates, because a partial root list would replace them with
+smaller ones.
 
 One transcript can sit in two roots (a copied account folder, or a rollout in
 both `sessions` and `archived_sessions`). Discovery counts each transcript
-file name once and keeps the newest copy, so a copy is not summed twice.
+once and keeps the newest copy. The key is the file name, plus the parent
+session for Claude subagent files, whose ids repeat across sessions.
 
 Unchanged: wire fields, cadence, the 12-workspace and 5-minute cycle caps, the
 50 MiB per-file bound, cache layout and parser version. Workspaces whose file

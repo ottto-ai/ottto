@@ -1449,13 +1449,26 @@ fn discover_workspaces(
 
 /// Registered roots can hold one transcript twice: a copied account folder, or
 /// a rollout present in both `sessions` and `archived_sessions`. Transcript
-/// file names carry the session id, so each name counts once, keeping the
-/// newest copy. Output is newest first, ties broken by path.
+/// file names carry the session id, so each counts once, keeping the newest
+/// copy. Output is newest first, ties broken by path.
 fn newest_copy_per_file_name(mut files: Vec<(PathBuf, SystemTime)>) -> Vec<(PathBuf, SystemTime)> {
     files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut seen = std::collections::BTreeSet::new();
-    files.retain(|(path, _)| seen.insert(path.file_name().map(|name| name.to_os_string())));
+    files.retain(|(path, _)| seen.insert(transcript_copy_key(path)));
     files
+}
+
+/// Claude subagent ids are unique only within their parent session
+/// (`<session>/subagents/agent-<id>.jsonl`), so that key keeps the parent.
+fn transcript_copy_key(path: &Path) -> Vec<std::ffi::OsString> {
+    let name = path.file_name().map(|name| name.to_os_string());
+    let session = path
+        .parent()
+        .filter(|dir| dir.file_name() == Some(std::ffi::OsStr::new("subagents")))
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map(|session| session.to_os_string());
+    session.into_iter().chain(name).collect()
 }
 
 fn file_date(mtime: SystemTime) -> Date {
@@ -1707,15 +1720,19 @@ fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
             continue;
         }
         any_source = true;
-        let roots =
-            crate::snapshot_roots::registered_scan_roots(source, home).unwrap_or_else(|error| {
+        // A partial root list would rebuild workspaces without the missing
+        // transcripts and replace their last good aggregates. Skip instead.
+        let roots = match crate::snapshot_roots::registered_scan_roots(source, home) {
+            Ok(roots) => roots,
+            Err(error) => {
                 eprintln!(
-                    "context composition using default roots for {}: {}",
+                    "context composition harvest skipped for {}: {}",
                     agent_source_label(source),
                     crate::snapshot_sync::safe_error(&error)
                 );
-                source.default_roots(home)
-            });
+                continue;
+            }
+        };
         if let Err(error) = harvest_source(
             &client,
             &device,

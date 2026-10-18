@@ -1337,6 +1337,19 @@ fn discovery_spans_registered_roots_and_counts_each_transcript_once() {
             slot_root.join("-workspace/slot-only.jsonl"),
         ]
     );
+    // Subagent ids repeat across parent sessions; those are distinct files.
+    for session in ["session-a", "session-b"] {
+        let dir = slot_root.join("-workspace").join(session).join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("agent-1.jsonl"), &record).unwrap();
+    }
+    let scans = discover_workspaces(
+        &[default_root.clone(), slot_root.clone()],
+        SystemTime::now(),
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(scans[0].files.len(), 5);
     // The default folder alone is the pre-registration view.
     let default_only = discover_workspaces(&[default_root], SystemTime::now(), deadline).unwrap();
     assert_eq!(default_only[0].files.len(), 2);

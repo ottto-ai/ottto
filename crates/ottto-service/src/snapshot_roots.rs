@@ -23,22 +23,30 @@ pub(crate) fn scan_roots(
 /// context composition. Codex slot homes come from accepted registrations,
 /// the homes the status collection hands the session sink; running-process
 /// homes are not probed. Registrations are read without credentials.
+///
+/// Unlike the status collection, an unreadable registration or slot home is an
+/// error: a collector that replaces whole aggregates must not mistake a
+/// missing root for removed transcripts.
 pub(crate) fn registered_scan_roots(source: SnapshotSource, home: &Path) -> Result<Vec<PathBuf>> {
     let codex_homes = if source == SnapshotSource::Codex {
-        registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())
+        registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())?
     } else {
         Vec::new()
     };
     scan_roots(source, home, &codex_homes)
 }
 
-fn registered_codex_homes(store: &FileCodexAccountSlotSettingsStore) -> Vec<PathBuf> {
+fn registered_codex_homes(store: &FileCodexAccountSlotSettingsStore) -> Result<Vec<PathBuf>> {
     store
         .registered_bindings()
-        .unwrap_or_default()
+        .context("read registered Codex transcript homes")?
         .into_iter()
         .filter(|binding| binding.accepted)
-        .filter_map(|binding| store.slot_home(&binding.slot_id).ok())
+        .map(|binding| {
+            store
+                .slot_home(&binding.slot_id)
+                .context("resolve registered Codex transcript home")
+        })
         .collect()
 }
 
