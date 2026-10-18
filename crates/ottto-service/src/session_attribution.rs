@@ -26,6 +26,8 @@ use zeroize::Zeroizing;
 
 pub const SESSION_ATTRIBUTION_SCHEMA_VERSION: &str = "session_attribution.v1";
 pub const MAX_SESSION_ATTRIBUTION_FACTS: usize = 24;
+/// `skill_id` facts per session; invocations are emitted before references.
+pub(crate) const MAX_SKILL_FACTS: usize = 8;
 pub const MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES: usize = 128;
 pub const MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES: usize = 32;
 pub const MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES: usize = 96;
@@ -344,8 +346,12 @@ impl SessionAttributionContext {
             }
         }
 
+        // Keyed case-insensitively: provider names arrive lowercased, while
+        // SKILL.md directory names keep their case, and one skill must not
+        // take two fact slots. Each fact still hashes its own spelling, and
+        // `activity_summary` uploads those same spellings for promotion.
         let mut emitted_skills = BTreeSet::new();
-        for skill in input.provider_skills.iter().take(8) {
+        for skill in input.provider_skills.iter().take(MAX_SKILL_FACTS) {
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
                 let display_label = skill_name_display_label(skill);
                 push_labeled_fact(
@@ -358,11 +364,13 @@ impl SessionAttributionContext {
                     "direct",
                     &evidence_context,
                 );
-                emitted_skills.insert(skill.clone());
+                emitted_skills.insert(skill.to_ascii_lowercase());
             }
         }
         for skill in input.activity_skills {
-            if emitted_skills.len() >= 8 || emitted_skills.contains(skill) {
+            if emitted_skills.len() >= MAX_SKILL_FACTS
+                || emitted_skills.contains(&skill.to_ascii_lowercase())
+            {
                 continue;
             }
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
@@ -377,11 +385,13 @@ impl SessionAttributionContext {
                     "direct",
                     &evidence_context,
                 );
-                emitted_skills.insert(skill.clone());
+                emitted_skills.insert(skill.to_ascii_lowercase());
             }
         }
         if let Some(skill) = input.first_prompt.and_then(slash_skill_name) {
-            if emitted_skills.len() < 8 && !emitted_skills.contains(&skill) {
+            if emitted_skills.len() < MAX_SKILL_FACTS
+                && !emitted_skills.contains(&skill.to_ascii_lowercase())
+            {
                 if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
                     let display_label = skill_name_display_label(&skill);
                     push_labeled_fact(
@@ -2032,9 +2042,10 @@ mod tests {
             launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
         let provider_skills = BTreeSet::from(["shared-skill".to_string()]);
+        // Same skill as the invocation, spelled with its directory's case.
         let activity_skills = BTreeSet::from([
             "repo-task-lifecycle".to_string(),
-            "shared-skill".to_string(),
+            "Shared-Skill".to_string(),
         ]);
 
         let facts = context.grouping_facts(SessionAttributionGroupingInput {
