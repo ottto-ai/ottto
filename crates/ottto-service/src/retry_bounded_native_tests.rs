@@ -217,6 +217,8 @@ fn bounded_retry_plain_http_is_declined_before_token_or_batch_io() {
 }
 
 #[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_native_transport_fallback_auth_exact_ack_checkpoint_and_recovery() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -297,6 +299,8 @@ fn bounded_retry_native_transport_fallback_auth_exact_ack_checkpoint_and_recover
     eprintln!("bounded native batch_posts=3 fresh_tokens=2 exact_A_and_C_recovery=true pending_B=true no_census_completion=true");
 }
 #[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_native_response_cap_and_post_ack_cancellation_preserve_durable_recovery() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -443,6 +447,8 @@ impl crate::source_rotation::Owner for NativeRetryRotation {
     }
 }
 #[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_actual_owner_boundary_fairness_same_source_block_and_recovery() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -621,8 +627,80 @@ fn bounded_retry_native_stale_authority_body_and_checkpoint_stop_before_token() 
         assert_eq!(std::fs::read(&f.progress_path).unwrap(), progress);
     }
 }
+// Fixed-slot monotonic stage clock for the deadline fixture. Each slot holds
+// microseconds since the listener bound (u64::MAX = not reached). A mark is one
+// atomic store, so the client and server threads share one timeline without
+// locks, allocation, or per-byte logging, and a panicking side keeps its marks.
+#[derive(Clone, Copy)]
+enum BoundedDeadlineStage {
+    ListenerReady,
+    ServerStarted,
+    TokenAccepted,
+    TokenRead,
+    TokenSleepStart,
+    TokenSleepEnd,
+    TokenWriteStart,
+    TokenWriteEnd,
+    AckAccepted,
+    AckRead,
+    AckHeadWritten,
+    AckTrickleEnd,
+    ServerReturned,
+    ClientCall,
+    ClientResult,
+    ServerJoined,
+}
+const BOUNDED_DEADLINE_STAGES: [&str; 16] = [
+    "listener_ready",
+    "server_started",
+    "token_accepted",
+    "token_read",
+    "token_sleep_start",
+    "token_sleep_end",
+    "token_write_start",
+    "token_write_end",
+    "ack_accepted",
+    "ack_read",
+    "ack_head_written",
+    "ack_trickle_end",
+    "server_returned",
+    "client_call",
+    "client_result",
+    "server_joined",
+];
+struct BoundedDeadlineStages {
+    origin: Instant,
+    at: [std::sync::atomic::AtomicU64; BOUNDED_DEADLINE_STAGES.len()],
+}
+impl BoundedDeadlineStages {
+    fn new(origin: Instant) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            origin,
+            at: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(u64::MAX)),
+        })
+    }
+    fn mark(&self, stage: BoundedDeadlineStage) {
+        let micros = u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
+        self.at[stage as usize].store(micros, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl std::fmt::Display for BoundedDeadlineStages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (name, at) in BOUNDED_DEADLINE_STAGES.iter().zip(&self.at) {
+            match at.load(std::sync::atomic::Ordering::SeqCst) {
+                u64::MAX => write!(f, " {name}=-")?,
+                micros => write!(f, " {name}={}.{:03}ms", micros / 1000, micros % 1000)?,
+            }
+        }
+        Ok(())
+    }
+}
+
 #[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
+    use self::BoundedDeadlineStage as Stage;
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -636,27 +714,45 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
         let before = std::fs::read(&f.index_path).unwrap();
         let mut page = bounded_native_capture(&f, Instant::now() - Duration::from_secs(61));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stages = BoundedDeadlineStages::new(Instant::now());
+        stages.mark(Stage::ListenerReady);
         let address = listener.local_addr().unwrap();
         let ack = bounded_native_ack(&current[0]);
+        let server_stages = stages.clone();
         let server = bounded_native_server(listener, move |listener| {
             use std::io::Write;
+            let stages = server_stages;
+            stages.mark(Stage::ServerStarted);
             let (mut stream, _) = listener.accept().unwrap();
+            stages.mark(Stage::TokenAccepted);
             bounded_native_read(&mut stream);
+            stages.mark(Stage::TokenRead);
+            stages.mark(Stage::TokenSleepStart);
             if stalled_token {
                 std::thread::sleep(Duration::from_millis(600));
+                stages.mark(Stage::TokenSleepEnd);
+                stages.mark(Stage::ServerReturned);
                 return 0;
             }
             std::thread::sleep(Duration::from_millis(120));
+            stages.mark(Stage::TokenSleepEnd);
+            stages.mark(Stage::TokenWriteStart);
             bounded_native_response(&mut stream, "200 OK", "{\"token\":\"fresh\"}");
+            stages.mark(Stage::TokenWriteEnd);
             let (mut stream, _) = listener.accept().unwrap();
+            stages.mark(Stage::AckAccepted);
             bounded_native_read(&mut stream);
+            stages.mark(Stage::AckRead);
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",ack.len()).unwrap();
+            stages.mark(Stage::AckHeadWritten);
             for byte in ack.bytes().take(30) {
                 if stream.write_all(&[byte]).is_err() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
+            stages.mark(Stage::AckTrickleEnd);
+            stages.mark(Stage::ServerReturned);
             1
         });
         // Start the 500ms retained budget with the measured turn, not before
@@ -666,6 +762,7 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
             Duration::ZERO,
         )
         .unwrap();
+        stages.mark(Stage::ClientCall);
         let started = Instant::now();
         let result = page.turn(
             &SnapshotApiClient::new(format!("http://{address}"))
@@ -677,10 +774,11 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
             &mut || Ok(()),
         );
         let elapsed = started.elapsed();
-        // Record the client outcome before joining: a fixture panic must not
-        // hide the client's own error or timing.
+        stages.mark(Stage::ClientResult);
+        // Record the client outcome and the stage clock before joining: a
+        // fixture panic must not hide the client's own error or timing.
         let client = format!(
-            "stalled_token={stalled_token} elapsed={elapsed:?} posts_left={} result={:?}",
+            "stalled_token={stalled_token} elapsed={elapsed:?} posts_left={} result={:?} stages:{stages}",
             page.budget.posts_left(),
             result.as_ref().map_err(|e| format!("{e:#}"))
         );
@@ -690,12 +788,14 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
             elapsed < Duration::from_millis(900),
             "absolute timeout failed: {client}"
         );
+        let served = server.join();
+        stages.mark(Stage::ServerJoined);
         assert_eq!(
-            server
-                .join()
-                .unwrap_or_else(|_| panic!("fixture server failed; client {client}")),
+            served.unwrap_or_else(|_| panic!(
+                "fixture server failed; client {client}; joined stages:{stages}"
+            )),
             usize::from(!stalled_token),
-            "{client}"
+            "{client}; joined stages:{stages}"
         );
         assert_eq!(
             page.budget.posts_left(),
@@ -707,7 +807,7 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
             serde_json::from_slice(&std::fs::read(&f.progress_path).unwrap()).unwrap();
         assert_eq!(durable.accepted_fingerprints.len(), 1);
         eprintln!(
-            "bounded deadline stalled_token={stalled_token} elapsed_ms={}",
+            "bounded deadline stalled_token={stalled_token} elapsed_ms={} stages:{stages}",
             elapsed.as_millis()
         );
     }
@@ -715,6 +815,8 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
 
 #[test]
 #[serial(source_upload_deadlines)]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_native_reshed_keeps_original_expiry_and_shared_posts() {
     if !crate::heap_layout_bound::layout_supported() {
         return;

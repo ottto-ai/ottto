@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 688,
-  "content_sha256": "baea6bcedfe4d9b9df6a54d5f8d81acc64ec7168dd3a808324f03a849cf0b75d",
+  "content_sha256": "c027db770c63d90893b238952a5c30d3efb3d8105545150444c5dda733568240",
   "files": [
     {
       "executable": false,
@@ -1112,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_bounded_native_tests.rs",
-      "sha256": "9df8766faecd258d14b5eb95ebba73ad67f55fbe3dcd0ad5d4a5d0d39ce3a9b8",
-      "size_bytes": 34653
+      "sha256": "477ffd2930e8dc4123bdbcae47dc9e89954773660371408cbf60e390e95cb5b0",
+      "size_bytes": 38485
     },
     {
       "executable": false,
@@ -1126,8 +1126,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_live_native_tests.rs",
-      "sha256": "6d2efd297e5b95660df214178cb1ef388af9e2c55d0b3e6d9a4dd16223dc50f5",
-      "size_bytes": 24967
+      "sha256": "3cfec8f57e5dd65784529d963d8a073a6c2c4e746981a88ffc0750f23ba7a106",
+      "size_bytes": 25195
     },
     {
       "executable": false,
@@ -1189,15 +1189,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "5a1ded4bb583e2fd887e7be4992adc82aacc62e933675f3c2cc7353b104a06c3",
-      "size_bytes": 814695
+      "sha256": "3d29b0e343e2927f0917b7f57c5b6e6874e56c8a640b3da29613c68da485aed8",
+      "size_bytes": 815146
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/authority_proof_correction_pipeline_tests.rs",
-      "sha256": "31e9ebe8717dd1f1898cd8cdb9659d80c2d775d5714e06aeb9e8f9a777db047e",
-      "size_bytes": 104837
+      "sha256": "bbbb902db32cd58f49634ee2debb27bbf239c77eb47c125aa391ebeb3567b1ac",
+      "size_bytes": 105144
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p12_pipeline_original_tests.rs",
-      "sha256": "8c5071aa65d9653f0ca82665b74023ac99b5bda4f5f4fd55196ae6cbe3c64d5f",
-      "size_bytes": 111554
+      "sha256": "a33b6a4ce22ea2ec425540633dfd64edb6e3c9570f4611bffb4e896153356b35",
+      "size_bytes": 111863
     },
     {
       "executable": false,

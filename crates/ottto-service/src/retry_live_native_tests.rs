@@ -292,6 +292,8 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
 }
 
 #[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_and_ack() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -419,6 +421,8 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
 }
 
 #[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
