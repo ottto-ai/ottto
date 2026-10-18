@@ -31,6 +31,7 @@ pub(crate) mod claude_request_identity;
 pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
+mod codex_compressed_input;
 mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
@@ -52,6 +53,7 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+use codex_compressed_input::OpenedInput;
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 
 pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
@@ -16254,7 +16256,7 @@ impl ParsedJsonlFile {
 // The native file parser owns all state needed between physical-line steps.
 // Finalization is separate: a line step is never file or upload authority.
 struct OwnedJsonlParser {
-    reader: BoundedJsonlReader<BufReader<File>>,
+    reader: BoundedJsonlReader<OpenedInput>,
     accumulator: SnapshotAccumulator,
     source: SnapshotSource,
     apply_line: fn(&Value, &mut SnapshotAccumulator),
@@ -16277,7 +16279,35 @@ impl OwnedJsonlParser {
         artifacts_enabled: bool,
         context_curve_enabled: bool,
     ) -> Result<Self> {
-        let reader = BufReader::new(file);
+        Self::new_opened(
+            OpenedInput::plain(file),
+            path,
+            source,
+            apply_line,
+            codex_title_metadata,
+            codex_turn_traces,
+            codex_parent_ownership_ledgers,
+            artifacts_enabled,
+            context_curve_enabled,
+        )
+    }
+    /// Every input kind reaches the same line parser through one opened
+    /// object. Its File was opened and identified by the caller; a compressed
+    /// input arrives with its decoder credit already paid.
+    #[allow(clippy::too_many_arguments)]
+    fn new_opened(
+        reader: OpenedInput,
+        path: &Path,
+        source: SnapshotSource,
+        apply_line: fn(&Value, &mut SnapshotAccumulator),
+        codex_title_metadata: Option<&CodexTitleMetadata>,
+        codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+        codex_parent_ownership_ledgers: Option<
+            Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>,
+        >,
+        artifacts_enabled: bool,
+        context_curve_enabled: bool,
+    ) -> Result<Self> {
         // Snapshot semantics come from provider-native session evidence. Mutable
         // current config defaults are useful for live status display, but applying
         // today's defaults to cumulative historical usage would retroactively
@@ -60145,7 +60175,7 @@ crate::heap_layout_bound::fields!(UsageBucketState; rows, first_activity_at, las
 crate::heap_layout_bound::fields!(UsageCosts; observed, reported, total, input, output, cache_read, cache_creation);
 crate::heap_layout_bound::fields!(UsageTotals; input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, costs);
 
-impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<BufReader<File>> {
+impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInput> {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self {
             reader,
