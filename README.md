@@ -594,10 +594,10 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   persisted backend API base URL. Manual edits to the managed Ottto fence are
   rejected with `manual_fence_review_required`, leaving local keys in place
   until the user reviews the file instead of guessing at cleanup. Pi setup
-  actions also register or merge the local telemetry device source grant so
-  route-smoke session imports can issue Pi-scoped relay tokens, but they skip
-  Codex/Claude OTLP config patching because Pi telemetry is imported from local
-  session files. The local scan
+  actions also register or merge the local telemetry device source grant, but
+  they skip Codex/Claude OTLP config patching because Pi telemetry is imported
+  from local session files. Pi route Verify no longer uploads smoke transcripts
+  to the retired direct Pi import endpoint. The local scan
   reports Pi as requiring install when the Pi CLI/session files are present but
   the device grant does not yet include `pi`.
 - local Claude Code reasoning-effort reduction at that loopback boundary:

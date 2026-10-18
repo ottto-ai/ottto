@@ -94,7 +94,6 @@ const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_MARKER_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-const PI_IMPORT_RUN_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -102,10 +101,6 @@ const PI_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const PI_SESSION_MAX_DEPTH: usize = 32;
 const PI_SESSION_MAX_ENTRIES: usize = 20_000;
 const PI_SESSION_MAX_FILES: usize = 10_000;
-const PI_SESSION_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const PI_SESSION_MAX_AGGREGATE_BYTES: u64 = 128 * 1024 * 1024;
-const PI_MULTIPART_MAX_FIELD_BYTES: usize = 4 * 1024;
-const PI_MULTIPART_MAX_BODY_BYTES: usize = 132 * 1024 * 1024;
 const PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON: &str =
     "race-safe rooted session access is unavailable on this platform";
 const PI_SESSION_CENSUS_FAILED_CODE: &str = "pi_session_census_failed";
@@ -11931,20 +11926,12 @@ struct PiSessionSafetyLimits {
     max_depth: usize,
     max_entries: usize,
     max_files: usize,
-    max_file_bytes: u64,
-    max_aggregate_bytes: u64,
-    max_multipart_field_bytes: usize,
-    max_multipart_body_bytes: usize,
 }
 
 const PI_SESSION_SAFETY_LIMITS: PiSessionSafetyLimits = PiSessionSafetyLimits {
     max_depth: PI_SESSION_MAX_DEPTH,
     max_entries: PI_SESSION_MAX_ENTRIES,
     max_files: PI_SESSION_MAX_FILES,
-    max_file_bytes: PI_SESSION_MAX_FILE_BYTES,
-    max_aggregate_bytes: PI_SESSION_MAX_AGGREGATE_BYTES,
-    max_multipart_field_bytes: PI_MULTIPART_MAX_FIELD_BYTES,
-    max_multipart_body_bytes: PI_MULTIPART_MAX_BODY_BYTES,
 };
 
 fn pi_session_files() -> Result<BTreeSet<PathBuf>, LocalApiError> {
@@ -12089,29 +12076,6 @@ fn collect_pi_session_files(
     Ok(())
 }
 
-fn import_new_pi_route_sessions(
-    api_base_url: &str,
-    route: &PiModelRoute,
-    before: &PiSessionCensus,
-) -> Result<Option<serde_json::Value>, LocalApiError> {
-    // Keep the pre-smoke descriptor as the authority across the whole live
-    // verification. Reopening the pathname here would let an entirely different
-    // real directory generation reclassify its pre-existing transcripts as new.
-    let session_files = new_pi_route_session_files(before)?;
-    if session_files.is_empty() {
-        return Ok(None);
-    }
-    let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(
-        api_base_url,
-        &relay_token,
-        route,
-        &before.root,
-        &session_files,
-    )
-    .map(Some)
-}
-
 fn new_pi_route_session_files(before: &PiSessionCensus) -> Result<Vec<PathBuf>, LocalApiError> {
     Ok(
         pi_session_files_for_root(&before.root, PI_SESSION_SAFETY_LIMITS)?
@@ -12121,50 +12085,23 @@ fn new_pi_route_session_files(before: &PiSessionCensus) -> Result<Vec<PathBuf>, 
     )
 }
 
-/// Upload local Pi session files modified at or after `since` for `route`. Used
-/// by the passive (no-live-smoke) subscription-OAuth verify path so a fresh user
-/// `pi` run is imported and counts as observed usage. This only UPLOADS existing
-/// local session transcripts (via `upload_pi_import_run`) — it never runs `pi`,
-/// so it can't burn the rotating OAuth token. The `since` mtime bound keeps each
-/// verify from re-uploading the user's entire session history.
-struct PiSessionSelection {
-    root: OpenPiSessionRoot,
-    files: Vec<PathBuf>,
-}
-
-fn recent_pi_session_files(since: SystemTime) -> Result<Option<PiSessionSelection>, LocalApiError> {
+/// Local Pi session files modified at or after `since`. The passive
+/// (no-live-smoke) subscription-OAuth verify path uses only their presence as
+/// local evidence; it never runs `pi` and never uploads or reads transcript
+/// contents (the direct Pi import endpoint is retired).
+fn recent_pi_session_files(since: SystemTime) -> Result<Option<Vec<PathBuf>>, LocalApiError> {
     let Some(root) = open_pi_session_root()? else {
         return Ok(None);
     };
     let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
-    let files = pi_session_files_modified_since(&root, files, since)?;
-    Ok(Some(PiSessionSelection { root, files }))
-}
-
-fn import_pi_route_session_files(
-    api_base_url: &str,
-    route: &PiModelRoute,
-    selection: &PiSessionSelection,
-) -> Result<Option<serde_json::Value>, LocalApiError> {
-    if selection.files.is_empty() {
-        return Ok(None);
-    }
-    let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(
-        api_base_url,
-        &relay_token,
-        route,
-        &selection.root,
-        &selection.files,
-    )
-    .map(Some)
+    pi_session_files_modified_since(&root, files, since).map(Some)
 }
 
 /// Keep only session files whose on-disk mtime is at or after `since`. Files
 /// whose metadata can't be read are dropped (treated as not-recent), matching
-/// the conservative behavior of the live-import path. Pure helper so the mtime
+/// the conservative behavior of the live census. Pure helper so the mtime
 /// bound used by the passive Pi route verifier is unit-testable without the
-/// relay-token / upload network calls.
+/// network calls.
 fn pi_session_files_modified_since(
     root: &OpenPiSessionRoot,
     files: impl IntoIterator<Item = PathBuf>,
@@ -12452,10 +12389,6 @@ struct RelayTokenApiResponse {
     token: String,
 }
 
-fn issue_pi_relay_token(api_base_url: &str) -> Result<String, LocalApiError> {
-    issue_source_relay_token(api_base_url, &SourceKind::Pi)
-}
-
 fn issue_source_relay_token(
     api_base_url: &str,
     source: &SourceKind,
@@ -12627,254 +12560,6 @@ fn has_loopback_http_origin(value: &str, host: &str) -> bool {
         return false;
     };
     rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
-}
-
-fn upload_pi_import_run(
-    api_base_url: &str,
-    relay_token: &str,
-    route: &PiModelRoute,
-    session_root: &OpenPiSessionRoot,
-    session_files: &[PathBuf],
-) -> Result<serde_json::Value, LocalApiError> {
-    let boundary = format!("ottto-pi-route-{}", current_millis());
-    let body = build_pi_import_multipart(
-        route,
-        session_root,
-        session_files,
-        &boundary,
-        PI_SESSION_SAFETY_LIMITS,
-    )?;
-    let url = api_url_with_base(api_base_url, "/api/v1/pi/import-runs");
-    let response = ureq::post(&url)
-        .set("Accept", "application/json")
-        .set("Authorization", &format!("Bearer {relay_token}"))
-        .set(
-            "Content-Type",
-            &format!("multipart/form-data; boundary={boundary}"),
-        )
-        .timeout(PI_IMPORT_RUN_HTTP_TIMEOUT)
-        .send_bytes(&body)
-        .map_err(|error| backend_error_from_ureq(&url, error))?;
-    response
-        .into_json()
-        .map_err(|error| backend_response_unexpected(&url, error.to_string()))
-}
-
-struct OpenPiSessionUpload {
-    file: fs::File,
-    file_name: String,
-    metadata_len: u64,
-}
-
-fn build_pi_import_multipart(
-    route: &PiModelRoute,
-    session_root: &OpenPiSessionRoot,
-    session_files: &[PathBuf],
-    boundary: &str,
-    limits: PiSessionSafetyLimits,
-) -> Result<Vec<u8>, LocalApiError> {
-    if session_files.len() > limits.max_files {
-        return Err(pi_session_import_refused(
-            "upload exceeded the maximum file count",
-        ));
-    }
-    let mut body = Vec::new();
-    for (field, value) in pi_route_import_defaults(route) {
-        append_multipart_text_field(&mut body, boundary, field, value, limits)?;
-    }
-    let mut aggregate_metadata_bytes = 0_u64;
-    let mut aggregate_session_bytes = 0_u64;
-    for path in session_files {
-        let mut upload = open_pi_session_upload(session_root, path, limits)?;
-        aggregate_metadata_bytes = aggregate_metadata_bytes
-            .checked_add(upload.metadata_len)
-            .ok_or_else(|| pi_session_import_refused("aggregate byte count overflowed"))?;
-        if aggregate_metadata_bytes > limits.max_aggregate_bytes {
-            return Err(pi_session_import_refused(
-                "session files exceeded the maximum aggregate byte size",
-            ));
-        }
-        append_multipart_file_field(
-            &mut body,
-            boundary,
-            "files",
-            &upload.file_name,
-            &mut upload.file,
-            &mut aggregate_session_bytes,
-            limits,
-        )?;
-    }
-    append_pi_multipart_bytes(&mut body, format!("--{boundary}--\r\n").as_bytes(), limits)?;
-    Ok(body)
-}
-
-fn open_pi_session_upload(
-    session_root: &OpenPiSessionRoot,
-    path: &Path,
-    limits: PiSessionSafetyLimits,
-) -> Result<OpenPiSessionUpload, LocalApiError> {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-        return Err(pi_session_import_refused(
-            "upload contained a non-jsonl session file",
-        ));
-    }
-    let file = open_pi_session_file_beneath_root(session_root, path)
-        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-    if !metadata.is_file() {
-        return Err(pi_session_import_refused(
-            "upload target was not a regular file",
-        ));
-    }
-    if metadata.len() > limits.max_file_bytes {
-        return Err(pi_session_import_refused(
-            "session file exceeded the maximum byte size",
-        ));
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("session.jsonl")
-        .to_string();
-    Ok(OpenPiSessionUpload {
-        file,
-        file_name,
-        metadata_len: metadata.len(),
-    })
-}
-
-fn pi_route_import_defaults(route: &PiModelRoute) -> Vec<(&'static str, &str)> {
-    let mut defaults = Vec::new();
-    if let Some(value) = route.classification.billing_provider.as_deref() {
-        defaults.push(("billing_provider", value));
-    }
-    if let Some(value) = route.classification.model_provider.as_deref() {
-        defaults.push(("model_provider", value));
-    }
-    if let Some(value) = route.classification.billing_channel.as_deref() {
-        defaults.push(("billing_channel", value));
-    }
-    if let Some(value) = route.classification.auth_mode.as_deref() {
-        defaults.push(("auth_mode", value));
-    }
-    if let Some(value) = route.classification.gateway_provider.as_deref() {
-        defaults.push(("gateway_provider", value));
-    }
-    if let Some(value) = route.classification.subscription_product.as_deref() {
-        defaults.push(("subscription_product", value));
-    }
-    defaults
-}
-
-fn append_multipart_text_field(
-    body: &mut Vec<u8>,
-    boundary: &str,
-    name: &str,
-    value: &str,
-    limits: PiSessionSafetyLimits,
-) -> Result<(), LocalApiError> {
-    if value.len() > limits.max_multipart_field_bytes {
-        return Err(pi_session_import_refused(
-            "route metadata exceeded the multipart field byte cap",
-        ));
-    }
-    append_pi_multipart_bytes(body, format!("--{boundary}\r\n").as_bytes(), limits)?;
-    append_pi_multipart_bytes(
-        body,
-        format!(
-            "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
-            multipart_token(name)
-        )
-        .as_bytes(),
-        limits,
-    )?;
-    append_pi_multipart_bytes(body, value.as_bytes(), limits)?;
-    append_pi_multipart_bytes(body, b"\r\n", limits)
-}
-
-fn append_multipart_file_field(
-    body: &mut Vec<u8>,
-    boundary: &str,
-    name: &str,
-    file_name: &str,
-    file: &mut fs::File,
-    aggregate_session_bytes: &mut u64,
-    limits: PiSessionSafetyLimits,
-) -> Result<(), LocalApiError> {
-    append_pi_multipart_bytes(body, format!("--{boundary}\r\n").as_bytes(), limits)?;
-    append_pi_multipart_bytes(
-        body,
-        format!(
-            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-            multipart_token(name),
-            multipart_token(file_name),
-        )
-        .as_bytes(),
-        limits,
-    )?;
-    append_pi_multipart_bytes(body, b"Content-Type: application/x-ndjson\r\n\r\n", limits)?;
-
-    let mut file_bytes = 0_u64;
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-        if read == 0 {
-            break;
-        }
-        let read = read as u64;
-        file_bytes = file_bytes
-            .checked_add(read)
-            .ok_or_else(|| pi_session_import_refused("session file byte count overflowed"))?;
-        if file_bytes > limits.max_file_bytes {
-            return Err(pi_session_import_refused(
-                "session file exceeded the maximum byte size while reading",
-            ));
-        }
-        *aggregate_session_bytes = (*aggregate_session_bytes)
-            .checked_add(read)
-            .ok_or_else(|| pi_session_import_refused("aggregate byte count overflowed"))?;
-        if *aggregate_session_bytes > limits.max_aggregate_bytes {
-            return Err(pi_session_import_refused(
-                "session files exceeded the maximum aggregate byte size while reading",
-            ));
-        }
-        append_pi_multipart_bytes(body, &buffer[..read as usize], limits)?;
-    }
-    append_pi_multipart_bytes(body, b"\r\n", limits)
-}
-
-fn append_pi_multipart_bytes(
-    body: &mut Vec<u8>,
-    bytes: &[u8],
-    limits: PiSessionSafetyLimits,
-) -> Result<(), LocalApiError> {
-    let next_len = body
-        .len()
-        .checked_add(bytes.len())
-        .ok_or_else(|| pi_session_import_refused("multipart byte count overflowed"))?;
-    if next_len > limits.max_multipart_body_bytes {
-        return Err(pi_session_import_refused(
-            "multipart body exceeded the maximum byte size",
-        ));
-    }
-    body.try_reserve(bytes.len())
-        .map_err(|_| pi_session_import_refused("multipart allocation failed"))?;
-    body.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn multipart_token(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '"' | '\r' | '\n' => '_',
-            _ => ch,
-        })
-        .collect()
 }
 
 fn no_fresh_telemetry_code(source: &SourceKind, smoke: &SmokeResult) -> &'static str {
@@ -14338,21 +14023,16 @@ fn run_one_pi_route_verification(
         return verify_pi_subscription_oauth_route_passively(api_base_url, credentials, route);
     }
 
-    let (before_session_census, smoke_after, smoke) = match run_pi_route_pre_smoke(route) {
+    // The direct Pi import endpoint is retired, so Verify no longer uploads the
+    // smoke transcript. The post-smoke census already ran through the held
+    // pre-smoke root; a new local session without matching backend usage
+    // settles as the existing local-only Warning, never as an upload success.
+    let (_, smoke_after, smoke) = match run_pi_route_pre_smoke(route) {
         Ok(ready) => ready,
         Err(failed) => return *failed,
     };
     if !smoke.succeeded {
         return pi_route_result_from_smoke(route, &smoke, Some(smoke_after));
-    }
-    if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_census) {
-        // Workspace data sharing can be intentionally disabled. It is useful
-        // source status, but not a service error and should not pollute the
-        // daemon's error log.
-        if !is_telemetry_disabled_by_admin_error(&error) {
-            eprintln!("Pi route smoke session import failed: {error}");
-        }
-        return pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error);
     }
 
     let filters = if pi_route_is_unscoped(route) {
@@ -14570,32 +14250,26 @@ fn verify_pi_subscription_oauth_route_passively(
     route: &PiModelRoute,
 ) -> SourceRouteVerificationResult {
     let lookback = rfc3339_hours_ago(PI_PASSIVE_LOOKBACK_HOURS);
-    // Import recent local Pi sessions BEFORE polling so a fresh user `pi` run is
-    // uploaded and counts as observed usage — otherwise a valid OAuth route with
-    // real recent usage is mislabeled `pi_oauth_reauth_required` just because the
-    // local_sessions collector hasn't uploaded it yet. This only uploads existing
-    // transcripts (no live `pi`), so it can't burn the rotating OAuth token. The
-    // mtime bound matches the passive lookback window. Non-fatal on error.
-    let import_since = SystemTime::now()
+    // Recent local Pi sessions count as local route evidence so a valid OAuth
+    // route with fresh local use is not mislabeled `pi_oauth_reauth_required`.
+    // Only file presence and mtime are read; nothing is uploaded because the
+    // direct Pi import endpoint is retired. The mtime bound matches the passive
+    // lookback window. Non-fatal on error.
+    let local_evidence_since = SystemTime::now()
         .checked_sub(Duration::from_secs(
             u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600,
         ))
         .unwrap_or(UNIX_EPOCH);
-    let recent_session_selection = match recent_pi_session_files(import_since) {
-        Ok(selection) => selection,
+    let recent_session_files = match recent_pi_session_files(local_evidence_since) {
+        Ok(files) => files,
         Err(error) => {
             eprintln!("Pi passive route session discovery failed (non-fatal): {error}");
             None
         }
     };
-    if let Some(selection) = recent_session_selection.as_ref() {
-        if let Err(error) = import_pi_route_session_files(api_base_url, route, selection) {
-            eprintln!("Pi passive route session import failed (non-fatal): {error}");
-        }
-    }
-    let recent_local_session_observed = recent_session_selection
+    let recent_local_session_observed = recent_session_files
         .as_ref()
-        .is_some_and(|selection| !selection.files.is_empty());
+        .is_some_and(|files| !files.is_empty());
     let local_session_observed = Some(recent_local_session_observed);
     let local_evidence_observed = pi_route_has_local_verification_evidence(
         &pi_route_billing_identity_hints(route),
@@ -26510,15 +26184,6 @@ for line in sys.stdin:
         assert!(smoke.succeeded, "fake Pi smoke failed: {}", smoke.message);
         let selected = new_pi_route_session_files(&before).expect("select first-use transcript");
         assert_eq!(selected, vec![home.join(".pi/agent/sessions/first.jsonl")]);
-        let mut upload =
-            open_pi_session_upload(&before.root, &selected[0], PI_SESSION_SAFETY_LIMITS)
-                .expect("first-use transcript is import-ready beneath held root");
-        let mut bytes = Vec::new();
-        upload
-            .file
-            .read_to_end(&mut bytes)
-            .expect("read first-use transcript");
-        assert_eq!(bytes, b"{}\n");
         for path in [
             home.join(".pi"),
             home.join(".pi/agent"),
@@ -26531,6 +26196,89 @@ for line in sys.stdin:
                 & 0o777;
             assert_eq!(mode, 0o700, "new Pi directories must be owner-only");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn live_pi_verify_makes_no_retired_import_request_and_settles_local_only() {
+        let root = control_test_root("pi-live-no-retired-import");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let fake_pi = fake_binary_path(&root, "pi");
+        fs::write(
+            &fake_pi,
+            "#!/bin/sh\nprintf '{}\\n' > \"$HOME/.pi/agent/sessions/smoke.jsonl\"\n",
+        )
+        .expect("write Pi smoke");
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755))
+            .expect("mark fake Pi executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+        let _search_guard = EnvVarGuard::set_os(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            fake_pi
+                .parent()
+                .expect("fake Pi parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Pi verify backend");
+        let api_base_url = format!("http://{}", listener.local_addr().expect("local address"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let request = read_complete_http_request(&mut stream);
+                let request_line = request.lines().next().unwrap_or_default().to_string();
+                recorded.lock().expect("record request").push(request_line);
+                write_json_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    r#"{"verified":false,"records_seen":0,"last_record_id":null,"last_received_at":null,"smoke_after":"2026-10-18T00:00:00Z"}"#,
+                );
+            }
+        });
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "otsr_test".to_string(),
+            connection: LocalConnectionBinding {
+                setup_run_id: "setup_pi_verify".to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                claim_code: None,
+                api_base_url: api_base_url.clone(),
+            },
+        };
+
+        let route =
+            run_one_pi_route_verification(&api_base_url, &mut credentials, &live_pi_route());
+
+        let requests = requests.lock().expect("read requests").clone();
+        assert!(
+            !requests.is_empty(),
+            "Verify still polls setup verification"
+        );
+        for request in &requests {
+            assert!(
+                request.starts_with("GET ")
+                    && request
+                        .contains("/api/v1/setup-runs/setup_pi_verify/local-client/verification"),
+                "Verify must only poll setup verification, saw {request}"
+            );
+            assert!(!request.contains("/api/v1/pi/"));
+            assert!(!request.contains("relay-token"));
+        }
+        assert_eq!(route.status, SourceVerificationStatus::Warning);
+        assert!(route.verified);
+        assert_eq!(route.records_seen, 0);
+        assert_eq!(route.error_code.as_deref(), Some(PI_LOCAL_ONLY_CODE));
+        assert_eq!(route.local_session_observed, Some(true));
+        assert!(!route.message.text.contains("Sign in"));
+        let aggregate = pi_route_aggregate_result(vec![route]);
+        assert_eq!(aggregate.message.code, PI_LOCAL_ONLY_CODE);
+        assert!(!aggregate.message.text.contains("Sign in"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -26839,25 +26587,6 @@ for line in sys.stdin:
 
         assert_eq!(files.len(), 1);
         assert!(files.contains(&nested.join("session.jsonl")));
-
-        let opened_root = open_pi_test_root(&root);
-        let body = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &[nested.join("session.jsonl")],
-            "test-boundary",
-            PiSessionSafetyLimits {
-                max_depth: 4,
-                max_entries: 16,
-                max_files: 4,
-                max_file_bytes: 64,
-                max_aggregate_bytes: 128,
-                max_multipart_field_bytes: 64,
-                max_multipart_body_bytes: 4 * 1024,
-            },
-        )
-        .expect("build bounded nested Pi multipart");
-        assert!(body.windows(3).any(|window| window == b"{}\n"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -27008,7 +26737,7 @@ for line in sys.stdin:
 
     #[cfg(unix)]
     #[test]
-    fn pi_session_live_import_refuses_root_replacement_between_censuses() {
+    fn pi_session_live_census_refuses_root_replacement_between_censuses() {
         let parent = control_test_root("pi-session-live-root-replacement");
         let root = parent.join("sessions");
         let original = parent.join("sessions-original");
@@ -27029,12 +26758,8 @@ for line in sys.stdin:
         fs::write(&replacement_session, b"pre-existing\n")
             .expect("write pre-existing replacement session");
 
-        let error = import_new_pi_route_sessions(
-            "http://127.0.0.1:1",
-            &subscription_oauth_route(),
-            &before,
-        )
-        .expect_err("a different real root generation must be refused before selection or upload");
+        let error = new_pi_route_session_files(&before)
+            .expect_err("a different real root generation must be refused before selection");
 
         assert!(error.to_string().contains("session root changed"));
         assert!(replacement_session.exists());
@@ -27070,7 +26795,7 @@ for line in sys.stdin:
 
     #[cfg(unix)]
     #[test]
-    fn pi_session_upload_rejects_file_and_directory_symlink_swaps() {
+    fn pi_session_open_rejects_file_and_directory_symlink_swaps() {
         use std::os::unix::fs::symlink;
 
         let root = control_test_root("pi-session-swap");
@@ -27087,15 +26812,11 @@ for line in sys.stdin:
 
         fs::rename(&nested, root.join("nested-original")).expect("move discovered directory");
         symlink(&outside, &nested).expect("swap directory for symlink");
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &discovered.into_iter().collect::<Vec<_>>(),
-            "test-boundary",
-            PI_SESSION_SAFETY_LIMITS,
-        )
-        .expect_err("component-wise no-follow open must reject directory swap");
-        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+        for path in &discovered {
+            let error = open_pi_session_file_beneath_root(&opened_root, path)
+                .expect_err("component-wise no-follow open must reject directory swap");
+            assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        }
 
         fs::remove_file(&nested).expect("remove directory symlink");
         let final_session = root.join("final.jsonl");
@@ -27104,83 +26825,13 @@ for line in sys.stdin:
             .expect("discover final session");
         fs::remove_file(&final_session).expect("remove discovered final session");
         symlink(&outside_session, &final_session).expect("swap file for symlink");
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &discovered
-                .into_iter()
-                .filter(|path| path == &final_session)
-                .collect::<Vec<_>>(),
-            "test-boundary",
-            PI_SESSION_SAFETY_LIMITS,
-        )
-        .expect_err("no-follow open must reject final-component swap");
-        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+        assert!(discovered.contains(&final_session));
+        let error = open_pi_session_file_beneath_root(&opened_root, &final_session)
+            .expect_err("no-follow open must reject final-component swap");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_upload_reads_held_descriptor_after_path_swap() {
-        use std::os::unix::fs::symlink;
-
-        let root = control_test_root("pi-session-held-open");
-        let outside = control_test_root("pi-session-held-open-outside");
-        let session = root.join("session.jsonl");
-        let moved = root.join("session-original.jsonl");
-        let outside_session = outside.join("session.jsonl");
-        fs::write(&session, b"inside\n").expect("write inside session");
-        fs::write(&outside_session, b"outside-secret\n").expect("write outside session");
-        let opened_root = open_pi_test_root(&root);
-        let mut opened = open_pi_session_upload(&opened_root, &session, PI_SESSION_SAFETY_LIMITS)
-            .expect("open and verify session beneath root");
-
-        fs::rename(&session, &moved).expect("move verified session");
-        symlink(&outside_session, &session).expect("replace verified path with symlink");
-        let mut bytes = Vec::new();
-        opened
-            .file
-            .read_to_end(&mut bytes)
-            .expect("read held descriptor");
-
-        assert_eq!(bytes, b"inside\n");
-        assert!(!bytes.windows(14).any(|window| window == b"outside-secret"));
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_upload_processes_large_file_sets_without_holding_all_descriptors() {
-        let root = control_test_root("pi-session-sequential-descriptors");
-        let mut files = Vec::new();
-        for index in 0..300 {
-            let path = root.join(format!("{index}.jsonl"));
-            fs::write(&path, b"{}\n").expect("write session file");
-            files.push(path);
-        }
-        let opened_root = open_pi_test_root(&root);
-        let limits = PiSessionSafetyLimits {
-            max_files: 512,
-            max_file_bytes: 16,
-            max_aggregate_bytes: 4 * 1024,
-            max_multipart_body_bytes: 128 * 1024,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-
-        let body = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &files,
-            "test-boundary",
-            limits,
-        )
-        .expect("sequential descriptor use must support more than 256 session files");
-
-        assert!(body.ends_with(b"--test-boundary--\r\n"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -27216,87 +26867,6 @@ for line in sys.stdin:
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(wide);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_upload_refuses_file_aggregate_and_multipart_caps() {
-        let root = control_test_root("pi-session-upload-caps");
-        let first = root.join("first.jsonl");
-        let second = root.join("second.jsonl");
-        fs::write(&first, b"12345").expect("write oversized session");
-        fs::write(&second, b"6789").expect("write aggregate session");
-        let opened_root = open_pi_test_root(&root);
-
-        let per_file_limits = PiSessionSafetyLimits {
-            max_file_bytes: 4,
-            max_aggregate_bytes: 16,
-            max_multipart_body_bytes: 4 * 1024,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            std::slice::from_ref(&first),
-            "test-boundary",
-            per_file_limits,
-        )
-        .expect_err("oversized file must be refused before reading");
-        assert!(error.to_string().contains("maximum byte size"));
-
-        let aggregate_limits = PiSessionSafetyLimits {
-            max_file_bytes: 8,
-            max_aggregate_bytes: 8,
-            max_multipart_body_bytes: 4 * 1024,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &[first.clone(), second],
-            "test-boundary",
-            aggregate_limits,
-        )
-        .expect_err("aggregate oversize must be refused before body construction");
-        assert!(error.to_string().contains("aggregate byte size"));
-
-        let mut route = subscription_oauth_route();
-        route.classification.billing_provider = Some("x".repeat(17));
-        let multipart_limits = PiSessionSafetyLimits {
-            max_file_bytes: 8,
-            max_aggregate_bytes: 8,
-            max_multipart_field_bytes: 16,
-            max_multipart_body_bytes: 4 * 1024,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-        let error = build_pi_import_multipart(
-            &route,
-            &opened_root,
-            &[first],
-            "test-boundary",
-            multipart_limits,
-        )
-        .expect_err("oversized multipart metadata must be refused");
-        assert!(error.to_string().contains("multipart field byte cap"));
-
-        let body_limits = PiSessionSafetyLimits {
-            max_file_bytes: 8,
-            max_aggregate_bytes: 8,
-            max_multipart_field_bytes: 64,
-            max_multipart_body_bytes: 16,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &[],
-            "test-boundary",
-            body_limits,
-        )
-        .expect_err("multipart framing must honor the total body cap");
-        assert!(error.to_string().contains("multipart body"));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -30551,17 +30121,11 @@ X-API-Key = "otel_redacted"
     #[test]
     fn pi_verify_budgets_fit_interactive_cli_bounds() {
         assert!(PI_SMOKE_COMMAND_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
-        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT > Duration::from_secs(30));
-        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT <= SMOKE_COMMAND_TIMEOUT);
         assert!(PI_VERIFICATION_WAIT_TIMEOUT < VERIFICATION_WAIT_TIMEOUT);
         assert!(PI_VERIFICATION_HTTP_TIMEOUT < SETUP_VERIFICATION_HTTP_TIMEOUT);
         assert!(PI_VERIFICATION_HTTP_TIMEOUT > PI_VERIFICATION_WAIT_TIMEOUT);
         assert!(
-            PI_SMOKE_COMMAND_TIMEOUT
-                + PI_IMPORT_RUN_HTTP_TIMEOUT
-                + PI_VERIFICATION_HTTP_TIMEOUT
-                + PIPE_DRAIN_TIMEOUT
+            PI_SMOKE_COMMAND_TIMEOUT + PI_VERIFICATION_HTTP_TIMEOUT + PIPE_DRAIN_TIMEOUT
                 < Duration::from_secs(90)
         );
     }
@@ -30599,32 +30163,6 @@ X-API-Key = "otel_redacted"
     fn setup_scan_result_http_timeout_covers_synchronous_backend_work() {
         assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT >= Duration::from_secs(120));
         assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn upload_pi_import_accepts_response_slower_than_previous_pi_timeout() {
-        let api_base_url = delayed_pi_import_run_server(Duration::from_secs(31));
-        let root = control_test_root("pi-import-slow-response");
-        let session_file = root.join("session.jsonl");
-        fs::write(
-            &session_file,
-            r#"{"type":"session","id":"pi-slow-import","cwd":"/tmp/pi","version":1}"#,
-        )
-        .expect("write pi session file");
-        let opened_root = open_pi_test_root(&root);
-
-        let started = Instant::now();
-        let result = upload_pi_import_run(
-            &api_base_url,
-            "relay_test",
-            &subscription_oauth_route(),
-            &opened_root,
-            &[session_file],
-        )
-        .expect("Pi import POST should use Pi-specific timeout");
-
-        assert!(started.elapsed() > BACKEND_REQUEST_TIMEOUT);
-        assert_eq!(result["status"], "ok");
     }
 
     #[test]
@@ -31147,21 +30685,6 @@ X-API-Key = "otel_redacted"
                 r#"{{"run":{{"id":"{setup_run_id}","status":"waiting_for_user","machine_id":"machine_test"}},"sources":[],"next_action":null,"next_question":null}}"#
             );
             write_json_response(&mut stream, 200, "OK", &body);
-        });
-        format!("http://{address}")
-    }
-
-    fn delayed_pi_import_run_server(delay: Duration) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Pi import backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept Pi import");
-            let request = read_complete_http_request(&mut stream);
-            assert!(request.contains("/api/v1/pi/import-runs"));
-            assert!(request.contains("Authorization: Bearer relay_test"));
-            assert!(request.contains("name=\"files\""));
-            thread::sleep(delay);
-            write_json_response(&mut stream, 200, "OK", r#"{"status":"ok"}"#);
         });
         format!("http://{address}")
     }
