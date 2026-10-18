@@ -45,73 +45,73 @@ const CONTEXT_CYCLE_BUDGET: Duration = Duration::from_secs(
 );
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct ContextFootprintCategoryInput {
-    name: String,
-    tokens: u64,
-    pct: f64,
-    loading_mode: String,
+pub(crate) struct ContextFootprintCategoryInput {
+    pub(crate) name: String,
+    pub(crate) tokens: u64,
+    pub(crate) pct: f64,
+    pub(crate) loading_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct ContextFootprintItemInput {
-    kind: String,
-    name: String,
-    tokens: u64,
+pub(crate) struct ContextFootprintItemInput {
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pct: Option<f64>,
+    pub(crate) pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<String>,
+    pub(crate) source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    relative_path: Option<String>,
-    loading_mode: String,
+    pub(crate) relative_path: Option<String>,
+    pub(crate) loading_mode: String,
     #[serde(flatten)]
-    file_counts: FileCounts,
+    pub(crate) file_counts: FileCounts,
     // Preserve the original /context path only until measurement. Never upload it.
     #[serde(skip)]
-    local_path: Option<PathBuf>,
+    pub(crate) local_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct ContextFootprintMcpToolInput {
+pub(crate) struct ContextFootprintMcpToolInput {
     name: String,
     server: String,
     tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct ContextFootprintIngestRequest {
-    agent_source: String,
-    machine_id: String,
-    workspace_hash: String,
+pub(crate) struct ContextFootprintIngestRequest {
+    pub(crate) agent_source: String,
+    pub(crate) machine_id: String,
+    pub(crate) workspace_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    workspace_label: Option<String>,
+    pub(crate) workspace_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    workspace_label_source: Option<String>,
+    pub(crate) workspace_label_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repository_hash: Option<String>,
+    pub(crate) repository_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repository_label: Option<String>,
+    pub(crate) repository_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repository_label_source: Option<String>,
+    pub(crate) repository_label_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repository_identity_source: Option<String>,
+    pub(crate) repository_identity_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    workspace_kind: Option<String>,
-    config_hash: String,
-    captured_at: String,
-    collector_version: String,
-    counter_source: String,
-    model: String,
-    used_tokens: u64,
-    context_window_tokens: u64,
-    pct_context: f64,
+    pub(crate) workspace_kind: Option<String>,
+    pub(crate) config_hash: String,
+    pub(crate) captured_at: String,
+    pub(crate) collector_version: String,
+    pub(crate) counter_source: String,
+    pub(crate) model: String,
+    pub(crate) used_tokens: u64,
+    pub(crate) context_window_tokens: u64,
+    pub(crate) pct_context: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    free_space_tokens: Option<u64>,
-    categories: Vec<ContextFootprintCategoryInput>,
-    memory_files: Vec<ContextFootprintItemInput>,
-    skills: Vec<ContextFootprintItemInput>,
-    custom_agents: Vec<ContextFootprintItemInput>,
-    mcp_tools: Vec<ContextFootprintMcpToolInput>,
+    pub(crate) free_space_tokens: Option<u64>,
+    pub(crate) categories: Vec<ContextFootprintCategoryInput>,
+    pub(crate) memory_files: Vec<ContextFootprintItemInput>,
+    pub(crate) skills: Vec<ContextFootprintItemInput>,
+    pub(crate) custom_agents: Vec<ContextFootprintItemInput>,
+    pub(crate) mcp_tools: Vec<ContextFootprintMcpToolInput>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -237,6 +237,13 @@ pub fn spawn_context_footprint_sync() -> Result<()> {
                     false
                 }
             };
+            // Codex session starts share this thread: no extra background job.
+            if let Err(error) = crate::codex_session_start::harvest_once(&home, &support_dir) {
+                eprintln!(
+                    "codex session start harvest skipped: {}",
+                    crate::snapshot_sync::safe_error(&error)
+                );
+            }
             std::thread::sleep(next_context_cycle_delay(refused));
         })
         .map_err(|error| anyhow!("spawn context footprint sync: {error}"))?;
@@ -1423,7 +1430,9 @@ fn request_content_hash(parsed: &ParsedContextFootprint) -> Result<String> {
     Ok(sha256_bytes(&canonical))
 }
 
-fn request_content_hash_for_request(request: &ContextFootprintIngestRequest) -> Result<String> {
+pub(crate) fn request_content_hash_for_request(
+    request: &ContextFootprintIngestRequest,
+) -> Result<String> {
     let canonical = serde_json::to_vec(&json!({
         "cache_schema": "context_footprint_request_v3",
         "agent_source": &request.agent_source,

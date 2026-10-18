@@ -46,10 +46,19 @@ pub(crate) fn measure_file(
     file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .ok()?;
+    measure_bytes(&bytes, auto_memory, salt)
+}
+
+/// Counts for complete file bytes already in memory (never a partial prefix).
+pub(crate) fn measure_bytes(
+    bytes: &[u8],
+    auto_memory: bool,
+    salt: Option<&[u8; 32]>,
+) -> Option<FileCounts> {
     if bytes.len() > MAX_FILE_BYTES {
         return None;
     }
-    let text = std::str::from_utf8(&bytes).ok()?;
+    let text = std::str::from_utf8(bytes).ok()?;
     // split_terminator excludes the phantom line after a final newline, while
     // retaining empty lines and CR units in CRLF input.
     let mut file_lines = 0usize;
@@ -71,7 +80,7 @@ pub(crate) fn measure_file(
         file_bytes: Some(bytes.len() as u64),
         file_lines: Some(file_lines as u64),
         file_chars: Some(text.encode_utf16().count() as u64),
-        content_hash: salt.map(|salt| salted_content_hash(salt, &bytes)),
+        content_hash: salt.map(|salt| salted_content_hash(salt, bytes)),
         loaded_lines: auto_memory.then_some(loaded_lines as u64),
         truncated_by_limit: auto_memory.then_some(loaded_lines < file_lines),
     })
