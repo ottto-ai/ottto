@@ -752,7 +752,7 @@ fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
 
 #[test]
 fn codex_v2_receipts_reach_local_diagnostics_with_open_turn_debt() {
-    use crate::codex_scan_diagnostics::{CodexScanDiagnostics, CountingV2Receipts};
+    use crate::codex_scan_diagnostics::CountingV2Receipts;
     let usage = [3_000, 0, 0, 300, 30, 3_300];
     let staged = [1_000, 0, 0, 100, 10, 1_100];
     let values = [
@@ -788,13 +788,10 @@ fn codex_v2_receipts_reach_local_diagnostics_with_open_turn_debt() {
     assert_eq!(receipts.open_turn_ui_pending_events_this_scan, 1);
     assert_eq!(receipts.open_turn_ui_pending_usage_this_scan, staged);
     assert_eq!(receipts.open_turn_ui_pending_unsummable_this_scan, 0);
-    let journal = serde_json::to_value(CodexScanDiagnostics {
-        codex_counting_v2: receipts,
-        ..Default::default()
-    })
-    .unwrap();
+    // The terminal journal serializes this block as `local_codex_counting_v2`.
+    let journal = serde_json::to_value(receipts).unwrap();
     assert_eq!(
-        journal["codex_counting_v2"]["open_turn_ui_pending_usage_this_scan"],
+        journal["open_turn_ui_pending_usage_this_scan"],
         json!(staged)
     );
     assert_eq!(

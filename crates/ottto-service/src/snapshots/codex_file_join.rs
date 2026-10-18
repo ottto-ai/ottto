@@ -1867,7 +1867,10 @@ pub(super) mod tests {
         let _cutover = codex_counting_version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
-        let receipts = counted.local_codex_diagnostics.unwrap().codex_counting_v2;
+        let receipts = counted
+            .codex_counting_v2
+            .as_deref()
+            .expect("an executed configured group parse owns receipts");
         assert_eq!(receipts.v2_sessions, 1, "a joined group folds once");
         // One carried accumulator saw both members' records.
         assert_eq!(receipts.native_outside_open_turn, 2);
@@ -1876,13 +1879,9 @@ pub(super) mod tests {
             assert!(index.files[key].codex_counting_v2, "V2 marks every member");
             assert!(!legacy_index.files[key].codex_counting_v2);
         }
-        assert_eq!(
-            legacy
-                .local_codex_diagnostics
-                .unwrap()
-                .codex_counting_v2
-                .v2_sessions,
-            0
+        assert!(
+            legacy.codex_counting_v2.is_none(),
+            "an inactive scan reports no receipts, not a zero block"
         );
         for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
             assert_eq!(counted.input_tokens, legacy.input_tokens);

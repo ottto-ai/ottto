@@ -2861,6 +2861,9 @@ pub struct SourceScanResult {
     pub snapshots: Vec<SnapshotItem>,
     pending_finalization: Vec<PendingIndexFinalization>,
     pub(crate) local_codex_diagnostics: Option<CodexScanDiagnostics>,
+    /// Local-only V2 counting receipts of this scan, moved out of its census.
+    /// `None` when no configured counting parse finished (never a zero block).
+    pub(crate) codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
     codex_join_validation: Option<codex_file_join::Validation>,
     codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
 }
@@ -15105,6 +15108,8 @@ impl OwnedSourceScan {
                             inventory,
                             groups: codex_join_completed,
                         }),
+                    // Moved, not copied: the box was charged with the census.
+                    codex_counting_v2: census.codex_counting_v2.take(),
                     local_codex_diagnostics: (source == SnapshotSource::Codex).then_some(
                         CodexScanDiagnostics {
                             version: 1,
@@ -15121,11 +15126,6 @@ impl OwnedSourceScan {
                                 clean_followup: needs_clean_followup,
                                 census_complete,
                             },
-                            codex_counting_v2: census
-                                .codex_counting_v2
-                                .as_deref()
-                                .copied()
-                                .unwrap_or_default(),
                             ..codex_title_metadata.local_diagnostics
                         },
                     ),
