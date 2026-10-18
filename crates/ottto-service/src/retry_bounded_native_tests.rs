@@ -47,14 +47,128 @@ fn bounded_native_read(stream: &mut std::net::TcpStream) -> Vec<u8> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
+    let deadline = Instant::now() + BOUNDED_NATIVE_FIXTURE_WAIT;
     let mut bytes = Vec::new();
     let mut buf = [0; 4096];
     while !http_request_complete(&bytes) {
-        let n = stream.read(&mut buf).unwrap();
-        assert!(n > 0);
+        assert!(
+            Instant::now() < deadline,
+            "fixture request incomplete after {BOUNDED_NATIVE_FIXTURE_WAIT:?}: {} bytes",
+            bytes.len()
+        );
+        let n = stream
+            .read(&mut buf)
+            .unwrap_or_else(|e| panic!("fixture request read after {} bytes: {e}", bytes.len()));
+        assert!(n > 0, "client closed fixture request after {} bytes", bytes.len());
         bytes.extend_from_slice(&buf[..n]);
     }
     bytes
+}
+
+// Loopback fixture server. The client turn is synchronous, so once it returns
+// no further connection can arrive: `join` cancels a pending accept instead of
+// waiting forever, and dropping the guard (client early return or panic) stops
+// the server too. Both are bounded, so a stranded fixture cannot keep holding
+// SNAPSHOT_SYNC_LOCK for every later retry test.
+const BOUNDED_NATIVE_FIXTURE_WAIT: Duration = Duration::from_secs(10);
+struct BoundedNativeListener {
+    listener: std::net::TcpListener,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl BoundedNativeListener {
+    fn accept(&self) -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let started = Instant::now();
+        let mut reported = false;
+        loop {
+            // Drain any queued connection before honoring cancellation.
+            match self.listener.accept() {
+                Ok((stream, peer)) => {
+                    // BSD accept inherits the listener's non-blocking flag.
+                    stream.set_nonblocking(false)?;
+                    self.accepted.fetch_add(1, SeqCst);
+                    return Ok((stream, peer));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            let next = self.accepted.load(SeqCst) + 1;
+            if self.stop.load(SeqCst) {
+                return Err(std::io::Error::other(format!(
+                    "client returned before fixture connection {next}"
+                )));
+            }
+            if !reported && started.elapsed() > BOUNDED_NATIVE_FIXTURE_WAIT {
+                reported = true;
+                eprintln!(
+                    "fixture still waiting for connection {next} after {BOUNDED_NATIVE_FIXTURE_WAIT:?}; client turn has not returned"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn into_inner(self) -> std::net::TcpListener {
+        self.listener
+    }
+}
+struct BoundedNativeServer<T> {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    done: std::sync::mpsc::Receiver<()>,
+    handle: Option<std::thread::JoinHandle<T>>,
+}
+fn bounded_native_server<T: Send + 'static>(
+    listener: std::net::TcpListener,
+    serve: impl FnOnce(BoundedNativeListener) -> T + Send + 'static,
+) -> BoundedNativeServer<T> {
+    listener.set_nonblocking(true).unwrap();
+    let listener = BoundedNativeListener {
+        listener,
+        stop: Default::default(),
+        accepted: Default::default(),
+    };
+    let (stop, accepted) = (listener.stop.clone(), listener.accepted.clone());
+    // A panicking server drops `finished`, which also ends the wait below.
+    let (finished, done) = std::sync::mpsc::sync_channel(1);
+    let handle = std::thread::spawn(move || {
+        let result = serve(listener);
+        let _ = finished.send(());
+        result
+    });
+    BoundedNativeServer {
+        stop,
+        accepted,
+        done,
+        handle: Some(handle),
+    }
+}
+impl<T> BoundedNativeServer<T> {
+    fn stop_and_wait(&mut self) -> Option<std::thread::JoinHandle<T>> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = self.handle.take()?;
+        match self.done.recv_timeout(BOUNDED_NATIVE_FIXTURE_WAIT) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            _ => Some(handle),
+        }
+    }
+    /// Call only after the client turn returned.
+    fn join(mut self) -> std::thread::Result<T> {
+        match self.stop_and_wait() {
+            Some(handle) => handle.join(),
+            None => panic!(
+                "fixture server still running {BOUNDED_NATIVE_FIXTURE_WAIT:?} after the client returned; accepted {} connection(s)",
+                self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+            ),
+        }
+    }
+}
+impl<T> Drop for BoundedNativeServer<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.stop_and_wait() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[test]
@@ -119,7 +233,7 @@ fn bounded_retry_native_transport_fallback_auth_exact_ack_checkpoint_and_recover
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let ack = bounded_native_ack(&item);
-    let server = std::thread::spawn(move || {
+    let server = bounded_native_server(listener, move |listener| {
         let mut trace = Vec::new();
         for (status, body) in [
             ("200 OK", "{\"token\":\"fresh-one\"}"),
@@ -201,7 +315,7 @@ fn bounded_retry_native_response_cap_and_post_ack_cancellation_preserve_durable_
         let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let server_live = live.clone();
         let ack = bounded_native_ack(&f.items[0]);
-        let server = std::thread::spawn(move || {
+        let server = bounded_native_server(listener, move |listener| {
             let (mut stream, _) = listener.accept().unwrap();
             bounded_native_read(&mut stream);
             bounded_native_response(&mut stream, "200 OK", "{\"token\":\"fresh\"}");
@@ -366,7 +480,7 @@ fn bounded_retry_actual_owner_boundary_fairness_same_source_block_and_recovery()
                 None
             } else {
                 let ack = bounded_native_ack(&scan.a.items[0]);
-                Some(std::thread::spawn(move || {
+                Some(bounded_native_server(listener, move |listener| {
                     let (mut stream, _) = listener.accept().unwrap();
                     bounded_native_read(&mut stream);
                     bounded_native_response(&mut stream, "200 OK", "{\"token\":\"fresh\"}");
@@ -529,7 +643,7 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let ack = bounded_native_ack(&current[0]);
-        let server = std::thread::spawn(move || {
+        let server = bounded_native_server(listener, move |listener| {
             use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
             bounded_native_read(&mut stream);
@@ -598,7 +712,7 @@ fn bounded_retry_native_reshed_keeps_original_expiry_and_shared_posts() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let ack = bounded_native_ack(&current[0]);
-    let server = std::thread::spawn(move || {
+    let server = bounded_native_server(listener, move |listener| {
         use std::io::Write;
         for n in 0..4 {
             let (mut stream, _) = listener.accept().unwrap();
@@ -659,7 +773,7 @@ fn bounded_retry_native_tls_trickle_cannot_extend_token_or_batch_deadline() {
         let f = SameSourceAckFixture::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
+        let server = bounded_native_server(listener, move |listener| {
             use std::io::{Read, Write};
             let (mut stream, _) = listener.accept().unwrap();
             stream

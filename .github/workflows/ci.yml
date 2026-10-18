@@ -48,7 +48,8 @@ jobs:
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Runtime tests
-        run: cargo test --workspace --locked
+        # Print a failing assertion when it happens, not only after the suite.
+        run: cargo test --workspace --locked -- --nocapture
 
       - name: Layout coverage receipt
         run: |

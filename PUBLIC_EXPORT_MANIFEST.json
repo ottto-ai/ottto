@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 684,
-  "content_sha256": "782e96366c374857de4b63600ef088d0bd12ab67fbae7e32c7d103da08f09b54",
+  "content_sha256": "434f890f0b4d0098b795e472cde87989e08b943f09ee37d18a5225a2aaff9647",
   "files": [
     {
       "executable": false,
@@ -20,8 +20,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/ci.yml",
-      "sha256": "2bcf6272a1d7b4a6b5febd616eb7963bdb08a985fc0f1e36c7c56b274f261550",
-      "size_bytes": 3917
+      "sha256": "9005b94670e681b24fd6b8106b43f900d100bd9dd648e94d29fdc106f8137490",
+      "size_bytes": 4011
     },
     {
       "executable": false,
@@ -1112,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_bounded_native_tests.rs",
-      "sha256": "b43e8535769412b2b087c4141494c2494f8657df940bdb5bf3df166e739f4cde",
-      "size_bytes": 29118
+      "sha256": "6cb4364d4f2cc10b0a9f9936c6dee456334acb463bb10505917a37cc3ce2f1f5",
+      "size_bytes": 33882
     },
     {
       "executable": false,
@@ -1126,8 +1126,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_live_native_tests.rs",
-      "sha256": "ba1c1357ee7d5a462d01f9293623ebd1d0be9522c1868134ea38dde6f60e08f3",
-      "size_bytes": 24871
+      "sha256": "6d2efd297e5b95660df214178cb1ef388af9e2c55d0b3e6d9a4dd16223dc50f5",
+      "size_bytes": 24967
     },
     {
       "executable": false,
@@ -1574,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/ci-supported-rust.html",
-      "sha256": "6fc2c6d7705787001e6a41ec15b9670f120b925cee8ab5c173b1d67d22651da6",
-      "size_bytes": 992
+      "sha256": "9bfd20e5c1321b85e65649788983656e11a8b8f904537cd7552df495a02f5c00",
+      "size_bytes": 1420
     },
     {
       "executable": false,
@@ -4793,7 +4793,7 @@
   ],
   "generated_at": "2026-10-18T12:32:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 684,
+  "output_file_count": 685,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
