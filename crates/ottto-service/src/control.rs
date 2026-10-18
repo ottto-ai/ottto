@@ -26845,7 +26845,6 @@ for line in sys.stdin:
             max_depth: 1,
             max_entries: 16,
             max_files: 16,
-            ..PI_SESSION_SAFETY_LIMITS
         };
         let error = pi_session_files_in_with_limits(&root, limits)
             .expect_err("deep traversal must be refused");
@@ -26859,7 +26858,6 @@ for line in sys.stdin:
             max_depth: 4,
             max_entries: 16,
             max_files: 2,
-            ..PI_SESSION_SAFETY_LIMITS
         };
         let error = pi_session_files_in_with_limits(&wide, limits)
             .expect_err("wide traversal must be refused");
