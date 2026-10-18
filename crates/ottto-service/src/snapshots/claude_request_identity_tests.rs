@@ -1353,6 +1353,8 @@ fn desktop_census_witness_is_bound_to_completion_process_and_inventory() {
                 source_created_at: None,
                 imported: false,
             }),
+            desktop_session_id: None,
+            spawned_from_desktop_session_id: None,
         },
     );
     index.claude_desktop_title_files.insert(
@@ -1368,6 +1370,8 @@ fn desktop_census_witness_is_bound_to_completion_process_and_inventory() {
                 source_created_at: None,
                 imported: true,
             }),
+            desktop_session_id: None,
+            spawned_from_desktop_session_id: None,
         },
     );
     let census = identity::desktop_census_at(&index, 100).unwrap();

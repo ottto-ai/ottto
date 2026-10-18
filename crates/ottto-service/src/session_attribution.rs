@@ -1097,6 +1097,64 @@ pub fn claude_subagent_facts(
     facts
 }
 
+/// Parser id stamped on the lineage facts read from the Claude desktop app's
+/// per-session store. The backend serves an edge with this capture source as
+/// `launched`: the parent started a separate session rather than sub-work.
+pub const CLAUDE_DESKTOP_SPAWN_SOURCE_VERSION: &str = "claude_desktop_spawn:v1";
+
+/// Lineage of a Claude Code session another session started from the Claude
+/// desktop app (its `start_session` tool). The app records the starting session
+/// as `spawnedFrom` in the child's own store file, so these are provider-owned
+/// artifacts, not inference.
+pub struct ClaudeDesktopSpawnAttribution<'a> {
+    /// The starting session's transcript id (its `cliSessionId`).
+    pub parent_session_ref: &'a str,
+    /// The top of the desktop spawn chain; equals the parent at depth 1.
+    pub root_session_ref: &'a str,
+    pub spawn_depth: usize,
+}
+
+/// Fixed-name lineage facts for one desktop-spawned Claude Code session.
+///
+/// Ordered most- to least-load-bearing because the caller trims from the tail
+/// to stay inside the bounded payload budget.
+pub fn claude_desktop_spawn_facts(
+    attribution: &ClaudeDesktopSpawnAttribution<'_>,
+    source_session_id: &str,
+    observed_at: &str,
+) -> Vec<SessionAttributionFact> {
+    let mut facts = Vec::new();
+    let evidence_context = EvidenceContext {
+        source_session_id,
+        observed_at,
+        source_version: CLAUDE_DESKTOP_SPAWN_SOURCE_VERSION,
+    };
+    for (field, value) in [
+        ("parent_session_ref", attribution.parent_session_ref),
+        ("origin_kind", "agent_spawn"),
+        ("root_session_ref", attribution.root_session_ref),
+        ("agent_kind", "claude_desktop_session"),
+    ] {
+        push_fact(
+            &mut facts,
+            field,
+            value,
+            "provider_artifact",
+            "direct",
+            &evidence_context,
+        );
+    }
+    push_fact(
+        &mut facts,
+        "spawn_depth",
+        &attribution.spawn_depth.to_string(),
+        "provider_artifact",
+        "direct",
+        &evidence_context,
+    );
+    facts
+}
+
 /// Exact Codex subagent identity plus optional family facts.
 ///
 /// The rollout itself supplies the subagent identity and an independently
@@ -1788,6 +1846,41 @@ mod tests {
             workflow_ref: Some("402d846d-c13c-4743-8326-580e4ca70e30".to_string()),
             agent_kind: "pr-fixer",
         }
+    }
+
+    #[test]
+    fn claude_desktop_spawn_facts_state_the_starting_session_as_provider_artifact() {
+        let facts = claude_desktop_spawn_facts(
+            &ClaudeDesktopSpawnAttribution {
+                parent_session_ref: "94bd328b-f2a9-4c31-bbfe-e174d41b4310",
+                root_session_ref: "11111111-2222-3333-4444-555555555555",
+                spawn_depth: 2,
+            },
+            "da1dc804-1c50-4401-8c3c-0898b126772f",
+            "2026-10-18T10:20:00Z",
+        );
+
+        let by_field: BTreeMap<&str, &str> = facts
+            .iter()
+            .map(|fact| (fact.field.as_str(), fact.value.as_str()))
+            .collect();
+        assert_eq!(
+            by_field,
+            BTreeMap::from([
+                ("parent_session_ref", "94bd328b-f2a9-4c31-bbfe-e174d41b4310"),
+                ("origin_kind", "agent_spawn"),
+                ("root_session_ref", "11111111-2222-3333-4444-555555555555"),
+                ("agent_kind", "claude_desktop_session"),
+                ("spawn_depth", "2"),
+            ])
+        );
+        assert_eq!(facts[0].field, "parent_session_ref");
+        for fact in &facts {
+            assert_eq!(fact.evidence.kind, "provider_artifact");
+            assert_eq!(fact.evidence.strength, "direct");
+            assert_eq!(fact.evidence.source_version, "claude_desktop_spawn:v1");
+        }
+        validate_fact_limits(&facts).expect("facts fit the wire contract");
     }
 
     #[test]

@@ -8628,9 +8628,20 @@ struct ClaudeTitleMetadata {
     titles: BTreeMap<String, ClaudeTitleCandidate>,
     account_identifier_hashes: BTreeMap<String, BTreeSet<String>>,
     original_identity_evidence: BTreeMap<String, BTreeSet<ClaudeDesktopIdentityEvidence>>,
+    /// Child transcript id -> the session that started it from the desktop app
+    /// (`spawnedFrom`), resolved through the store to the parent's own
+    /// transcript id. Only unambiguous, acyclic links are kept.
+    spawn_lineage: BTreeMap<String, ClaudeDesktopSpawnLineage>,
     legacy_sidecar_fingerprint: String,
     sidecar_census_incomplete: bool,
     original_identity_census_incomplete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeDesktopSpawnLineage {
+    parent_session_id: String,
+    root_session_id: String,
+    spawn_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -8652,6 +8663,14 @@ struct ClaudeDesktopTitleIndexEntry {
     account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original_identity: Option<ClaudeDesktopIdentityEvidence>,
+    /// The desktop app's own id for this session (`local_<uuid>`), which is
+    /// what another session's `spawnedFrom` names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desktop_session_id: Option<String>,
+    /// `spawnedFrom.sessionId`: the desktop id of the session that started
+    /// this one with the app's `start_session` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spawned_from_desktop_session_id: Option<String>,
 }
 
 /// Directory identity is original only for a native, unimported session. Desktop's
@@ -8760,7 +8779,23 @@ impl ClaudeTitleMetadata {
                 "complete"
             },
         ]);
+        // Appended only when a link exists, so sessions nobody spawned keep
+        // their fingerprint and only spawned children re-emit once.
+        let spawn_depth;
+        if let Some(lineage) = self.spawn_lineage.get(source_session_id) {
+            spawn_depth = lineage.spawn_depth.to_string();
+            parts.extend([
+                "desktop_spawn_lineage:v1",
+                lineage.parent_session_id.as_str(),
+                lineage.root_session_id.as_str(),
+                spawn_depth.as_str(),
+            ]);
+        }
         sha256_hex(&parts)
+    }
+
+    fn spawn_lineage(&self, source_session_id: &str) -> Option<&ClaudeDesktopSpawnLineage> {
+        self.spawn_lineage.get(source_session_id)
     }
 
     #[cfg(test)]
@@ -8984,6 +9019,8 @@ impl ClaudeTitleMetadata {
                 }
             }
         }
+        metadata.spawn_lineage =
+            claude_desktop_spawn_lineage(index.claude_desktop_title_files.values());
         let sidecar_parts = metadata
             .titles
             .iter()
@@ -8992,6 +9029,77 @@ impl ClaudeTitleMetadata {
         metadata.legacy_sidecar_fingerprint = sha256_hex_owned(&sidecar_parts);
         metadata
     }
+}
+
+/// Deepest desktop spawn chain followed. Real chains are a few levels; the
+/// bound matches the backend's `spawn_depth` limit and stops a pathological or
+/// cyclic store.
+const MAX_CLAUDE_DESKTOP_SPAWN_DEPTH: usize = 9;
+
+/// Resolve each desktop `spawnedFrom` link to transcript ids.
+///
+/// A link is kept only when every store file for the child agrees on one parent
+/// desktop id, that desktop id belongs to exactly one transcript, and the chain
+/// up to its root is acyclic within the depth bound. Anything else leaves the
+/// child unlinked rather than guessing.
+fn claude_desktop_spawn_lineage<'a>(
+    entries: impl Iterator<Item = &'a ClaudeDesktopTitleIndexEntry>,
+) -> BTreeMap<String, ClaudeDesktopSpawnLineage> {
+    let mut cli_by_desktop: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    let mut parent_desktop_by_cli: BTreeMap<&str, BTreeSet<Option<&str>>> = BTreeMap::new();
+    for entry in entries {
+        if let Some(desktop_id) = entry.desktop_session_id.as_deref() {
+            cli_by_desktop
+                .entry(desktop_id)
+                .or_default()
+                .insert(entry.cli_session_id.as_str());
+        }
+        parent_desktop_by_cli
+            .entry(entry.cli_session_id.as_str())
+            .or_default()
+            .insert(entry.spawned_from_desktop_session_id.as_deref());
+    }
+    let direct_parent = |child: &str| -> Option<&str> {
+        let parents = parent_desktop_by_cli.get(child)?;
+        let [Some(parent_desktop_id)] = parents.iter().copied().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let clis = cli_by_desktop.get(parent_desktop_id)?;
+        let [parent] = clis.iter().copied().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        (parent != child).then_some(parent)
+    };
+    let mut lineage = BTreeMap::new();
+    for &child in parent_desktop_by_cli.keys() {
+        let Some(parent) = direct_parent(child) else {
+            continue;
+        };
+        let mut seen = BTreeSet::from([child, parent]);
+        let mut root = parent;
+        let mut depth = 1;
+        let complete = loop {
+            let Some(next) = direct_parent(root) else {
+                break true;
+            };
+            if depth >= MAX_CLAUDE_DESKTOP_SPAWN_DEPTH || !seen.insert(next) {
+                break false;
+            }
+            root = next;
+            depth += 1;
+        };
+        if complete {
+            lineage.insert(
+                child.to_string(),
+                ClaudeDesktopSpawnLineage {
+                    parent_session_id: parent.to_string(),
+                    root_session_id: root.to_string(),
+                    spawn_depth: depth,
+                },
+            );
+        }
+    }
+    lineage
 }
 
 #[derive(Debug, Default)]
@@ -9246,13 +9354,31 @@ fn load_claude_desktop_session_title(
             bounded_rfc3339_millis(millis)
         });
     }
+    // Lineage ids are optional: a missing or malformed one leaves the session
+    // unlinked and never invalidates its title.
+    let desktop_session_id =
+        string_at(&value, &["sessionId"]).filter(|id| is_claude_desktop_session_id(id));
+    let spawned_from_desktop_session_id = string_at(&value, &["spawnedFrom", "sessionId"])
+        .filter(|id| is_claude_desktop_session_id(id));
     Ok(Some(ClaudeDesktopTitleIndexEntry {
         cli_session_id,
         title,
         user_set,
         account_identifier_hash,
         original_identity,
+        desktop_session_id,
+        spawned_from_desktop_session_id,
     }))
+}
+
+/// Desktop session ids are compact `local_<uuid>`-style tokens; anything else
+/// is not retained.
+fn is_claude_desktop_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 /// Per-turn fast-mode signal lifted from Codex's undocumented `logs_2.sqlite`
@@ -9496,6 +9622,8 @@ struct SnapshotAccumulator {
     codex_creator_evidence: Option<SessionAccountEvidence>,
     codex_creator_evidence_conflicted: bool,
     claude_desktop_identity: Option<SessionAccountEvidence>,
+    /// The session that started this one from the Claude desktop app.
+    claude_desktop_spawn_lineage: Option<ClaudeDesktopSpawnLineage>,
     claude_owned_session_id_observed: bool,
     claude_owned_session_id_conflicted: bool,
     codex_ownership_boundary: CodexOwnershipBoundary,
@@ -9705,6 +9833,7 @@ impl SnapshotAccumulator {
             codex_creator_evidence: None,
             codex_creator_evidence_conflicted: false,
             claude_desktop_identity: None,
+            claude_desktop_spawn_lineage: None,
             claude_owned_session_id_observed: false,
             claude_owned_session_id_conflicted: false,
             codex_ownership_boundary: CodexOwnershipBoundary::Undetermined,
@@ -10911,6 +11040,11 @@ impl SnapshotAccumulator {
             }
             self.claude_desktop_identity = Some(evidence);
         }
+        // Keyed by the transcript's own file stem: the desktop store names
+        // native sessions by `cliSessionId`, never by a copied locator.
+        if path.file_stem().and_then(|value| value.to_str()) == Some(session_id.as_str()) {
+            self.claude_desktop_spawn_lineage = metadata.spawn_lineage(&session_id).cloned();
+        }
         let Some(candidate) = metadata.titles.get(session_id.as_str()) else {
             return;
         };
@@ -11321,6 +11455,27 @@ impl SnapshotAccumulator {
                 collected_at,
                 self.source.parser_version(),
             ));
+        }
+        // The starting session the Claude desktop app recorded for a session
+        // another agent opened with its `start_session` tool. Provider-owned
+        // lineage, so it sits ahead of launcher facts and never overwrites a
+        // field provider-native evidence already filled.
+        if let Some(lineage) = self.claude_desktop_spawn_lineage.as_ref() {
+            let mut spawn_facts = crate::session_attribution::claude_desktop_spawn_facts(
+                &crate::session_attribution::ClaudeDesktopSpawnAttribution {
+                    parent_session_ref: &lineage.parent_session_id,
+                    root_session_ref: &lineage.root_session_id,
+                    spawn_depth: lineage.spawn_depth,
+                },
+                &source_session_id,
+                collected_at,
+            );
+            spawn_facts.retain(|spawn_fact| {
+                !attribution_facts
+                    .iter()
+                    .any(|fact| fact.field == spawn_fact.field)
+            });
+            attribution_facts.extend(spawn_facts);
         }
         // The controller edge an instrumented launcher stated at spawn time.
         // Same position and same reason as the subagent identity above: it is
@@ -48663,6 +48818,148 @@ mod tests {
         assert!(metadata.original_identity_evidence.is_empty());
     }
 
+    fn desktop_spawn_entry(
+        cli: &str,
+        desktop: &str,
+        spawned_from: Option<&str>,
+    ) -> ClaudeDesktopTitleIndexEntry {
+        ClaudeDesktopTitleIndexEntry {
+            cli_session_id: cli.to_string(),
+            title: None,
+            user_set: false,
+            account_identifier_hash: None,
+            original_identity: None,
+            desktop_session_id: Some(desktop.to_string()),
+            spawned_from_desktop_session_id: spawned_from.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_resolves_parent_root_and_depth() {
+        let entries = [
+            desktop_spawn_entry("root-cli", "local_root", None),
+            desktop_spawn_entry("mid-cli", "local_mid", Some("local_root")),
+            desktop_spawn_entry("leaf-cli", "local_leaf", Some("local_mid")),
+            // The parent's store file is gone: nothing to resolve the link to.
+            desktop_spawn_entry("orphan-cli", "local_orphan", Some("local_missing")),
+        ];
+        let lineage = claude_desktop_spawn_lineage(entries.iter());
+
+        assert_eq!(
+            lineage.get("mid-cli"),
+            Some(&ClaudeDesktopSpawnLineage {
+                parent_session_id: "root-cli".to_string(),
+                root_session_id: "root-cli".to_string(),
+                spawn_depth: 1,
+            })
+        );
+        assert_eq!(
+            lineage.get("leaf-cli"),
+            Some(&ClaudeDesktopSpawnLineage {
+                parent_session_id: "mid-cli".to_string(),
+                root_session_id: "root-cli".to_string(),
+                spawn_depth: 2,
+            })
+        );
+        assert!(!lineage.contains_key("root-cli"));
+        assert!(!lineage.contains_key("orphan-cli"));
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_refuses_ambiguous_and_cyclic_links() {
+        let entries = [
+            // Two store files for one child disagree on who started it.
+            desktop_spawn_entry("parent-a", "local_a", None),
+            desktop_spawn_entry("parent-b", "local_b", None),
+            desktop_spawn_entry("split-child", "local_split_1", Some("local_a")),
+            desktop_spawn_entry("split-child", "local_split_2", Some("local_b")),
+            // One desktop id claimed by two transcripts.
+            desktop_spawn_entry("dup-1", "local_dup", None),
+            desktop_spawn_entry("dup-2", "local_dup", None),
+            desktop_spawn_entry("dup-child", "local_dup_child", Some("local_dup")),
+            // A cycle never yields a root.
+            desktop_spawn_entry("cycle-1", "local_c1", Some("local_c2")),
+            desktop_spawn_entry("cycle-2", "local_c2", Some("local_c1")),
+            desktop_spawn_entry("self", "local_self", Some("local_self")),
+        ];
+        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        assert!(lineage.is_empty(), "{lineage:?}");
+    }
+
+    #[test]
+    fn claude_desktop_spawned_session_emits_starting_session_lineage() {
+        let parent = "94bd328b-f2a9-4c31-bbfe-e174d41b4310";
+        let child = "da1dc804-1c50-4401-8c3c-0898b126772f";
+        let (home, transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-spawned",
+            child,
+            &format!(
+                "{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"title\":\"UI proposal\",\"titleSource\":\"tool\",\"spawnedFrom\":{{\"sessionId\":\"local_25ffd936\",\"taskId\":\"task_1\",\"sideSession\":true}}}}"
+            ),
+            &format!(
+                "{{\"timestamp\":\"2026-10-18T10:12:00Z\",\"sessionId\":\"{child}\",\"entrypoint\":\"claude-desktop\",\"message\":{{\"model\":\"claude-opus-5-5\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n"
+            ),
+        );
+        let store_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-ctx")
+            .join("workspace");
+        let unlinked = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+        assert!(
+            unlinked.spawn_lineage.is_empty(),
+            "parent not in the store yet"
+        );
+        fs::write(
+            store_dir.join("local_desktop-0.json"),
+            format!(
+                "{{\"sessionId\":\"local_25ffd936\",\"cliSessionId\":\"{parent}\",\"title\":\"Repo analysis\",\"spawnedFrom\":null}}"
+            ),
+        )
+        .expect("write parent store file");
+        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+
+        // Only the child's sidecar fingerprint moves, so only it re-emits.
+        assert_ne!(
+            metadata.session_sidecar_fingerprint(child),
+            unlinked.session_sidecar_fingerprint(child)
+        );
+        assert!(metadata.spawn_lineage(parent).is_none());
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript_path,
+            "2026-10-18T10:20:00Z",
+            "fp".to_string(),
+            &metadata,
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        let by_field: BTreeMap<&str, &crate::session_attribution::SessionAttributionFact> = item
+            .attribution_facts
+            .iter()
+            .map(|fact| (fact.field.as_str(), fact))
+            .collect();
+        assert_eq!(by_field["parent_session_ref"].value, parent);
+        assert_eq!(by_field["root_session_ref"].value, parent);
+        assert_eq!(by_field["origin_kind"].value, "agent_spawn");
+        assert_eq!(by_field["agent_kind"].value, "claude_desktop_session");
+        assert_eq!(by_field["spawn_depth"].value, "1");
+        assert_eq!(
+            by_field["parent_session_ref"].evidence.kind,
+            "provider_artifact"
+        );
+        assert_eq!(
+            by_field["parent_session_ref"].evidence.source_version,
+            "claude_desktop_spawn:v1"
+        );
+        fs::remove_dir_all(home).expect("remove fixture");
+    }
+
     #[test]
     fn claude_desktop_store_title_applies_to_matching_session() {
         let (home, transcript_path, projects_root) = claude_desktop_fixture(
@@ -57871,13 +58168,14 @@ crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; census_window_end,
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier_hash, evidence_request_count, members, member_request_id_fingerprints);
 crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before);
 crate::heap_layout_bound::fields!(ClaudeDesktopIdentityEvidence; account_identifier_hash, provider_workspace_hash, source_created_at, imported);
-crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity);
+crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id, root_session_id, spawn_depth);
+crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id);
 crate::heap_layout_bound::fields!(ClaudeDuplicateRequestOwner; root_session_id_hash, source_session_id_hash);
 crate::heap_layout_bound::fields!(ClaudeOwnedStartCensusWitness; marker_source_file_fingerprint, verified_source_file_fingerprint, emitted_source_file_fingerprint);
 crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded);
 crate::heap_layout_bound::fields!(ClaudeResponseRecord; cache_slot, physical_sequence, usage, model, selector, reasoning_effort, request_id, timestamp, computed_effective_input_context, tool_uses);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
-crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, effective_input_context);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);
@@ -57917,7 +58215,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
