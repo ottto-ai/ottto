@@ -75,7 +75,10 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
         }
         let expected_admission = !short && !unknown;
         let mut retained = Vec::new();
-        let (admitted, allocations) = crate::retry_allocation_probe::measure_process(|| {
+        // Synchronous on this thread (no spawn, channel or pool in the call
+        // chain): thread-local accounting counts the same allocation events
+        // and excludes unrelated tests' allocations in parallel hosted runs.
+        let (admitted, allocations) = crate::retry_allocation_probe::measure(|| {
             phase.retain_target_output(&parsed, &mut retained, &mut paid)
         });
         assert_eq!(admitted.is_ok(), expected_admission);
@@ -270,7 +273,13 @@ fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once(
         );
         assert!(paid.as_mut().unwrap().reserve_recovery(recovery));
         let unchanged = serde_json::to_vec(&index).unwrap();
-        let (imported, allocations) = crate::retry_allocation_probe::measure_process(|| {
+        // Synchronous on this thread (no spawn, channel or pool in the call
+        // chain), so thread-local accounting excludes parallel tests. Unlike
+        // the born-in-scope process audit, it nets frees and the old side of
+        // reallocations of storage that existed before the call: the peak is
+        // this thread's actual incremental heap, not an upper bound on new
+        // allocations alone.
+        let (imported, allocations) = crate::retry_allocation_probe::measure(|| {
             phase.import_window_paid(Some(window), &index, &scan.census_window_end, &mut paid)
         });
         assert_eq!(imported, !one_byte_short);
@@ -3830,7 +3839,10 @@ fn native_comparison_corrected_native_receipt_fixture(
             0,
             0,
         ));
-        let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
+        // Synchronous on this thread (no spawn, channel or pool in the call
+        // chain): thread-local accounting counts the same allocation events
+        // and excludes unrelated tests' allocations in parallel hosted runs.
+        let (_, allocation) = crate::retry_allocation_probe::measure(|| {
             completion.prepare_native_corrections(&scan, &previous, &disposition)
         });
         assert_eq!(
