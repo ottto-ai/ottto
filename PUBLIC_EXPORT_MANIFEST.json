@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 682,
-  "content_sha256": "2f249c33206cdc13484c07663add2bcac22998165e38531308ef8c77006c5681",
+  "content_sha256": "d30cf547586d0aa9e331346c6c2c26f510292c3ce509bf3582bb0e41dc43445e",
   "files": [
     {
       "executable": false,
@@ -1573,6 +1573,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/ci-supported-rust.html",
+      "sha256": "6fc2c6d7705787001e6a41ec15b9670f120b925cee8ab5c173b1d67d22651da6",
+      "size_bytes": 992
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/claude-accounts.md",
       "sha256": "1b6c83055c559e322ff834ab38004971e1b1f6b7a8203dd2d9d17b99718c1b63",
       "size_bytes": 24592
@@ -1604,13 +1611,6 @@
       "path": "docs/connectors.md",
       "sha256": "296177f70537e93cd8fef23b3980ea7114449179c67c5202c825fb2796b4ddd5",
       "size_bytes": 1982
-    },
-    {
-      "executable": false,
-      "mode": "0644",
-      "path": "docs/dev/2026-10-18-supported-rust-ci.html",
-      "sha256": "6fc2c6d7705787001e6a41ec15b9670f120b925cee8ab5c173b1d67d22651da6",
-      "size_bytes": 992
     },
     {
       "executable": false,
