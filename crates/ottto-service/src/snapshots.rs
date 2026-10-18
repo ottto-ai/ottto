@@ -6044,8 +6044,9 @@ fn claude_api_matches_transcript_occurrence(
 /// Claude Code's `api_request` event carries no thinking count, so the sidecar
 /// reports 0 while the transcript holds the real count. Only a count the
 /// sidecar actually reported must equal the transcript's.
-fn claude_api_reasoning_matches(reported: u64, transcript: u64) -> bool {
-    reported == 0 || reported == transcript
+fn claude_api_reasoning_matches(reported: impl Into<u128>, transcript: impl Into<u128>) -> bool {
+    let reported = reported.into();
+    reported == 0 || reported == transcript.into()
 }
 
 fn claude_family_request_ids_are_disjoint(pending: &ClaudeAccountFamilyPending) -> bool {
@@ -6524,7 +6525,10 @@ fn claude_account_evidence_covers_snapshot(
         && sum(|row| row.cache_read_tokens) == u128::from(item.cache_read_tokens)
         && cache_creation
             == u128::from(item.cache_creation_5m_tokens) + u128::from(item.cache_creation_1h_tokens)
-        && sum(|row| row.reasoning_output_tokens) == u128::from(item.reasoning_output_tokens)
+        && claude_api_reasoning_matches(
+            sum(|row| row.reasoning_output_tokens),
+            item.reasoning_output_tokens,
+        )
         && sum(|row| row.request_count) == u128::from(item.request_count)
 }
 
