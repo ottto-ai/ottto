@@ -14208,10 +14208,16 @@ impl OwnedSourceScan {
                 // Counting receipts reach the scan's local diagnostics only
                 // when this parse finishes: once per finished active file (a
                 // joined group is one).
-                let mut codex_counting_receipts = census.codex_counting_v2;
-                if let Some(counting) = parser.accumulator.codex_counting.as_deref() {
-                    counting.fold_receipts(&mut codex_counting_receipts);
-                }
+                let codex_counting_receipts =
+                    parser
+                        .accumulator
+                        .codex_counting
+                        .as_deref()
+                        .map(|counting| {
+                            let mut receipts = census.codex_counting_v2.clone().unwrap_or_default();
+                            counting.fold_receipts(&mut receipts);
+                            receipts
+                        });
                 let mut parsed_file = match parser.finish(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -14227,7 +14233,9 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
-                census.codex_counting_v2 = codex_counting_receipts;
+                if let Some(receipts) = codex_counting_receipts {
+                    census.codex_counting_v2 = Some(receipts);
+                }
                 let target_finalization_credit = if comparison_target {
                     if source != SnapshotSource::ClaudeCode || !aliases.is_empty() {
                         return Err(crate::source_rotation::LocalRefusal(
@@ -15113,7 +15121,11 @@ impl OwnedSourceScan {
                                 clean_followup: needs_clean_followup,
                                 census_complete,
                             },
-                            codex_counting_v2: census.codex_counting_v2,
+                            codex_counting_v2: census
+                                .codex_counting_v2
+                                .as_deref()
+                                .copied()
+                                .unwrap_or_default(),
                             ..codex_title_metadata.local_diagnostics
                         },
                     ),
@@ -20385,8 +20397,10 @@ struct ScanCensus {
     removed_index_keys: BTreeSet<String>,
     /// Count-only parse-selection reasons for Claude candidates on this page.
     claude_parse_reasons: [usize; CANDIDATE_PARSE_REASON_COUNT],
-    /// Local-only V2 counting receipts of this scan's finished parses.
-    codex_counting_v2: crate::codex_scan_diagnostics::CountingV2Receipts,
+    /// Local-only V2 counting receipts of this scan's finished parses. Boxed
+    /// so the census moved through every scan step stays small; allocated
+    /// only once a configured counting parse finishes.
+    codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
 }
 
 /// Preserve the old scope/open/object short-circuit and its one existing open.
