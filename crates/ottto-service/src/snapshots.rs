@@ -1,6 +1,6 @@
 use crate::codex_scan_diagnostics::{
-    self, CensusGates, CodexScanDiagnostics, FileReason, IncompleteShape, RecoveryLineage,
-    UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
+    self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
+    RecoveryLineage, StateRowFieldDiffs, UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -13389,7 +13389,9 @@ impl OwnedSourceScan {
         index.activate_quarantine_witness(source);
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
         let codex_title_metadata = if source == SnapshotSource::Codex {
-            CodexTitleMetadata::load_from_roots(roots)
+            let mut metadata = CodexTitleMetadata::load_from_roots(roots);
+            metadata.count_prior_state_only_conflicts(index);
+            metadata
         } else {
             CodexTitleMetadata::default()
         };
@@ -22108,6 +22110,7 @@ impl CodexTitleMetadata {
                 &state_path,
                 &mut metadata.state_threads,
                 &mut metadata.identity_conflicts,
+                &mut metadata.local_diagnostics.identity_conflict_taxonomy,
             );
             metadata.local_diagnostics.state_threads.observe_root(
                 &state_census,
@@ -22197,8 +22200,52 @@ impl CodexTitleMetadata {
                 metadata.spawn_parent_conflicts.insert(child);
             }
         }
+        metadata.count_identity_conflict_scope();
         metadata.legacy_sidecar_fingerprint = sha256_hex_owned(&legacy_sidecar_parts);
         metadata
+    }
+
+    /// Diagnostics only. Reads the merged maps already in hand; the per-edge
+    /// pass runs only when some conflict exists.
+    fn count_identity_conflict_scope(&mut self) {
+        let conflicts = &self.identity_conflicts;
+        let taxonomy = &mut self.local_diagnostics.identity_conflict_taxonomy;
+        taxonomy.conflict_keys_total = saturating_count_u32(conflicts.len());
+        if conflicts.is_empty() {
+            return;
+        }
+        taxonomy.conflict_keys_state_created = saturating_count_u32(
+            conflicts
+                .iter()
+                .filter(|key| self.state_created_threads.contains(key.as_str()))
+                .count(),
+        );
+        taxonomy.conflict_parent_child_edges = saturating_count_u32(
+            self.spawn_parents
+                .values()
+                .filter(|parent| conflicts.contains(parent.as_str()))
+                .count(),
+        );
+    }
+
+    /// Diagnostics only: conflict keys the prior scan published as durable
+    /// state-only entities. Must run before this scan rebinds that map.
+    fn count_prior_state_only_conflicts(&mut self, index: &ScanIndex) {
+        if self.identity_conflicts.is_empty() {
+            return;
+        }
+        self.local_diagnostics
+            .identity_conflict_taxonomy
+            .conflict_keys_prior_state_only = saturating_count_u32(
+            self.identity_conflicts
+                .iter()
+                .filter(|key| {
+                    index
+                        .codex_state_only_snapshot_fingerprints
+                        .contains_key(key.as_str())
+                })
+                .count(),
+        );
     }
 }
 
@@ -22444,6 +22491,7 @@ fn load_codex_sqlite_state_threads(
     path: &Path,
     state_threads: &mut BTreeMap<String, CodexStateThread>,
     identity_conflicts: &mut BTreeSet<String>,
+    taxonomy: &mut IdentityConflictTaxonomy,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -22503,8 +22551,12 @@ fn load_codex_sqlite_state_threads(
         let (raw_id, thread) = row
             .context(crate::codex_scan_diagnostics::LoaderStage::Row)
             .context("read Codex state thread census row")?;
+        let conflicts_before = identity_conflicts.len();
         let id =
             record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
+        if identity_conflicts.len() != conflicts_before {
+            taxonomy.state_alias_keys = taxonomy.state_alias_keys.saturating_add(1);
+        }
         if identity_conflicts.contains(id.as_str()) {
             loaded.remove(id.as_str());
             state_threads.remove(id.as_str());
@@ -22517,18 +22569,51 @@ fn load_codex_sqlite_state_threads(
             loaded.remove(id.as_str());
             state_threads.remove(id.as_str());
             identity_conflicts.insert(id);
+            taxonomy.state_intra_root_row_keys =
+                taxonomy.state_intra_root_row_keys.saturating_add(1);
         }
     }
     for (id, thread) in loaded {
-        if state_threads
+        if let Some(existing) = state_threads
             .insert(id.clone(), thread.clone())
-            .is_some_and(|existing| existing != thread)
+            .filter(|existing| *existing != thread)
         {
+            taxonomy.observe_state_cross_root(codex_state_thread_field_diffs(&existing, &thread));
             state_threads.remove(id.as_str());
             identity_conflicts.insert(id);
         }
     }
     Ok(())
+}
+
+/// One unit per differing field. Exhaustive so a new row field must be
+/// classified before it can take part in the row comparison above.
+fn codex_state_thread_field_diffs(
+    existing: &CodexStateThread,
+    incoming: &CodexStateThread,
+) -> StateRowFieldDiffs {
+    let CodexStateThread {
+        title,
+        tokens_used,
+        archived,
+        created_at,
+        updated_at,
+        model,
+        rollout_path,
+    } = existing;
+    StateRowFieldDiffs {
+        title: u32::from(*title != incoming.title),
+        tokens_used: u32::from(*tokens_used != incoming.tokens_used),
+        archived: u32::from(*archived != incoming.archived),
+        created_at: u32::from(*created_at != incoming.created_at),
+        updated_at: u32::from(*updated_at != incoming.updated_at),
+        model: u32::from(*model != incoming.model),
+        rollout_path: u32::from(*rollout_path != incoming.rollout_path),
+    }
+}
+
+fn saturating_count_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 fn load_codex_rollout_extents(
@@ -49276,6 +49361,31 @@ mod tests {
             LoaderReason::IncompleteShape
         );
         fs::remove_file(home.join("state_5.sqlite")).unwrap();
+        // Untitled cased aliases inside one state DB are an alias, not a row
+        // conflict, and the threads loader is the first to see them.
+        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch(concat!(
+            "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, ",
+            "thread_source TEXT, first_user_message TEXT); INSERT INTO threads VALUES ",
+            "('ABCDEF00-0000-7000-8000-000000000002', NULL, 1, 'user', NULL), ",
+            "('abcdef00-0000-7000-8000-000000000002', NULL, 2, 'user', NULL);"
+        ))
+        .unwrap();
+        drop(db);
+        let alias = CodexTitleMetadata::load_from_roots(roots);
+        assert!(alias.local_diagnostics.state_threads.identity_conflict);
+        assert!(!alias.local_diagnostics.state_titles.identity_conflict);
+        let taxonomy = alias.local_diagnostics.identity_conflict_taxonomy;
+        assert_eq!(
+            (
+                taxonomy.state_alias_keys,
+                taxonomy.state_intra_root_row_keys,
+                taxonomy.state_cross_root_keys,
+                taxonomy.conflict_keys_total,
+            ),
+            (1, 0, 0, 1)
+        );
+        fs::remove_file(home.join("state_5.sqlite")).unwrap();
         // Differently cased UUIDs collapse to the same comparison key.
         fs::write(
             home.join("session_index.jsonl"),
@@ -49334,6 +49444,86 @@ mod tests {
             assert!(diagnostics[loader]["first_failure_root_digest"].is_null());
             assert!(diagnostics[loader]["sqlite_extended_code"].is_null());
             assert!(diagnostics[loader]["first_failure_stage"].is_null());
+        }
+
+        // The same ids in two homes: `progress` differs only in tokens_used,
+        // `locator` in rollout_path, and the 0-token copy of `idle` is never
+        // loaded. `progress` is also created and the parent of a `bad` edge.
+        let progress = "abcdef00-0000-7000-8000-000000000011";
+        let locator = "abcdef00-0000-7000-8000-000000000012";
+        let idle = "abcdef00-0000-7000-8000-000000000013";
+        let child = "abcdef00-0000-7000-8000-000000000014";
+        let schema = concat!(
+            "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, model TEXT, ",
+            "rollout_path TEXT, thread_source TEXT, first_user_message TEXT); ",
+            "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);"
+        );
+        for (codex_dir, progress_tokens, progress_source, locator_path, idle_tokens) in [
+            (&bad, 5, "agent_created_thread", "a.jsonl", 3),
+            (&good, 7, "user", "b.jsonl", 0),
+        ] {
+            let db = Connection::open(codex_dir.join("state_5.sqlite")).unwrap();
+            db.execute_batch(schema).unwrap();
+            for (id, tokens, source, rollout_path) in [
+                (progress, progress_tokens, progress_source, "p.jsonl"),
+                (locator, 1, "user", locator_path),
+                (idle, idle_tokens, "user", "i.jsonl"),
+            ] {
+                db.execute(
+                    "INSERT INTO threads VALUES (?1, 'same', ?2, 'm', ?3, ?4, NULL)",
+                    rusqlite::params![id, tokens, rollout_path, source],
+                )
+                .unwrap();
+            }
+        }
+        let db = Connection::open(bad.join("state_5.sqlite")).unwrap();
+        db.execute(
+            "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+            rusqlite::params![progress, child],
+        )
+        .unwrap();
+        drop(db);
+        let mut cross = CodexTitleMetadata::load_from_roots(&roots);
+        assert!(cross.local_diagnostics.state_threads.identity_conflict);
+        assert!(cross.state_census_incomplete && cross.sidecar_census_incomplete);
+        assert!(!cross.state_census_unscoped_incomplete);
+        assert!(!cross.sidecar_census_unscoped_incomplete);
+        let mut index = ScanIndex::default();
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert(locator.to_string(), "prior".to_string());
+        cross.count_prior_state_only_conflicts(&index);
+        let taxonomy = cross.local_diagnostics.identity_conflict_taxonomy;
+        assert_eq!(
+            (
+                taxonomy.state_alias_keys,
+                taxonomy.state_intra_root_row_keys,
+                taxonomy.state_cross_root_keys,
+                taxonomy.state_cross_root_progress_only_keys,
+                taxonomy.state_cross_root_identity_field_keys,
+            ),
+            (0, 0, 2, 1, 1)
+        );
+        assert_eq!(
+            taxonomy.state_cross_root_field_differs,
+            StateRowFieldDiffs {
+                tokens_used: 1,
+                rollout_path: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            (
+                taxonomy.conflict_keys_total,
+                taxonomy.conflict_keys_state_created,
+                taxonomy.conflict_keys_prior_state_only,
+                taxonomy.conflict_parent_child_edges,
+            ),
+            (2, 1, 1, 1)
+        );
+        let serialized = serde_json::to_string(&cross.local_diagnostics).unwrap();
+        for id in [progress, locator, idle, child, "p.jsonl", "a.jsonl"] {
+            assert!(!serialized.contains(id));
         }
         fs::remove_dir_all(home).unwrap();
     }
@@ -55993,6 +56183,7 @@ mod tests {
             &codex_dir.join("state_5.sqlite"),
             &mut state_threads,
             &mut state_conflicts,
+            &mut IdentityConflictTaxonomy::default(),
         )
         .expect("a scoped collision retains unrelated state rows");
         assert!(state_threads.is_empty());
