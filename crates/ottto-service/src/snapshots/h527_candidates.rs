@@ -875,5 +875,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+mod producer;
+pub use producer::run_operator_producer;
+
 #[cfg(test)]
 mod tests;

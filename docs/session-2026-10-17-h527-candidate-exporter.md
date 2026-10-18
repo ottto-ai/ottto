@@ -111,3 +111,54 @@ Fixture `fixtures/h527-candidates/unqualified-redacted.v1.json` is the RFC 8785 
 Fixture `fixtures/h527-candidates/disclosure-not-run.v1.json` is the exact disclosure record for the fixture scope, with a synthetic exclusion summary and a skipped screen. It validates under SESSION's frozen `LocalExclusionDisclosure`.
 
 Fixture `fixtures/h527-candidates/held-mixed.v1.json` is the exact packet for a synthetic census covering every member-scoped hold class and the global hold. Tests drive real parser items from synthetic transcripts. Validation is hosted Public CI only; no local Cargo was run. A green CI does not make this core releasable.
+
+## Offline producer (`h527-produce`, October 18)
+
+`snapshots/h527_candidates/producer.rs` computes candidate bodies and exclusions from one explicit input bundle. It is reached only through the hidden operator subcommand:
+
+```
+ottto-service h527-produce --input <bundle.json> --out-dir <new private dir>
+```
+
+It changes no daemon, discovery, scan-index, upload or runtime path. It reads only the files the bundle names, never follows symlinks, and writes only into a new `0700` output directory.
+
+Input `h527_producer_input:v1` (strict, unknown fields refused, at most 4 MiB):
+
+```
+{contract_version, scope:{operation_id,user_id,organization_id,device_id,machine_id,producer_revision},
+ collected_at (RFC 3339), upload_policy:{5 booleans}, context_curve_enabled,
+ targets:[18 x {source_session_id, session_key_sha256, prior_refusal_body_witness,
+                transcript_path, b2_first_ack_order|null}],
+ peer_roots:[{class: projects|slot|held|archive|quarantine|other, path}],
+ bounds:{max_peer_files, max_peer_total_bytes, max_peer_file_bytes, max_line_bytes},
+ catalog_prices?:{publication:{source,revision,sha256},
+                  rates_usd_per_mtok:{"<model>|<context_bucket>":{input,output,cache_read,
+                                       cache_creation_5m,cache_creation_1h}}}}
+```
+
+Steps:
+
+1. Each target is parsed with the unchanged Claude parser. A target is held unless the parse is complete, it yields exactly one item, every counted request carries a native id, and totals equal the sum of its per-request usage. A held target's request ids still take part in step 3.
+2. Every `.jsonl` file under the peer roots is streamed once. Native request ids are compared exactly, in memory, against all targets. Fork-copied lines belong to the session they name. A subagent transcript belongs to its path identity; any other file belongs to its first named session, as in the parser.
+   - These leave coverage unknown, and every target is then held without a body: a cap overflow, a file changed during the read, an unreadable file, a compressed transcript, an unparseable line carrying a request id key, an invalid fork marker, or a symlink leaving the roots.
+   - A target's own replica that carries an id the target lacks is held as an unknown owner.
+3. B2 counting allocation is fixed for the whole batch before any body or money exists:
+   - An id seen in any peer is excluded from every target.
+   - An id shared only by targets is kept by the lowest `b2_first_ack_order`, else by the smaller `session_key_sha256`.
+   - The allocation digest is recorded. B2 is counting only; it is not ownership.
+4. Each target is re-parsed with the same parser, dropping only the lines of its excluded ids. The producer then checks exactly: kept ids, per-request usage, item totals = original − excluded, and usage rows. The ordinary daemon serializer writes the one-item body. Any mismatch holds the target.
+5. A receipt is written for each kept shared request: the keeping root, `untagged`, and its starting subscription unchanged. The producer applies no Contract-5 permit. A body that carries request evidence is held as unsupported, and allocation-driven name changes must be zero.
+
+Outputs (`0600`, created new):
+
+- `artifact.json` (`h527_producer_diagnostic:v1`, `local_only`, `admission_authority: none`)
+  - input and file manifest, coverage census, B2 allocation, per-target partitions and reconciliation
+  - unqualified bodies and their hashes, SI receipts
+  - qualification gaps, and the pipeline stages not reproduced
+- `candidate-bundle.json`: the frozen operator packet. All 18 members are held with `missing_evidence` and carry no body fields. Each member's `qualification_report_sha256` binds its target report.
+- `disclosures.json`: only when `catalog_prices` is supplied. These are `LocalExclusionDisclosure` records with the copy screen `not_run`. `excluded_catalog_cost_usd` is an exporter estimate at catalog prices, not canonical money. When prices are missing or a model is unpriced, there is no estimate; it is never shown as zero.
+- `summary.json`: content-free counts and hashes.
+
+Not reproduced, and disclosed in each artifact: Contract-5 local evidence and permit, account binding, desktop title metadata, attribution context, backfill cutoff, and cache-head identity. These bodies are therefore identity-less and untagged. If SOURCE or SI need pipeline-identical overlays, the dependency is the pre-upload phase of the sync pipeline, not this producer.
+
+Tests: `producer/tests.rs` drives 18 synthetic targets and peer roots. They cover a peer exclusion, a B2 first-ACK keeper, a hash keeper, a held-root peer and a fork child. They check that each body equals the parse of a transcript with the excluded line physically removed. Further checks cover the receipt, the held packet, the estimate, determinism, refusing an existing output directory, and holds on a compressed peer or a capped census.

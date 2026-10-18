@@ -108,6 +108,19 @@ enum Command {
         #[arg(long = "private-upload-payload-out")]
         private_upload_payload_out: Option<PathBuf>,
     },
+    /// Offline one-off: build unqualified h527 diagnostic candidates from one
+    /// explicit input bundle. Reads only the named transcripts and peer roots;
+    /// writes only into a new private output directory. No upload, index or
+    /// daemon state is touched.
+    #[command(hide = true)]
+    H527Produce {
+        /// `h527_producer_input:v1` JSON bundle.
+        #[arg(long)]
+        input: PathBuf,
+        /// New directory for the artifact, held packet and summary.
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -240,6 +253,12 @@ fn main() -> Result<()> {
                 },
                 &mut output,
             )?;
+        }
+        Command::H527Produce { input, out_dir } => {
+            let summary =
+                ottto_service::snapshots::h527_candidates::run_operator_producer(&input, &out_dir)
+                    .map_err(anyhow::Error::msg)?;
+            println!("{summary}");
         }
         Command::Status { json } => {
             let token = load_or_create_control_token()?;
