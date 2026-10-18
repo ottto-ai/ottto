@@ -313,6 +313,8 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
 }
 
 #[test]
+// Exact report counts: exclude other client_report resetters and leasers.
+#[serial(client_report)]
 fn owned_rotation_integrated_native_oracle() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
