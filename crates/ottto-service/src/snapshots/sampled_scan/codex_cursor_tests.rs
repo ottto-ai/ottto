@@ -201,6 +201,8 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
                 // A paused skip delivers and counts nothing.
                 assert_eq!(reader.report.physical_line_count, 1);
                 assert!(reader.buf.len() <= 64);
+                // E4: the paused skip holds no prefix byte.
+                assert!(reader.buf.is_empty());
                 if partials == 1 {
                     // Pause-time shrink (parent ACK): a grown buffer is cut
                     // back to `max(len, 64 KiB)` with every live byte and the
@@ -210,7 +212,7 @@ fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
                     let live = reader.buf.clone();
                     shrink_paused_buffer(&mut reader.buf);
                     assert_eq!(reader.buf, live);
-                    assert!(reader.skipping);
+                    assert!(reader.skipping.is_some());
                     assert!(reader.buf.capacity() >= live.len().max(PAUSED_BUFFER_BYTES));
                     assert!(reader.buf.capacity() < 1 << 20);
                 }
@@ -326,6 +328,63 @@ fn chunked_reader_matches_unchunked_reader_without_extent() {
     assert_eq!(chunked, read(false));
     assert_eq!(chunked.2, input.len() as u64);
     assert_eq!(chunked.1.physical_line_count, 4);
+}
+
+/// An overlong Codex row whose capped prefix carries the salvage envelope.
+fn overlong_envelope_row() -> Vec<u8> {
+    format!(
+        "{{\"timestamp\":\"2026-10-07T10:30:00Z\",\"ordinal\":7,\"type\":\"response_item\",\"payload\":\"{}\"}}",
+        "x".repeat(400)
+    )
+    .into_bytes()
+}
+
+/// E4 (R2-H2): a paused cursor skip holds no prefix byte, so a pause never
+/// charges the salvage prefix, and its salvage (taken from the capped
+/// prefix when the skip first paused) is the envelope an unchunked read
+/// takes at the newline, value for value.
+#[test]
+fn paused_overlong_skip_salvages_early_with_identical_output() {
+    let mut input = codex_line(json!({"n": 1}));
+    input.extend(overlong_envelope_row());
+    input.push(b'\n');
+    input.extend(codex_line(json!({"n": 2})));
+    let read = |chunked: bool| {
+        let mut reader =
+            BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()), 96, true);
+        if chunked {
+            reader.set_chunked_skip(32);
+        }
+        let mut seen = Vec::new();
+        let mut partials = 0;
+        loop {
+            match reader.step(|value| seen.push(value.clone())).unwrap() {
+                JsonlReaderStep::Partial => {
+                    partials += 1;
+                    assert!(reader.skipping.is_some());
+                    assert!(reader.buf.is_empty(), "no prefix byte is held");
+                }
+                JsonlReaderStep::Line => {}
+                JsonlReaderStep::Complete(report) => return (seen, report, partials),
+            }
+        }
+    };
+    let (chunked, chunked_report, partials) = read(true);
+    let (unchunked, unchunked_report, unchunked_partials) = read(false);
+    assert!(partials > 0, "the skip paused");
+    assert_eq!(unchunked_partials, 0);
+    assert_eq!(chunked, unchunked);
+    assert_eq!(chunked_report, unchunked_report);
+    assert_eq!(chunked_report.over_line_cap_count, 1);
+    assert_eq!(
+        chunked,
+        vec![
+            json!({"n": 1}),
+            json!({"timestamp": "2026-10-07T10:30:00Z",
+                "type": "oversized_payload_skipped", "ordinal": 7}),
+            json!({"n": 2}),
+        ]
+    );
 }
 
 #[test]

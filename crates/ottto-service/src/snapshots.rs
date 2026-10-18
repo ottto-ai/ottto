@@ -18037,9 +18037,10 @@ struct BoundedJsonlReader<R> {
     /// Resumable reads only: an overlong line's skip pauses after this many
     /// skipped bytes per step instead of consuming to its newline at once.
     chunked_skip: Option<usize>,
-    /// An overlong line is being skipped across steps; `buf` keeps only its
-    /// existing bounded salvage prefix.
-    skipping: bool,
+    /// An overlong line is being skipped across steps. Its salvage was
+    /// taken from the capped prefix when the skip first paused and `buf`
+    /// was cleared then (E4), so a pause never holds the 16 MiB prefix.
+    skipping: Option<EarlySalvage>,
     /// Resumable reads only: never consume past this frozen extent.
     extent_limit: Option<u64>,
     /// Physical bytes consumed from `reader`, including skipped bytes.
@@ -18066,7 +18067,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             failure: None,
             acquisition: None,
             chunked_skip: None,
-            skipping: false,
+            skipping: None,
             extent_limit: None,
             consumed: 0,
             last_line_end: 0,
@@ -18117,14 +18118,14 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         if self.finished {
             return Ok(JsonlReaderStep::Complete(self.report));
         }
-        if !self.skipping {
+        if self.skipping.is_none() {
             self.buf.clear();
         }
         let result = self.read_step(on_value);
         // Values have been consumed synchronously and dropped. Retain only the
         // existing buffer capacity; no logical raw row survives this return.
-        // A paused overlong skip keeps only its bounded salvage prefix.
-        if !self.skipping {
+        // A paused overlong skip keeps no bytes (E4).
+        if self.skipping.is_none() {
             self.buf.clear();
         }
         if let Err(error) = &result {
@@ -18145,7 +18146,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         // tracks whether we reached a newline (vs. EOF) so we can stop the
         // outer loop on a trailing partial line.
         let mut line_complete = false;
-        let mut overflowed = self.skipping;
+        let mut early = self.skipping.take();
+        let mut overflowed = early.is_some();
         let mut skipped_this_step = 0_usize;
         let reached_eof = loop {
             let raw = reader.fill_buf()?;
@@ -18201,14 +18203,18 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         {
                             // Pause the skip at a chunk boundary. The line is
                             // neither delivered nor counted until its newline.
-                            self.skipping = true;
+                            // The capped prefix is final once overflowed, so
+                            // its salvage is taken now and the bytes dropped
+                            // (E4): the same envelope the newline would give.
+                            self.skipping = Some(early.take().unwrap_or_else(|| {
+                                EarlySalvage::take(buf, salvage_codex_envelope)
+                            }));
                             return Ok(JsonlReaderStep::Partial);
                         }
                     }
                 }
             }
         };
-        self.skipping = false;
         if reached_eof
             && self.extent_limit.is_some()
             && (overflowed || !buf.is_empty())
@@ -18228,44 +18234,69 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             self.finished = true;
             return Ok(JsonlReaderStep::Complete(*report));
         }
-        report.physical_line_count += 1;
-        if overflowed {
-            report.over_line_cap_count += 1;
-            // Codex created-thread ownership requires a gap-free ordinal and
-            // timestamp stream. Image-bearing response/compaction rows carry
-            // that structural envelope before their huge payload. Preserve
-            // only those two content-free scalars; the payload stays skipped
-            // and is still disclosed as one dropped potential usage record.
-            if salvage_codex_envelope {
-                if let Some(value) = oversized_codex_envelope(buf) {
-                    on_value(&value);
-                }
-            }
-            // Drop the oversized line; its retained-capacity buffer is reset to
-            // the cap so one huge line does not pin a large allocation.
-            buf.clear();
-            buf.shrink_to(max_line_bytes);
-            self.finished = reached_eof;
-            return Ok(JsonlReaderStep::Line);
-        }
-        // Trim a trailing CR so a CRLF transcript parses identically to LF.
-        let mut bytes = buf.as_slice();
-        if bytes.last() == Some(&b'\r') {
-            bytes = &bytes[..bytes.len() - 1];
-        }
-        match std::str::from_utf8(bytes) {
-            Ok(line) if line.trim().is_empty() => {}
-            Ok(line) => match serde_json::from_str::<Value>(line) {
-                Ok(value) => {
-                    report.parsed_json_line_count += 1;
-                    on_value(&value);
-                }
-                Err(_) => report.malformed_json_line_count += 1,
-            },
-            Err(_) => report.invalid_utf8_line_count += 1,
-        }
+        apply_physical_line(
+            buf,
+            report,
+            overflowed,
+            early,
+            max_line_bytes,
+            salvage_codex_envelope,
+            &mut on_value,
+        );
         self.finished = reached_eof;
         Ok(JsonlReaderStep::Line)
+    }
+}
+
+/// Count and apply one physical line held in `buf` (newline-terminated, or a
+/// trailing line at EOF). Shared by every read path.
+fn apply_physical_line(
+    buf: &mut Vec<u8>,
+    report: &mut JsonlReadReport,
+    overflowed: bool,
+    early: Option<EarlySalvage>,
+    max_line_bytes: usize,
+    salvage_codex_envelope: bool,
+    on_value: &mut impl FnMut(&Value),
+) {
+    report.physical_line_count += 1;
+    if overflowed {
+        report.over_line_cap_count += 1;
+        // Codex created-thread ownership requires a gap-free ordinal and
+        // timestamp stream. Image-bearing response/compaction rows carry
+        // that structural envelope before their huge payload. Preserve
+        // only those two content-free scalars; the payload stays skipped
+        // and is still disclosed as one dropped potential usage record.
+        if salvage_codex_envelope {
+            let value = match early {
+                Some(early) => early.envelope.map(SalvagedEnvelope::value),
+                None => oversized_codex_envelope(buf),
+            };
+            if let Some(value) = value {
+                on_value(&value);
+            }
+        }
+        // Drop the oversized line; its retained-capacity buffer is reset to
+        // the cap so one huge line does not pin a large allocation.
+        buf.clear();
+        buf.shrink_to(max_line_bytes);
+        return;
+    }
+    // Trim a trailing CR so a CRLF transcript parses identically to LF.
+    let mut bytes = buf.as_slice();
+    if bytes.last() == Some(&b'\r') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(line) if line.trim().is_empty() => {}
+        Ok(line) => match serde_json::from_str::<Value>(line) {
+            Ok(value) => {
+                report.parsed_json_line_count += 1;
+                on_value(&value);
+            }
+            Err(_) => report.malformed_json_line_count += 1,
+        },
+        Err(_) => report.invalid_utf8_line_count += 1,
     }
 }
 
@@ -18284,7 +18315,51 @@ fn read_bounded_jsonl_lines_impl(
     }
 }
 
+/// An overlong cursor record's salvage, taken from its capped prefix when
+/// its skip first paused (E4). `envelope` is exactly what
+/// `oversized_codex_envelope` derives from that prefix at the newline: the
+/// prefix no longer changes once the line overflowed.
+#[derive(Debug)]
+struct EarlySalvage {
+    envelope: Option<SalvagedEnvelope>,
+}
+crate::heap_layout_bound::fields!(EarlySalvage; envelope);
+
+impl EarlySalvage {
+    fn take(prefix: &mut Vec<u8>, salvage_codex_envelope: bool) -> Self {
+        let envelope = if salvage_codex_envelope {
+            oversized_codex_envelope_parts(prefix)
+        } else {
+            None
+        };
+        prefix.clear();
+        Self { envelope }
+    }
+}
+
+/// The two content-free scalars an oversized Codex row keeps.
+#[derive(Debug)]
+struct SalvagedEnvelope {
+    timestamp: String,
+    ordinal: u64,
+}
+crate::heap_layout_bound::fields!(SalvagedEnvelope; timestamp, ordinal);
+
+impl SalvagedEnvelope {
+    fn value(self) -> Value {
+        json!({
+            "timestamp": self.timestamp,
+            "type": "oversized_payload_skipped",
+            "ordinal": self.ordinal,
+        })
+    }
+}
+
 fn oversized_codex_envelope(prefix: &[u8]) -> Option<Value> {
+    oversized_codex_envelope_parts(prefix).map(SalvagedEnvelope::value)
+}
+
+fn oversized_codex_envelope_parts(prefix: &[u8]) -> Option<SalvagedEnvelope> {
     let mut depth = 0_u32;
     let mut index = 0_usize;
     let mut ordinal = None;
@@ -18344,11 +18419,10 @@ fn oversized_codex_envelope(prefix: &[u8]) -> Option<Value> {
             _ => index += 1,
         }
     }
-    Some(json!({
-        "timestamp": timestamp?,
-        "type": "oversized_payload_skipped",
-        "ordinal": ordinal?,
-    }))
+    Some(SalvagedEnvelope {
+        timestamp: timestamp?,
+        ordinal: ordinal?,
+    })
 }
 
 fn json_string_token_end(bytes: &[u8], start: usize) -> Option<usize> {

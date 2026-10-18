@@ -809,8 +809,8 @@ fn record_paused_charge(job: &mut OwnedActiveFile, charge: usize) {
 }
 
 /// Request `max(len, 64 KiB)` reader-buffer capacity before a slot charge
-/// (parent shrink ACK). Every live byte, including a skip's salvage prefix,
-/// is kept; the charge then walks the actual resulting capacity, which the
+/// (parent shrink ACK). Every live byte is kept (a paused skip holds none:
+/// E4 took its salvage); the charge then walks the actual resulting capacity, which the
 /// allocator may leave larger. Shrinking never certifies, publishes, clears
 /// debt or grants read budget.
 pub(in crate::snapshots) fn shrink_paused_buffer(buf: &mut Vec<u8>) {

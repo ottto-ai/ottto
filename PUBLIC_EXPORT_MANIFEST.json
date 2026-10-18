@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 703,
-  "content_sha256": "6313b2e0a904ed7c73b46d36d5a092f4cdf94cb5ff55cdaa573c476f27f16929",
+  "content_sha256": "5f53fc73ef49e7368123a45e3323e6d199f6fc63247ae42cffab66c3b2e74c25",
   "files": [
     {
       "executable": false,
@@ -1266,8 +1266,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b0723e2457e84aeec31bc38aeacc25d466cbd35f888ec74c99ace0700c45e623",
-      "size_bytes": 2712828
+      "sha256": "777287e73589a7d4b4a88e39c842c84be1967477fc19edc7602fe58c5dda16a0",
+      "size_bytes": 2715141
     },
     {
       "executable": false,
@@ -1490,15 +1490,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "33e4155309ee8757aa7d5d3b32b1c19bd8e6936ca2b08f4e28d48e861dcff316",
-      "size_bytes": 94031
+      "sha256": "6003336e37417af4f4f4caba1d92a0103fd1a55cb28d22fb1856fb52a2370a52",
+      "size_bytes": 94043
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "5fd5a44c108ba0451ce321a254250dfba885b096df2c02fe683b705932e95804",
-      "size_bytes": 83239
+      "sha256": "2c3001c0f54ad59e470ee719e4be8c49fd7cb7d1a2dca57b879e4d6128fbe76b",
+      "size_bytes": 85531
     },
     {
       "executable": false,
