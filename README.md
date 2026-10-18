@@ -275,6 +275,7 @@ ottto login --json --no-browser --no-wait
 ottto account --json
 ottto logout --json
 ottto logout --local-only --json
+ottto logout --forget-installation --confirm --json
 ottto logout --local-only --forget-installation --confirm --json
 ottto doctor --json
 ottto fix --app codex --json
@@ -412,7 +413,13 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - native app auth commands: `auth_status`, `auth_start`, `auth_complete`, and
   `auth_reset`. Reset/logout is cloud-first by default: the daemon records a
   `local-client/disconnect` in Ottto before clearing local account, connection,
-  and setup-run token state. `local_only=true` is reserved for emergency local
+  and setup-run token state. That request also presents this Mac's relay-device
+  id and secret, read before any local deletion, so Ottto can release the Mac's
+  server registration; the response reports `device_released`, and `false`
+  (or an older server that omits it) means the registration may still be
+  active until its account disconnects the Mac on the Apps page (Disconnect). An
+  account switch sends the same release for the previous device unless the new
+  binding reuses that device id. `local_only=true` is reserved for emergency local
   cleanup when the backend cannot be reached or the website state is stale.
   Neither mode clears account/device identity while Cloud sessions still needs
   an exact backend DELETE confirmation; revoke it in the Ottto app, wait for
@@ -424,15 +431,24 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   idempotent no-ops while a bound user is already connected; they cannot create
   a pending-claim overlay over a healthy binding. Rejected or unauthorized
   setup-run polling is terminal locally instead of retrying a stale run.
-- `ottto logout --local-only --forget-installation --confirm` is the explicit
-  destructive reset path. It clears installation id, account scope, active and
-  prior credentials, setup bindings, destination receipt namespaces, and
-  first-sweep progress together, while leaving Codex, Claude Code, and Pi source
-  data untouched. Restart the daemon before pairing so it creates a fresh
-  installation identity. Because replacement credentials use a new destination
+- `ottto logout --forget-installation --confirm` is the explicit destructive
+  reset path. It first disconnects this Mac in Ottto and releases its server
+  registration, exactly like an ordinary logout, then clears installation id,
+  active and prior credentials, setup bindings, destination receipt namespaces,
+  and first-sweep progress together, while leaving Codex, Claude Code, and Pi
+  source data untouched. It requires an active Ottto connection. The account
+  scope is derived from the Mac and its macOS user, so it is not cleared and
+  is the same after the reset. Restart the daemon before pairing so it creates
+  a fresh installation identity. Because replacement credentials use a new destination
   namespace, ordinary replacement never reuses the old destination's receipts;
   it creates clean receipt and first-sweep state for the new destination while
   preserving the stable `otm_…` machine identity.
+- `ottto logout --local-only --forget-installation --confirm` is the emergency
+  variant for when Ottto cannot be reached. It performs the same local reset
+  without contacting Ottto, so the server registration is not released: this
+  Mac stays registered to the old Ottto account, and a different account can
+  connect it only after the old account removes this Mac on its Apps page
+  (Disconnect).
 - `ottto uninstall` requires `--confirm`, warns about receipt and first-sweep
   loss, and accepts `--backup-state <directory>` to export only those receipts
   and first-sweep state first (never relay credentials or account secrets).
