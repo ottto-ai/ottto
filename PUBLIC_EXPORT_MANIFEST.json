@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 684,
-  "content_sha256": "bf8656d941525d284f92e932f12a8132758d0a9b6dd2cb02e000899139a3cf61",
+  "content_sha256": "e91366763ea2d001388d30d59d2570e8a267c887153982fda2ae4e6bb5c42c70",
   "files": [
     {
       "executable": false,
@@ -1413,8 +1413,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/h527_candidates/producer.rs",
-      "sha256": "431f258c22706eba1846190f0727065e81fb188635778e66ad795620db1b3a8a",
-      "size_bytes": 78306
+      "sha256": "680623a400b149b0b2a24db6cbc2219339d838d7ba24b4976b9ed59a090dab0a",
+      "size_bytes": 78320
     },
     {
       "executable": false,

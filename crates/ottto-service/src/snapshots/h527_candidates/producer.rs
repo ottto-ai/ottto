@@ -863,7 +863,7 @@ pub(crate) fn produce(
             "approved_conservation_pending",
             "producer_revision_unverified",
         ],
-        "qualification_report_scheme": "sha256(rfc8785(target report without unqualified_batch_request_json))",
+        "qualification_report_scheme": "sha256(rfc8785(target report with the body bytes removed and the body sha256 kept))",
         "qualification_reports": report_bindings,
         "targets": target_reports,
     });
