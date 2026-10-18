@@ -271,10 +271,12 @@ impl OwnedSourceScan {
             let inputs = active.parser.take_live_reduction_inputs();
             // A cursor job's state grows past the ordinary walk's visit limit
             // (usage hours, witnesses); charge it by bytes like its pause (N3).
+            // The walk charges the file itself, as before it was boxed.
+            let file: &OwnedActiveFile = active;
             let bound = if active.cursor.is_some() {
-                crate::heap_layout_bound::completed_bound(active, remaining)
+                crate::heap_layout_bound::completed_bound(file, remaining)
             } else {
-                crate::heap_layout_bound::bound(active, remaining)
+                crate::heap_layout_bound::bound(file, remaining)
             };
             active.parser.restore_live_reduction_inputs(inputs);
             bound

@@ -14205,7 +14205,7 @@ impl OwnedSourceScan {
                                 // at capture/send/checkpoint, after all page replays.
                                 let source_file_fingerprint =
                                     candidate.source_file_fingerprint.clone();
-                                active_file = Some(OwnedActiveFile {
+                                active_file = Some(Box::new(OwnedActiveFile {
                                     comparison_target: false,
                                     sampling: None,
                                     previous_snapshot_fingerprint: index
@@ -14225,7 +14225,7 @@ impl OwnedSourceScan {
                                     cursor: None,
                                     charged_bytes: 0,
                                     hold_offset: None,
-                                });
+                                }));
                                 codex_legacy_join_baselines.extend(baselines);
                                 pending!();
                             }
@@ -14299,7 +14299,7 @@ impl OwnedSourceScan {
                     ) {
                         sampled_scan::codex_cursor::Resumed::Active(job, lease) => {
                             codex_cursor_lease = Some(lease);
-                            active_file = Some(*job);
+                            active_file = Some(job);
                             pending!();
                         }
                         // Deferred, invalidated or ended as strict debt: this
@@ -14685,7 +14685,7 @@ impl OwnedSourceScan {
                     cursor: _,
                     charged_bytes: _,
                     hold_offset: _,
-                } = active;
+                } = *active;
                 let mut parser = parser;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
                     match replay.finish() {
@@ -16468,7 +16468,7 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            let mut active = OwnedActiveFile {
+            let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
                 sampling: file_sampling,
                 candidate,
@@ -16483,7 +16483,7 @@ impl OwnedSourceScan {
                 cursor: None,
                 charged_bytes: 0,
                 hold_offset: None,
-            };
+            });
             if let Some(context) = sampling
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)

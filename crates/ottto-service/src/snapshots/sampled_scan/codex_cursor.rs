@@ -628,17 +628,19 @@ impl Drop for CursorLease {
 /// The scan frame's active file and, while it is a cursor job, its slot
 /// lease. Dropping a frame mid-job (an abandoned or refused page) returns
 /// the intact job to the slot (K12), so a later page resumes it instead of
-/// losing every page already read.
+/// losing every page already read. The file is boxed so the scan object,
+/// and every move of the active file in `OwnedSourceScan::step`, stays
+/// pointer-sized (debug builds give each temporary its own stack slot).
 #[derive(Default)]
 pub(in crate::snapshots) struct ActiveFrame {
-    file: Option<OwnedActiveFile>,
+    file: Option<Box<OwnedActiveFile>>,
     lease: Option<CursorLease>,
 }
 crate::heap_layout_bound::fields!(ActiveFrame; file, lease);
 
 impl ActiveFrame {
     pub(in crate::snapshots) fn new(
-        file: Option<OwnedActiveFile>,
+        file: Option<Box<OwnedActiveFile>>,
         lease: Option<CursorLease>,
     ) -> Self {
         Self { file, lease }
@@ -646,13 +648,13 @@ impl ActiveFrame {
 
     pub(in crate::snapshots) fn into_parts(
         mut self,
-    ) -> (Option<OwnedActiveFile>, Option<CursorLease>) {
+    ) -> (Option<Box<OwnedActiveFile>>, Option<CursorLease>) {
         (self.file.take(), self.lease.take())
     }
 }
 
 impl std::ops::Deref for ActiveFrame {
-    type Target = Option<OwnedActiveFile>;
+    type Target = Option<Box<OwnedActiveFile>>;
     fn deref(&self) -> &Self::Target {
         &self.file
     }
@@ -759,7 +761,7 @@ pub(in crate::snapshots) fn shrink_paused_buffer(buf: &mut Vec<u8>) {
 
 impl CursorLease {
     /// Park the job in the slot until a later page resumes it.
-    pub(in crate::snapshots) fn pause(self, mut job: OwnedActiveFile) -> PauseEnd {
+    pub(in crate::snapshots) fn pause(self, mut job: Box<OwnedActiveFile>) -> PauseEnd {
         if let Some(meta) = job.cursor.as_mut() {
             meta.pages = meta.pages.saturating_add(1);
         }
@@ -769,7 +771,7 @@ impl CursorLease {
     /// The resumed job's revalidation evidence is unavailable this page
     /// (K9): not a member change. It returns to the slot uncounted, its
     /// path still pending (`InProgress`).
-    pub(in crate::snapshots) fn defer(self, job: OwnedActiveFile) -> PauseEnd {
+    pub(in crate::snapshots) fn defer(self, job: Box<OwnedActiveFile>) -> PauseEnd {
         self.suspend(job, |counters| counters.jobs_deferred_inputs += 1)
     }
 
@@ -777,7 +779,7 @@ impl CursorLease {
     /// reinstalls them) and make room for it in the state budget by
     /// releasing least-recently-useful retained copies (K6). A job that does
     /// not fit ends as strict `JoinStateBound` debt.
-    fn suspend(self, mut job: OwnedActiveFile, count: fn(&mut Counters)) -> PauseEnd {
+    fn suspend(self, mut job: Box<OwnedActiveFile>, count: fn(&mut Counters)) -> PauseEnd {
         // The slot charge walks the reader buffer's capacity (S3); shrink it
         // first so one overlong record cannot pin `max_line_bytes`.
         shrink_paused_buffer(&mut job.parser.reader.buf);
@@ -808,7 +810,7 @@ impl CursorLease {
                     );
                 }
             });
-            return PauseEnd::StateBound(Box::new(job), disclosure);
+            return PauseEnd::StateBound(job, disclosure);
         };
         drop(inputs);
         self.store(job, charge, count);
@@ -817,7 +819,7 @@ impl CursorLease {
 
     /// Frame drop (K12): an intact job returns to the slot. A job that no
     /// longer fits is lost; its path is still pending, so it restarts.
-    fn return_job(self, mut job: OwnedActiveFile) {
+    fn return_job(self, mut job: Box<OwnedActiveFile>) {
         shrink_paused_buffer(&mut job.parser.reader.buf);
         drop(job.parser.take_live_reduction_inputs());
         match paused_charge(&job).filter(|charge| self.cache.cursor_make_room(*charge)) {
@@ -827,13 +829,13 @@ impl CursorLease {
     }
 
     /// Move the job into the slot this lease holds, then disarm.
-    fn store(self, job: OwnedActiveFile, charge: usize, count: fn(&mut Counters)) {
+    fn store(self, job: Box<OwnedActiveFile>, charge: usize, count: fn(&mut Counters)) {
         let token = self.token;
         let cache = Arc::clone(&self.cache);
         let mut job = Some(job);
         self.end(|cursor| {
             if matches!(cursor.slot, Slot::ActiveElsewhere { token: held } if held == token) {
-                cursor.slot = Slot::Paused(Box::new(job.take().expect("job moved once")));
+                cursor.slot = Slot::Paused(job.take().expect("job moved once"));
                 cursor.slot_charge = charge;
                 cursor.slot_touched = cursor.rotation.page;
                 count(&mut cursor.counters);
@@ -1375,7 +1377,7 @@ impl SharedCache {
     pub(in crate::snapshots) fn cursor_resume(
         self: &Arc<Self>,
         namespace: &Scope,
-    ) -> Option<(OwnedActiveFile, CursorLease)> {
+    ) -> Option<(Box<OwnedActiveFile>, CursorLease)> {
         let (job, token) = self.with_cursor(|cursor| {
             let Slot::Paused(job) = &cursor.slot else {
                 return None;
@@ -1410,7 +1412,7 @@ impl SharedCache {
             Some((job, token))
         })??;
         Some((
-            *job,
+            job,
             CursorLease {
                 cache: Arc::clone(self),
                 token,
@@ -1630,10 +1632,9 @@ pub(in crate::snapshots) fn resume_paused_job(
     targets: DisclosureTargets<'_>,
 ) -> Resumed {
     let sampling = context.sampling;
-    let Some((job, lease)) = sampling.cache.cursor_resume(&sampling.namespace) else {
+    let Some((mut job, lease)) = sampling.cache.cursor_resume(&sampling.namespace) else {
         return Resumed::Idle;
     };
-    let mut job = Box::new(job);
     let scope = job.sampling.as_ref().and_then(|_| {
         super::reduction_dependencies(
             context.source,
@@ -1678,7 +1679,7 @@ pub(in crate::snapshots) fn resume_paused_job(
         }
         // Unavailable evidence is not a member change: the job waits in the
         // slot, its path pending (K9).
-        Resume::Unavailable => match lease.defer(*job) {
+        Resume::Unavailable => match lease.defer(job) {
             PauseEnd::Paused => None,
             PauseEnd::StateBound(job, disclosure) => Some((job, disclosure)),
         },
