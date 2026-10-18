@@ -304,6 +304,52 @@ fn sealed_prefix_grant_holds_only_for_the_certified_object() {
     assert!(!grant.holds(&File::open(&other.0).unwrap()));
 }
 
+/// Parent ruling 2: the lossy same-object grant revalidates in `finish`
+/// against the held FD and the selected path: growth holds; a replaced path
+/// (the held FD unchanged) or a shrunk object does not.
+#[test]
+fn lossy_identity_grant_revalidates_held_object_and_selected_path() {
+    let lines = b"{\"a\":1}\n{\"b\":2}\n";
+    for edit in ["grow", "replace", "shrink"] {
+        let temp = Temp::new("lossy-grant", lines);
+        let mut file = OpenOptions::new().read(true).open(&temp.0).unwrap();
+        let scope = Scope("lossy-grant".into());
+        let mut plan =
+            crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, 100)
+                .unwrap();
+        let frozen = plan.frozen_length();
+        plan.observe_complete_records(lines).unwrap();
+        let (refusal, identity) = plan.commit_sealed_prefix_or_lossy_identity(
+            &mut file, true, &scope, 100, 200, true, frozen,
+        );
+        assert_eq!(refusal.unwrap_err(), PrefixRefusal::Lossy);
+        let grant = FinishGrant::LossySameObject(identity.expect("lossy-only refusal"));
+        assert!(grant.holds(&mut file, &temp.0), "{edit}: unchanged");
+        match edit {
+            "grow" => {
+                temp.append(b"{\"c\":3}\n");
+                assert!(grant.holds(&mut file, &temp.0), "growth holds");
+            }
+            "replace" => {
+                let replacement = temp.0.with_extension("replacement");
+                fs::copy(&temp.0, &replacement).unwrap();
+                fs::rename(&replacement, &temp.0).unwrap();
+                temp.append(b"{\"c\":3}\n");
+                assert!(!grant.holds(&mut file, &temp.0), "replaced path");
+            }
+            _ => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&temp.0)
+                    .unwrap()
+                    .set_len(4)
+                    .unwrap();
+                assert!(!grant.holds(&mut file, &temp.0), "shrunk");
+            }
+        }
+    }
+}
+
 #[test]
 fn chunked_reader_matches_unchunked_reader_without_extent() {
     let (input, _, _) = reader_input();
@@ -2069,6 +2115,137 @@ fn grown_unterminated_last_record_stays_withheld() {
         );
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
     });
+}
+
+/// Parent ruling 2 (R1-H1): a lossy cursor job whose file grew past its
+/// frozen extent publishes UNCERTIFIED through its same-object identity
+/// proof: main's semantic output for the object it read, the original debt
+/// and age kept, no checkpoint, copy or verification. Before the grant its
+/// `finish` refused (`jobs_finish_failed`). The loss is an overlong line
+/// (terminal salvage loss main publishes; a malformed line is retryable and
+/// main publishes nothing). Controls: a replaced path or a shrunk file
+/// publishes nothing from that attempt.
+#[test]
+fn lossy_grown_job_publishes_uncertified_through_same_object_identity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    let now = 1_900_000_000_u64;
+    let due = now + 100;
+    let mut overlong = br#"{"timestamp":"2026-10-07T10:30:00Z","type":"event_msg","payload":{"type":"agent_message","message":""#.to_vec();
+    overlong.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+    overlong.extend_from_slice(b"\"}}\n");
+    for case in ["grow", "replace", "shrink"] {
+        clock.set(now);
+        let fixture = ScanRoot::new(20);
+        fixture.append(SESSION, &overlong);
+        for n in 21..=40 {
+            fixture.append(SESSION, &token_line(n));
+        }
+        let path = fixture.file(SESSION);
+        let key = local_index_key(&path);
+        // A recorded entry that owes `due`; an append then selects the file.
+        let (mut seeded, _) = page(
+            &fixture,
+            ScanIndex::default(),
+            Some(Arc::new(SharedCache::default())),
+        );
+        seeded
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .set_unverified_deadline(due);
+        fixture.append(SESSION, &token_line(41));
+        // Main's sampled lossy read of the same object from the same index.
+        let (main_index, main) = page(
+            &fixture,
+            seeded.clone(),
+            Some(Arc::new(SharedCache::default())),
+        );
+        assert!(!main.snapshots.is_empty(), "main publishes terminal loss");
+        let deadline = |index: &ScanIndex| {
+            index
+                .files
+                .get(&key)
+                .and_then(ScanIndexEntry::unverified_deadline)
+        };
+        assert_eq!(deadline(&main_index), Some(due), "main keeps the debt");
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 1024, 64, || {
+            let (mut index, first) = page(&fixture, seeded.clone(), Some(Arc::clone(&cache)));
+            assert!(first.snapshots.is_empty(), "{case}: paused");
+            assert_eq!(
+                counter(&cache, |c| c.jobs_paused),
+                1,
+                "{case}: {}",
+                counters(&cache)
+            );
+            match case {
+                "grow" => fixture.append(SESSION, &token_line(42)),
+                "replace" => {
+                    let replacement = path.with_extension("replacement");
+                    fs::copy(&path, &replacement).unwrap();
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&replacement)
+                        .unwrap()
+                        .write_all(&token_line(42))
+                        .unwrap();
+                    fs::rename(&replacement, &path).unwrap();
+                }
+                _ => OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(fixture.len(SESSION) / 2)
+                    .unwrap(),
+            }
+            let ended = |cache: &SharedCache| match case {
+                "grow" => counter(cache, |c| c.jobs_uncertified + c.jobs_finish_failed) > 0,
+                "replace" => counter(cache, |c| c.jobs_unavailable_ended) > 0,
+                _ => counter(cache, |c| c.jobs_invalidated) > 0,
+            };
+            let mut ending = None;
+            for _ in 0..64 {
+                let (next, scan, _) = page_steps(
+                    &fixture,
+                    index,
+                    Some(Arc::clone(&cache)),
+                    "cursor-fixture",
+                    NOW,
+                    |_| {},
+                    10_000,
+                );
+                index = next;
+                if ended(&cache) {
+                    ending = Some(scan);
+                    break;
+                }
+                assert!(
+                    scan.snapshots.is_empty(),
+                    "{case}: a paused job publishes nothing"
+                );
+            }
+            let ending = ending.unwrap_or_else(|| panic!("{case}: {}", counters(&cache)));
+            assert_eq!(counter(&cache, |c| c.jobs_finish_failed), 0, "{case}");
+            assert_eq!(counter(&cache, |c| c.jobs_certified), 0, "{case}");
+            assert!(cache.retained_checkpoint(&key).is_none(), "{case}: no copy");
+            if case != "grow" {
+                assert!(ending.snapshots.is_empty(), "{case}: nothing published");
+                assert_eq!(counter(&cache, |c| c.jobs_uncertified), 0, "{case}");
+                return;
+            }
+            assert_eq!(counter(&cache, |c| c.jobs_uncertified), 1);
+            assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0);
+            assert_eq!(
+                fingerprints(&ending),
+                fingerprints(&main),
+                "main's semantic output for the object read"
+            );
+            assert_eq!(deadline(&index), Some(due), "original debt and age kept");
+        });
+    }
 }
 
 /// K7 as pure state: oldest waiter first, never-served files ahead of served

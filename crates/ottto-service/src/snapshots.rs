@@ -17505,7 +17505,8 @@ impl OwnedJsonlParser {
         } = self;
         let mut reader = bounded.reader;
         let report = bounded.report;
-        // Present only for a cursor job whose prefix certificate passed (S12).
+        // Present only for a cursor job whose prefix certificate passed (S12)
+        // or whose lossy job holds ruling 2's same-object identity proof.
         let sealed_prefix = bounded.sealed_prefix;
         // A cursor read withheld an unterminated final record (N2).
         let sealed_fragment = bounded.sealed_fragment.is_some();
@@ -17521,12 +17522,16 @@ impl OwnedJsonlParser {
         // A cursor job read only up to its frozen extent; appended bytes
         // belong to the next tail, so its object may have grown. Only a job
         // whose prefix certificate passed against the held FD carries
-        // `sealed_prefix` (same dev/ino, no shrink, no same-size edit, held-FD
+        // `Certified` (same dev/ino, no shrink, no same-size edit, held-FD
         // samples, scope), and the held FD must still be that dev/ino and at
-        // least the frozen extent long. Every other read keeps exact equality.
-        let certified_grown_prefix =
-            sealed_prefix.is_some_and(|prefix| prefix.holds(reader.get_ref()));
-        if observed_after_read != expected_opened_object_identity && !certified_grown_prefix {
+        // least the frozen extent long. A lossy job (ruling 2) carries only
+        // its same-object proof, revalidated here against the held FD (no
+        // shrink, same covered samples) and the selected path; it publishes
+        // uncertified. Every other read keeps exact equality.
+        let grown_identity_holds = sealed_prefix
+            .as_ref()
+            .is_some_and(|grant| grant.holds(reader.get_mut(), path));
+        if observed_after_read != expected_opened_object_identity && !grown_identity_holds {
             return Err(anyhow::anyhow!(
                 "opened snapshot candidate changed while it was parsed"
             ));
@@ -18076,9 +18081,11 @@ struct BoundedJsonlReader<R> {
     /// genuine unchanged EOF can apply them with main's trailing-line rule
     /// (E1).
     sealed_fragment: Option<(bool, Option<EarlySalvage>)>,
-    /// Set only after a cursor job's prefix certificate passed against its
-    /// held FD: the identity `finish` may accept for a grown object (S12).
-    sealed_prefix: Option<sampled_scan::codex_cursor::SealedPrefix>,
+    /// Set only by a cursor job's `finish_job`: the identity `finish` may
+    /// accept for a grown object. `Certified` after its prefix certificate
+    /// passed (S12); `LossySameObject` (ruling 2) is not a sealed-prefix
+    /// certificate and permits only an uncertified publication.
+    sealed_prefix: Option<sampled_scan::codex_cursor::FinishGrant>,
 }
 
 impl<R: BufRead> BoundedJsonlReader<R> {

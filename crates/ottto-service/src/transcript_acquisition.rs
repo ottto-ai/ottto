@@ -119,6 +119,44 @@ impl Samples {
     }
 }
 
+/// Parent ruling 2 (#606 round 3): the opened object's identity and the
+/// samples covering its sealed prefix, minted only by
+/// `ReadPlan::commit_sealed_prefix_or_lossy_identity` when the certificate
+/// refused as `Lossy` alone (every identity, sample, scope and audit check
+/// passed). It certifies nothing: no checkpoint, verification, retention or
+/// debt change. It lets `finish` accept a grown object for an UNCERTIFIED
+/// publication only while `holds` passes at finalization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LossyPrefixIdentity {
+    stamp: FileStamp,
+    samples: Samples,
+}
+
+impl LossyPrefixIdentity {
+    /// Revalidate against the held FD now: the same object, unchanged or
+    /// grown (never shrunk, never edited at the same size), and both covered
+    /// samples re-read from the held FD unchanged.
+    pub(crate) fn holds(&self, file: &mut File) -> bool {
+        let Ok(now) = file.metadata().and_then(FileStamp::capture) else {
+            return false;
+        };
+        let sealed = self.samples.sealed_offset;
+        if !self.stamp.same_object(&now)
+            || !(now == self.stamp || now.length > self.stamp.length)
+            || !self.samples.valid_for(self.stamp.length)
+        {
+            return false;
+        }
+        let mut guard = 0;
+        let boundary_start = sealed - self.samples.boundary.len() as u64;
+        matches!(sample_at(file, 0, &self.samples.head, &mut guard), Ok(true))
+            && matches!(
+                sample_at(file, boundary_start, &self.samples.boundary, &mut guard),
+                Ok(true)
+            )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Checkpoint {
     stamp: FileStamp,
@@ -517,6 +555,40 @@ impl ReadPlan {
 }
 
 impl ReadPlan {
+    /// `commit_sealed_prefix`, plus ruling 2's typed identity exactly when it
+    /// refused as `Lossy`: that refusal is reached only after every other
+    /// identity, sample, scope and audit check passed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_sealed_prefix_or_lossy_identity(
+        self,
+        file: &mut File,
+        path_same_object: bool,
+        current_scope: &Scope,
+        started: u64,
+        now: u64,
+        lossy: bool,
+        consumed: u64,
+    ) -> (
+        Result<Checkpoint, PrefixRefusal>,
+        Option<LossyPrefixIdentity>,
+    ) {
+        let identity = LossyPrefixIdentity {
+            stamp: self.stamp.clone(),
+            samples: self.samples.clone(),
+        };
+        let result = self.commit_sealed_prefix(
+            file,
+            path_same_object,
+            current_scope,
+            started,
+            now,
+            lossy,
+            consumed,
+        );
+        let identity = matches!(result, Err(PrefixRefusal::Lossy)).then_some(identity);
+        (result, identity)
+    }
+
     /// Certify the sealed prefix `[0, s)` of a read that spanned pages while
     /// the source may have grown. `s` is the end of the last complete record
     /// at or below the frozen length; an unfinished record after it is never
@@ -623,6 +695,7 @@ crate::heap_layout_bound::fields!(AuditDebt; due_unix_seconds);
 crate::heap_layout_bound::fields!(FileStamp; length, #[cfg(unix)] device, #[cfg(unix)] inode,
     #[cfg(unix)] modified, #[cfg(unix)] changed);
 crate::heap_layout_bound::fields!(Samples; sealed_offset, head, boundary);
+crate::heap_layout_bound::fields!(LossyPrefixIdentity; stamp, samples);
 crate::heap_layout_bound::fields!(Checkpoint; stamp, scope, samples, last_full_verified_unix_seconds, audit_debt);
 crate::heap_layout_bound::fields!(ReadPlan; mode, stamp, scope, samples, start_offset,
     last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record);
@@ -1216,6 +1289,51 @@ mod tests {
             .unwrap_err(),
             PrefixRefusal::Dependency
         );
+        // Ruling 2: only a `Lossy`-alone refusal leaves the typed identity. It
+        // revalidates against the held FD: growth holds; a covered-sample
+        // edit or a shrink does not. Any other refusal leaves none.
+        for edit in ["grow", "sample", "shrink"] {
+            let g = Fixture::new(b"one\ntwo\n");
+            let (mut file, plan, frozen) = sealed_read(&g, 100);
+            let (refusal, identity) = plan.commit_sealed_prefix_or_lossy_identity(
+                &mut file,
+                true,
+                &scope(),
+                100,
+                200,
+                true,
+                frozen,
+            );
+            assert_eq!(refusal.unwrap_err(), PrefixRefusal::Lossy);
+            let identity = identity.expect("a lossy-only refusal carries the identity");
+            assert!(identity.holds(&mut file), "{edit}: unchanged");
+            g.append(b"three\n");
+            match edit {
+                "grow" => assert!(identity.holds(&mut file), "growth holds"),
+                "sample" => {
+                    let mut writer = g.open();
+                    writer.seek(SeekFrom::Start(0)).unwrap();
+                    writer.write_all(b"O").unwrap();
+                    assert!(!identity.holds(&mut file), "covered sample changed");
+                }
+                _ => {
+                    g.open().set_len(2).unwrap();
+                    assert!(!identity.holds(&mut file), "shrunk");
+                }
+            }
+        }
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        let (refusal, identity) = plan.commit_sealed_prefix_or_lossy_identity(
+            &mut file,
+            true,
+            &Scope("other-interpretation".into()),
+            100,
+            200,
+            true,
+            frozen,
+        );
+        assert_eq!(refusal.unwrap_err(), PrefixRefusal::Dependency);
+        assert!(identity.is_none(), "not the sole refusal");
         // A read that outlived the interval certifies at its start and stays due.
         let (mut file, plan, frozen) = sealed_read(&f, 100);
         let late = 100 + AUDIT_INTERVAL_SECONDS;

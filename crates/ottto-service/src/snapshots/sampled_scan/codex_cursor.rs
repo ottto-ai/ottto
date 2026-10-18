@@ -22,7 +22,8 @@ use super::super::*;
 use super::{SharedCache, STATE_BYTES};
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::transcript_acquisition::{
-    AuditDebt, Checkpoint, FullReason, PrefixRefusal, Scope, AUDIT_INTERVAL_SECONDS, SAMPLE_BYTES,
+    AuditDebt, Checkpoint, FullReason, LossyPrefixIdentity, PrefixRefusal, Scope,
+    AUDIT_INTERVAL_SECONDS, SAMPLE_BYTES,
 };
 use std::os::unix::fs::FileExt;
 
@@ -311,6 +312,44 @@ impl SealedPrefix {
         OpenStamp::capture(file).is_ok_and(|now| {
             now.dev == self.dev && now.ino == self.ino && now.extent >= self.extent
         })
+    }
+}
+
+/// The identity `finish` may accept for a cursor job's grown object. Only
+/// `finish_job` sets it (in the reader's `sealed_prefix` slot).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum FinishGrant {
+    /// A passed prefix certificate (S12): `Certified` only.
+    Certified(SealedPrefix),
+    /// Parent ruling 2: the certificate refused as `Lossy` alone, after a
+    /// completed traversal of the frozen extent with parse/salvage loss
+    /// only. It permits nothing but an UNCERTIFIED publication of a grown
+    /// object; it is not a sealed-prefix certificate and mints no checkpoint,
+    /// retention, verification, ownership proof or debt change.
+    LossySameObject(LossyPrefixIdentity),
+}
+
+impl HeapLayoutBound for FinishGrant {
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        match self {
+            Self::Certified(prefix) => prefix.heap_bound(c),
+            Self::LossySameObject(identity) => identity.heap_bound(c),
+        }
+    }
+}
+
+impl FinishGrant {
+    /// Revalidated at finalization against the held FD (`file`). The lossy
+    /// grant also requires the selected `path` to still name the held object
+    /// and the covered samples to re-read unchanged (no replacement, shrink
+    /// or same-size edit).
+    pub(in crate::snapshots) fn holds(&self, file: &mut File, path: &Path) -> bool {
+        match self {
+            Self::Certified(prefix) => prefix.holds(file),
+            Self::LossySameObject(identity) => {
+                path_names_object(file, path) && identity.holds(file)
+            }
+        }
     }
 }
 
@@ -769,7 +808,9 @@ pub(in crate::snapshots) enum JobEnd {
         fragment: Option<SealedFragment>,
     },
     /// Every object check held but the read was lossy: publish uncertified
-    /// with debt staged, exactly like today's lossy full read.
+    /// with debt staged, exactly like today's lossy full read. A grown file
+    /// publishes only through ruling 2's same-object identity proof
+    /// (`FinishGrant::LossySameObject`), revalidated in `finish`.
     Uncertified {
         grown: bool,
         publication: Publication,
@@ -1039,6 +1080,7 @@ pub(in crate::snapshots) fn finish_job(
     let counting_holds = counting_reusable(&parser.accumulator, &meta.counting, counting_now);
     let mut frozen_end = None;
     let mut read_start = 0;
+    let mut lossy_identity = None;
     // `Err(None)`: evidence unavailable at emission (K9), not a refusal.
     let result = match (parser.reader.acquisition.take(), current_scope) {
         (Some(_), Some(_)) if !counting_holds => Err(Some(PrefixRefusal::Dependency)),
@@ -1049,7 +1091,7 @@ pub(in crate::snapshots) fn finish_job(
                 .reader
                 .extent_limit
                 .map(|limit| plan.start_offset().saturating_add(limit));
-            plan.commit_sealed_prefix(
+            let (result, identity) = plan.commit_sealed_prefix_or_lossy_identity(
                 parser.reader.reader.get_mut(),
                 path_same_object,
                 scope,
@@ -1057,8 +1099,9 @@ pub(in crate::snapshots) fn finish_job(
                 now,
                 lossy,
                 consumed_end,
-            )
-            .map_err(Some)
+            );
+            lossy_identity = identity;
+            result.map_err(Some)
         }
         (Some(_), None) => Err(None),
         (None, _) => Err(Some(PrefixRefusal::Invalidated(
@@ -1116,16 +1159,32 @@ pub(in crate::snapshots) fn finish_job(
             cache.with_cursor(update);
         }
     }
+    // Parent ruling 2: a lossy job's identity proof covers only a completed
+    // traversal of the frozen extent, ending on a record boundary, whose loss
+    // is parse/salvage loss main publishes. A read failure, an unfinished
+    // read or a withheld record gets no proof, and an EOF-applied record
+    // keeps strict finish identity (E1).
+    let completed_traversal = job.parser.reader.finished
+        && job.parser.reader.failure.is_none()
+        && !job.parser.reader.sealed_fragment()
+        && frozen_end == Some(read_start.saturating_add(consumed));
+    let lossy_identity = lossy_identity.filter(|_| {
+        completed_traversal && !eof_applied && matches!(result, Err(Some(PrefixRefusal::Lossy)))
+    });
     if result.is_ok() && !eof_applied {
-        // Only a passed certificate grants `finish` a grown object (S12).
-        // A lossy (uncertified) job keeps main's strict finish identity:
-        // if its file grew, the publication fails and the pending path
-        // restarts it, as main's lossy read of a growing file does.
-        job.parser.reader.sealed_prefix = frozen_end.map(|extent| SealedPrefix {
-            dev: meta.stamp_open.dev,
-            ino: meta.stamp_open.ino,
-            extent,
+        // A passed certificate grants `finish` a grown object (S12).
+        job.parser.reader.sealed_prefix = frozen_end.map(|extent| {
+            FinishGrant::Certified(SealedPrefix {
+                dev: meta.stamp_open.dev,
+                ino: meta.stamp_open.ino,
+                extent,
+            })
         });
+    } else if let Some(identity) = lossy_identity {
+        // An uncertified job grants it only through ruling 2's proof,
+        // revalidated in `finish`; otherwise it keeps main's strict finish
+        // identity (a grown file fails publication and restarts).
+        job.parser.reader.sealed_prefix = Some(FinishGrant::LossySameObject(identity));
     }
     match result {
         Ok(checkpoint) => {
@@ -1829,8 +1888,13 @@ pub(in crate::snapshots) fn resume_paused_job(
 /// The job's path still names the object its held FD reads (dev/ino only;
 /// no byte is read from the path).
 fn path_names_held_object(job: &OwnedActiveFile) -> bool {
-    OpenStamp::capture(job.parser.reader.reader.get_ref()).is_ok_and(|held| {
-        fs::symlink_metadata(&job.candidate.path)
+    path_names_object(job.parser.reader.reader.get_ref(), &job.candidate.path)
+}
+
+/// `path` names the object `file` reads (dev/ino; no byte read from it).
+fn path_names_object(file: &File, path: &Path) -> bool {
+    OpenStamp::capture(file).is_ok_and(|held| {
+        fs::symlink_metadata(path)
             .is_ok_and(|path| path.dev() == held.dev && path.ino() == held.ino)
     })
 }
