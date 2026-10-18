@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 688,
-  "content_sha256": "c027db770c63d90893b238952a5c30d3efb3d8105545150444c5dda733568240",
+  "candidate_file_count": 689,
+  "content_sha256": "c87e2e7424513aeaeadc71cfe603e0d47682546c7e9cdbc2272df0498fa81f83",
   "files": [
     {
       "executable": false,
@@ -90,8 +90,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "894ab5743ad475451a6d0962e44ad1842f57df3cadaefb7fa8050939b2c12fb0",
-      "size_bytes": 54392
+      "sha256": "c0404d15cb039d5cd6285c280907285974a73cfc33df95a70beb3e59653214f6",
+      "size_bytes": 54422
     },
     {
       "executable": false,
@@ -916,8 +916,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "082e771b452bce99963724b90b3163ef106c59d954374fa06c7a0a8d54e856b9",
-      "size_bytes": 1275806
+      "sha256": "17360993dc5e4ffac7487e6163a36462a730c0feca40a57dada69bc4551f379d",
+      "size_bytes": 1259122
     },
     {
       "executable": false,
@@ -3057,6 +3057,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-18-pi-verify-retired-import.md",
+      "sha256": "27c33bda61300d119c67ce5a0086256ceaf8c579f18bcd954c68ca4cbac48e1a",
+      "size_bytes": 2737
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-18-sampled-acquisition-causal-diagnostics.md",
       "sha256": "7f3e819aba1b9b5181ea22b2cd7b28e34819c0991413a0ef8f657f2be3c9e058",
       "size_bytes": 3035
@@ -4819,9 +4826,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T14:46:51+00:00",
+  "generated_at": "2026-10-18T15:23:42+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 689,
+  "output_file_count": 690,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4858,5 +4865,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b113119e49b530e36c543df9d1c18280b8a4490f"
+  "source_commit": "54a3a941f00f619ceee9f08b794af6cfccb92683"
 }
