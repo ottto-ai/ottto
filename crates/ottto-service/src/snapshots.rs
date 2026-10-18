@@ -3952,7 +3952,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         identity,
         &current_files,
         observations,
-        comparison.and_then(|view| view.negatives),
+        comparison,
     )
 }
 
@@ -3969,8 +3969,14 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     current_files: &BTreeSet<String>,
     observations: Option<ClaudeNativeObservations>,
-    negatives: Option<claude_native_comparison::NegativeView<'_>>,
+    comparison: Option<claude_native_comparison::FoldView<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
+    let (negatives, diagnostic) = comparison.map_or((None, None), |view| {
+        (view.negatives, view.lease.map(|lease| &lease.diagnostic))
+    });
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.update(|d| d.fold_index_generation = Some(index.generation));
+    }
     let mut duplicate_census = match observations {
         Some(observed) => {
             assert_eq!(
@@ -4794,6 +4800,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             } else {
                 BTreeSet::new()
             };
+        let mut rearm = crate::local_resource_diagnostics::NativeRearm {
+            negative_keys: negative_keys.len(),
+            ..Default::default()
+        };
         for (index_key, entry) in &mut index.files {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
@@ -4809,11 +4819,22 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .is_some_and(|request_hashes| {
                     !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                 });
-            if full_rearm
+            let proof_candidate = proven.contains_key(&root_session_id)
+                && !current_ids.contains(source_session_id.as_str());
+            let negative = negative_keys.contains(index_key.as_str());
+            let other_rearm = full_rearm
+                || invalidated_witness_roots.contains(&root_session_id)
+                || changed_duplicate_owners.contains(&duplicate_owner)
+                || current_member_owns_changed_request;
+            rearm.proof_candidates = rearm
+                .proof_candidates
+                .saturating_add(usize::from(proof_candidate));
+            rearm.other_rearm_matches = rearm
+                .other_rearm_matches
+                .saturating_add(usize::from(other_rearm));
+            let rearmed = full_rearm
                 || {
-                    let proof_rearm = proven.contains_key(&root_session_id)
-                        && !current_ids.contains(source_session_id.as_str())
-                        && !negative_keys.contains(index_key.as_str());
+                    let proof_rearm = proof_candidate && !negative;
                     #[cfg(test)]
                     {
                         proof_rearm
@@ -4829,15 +4850,21 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 }
                 || invalidated_witness_roots.contains(&root_session_id)
                 || changed_duplicate_owners.contains(&duplicate_owner)
-                || current_member_owns_changed_request
-            {
+                || current_member_owns_changed_request;
+            if rearmed {
                 // Reparse earlier-page members when terminal family proof
                 // changes or when a later page reveals a cross-family request
                 // duplicate. Changed hash-only witnesses re-arm every affected
                 // owner once; stable duplicates remain fail-closed without an
                 // unbounded corrective replay loop.
+                rearm.clear_calls = rearm.clear_calls.saturating_add(1);
                 entry.source_file_fingerprint.clear();
+            } else if proof_candidate && negative {
+                rearm.suppressed = rearm.suppressed.saturating_add(1);
             }
+        }
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
         index

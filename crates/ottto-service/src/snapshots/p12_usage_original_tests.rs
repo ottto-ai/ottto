@@ -206,7 +206,7 @@ impl Family {
             None,
             &BTreeSet::new(),
             None,
-            completion.negatives(Some(&lease)),
+            Some(completion.fold_view(Some(&lease))),
         );
         items.clone_from_slice(&scan.snapshots);
         completion.capture_native_corrections(
