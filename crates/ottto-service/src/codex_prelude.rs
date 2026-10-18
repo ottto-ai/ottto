@@ -279,10 +279,15 @@ impl CodexPreludeParser {
                 }
             }
             "token_usage_record" => {
-                prelude.first_input_tokens = payload
+                let input = payload
                     .get("usage")
                     .and_then(|usage| usage.get("input_tokens"))
                     .and_then(Value::as_u64);
+                // A zero-input record is a context estimate, not a request.
+                if input == Some(0) {
+                    return PreludeStep::More;
+                }
+                prelude.first_input_tokens = input;
                 prelude.complete = true;
                 prelude.input_closed = true;
                 if prelude.context_window.is_some() {
@@ -291,10 +296,13 @@ impl CodexPreludeParser {
             }
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("token_count") => {
                 let info = payload.get("info").unwrap_or(&Value::Null);
+                // An all-zero context estimate before the first request is
+                // not a request.
                 let Some(input) = info
                     .get("last_token_usage")
                     .and_then(|usage| usage.get("input_tokens"))
                     .and_then(Value::as_u64)
+                    .filter(|input| *input > 0 || prelude.complete)
                 else {
                     return PreludeStep::More;
                 };
@@ -610,6 +618,22 @@ mod tests {
 
     #[test]
     fn token_count_event_also_closes_the_prelude() {
+        let estimate = |kind: &str| match kind {
+            "record" => usage(0),
+            _ => json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 0}, "total_token_usage": {"input_tokens": 0}}}}),
+        };
+        for kind in ["record", "event"] {
+            // A zero context estimate does not end request 1's input.
+            let prelude = parse(&[
+                meta(json!({})),
+                estimate(kind),
+                message("user", Some(AGENTS_MD_KIND), "RULES"),
+                usage(5),
+            ]);
+            assert_eq!(prelude.first_input_tokens, Some(5), "{kind}");
+            assert_eq!(prelude.chars(BlockKind::AgentsMd), 5, "{kind}");
+        }
         let prelude = parse(&[
             meta(json!({"context_window": null})),
             json!({"type": "event_msg", "payload": {"type": "token_count", "info": {

@@ -531,14 +531,21 @@ struct OpeningCall {
 #[derive(Debug, Clone, Default)]
 struct OpeningFileState {
     ordinal: u64,
-    request: u8,
+    /// The first observation's tool.
     tool: String,
     repo_path: Option<String>,
     instruction_segments: u8,
-    chars: u64,
-    reads: u64,
-    client_loaded: bool,
-    truncated: bool,
+    // By the request the observation arrives in (2, 3), so a request the
+    // transcript never reached contributes nothing.
+    reads: [u64; 2],
+    chars: [u64; 2],
+    client_loaded: [bool; 2],
+    truncated: [bool; 2],
+}
+
+/// Index of an opening request (2 or 3) in per-request arrays.
+fn slot(request: u8) -> usize {
+    usize::from(request.clamp(2, 3) - 2)
 }
 
 /// Per-transcript accumulator. Everything but the counters is dropped at the
@@ -589,7 +596,7 @@ crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input
 crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest);
 crate::heap_layout_bound::fields!(ConfigDigest; a, b, len);
 crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
-crate::heap_layout_bound::fields!(OpeningFileState; ordinal, request, tool, repo_path, instruction_segments, chars, reads, client_loaded, truncated);
+crate::heap_layout_bound::fields!(OpeningFileState; ordinal, tool, repo_path, instruction_segments, reads, chars, client_loaded, truncated);
 crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
 
 impl SessionStartState {
@@ -1211,9 +1218,10 @@ impl SessionStartState {
         };
         call.answered = true;
         let share = output_units / call.candidates.max(1);
+        let arrives = slot(call.response + 1);
         for key in &call.files {
             if let Some(file) = self.files.get_mut(key) {
-                file.chars += share;
+                file.chars[arrives] += share;
             }
         }
         if client_truncated {
@@ -1226,10 +1234,11 @@ impl SessionStartState {
             return;
         };
         call.truncated = true;
-        self.truncated_outputs[usize::from(call.response.clamp(1, 2) - 1)] += 1;
+        let arrives = slot(call.response + 1);
+        self.truncated_outputs[arrives] += 1;
         for key in &call.files {
             if let Some(file) = self.files.get_mut(key) {
-                file.truncated = true;
+                file.truncated[arrives] = true;
             }
         }
     }
@@ -1250,7 +1259,7 @@ impl SessionStartState {
             .map_or(0, |haystack| instruction_segments(&key, haystack));
         if self.upsert_file(&key, repo_path, segments, record_type, request, true) {
             if let Some(file) = self.files.get_mut(&key) {
-                file.chars += chars;
+                file.chars[slot(request)] += chars;
             }
         }
     }
@@ -1265,26 +1274,26 @@ impl SessionStartState {
         request: u8,
         client_loaded: bool,
     ) -> bool {
+        let arrives = slot(request);
         if let Some(file) = self.files.get_mut(key) {
-            file.reads += 1;
-            file.client_loaded |= client_loaded;
+            file.reads[arrives] += 1;
+            file.client_loaded[arrives] |= client_loaded;
             return true;
         }
         if segments == 0 && !client_loaded {
             return false;
         }
-        let file = OpeningFileState {
+        let mut file = OpeningFileState {
             ordinal: self.files.len() as u64,
-            request,
             tool: tool_label(tool),
             repo_path,
             instruction_segments: segments,
-            reads: 1,
-            client_loaded,
             ..OpeningFileState::default()
         };
+        file.reads[arrives] = 1;
+        file.client_loaded[arrives] = client_loaded;
         if !self.charge(file_bytes(key, &file)) {
-            self.files_untracked[usize::from(request.clamp(2, 3) - 2)] += 1;
+            self.files_untracked[arrives] += 1;
             return false;
         }
         self.files.insert(key.to_string(), file);
@@ -1363,33 +1372,38 @@ impl SessionStartState {
                 // Unknown, not zero: a file named past the cap went unseen.
                 start.opening_files_unknown = true;
             } else {
+                // Only what arrived in reached requests; a file first seen in
+                // an unreached request is dropped, not counted.
                 let mut files = self
                     .files
                     .into_iter()
-                    .filter(|(_, file)| reached(usize::from(file.request)))
+                    .filter_map(|(key, file)| {
+                        let first = file.reads[..arrived].iter().position(|reads| *reads > 0)?;
+                        Some((key, first, file))
+                    })
                     .collect::<Vec<_>>();
-                files.sort_by_key(|(_, file)| file.ordinal);
+                files.sort_by_key(|(_, _, file)| file.ordinal);
                 start.files_over_guard = self.files_untracked[..arrived].iter().sum::<u64>()
                     + files.len().saturating_sub(MAX_OPENING_FILES) as u64;
                 files.truncate(MAX_OPENING_FILES);
                 start.file_candidates = files
                     .into_iter()
-                    .map(|(key, file)| OpeningFileCandidate {
+                    .map(|(key, first, file)| OpeningFileCandidate {
                         path_hash: attribution
                             .and_then(|context| context.opaque_id("opening_path", &key)),
                         ext: extension(&key).map(str::to_string),
                         repo_path: file.repo_path,
                         row: SnapshotOpeningFile {
-                            request: file.request,
+                            request: first as u8 + 2,
                             tool: file.tool,
                             repo_path: None,
                             path_hash: None,
                             ext: None,
-                            chars: file.chars,
-                            reads: file.reads,
+                            chars: file.chars[..arrived].iter().sum(),
+                            reads: file.reads[..arrived].iter().sum(),
                             instruction_segments: file.instruction_segments,
-                            client_loaded: file.client_loaded,
-                            truncated: file.truncated,
+                            client_loaded: file.client_loaded[..arrived].contains(&true),
+                            truncated: file.truncated[..arrived].contains(&true),
                         },
                     })
                     .collect();
@@ -1907,6 +1921,54 @@ mod tests {
                 assert_eq!(start.opening_truncated_outputs, Some(1));
             }
         }
+    }
+
+    /// A file read in request 2 and again in an unreached request 3 reports
+    /// only its request-2 observation.
+    #[test]
+    fn later_observations_of_a_file_wait_for_their_request() {
+        let cwd = Path::new("/w/repo");
+        let mut state = SessionStartState {
+            instructions: Some("See docs/guide.md".to_string()),
+            ..SessionStartState::default()
+        };
+        let read = |id: &str| {
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": "/w/repo/docs/guide.md"}}]}})
+        };
+        let result = |id: &str, text: &str| {
+            json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": id, "content": text}]}})
+        };
+        state.observe_claude_line(&read("t1"), 1, Some(cwd));
+        state.observe_claude_line(&result("t1", "abcd"), 1, Some(cwd));
+        state.observe_claude_line(&read("t2"), 2, Some(cwd));
+        state.observe_claude_line(&result("t2", "efghij"), 2, Some(cwd));
+        state.observe_claude_line(
+            &json!({"type": "attachment", "attachment": {"type": "read_truncation_notice", "toolUseID": "t2"}}),
+            2,
+            Some(cwd),
+        );
+        state.note_claude_response(0, &UsageTotals::default(), 1, 1);
+        state.note_claude_response(1, &UsageTotals::default(), 2, 1);
+        let mut start = state
+            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .expect("measured");
+        start.apply_upload_policy(true, false);
+        assert_eq!(start.opening_request_count, Some(2));
+        assert_eq!(start.opening_truncated_outputs, Some(0));
+        assert_eq!(
+            start.opening_files,
+            [SnapshotOpeningFile {
+                request: 2,
+                tool: "Read".to_string(),
+                repo_path: Some("docs/guide.md".to_string()),
+                chars: 4,
+                reads: 1,
+                instruction_segments: 2,
+                ..SnapshotOpeningFile::default()
+            }]
+        );
     }
 
     #[test]
