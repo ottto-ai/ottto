@@ -75,6 +75,10 @@ const CONTEXT_COMPOSITION_CYCLE_BUDGET: Duration = Duration::from_secs(5 * 60);
 /// A single very large transcript is skipped to bound per-file work.
 const MAX_TRANSCRIPT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_WORKSPACES_PER_CYCLE: usize = 12;
+/// A live session appends to its transcript every few seconds, so one such
+/// file would fence its whole workspace on every cycle. Files modified this
+/// recently wait for a later cycle.
+const SETTLE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// Capture window (inclusive) must not exceed the backend cap (92 days).
 const MAX_WINDOW_DAYS: i64 = 92;
 const MAX_TOP_FILES: usize = 100;
@@ -1625,6 +1629,21 @@ fn transcript_copy_key(path: &Path) -> Vec<std::ffi::OsString> {
     session.into_iter().chain(name).collect()
 }
 
+/// Leaves out transcripts modified within `SETTLE_WINDOW` of `now` that the
+/// last upload did not include; a later cycle picks them up. An uploaded
+/// transcript stays even when recent, so a replacement never drops its history.
+fn retain_settled_files(
+    files: &mut Vec<(PathBuf, SystemTime)>,
+    now: SystemTime,
+    uploaded: Option<&CompositionFilesSignature>,
+) {
+    files.retain(|(path, mtime)| {
+        now.duration_since(*mtime)
+            .is_ok_and(|age| age >= SETTLE_WINDOW)
+            || uploaded.is_some_and(|files| files.contains_key(path.to_string_lossy().as_ref()))
+    });
+}
+
 fn file_date(mtime: SystemTime) -> Date {
     OffsetDateTime::from(mtime).to_offset(UtcOffset::UTC).date()
 }
@@ -1982,12 +2001,23 @@ fn harvest_source(
     let mut excluded_not_fresh = 0u64;
     let mut copied_history = 0u64;
 
-    for scan in workspaces {
+    for mut scan in workspaces {
         if Instant::now() >= deadline {
             return Err(anyhow!("context composition report budget expired"));
         }
         let workspace_text = scan.workspace.to_string_lossy();
         let workspace_hash = sha256_hex(&[workspace_text.as_ref()]);
+        let path = cache_path(support_dir, agent_source, &workspace_hash);
+        let cache = read_cache(&path);
+        retain_settled_files(
+            &mut scan.files,
+            now,
+            cache.as_ref().map(|entry| &entry.files),
+        );
+        if scan.files.is_empty() {
+            skipped += 1;
+            continue;
+        }
         let signature = match workspace_files_signature(&scan.files, deadline) {
             Ok(signature) => signature,
             Err(_) if Instant::now() >= deadline => {
@@ -2001,8 +2031,6 @@ fn harvest_source(
                 continue;
             }
         };
-        let path = cache_path(support_dir, agent_source, &workspace_hash);
-        let cache = read_cache(&path);
         let now_dt = OffsetDateTime::now_utc();
         if !should_rescan(
             cache.as_ref(),
