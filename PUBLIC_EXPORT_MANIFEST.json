@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 681,
-  "content_sha256": "d14003e9737a3fb8141ebfcfe4a92b1c2f1d61f31276d837210ab8942da32f38",
+  "candidate_file_count": 683,
+  "content_sha256": "514b27cbc9079cff2c869e9fcfede6aff7ccbd36303fc5b1daa480ab47525ed8",
   "files": [
     {
       "executable": false,
@@ -1007,8 +1007,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics.rs",
-      "sha256": "88653db8c3540a08d69e94b80a0fd58ca4924fc3bda439f07259fe6dfd65544b",
-      "size_bytes": 26541
+      "sha256": "cf96789a02131bc7b7258586a5ac2d436baf08b64be53f4e1a35919d9f37e277",
+      "size_bytes": 27333
     },
     {
       "executable": false,
@@ -1259,8 +1259,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "7c89038cea67ddb9f7834f8881b41f5bbc3c9a680d0c88e704f874b090d071a6",
-      "size_bytes": 2609265
+      "sha256": "424245780a9da45450acefadb8ab01a1f8b016abba5f2dfab5a7ae61884dd6ea",
+      "size_bytes": 2610712
     },
     {
       "executable": false,
@@ -1469,8 +1469,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "9e77c1ba48e3a7b951460d19a2ec11d69ce8b0ba842c1860d0b8cfd4c407716e",
-      "size_bytes": 71461
+      "sha256": "c814ff60ca57c8921731627185692db78c02c800db64e2055da03458fc57977c",
+      "size_bytes": 71874
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/traversal_transition.rs",
+      "sha256": "0cee4f4082527ef0d8d38fc08a125cb5858097f3f1c8e4f4828f960702695420",
+      "size_bytes": 11100
     },
     {
       "executable": false,
@@ -3025,6 +3032,13 @@
       "path": "docs/session-2026-10-18-page-scoped-witness-reconstruction.md",
       "sha256": "e7fc1d9eea0a208f34f52f1afb9ed154a71cc66d930b8e6ba5e6c9e075a081f7",
       "size_bytes": 2396
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-traversal-transition-diagnostics.md",
+      "sha256": "8dabdfd62eb617c96fd26e68fe1a9eeb82bf5f14ae7a5807e28af23b1cc278d7",
+      "size_bytes": 2033
     },
     {
       "executable": false,
@@ -4770,9 +4784,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T11:43:44+00:00",
+  "generated_at": "2026-10-18T12:38:38+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 682,
+  "output_file_count": 684,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4809,5 +4823,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f684b41de08334089043e2a204c23c27b482fd39"
+  "source_commit": "84a234678526595a623ecca1caecc7e9d0c07240"
 }

@@ -185,6 +185,27 @@ pub(crate) fn codex_census_fence(
 #[derive(Serialize)]
 struct EmptyCounts {}
 
+/// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
+pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "bounded_traversal_transition",
+        source: Source::from_slug(source),
+        observation: Observation {
+            observed_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+            wall_elapsed_us: 0,
+            shared_process_cpu_delta_us: None,
+            process_lifetime_max_rss_bytes: None,
+            process_lifetime_max_rss_before_bytes: None,
+        },
+        counts,
+    });
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct CollectionCounts {
     pub(crate) scanned_files: usize,
