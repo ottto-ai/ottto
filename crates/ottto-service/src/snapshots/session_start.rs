@@ -305,8 +305,15 @@ fn shell_path_tokens(command: &str) -> impl Iterator<Item = &str> {
 /// True when a shell command may change its working directory, so its
 /// relative paths cannot be shown to be inside the session's checkout.
 fn shell_changes_directory(command: &str) -> bool {
+    // Quotes and braces split too, so `bash -lc 'cd x && ...'` is caught.
     command
-        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '`'))
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ';' | '|' | '&' | '(' | ')' | '`' | '\'' | '"' | '{' | '}'
+                )
+        })
         .any(|word| {
             matches!(word, "cd" | "pushd" | "popd" | "chdir" | "-C")
                 || [
@@ -325,9 +332,8 @@ fn shell_changes_directory(command: &str) -> bool {
 /// A Claude response spanning several model requests (`usage.iterations[]`):
 /// its counters are not request 1's and later ordinals shift.
 fn claude_multi_request(value: &Value) -> bool {
-    value
-        .pointer("/message/usage/iterations")
-        .or_else(|| value.pointer("/usage/iterations"))
+    super::claude_code_usage_root(value)
+        .and_then(|usage| usage.get("iterations"))
         .and_then(Value::as_array)
         .is_some_and(|iterations| iterations.len() > 1)
 }
@@ -1916,6 +1922,8 @@ mod tests {
         assert!(shell_changes_directory("cd /tmp && cat x.md"));
         assert!(shell_changes_directory("(pushd d; ls)"));
         assert!(shell_changes_directory("git -C ../other status"));
+        assert!(shell_changes_directory("bash -lc 'cd /p && cat x.md'"));
+        assert!(shell_changes_directory("sh -c \"cd /p; cat x.md\""));
         assert!(!shell_changes_directory("cat docs/cdn.md"));
         assert_eq!(
             shell_path_tokens("sed -n 1,5p a/b.md | grep x > out.txt").collect::<Vec<_>>(),
@@ -2004,6 +2012,9 @@ mod tests {
         assert_eq!(start.client_version.as_deref(), Some("2.1.300"));
         assert_eq!(start.opening_request_count, None);
         assert_eq!(start.first_request_uncached_input_tokens, None);
+        // Every usage root the parser accepts is checked.
+        assert!(claude_multi_request(&json!({"payload": {"usage": {
+            "iterations": [{"input_tokens": 1}, {"input_tokens": 2}]}}})));
     }
 
     #[test]
