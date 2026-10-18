@@ -155,6 +155,17 @@ pub(super) fn configure_singleton(
     configure(&mut parser.accumulator, evidence, Some(cutover));
 }
 
+/// A joined group's member evidence. Inactive, the member view is never
+/// traversed, so an inactive group scan allocates nothing for counting.
+pub(super) fn group_evidence<'a>(
+    entries: impl IntoIterator<Item = &'a ScanIndexEntry>,
+) -> AckEvidence {
+    if cutover_unix_ms().is_none() {
+        return AckEvidence::None;
+    }
+    AckEvidence::of_view(entries)
+}
+
 /// Joined-group replay parser: configured once, from the group's evidence,
 /// on its fresh accumulator. The accumulator carried across members is never
 /// reconfigured, so no member resets V2 state mid-session.

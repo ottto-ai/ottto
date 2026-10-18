@@ -399,6 +399,27 @@ fn codex_v2_reopened_closed_turn_never_regains_native_authority() {
     assert_eq!(counters.native_counted, 0);
     assert_eq!(legacy(&values).money(), five(usage));
 
+    // A closure whose start was never bound is final too: the id reopens only
+    // as an unbound span and its native adds nothing.
+    for close in [completed as fn(&str, &str) -> Value, aborted] {
+        let values = [
+            header(POST),
+            context("2026-10-18T10:00:02Z", "turn-1"),
+            ui("2026-10-18T10:00:10Z", usage, usage),
+            close("2026-10-18T10:00:11Z", "turn-1"),
+            started("2026-10-18T10:00:12Z", "turn-1"),
+            native("2026-10-18T10:00:13Z", "turn-1", "resp-1", usage, usage),
+            completed("2026-10-18T10:00:20Z", "turn-1"),
+        ];
+        let counted = v2(&values);
+        assert_eq!(counted.money(), five(usage));
+        let counters = counted.counters();
+        assert_eq!(counters.turn_reopened, 1);
+        assert_eq!(counters.native_after_turn_closed, 1);
+        assert_eq!(counters.native_counted, 0);
+        assert_eq!(legacy(&values).money(), five(usage));
+    }
+
     // Far beyond the exact ring: the filter still holds turn-1 closed. The
     // hit is unconfirmed, its native counts 0, and UI in the span keeps the
     // unbound rule, so V2 equals Legacy and nothing is counted twice.
@@ -585,6 +606,21 @@ fn codex_counting_version_decision_is_stable() {
     assert_eq!(
         decide(&first_usage, AckEvidence::None),
         CountingVersion::Legacy
+    );
+    // Inactive, a group's member view is never traversed, so the group scan
+    // allocates nothing for counting; active, it reads the members' evidence.
+    let unpolled = std::iter::from_fn(|| -> Option<&'static ScanIndexEntry> {
+        panic!("an inactive group must not read member evidence")
+    });
+    assert_eq!(
+        codex_counting_version::group_evidence(unpolled),
+        AckEvidence::None
+    );
+    let marked = entry(Some("body"), true);
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    assert_eq!(
+        codex_counting_version::group_evidence([&marked]),
+        AckEvidence::V2Marked
     );
 }
 

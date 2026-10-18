@@ -821,7 +821,7 @@ impl GroupReader {
             .active_upload_context_fingerprint
             .clone()
             .unwrap_or_default();
-        self.counting_evidence = codex_counting_version::AckEvidence::of_view(
+        self.counting_evidence = codex_counting_version::group_evidence(
             self.members
                 .iter()
                 .filter_map(|member| index.files.get(&local_index_key(&member.path))),

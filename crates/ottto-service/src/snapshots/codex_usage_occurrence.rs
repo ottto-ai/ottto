@@ -548,6 +548,20 @@ impl OccurrenceReducer {
         self.native_since_prev_ui = false;
     }
 
+    /// Enters a closed id into the filter and, once, into the exact ring.
+    fn remember_closed(&mut self, id: String) {
+        self.closed_filter
+            .get_or_insert_with(ClosedTurnFilter::new)
+            .insert(&id);
+        if self.closed_turns.contains(&id) {
+            return;
+        }
+        if self.closed_turns.len() >= MAX_CLOSED_TURN_IDS {
+            self.closed_turns.pop_front();
+        }
+        self.closed_turns.push_back(id);
+    }
+
     fn closed(&self, turn_id: &str) -> Closed {
         if self.closed_turns.iter().any(|closed| closed == turn_id) {
             Closed::Recent
@@ -637,16 +651,24 @@ impl SnapshotAccumulator {
     }
 
     /// Closure publishes a UI-only turn's staged rows. A later native for the
-    /// closed turn adds nothing, which is exactly the Legacy outcome.
+    /// closed turn adds nothing, which is exactly the Legacy outcome. Every
+    /// explicit closure is final, including one whose start was never bound.
     fn close_codex_turn(&mut self, closing_turn_id: Option<&str>) {
         let Some(reducer) = self.codex_occurrence() else {
             return;
         };
+        let closing = closing_turn_id.filter(|id| !id.is_empty() && id.len() <= MAX_TURN_ID_BYTES);
         let Some(turn) = reducer.turn.take() else {
+            if let Some(closing) = closing {
+                reducer.remember_closed(closing.to_owned());
+            }
             return;
         };
         if closing_turn_id.is_some_and(|closing| closing != turn.id) {
             reducer.counters.turn_closure_mismatch += 1;
+            if let Some(closing) = closing {
+                reducer.remember_closed(closing.to_owned());
+            }
         }
         let BoundTurn {
             id,
@@ -655,14 +677,7 @@ impl SnapshotAccumulator {
             pending,
             ..
         } = turn;
-        reducer
-            .closed_filter
-            .get_or_insert_with(ClosedTurnFilter::new)
-            .insert(&id);
-        if reducer.closed_turns.len() >= MAX_CLOSED_TURN_IDS {
-            reducer.closed_turns.pop_front();
-        }
-        reducer.closed_turns.push_back(id);
+        reducer.remember_closed(id);
         if !native && !ui_published {
             self.publish_codex_pending(&pending);
         }
