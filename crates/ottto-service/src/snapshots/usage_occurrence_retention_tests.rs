@@ -15,7 +15,7 @@ fn claude_row(index: usize, tier: Option<&str>, long: bool) -> Value {
         "requestId": format!("req_{index:06}"),
         "message": {
             "id": format!("msg_{index:06}"),
-            "model": "claude-fixture-model",
+            "model": "claude-opus-4-8",
             "role": "assistant",
             "usage": {
                 "input_tokens": 10 + index as u64,

@@ -1,0 +1,271 @@
+{
+  "aliases": [
+    {
+      "kind": "tiered",
+      "model": "gpt-5-4",
+      "raw_model": "gpt-5.4",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-4",
+      "raw_model": "gpt-5.4-2026-03-05",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-5",
+      "raw_model": "openai/gpt-5.5",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-6-luna",
+      "raw_model": "gpt-5.6-luna",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-6-sol",
+      "raw_model": "gpt-5.6-sol",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-6-terra",
+      "raw_model": "gpt-5.6-terra",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-astra",
+      "raw_model": "gpt-6-astra",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-sol",
+      "raw_model": "gpt-6-sol",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-1-sol",
+      "raw_model": "gpt-6.1-sol",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-1-sol",
+      "raw_model": "gpt-6.1-sol-2026-09-30",
+      "tokens": 272000
+    },
+    {
+      "kind": null,
+      "model": "gpt-5-4-mini",
+      "raw_model": "gpt-5.4-mini",
+      "tokens": null
+    },
+    {
+      "kind": null,
+      "model": "gpt-5-4-nano",
+      "raw_model": "gpt-5.4-nano",
+      "tokens": null
+    },
+    {
+      "kind": null,
+      "model": "gpt-5-3-codex",
+      "raw_model": "gpt-5.3-codex",
+      "tokens": null
+    },
+    {
+      "kind": null,
+      "model": "gpt-4-1",
+      "raw_model": "gpt-4.1",
+      "tokens": null
+    },
+    {
+      "kind": null,
+      "model": "o3",
+      "raw_model": "o3",
+      "tokens": null
+    },
+    {
+      "kind": "tiered",
+      "model": "claude-haiku-5-5",
+      "raw_model": "claude-haiku-5-5",
+      "tokens": 100000
+    },
+    {
+      "kind": "tiered",
+      "model": "claude-haiku-5-5",
+      "raw_model": "claude-haiku-5-5-20261015",
+      "tokens": 100000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-4-8",
+      "raw_model": "claude-opus-4-8",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-4-8",
+      "raw_model": "anthropic/claude-opus-4-8",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-4-8",
+      "raw_model": "us.anthropic.claude-opus-4-8-v1:0",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-5-5",
+      "raw_model": "claude-opus-5-5",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-sonnet-4-6",
+      "raw_model": "claude-sonnet-4-6",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-fable-5-1",
+      "raw_model": "claude-fable-5-1",
+      "tokens": 200000
+    },
+    {
+      "kind": null,
+      "model": "claude-opus-4-5",
+      "raw_model": "claude-opus-4-5-20251101",
+      "tokens": null
+    },
+    {
+      "kind": null,
+      "model": "claude-sonnet-4-5",
+      "raw_model": "claude-sonnet-4-5",
+      "tokens": null
+    },
+    {
+      "kind": null,
+      "model": "claude-haiku-4-5",
+      "raw_model": "claude-haiku-4-5-20251001",
+      "tokens": null
+    }
+  ],
+  "comparison": "long_when_prompt_tokens_greater_than_line",
+  "contract_version": "provider_price_lines:v1",
+  "lines": [
+    {
+      "kind": "tiered",
+      "model": "gpt-5-4",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-5",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-6-luna",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-6-sol",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-5-6-terra",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-astra",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-sol",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "gpt-6-1-sol",
+      "tokens": 272000
+    },
+    {
+      "kind": "tiered",
+      "model": "claude-haiku-5-5",
+      "tokens": 100000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-fable-5",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-fable-5-1",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-mythos-5",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-mythos-5-1",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-4-6",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-4-7",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-4-8",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-5",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-opus-5-5",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-sonnet-4-6",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-sonnet-5",
+      "tokens": 200000
+    },
+    {
+      "kind": "analysis",
+      "model": "claude-sonnet-5-5",
+      "tokens": 200000
+    }
+  ],
+  "prompt_tokens": "uncached_input_plus_cache_read_plus_cache_write",
+  "tiered_effective_from_utc": "2026-09-01T00:00:00Z"
+}
