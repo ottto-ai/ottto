@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 695,
-  "content_sha256": "f6a11150cb0cb39bfb4c82cc3786b01079a056cc6c388e048adee9b8e9021b9d",
+  "content_sha256": "128e9f6ac73d2f60f1d15c83add5a9265e5f31e51bb4d8e83862d56e27a1ac90",
   "files": [
     {
       "executable": false,
@@ -1035,8 +1035,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/mcp_inventory.rs",
-      "sha256": "24d5be6554bbfeb0ca635478786d3947308cb7c19e56b0908f0f4b8df15b3bca",
-      "size_bytes": 159975
+      "sha256": "04c193fe461137aff1dd6383ec6bb4fdbcf413e852db8a2ef30d3f990b28e0b9",
+      "size_bytes": 160116
     },
     {
       "executable": false,
@@ -4868,7 +4868,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T20:26:41+00:00",
+  "generated_at": "2026-10-18T21:38:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 696,
   "public_roots": [
@@ -4907,5 +4907,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cf73c81e7f2f992bc7faa79adeb27ba90ef8ec1d"
+  "source_commit": "8b4c4d05900a2dd58660f8f1df936c66d6d52b11"
 }
