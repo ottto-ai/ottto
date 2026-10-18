@@ -1,23 +1,26 @@
-//! Codex session-start footprint: what every new Codex session loads before
-//! its first model request (the AGENTS.md chain and the skills listing).
+//! Codex prelude footprint: what every new Codex session loads before its
+//! first model request (the AGENTS.md chain and the skills listing).
 //!
-//! This is a light prefix reader, separate from the daily whole-file
-//! composition scan. It reads only the prelude of each NEW rollout (the rows
+//! [`CodexPreludeParser`] is the one Codex prelude parser (CROSS-LANE R1): it
+//! takes rollout rows already decoded, so the session sink can share it. This
+//! module's uploader reads only the prelude of each NEW rollout (the rows
 //! before the first token record, typically ~15 lines / ~160 KB; bounded by
 //! [`MAX_PRELUDE_LINES`] and [`MAX_PRELUDE_BYTES`]) once, and remembers the
-//! outcome in a small local index so later cycles never read it again. For
-//! each repository scope it uploads the newest owned fresh start as a
-//! context-footprint snapshot with `agent_source = "codex"`, only when the
-//! payload changed or weekly, exactly like the Claude Code footprint.
+//! outcome in a small local index. For each repository scope it uploads the
+//! newest owned fresh start as a context-footprint snapshot with
+//! `agent_source = "codex"`, dated at that session's start: one rollout is one
+//! observation and is never sent again.
 //!
-//! Codex records what it injected: `world_state.state.agents_md` holds the
-//! loaded AGENTS.md text and `world_state.state.host_skills.body` the skills
-//! listing (cli >= 0.159); older rollouts carry the same text in
-//! `content_item_kinds`-labeled messages. The project part of the AGENTS.md
-//! text is split back into its files with a metadata-only `stat` of the
-//! root-to-cwd chain, mirroring Codex's own loader: files joined by a blank
-//! line, the total capped at `project_doc_max_bytes` (32 KiB by default) with
-//! the tail silently dropped.
+//! Codex records what it injected in `world_state` (cli >= 0.159; older
+//! rollouts are not supported): `state.agents_md` holds the loaded AGENTS.md
+//! text and `state.host_skills.body` the skills listing. The project part of
+//! the AGENTS.md text is split back into its files with a metadata-only `stat`
+//! of the root-to-cwd chain, mirroring Codex's own loader: files joined by a
+//! blank line, the total capped at `project_doc_max_bytes` (32 KiB by default)
+//! with the tail silently dropped ([`agents_md_cut`]).
+//!
+//! Sizes are UTF-16 character counts; the backend owns the conversion to
+//! tokens (see [`COUNTER_SOURCE`]).
 //!
 //! Rollouts come from every registered Codex home (`~/.codex` and accepted
 //! Ottto slot homes, `sessions` and `archived_sessions`); each session is
@@ -27,9 +30,10 @@
 //! Privacy: sizes only. No instruction or skill text leaves the Mac. File
 //! paths are repository-relative. A file loaded whole also gets the Claude
 //! file-count collector's counts and device-salted hash (same function, same
-//! recipe); a trimmed or cut file sends only its `stat` size.
+//! recipe); a trimmed or cut file sends only its `stat` size, and none above
+//! the 1 MiB admission bound.
 
-use crate::context_file_counts::{load_or_create_salt, measure_bytes, FileCounts};
+use crate::context_file_counts::{load_or_create_salt, measure_bytes, FileCounts, MAX_FILE_BYTES};
 use crate::context_footprint::{
     collect_recent_jsonl_files, request_content_hash_for_request, resolve_repository_identity,
     safe_text, sha256_hex, workspace_label, ContextFootprintCategoryInput,
@@ -62,14 +66,16 @@ const MAX_WORKSPACES_PER_CYCLE: usize = 12;
 const MAX_NEW_PRELUDES_PER_CYCLE: usize = 400;
 const MAX_SKILL_ITEMS: usize = 512;
 const MAX_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
-const CHARS_PER_TOKEN: u64 = 4;
 const DEFAULT_PROJECT_DOC_MAX_BYTES: u64 = 32 * 1024;
 const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 const PROJECT_DOC_JOIN: &str = "\n\n";
 /// Per directory Codex loads the first existing name, override first.
 const AGENTS_FILENAMES: [&str; 2] = ["AGENTS.override.md", "AGENTS.md"];
 const COMBINED_CHAIN_NAME: &str = "AGENTS.md (chain)";
-const COUNTER_SOURCE: &str = "codex_rollout_prelude_v1";
+/// Item and category `tokens` carry UTF-16 character counts, not tokens: the
+/// backend owns the character-to-token ratio and converts on admission.
+/// Category `pct` is 0 for the same reason.
+const COUNTER_SOURCE: &str = "codex_rollout_prelude_chars_v1";
 const INDEX_SCHEMA: &str = "codex-session-start-index-v2";
 const STATE_DIR: &str = "codex_session_start";
 const LOCAL_DISABLE_ENV: &str = "OTTTO_CODEX_SESSION_START_HARVEST_DISABLED";
@@ -119,37 +125,60 @@ fn read_prelude(path: &Path) -> std::io::Result<CodexPrelude> {
 }
 
 pub(crate) fn parse_prelude(mut reader: impl BufRead) -> std::io::Result<CodexPrelude> {
-    let mut prelude = CodexPrelude::default();
-    let mut session_id: Option<String> = None;
-    let mut world_state_seen = false;
-    let mut message_agents_md: Option<LoadedAgentsMd> = None;
-    let mut message_skills: Option<String> = None;
+    let mut parser = CodexPreludeParser::default();
     let mut line = Vec::new();
-    // Rows after the first request are read only for its context window,
-    // which a `token_count` event can carry right after the usage record.
-    let mut lines_after_first_request = 0usize;
     for _ in 0..MAX_PRELUDE_LINES {
         line.clear();
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
+        // Rows that are not JSON still count toward the window bound.
+        let value = serde_json::from_slice::<Value>(&line).unwrap_or(Value::Null);
+        if parser.observe(&value) == PreludeStep::Done {
+            break;
+        }
+    }
+    Ok(parser.finish())
+}
+
+/// Whether the caller should feed the next rollout row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreludeStep {
+    More,
+    Done,
+}
+
+/// The one Codex prelude parser (CROSS-LANE R1). Feed rollout rows in order,
+/// already decoded, until it says [`PreludeStep::Done`]; callers that decode
+/// rows for another purpose share this instead of parsing the prelude again.
+/// Requires `world_state` (cli >= 0.159); older rollouts are not supported.
+#[derive(Debug, Default)]
+pub(crate) struct CodexPreludeParser {
+    prelude: CodexPrelude,
+    session_id: Option<String>,
+    world_state_seen: bool,
+    /// Rows after the first request are read only for its context window,
+    /// which a `token_count` event can carry right after the usage record.
+    rows_after_first_request: usize,
+}
+
+impl CodexPreludeParser {
+    pub(crate) fn observe(&mut self, value: &Value) -> PreludeStep {
+        let prelude = &mut self.prelude;
         if prelude.complete {
-            lines_after_first_request += 1;
-            if lines_after_first_request > MAX_LINES_FOR_WINDOW {
-                break;
+            self.rows_after_first_request += 1;
+            if self.rows_after_first_request > MAX_LINES_FOR_WINDOW {
+                return PreludeStep::Done;
             }
         }
-        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
-            continue;
-        };
         let payload = value.get("payload").unwrap_or(&Value::Null);
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         if prelude.complete && kind != "event_msg" {
-            continue;
+            return PreludeStep::More;
         }
         match kind {
             "session_meta" => {
-                note_session_meta(&mut prelude, &mut session_id, payload);
+                note_session_meta(prelude, &mut self.session_id, payload);
                 if prelude.started_at.is_none() {
                     prelude.started_at = payload
                         .get("timestamp")
@@ -159,17 +188,15 @@ pub(crate) fn parse_prelude(mut reader: impl BufRead) -> std::io::Result<CodexPr
                         .map(OffsetDateTime::unix_timestamp);
                 }
             }
-            "turn_context" => {
-                if prelude.model.is_none() {
-                    prelude.model = payload
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                }
+            "turn_context" if prelude.model.is_none() => {
+                prelude.model = payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
-            "world_state" if !world_state_seen => {
+            "world_state" if !self.world_state_seen => {
                 if let Some(state) = payload.get("state").filter(|s| s.is_object()) {
-                    world_state_seen = true;
+                    self.world_state_seen = true;
                     prelude.agents_md = state.get("agents_md").and_then(|agents| {
                         Some(LoadedAgentsMd {
                             directory: agents
@@ -193,7 +220,7 @@ pub(crate) fn parse_prelude(mut reader: impl BufRead) -> std::io::Result<CodexPr
                     .and_then(Value::as_u64);
                 prelude.complete = true;
                 if prelude.context_window.is_some() {
-                    break;
+                    return PreludeStep::Done;
                 }
             }
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("token_count") => {
@@ -203,7 +230,7 @@ pub(crate) fn parse_prelude(mut reader: impl BufRead) -> std::io::Result<CodexPr
                     .and_then(|usage| usage.get("input_tokens"))
                     .and_then(Value::as_u64)
                 else {
-                    continue;
+                    return PreludeStep::More;
                 };
                 if !prelude.complete {
                     prelude.first_input_tokens = Some(input);
@@ -212,24 +239,19 @@ pub(crate) fn parse_prelude(mut reader: impl BufRead) -> std::io::Result<CodexPr
                 if let Some(window) = info.get("model_context_window").and_then(Value::as_u64) {
                     prelude.context_window.get_or_insert(window);
                 }
-                break;
+                return PreludeStep::Done;
             }
             "response_item" if payload.get("type").and_then(Value::as_str) == Some("message") => {
-                note_message(
-                    &mut prelude,
-                    &mut message_agents_md,
-                    &mut message_skills,
-                    payload,
-                );
+                note_message(prelude, payload);
             }
             _ => {}
         }
+        PreludeStep::More
     }
-    if !world_state_seen {
-        prelude.agents_md = message_agents_md;
-        prelude.skills_body = message_skills;
+
+    pub(crate) fn finish(self) -> CodexPrelude {
+        self.prelude
     }
-    Ok(prelude)
 }
 
 fn note_session_meta(prelude: &mut CodexPrelude, session_id: &mut Option<String>, meta: &Value) {
@@ -268,15 +290,10 @@ fn note_session_meta(prelude: &mut CodexPrelude, session_id: &mut Option<String>
     };
 }
 
-const INJECTED_USER_PREFIXES: [&str; 2] = ["<environment_context>", "<user_instructions>"];
-const AGENTS_MD_HEADER: &str = "# AGENTS.md instructions";
-
-fn note_message(
-    prelude: &mut CodexPrelude,
-    agents_md: &mut Option<LoadedAgentsMd>,
-    skills: &mut Option<String>,
-    payload: &Value,
-) {
+/// Harness text outside `world_state`, by its `content_item_kinds` label.
+/// Every supported rollout labels its message blocks; unlabeled blocks are
+/// not counted. AGENTS.md and the skills listing come from `world_state`.
+fn note_message(prelude: &mut CodexPrelude, payload: &Value) {
     let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
     if role != "developer" && role != "user" {
         return;
@@ -284,80 +301,32 @@ fn note_message(
     let Some(blocks) = payload.get("content").and_then(Value::as_array) else {
         return;
     };
-    let kinds = payload
+    let Some(kinds) = payload
         .get("internal_chat_message_metadata_passthrough")
         .and_then(|meta| meta.get("content_item_kinds"))
         .and_then(Value::as_array)
-        .filter(|kinds| kinds.len() == blocks.len());
-    for (index, block) in blocks.iter().enumerate() {
-        let Some(text) = block.get("text").and_then(Value::as_str) else {
+        .filter(|kinds| kinds.len() == blocks.len())
+    else {
+        return;
+    };
+    for (block, kind) in blocks.iter().zip(kinds) {
+        let (Some(text), Some(kind)) = (block.get("text").and_then(Value::as_str), kind.as_str())
+        else {
             continue;
         };
-        let label = kinds.and_then(|kinds| kinds[index].as_str());
-        let kind = match label {
-            Some(kind) => kind,
-            None if role == "user" && text.trim_start().starts_with(AGENTS_MD_HEADER) => {
-                "agents_md.instructions"
-            }
-            None if role == "user"
-                && INJECTED_USER_PREFIXES
-                    .iter()
-                    .any(|prefix| text.trim_start().starts_with(prefix)) =>
-            {
-                "injected"
-            }
-            None if role == "user" => "user.text",
-            None => "developer",
-        };
         match kind {
-            "agents_md.instructions" => {
-                if agents_md.is_none() {
-                    *agents_md = Some(unwrap_agents_md_message(text));
-                }
-            }
-            "host_skills.instructions" => {
-                if skills.is_none() {
-                    *skills = Some(unwrap_tag(text, "skills_instructions").to_string());
-                }
-            }
             "hooks.additional_context" => prelude.hook_chars += char_count(text),
-            // The session_meta copy is already counted.
-            "model.base_instructions" => {}
+            // Counted from world_state / session_meta, or the user's own text.
+            "agents_md.instructions" | "host_skills.instructions" | "model.base_instructions" => {}
             kind if kind.starts_with("user.") => {}
             _ => prelude.other_harness_chars += char_count(text),
         }
     }
 }
 
-/// `# AGENTS.md instructions for <dir>\n\n<INSTRUCTIONS>\n...\n</INSTRUCTIONS>`
-fn unwrap_agents_md_message(text: &str) -> LoadedAgentsMd {
-    let directory = text
-        .lines()
-        .next()
-        .and_then(|header| header.strip_prefix("# AGENTS.md instructions for "))
-        .map(|dir| dir.trim().to_string())
-        .filter(|dir| !dir.is_empty());
-    LoadedAgentsMd {
-        directory,
-        text: unwrap_tag(text, "INSTRUCTIONS").to_string(),
-    }
-}
-
-fn unwrap_tag<'a>(text: &'a str, tag: &str) -> &'a str {
-    let open = format!("<{tag}>\n");
-    let close = format!("\n</{tag}>");
-    match (text.find(&open), text.rfind(&close)) {
-        (Some(start), Some(end)) if start + open.len() <= end => &text[start + open.len()..end],
-        _ => text,
-    }
-}
-
+/// UTF-16 code units, the unit of the Claude file counts and the backend ratio.
 fn char_count(text: &str) -> u64 {
-    text.chars().count() as u64
-}
-
-fn estimate_tokens(chars: u64) -> u64 {
-    chars.div_ceil(CHARS_PER_TOKEN)
+    text.encode_utf16().count() as u64
 }
 
 // -------------------------------------------------------------------------
@@ -425,7 +394,7 @@ pub(crate) fn agents_md_chain(directory: &Path, root: Option<&Path>) -> Vec<Chai
 }
 
 /// `project_doc_max_bytes` from the home's `config.toml`, else 32 KiB.
-fn project_doc_max_bytes(codex_home: &Path, trust: CodexHomeTrust) -> u64 {
+pub(crate) fn project_doc_max_bytes(codex_home: &Path, trust: CodexHomeTrust) -> u64 {
     read_codex_config_file_secure(codex_home, trust)
         .ok()
         .flatten()
@@ -441,6 +410,17 @@ pub(crate) fn configured_project_doc_max_bytes(raw: &str) -> Option<u64> {
         .and_then(Item::as_value)?
         .as_integer()?;
     u64::try_from(value).ok()
+}
+
+/// Whether Codex cut the project part of a loaded AGENTS.md text at its
+/// `project_doc_max_bytes` budget (the text Codex loaded, as in `world_state`).
+/// The shared truncation rule for the per-file items and the per-session flag
+/// (CROSS-LANE S5). The user-level part before the separator is not budgeted.
+pub(crate) fn agents_md_cut(text: &str, limit: u64) -> bool {
+    let project = text
+        .find(PROJECT_DOC_SEPARATOR)
+        .map_or(text, |at| &text[at + PROJECT_DOC_SEPARATOR.len()..]);
+    limit > 0 && project.len() as u64 >= limit
 }
 
 /// Inputs for splitting one loaded AGENTS.md text into file items.
@@ -557,7 +537,7 @@ fn project_items(project: &str, inputs: &InstructionInputs<'_>) -> Vec<ContextFo
     }
     // The files changed after the session started. One file is still that
     // file; several can no longer be split honestly.
-    let at_limit = bytes.len() as u64 >= inputs.limit;
+    let at_limit = agents_md_cut(project, inputs.limit);
     match inputs.chain {
         [only] => vec![sized_item(
             &only.name,
@@ -599,13 +579,14 @@ fn sized_item(
         .then(|| measure_bytes(bytes, false, salt))
         .flatten()
         .unwrap_or(FileCounts {
-            file_bytes: disk_size,
+            // Never an uncapped size: admission bounds file_bytes at 1 MiB (BR4).
+            file_bytes: disk_size.filter(|size| *size <= MAX_FILE_BYTES as u64),
             ..FileCounts::default()
         });
     ContextFootprintItemInput {
         kind: "memory_file".to_string(),
         name: name.to_string(),
-        tokens: estimate_tokens(char_count(&String::from_utf8_lossy(bytes))),
+        tokens: char_count(&String::from_utf8_lossy(bytes)),
         pct: None,
         source: Some(source.to_string()),
         relative_path: relative_path.map(str::to_string),
@@ -695,7 +676,7 @@ pub(crate) fn skill_items(
         items.push(ContextFootprintItemInput {
             kind: "skill".to_string(),
             name,
-            tokens: estimate_tokens(char_count(line)),
+            tokens: char_count(line),
             pct: None,
             source: Some(source.to_string()),
             relative_path: None,
@@ -770,17 +751,16 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
         })
         .unwrap_or_default();
 
-    let pct = |tokens: u64| ((tokens as f64 / window as f64) * 10_000.0).round() / 100.0;
-    let category = |name: &str, tokens: u64| ContextFootprintCategoryInput {
+    let category = |name: &str, chars: u64| ContextFootprintCategoryInput {
         name: name.to_string(),
-        tokens,
-        pct: pct(tokens),
+        tokens: chars,
+        pct: 0.0,
         loading_mode: "always_on".to_string(),
     };
     let mut categories = vec![
         category(
             "System prompt",
-            estimate_tokens(prelude.base_instructions_chars + prelude.other_harness_chars),
+            prelude.base_instructions_chars + prelude.other_harness_chars,
         ),
         category(
             "Memory files",
@@ -788,18 +768,11 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
         ),
         category(
             "Skills",
-            prelude
-                .skills_body
-                .as_deref()
-                .map(|body| estimate_tokens(char_count(body)))
-                .unwrap_or(0),
+            prelude.skills_body.as_deref().map(char_count).unwrap_or(0),
         ),
     ];
     if prelude.hook_chars > 0 {
-        categories.push(category(
-            "Hook context",
-            estimate_tokens(prelude.hook_chars),
-        ));
+        categories.push(category("Hook context", prelude.hook_chars));
     }
 
     let model = prelude
@@ -808,6 +781,12 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
         .and_then(|model| safe_text(model, 128))
         .unwrap_or_else(|| "unknown".to_string());
     let used_tokens = prelude.first_input_tokens.unwrap_or(0);
+    // The source observation is the session start, not this upload (a
+    // replayed prelude is the same observation; BR3).
+    let captured_at = OffsetDateTime::from_unix_timestamp(prelude.started_at?)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()?;
     let content = serde_json::to_string(&json!({
         "categories": &categories,
         "memory_files": &memory_files,
@@ -832,15 +811,13 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
         repository_identity_source: identity.repository_identity_source,
         workspace_kind: identity.workspace_kind,
         config_hash,
-        captured_at: OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
+        captured_at,
         collector_version: compiled_release_version(),
         counter_source: COUNTER_SOURCE.to_string(),
         model,
         used_tokens,
         context_window_tokens: window,
-        pct_context: pct(used_tokens),
+        pct_context: ((used_tokens as f64 / window as f64) * 10_000.0).round() / 100.0,
         free_space_tokens: None,
         categories,
         memory_files,
@@ -907,25 +884,30 @@ struct UploadCacheEntry {
     identity: String,
     request_sha256: String,
     posted_at: String,
-    /// Rollout whose prelude was uploaded; until a newer start or the weekly
-    /// refresh, its scope needs no slot in a cycle.
+    /// Newest rollout whose prelude this scope has sent (or matched). A
+    /// rollout is one observation: it is never sent again (BR3).
     #[serde(default)]
     rollout: Option<String>,
 }
 
-/// Reads the upload cache entry still fresh for this destination.
-fn fresh_upload(
+impl UploadCacheEntry {
+    fn posted_within_week(&self) -> bool {
+        OffsetDateTime::parse(&self.posted_at, &Rfc3339)
+            .map(|posted| (OffsetDateTime::now_utc() - posted).whole_seconds() < MAX_STALENESS_SECS)
+            .unwrap_or(false)
+    }
+}
+
+/// The scope's last upload to this destination, of any age.
+fn last_upload(
     support_dir: &Path,
     identity: &str,
     workspace_hash: &str,
 ) -> Option<UploadCacheEntry> {
-    let entry = fs::read(upload_cache_path(support_dir, workspace_hash))
+    fs::read(upload_cache_path(support_dir, workspace_hash))
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<UploadCacheEntry>(&bytes).ok())?;
-    let fresh = OffsetDateTime::parse(&entry.posted_at, &Rfc3339)
-        .map(|posted| (OffsetDateTime::now_utc() - posted).whole_seconds() < MAX_STALENESS_SECS)
-        .unwrap_or(false);
-    (entry.identity == identity && fresh).then_some(entry)
+        .and_then(|bytes| serde_json::from_slice::<UploadCacheEntry>(&bytes).ok())
+        .filter(|entry| entry.identity == identity)
 }
 
 fn upload_cache_path(support_dir: &Path, workspace_hash: &str) -> PathBuf {
@@ -1124,9 +1106,9 @@ fn select_candidates(
         if !seen_scopes.insert(scope) {
             continue;
         }
-        // Already uploaded and not yet due: leave the slot to other scopes,
-        // so more than the per-cycle limit of repositories all get measured.
-        let uploaded = fresh_upload(support_dir, identity, &sha256_hex(&[cwd.as_str()]))
+        // This start was already sent (one rollout is one observation): leave
+        // the slot to other scopes, so every repository gets measured.
+        let uploaded = last_upload(support_dir, identity, &sha256_hex(&[cwd.as_str()]))
             .is_some_and(|entry| entry.rollout.as_deref() == Some(path.as_str()));
         if !uploaded {
             chosen.push((PathBuf::from(path), workspace, codex_home.clone()));
@@ -1155,8 +1137,10 @@ fn upload_if_changed(
     let path = upload_cache_path(support_dir, &request.workspace_hash);
     let now = OffsetDateTime::now_utc();
     let rollout = rollout.to_string_lossy().into_owned();
-    if let Some(entry) = fresh_upload(support_dir, identity, &request.workspace_hash) {
-        if entry.request_sha256 == hash {
+    if let Some(entry) = last_upload(support_dir, identity, &request.workspace_hash) {
+        // A newer start with the same sizes is sent at most weekly; between
+        // those, the scope's latest observation stays the one already sent.
+        if entry.request_sha256 == hash && entry.posted_within_week() {
             if entry.rollout.as_deref() != Some(rollout.as_str()) {
                 // Same payload from a newer start: remember it, no upload.
                 write_json_atomic(

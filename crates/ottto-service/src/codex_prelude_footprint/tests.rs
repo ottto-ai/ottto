@@ -102,27 +102,30 @@ fn prelude_reads_world_state_and_stops_at_first_request() {
 }
 
 #[test]
-fn prelude_falls_back_to_labeled_messages_without_world_state() {
-    let prelude = parse(&[
+fn rows_fed_one_by_one_match_the_reader_and_need_world_state() {
+    let records = [
         meta(json!({})),
-        message(
-            "developer",
-            Some("host_skills.instructions"),
-            "<skills_instructions>\nLISTING\n</skills_instructions>",
-        ),
-        // Unlabeled (older builds): detected by the header.
+        // Without world_state (cli < 0.159) nothing is taken from messages.
         message(
             "user",
-            None,
-            "# AGENTS.md instructions for /repo/sub\n\n<INSTRUCTIONS>\nRULES\n</INSTRUCTIONS>",
+            Some("agents_md.instructions"),
+            "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nRULES\n</INSTRUCTIONS>",
         ),
-        message("user", None, "fix the bug"),
+        message("user", None, "unlabeled text is not counted"),
         usage(100),
-    ]);
-    let agents = prelude.agents_md.unwrap();
-    assert_eq!(agents.text, "RULES");
-    assert_eq!(agents.directory.as_deref(), Some("/repo/sub"));
-    assert_eq!(prelude.skills_body.as_deref(), Some("LISTING"));
+        json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": 100}, "model_context_window": 1000}}}),
+        json!({"type": "event_msg", "payload": {"type": "never_read"}}),
+    ];
+    let mut parser = CodexPreludeParser::default();
+    let fed = records
+        .iter()
+        .take_while(|row| parser.observe(row) == PreludeStep::More);
+    assert_eq!(fed.count(), 3);
+    let prelude = parser.finish();
+    assert_eq!(prelude, parse(&records));
+    assert!(prelude.complete);
+    assert_eq!(prelude.agents_md, None);
     assert_eq!(prelude.other_harness_chars, 0);
 }
 
@@ -208,14 +211,14 @@ fn user_and_project_chain_split_into_files() {
     // Codex trims the user file: disk bytes, but no whole-file line count.
     assert_eq!(out[0].file_counts.file_bytes, Some(7));
     assert_eq!(out[0].file_counts.file_lines, None);
-    assert_eq!(out[0].tokens, 2);
+    assert_eq!(out[0].tokens, 6);
     assert_eq!(out[1].relative_path.as_deref(), Some("AGENTS.md"));
     assert_eq!(out[1].file_counts.file_bytes, Some(root.len() as u64));
     assert_eq!(out[1].file_counts.file_lines, Some(1));
     assert_eq!(out[2].relative_path.as_deref(), Some("backend/AGENTS.md"));
     assert_eq!(out[2].file_counts.file_lines, Some(2));
     assert_eq!(out[2].file_counts.file_chars, Some(12));
-    assert_eq!(out[2].tokens, 3);
+    assert_eq!(out[2].tokens, 12);
     assert!(out.iter().all(|item| item.kind == "memory_file"));
     assert!(out
         .iter()
@@ -236,8 +239,30 @@ fn chain_over_limit_marks_the_cut_file() {
     assert_eq!(out[0].file_counts.truncated_by_limit, Some(false));
     assert_eq!(out[1].file_counts.file_bytes, Some(25));
     assert_eq!(out[1].file_counts.file_lines, None);
-    assert_eq!(out[1].tokens, 3);
+    assert_eq!(out[1].tokens, 10);
     assert_eq!(out[1].file_counts.truncated_by_limit, Some(true));
+    // The same rule answers the per-session flag from the loaded text alone.
+    assert!(agents_md_cut(&text, 40));
+    assert!(!agents_md_cut(&text, 64));
+    assert!(!agents_md_cut(
+        &format!("{}{PROJECT_DOC_SEPARATOR}p", "u".repeat(99)),
+        40
+    ));
+}
+
+#[test]
+fn over_cap_disk_size_is_omitted_but_the_cut_is_kept() {
+    // A 2 MiB AGENTS.md whose loaded prefix fits the budget: admission
+    // bounds file_bytes at 1 MiB, so the payload carries no disk size (BR4).
+    let text = "x".repeat(40);
+    let files = chain(&[("AGENTS.md", "AGENTS.md", 2 * 1024 * 1024)]);
+    let out = items(&text, &files, None, 40);
+    let wire = serde_json::to_value(&out[0]).unwrap();
+    assert_eq!(
+        wire,
+        json!({"kind": "memory_file", "name": "AGENTS.md", "tokens": 40, "source": "Project",
+            "relative_path": "AGENTS.md", "loading_mode": "always_on", "truncated_by_limit": true})
+    );
 }
 
 #[test]
@@ -278,7 +303,7 @@ fn changed_files_fall_back_without_guessing_boundaries() {
     assert_eq!(out[1].name, COMBINED_CHAIN_NAME);
     assert_eq!(out[1].relative_path, None);
     assert_eq!(out[1].file_counts.file_bytes, None);
-    assert_eq!(out[1].tokens, 3);
+    assert_eq!(out[1].tokens, 10);
 }
 
 #[test]
@@ -349,7 +374,7 @@ fn skills_listing_becomes_sized_skill_items() {
         ]
     );
     let line = "- deploy: Ship it. (file: r1/deploy/SKILL.md)";
-    assert_eq!(out[1].tokens, (line.len() as u64).div_ceil(4));
+    assert_eq!(out[1].tokens, line.len() as u64);
     assert!(out
         .iter()
         .all(|item| item.kind == "skill" && item.relative_path.is_none()));
@@ -368,6 +393,7 @@ fn request_carries_sizes_and_no_text() {
         model: Some("gpt-6.1-sol".to_string()),
         context_window: Some(200_000),
         first_input_tokens: Some(25_000),
+        started_at: Some(1_792_310_400),
         base_instructions_chars: 4_000,
         other_harness_chars: 400,
         agents_md: Some(LoadedAgentsMd {
@@ -416,7 +442,11 @@ fn request_carries_sizes_and_no_text() {
     assert_eq!(request.skills.len(), 3);
     let names: Vec<&str> = request.categories.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["System prompt", "Memory files", "Skills"]);
-    assert_eq!(request.categories[0].tokens, 1_100);
+    // Characters, not tokens: the backend owns the ratio.
+    assert_eq!(request.counter_source, "codex_rollout_prelude_chars_v1");
+    assert_eq!(request.categories[0].tokens, 4_400);
+    // Dated at the session start, not the upload.
+    assert_eq!(request.captured_at, "2026-10-18T08:00:00Z");
     assert_eq!(request.workspace_label, None);
     let wire = serde_json::to_string(&request).unwrap();
     assert!(!wire.contains("SECRET-RULE-TEXT"));
@@ -518,14 +548,16 @@ fn newest_session_start_wins_over_recent_activity() {
         select_candidates(&roots, &support, "dest", deadline),
         chosen
     );
-    // Once that start is uploaded (and not yet due), the scope frees its
-    // per-cycle slot for other repositories; another destination still needs it.
+    // Once that start is sent it is one observation: a week later it is
+    // still not replayed (BR3) and frees its slot for other repositories;
+    // another destination still needs it.
+    let week_ago = OffsetDateTime::now_utc() - time::Duration::days(8);
     write_json_atomic(
         &upload_cache_path(&support, &sha256_hex(&[cwd.as_str()])),
         &UploadCacheEntry {
             identity: "dest".to_string(),
             request_sha256: "h".to_string(),
-            posted_at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
+            posted_at: week_ago.format(&Rfc3339).unwrap(),
             rollout: Some(chosen[0].0.to_string_lossy().into_owned()),
         },
     );
@@ -534,6 +566,15 @@ fn newest_session_start_wins_over_recent_activity() {
         select_candidates(&roots, &support, "other", deadline),
         chosen
     );
+    // A genuinely newer start is a new observation.
+    write_rollout(
+        &sessions,
+        "rollout-newest.jsonl",
+        &start("newest", "2026-10-18T11:00:00Z"),
+    );
+    let newer = select_candidates(&roots, &support, "dest", deadline);
+    assert_eq!(newer.len(), 1);
+    assert!(newer[0].0.ends_with("rollout-newest.jsonl"));
 }
 
 #[test]

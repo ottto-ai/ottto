@@ -315,8 +315,9 @@ permission prompt.
 Codex session-start footprint: for each new Codex session (in `~/.codex` and
 in Ottto-managed Codex account folders) the daemon reads only the rows before
 its first model request, once, and uploads per repository the sizes of what
-Codex loaded. For each AGENTS.md file that is bytes, an estimated token count
-and whether Codex's `project_doc_max_bytes` limit cut it; a file loaded whole
+Codex loaded, dated at that session's start. For each AGENTS.md file that is
+its loaded size in characters, its byte size (omitted above 1 MiB) and whether
+Codex's `project_doc_max_bytes` limit cut it; a file loaded whole
 also gets its lines, UTF-16 characters and the same device-salted hash as the
 Claude Code file counts (the salt never leaves the Mac, so hashes cannot be
 matched to known files or compared across machines). For each listed skill it

@@ -238,7 +238,7 @@ pub fn spawn_context_footprint_sync() -> Result<()> {
                 }
             };
             // Codex session starts share this thread: no extra background job.
-            if let Err(error) = crate::codex_session_start::harvest_once(&home, &support_dir) {
+            if let Err(error) = crate::codex_prelude_footprint::harvest_once(&home, &support_dir) {
                 eprintln!(
                     "codex session start harvest skipped: {}",
                     crate::snapshot_sync::safe_error(&error)
