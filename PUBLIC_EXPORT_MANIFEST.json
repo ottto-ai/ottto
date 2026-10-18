@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 689,
-  "content_sha256": "c87e2e7424513aeaeadc71cfe603e0d47682546c7e9cdbc2272df0498fa81f83",
+  "content_sha256": "6cd448279310152b5a9f1fe0b421932a764a43a4a7c34506ecfbcb503f44b302",
   "files": [
     {
       "executable": false,
@@ -1112,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_bounded_native_tests.rs",
-      "sha256": "477ffd2930e8dc4123bdbcae47dc9e89954773660371408cbf60e390e95cb5b0",
-      "size_bytes": 38485
+      "sha256": "4c916d3b54799597f10ade13083a9f73f5bcafc500888195c066e8f060f60e32",
+      "size_bytes": 39080
     },
     {
       "executable": false,

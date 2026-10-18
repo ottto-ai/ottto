@@ -696,6 +696,20 @@ impl std::fmt::Display for BoundedDeadlineStages {
     }
 }
 
+// Wait for a fixed end point in sleeps of at most 1ms, comparing monotonic
+// time each wake. A late wake shortens what is left instead of adding a whole
+// fixed sleep on top (CI showed one 120ms sleep taking 248.7ms). Best effort,
+// not a real-time guarantee: the stage clock records the actual delay.
+fn bounded_native_wait_until(end: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            return;
+        }
+        std::thread::sleep((end - now).min(Duration::from_millis(1)));
+    }
+}
+
 #[test]
 // The bounded turn leases the shared client_report counters across its token/batch I/O.
 #[serial(client_report)]
@@ -726,6 +740,7 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
             let (mut stream, _) = listener.accept().unwrap();
             stages.mark(Stage::TokenAccepted);
             bounded_native_read(&mut stream);
+            let token_read = Instant::now();
             stages.mark(Stage::TokenRead);
             stages.mark(Stage::TokenSleepStart);
             if stalled_token {
@@ -734,7 +749,7 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
                 stages.mark(Stage::ServerReturned);
                 return 0;
             }
-            std::thread::sleep(Duration::from_millis(120));
+            bounded_native_wait_until(token_read + Duration::from_millis(120));
             stages.mark(Stage::TokenSleepEnd);
             stages.mark(Stage::TokenWriteStart);
             bounded_native_response(&mut stream, "200 OK", "{\"token\":\"fresh\"}");
