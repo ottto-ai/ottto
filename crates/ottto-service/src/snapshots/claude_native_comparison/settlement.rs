@@ -831,7 +831,10 @@ impl Controller {
         let (occupied, prepaid) = plan.ok_or_else(refuse)?;
         #[cfg(test)]
         let result = {
-            let (result, allocation) = crate::retry_allocation_probe::measure_process(|| {
+            // complete() is synchronous on this thread (no spawn, channel or
+            // pool) and consumes pre-existing state: born-in-scope accounting
+            // charged to this thread only, so parallel tests cannot inflate it.
+            let (result, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
                 self.complete(scan, terminal, current)
             });
             assert!(

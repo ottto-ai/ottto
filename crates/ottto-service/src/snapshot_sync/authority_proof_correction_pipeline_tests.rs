@@ -1406,6 +1406,8 @@ fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
 /// (at least once), settle exactly and re-prove without a fresh grant.
 #[test]
 #[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
 fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-shed", false);
@@ -1527,6 +1529,8 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
 /// and records that revision in the same settlement.
 #[test]
 #[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
 fn superseded_revision_ack_never_drains_the_current_revision() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-superseded", false);
@@ -2291,6 +2295,8 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
 
 #[test]
 #[serial(source_manifests)]
+// A rejected entity records Poisoned in the shared client_report counters.
+#[serial(client_report)]
 fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("apc-permanent-drain", true);
