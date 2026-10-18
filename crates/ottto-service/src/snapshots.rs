@@ -288,10 +288,7 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // codex v39 finds SKILL.md references with the shared path extractor (any
 // skills root, nested `.system`/synced layouts, relative paths, filename
 // boundaries) and emits capability marker v2 when every reference was named.
-// codex v40 stamps each response's long-context price bucket
-// (`context_bucket` short/long against `provider_long_context_price_line`) on
-// that response's usage row, so usage splits per hour and model by price tier.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v40";
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v39";
 const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
@@ -376,7 +373,9 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // codex v34 revisits retained rollouts once for the v39 skill extractor and the
 // v2 capability marker; unchanged sessions then converge as semantic no-ops.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v34";
-// The v40 long-context price bucket restates recent history once. Only a
+// The per-request long-context price bucket (`provider_context_bucket`)
+// restates recent Codex history once. It rides the release's single bundled
+// parser-version bump rather than bumping here. Only a
 // rollout last modified on or after the price-line effective date can hold a
 // request the bucket applies to, so exactly those files are revisited; older
 // rollouts are never re-read for it. Inside a revisited file only requests
