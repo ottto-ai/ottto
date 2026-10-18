@@ -640,7 +640,9 @@ const PROVIDER_PRICE_LINES: &[(&str, u64, ProviderPriceLineKind)] = &[
 /// prefixes, a Bedrock `-vN:M` suffix, a dated snapshot (`-YYYY-MM-DD`,
 /// `-YYYYMMDD`, `@YYYYMMDD`) and `-latest` dropped; dots become dashes.
 fn provider_price_line_model_key(model: &str) -> String {
-    let all_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    // Byte checks only: model ids come from transcripts and may be non-ASCII,
+    // and every cut below lands just before an ASCII `-`/`@`, a char boundary.
+    let all_digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
     let mut key = model.trim().to_ascii_lowercase();
     for marker in ["anthropic.", "anthropic/", "openai/"] {
         if let Some(index) = key.find(marker) {
@@ -648,10 +650,9 @@ fn provider_price_line_model_key(model: &str) -> String {
         }
     }
     if let Some((head, version)) = key.rsplit_once("-v") {
-        if version
-            .split_once(':')
-            .is_some_and(|(major, minor)| all_digits(major) && all_digits(minor))
-        {
+        if version.split_once(':').is_some_and(|(major, minor)| {
+            all_digits(major.as_bytes()) && all_digits(minor.as_bytes())
+        }) {
             key = head.to_string();
         }
     }
@@ -659,22 +660,24 @@ fn provider_price_line_model_key(model: &str) -> String {
         key = head.to_string();
     }
     let bytes = key.as_bytes();
-    if bytes.len() > 11 && {
-        let tail = &key[key.len() - 11..];
-        tail.as_bytes()[0] == b'-'
-            && tail.as_bytes()[5] == b'-'
-            && tail.as_bytes()[8] == b'-'
-            && all_digits(&tail[1..5])
-            && all_digits(&tail[6..8])
-            && all_digits(&tail[9..11])
-    } {
-        key.truncate(key.len() - 11);
+    let dated_suffix = if bytes.len() > 11
+        && bytes[bytes.len() - 11] == b'-'
+        && bytes[bytes.len() - 6] == b'-'
+        && bytes[bytes.len() - 3] == b'-'
+        && all_digits(&bytes[bytes.len() - 10..bytes.len() - 6])
+        && all_digits(&bytes[bytes.len() - 5..bytes.len() - 3])
+        && all_digits(&bytes[bytes.len() - 2..])
+    {
+        11
     } else if bytes.len() > 9
         && matches!(bytes[bytes.len() - 9], b'-' | b'@')
-        && all_digits(&key[key.len() - 8..])
+        && all_digits(&bytes[bytes.len() - 8..])
     {
-        key.truncate(key.len() - 9);
-    }
+        9
+    } else {
+        0
+    };
+    key.truncate(key.len() - dated_suffix);
     key.replace('.', "-")
 }
 
@@ -52131,6 +52134,10 @@ mod tests {
             "o3",
             "claude-haiku-4-5-20251001",
             "claude-opus-4-5",
+            // Non-ASCII ids resolve to no line rather than panicking.
+            "éabcdefghij",
+            "gpt-5.4-2026-03-0é",
+            "é20260101",
         ] {
             assert_eq!(provider_price_line(model), None, "{model}");
             assert_eq!(
