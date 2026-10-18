@@ -10265,15 +10265,24 @@ impl SnapshotAccumulator {
             Some(1) => {
                 let turn_id = string_at(value, &["payload", "turn_id"]);
                 let trace_id = string_at(value, &["payload", "trace_id"]);
+                let hex32 = |value: &str| {
+                    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                };
                 // Codex omits `trace_id` on most parentless created threads. Their
                 // anti-copy proof is the start bound, the UUID turn binding and the
-                // first-request equality, so only that path accepts an absent id;
-                // a present one must always be well formed.
-                let trace_id_valid = match trace_id.as_deref() {
-                    Some(value) => {
-                        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                // first-request equality, so only that path accepts a missing key.
+                // Any present value, including null, empty or non-string, must be
+                // well formed.
+                let trace_id_valid = if self.codex_parentless_created_thread() {
+                    match value
+                        .get("payload")
+                        .and_then(|payload| payload.get("trace_id"))
+                    {
+                        None => true,
+                        Some(raw) => raw.as_str().is_some_and(hex32),
                     }
-                    None => self.codex_parentless_created_thread(),
+                } else {
+                    trace_id.as_deref().is_some_and(hex32)
                 };
                 let valid = codex_is_task_started(value)
                     && turn_id
@@ -54015,7 +54024,7 @@ mod tests {
         };
         type Configure = fn(&mut CodexTitleMetadata, &Path);
         let none: Configure = |_, _| {};
-        let cases: [(&str, String, Configure); 39] = [
+        let cases: [(&str, String, Configure); 42] = [
             (
                 "copied-counters",
                 edit(&|values| {
@@ -54208,6 +54217,27 @@ mod tests {
                 "trace-id-malformed",
                 edit(&|values| {
                     values[1]["payload"]["trace_id"] = json!("not-a-32-hex-trace-id");
+                }),
+                none,
+            ),
+            (
+                "trace-id-empty",
+                edit(&|values| {
+                    values[1]["payload"]["trace_id"] = json!("");
+                }),
+                none,
+            ),
+            (
+                "trace-id-not-a-string",
+                edit(&|values| {
+                    values[1]["payload"]["trace_id"] = json!(123);
+                }),
+                none,
+            ),
+            (
+                "trace-id-null",
+                edit(&|values| {
+                    values[1]["payload"]["trace_id"] = Value::Null;
                 }),
                 none,
             ),
