@@ -718,7 +718,7 @@ struct LogoutArgs {
     local_only: bool,
     #[arg(
         long,
-        help = "Forget installation identity, account scope, credentials, and local sync receipts"
+        help = "Forget installation identity, credentials, and local sync receipts; without --local-only, first release this Mac in Ottto"
     )]
     forget_installation: bool,
     #[arg(
@@ -3934,6 +3934,34 @@ mod tests {
             invocation.request.command,
             LocalControlCommand::AuthReset {
                 local_only: true,
+                forget_installation: true,
+            }
+        );
+    }
+
+    #[test]
+    fn cloud_forget_installation_is_accepted_without_local_only() {
+        let unconfirmed = Cli::parse_from(["ottto", "logout", "--forget-installation"]);
+        let error = validate_cli(&unconfirmed).expect_err("confirmation required");
+        assert!(error.message.contains("--confirm"));
+
+        let confirmed = Cli::parse_from([
+            "ottto",
+            "logout",
+            "--forget-installation",
+            "--confirm",
+            "--json",
+        ]);
+        assert!(validate_cli(&confirmed).is_ok());
+        let invocation = invocation_from_cli(confirmed);
+        assert_eq!(
+            invocation.request.protocol_version,
+            ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AuthReset {
+                local_only: false,
                 forget_installation: true,
             }
         );
