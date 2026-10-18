@@ -17638,7 +17638,9 @@ fn codex_native_created_thread_header(
 /// A parentless created thread's header must not name a parent or a
 /// structured spawn source; such lineage would be untrusted and contradictory.
 fn codex_header_declares_no_parent(meta: &Value) -> bool {
-    meta.get("parent_thread_id").is_none_or(Value::is_null)
+    meta.get("parent_thread_id")
+        .unwrap_or(&Value::Null)
+        .is_null()
         && !meta.get("source").is_some_and(Value::is_object)
 }
 
@@ -20962,7 +20964,8 @@ fn load_codex_sqlite_spawn_edges(
         created_in_database.push(child.clone());
         if first_user_message
             .as_deref()
-            .is_none_or(codex_created_thread_mentions_delegation)
+            .map(codex_created_thread_mentions_delegation)
+            .unwrap_or(true)
         {
             parentless_ineligible.insert(child.clone());
         }
@@ -54393,7 +54396,8 @@ mod tests {
         let descendant = [(child, grandchild)];
         let self_edge = [(child, child), (child, grandchild)];
         let empty_parent = [("", child), (child, grandchild)];
-        let cases: [(&str, Option<&str>, Option<&[(&str, &str)]>); 4] = [
+        type Edges<'a> = &'a [(&'a str, &'a str)];
+        let cases: [(&str, Option<&str>, Option<Edges<'_>>); 4] = [
             ("no-edge-table", Some("plain prompt"), None),
             ("null-message", None, Some(&descendant)),
             ("self-edge", Some("plain prompt"), Some(&self_edge)),
