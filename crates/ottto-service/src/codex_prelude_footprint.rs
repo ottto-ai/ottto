@@ -884,10 +884,11 @@ struct UploadCacheEntry {
     identity: String,
     request_sha256: String,
     posted_at: String,
-    /// Newest rollout whose prelude this scope has sent (or matched). A
-    /// rollout is one observation: it is never sent again (BR3).
+    /// Watermark: start (unix seconds) of the newest session this scope has
+    /// sent or matched. A start at or before it is never sent again, even
+    /// when an older session resumes later (BR3).
     #[serde(default)]
-    rollout: Option<String>,
+    started_at: Option<i64>,
 }
 
 impl UploadCacheEntry {
@@ -984,7 +985,7 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
             support_dir,
             &identity,
             &request,
-            &file,
+            prelude.started_at,
         ) {
             Ok(true) => uploaded += 1,
             Ok(false) => skipped += 1,
@@ -1081,7 +1082,7 @@ fn select_candidates(
     let mut seen_scopes: BTreeSet<String> = BTreeSet::new();
     let mut scopes = index.scopes.clone();
     let mut chosen = Vec::new();
-    for (_, path, cwd) in starts {
+    for (started, path, cwd) in starts {
         if Instant::now() >= deadline || chosen.len() >= MAX_WORKSPACES_PER_CYCLE {
             break;
         }
@@ -1106,11 +1107,12 @@ fn select_candidates(
         if !seen_scopes.insert(scope) {
             continue;
         }
-        // This start was already sent (one rollout is one observation): leave
-        // the slot to other scopes, so every repository gets measured.
-        let uploaded = last_upload(support_dir, identity, &sha256_hex(&[cwd.as_str()]))
-            .is_some_and(|entry| entry.rollout.as_deref() == Some(path.as_str()));
-        if !uploaded {
+        // Nothing newer than what this scope already sent: leave the slot to
+        // other scopes, so every repository gets measured.
+        let sent = last_upload(support_dir, identity, &sha256_hex(&[cwd.as_str()]))
+            .and_then(|entry| entry.started_at)
+            .is_some_and(|sent| started <= sent);
+        if !sent {
             chosen.push((PathBuf::from(path), workspace, codex_home.clone()));
         }
     }
@@ -1131,26 +1133,29 @@ fn upload_if_changed(
     support_dir: &Path,
     identity: &str,
     request: &ContextFootprintIngestRequest,
-    rollout: &Path,
+    started_at: Option<i64>,
 ) -> Result<bool> {
     let hash = request_content_hash_for_request(request)?;
     let path = upload_cache_path(support_dir, &request.workspace_hash);
     let now = OffsetDateTime::now_utc();
-    let rollout = rollout.to_string_lossy().into_owned();
     if let Some(entry) = last_upload(support_dir, identity, &request.workspace_hash) {
+        if entry
+            .started_at
+            .zip(started_at)
+            .is_some_and(|(sent, start)| start <= sent)
+        {
+            return Ok(false);
+        }
         // A newer start with the same sizes is sent at most weekly; between
         // those, the scope's latest observation stays the one already sent.
         if entry.request_sha256 == hash && entry.posted_within_week() {
-            if entry.rollout.as_deref() != Some(rollout.as_str()) {
-                // Same payload from a newer start: remember it, no upload.
-                write_json_atomic(
-                    &path,
-                    &UploadCacheEntry {
-                        rollout: Some(rollout),
-                        ..entry
-                    },
-                );
-            }
+            write_json_atomic(
+                &path,
+                &UploadCacheEntry {
+                    started_at: started_at.max(entry.started_at),
+                    ..entry
+                },
+            );
             return Ok(false);
         }
     }
@@ -1163,7 +1168,7 @@ fn upload_if_changed(
             identity: identity.to_string(),
             request_sha256: hash,
             posted_at: now.format(&Rfc3339).unwrap_or_default(),
-            rollout: Some(rollout),
+            started_at,
         },
     );
     Ok(true)

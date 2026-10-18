@@ -558,8 +558,16 @@ fn newest_session_start_wins_over_recent_activity() {
             identity: "dest".to_string(),
             request_sha256: "h".to_string(),
             posted_at: week_ago.format(&Rfc3339).unwrap(),
-            rollout: Some(chosen[0].0.to_string_lossy().into_owned()),
+            // 2026-10-18T09:00:00Z, the start of rollout-newer.
+            started_at: Some(1_792_314_000),
         },
+    );
+    assert!(select_candidates(&roots, &support, "dest", deadline).is_empty());
+    // An older session resuming later is no newer observation either.
+    write_rollout(
+        &sessions,
+        "rollout-older.jsonl",
+        &start("older", "2026-10-17T09:00:00Z"),
     );
     assert!(select_candidates(&roots, &support, "dest", deadline).is_empty());
     assert_eq!(
