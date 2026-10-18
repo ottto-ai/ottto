@@ -10805,7 +10805,18 @@ impl SnapshotAccumulator {
     }
 
     fn set_title(&mut self, title: Option<String>, source: &str) {
-        let Some(title) = title.and_then(|value| normalize_display_title(value, source)) else {
+        // Claude transcript titles come from already validated customTitle records.
+        // Preserve that validation policy through this second normalization while
+        // retaining the existing emitted source and Codex transcript-title policy.
+        let normalization_source =
+            if self.source == SnapshotSource::ClaudeCode && source == "transcript_title" {
+                "custom_title"
+            } else {
+                source
+            };
+        let Some(title) =
+            title.and_then(|value| normalize_display_title(value, normalization_source))
+        else {
             return;
         };
         self.title = Some(title);
@@ -26005,7 +26016,7 @@ fn is_safe_display_title(value: &str, source: &str) -> bool {
         return false;
     }
     if is_codex_tool_call_name(&lowered)
-        || looks_like_raw_identifier(value)
+        || looks_like_raw_identifier(value, source)
         || looks_like_shell_command(&lowered)
         || looks_like_setup_text(&lowered)
         || contains_blocked_prompt_fragment(value)
@@ -26106,13 +26117,13 @@ fn is_codex_tool_call_name(lowered: &str) -> bool {
             .any(|prefix| lowered.starts_with(prefix))
 }
 
-fn looks_like_raw_identifier(value: &str) -> bool {
+fn looks_like_raw_identifier(value: &str, source: &str) -> bool {
     let trimmed = value.trim();
     if codex_identity_is_uuid_shaped(trimmed) {
         return true;
     }
     let lowered = trimmed.to_ascii_lowercase();
-    if lowered.starts_with("rollout-") && lowered.len() >= 44 {
+    if lowered.starts_with("rollout-") && (source == "custom_title" || lowered.len() >= 44) {
         return true;
     }
     if lowered.starts_with("session_") || lowered.starts_with("sess_") {
@@ -26123,6 +26134,28 @@ fn looks_like_raw_identifier(value: &str) -> bool {
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'));
     let has_digit = trimmed.chars().any(|ch| ch.is_ascii_digit());
+    if source == "custom_title" {
+        // Explicit names may be dated word slugs. Keep known credential shapes
+        // blocked even when their opaque suffix happens to contain no digits.
+        if lowered.starts_with("ghp_")
+            || lowered.starts_with("sk-ant-")
+            || (matches!(trimmed.len(), 32 | 40 | 64)
+                && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return true;
+        }
+        if !has_space && ascii_token && has_digit && trimmed.len() >= 24 {
+            let segments = trimmed.split(['-', '_', ':']).collect::<Vec<_>>();
+            return segments.len() < 2
+                || !segments.iter().any(|segment| {
+                    segment.len() >= 3 && segment.bytes().all(|byte| byte.is_ascii_alphabetic())
+                })
+                || segments.iter().any(|segment| {
+                    segment.len() > 16 && segment.bytes().any(|byte| byte.is_ascii_digit())
+                });
+        }
+        return false;
+    }
     !has_space && ascii_token && has_digit && trimmed.len() >= 24
 }
 
@@ -49440,6 +49473,130 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_custom_title_keeps_dated_word_slugs() {
+        for title in [
+            "codex-completeness-owner-oct18",
+            "daemon-codex-counting-implementation-20261018",
+            "landing-owner-20261018T090555Z",
+            "cc-delta-admission-597-head3-oct18",
+            "autofix-i-ab719c5071-a3-review2c",
+            "daemon_custom_title_review_20261018",
+            "daemon:custom:title:review:20261018",
+        ] {
+            assert_eq!(
+                claude_custom_title_display_title(title.to_string()).as_deref(),
+                Some(title),
+                "transcript custom title: {title}"
+            );
+            assert_eq!(
+                claude_registration_display_title(title.to_string()).as_deref(),
+                Some(title),
+                "registration custom title: {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_custom_title_dated_slugs_survive_parser_normalization() {
+        for title in [
+            "codex-completeness-owner-oct18",
+            "daemon-codex-counting-implementation-20261018",
+            "landing-owner-20261018T090555Z",
+            "cc-delta-admission-597-head3-oct18",
+            "autofix-i-ab719c5071-a3-review2c",
+        ] {
+            let path = temp_file("claude-dated-custom-title");
+            let records = [
+                serde_json::json!({
+                    "type": "custom-title",
+                    "customTitle": title,
+                    "sessionId": "12345678-abcd-1234-abcd-123456789abc"
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-10-18T10:00:00Z",
+                    "sessionId": "12345678-abcd-1234-abcd-123456789abc",
+                    "message": {
+                        "model": "claude-sonnet-5",
+                        "usage": {"input_tokens": 5, "output_tokens": 2}
+                    }
+                }),
+            ];
+            let transcript = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(&path, transcript).expect("write synthetic custom-title fixture");
+            let items =
+                parse_claude_code_jsonl_file(&path, "2026-10-18T10:04:00Z", "fp".to_string())
+                    .expect("parse synthetic custom-title fixture");
+            fs::remove_file(path).expect("remove synthetic custom-title fixture");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].session_display_name.as_deref(), Some(title));
+            assert_eq!(
+                items[0].session_display_name_source.as_deref(),
+                Some("transcript_title")
+            );
+        }
+    }
+
+    #[test]
+    fn claude_custom_title_rejects_identifiers_and_secret_shapes() {
+        let titles = [
+            "12345678-abcd-1234-abcd-123456789abc".to_string(),
+            "rollout-20261018-abc".to_string(),
+            "ROLLOUT-20261018-abc".to_string(),
+            "rollout-20261018-12345678-abcd-1234-abcd-123456789abc".to_string(),
+            "session_helper_review_20261018".to_string(),
+            "sess_helper_review_20261018".to_string(),
+            "a1".repeat(16),
+            "a1".repeat(20),
+            "a1".repeat(32),
+            "a".repeat(40),
+            format!("ghp_{}", "a1".repeat(18)),
+            format!("ghp_{}", "a".repeat(36)),
+            format!("sk-ant-api03-{}", "a1".repeat(20)),
+            format!("sk-ant-api03-{}", "a".repeat(40)),
+            "opaque12345678901234567890".to_string(),
+            "ab12-cd34-ef56-123456789012".to_string(),
+            "helper-review-12345678901234567".to_string(),
+        ];
+        for title in titles {
+            assert_eq!(claude_custom_title_display_title(title.clone()), None);
+            assert_eq!(claude_registration_display_title(title), None);
+        }
+    }
+
+    #[test]
+    fn claude_custom_title_relaxation_does_not_change_other_sources() {
+        let title = "codex-completeness-owner-oct18";
+        for source in [
+            "first_prompt",
+            "ai_title",
+            "summary",
+            "session_index",
+            "other",
+        ] {
+            assert_eq!(normalize_display_title(title.to_string(), source), None);
+            // A short rollout-shaped value keeps its existing non-custom behavior.
+            assert_eq!(
+                normalize_display_title("rollout-20261018-abc".to_string(), source).as_deref(),
+                Some("rollout-20261018-abc")
+            );
+        }
+        assert_eq!(
+            first_prompt_display_title(SnapshotSource::ClaudeCode, title.to_string()),
+            None
+        );
+        let mut codex = SnapshotAccumulator::new(SnapshotSource::Codex);
+        codex.set_title(Some(title.to_string()), "transcript_title");
+        assert_eq!(codex.title, None);
+        assert_eq!(codex.title_source, None);
+        codex.set_title(Some("Review title policy".to_string()), "transcript_title");
+        assert_eq!(codex.title.as_deref(), Some("Review title policy"));
+        assert_eq!(codex.title_source.as_deref(), Some("transcript_title"));
     }
 
     #[test]
