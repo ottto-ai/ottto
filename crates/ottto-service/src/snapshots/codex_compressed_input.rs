@@ -313,9 +313,11 @@ mod tests {
         let mut rows = vec![json!({"type":"session_meta","payload":{"id":"compressed-fixture"}})];
         for n in [100_u64, 250, 400] {
             let usage = json!({"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10});
-            rows.push(json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
+            rows.push(
+                json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
                 "payload":{"type":"token_count", "info":{"model":"gpt-synthetic",
-                "total_token_usage":usage, "last_token_usage":usage}}}));
+                "total_token_usage":usage, "last_token_usage":usage}}}),
+            );
         }
         let mut bytes = Vec::new();
         for row in rows {
