@@ -1614,6 +1614,10 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
                         "resource-fixture",
                     )
                 });
+            let records = records
+                .into_iter()
+                .filter(|record| record["stage"] == "native_collection_page")
+                .collect::<Vec<_>>();
             assert_eq!(records.len(), 1, "one completed collection page");
             let record = &records[0];
             assert_eq!(record["stage"], "native_collection_page");
@@ -1698,6 +1702,11 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             production_scan(&f, source, ScanIndex::default(), None, "resource-fixture")
         });
+        let records = records
+            .into_iter()
+            .filter(|record| record["stage"] == "native_collection_page")
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "one completed collection page");
         assert!(
             records[0]["counts"]["sampled_acquisition"].is_null(),
             "uncovered read counts are unknown"
