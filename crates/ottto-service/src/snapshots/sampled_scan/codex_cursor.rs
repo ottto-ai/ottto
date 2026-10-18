@@ -48,6 +48,12 @@ pub(in crate::snapshots) const SAMPLE_READ_BYTES: u64 = 2 * SAMPLE_BYTES as u64;
 /// A paused job is stale, and another namespace may evict it, once this many
 /// cursor pages passed without its own namespace resuming it (K10).
 const NAMESPACE_STALE_PAGES: u64 = 16;
+/// E2: a paused job whose revalidation evidence stays unavailable for this
+/// many consecutive resume pages ends (slot freed, path processed for the
+/// generation with a retryable cause, prior body kept). Small, like
+/// `MEMBER_CHANGED_AFTER`: ending costs only the job's progress, while a
+/// held slot starves every other large file.
+const UNAVAILABLE_RESUMES: u32 = 3;
 /// A deferred large file keeps its rotation turn while it was seen within
 /// this many cursor pages; its first-wait page is forgotten after
 /// `WAITER_FORGET_PAGES`.
@@ -121,9 +127,10 @@ pub(in crate::snapshots) struct PageBudget {
     singleton_decoded: u64,
     disabled_disclosed: bool,
     page_noted: bool,
+    resume_claimed: bool,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
-    disabled_disclosed, page_noted);
+    disabled_disclosed, page_noted, resume_claimed);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -201,6 +208,12 @@ impl PageBudget {
         if !std::mem::replace(&mut self.disabled_disclosed, true) {
             cache.with_cursor(|cursor| cursor.counters.cursor_disabled_unsupported_layout += 1);
         }
+    }
+
+    /// At most one resume attempt per scan object (E2): true only the first
+    /// time. A deferred job is never resumed again in the same page.
+    pub(in crate::snapshots) fn claim_resume(&mut self) -> bool {
+        !std::mem::replace(&mut self.resume_claimed, true)
     }
 
     /// Advance the cursor page clock once per scan object (K7, K10).
@@ -292,9 +305,11 @@ pub(in crate::snapshots) struct JobMeta {
     /// job (N1) keeps no checkpoint, copy or verification at completion.
     census_trusted: bool,
     pages: u32,
+    /// Consecutive resume pages whose evidence was unavailable (E2).
+    unavailable_resumes: u32,
 }
 crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, dependencies,
-    owner, counting, fence, census_trusted, pages);
+    owner, counting, fence, census_trusted, pages, unavailable_resumes);
 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
@@ -387,6 +402,9 @@ pub(in crate::snapshots) struct Counters {
     /// A completion on a file that did not grow withheld an unterminated
     /// final record (N2): debt staged, the record left to main's EOF path.
     pub(in crate::snapshots) sealed_fragment_withheld: u64,
+    /// E2: a paused job ended because its path no longer named the held
+    /// object or its evidence stayed unavailable for `UNAVAILABLE_RESUMES`.
+    pub(in crate::snapshots) jobs_unavailable_ended: u64,
     pub(in crate::snapshots) memo_hits: u64,
     pub(in crate::snapshots) memo_records: u64,
     pub(in crate::snapshots) parked_hits: u64,
@@ -396,7 +414,8 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
     jobs_lost, jobs_deferred_inputs, jobs_start_unstartable, jobs_audit_restarted,
     jobs_finish_failed, jobs_frame_returned, deferred, deferred_rotation,
     deferred_next_generation, namespace_busy, cursor_disabled_unsupported_layout, audit_overdue,
-    audit_overdue_max_age_seconds, sealed_fragment_withheld, memo_hits, memo_records, parked_hits);
+    audit_overdue_max_age_seconds, sealed_fragment_withheld, jobs_unavailable_ended,
+    memo_hits, memo_records, parked_hits);
 
 /// A `JoinStateBound` file waits here until its object or reduction
 /// dependencies change. Its job ran out of a build constant
@@ -921,13 +940,15 @@ fn park(cursor: &mut CursorState, key: String, parked: Parked) {
 /// End a cursor job at its frozen extent: certify the sealed prefix from the
 /// held FD (`ReadPlan::commit_sealed_prefix`), record the attempt and free
 /// the slot. `current_scope` and `counting_now` are recomputed now from the
-/// current index (K8, K9).
+/// current index (K8, K9). `census_trusted`: the state and sidecar census
+/// were complete at start and are now.
 pub(in crate::snapshots) fn finish_job(
     cache: &SharedCache,
     lease: Option<CursorLease>,
     job: &mut OwnedActiveFile,
     current_scope: Option<&Scope>,
     counting_now: &str,
+    census_trusted: bool,
 ) -> JobEnd {
     let Some(meta) = job.cursor.take() else {
         return JobEnd::Restart;
@@ -979,6 +1000,12 @@ pub(in crate::snapshots) fn finish_job(
         (None, _) => Err(Some(PrefixRefusal::Invalidated(
             FullReason::InvalidCheckpoint,
         ))),
+    };
+    // R1-M1: under an untrusted census the scope follows census completeness,
+    // so a dependency mismatch is unavailable evidence, not a member change.
+    let result = match result {
+        Err(Some(PrefixRefusal::Dependency)) if !census_trusted => Err(None),
+        result => result,
     };
     // N2: on a quiescent file the withheld record will not be completed by
     // an append; its bytes stay owed. The deadline is the read's own audit
@@ -1361,6 +1388,7 @@ impl SharedCache {
             owner,
             census_trusted,
             pages: 1,
+            unavailable_resumes: 0,
         });
         Ok(CursorLease {
             cache: Arc::clone(self),
@@ -1593,6 +1621,8 @@ pub(in crate::snapshots) struct ResumeInputs<'a> {
     pub(in crate::snapshots) scope: Option<Scope>,
     /// `counting_view` recomputed from the resuming scan's index (K8).
     pub(in crate::snapshots) counting: String,
+    /// The state and sidecar census are complete now (R1-M1).
+    pub(in crate::snapshots) census_complete: bool,
 }
 
 /// What the resuming scan supplies to `resume_paused_job`.
@@ -1609,6 +1639,8 @@ pub(in crate::snapshots) struct ResumeContext<'a> {
     pub(in crate::snapshots) inventory: Option<&'a codex_file_join::HeaderInventory>,
     /// Selection flags of this page's Codex candidates (`requeue`).
     pub(in crate::snapshots) flags: &'a BTreeMap<String, (bool, bool)>,
+    /// The state and sidecar census are complete this page (R1-M1).
+    pub(in crate::snapshots) census_complete: bool,
 }
 
 /// How `resume_paused_job` used the page.
@@ -1635,6 +1667,11 @@ pub(in crate::snapshots) fn resume_paused_job(
     let Some((mut job, lease)) = sampling.cache.cursor_resume(&sampling.namespace) else {
         return Resumed::Idle;
     };
+    // E2: a path that no longer names the held object (archived, renamed,
+    // deleted or replaced) can never revalidate; end the job now.
+    if !path_names_held_object(&job) {
+        return end_unavailable(job, lease, index, targets);
+    }
     let scope = job.sampling.as_ref().and_then(|_| {
         super::reduction_dependencies(
             context.source,
@@ -1666,10 +1703,14 @@ pub(in crate::snapshots) fn resume_paused_job(
             inventory: context.inventory,
             scope,
             counting,
+            census_complete: context.census_complete,
         },
     );
     let debt = match verdict {
         Resume::Valid => {
+            if let Some(meta) = job.cursor.as_mut() {
+                meta.unavailable_resumes = 0;
+            }
             // This page also selected the job's path; read it once, through
             // the job, and keep it pending so the census still waits if the
             // job pauses.
@@ -1678,11 +1719,21 @@ pub(in crate::snapshots) fn resume_paused_job(
             return Resumed::Active(job, lease);
         }
         // Unavailable evidence is not a member change: the job waits in the
-        // slot, its path pending (K9).
-        Resume::Unavailable => match lease.defer(job) {
-            PauseEnd::Paused => None,
-            PauseEnd::StateBound(job, disclosure) => Some((job, disclosure)),
-        },
+        // slot, its path pending (K9), for at most `UNAVAILABLE_RESUMES`
+        // consecutive pages (E2).
+        Resume::Unavailable => {
+            let waited = job.cursor.as_mut().map_or(UNAVAILABLE_RESUMES, |meta| {
+                meta.unavailable_resumes = meta.unavailable_resumes.saturating_add(1);
+                meta.unavailable_resumes
+            });
+            if waited >= UNAVAILABLE_RESUMES {
+                return end_unavailable(job, lease, index, targets);
+            }
+            match lease.defer(job) {
+                PauseEnd::Paused => None,
+                PauseEnd::StateBound(job, disclosure) => Some((job, disclosure)),
+            }
+        }
         Resume::Changed => sampling
             .cache
             .cursor_invalidate(lease, &job)
@@ -1696,6 +1747,41 @@ pub(in crate::snapshots) fn resume_paused_job(
     }
     // Otherwise its path is still pending; a later page resumes or
     // restarts it.
+    Resumed::Spent
+}
+
+/// The job's path still names the object its held FD reads (dev/ino only;
+/// no byte is read from the path).
+fn path_names_held_object(job: &OwnedActiveFile) -> bool {
+    OpenStamp::capture(job.parser.reader.reader.get_ref()).is_ok_and(|held| {
+        fs::symlink_metadata(&job.candidate.path)
+            .is_ok_and(|path| path.dev() == held.dev && path.ino() == held.ino)
+    })
+}
+
+/// E2: end a resumed job whose evidence cannot become available: free the
+/// slot, count the file's attempt for this generation (K7) and process its
+/// path with a retryable `Reduction` cause. Nothing publishes; the prior
+/// body is kept, and the next generation restarts the read.
+fn end_unavailable(
+    job: Box<OwnedActiveFile>,
+    lease: CursorLease,
+    index: &mut ScanIndex,
+    mut targets: DisclosureTargets<'_>,
+) -> Resumed {
+    let meta = job.cursor.as_ref();
+    let rotation = meta.map(|meta| rotation_key(&meta.namespace, &meta.key));
+    lease.end(|cursor| {
+        cursor.counters.jobs_unavailable_ended += 1;
+        if let (Some(meta), Some(rotation)) = (meta, rotation.as_ref()) {
+            cursor.invalidations.remove(&meta.key);
+            cursor.rotation.complete(rotation, meta.fence.as_deref());
+        }
+    });
+    targets
+        .census
+        .record_unreadable(UnreadableCause::Reduction, 1);
+    dequeue(index, &job.candidate);
     Resumed::Spent
 }
 
@@ -1741,14 +1827,22 @@ pub(in crate::snapshots) fn revalidate(
     ) else {
         return Resume::Unavailable;
     };
+    // R1-M1: under an untrusted census (at start or now) the dependency
+    // fingerprint follows census completeness, so a mismatch is not proof of
+    // a member change: unavailable evidence.
+    let changed = if meta.census_trusted && inputs.census_complete {
+        Resume::Changed
+    } else {
+        Resume::Unavailable
+    };
     if Some(&dependencies) != meta.dependencies.as_ref() {
-        return Resume::Changed;
+        return changed;
     }
     let Some(scope) = inputs.scope.as_ref() else {
         return Resume::Unavailable;
     };
     if job.sampling.as_ref().map(|active| &active.scope) != Some(scope) {
-        return Resume::Changed;
+        return changed;
     }
     let Some(inventory) = inputs.inventory.filter(|inventory| inventory.complete) else {
         return Resume::Unavailable;

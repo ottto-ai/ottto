@@ -14269,8 +14269,14 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_ref() {
                     codex_page.note_page(&context.cache);
                 }
+                // E2: at most one resume attempt per page, and none on a page
+                // that selected no candidates (no header inventory: no
+                // evidence for the job this page). A deferred job therefore
+                // never spins within a page.
                 if let Some(context) = sampling.as_ref().filter(|_| {
                     !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
+                        && codex_join_inventory.is_some()
+                        && codex_page.claim_resume()
                 }) {
                     // Continuing the paused job is the highest scheduling class.
                     match sampled_scan::codex_cursor::resume_paused_job(
@@ -14285,6 +14291,7 @@ impl OwnedSourceScan {
                             parents: codex_parent_ownership_ledgers.clone(),
                             inventory: codex_join_inventory.as_ref(),
                             flags: &codex_selected_flags,
+                            census_complete: state_census_complete && sidecar_census_complete,
                         },
                         index,
                         &mut identified_candidates,
@@ -14552,6 +14559,7 @@ impl OwnedSourceScan {
                         &mut active,
                         current_scope.as_ref(),
                         &counting_now,
+                        census_trusted,
                     ) {
                         sampled_scan::codex_cursor::JobEnd::Certified {
                             checkpoint,

@@ -772,13 +772,35 @@ fn page_with(
     collected_at: &str,
     tweak: impl Fn(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Modes) {
+    page_steps(
+        fixture,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        tweak,
+        usize::MAX,
+    )
+}
+
+/// `page_with` that fails once the page takes more than `max_steps` steps
+/// (E2: one scan object never spins).
+fn page_steps(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: Option<Arc<SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    tweak: impl Fn(&mut OwnedSourceScan),
+    max_steps: usize,
+) -> (ScanIndex, SourceScanResult, Modes) {
     let mut scan = codex_scan(fixture, index, collected_at);
     tweak(&mut scan);
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
     }
     let mut modes = (0, 0);
-    loop {
+    for _ in 0..max_steps {
         if let Some(context) = scan.sampling.as_ref() {
             modes = (context.full_files, context.tail_files);
         }
@@ -804,6 +826,7 @@ fn page_with(
             }
         }
     }
+    panic!("the page did not finish within {max_steps} steps");
 }
 
 fn codex_scan(fixture: &ScanRoot, index: ScanIndex, collected_at: &str) -> OwnedSourceScan {
@@ -1643,6 +1666,117 @@ fn incomplete_sidecar_census_pages_cursor_only_and_publishes_unverified() {
             .traversal
             .as_ref()
             .map_or(true, |traversal| traversal.pending_candidates.is_empty()));
+    });
+}
+
+/// E2 (R2-B1): a resume whose evidence is unavailable is tried at most once
+/// per page and ends after `UNAVAILABLE_RESUMES` such pages, freeing the
+/// slot. The trigger is R1-M1's: an untrusted census plus a changed scope.
+/// Before E2 the deferred job was resumed again on the next step of the
+/// same scan object, forever; every page here must finish within a bound.
+#[test]
+fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const STEPS: usize = 10_000;
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    let flipped = |scan: &mut OwnedSourceScan| {
+        scan.sidecar_census_complete = false;
+        scan.context_curve_enabled = !scan.context_curve_enabled;
+    };
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, _, _) = page_steps(
+            &fixture,
+            ScanIndex::default(),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+            NOW,
+            |_| {},
+            STEPS,
+        );
+        assert_eq!(
+            counter(&cache, |c| c.jobs_paused),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        for page in 1..=u64::from(UNAVAILABLE_RESUMES) {
+            let (next, _, _) = page_steps(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                flipped,
+                STEPS,
+            );
+            index = next;
+            if page < u64::from(UNAVAILABLE_RESUMES) {
+                // One resume attempt per page, deferred uncounted (K9).
+                assert_eq!(counter(&cache, |c| c.jobs_deferred_inputs), page);
+                assert_eq!(counter(&cache, |c| c.jobs_unavailable_ended), 0);
+                assert!(!cache.cursor_slot_free());
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_unavailable_ended),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert_eq!(
+            counter(&cache, |c| c.jobs_deferred_inputs),
+            u64::from(UNAVAILABLE_RESUMES) - 1
+        );
+        assert_eq!(
+            counter(&cache, |c| c.jobs_invalidated),
+            0,
+            "not a member change"
+        );
+    });
+}
+
+/// E2: a paused job whose path no longer names its held object (replaced
+/// here) ends on its next resume: slot freed, nothing published from it,
+/// never counted as a member change.
+#[test]
+fn paused_job_whose_path_was_replaced_ends_on_resume() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (index, _) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
+        assert_eq!(
+            counter(&cache, |c| c.jobs_paused),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        let replacement = path.with_extension("replacement");
+        fs::copy(&path, &replacement).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let (_, _, _) = page_steps(
+            &fixture,
+            index,
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+            NOW,
+            |_| {},
+            10_000,
+        );
+        assert_eq!(
+            counter(&cache, |c| c.jobs_unavailable_ended),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert_eq!(counter(&cache, |c| c.jobs_resumed), 1, "one attempt");
+        assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0);
     });
 }
 
