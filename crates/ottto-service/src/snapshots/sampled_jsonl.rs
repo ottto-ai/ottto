@@ -247,18 +247,32 @@ impl OwnedJsonlParser {
         remaining_copy_budget: usize,
     ) -> CompletedNativeAcquisition {
         let budget = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
-        if budget == 0
-            || !sampled_scan::compatible_reduction(&self.accumulator)
-            || self.retention_bound(budget).is_none()
-        {
+        if budget == 0 || !sampled_scan::compatible_reduction(&self.accumulator) {
             return CompletedNativeAcquisition {
                 checkpoint,
                 reduction: None,
             };
         }
+        // The certificate consumed the acquisition plan, so charge the
+        // certificate itself where `retention_bound` charges the plan.
         let inputs = self.take_live_reduction_inputs();
-        let accumulator = self.accumulator.clone();
+        let admitted = (|| {
+            let state = crate::heap_layout_bound::bound(&self.accumulator, budget)?;
+            let certificate =
+                crate::heap_layout_bound::bound(&checkpoint, budget.checked_sub(state)?)?;
+            let inline = std::mem::size_of::<CachedJsonlReduction>()
+                .checked_sub(std::mem::size_of::<SnapshotAccumulator>())?;
+            let total = state.checked_add(certificate)?.checked_add(inline)?;
+            (total <= budget).then_some(())
+        })();
+        let accumulator = admitted.map(|()| self.accumulator.clone());
         self.restore_live_reduction_inputs(inputs);
+        let Some(accumulator) = accumulator else {
+            return CompletedNativeAcquisition {
+                checkpoint,
+                reduction: None,
+            };
+        };
         let reduction = CachedJsonlReduction {
             accumulator,
             report: self.reader.report,
