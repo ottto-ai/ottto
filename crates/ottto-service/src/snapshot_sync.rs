@@ -8428,7 +8428,7 @@ mod tests {
         let transcripts = root.join("transcripts");
         std::fs::create_dir_all(&transcripts).unwrap();
         for id in ["bounded-a", "bounded-b"] {
-            let row = json!({"timestamp":"2026-10-18T12:00:00Z", "sessionId":id, "requestId":format!("req-{id}"), "message":{"id":format!("msg-{id}"), "model":"claude-opus-4-8", "usage":{"input_tokens":42,"output_tokens":1}}});
+            let row = serde_json::json!({"timestamp":"2026-10-18T12:00:00Z", "sessionId":id, "requestId":format!("req-{id}"), "message":{"id":format!("msg-{id}"), "model":"claude-opus-4-8", "usage":{"input_tokens":42,"output_tokens":1}}});
             std::fs::write(transcripts.join(format!("{id}.jsonl")), format!("{row}\n")).unwrap();
         }
         let mut index = ScanIndex::default();
