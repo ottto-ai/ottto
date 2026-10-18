@@ -74,6 +74,12 @@ impl OwnedJsonlParser {
         debt: Option<AuditDebt>,
         now: u64,
     ) -> Result<ReadMode> {
+        // Checkpoints, samples and resume offsets are physical-file bytes. A
+        // compressed stream has none, so it is never sampled or resumed.
+        anyhow::ensure!(
+            !self.reader.reader.is_compressed(),
+            "compressed input has no physical acquisition offsets"
+        );
         anyhow::ensure!(
             self.reader.reader.buffer().is_empty() && !self.reader.finished,
             "acquisition must begin before native parsing"

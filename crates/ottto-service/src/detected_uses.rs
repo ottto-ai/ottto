@@ -264,13 +264,14 @@ fn row_plan_fingerprint(row: &SnapshotModelUsage) -> Option<String> {
     }
 }
 
+/// Reasoning tokens are a part of `output_tokens` for Codex and Claude, so
+/// they are not added again.
 fn row_total_tokens(row: &SnapshotModelUsage) -> u64 {
     row.input_tokens
         .saturating_add(row.output_tokens)
         .saturating_add(row.cache_read_tokens)
         .saturating_add(row.cache_creation_5m_tokens)
         .saturating_add(row.cache_creation_1h_tokens)
-        .saturating_add(row.reasoning_output_tokens)
         .saturating_add(row.unattributed_total_tokens)
 }
 
@@ -512,6 +513,25 @@ mod tests {
             .expect("anthropic group present");
         assert_eq!(anthropic.token_volume_recent[0].tokens, 600);
         assert_eq!(anthropic.last_seen_at, "2026-05-28T09:30:00Z");
+    }
+
+    #[test]
+    fn reasoning_tokens_are_not_counted_on_top_of_output() {
+        let mut row = model_usage(Some("anthropic"), Some("anthropic"), None, None, 1000, 900);
+        row.reasoning_output_tokens = 300;
+        let snapshots = vec![snapshot(
+            "claude-thinking",
+            "2026-05-28T08:45:00Z",
+            vec![usage_bucket(
+                "2026-05-28T08:00:00Z",
+                "2026-05-28T08:45:00Z",
+                vec![row],
+            )],
+        )];
+
+        let detected = aggregate_detected_uses(&snapshots);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].token_volume_recent[0].tokens, 1900);
     }
 
     #[test]

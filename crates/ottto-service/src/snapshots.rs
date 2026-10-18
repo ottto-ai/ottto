@@ -31,9 +31,12 @@ pub(crate) mod claude_request_identity;
 pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
+mod codex_compressed_input;
 mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
+#[cfg(test)]
+mod claude_thinking_tokens_tests;
 mod context_curve;
 #[cfg(test)]
 mod launch_demand_tests;
@@ -50,6 +53,7 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+use codex_compressed_input::OpenedInput;
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 
 pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
@@ -317,7 +321,10 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // v39 records skill evidence from the tool walk: `Skill` tool input as an
 // invocation, SKILL.md paths read by `Read`/`Bash` as references (shared
 // extractor with Codex), and capability marker v2 when every reference was named.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v39";
+// v40 reads `output_tokens_details.thinking_tokens` into `reasoning_output_tokens`
+// (clamped to `output_tokens`). Scan identity is unchanged: only changed
+// transcripts re-parse, so a 0 under v39 means "not read", not "no thinking".
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v40";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -6075,7 +6082,10 @@ fn claude_api_matches_transcript_occurrence(
     row.input_tokens == occurrence.input_tokens
         && row.output_tokens == occurrence.output_tokens
         && row.cache_read_tokens == occurrence.cache_read_tokens
-        && row.reasoning_output_tokens == occurrence.reasoning_output_tokens
+        && claude_api_reasoning_matches(
+            row.reasoning_output_tokens,
+            occurrence.reasoning_output_tokens,
+        )
         && api_cache_creation == transcript_cache_creation
         && occurrence
             .model
@@ -6083,6 +6093,14 @@ fn claude_api_matches_transcript_occurrence(
             .map_or(true, |model| model == row.model)
         && speed_matches
         && effort_matches
+}
+
+/// Claude Code's `api_request` event carries no thinking count, so the sidecar
+/// reports 0 while the transcript holds the real count. Only a count the
+/// sidecar actually reported must equal the transcript's.
+fn claude_api_reasoning_matches(reported: impl Into<u128>, transcript: impl Into<u128>) -> bool {
+    let reported = reported.into();
+    reported == 0 || reported == transcript.into()
 }
 
 fn claude_family_request_ids_are_disjoint(pending: &ClaudeAccountFamilyPending) -> bool {
@@ -6561,7 +6579,10 @@ fn claude_account_evidence_covers_snapshot(
         && sum(|row| row.cache_read_tokens) == u128::from(item.cache_read_tokens)
         && cache_creation
             == u128::from(item.cache_creation_5m_tokens) + u128::from(item.cache_creation_1h_tokens)
-        && sum(|row| row.reasoning_output_tokens) == u128::from(item.reasoning_output_tokens)
+        && claude_api_reasoning_matches(
+            sum(|row| row.reasoning_output_tokens),
+            item.reasoning_output_tokens,
+        )
         && sum(|row| row.request_count) == u128::from(item.request_count)
 }
 
@@ -7038,8 +7059,10 @@ fn prepare_claude_reported_usage_with_credit<
             if row.input_tokens != occurrence.usage.input_tokens
                 || row.output_tokens != occurrence.usage.output_tokens
                 || row.cache_read_tokens != occurrence.usage.cache_read_tokens
-                || Some(occurrence.usage.reasoning_output_tokens)
-                    != Some(row.reasoning_output_tokens)
+                || !claude_api_reasoning_matches(
+                    row.reasoning_output_tokens,
+                    occurrence.usage.reasoning_output_tokens,
+                )
                 || api_cache_creation != transcript_cache_creation
                 || occurrence
                     .model
@@ -16255,7 +16278,7 @@ impl ParsedJsonlFile {
 // The native file parser owns all state needed between physical-line steps.
 // Finalization is separate: a line step is never file or upload authority.
 struct OwnedJsonlParser {
-    reader: BoundedJsonlReader<BufReader<File>>,
+    reader: BoundedJsonlReader<OpenedInput>,
     accumulator: SnapshotAccumulator,
     source: SnapshotSource,
     apply_line: fn(&Value, &mut SnapshotAccumulator),
@@ -16278,7 +16301,35 @@ impl OwnedJsonlParser {
         artifacts_enabled: bool,
         context_curve_enabled: bool,
     ) -> Result<Self> {
-        let reader = BufReader::new(file);
+        Self::new_opened(
+            OpenedInput::plain(file),
+            path,
+            source,
+            apply_line,
+            codex_title_metadata,
+            codex_turn_traces,
+            codex_parent_ownership_ledgers,
+            artifacts_enabled,
+            context_curve_enabled,
+        )
+    }
+    /// Every input kind reaches the same line parser through one opened
+    /// object. Its File was opened and identified by the caller; a compressed
+    /// input arrives with its decoder credit already paid.
+    #[allow(clippy::too_many_arguments)]
+    fn new_opened(
+        reader: OpenedInput,
+        path: &Path,
+        source: SnapshotSource,
+        apply_line: fn(&Value, &mut SnapshotAccumulator),
+        codex_title_metadata: Option<&CodexTitleMetadata>,
+        codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+        codex_parent_ownership_ledgers: Option<
+            Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>,
+        >,
+        artifacts_enabled: bool,
+        context_curve_enabled: bool,
+    ) -> Result<Self> {
         // Snapshot semantics come from provider-native session evidence. Mutable
         // current config defaults are useful for live status display, but applying
         // today's defaults to cumulative historical usage would retroactively
@@ -20210,19 +20261,28 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         return None;
     }
     let (cache_5m, cache_1h) = claude_code_cache_creation_split(root);
+    let output_tokens = u64_at(root, &["output_tokens"])
+        .or_else(|| u64_at(root, &["outputTokens"]))
+        .unwrap_or_default();
+    // Claude Code writes the thinking count as
+    // `output_tokens_details.thinking_tokens`, a part of `output_tokens`.
+    // Early streamed rows can briefly report more thinking than output, so
+    // clamp to the record's own output.
+    let reasoning_output_tokens = u64_at(root, &["reasoning_output_tokens"])
+        .or_else(|| u64_at(root, &["output_tokens_details", "thinking_tokens"]))
+        .unwrap_or_default()
+        .min(output_tokens);
     let usage = UsageTotals {
         input_tokens: u64_at(root, &["input_tokens"])
             .or_else(|| u64_at(root, &["inputTokens"]))
             .unwrap_or_default(),
-        output_tokens: u64_at(root, &["output_tokens"])
-            .or_else(|| u64_at(root, &["outputTokens"]))
-            .unwrap_or_default(),
+        output_tokens,
         cache_read_tokens: u64_at(root, &["cache_read_input_tokens"])
             .or_else(|| u64_at(root, &["cache_read_tokens"]))
             .unwrap_or_default(),
         cache_creation_5m_tokens: cache_5m,
         cache_creation_1h_tokens: cache_1h,
-        reasoning_output_tokens: u64_at(root, &["reasoning_output_tokens"]).unwrap_or_default(),
+        reasoning_output_tokens,
         unattributed_total_tokens: 0,
         request_count: 1,
         costs: UsageCosts::default(),
@@ -39989,7 +40049,7 @@ mod tests {
         )])
     }
 
-    fn complete_api_row(
+    pub(super) fn complete_api_row(
         parent: &str,
         request_id: &str,
         sequence: u64,
@@ -40023,7 +40083,7 @@ mod tests {
         row
     }
 
-    fn complete_trace_row(
+    pub(super) fn complete_trace_row(
         parent: &str,
         request_id: &str,
         agent_id: &str,
@@ -58447,7 +58507,7 @@ mod tests {
         );
     }
 
-    fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
+    pub(super) fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
         ScanIndexEntry {
             size_bytes: 1,
             modified_unix_seconds: 2,
@@ -60136,7 +60196,7 @@ crate::heap_layout_bound::fields!(UsageBucketState; rows, first_activity_at, las
 crate::heap_layout_bound::fields!(UsageCosts; observed, reported, total, input, output, cache_read, cache_creation);
 crate::heap_layout_bound::fields!(UsageTotals; input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, costs);
 
-impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<BufReader<File>> {
+impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInput> {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self {
             reader,
