@@ -1291,7 +1291,12 @@ fn discovery_incomplete_transcript_refuses_partial_workspace_set() {
 #[test]
 fn discovery_expired_budget_is_not_complete_empty_coverage() {
     let root = crate::test_scratch::private_dir("composition-discovery-expired");
-    assert!(discover_workspaces(&[root.clone()], SystemTime::now(), Instant::now()).is_err());
+    assert!(discover_workspaces(
+        std::slice::from_ref(&root),
+        SystemTime::now(),
+        Instant::now()
+    )
+    .is_err());
     fs::remove_dir_all(root).unwrap();
 }
 
