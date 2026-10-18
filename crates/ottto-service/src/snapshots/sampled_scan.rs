@@ -225,67 +225,112 @@ impl OwnedSourceScan {
         self
     }
     pub(crate) fn release_sampled_cache_for_copy_refusal(&self) {
-        if let Some(context) = self.sampling.as_ref() {
-            // A full parser's native accumulator is the unchanged synchronous
-            // baseline. Its local layout refusal forbids optional copies, but
-            // does not invalidate other already bounded resident reductions.
-            // Acquisition/path scratch still uses the separate 1MiB reserve.
-            // Borrowed tail state, unsupported audit metadata and an unbounded
-            // resident graph retain the existing conservative release behavior.
-            let native_full_baseline = self.active_file.as_ref().is_some_and(|active| {
-                active
-                    .sampling
-                    .as_ref()
-                    .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
-            });
-            if native_full_baseline
-                && context.audit_metadata_supported
-                && crate::heap_layout_bound::bound(context, STATE_BYTES).is_some()
-            {
-                return;
-            }
-            context.cache.clear();
-        }
+        release_cache_for_copy_refusal(self.sampling.as_ref(), self.active_file.as_deref());
     }
     /// Charge only optimization-owned native state, samples/keys and copies.
     /// The unchanged serial index/metadata is baseline; parked/proof/send
     /// frames still use their existing aggregate 32MiB allocation/lifetime gate.
     pub(super) fn sampled_copy_budget(&mut self) -> usize {
-        let Some(context) = self
-            .sampling
-            .as_ref()
-            .filter(|context| context.audit_metadata_supported)
-        else {
-            return 0;
-        };
-        let Some(resident) = crate::heap_layout_bound::bound(context, STATE_BYTES) else {
-            return 0;
-        };
-        let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
-            return 0;
-        };
-        let active = self.active_file.as_mut().map_or(Some(0), |active| {
-            // These native source-wide inputs predate the optimization, are
-            // refreshed on reuse, and are absent from every retained copy.
-            // All active owned parser/acquisition/path/receipt state stays charged.
-            let inputs = active.parser.take_live_reduction_inputs();
-            // A cursor job's state grows past the ordinary walk's visit limit
-            // (usage hours, witnesses); charge it by bytes like its pause (N3).
-            // The walk charges the file itself, as before it was boxed.
-            let file: &OwnedActiveFile = active;
-            let bound = if active.cursor.is_some() {
-                crate::heap_layout_bound::completed_bound(file, remaining)
-            } else {
-                crate::heap_layout_bound::bound(file, remaining)
-            };
-            active.parser.restore_live_reduction_inputs(inputs);
-            bound
-        });
-        active
-            .and_then(|used| remaining.checked_sub(used))
-            .map(|remaining| remaining / 2)
-            .unwrap_or(0)
+        copy_budget_beside(
+            self.sampling.as_ref(),
+            self.active_file.as_deref_mut(),
+            false,
+        )
     }
+}
+
+/// The copy-refusal release for `sampling` beside `active`.
+pub(super) fn release_cache_for_copy_refusal(
+    sampling: Option<&Context>,
+    active: Option<&OwnedActiveFile>,
+) {
+    if let Some(context) = sampling {
+        // A full parser's native accumulator is the unchanged synchronous
+        // baseline. Its local layout refusal forbids optional copies, but
+        // does not invalidate other already bounded resident reductions.
+        // Acquisition/path scratch still uses the separate 1MiB reserve.
+        // Borrowed tail state, unsupported audit metadata and an unbounded
+        // resident graph retain the existing conservative release behavior.
+        let native_full_baseline = active.is_some_and(|active| {
+            active
+                .sampling
+                .as_ref()
+                .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
+        });
+        if native_full_baseline
+            && context.audit_metadata_supported
+            && crate::heap_layout_bound::bound(context, STATE_BYTES).is_some()
+        {
+            return;
+        }
+        context.cache.clear();
+    }
+}
+
+/// A completing cursor job's exact copy budget (E3), with the same
+/// refusal release the step start applies to an ordinary file.
+pub(super) fn completion_copy_budget(
+    sampling: Option<&Context>,
+    active: &mut OwnedActiveFile,
+) -> usize {
+    let budget = copy_budget_beside(sampling, Some(&mut *active), true);
+    if budget == 0 {
+        release_cache_for_copy_refusal(sampling, Some(&*active));
+    }
+    budget
+}
+
+/// The copy budget left beside the active file. A cursor job's state grows
+/// past the ordinary walk's visit limit (usage hours, witnesses), so it is
+/// charged by bytes like its pause (N3), but never walked per line (E3):
+/// mid-job it uses the last walk plus the bytes consumed since
+/// (`JobMeta::charge_estimate`); `completing` walks exactly, once, on the
+/// step that consumes the budget.
+pub(super) fn copy_budget_beside(
+    sampling: Option<&Context>,
+    active: Option<&mut OwnedActiveFile>,
+    completing: bool,
+) -> usize {
+    let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
+        return 0;
+    };
+    let Some(resident) = crate::heap_layout_bound::bound(context, STATE_BYTES) else {
+        return 0;
+    };
+    let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
+        return 0;
+    };
+    let active = active.map_or(Some(0), |active| {
+        let consumed = active.parser.reader.consumed_bytes();
+        let estimate = active
+            .cursor
+            .as_ref()
+            .filter(|_| !completing)
+            .and_then(|meta| meta.charge_estimate(consumed));
+        if let Some(estimate) = estimate {
+            return Some(estimate);
+        }
+        // These native source-wide inputs predate the optimization, are
+        // refreshed on reuse, and are absent from every retained copy.
+        // All active owned parser/acquisition/path/receipt state stays charged.
+        let inputs = active.parser.take_live_reduction_inputs();
+        // The walk charges the file itself, as before it was boxed.
+        let file: &OwnedActiveFile = active;
+        let bound = if active.cursor.is_some() {
+            crate::heap_layout_bound::completed_bound(file, remaining)
+        } else {
+            crate::heap_layout_bound::bound(file, remaining)
+        };
+        active.parser.restore_live_reduction_inputs(inputs);
+        if let Some(meta) = active.cursor.as_mut() {
+            meta.record_charge(bound.unwrap_or(usize::MAX), consumed);
+        }
+        bound
+    });
+    active
+        .and_then(|used| remaining.checked_sub(used))
+        .map(|remaining| remaining / 2)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

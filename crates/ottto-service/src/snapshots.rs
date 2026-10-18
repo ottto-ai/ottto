@@ -14520,6 +14520,13 @@ impl OwnedSourceScan {
                     active_file = Some(active);
                     pending!();
                 }
+                // E3: the completion step walks the finished job exactly,
+                // once, for the budget its retention consumes below.
+                let copy_budget = if active.cursor.is_some() {
+                    sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active)
+                } else {
+                    copy_budget
+                };
                 // S6: a cursor job commits only through its sealed-prefix
                 // certificate; an invalidated attempt publishes nothing.
                 let mut cursor_certificate = None;

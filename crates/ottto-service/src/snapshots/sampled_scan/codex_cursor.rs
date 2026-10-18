@@ -33,6 +33,10 @@ const CURSOR_PASS_BYTES: u64 = 64 * 1024 * 1024;
 const SINGLETON_PASS_BYTES: u64 = CURSOR_PASS_BYTES;
 /// A cursor read's overlong-line skip yields after this many skipped bytes.
 const SKIP_CHUNK_BYTES: usize = 1024 * 1024;
+/// A live cursor job's copy-budget charge is walked again after this many
+/// consumed bytes (E3): at most 16 walks per page (B / 4 MiB), plus the
+/// pause and completion walks, against one per line before.
+const CHARGE_REFRESH_BYTES: u64 = 4 * 1024 * 1024;
 /// Consecutive invalidated attempts of one file after which its attempt ends
 /// as strict `MemberChanged` debt (D2). Growth never invalidates: appended
 /// bytes belong to the next tail; unavailable evidence never counts (K9).
@@ -277,6 +281,29 @@ impl JobMeta {
     pub(in crate::snapshots) fn census_trusted(&self) -> bool {
         self.census_trusted
     }
+
+    /// The live job's copy-budget charge without a walk (E3): the last
+    /// `completed_bound` plus every byte the reader consumed since, so it
+    /// never undercounts what a line can add. None when no charge is
+    /// recorded, the reader restarted, or `CHARGE_REFRESH_BYTES` were
+    /// consumed since (the caller walks again: at most one walk per that
+    /// many bytes, never one per line).
+    pub(in crate::snapshots) fn charge_estimate(&self, consumed: u64) -> Option<usize> {
+        let (charge, at) = self.charge?;
+        let since = consumed.checked_sub(at)?;
+        if since >= CHARGE_REFRESH_BYTES {
+            return None;
+        }
+        usize::try_from(since)
+            .ok()
+            .map(|since| charge.saturating_add(since))
+    }
+
+    /// Record a walked charge (`usize::MAX` when the walk refused) taken at
+    /// reader position `consumed`.
+    pub(in crate::snapshots) fn record_charge(&mut self, charge: usize, consumed: u64) {
+        self.charge = Some((charge, consumed));
+    }
 }
 
 impl SealedPrefix {
@@ -307,9 +334,12 @@ pub(in crate::snapshots) struct JobMeta {
     pages: u32,
     /// Consecutive resume pages whose evidence was unavailable (E2).
     unavailable_resumes: u32,
+    /// The last walked copy-budget charge and the reader position it was
+    /// taken at (E3; see `charge_estimate`).
+    charge: Option<(usize, u64)>,
 }
 crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, dependencies,
-    owner, counting, fence, census_trusted, pages, unavailable_resumes);
+    owner, counting, fence, census_trusted, pages, unavailable_resumes, charge);
 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
@@ -769,6 +799,15 @@ pub(in crate::snapshots) fn paused_charge(job: &OwnedActiveFile) -> Option<usize
     crate::heap_layout_bound::completed_bound(job, STATE_BYTES)
 }
 
+/// The pause walk is the resumed page's starting copy-budget charge (E3):
+/// both exclude the live source-wide inputs.
+fn record_paused_charge(job: &mut OwnedActiveFile, charge: usize) {
+    let consumed = job.parser.reader.consumed_bytes();
+    if let Some(meta) = job.cursor.as_mut() {
+        meta.record_charge(charge, consumed);
+    }
+}
+
 /// Request `max(len, 64 KiB)` reader-buffer capacity before a slot charge
 /// (parent shrink ACK). Every live byte, including a skip's salvage prefix,
 /// is kept; the charge then walks the actual resulting capacity, which the
@@ -832,6 +871,7 @@ impl CursorLease {
             return PauseEnd::StateBound(job, disclosure);
         };
         drop(inputs);
+        record_paused_charge(&mut job, charge);
         self.store(job, charge, count);
         PauseEnd::Paused
     }
@@ -842,7 +882,10 @@ impl CursorLease {
         shrink_paused_buffer(&mut job.parser.reader.buf);
         drop(job.parser.take_live_reduction_inputs());
         match paused_charge(&job).filter(|charge| self.cache.cursor_make_room(*charge)) {
-            Some(charge) => self.store(job, charge, |counters| counters.jobs_frame_returned += 1),
+            Some(charge) => {
+                record_paused_charge(&mut job, charge);
+                self.store(job, charge, |counters| counters.jobs_frame_returned += 1);
+            }
             None => self.end(|cursor| cursor.counters.jobs_lost += 1),
         }
     }
@@ -1389,6 +1432,7 @@ impl SharedCache {
             census_trusted,
             pages: 1,
             unavailable_resumes: 0,
+            charge: None,
         });
         Ok(CursorLease {
             cache: Arc::clone(self),

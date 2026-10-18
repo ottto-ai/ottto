@@ -1780,6 +1780,55 @@ fn paused_job_whose_path_was_replaced_ends_on_resume() {
     });
 }
 
+/// E3 (R2-H1): between walks a live job's copy-budget charge is the last
+/// walk plus every byte consumed since; a walk is due again only after
+/// `CHARGE_REFRESH_BYTES` or a reader restart, never per line.
+#[test]
+fn live_job_charge_is_estimated_between_bounded_walks() {
+    let temp = Temp::new("charge", b"{}\n");
+    let mut meta = JobMeta {
+        key: "key".into(),
+        namespace: "namespace".into(),
+        stamp_open: OpenStamp::capture(&File::open(&temp.0).unwrap()).unwrap(),
+        started: 0,
+        dependencies: None,
+        owner: None,
+        counting: String::new(),
+        fence: None,
+        census_trusted: true,
+        pages: 0,
+        unavailable_resumes: 0,
+        charge: None,
+    };
+    assert_eq!(meta.charge_estimate(0), None, "the first step walks");
+    meta.record_charge(1_000, 10);
+    assert_eq!(meta.charge_estimate(10), Some(1_000));
+    assert_eq!(
+        meta.charge_estimate(510),
+        Some(1_500),
+        "consumed bytes charged"
+    );
+    assert!(meta
+        .charge_estimate(10 + CHARGE_REFRESH_BYTES - 1)
+        .is_some());
+    assert_eq!(
+        meta.charge_estimate(10 + CHARGE_REFRESH_BYTES),
+        None,
+        "walk again"
+    );
+    assert_eq!(
+        meta.charge_estimate(5),
+        None,
+        "a restarted reader walks again"
+    );
+    meta.record_charge(usize::MAX, 10);
+    assert_eq!(
+        meta.charge_estimate(20),
+        Some(usize::MAX),
+        "a refused walk stays refused"
+    );
+}
+
 /// N2 (R1-B2): a quiescent file larger than B whose last record has no
 /// newline. The sealed cursor completion certifies `[0, s)` and never counts
 /// that record, but stages debt and records only `[0, s)` as read, so the next
