@@ -10067,7 +10067,7 @@ struct SnapshotAccumulator {
     compaction_count: u64,
     compaction_timestamps: crate::owned_heap::OwnedVec<String>,
     claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
-    session_start: session_start::SessionStartState,
+    session_start: Box<session_start::SessionStartState>,
 }
 
 impl SnapshotAccumulator {
@@ -10199,7 +10199,7 @@ impl SnapshotAccumulator {
             compaction_count: 0,
             compaction_timestamps: crate::owned_heap::OwnedVec::new(),
             claude_compaction_observations: crate::owned_heap::OwnedVec::new(),
-            session_start: session_start::SessionStartState::default(),
+            session_start: Box::default(),
         }
     }
 
@@ -12116,13 +12116,13 @@ impl SnapshotAccumulator {
             }
         }
         let session_start = match self.source {
-            SnapshotSource::ClaudeCode => std::mem::take(&mut self.session_start).finish(
+            SnapshotSource::ClaudeCode => std::mem::take(&mut *self.session_start).finish(
                 true,
                 session_start::CLAUDE_PARTS_METHOD,
                 attribution_context,
                 crate::context_file_counts::device_salt().as_ref(),
             ),
-            SnapshotSource::Codex => std::mem::take(&mut self.session_start).finish(
+            SnapshotSource::Codex => std::mem::take(&mut *self.session_start).finish(
                 !self.codex_is_fork,
                 session_start::CODEX_PARTS_METHOD,
                 attribution_context,
