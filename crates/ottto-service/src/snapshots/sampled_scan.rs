@@ -40,11 +40,13 @@ impl HeapLayoutBound for SharedCache {
     }
 }
 impl SharedCache {
+    /// Copy-refusal release: evicts retained copies only. The paused cursor
+    /// job, the held-singleton memo, parked records and rotation state are
+    /// charged and bounded in `heap_bound`, and survive (K6).
     pub(super) fn clear(&self) {
         if let Ok(mut cache) = self.inner.lock() {
             cache.clear();
         }
-        self.cursor_clear();
     }
     pub(super) fn take(
         &self,
@@ -69,9 +71,10 @@ impl SharedCache {
         live_bytes: usize,
     ) {
         if let Some(state) = completed.reduction {
-            // A paused cursor job keeps its charge: admission may not fill the
-            // state budget underneath it.
-            let live_bytes = live_bytes.saturating_add(self.cursor_charge());
+            // The whole cursor state (paused job, memo, parked and rotation
+            // records) keeps its charge: admission may not fill the state
+            // budget underneath it.
+            let live_bytes = live_bytes.saturating_add(self.cursor_resident());
             if let Ok(mut cache) = self.inner.lock() {
                 cache.insert_reserving(
                     key,

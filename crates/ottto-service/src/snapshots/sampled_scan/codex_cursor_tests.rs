@@ -81,7 +81,7 @@ fn page_budget_plans_cursor_singleton_and_deferral() {
 }
 
 #[test]
-fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_input_change() {
+fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_change() {
     let mut state = CursorState::default();
     for _ in 1..MEMBER_CHANGED_AFTER {
         assert!(!invalidated(&mut state, "key"));
@@ -94,50 +94,60 @@ fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_input_c
     assert_eq!(state.counters.jobs_member_changed, 1);
     // The count restarts after the disclosure.
     assert!(!invalidated(&mut state, "key"));
+    let temp = Temp::new("parked", b"{\"a\":1}\n");
+    let file = File::open(&temp.0).unwrap();
+    let parked = |dependencies: Option<&str>| Parked {
+        stamp: OpenStamp::capture(&file).unwrap(),
+        dependencies: dependencies.map(str::to_owned),
+        disclosure: strict(DebtReason::JoinStateBound),
+        used: 0,
+    };
     let cache = SharedCache::default();
-    cache.with_cursor(|cursor| {
-        park(
-            cursor,
-            "key".into(),
-            Parked {
-                source_file_fingerprint: "revision-1".into(),
-                dependencies: Some("dependencies".into()),
-                disclosure: disclosure(),
-            },
-        )
-    });
-    // Unchanged inputs: the parked debt is disclosed again, nothing is read.
-    let parked = cache.cursor_parked("key", "revision-1", Some("dependencies"));
+    cache.with_cursor(|cursor| park(cursor, "key".into(), parked(Some("dependencies"))));
+    // Unchanged object and inputs: the strict debt is disclosed again and
+    // nothing is read.
+    let hit = cache.cursor_parked("key", &file, Some("dependencies"));
     assert_eq!(
-        parked.map(|disclosure| disclosure.state_only_blocked_session_ids),
-        Some(vec![SESSION.to_owned()])
+        hit.map(|disclosure| (disclosure.reason, disclosure.state_only_blocked_session_ids)),
+        Some((DebtReason::JoinStateBound, vec![SESSION.to_owned()]))
     );
+    // Growth cannot cure a prefix that only grows: still parked (R2-B3).
+    temp.append(b"{\"b\":2}\n");
     assert!(cache
-        .cursor_parked("key", "revision-1", Some("other"))
-        .is_none());
-    // A changed dependency woke it: the record is gone and the file retries.
+        .cursor_parked("key", &file, Some("dependencies"))
+        .is_some());
+    // A copy-refusal release keeps parked records (K6).
+    cache.clear();
     assert!(cache
-        .cursor_parked("key", "revision-1", Some("dependencies"))
+        .cursor_parked("key", &file, Some("dependencies"))
+        .is_some());
+    // A changed dependency wakes it: the record is gone and the file retries.
+    assert!(cache.cursor_parked("key", &file, Some("other")).is_none());
+    assert!(cache
+        .cursor_parked("key", &file, Some("dependencies"))
         .is_none());
+    // So does a shrink or in-place rewrite of the held object.
+    cache.with_cursor(|cursor| park(cursor, "key".into(), parked(None)));
+    fs::write(&temp.0, b"{}\n").unwrap();
+    assert!(cache.cursor_parked("key", &file, None).is_none());
     cache.with_cursor(|cursor| {
         for index in 0..=PARKED_KEYS {
+            let used = cursor.tick();
             park(
                 cursor,
                 format!("key-{index:03}"),
                 Parked {
-                    source_file_fingerprint: "revision-1".into(),
-                    dependencies: None,
-                    disclosure: disclosure(),
+                    used,
+                    ..parked(None)
                 },
             );
         }
         assert_eq!(cursor.parked.len(), PARKED_KEYS);
-        assert_eq!(cursor.counters.parked_hits, 1);
+        // The least recently used record goes first (L1).
+        assert!(!cursor.parked.contains_key("key-000"));
+        assert!(cursor.parked.contains_key(&format!("key-{PARKED_KEYS:03}")));
+        assert_eq!(cursor.counters.parked_hits, 3);
     });
-    cache.clear();
-    assert!(cache
-        .with_cursor(|cursor| cursor.parked.is_empty())
-        .unwrap());
 }
 
 #[test]
@@ -325,7 +335,9 @@ fn monotone_holds_are_fork_and_broken_ordinal_streams_only() {
     }
     accumulator.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
     assert!(!held_monotone(&accumulator));
-    assert_eq!(memo_counting_decision(), "legacy");
+    // K8: one reuse predicate for the restored accumulator.
+    assert!(counting_reusable(&accumulator, "legacy", "legacy"));
+    assert!(!counting_reusable(&accumulator, "legacy", "v2"));
 }
 
 /// C6: #597's parentless created-thread hold is memoized only where an
@@ -354,12 +366,14 @@ fn parentless_created_thread_hold_is_monotone_only_when_append_incurable() {
         set(&mut accumulator);
         assert!(held_monotone(&accumulator));
     }
-    // Missing sidecar projection (no `trace_id`, or a disagreeing state
-    // row): no append cures it, a sidecar change does. It is memoized, and
-    // the sidecar facts in `reduction_dependencies` (the memo digest) wake it.
+    // Missing sidecar projection (no `trace_id`, a disagreeing state row, or
+    // a lagging rollout extent): no append cures it, a sidecar change does.
+    // It is memoized, and the entry's full sidecar fingerprint wakes it
+    // (`held_singleton_memo_woken_by_sidecar_change`).
     let mut accumulator = proven();
     accumulator.codex_sidecar_projected_next_ordinal = None;
     assert!(held_monotone(&accumulator));
+    assert!(sidecar_wakes(&accumulator));
     // A parent ref makes it a parented created thread: ordinal rule only.
     accumulator.codex_parent_session_ref = Some("parent".into());
     assert!(!held_monotone(&accumulator));
@@ -367,12 +381,157 @@ fn parentless_created_thread_hold_is_monotone_only_when_append_incurable() {
 
 fn disclosure() -> Disclosure {
     Disclosure {
+        reason: DebtReason::HeldTerminal,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![SESSION.into()],
         diagnostic_reason: FileReason::OwnershipIncomplete,
         parsed_snapshot_count: 0,
     }
+}
+
+fn strict(reason: DebtReason) -> Disclosure {
+    Disclosure {
+        reason,
+        ownership_incomplete_file_count: 0,
+        zero_snapshot_usage_evidence: false,
+        state_only_blocked_session_ids: vec![SESSION.into()],
+        diagnostic_reason: FileReason::NotParsedThisCycle,
+        parsed_snapshot_count: 0,
+    }
+}
+
+/// K2 (R1-B2, parent H-3): `JoinStateBound` and `MemberChanged` keep the
+/// strict census gate (a retryable unreadable file, never residue) with the
+/// owner blocked and the prior body kept; only a held terminal refusal is
+/// settleable residue. One writer classifies fresh, memo and parked debt.
+#[test]
+fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
+    let candidate = CandidateFile {
+        scan_root: PathBuf::from("/synthetic/sessions"),
+        path: PathBuf::from(format!(
+            "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
+        )),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: "revision".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let disclose = |disclosure: &Disclosure| {
+        let mut index = ScanIndex::default();
+        let mut census = ScanCensus::default();
+        let mut residue = BTreeSet::new();
+        let mut residue_blocked = BTreeSet::new();
+        let mut blocked = BTreeSet::new();
+        let mut pending = Vec::new();
+        disclose_terminal_codex_debt(
+            disclosure,
+            &candidate,
+            (Some("prior".into()), None),
+            &mut index,
+            DisclosureTargets {
+                census: &mut census,
+                residue_index_keys: &mut residue,
+                residue_blocked_session_ids: &mut residue_blocked,
+                codex_state_only_blocked_session_ids: &mut blocked,
+                pending_finalization: &mut pending,
+            },
+        );
+        (census, residue, residue_blocked, blocked, pending, index)
+    };
+    for reason in [DebtReason::JoinStateBound, DebtReason::MemberChanged] {
+        assert!(!reason.settleable());
+        let (census, residue, residue_blocked, blocked, pending, index) = disclose(&strict(reason));
+        assert!(residue.is_empty() && residue_blocked.is_empty());
+        assert_eq!(census.ownership_incomplete_file_count, 0);
+        assert_eq!(census.unreadable_path_count, 1);
+        assert!(blocked.contains(SESSION));
+        assert!(index.codex_state_only_blocked_session_ids.contains(SESSION));
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].parse_complete);
+        assert_eq!(pending[0].diagnostic_reason, FileReason::NotParsedThisCycle);
+        assert_eq!(
+            pending[0].previous_snapshot_fingerprint.as_deref(),
+            Some("prior")
+        );
+    }
+    assert!(DebtReason::HeldTerminal.settleable());
+    let (census, residue, residue_blocked, blocked, pending, _) = disclose(&disclosure());
+    assert_eq!(residue.len(), 1);
+    assert!(residue_blocked.contains(SESSION) && blocked.contains(SESSION));
+    assert_eq!(census.ownership_incomplete_file_count, 1);
+    assert_eq!(census.unreadable_path_count, 0);
+    assert_eq!(
+        pending[0].diagnostic_reason,
+        FileReason::OwnershipIncomplete
+    );
+}
+
+/// K3 (R1-B3): a parentless created thread held for a missing sidecar
+/// projection wakes when the sidecar facts that can cure it change, e.g. the
+/// rollout extent catching up with the file (`rollout_file_matches`), or an
+/// identity conflict appearing. An ambiguous fork records no sidecar wake.
+#[test]
+fn held_singleton_memo_woken_by_sidecar_change() {
+    let temp = Temp::new("memo-sidecar", b"{\"n\":1}\n{\"n\":2}\n");
+    let file = File::open(&temp.0).unwrap();
+    let path = PathBuf::from(format!(
+        "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
+    ));
+    let mut codex = CodexTitleMetadata::default();
+    codex.rollout_extents.insert(
+        SESSION.into(),
+        CodexRolloutExtent {
+            next_byte_offset: 8,
+            next_ordinal: 1,
+        },
+    );
+    let mut held = SnapshotAccumulator::new(SnapshotSource::Codex);
+    held.codex_ownership_boundary = CodexOwnershipBoundary::NativeCreatedThread;
+    held.codex_sidecar_projected_next_ordinal = None;
+    assert!(held_monotone(&held) && sidecar_wakes(&held));
+    let recorded = sidecar_fingerprint(&codex, &path);
+    let entry = |sidecar: Option<String>| {
+        MemoEntry::new(
+            "digest".into(),
+            LiveWitness::read(&file, 8).unwrap(),
+            OpenStamp::capture(&file).unwrap(),
+            None,
+            sidecar,
+            disclosure(),
+        )
+    };
+    let created = entry(sidecar_wakes(&held).then(|| recorded.clone()));
+    assert!(created.matches("digest", &file, None, &recorded).is_some());
+    // The sidecar rollout extent catches up with the file: the cure is
+    // visible, the entry wakes and the file is re-read.
+    codex.rollout_extents.insert(
+        SESSION.into(),
+        CodexRolloutExtent {
+            next_byte_offset: 16,
+            next_ordinal: 2,
+        },
+    );
+    let caught_up = sidecar_fingerprint(&codex, &path);
+    assert_ne!(caught_up, recorded);
+    assert!(created.matches("digest", &file, None, &caught_up).is_none());
+    // An identity conflict on the path's session also wakes it.
+    let mut conflicted = codex.clone();
+    conflicted.identity_conflicts.insert(SESSION.into());
+    let conflict = sidecar_fingerprint(&conflicted, &path);
+    assert_ne!(conflict, caught_up);
+    let caught_up_entry = entry(Some(caught_up.clone()));
+    assert!(caught_up_entry
+        .matches("digest", &file, None, &conflict)
+        .is_none());
+    // A fork hold is cured by peer parent evidence only.
+    held.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+    assert!(!sidecar_wakes(&held));
+    let fork = entry(sidecar_wakes(&held).then(|| recorded.clone()));
+    assert!(fork.matches("digest", &file, None, &caught_up).is_some());
 }
 
 /// C2: no time-based expiry. A memo entry wakes on cheap changed evidence
@@ -393,30 +552,30 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     let live = LiveWitness::read(&file, 8).unwrap();
     let stamp = OpenStamp::capture(&file).unwrap();
     let parent = Some(("parent".to_owned(), Some("ledger-1".to_owned())));
-    let entry = MemoEntry::new("digest".into(), live, stamp, parent, disclosure());
+    let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
     assert_eq!(entry.parent_ref(), Some("parent"));
     assert!(entry
-        .matches("digest", &file, Some("ledger-1".into()))
+        .matches("digest", &file, Some("ledger-1".into()), "")
         .is_some());
     assert!(entry
-        .matches("other", &file, Some("ledger-1".into()))
+        .matches("other", &file, Some("ledger-1".into()), "")
         .is_none());
     assert!(entry
-        .matches("digest", &file, Some("ledger-2".into()))
+        .matches("digest", &file, Some("ledger-2".into()), "")
         .is_none());
-    assert!(entry.matches("digest", &file, None).is_none());
+    assert!(entry.matches("digest", &file, None, "").is_none());
     // Growth past the refused offset cannot cure the hold: still a hit, and
     // the hit returns the grown stamp for the entry to keep.
     temp.append(b"{\"n\":3}\n");
     let grown = entry
-        .matches("digest", &file, Some("ledger-1".into()))
+        .matches("digest", &file, Some("ledger-1".into()), "")
         .expect("growth is a hit");
     assert!(grown.extent > entry.stamp.extent);
     let mut refreshed = entry.clone();
     refreshed.stamp = grown;
     // No timer: an entry whose evidence is unchanged keeps matching.
     assert!(refreshed
-        .matches("digest", &file, Some("ledger-1".into()))
+        .matches("digest", &file, Some("ledger-1".into()), "")
         .is_some());
     // A same-length stamp change (an in-place write elsewhere) wakes it.
     OpenOptions::new()
@@ -426,12 +585,12 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
         .unwrap();
     assert!(refreshed
-        .matches("digest", &file, Some("ledger-1".into()))
+        .matches("digest", &file, Some("ledger-1".into()), "")
         .is_none());
     // A rewritten prefix is a miss (re-read).
     fs::write(&temp.0, b"{\"n\":9}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
     assert!(entry
-        .matches("digest", &file, Some("ledger-1".into()))
+        .matches("digest", &file, Some("ledger-1".into()), "")
         .is_none());
 }
 
@@ -446,6 +605,7 @@ fn singleton_memo_is_bounded_lru_with_frozen_charges() {
         "digest".into(),
         LiveWitness::read(&file, 8).unwrap(),
         OpenStamp::capture(&file).unwrap(),
+        None,
         None,
         disclosure(),
     );
@@ -464,13 +624,16 @@ fn singleton_memo_is_bounded_lru_with_frozen_charges() {
     assert!(charged >= frozen);
     memo.remove("key-0");
     assert!(!memo.entries.contains_key("key-0"));
-    // A cache reset drops every memo entry with the paused slot.
+    // A copy-refusal release keeps every memo entry (K6): they are charged
+    // once in `heap_bound` and reserved at insert admission.
     let cache = SharedCache::default();
     cache.memo_record("key".into(), entry);
     assert!(cache.memo_lookup("key").is_some());
+    let resident = cache.cursor_resident();
+    assert!(resident >= frozen / MEMO_ENTRIES);
     cache.clear();
-    assert!(cache.memo_lookup("key").is_none());
-    assert!(cache.cursor_slot_free());
+    assert!(cache.memo_lookup("key").is_some());
+    assert_eq!(cache.cursor_resident(), resident);
 }
 
 fn codex_line(value: Value) -> Vec<u8> {
@@ -552,19 +715,19 @@ fn page_in(
     cache: Option<Arc<SharedCache>>,
     namespace: &str,
 ) -> (ScanIndex, SourceScanResult, Modes) {
-    let mut scan = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        std::slice::from_ref(&fixture.root),
-        index,
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        false,
-        None,
-        &[],
-        false,
-        true,
-    );
+    page_at(fixture, index, cache, namespace, NOW)
+}
+
+/// A page collected at `collected_at`: a census generation that starts on a
+/// later page gets its own window, hence its own fence token (K7).
+fn page_at(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: Option<Arc<SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+) -> (ScanIndex, SourceScanResult, Modes) {
+    let mut scan = codex_scan(fixture, index, collected_at);
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
     }
@@ -595,6 +758,33 @@ fn page_in(
             }
         }
     }
+}
+
+fn codex_scan(fixture: &ScanRoot, index: ScanIndex, collected_at: &str) -> OwnedSourceScan {
+    OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        collected_at,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+}
+
+/// `NOW` plus one second per page.
+fn collected_at(page: u64) -> String {
+    let seconds = 12 * 3600 + page;
+    format!(
+        "2026-10-07T{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
 }
 
 fn fingerprints(scan: &SourceScanResult) -> Vec<String> {
@@ -771,38 +961,52 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         assert_eq!(tailed.last_full_verified(), t_start);
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
 
-        // (iii) scaled `L > L_max`: pages 600 s apart, so one read of
-        // `ceil(L/B)` pages outlives the interval.
-        let fixture = ScanRoot::new(80);
-        let path = fixture.file(SESSION);
-        let key = local_index_key(&path);
+        // (iii) scaled `L > L_max` for two large files, both appended every
+        // page, pages 600 s apart so each read of `ceil(L/B)` pages outlives
+        // the interval. Rotation, not a monopoly (K7): the files alternate,
+        // each certifies once per census generation, and a completed attempt
+        // ends that file's census hold, so generations turn over.
+        let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 80)]);
+        let sessions = [SESSION, SESSION_B];
+        let keys = sessions.map(|session| local_index_key(&fixture.file(session)));
         let cache = Arc::new(SharedCache::default());
         let mut index = ScanIndex::default();
-        let mut opened = None;
+        let mut opened = BTreeMap::new();
         let mut completions = Vec::new();
         let mut tails = 0;
-        for page_number in 0..64_u64 {
+        for page_number in 0..192_u64 {
             clock.set(now);
             let started = counter(&cache, |c| c.jobs_started);
             let certified = counter(&cache, |c| c.jobs_certified);
-            let retained = cache.retained_checkpoint(&key);
-            let open_length = fixture.len(SESSION);
-            let (next, scan, modes) =
-                page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            let paused = cache.cursor_job_key();
+            let lengths = sessions.map(|session| fixture.len(session));
+            let retained = keys.clone().map(|key| cache.retained_checkpoint(&key));
+            let (next, scan, modes) = page_at(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(page_number),
+            );
             index = next;
-            if counter(&cache, |c| c.jobs_started) > started {
-                opened = Some((now, open_length));
-            }
             if modes.1 > 0 {
-                // Every tail is permitted by the deadline or by G's grace.
+                // Every tail is permitted by its deadline or by G's grace.
                 let permitted = retained
-                    .as_ref()
-                    .is_some_and(|retained| now < retained.last_full_verified() + interval);
+                    .iter()
+                    .flatten()
+                    .all(|retained| now < retained.last_full_verified() + interval);
                 assert!(permitted || LEVER_GRACE, "tail past the audit deadline");
                 tails += modes.1;
             }
+            if counter(&cache, |c| c.jobs_started) > started {
+                let key = cache.cursor_job_key().expect("the new job paused");
+                let file = keys.iter().position(|known| *known == key).unwrap();
+                opened.insert(key, (now, lengths[file]));
+            }
             if counter(&cache, |c| c.jobs_certified) > certified {
-                let (t_start, open_length) = opened.expect("job opened");
+                // A job spans pages, so the completed one was paused before.
+                let key = paused.expect("a paused job completed");
+                let (t_start, open_length) = opened[&key];
                 let checkpoint = cache.retained_checkpoint(&key).expect("certificate");
                 assert!(
                     !scan.snapshots.is_empty(),
@@ -819,8 +1023,8 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                     .audit_obligation(now)
                     .map(|debt| debt.due_unix_seconds);
                 assert!(due.is_some_and(|due| due <= t_start + interval && due <= now));
-                completions.push((page_number, open_length));
-                if completions.len() == 2 {
+                completions.push((key, census_token(&index)));
+                if completions.len() == 4 {
                     break;
                 }
             } else {
@@ -829,22 +1033,22 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                     "nothing publishes between audits"
                 );
             }
-            fixture.append(SESSION, &token_line(next_line));
-            next_line += 1;
+            for (session, line) in sessions.iter().zip([next_line, next_line + 1]) {
+                fixture.append(session, &token_line(line));
+            }
+            next_line += 2;
             now += 600;
         }
-        assert_eq!(completions.len(), 2, "two audits: {}", counters(&cache));
-        let (first, _) = completions[0];
-        let (second, open_length) = completions[1];
-        // The next audit opens right after a completion and publishes every
-        // `ceil(L/B)` pages; a page overshoots B by at most one record.
-        let record = token_line(next_line).len() as u64;
-        let pages = second - first;
-        assert!(
-            open_length.div_ceil(B + record) <= pages && pages <= open_length.div_ceil(B),
-            "{pages} pages for {open_length} bytes"
-        );
-        assert_eq!(counter(&cache, |c| c.audit_overdue), 2);
+        assert_eq!(completions.len(), 4, "four audits: {}", counters(&cache));
+        // Rotation: each pair of completions serves both files.
+        assert_ne!(completions[0].0, completions[1].0, "{}", counters(&cache));
+        assert_ne!(completions[2].0, completions[3].0, "{}", counters(&cache));
+        // The fence ended each file's hold after its attempt, so the census
+        // generation turned over between the two rounds.
+        assert_ne!(completions[0].1, completions[2].1);
+        assert!(counter(&cache, |c| c.deferred_next_generation) > 0);
+        assert_eq!(counter(&cache, |c| c.audit_overdue), 4);
+        assert!(counter(&cache, |c| c.audit_overdue_max_age_seconds) > 0);
         if !LEVER_GRACE {
             assert_eq!(tails, 0, "outcome D: no tails above L_max");
         }
@@ -983,11 +1187,12 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         .all(|path| pending_hint(&index, path).is_none()));
 }
 
-/// A paused job from another namespace (account, destination or reduction
-/// settings changed) is evicted at resume and its file restarts under the
-/// new namespace.
+/// K10 (R1-H3): a live paused job of another namespace is never evicted by a
+/// concurrent scan (no ping-pong); its own namespace keeps resuming it. Only
+/// a stale job, untouched for `NAMESPACE_STALE_PAGES` cursor pages because
+/// its namespace stopped scanning, is evicted, and its file restarts there.
 #[test]
-fn namespace_change_evicts_paused_job_and_restarts_it() {
+fn concurrent_namespace_leaves_live_job_and_evicts_only_stale_one() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1002,7 +1207,7 @@ fn namespace_change_evicts_paused_job_and_restarts_it() {
             .flatten()
     };
     with_test_limits(2048, 4096, 64, || {
-        let (index, _, _) = page_in(
+        let (index_a, _, _) = page_in(
             &fixture,
             ScanIndex::default(),
             Some(Arc::clone(&cache)),
@@ -1015,12 +1220,270 @@ fn namespace_change_evicts_paused_job_and_restarts_it() {
             counters(&cache)
         );
         assert!(cache.cursor_charge() > 0);
-        let (_, scan, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "ns-b");
+        let (mut index_b, scan, _) = page_in(
+            &fixture,
+            ScanIndex::default(),
+            Some(Arc::clone(&cache)),
+            "ns-b",
+        );
         assert!(scan.snapshots.is_empty());
-        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        assert!(counter(&cache, |c| c.namespace_busy) > 0);
+        assert_eq!(paused_namespace(&cache).as_deref(), Some("ns-a"));
+        // Its own namespace resumes it.
+        let resumed = counter(&cache, |c| c.jobs_resumed);
+        page_in(&fixture, index_a, Some(Arc::clone(&cache)), "ns-a");
+        assert!(counter(&cache, |c| c.jobs_resumed) > resumed);
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+        // Only ns-b keeps scanning: the job goes stale and ns-b takes over.
+        let mut pages = 0_u64;
+        while counter(&cache, |c| c.jobs_lost) == 0 {
+            pages += 1;
+            assert!(pages <= NAMESPACE_STALE_PAGES + 1, "{}", counters(&cache));
+            let (next, _, _) = page_in(&fixture, index_b, Some(Arc::clone(&cache)), "ns-b");
+            index_b = next;
+        }
+        assert!(
+            pages + 1 >= NAMESPACE_STALE_PAGES,
+            "evicted after {pages} pages"
+        );
         assert_eq!(counter(&cache, |c| c.jobs_started), 2);
         assert_eq!(paused_namespace(&cache).as_deref(), Some("ns-b"));
     });
+}
+
+/// K1 (R1-B1 = R2-B3): a session larger than B with more than 256 distinct
+/// usage-bearing turns (UUID-shaped turn ids in `task_started`,
+/// `turn_context`, `token_count`, `task_complete` shapes) keeps every exact
+/// witness in its byte-charged slot, pages to a certificate, publishes once
+/// and matches the unpaged read.
+#[test]
+fn turn_heavy_session_pages_past_the_witness_cap_and_publishes_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const TURNS: u64 = 400;
+    let fixture = ScanRoot::new(0);
+    let mut body = Vec::new();
+    for turn in 1..=TURNS {
+        let turn_id = format!("01a03e98-5000-7000-8000-{turn:012}");
+        body.extend(codex_line(
+            json!({"timestamp": "2026-10-07T10:30:00Z", "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": turn_id}}),
+        ));
+        body.extend(codex_line(
+            json!({"timestamp": "2026-10-07T10:30:00Z", "type": "turn_context",
+            "payload": {"turn_id": turn_id, "model": "fixture-model"}}),
+        ));
+        body.extend(token_line(turn));
+        body.extend(codex_line(
+            json!({"timestamp": "2026-10-07T10:30:01Z", "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": turn_id}}),
+        ));
+    }
+    fixture.append(SESSION, &body);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    assert!(!unpaged.snapshots.is_empty());
+    let cache = Arc::new(SharedCache::default());
+    let mut widest = 0;
+    let mut publishing_pages = 0;
+    let paged = with_test_limits(16 * 1024, 8 * 1024, 1024, || {
+        let mut index = ScanIndex::default();
+        let mut published = None;
+        for _ in 0..128 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            let held = cache.with_cursor(|cursor| match &cursor.slot {
+                Slot::Paused(job) => job
+                    .parser
+                    .accumulator
+                    .codex_observed_priority_turns
+                    .as_ref()
+                    .map_or(0, BTreeMap::len),
+                Slot::Empty | Slot::ActiveElsewhere { .. } => 0,
+            });
+            widest = widest.max(held.unwrap_or(0));
+            if !scan.snapshots.is_empty() {
+                publishing_pages += 1;
+                published = Some(scan);
+            }
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                let (_, again) = page(&fixture, index, Some(Arc::clone(&cache)));
+                assert!(again.snapshots.is_empty(), "published once");
+                return published.expect("the certified read publishes");
+            }
+        }
+        panic!("turn-heavy job did not certify: {}", counters(&cache));
+    });
+    assert!(
+        widest > sampled_jsonl::MAX_PRIORITY_WITNESSES,
+        "a pause held {widest} exact witnesses"
+    );
+    assert_eq!(publishing_pages, 1);
+    assert_eq!(counter(&cache, |c| c.jobs_state_bound), 0);
+    assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+    assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
+}
+
+/// K6 (R2-B1): a copy-refusal release by a Claude scan sharing the process
+/// cache evicts retained copies only. The paused Codex job keeps its charge
+/// and resumes to a certificate without restarting.
+#[test]
+fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 4096, 64, || {
+        let (mut index, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
+        assert!(scan.snapshots.is_empty());
+        let charge = cache.cursor_charge();
+        assert!(charge > 0, "the job paused: {}", counters(&cache));
+        let claude_root = Temp::new("claude-root", b"");
+        fs::remove_file(&claude_root.0).unwrap();
+        fs::create_dir_all(claude_root.0.join("projects")).unwrap();
+        let support = claude_root.0.join("support");
+        fs::create_dir_all(&support).unwrap();
+        let claude = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            &[claude_root.0.join("projects")],
+            ScanIndex::default(),
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            Some(&support),
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
+        // No active file: the release takes its conservative full path.
+        claude.release_sampled_cache_for_copy_refusal();
+        drop(claude);
+        assert_eq!(cache.cursor_charge(), charge, "the paused job survives");
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        for _ in 0..32 {
+            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+        assert!(counter(&cache, |c| c.jobs_resumed) > 0);
+    });
+}
+
+/// K12 (R2-H3): dropping a scan frame mid-job returns the intact job to the
+/// slot; the next page resumes it instead of restarting from byte zero.
+#[test]
+fn frame_drop_mid_job_returns_job_to_slot() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 4096, 64, || {
+        let mut scan = codex_scan(&fixture, ScanIndex::default(), NOW)
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        for _ in 0..10_000 {
+            if scan
+                .active_file
+                .as_ref()
+                .is_some_and(|active| active.cursor.is_some())
+            {
+                break;
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { .. } => panic!("the job never started"),
+            }
+        }
+        assert!(!cache.cursor_slot_free(), "the frame holds the job");
+        drop(scan);
+        assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 1);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        assert!(cache.cursor_charge() > 0);
+        let mut index = ScanIndex::default();
+        for _ in 0..32 {
+            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+        assert!(counter(&cache, |c| c.jobs_resumed) > 0);
+    });
+}
+
+/// K7 as pure state: oldest waiter first, never-served files ahead of served
+/// ones (an overdue audit is aged behind waiting large files), inactive
+/// waiters do not block, and one completed attempt per census generation.
+#[test]
+fn rotation_serves_waiters_in_turn_and_fences_one_attempt_per_generation() {
+    let mut rotation = Rotation {
+        page: 10,
+        ..Rotation::default()
+    };
+    rotation.wait("a");
+    rotation.page = 11;
+    rotation.wait("b");
+    assert!(rotation.turn("a"));
+    assert!(!rotation.turn("b"));
+    assert!(
+        !rotation.turn("new"),
+        "a newcomer waits behind active waiters"
+    );
+    rotation.complete("a", Some("g1"));
+    assert!(rotation.turn("b"));
+    assert!(!rotation.turn("a"), "a served file goes behind a waiter");
+    assert!(rotation.fenced("a", Some("g1")));
+    assert!(!rotation.fenced("a", Some("g2")));
+    assert!(!rotation.fenced("a", None));
+    rotation.complete("b", Some("g1"));
+    // Next generation: both served, `a` longer ago; a never-served file
+    // that starts waiting later still goes first.
+    rotation.page = 12;
+    rotation.wait("b");
+    rotation.wait("a");
+    rotation.page = 13;
+    rotation.wait("c");
+    assert!(rotation.turn("c"));
+    assert!(!rotation.turn("a") && !rotation.turn("b"));
+    rotation.complete("c", Some("g2"));
+    assert!(rotation.turn("a"));
+    assert!(!rotation.turn("b"));
+    // A waiter not seen for `WAITER_ACTIVE_PAGES` pages blocks nobody.
+    rotation.page += WAITER_ACTIVE_PAGES;
+    rotation.wait("b");
+    assert!(rotation.turn("b"));
+    // Forgotten after `WAITER_FORGET_PAGES`; every table stays bounded.
+    rotation.page += WAITER_FORGET_PAGES;
+    rotation.wait("d");
+    assert!(!rotation.waiting.contains_key("a"));
+    for index in 0..=ROTATION_KEYS {
+        let key = format!("key-{index:03}");
+        rotation.wait(&key);
+        rotation.complete(&key, Some("g3"));
+    }
+    assert!(rotation.waiting.len() <= ROTATION_KEYS);
+    assert_eq!(rotation.served.len(), ROTATION_KEYS);
+    assert_eq!(rotation.attempted.len(), ROTATION_KEYS);
 }
 
 /// §r sizing at the measured event counts. Prints the figures for the PR;

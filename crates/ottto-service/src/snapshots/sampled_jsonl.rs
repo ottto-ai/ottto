@@ -247,7 +247,22 @@ impl OwnedJsonlParser {
         remaining_copy_budget: usize,
     ) -> CompletedNativeAcquisition {
         let budget = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
-        if budget == 0 || !sampled_scan::compatible_reduction(&self.accumulator) {
+        // The job kept every turn witness (K1); a retained copy keeps the
+        // cache-only caps that govern every other retained reduction.
+        let witnesses_retainable = self
+            .accumulator
+            .codex_observed_priority_turns
+            .as_ref()
+            .map_or(true, |observed| {
+                observed.len() <= MAX_PRIORITY_WITNESSES
+                    && observed
+                        .keys()
+                        .all(|turn| turn.len() <= MAX_PRIORITY_WITNESS_ID_BYTES)
+            });
+        if budget == 0
+            || !witnesses_retainable
+            || !sampled_scan::compatible_reduction(&self.accumulator)
+        {
             return CompletedNativeAcquisition {
                 checkpoint,
                 reduction: None,
@@ -265,7 +280,11 @@ impl OwnedJsonlParser {
             let total = state.checked_add(certificate)?.checked_add(inline)?;
             (total <= budget).then_some(())
         })();
-        let accumulator = admitted.map(|()| self.accumulator.clone());
+        let accumulator = admitted.map(|()| {
+            let mut copy = self.accumulator.clone();
+            copy.codex_priority_witnesses_uncapped = false;
+            copy
+        });
         self.restore_live_reduction_inputs(inputs);
         let Some(accumulator) = accumulator else {
             return CompletedNativeAcquisition {

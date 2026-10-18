@@ -162,6 +162,10 @@ pub(crate) enum PrefixRefusal {
     Invalidated(FullReason),
     /// The interpretation scope or another dependency changed: invalidates.
     Dependency,
+    /// A tail reached its audit deadline before commit. Like
+    /// `commit_after_native_completion`, a tail never certifies past it;
+    /// the next read is the full audit. Not an invalidation.
+    AuditDue,
     /// Every object check holds but the native read was lossy. The result
     /// publishes uncertified, exactly like a lossy full read.
     Lossy,
@@ -572,6 +576,11 @@ impl ReadPlan {
         }
         if current_scope != &self.scope {
             return Err(PrefixRefusal::Dependency);
+        }
+        if let (ReadMode::Tail, Some(debt)) = (self.mode, self.debt) {
+            if now >= debt.due_unix_seconds {
+                return Err(PrefixRefusal::AuditDue);
+            }
         }
         if lossy {
             return Err(PrefixRefusal::Lossy);
@@ -1153,6 +1162,35 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// M1: a multi-page tail that reaches its audit deadline before commit is
+    /// refused (the next read is the audit), exactly like a single-page tail.
+    #[test]
+    fn tail_prefix_reaching_its_audit_deadline_is_refused_for_the_audit() {
+        let f = Fixture::new(b"one\n");
+        let cp = initial(&f, 1000);
+        f.append(b"two\n");
+        let debt = Some(AuditDebt {
+            due_unix_seconds: 1500,
+        });
+        let tail = |commit_at: u64| {
+            let mut file = f.open();
+            let mut plan = ReadPlan::prepare(&mut file, Some(&cp), &scope(), debt, 1100).unwrap();
+            assert_eq!(plan.mode(), ReadMode::Tail);
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            plan.observe_complete_records(&bytes).unwrap();
+            let consumed = plan.frozen_length();
+            plan.commit_sealed_prefix(&mut file, true, &scope(), 1100, commit_at, false, consumed)
+        };
+        assert_eq!(tail(1500).unwrap_err(), PrefixRefusal::AuditDue);
+        let certified = tail(1499).unwrap();
+        assert_eq!(certified.sealed_offset(), 8);
+        assert_eq!(
+            certified.audit_debt().map(|debt| debt.due_unix_seconds),
+            Some(1500)
+        );
     }
 
     #[test]
