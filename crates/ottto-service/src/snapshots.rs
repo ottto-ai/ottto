@@ -281,7 +281,10 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // codex v37 promotes allowlisted SKILL.md reads from the existing activity
 // summary into canonical opaque skill attribution facts. This makes the
 // Sessions skill facet work for Codex without uploading paths or prompt text.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v38";
+// codex v39 finds SKILL.md references with the shared path extractor (any
+// skills root, nested `.system`/synced layouts, relative paths, filename
+// boundaries) and emits capability marker v2 when every reference was named.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v39";
 const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
@@ -311,7 +314,10 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // states at the same provider instant.
 // v38 qualifies original usage-event clocks and complete mixed-root delivery.
 // Ordinary parser invalidation retains scan identity and accounting authority.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v38";
+// v39 records skill evidence from the tool walk: `Skill` tool input as an
+// invocation, SKILL.md paths read by `Read`/`Bash` as references (shared
+// extractor with Codex), and capability marker v2 when every reference was named.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v39";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -357,7 +363,9 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // the version that emitted no label.
 // codex v32 revisits existing rollouts once so activity-derived skill facts
 // backfill naturally instead of appearing only on sessions touched later.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v33";
+// codex v34 revisits retained rollouts once for the v39 skill extractor and the
+// v2 capability marker; unchanged sessions then converge as semantic no-ops.
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v34";
 // v28 revisits Claude history once because the v34 MCP-tool selector changes
 // transcript-derived session semantics for operators who enabled attribution
 // capture. Sessions parsed with capture off remain semantic no-ops.
@@ -375,7 +383,9 @@ pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v33";
 // compactions still came from the raw transcript. Revisit Claude history once
 // so proven successors replace those scalars and unresolved predecessors omit
 // them instead of publishing inherited context as child-owned.
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v29";
+// v30 revisits Claude history once for the v39 skill evidence and the v2
+// capability marker, so stored empty skill lists are corrected, not only new ones.
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v30";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
@@ -9585,6 +9595,10 @@ struct SnapshotAccumulator {
     activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     seen_claude_capability_tool_uses: BTreeSet<String>,
     activity_skills: BTreeSet<String>,
+    // A SKILL.md reference whose skill could not be named (`cat SKILL.md`,
+    // `skills/*/SKILL.md`). The session then keeps the v1 capability marker:
+    // its skill list may be incomplete, so it cannot prove "no skill used".
+    skill_detector_incomplete: bool,
     activity_changed_file_hashes: BTreeSet<String>,
     activity_patch_operations: u64,
     activity_lines_added: u64,
@@ -9757,6 +9771,7 @@ impl SnapshotAccumulator {
             activity_capability_buckets: BTreeMap::new(),
             seen_claude_capability_tool_uses: BTreeSet::new(),
             activity_skills: BTreeSet::new(),
+            skill_detector_incomplete: false,
             activity_changed_file_hashes: BTreeSet::new(),
             activity_patch_operations: 0,
             activity_lines_added: 0,
@@ -10587,13 +10602,22 @@ impl SnapshotAccumulator {
         }
     }
 
-    fn note_activity_material(&mut self, material: &str) {
+    fn note_activity_tools(&mut self, material: &str) {
         for name in nested_unified_exec_tools(material) {
             self.note_activity_tool(&name);
         }
-        for skill in skill_names_from_material(material) {
-            self.activity_skills.insert(skill);
-        }
+    }
+
+    /// SKILL.md references in tool input (Codex arguments, Claude Read/Bash).
+    /// Keeps one name past the wire cap so the backend still sees truncation.
+    fn note_activity_skills(&mut self, material: &str) {
+        let skills = &mut self.activity_skills;
+        let named_all = for_each_skill_md_reference(material, |name| {
+            if skills.len() <= MAX_ACTIVITY_SKILLS {
+                skills.insert(name);
+            }
+        });
+        self.skill_detector_incomplete |= !named_all;
     }
 
     fn note_capability_call(
@@ -10658,11 +10682,20 @@ impl SnapshotAccumulator {
         } else {
             0
         };
+        // v2: v1's capability counts plus a skill detector that named every
+        // SKILL.md reference it saw. Only v2 may later back "no skill used".
         let capability_collection_version = matches!(
             self.source,
             SnapshotSource::Codex | SnapshotSource::ClaudeCode
         )
-        .then(|| "agent_capability_usage:v1".to_string());
+        .then(|| {
+            if self.skill_detector_incomplete {
+                "agent_capability_usage:v1"
+            } else {
+                "agent_capability_usage:v2"
+            }
+            .to_string()
+        });
         let has_activity = capability_collection_version.is_some()
             || tool_calls > 0
             || self.activity_patch_operations > 0
@@ -10688,7 +10721,12 @@ impl SnapshotAccumulator {
             mcp_tool_counts: bounded_activity_counts(&self.activity_mcp_tool_counts, 32),
             capability_counts,
             capability_buckets,
-            skills: self.activity_skills.iter().take(32).cloned().collect(),
+            skills: self
+                .activity_skills
+                .iter()
+                .take(MAX_ACTIVITY_SKILLS)
+                .cloned()
+                .collect(),
         })
     }
 
@@ -11010,7 +11048,12 @@ impl SnapshotAccumulator {
             return;
         };
         let normalized = value.trim().to_ascii_lowercase();
-        if !normalized.is_empty() && normalized.len() <= 128 {
+        // One past the fact cap is enough to keep invocations ahead of
+        // references in `grouping_facts`; more would only grow memory.
+        if !normalized.is_empty()
+            && normalized.len() <= 128
+            && self.provider_skills.len() <= crate::session_attribution::MAX_SKILL_FACTS
+        {
             self.provider_skills.insert(normalized);
         }
     }
@@ -17553,23 +17596,52 @@ fn nested_unified_exec_tools(material: &str) -> Vec<String> {
     names
 }
 
-fn skill_names_from_material(material: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut remaining = material;
-    while let Some(index) = remaining.find("/skills/") {
-        remaining = &remaining[index + "/skills/".len()..];
-        let Some(end) = remaining.find("/SKILL.md") else {
-            break;
-        };
-        let candidate = &remaining[..end];
-        if !candidate.contains('/') {
-            if let Some(name) = bounded_activity_label(candidate) {
-                names.push(name);
-            }
+const MAX_ACTIVITY_SKILLS: usize = 32;
+const SKILL_MD: &str = "SKILL.md";
+
+/// Calls `on_name` with the immediate parent directory of every `…/<name>/SKILL.md`
+/// path token in `material` (any root: `.agents/skills`, plugin caches,
+/// `skills/.system`, synced buckets, relative paths). Returns false when a
+/// SKILL.md reference could not be named (`cat SKILL.md`, `skills/*/SKILL.md`,
+/// `"$D/SKILL.md"`). A delimiter scan, not a shell parser; no file is read.
+fn for_each_skill_md_reference(material: &str, mut on_name: impl FnMut(String)) -> bool {
+    let is_delimiter = |ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\'' | '=' | '(' | ')' | ';' | '|' | '&' | '<' | '>' | ',' | '`'
+            )
+    };
+    let mut named_all = true;
+    for (index, _) in material.match_indices(SKILL_MD) {
+        let after = &material[index + SKILL_MD.len()..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            continue; // SKILL.md.backup, SKILL.mdx
         }
-        remaining = &remaining[end + "/SKILL.md".len()..];
+        let before = &material[..index];
+        let Some(directory) = before.strip_suffix('/') else {
+            if before.chars().next_back().map_or(true, is_delimiter) {
+                named_all = false; // bare SKILL.md: a reference to an unknown skill
+            }
+            continue; // MY_SKILL.md and similar are other files
+        };
+        let token_start = directory
+            .char_indices()
+            .rev()
+            .find(|&(_, ch)| is_delimiter(ch))
+            .map_or(0, |(at, ch)| at + ch.len_utf8());
+        let token = &directory[token_start..];
+        let parent = &token[token.rfind('/').map_or(0, |at| at + 1)..];
+        match bounded_activity_label(parent).filter(|name| name != "." && name != "..") {
+            Some(name) => on_name(name),
+            None => named_all = false,
+        }
     }
-    names
+    named_all
 }
 
 fn bounded_activity_counts(
@@ -18373,7 +18445,8 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             if let Some(material) = string_at(value, &["payload", "arguments"])
                 .or_else(|| string_at(value, &["payload", "input"]))
             {
-                accumulator.note_activity_material(&material);
+                accumulator.note_activity_tools(&material);
+                accumulator.note_activity_skills(&material);
             }
         }
         if payload_type.as_deref() == Some("function_call_output") {
@@ -19109,6 +19182,34 @@ fn claude_response_tool_uses(value: &Value) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Skill evidence from one Claude tool call: a `Skill` invocation (provider
+/// native, like the `attributionSkill` marker) or a SKILL.md reference read by
+/// `Read`/`Bash` (provider artifact). Never counts tools: Claude's tool totals
+/// come from its own classifier.
+fn note_claude_skill_signal(
+    name: &str,
+    input: Option<&Value>,
+    accumulator: &mut SnapshotAccumulator,
+) {
+    let Some(input) = input else {
+        return;
+    };
+    match name {
+        "Skill" => accumulator.note_provider_skill(string_at(input, &["skill"])),
+        "Read" => {
+            if let Some(path) = input.get("file_path").and_then(Value::as_str) {
+                accumulator.note_activity_skills(path);
+            }
+        }
+        "Bash" => {
+            if let Some(command) = input.get("command").and_then(Value::as_str) {
+                accumulator.note_activity_skills(command);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn note_claude_capability_calls(
     value: &Value,
     timestamp: Option<&str>,
@@ -19127,6 +19228,7 @@ fn note_claude_capability_calls(
         let Some(name) = string_at(block, &["name"]) else {
             continue;
         };
+        note_claude_skill_signal(&name, block.get("input"), accumulator);
         let Some((capability_id, raw_origin)) = claude_capability_from_tool_name(&name) else {
             continue;
         };
@@ -27922,12 +28024,287 @@ mod tests {
     }
 
     #[test]
+    fn skill_md_references_name_every_layout_and_flag_unnamed_ones() {
+        let refs = |material: &str| {
+            let mut names = Vec::new();
+            let named_all = for_each_skill_md_reference(material, |name| names.push(name));
+            (names, named_all)
+        };
+        let named = |names: &[&str]| {
+            (
+                names
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>(),
+                true,
+            )
+        };
+        let unnamed = (Vec::<String>::new(), false);
+        for (material, expected) in [
+            (".agents/skills/x/SKILL.md", named(&["x"])),
+            (
+                "/u/.claude/plugins/cache/mkt/plugin/1.2.0/skills/review/SKILL.md",
+                named(&["review"]),
+            ),
+            (
+                "/u/.codex/skills/.system/imagegen/SKILL.md",
+                named(&["imagegen"]),
+            ),
+            (
+                "/u/.claude/skills/synced/b1/MySkill/SKILL.md",
+                named(&["MySkill"]),
+            ),
+            ("cat skills/x/SKILL.md", named(&["x"])),
+            ("sed -n 1,40p r0/x/SKILL.md", named(&["x"])),
+            ("cat /skills/a/README.md /skills/b/SKILL.md", named(&["b"])),
+            ("cp /s/x/SKILL.md /s/x/SKILL.md.backup", named(&["x"])),
+            ("{\"cmd\":\"cat '/r/skills/a/SKILL.md'\"}", named(&["a"])),
+            ("cat\u{a0}x/SKILL.md", named(&["x"])),
+            ("cat /s/x/SKILL.mdx MY_SKILL.md", named(&[])),
+            ("cat SKILL.md", unnamed.clone()),
+            ("ls skills/*/SKILL.md", unnamed.clone()),
+            ("cat \"$D/SKILL.md\"", unnamed.clone()),
+            ("cat ../SKILL.md", unnamed.clone()),
+        ] {
+            assert_eq!(refs(material), expected, "{material}");
+        }
+    }
+
+    #[test]
+    fn claude_skill_evidence_separates_invocations_from_references() {
+        let tool_use = |id: &str, name: &str, input: Value| json!({"type":"assistant","sessionId":"claude-skills","timestamp":"2026-10-18T06:00:00Z","message":{"id":format!("msg-{id}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":name,"input":input}]}});
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        for line in [
+            tool_use("t1", "Skill", json!({"skill":"Repo-Task-Lifecycle"})),
+            json!({"type":"assistant","sessionId":"claude-skills","attributionSkill":"repo-task-lifecycle","message":{"role":"assistant","content":[]}}),
+            tool_use(
+                "t2",
+                "Read",
+                json!({"file_path":"/u/.claude/plugins/cache/m/p/1.0.0/skills/Review/SKILL.md"}),
+            ),
+            tool_use(
+                "t3",
+                "Read",
+                json!({"file_path":"/u/notes/x/SKILL.md.backup"}),
+            ),
+            tool_use(
+                "t4",
+                "Bash",
+                json!({"command":"sed -n 1,20p /u/skills/a/README.md /u/skills/pdf/SKILL.md; await tools.foo(1)"}),
+            ),
+            tool_use(
+                "t5",
+                "Edit",
+                json!({"file_path":"/u/skills/authoring/SKILL.md"}),
+            ),
+        ] {
+            apply_claude_code_line(&line, &mut accumulator);
+        }
+        assert_eq!(
+            accumulator.provider_skills.iter().collect::<Vec<_>>(),
+            vec!["repo-task-lifecycle"]
+        );
+        let summary = accumulator.activity_summary().expect("activity summary");
+        assert_eq!(summary.skills, vec!["Review", "pdf"]);
+        assert_eq!(
+            summary.capability_collection_version.as_deref(),
+            Some("agent_capability_usage:v2")
+        );
+        assert_eq!(summary.tool_calls, 0);
+        assert!(summary.tool_counts.is_empty());
+        let encoded = serde_json::to_string(&summary).expect("serialize");
+        assert!(!encoded.contains("/u/"));
+
+        // An unnamed reference keeps v1: this session cannot prove "no skill".
+        apply_claude_code_line(
+            &tool_use("t6", "Bash", json!({"command":"cat SKILL.md"})),
+            &mut accumulator,
+        );
+        let summary = accumulator.activity_summary().expect("activity summary");
+        assert_eq!(
+            summary.capability_collection_version.as_deref(),
+            Some("agent_capability_usage:v1")
+        );
+
+        // Bounded: one name past the wire cap is kept, so truncation shows.
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        for index in 0..40 {
+            apply_claude_code_line(
+                &tool_use(
+                    &format!("r{index}"),
+                    "Read",
+                    json!({"file_path": format!("/s/skill-{index:02}/SKILL.md")}),
+                ),
+                &mut accumulator,
+            );
+            accumulator.note_provider_skill(Some(format!("invoked-{index:02}")));
+        }
+        assert_eq!(accumulator.activity_skills.len(), MAX_ACTIVITY_SKILLS + 1);
+        assert_eq!(
+            accumulator.provider_skills.len(),
+            crate::session_attribution::MAX_SKILL_FACTS + 1
+        );
+        let summary = accumulator.activity_summary().expect("activity summary");
+        assert_eq!(summary.skills.len(), MAX_ACTIVITY_SKILLS);
+    }
+
+    #[test]
+    fn skill_detector_upgrade_republishes_retained_claude_history_once() {
+        let home = temp_dir("claude-skill-detector-upgrade");
+        let projects_root = home.join(".claude").join("projects");
+        let project_dir = projects_root.join("-Users-dev-repo");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let usage = |session_id: &str| json!({"timestamp":"2026-07-31T10:01:00Z","sessionId":session_id,"message":{"model":"claude-opus-4-8","usage":{"input_tokens":35,"output_tokens":8}}});
+        let skilled = "55555555-6666-7777-8888-999999999999";
+        let empty = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+        let read_skill = json!({"timestamp":"2026-07-31T10:02:00Z","type":"assistant","sessionId":skilled,"message":{"id":"msg-read","role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"/u/.claude/skills/pdf/SKILL.md"}}]}});
+        fs::write(
+            project_dir.join(format!("{skilled}.jsonl")),
+            format!("{}\n{read_skill}\n", usage(skilled)),
+        )
+        .expect("write skilled transcript");
+        fs::write(
+            project_dir.join(format!("{empty}.jsonl")),
+            format!("{}\n", usage(empty)),
+        )
+        .expect("write empty transcript");
+        let scan = |index: &mut ScanIndex, at: &str| {
+            scan_source_roots(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&projects_root),
+                index,
+                at,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("scan")
+        };
+        let content_hash = |item: &SnapshotItem| {
+            snapshot_content_hash(
+                SnapshotSource::ClaudeCode,
+                &item.source_session_id,
+                &snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, item),
+            )
+        };
+
+        let mut index = ScanIndex::default();
+        let current = scan(&mut index, "2026-07-31T10:04:00Z");
+        assert_eq!(current.snapshots.len(), 2);
+        // Rewind the index to what the previous daemon left: the old scan
+        // identity and a settled v1 body without Claude skill evidence.
+        let mut previous = BTreeMap::new();
+        for entry in index.files.values_mut() {
+            let mut old = current
+                .snapshots
+                .iter()
+                .find(|item| {
+                    item.source_file_fingerprint.as_deref()
+                        == Some(entry.source_file_fingerprint.as_str())
+                })
+                .expect("indexed snapshot")
+                .clone();
+            let summary = old.activity_summary.as_mut().expect("activity summary");
+            summary.capability_collection_version = Some("agent_capability_usage:v1".to_string());
+            summary.skills.clear();
+            entry.scan_identity_version = Some("claude_code_jsonl:v29".to_string());
+            entry.source_file_fingerprint = format!("v29:{}", entry.source_file_fingerprint);
+            entry.last_snapshot_fingerprint =
+                Some(snapshot_fingerprint(SnapshotSource::ClaudeCode, &old));
+            previous.insert(old.source_session_id.clone(), old);
+        }
+
+        let upgraded = scan(&mut index, "2026-07-31T10:05:00Z");
+        assert_eq!(upgraded.semantic_noop_count, 0);
+        assert_eq!(
+            upgraded.snapshots.len(),
+            2,
+            "every retained session republishes"
+        );
+        for item in &upgraded.snapshots {
+            let old = &previous[&item.source_session_id];
+            assert_eq!(content_hash(item), content_hash(old));
+            assert_eq!(
+                (item.input_tokens, item.output_tokens),
+                (old.input_tokens, old.output_tokens)
+            );
+            let summary = item.activity_summary.as_ref().expect("activity summary");
+            assert_eq!(
+                summary.capability_collection_version.as_deref(),
+                Some("agent_capability_usage:v2")
+            );
+            let expected: &[&str] = if item.source_session_id == skilled {
+                &["pdf"]
+            } else {
+                &[]
+            };
+            assert_eq!(summary.skills, expected);
+        }
+        let mut labels_off = upgraded.snapshots.clone();
+        apply_upload_policy(
+            SnapshotSource::ClaudeCode,
+            &mut labels_off,
+            SnapshotUploadPolicy {
+                session_titles_enabled: true,
+                workspace_labels_enabled: true,
+                session_artifacts_enabled: true,
+                session_attribution_enabled: false,
+                session_attribution_labels_enabled: false,
+            },
+        );
+        assert!(labels_off.iter().all(|item| item
+            .activity_summary
+            .as_ref()
+            .is_some_and(|summary| summary.skills.is_empty())
+            && item.attribution_facts.is_empty()));
+
+        let settled = scan(&mut index, "2026-07-31T10:06:00Z");
+        assert!(
+            settled.snapshots.is_empty(),
+            "converges after one republish"
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_unnamed_skill_reference_keeps_capability_marker_v1() {
+        let path = temp_file("codex-unnamed-skill");
+        let lines = [
+            json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"unnamed-skill-session"}}),
+            json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cat skills/*/SKILL.md /c/skills/pdf/SKILL.md\"}"}}),
+            json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write transcript");
+
+        let item = parse_codex_jsonl_file(&path, "2026-08-02T06:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let summary = item.activity_summary.as_ref().expect("activity summary");
+        assert_eq!(summary.skills, vec!["pdf"]);
+        assert_eq!(summary.shell_commands, 1);
+        assert_eq!(
+            summary.capability_collection_version.as_deref(),
+            Some("agent_capability_usage:v1")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn codex_activity_summary_counts_actions_without_uploading_content() {
         let path = temp_file("codex-activity-summary");
         let lines = vec![
             json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"activity-session"}}),
             json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"secret command\"}"}}),
-            json!({"timestamp":"2026-08-02T06:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.exec_command({}); await tools.write_stdin({}); /skills/repo-task-lifecycle/SKILL.md"}}),
+            json!({"timestamp":"2026-08-02T06:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.exec_command({}); await tools.write_stdin({}); /skills/repo-task-lifecycle/SKILL.md; cat /c/skills/.system/imagegen/SKILL.md"}}),
             json!({"timestamp":"2026-08-02T06:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"private patch content"}}),
             json!({"timestamp":"2026-08-02T06:00:04Z","type":"event_msg","payload":{"type":"patch_apply_end","changes":{"src/private.rs":{"unified_diff":"--- a/src/private.rs\n+++ b/src/private.rs\n-old\n+new\n"},"tests/secret.rs":{"unified_diff":"--- /dev/null\n+++ b/tests/secret.rs\n+test\n"}}}}),
             json!({"timestamp":"2026-08-02T06:00:05Z","type":"response_item","payload":{"type":"web_search_end"}}),
@@ -27962,7 +28339,11 @@ mod tests {
         assert_eq!(summary.web_searches, 1);
         assert_eq!(summary.mcp_calls, 2);
         assert_eq!(summary.subagent_spawns, 1);
-        assert_eq!(summary.skills, vec!["repo-task-lifecycle"]);
+        assert_eq!(summary.skills, vec!["imagegen", "repo-task-lifecycle"]);
+        assert_eq!(
+            summary.capability_collection_version.as_deref(),
+            Some("agent_capability_usage:v2")
+        );
         assert!(summary
             .mcp_tool_counts
             .iter()
@@ -59280,13 +59661,13 @@ pub(crate) mod cache_adapter_tests {
             "../../../fixtures/snapshot-audit/cache_observation_codex_v1.json"
         ))
         .unwrap();
+        if let Ok(output) = std::env::var("OTTTO_CACHE_FIXTURE_OUT") {
+            std::fs::write(output, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+        }
         assert_eq!(
             fixture, golden,
             "production codex cache fixture must remain exact"
         );
-        if let Ok(output) = std::env::var("OTTTO_CACHE_FIXTURE_OUT") {
-            std::fs::write(output, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
-        }
     }
     /// Export metadata from the already generated production-wire fixtures.
     #[test]
@@ -59527,7 +59908,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);

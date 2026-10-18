@@ -26,6 +26,8 @@ use zeroize::Zeroizing;
 
 pub const SESSION_ATTRIBUTION_SCHEMA_VERSION: &str = "session_attribution.v1";
 pub const MAX_SESSION_ATTRIBUTION_FACTS: usize = 24;
+/// `skill_id` facts per session; invocations are emitted before references.
+pub(crate) const MAX_SKILL_FACTS: usize = 8;
 pub const MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES: usize = 128;
 pub const MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES: usize = 32;
 pub const MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES: usize = 96;
@@ -345,7 +347,7 @@ impl SessionAttributionContext {
         }
 
         let mut emitted_skills = BTreeSet::new();
-        for skill in input.provider_skills.iter().take(8) {
+        for skill in input.provider_skills.iter().take(MAX_SKILL_FACTS) {
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
                 let display_label = skill_name_display_label(skill);
                 push_labeled_fact(
@@ -362,7 +364,7 @@ impl SessionAttributionContext {
             }
         }
         for skill in input.activity_skills {
-            if emitted_skills.len() >= 8 || emitted_skills.contains(skill) {
+            if emitted_skills.len() >= MAX_SKILL_FACTS || emitted_skills.contains(skill) {
                 continue;
             }
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
@@ -381,7 +383,7 @@ impl SessionAttributionContext {
             }
         }
         if let Some(skill) = input.first_prompt.and_then(slash_skill_name) {
-            if emitted_skills.len() < 8 && !emitted_skills.contains(&skill) {
+            if emitted_skills.len() < MAX_SKILL_FACTS && !emitted_skills.contains(&skill) {
                 if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
                     let display_label = skill_name_display_label(&skill);
                     push_labeled_fact(
