@@ -12,13 +12,19 @@ const AUDIT_AND_SCRATCH_BYTES: usize = 1024 * 1024;
 const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
+pub(super) mod codex_cursor;
+
 pub(crate) struct SharedCache {
     inner: Mutex<TranscriptCache<sampled_jsonl::CachedJsonlReduction>>,
+    /// The resumable Codex job slot and held-singleton memo. Charged once,
+    /// here; copy budgets and insert admission see it through this cache.
+    cursor: Mutex<codex_cursor::CursorState>,
 }
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
+            cursor: Mutex::new(codex_cursor::CursorState::default()),
         }
     }
 }
@@ -29,7 +35,8 @@ impl std::fmt::Debug for SharedCache {
 }
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        self.inner.heap_bound(c)
+        self.inner.heap_bound(c)?;
+        self.cursor.heap_bound(c)
     }
 }
 impl SharedCache {
@@ -44,6 +51,9 @@ impl SharedCache {
     ) -> Option<crate::transcript_cache::Retained<sampled_jsonl::CachedJsonlReduction>> {
         self.inner.lock().ok()?.take(key)
     }
+    pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
+        self.inner.lock().ok()?.sealed_offset(key)
+    }
     pub(super) fn insert(
         &self,
         key: String,
@@ -51,6 +61,9 @@ impl SharedCache {
         live_bytes: usize,
     ) {
         if let Some(state) = completed.reduction {
+            // A paused cursor job keeps its charge: admission may not fill the
+            // state budget underneath it.
+            let live_bytes = live_bytes.saturating_add(self.cursor_charge());
             if let Ok(mut cache) = self.inner.lock() {
                 cache.insert_reserving(
                     key,
@@ -67,7 +80,7 @@ impl SharedCache {
 
 pub(super) struct Context {
     pub(super) cache: Arc<SharedCache>,
-    namespace: Scope,
+    pub(super) namespace: Scope,
     pub(super) audit_metadata_supported: bool,
     pub(super) audit_slots: usize,
     pub(super) full_files: usize,

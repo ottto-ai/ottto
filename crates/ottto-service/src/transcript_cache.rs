@@ -111,6 +111,13 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
     }
+    /// Sealed offset of a retained entry without taking it, so a page budget
+    /// can plan a tail read before the frame consumes retained state.
+    pub(crate) fn sealed_offset(&self, key: &str) -> Option<u64> {
+        self.entries
+            .get(key)
+            .map(|entry| entry.retained.checkpoint.sealed_offset())
+    }
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) {
         self.entries.remove(key);
