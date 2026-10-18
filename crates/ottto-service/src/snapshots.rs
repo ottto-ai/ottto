@@ -10610,10 +10610,14 @@ impl SnapshotAccumulator {
 
     /// SKILL.md references in tool input (Codex arguments, Claude Read/Bash).
     /// Keeps one name past the wire cap so the backend still sees truncation.
+    /// The first spelling wins: `Foo/SKILL.md` and `foo/SKILL.md` are one
+    /// skill, and the backend keys uploaded names by their exact bytes.
     fn note_activity_skills(&mut self, material: &str) {
         let skills = &mut self.activity_skills;
         let named_all = for_each_skill_md_reference(material, |name| {
-            if skills.len() <= MAX_ACTIVITY_SKILLS {
+            if skills.len() <= MAX_ACTIVITY_SKILLS
+                && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name))
+            {
                 skills.insert(name);
             }
         });
@@ -10721,11 +10725,19 @@ impl SnapshotAccumulator {
             mcp_tool_counts: bounded_activity_counts(&self.activity_mcp_tool_counts, 32),
             capability_counts,
             capability_buckets,
+            // A reference to an invoked skill uploads the invocation's
+            // (lowercased) spelling, the one its `skill_id` fact hashes, so
+            // backend promotion of these names finds that fact.
             skills: self
                 .activity_skills
                 .iter()
                 .take(MAX_ACTIVITY_SKILLS)
-                .cloned()
+                .map(|skill| {
+                    self.provider_skills
+                        .get(&skill.to_ascii_lowercase())
+                        .unwrap_or(skill)
+                        .clone()
+                })
                 .collect(),
         })
     }
@@ -28099,6 +28111,13 @@ mod tests {
                 "Edit",
                 json!({"file_path":"/u/skills/authoring/SKILL.md"}),
             ),
+            // Casing variants of skills already seen: the invoked one and pdf.
+            tool_use(
+                "t7",
+                "Read",
+                json!({"file_path":"/u/.claude/skills/Repo-Task-Lifecycle/SKILL.md"}),
+            ),
+            tool_use("t8", "Read", json!({"file_path":"/u/skills/PDF/SKILL.md"})),
         ] {
             apply_claude_code_line(&line, &mut accumulator);
         }
@@ -28106,8 +28125,10 @@ mod tests {
             accumulator.provider_skills.iter().collect::<Vec<_>>(),
             vec!["repo-task-lifecycle"]
         );
+        // One spelling per skill, the one its `skill_id` fact hashes: backend
+        // admission promotes these names by exact bytes.
         let summary = accumulator.activity_summary().expect("activity summary");
-        assert_eq!(summary.skills, vec!["Review", "pdf"]);
+        assert_eq!(summary.skills, vec!["repo-task-lifecycle", "Review", "pdf"]);
         assert_eq!(
             summary.capability_collection_version.as_deref(),
             Some("agent_capability_usage:v2")

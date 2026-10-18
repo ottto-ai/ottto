@@ -348,7 +348,8 @@ impl SessionAttributionContext {
 
         // Keyed case-insensitively: provider names arrive lowercased, while
         // SKILL.md directory names keep their case, and one skill must not
-        // take two fact slots. Each fact still hashes its own spelling.
+        // take two fact slots. Each fact still hashes its own spelling, and
+        // `activity_summary` uploads those same spellings for promotion.
         let mut emitted_skills = BTreeSet::new();
         for skill in input.provider_skills.iter().take(MAX_SKILL_FACTS) {
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
