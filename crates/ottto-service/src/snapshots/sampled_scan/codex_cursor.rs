@@ -1400,6 +1400,14 @@ impl SharedCache {
             });
             refusal
         };
+        // #625 decoder seam: a compressed input has no physical offsets,
+        // samples or frozen extent, and its decoded size is not the on-disk
+        // length `PageBudget::plan` compares with B. Refuse it explicitly
+        // (never a cursor job); the activation names the compressed > B plan
+        // and sizes it by decoded bytes.
+        if job.parser.reader.reader.is_compressed() {
+            return Err(refuse(StartRefusal::Unstartable));
+        }
         // The certificate needs the acquisition's open stamp and samples.
         let Some((frozen, start)) = job
             .parser
