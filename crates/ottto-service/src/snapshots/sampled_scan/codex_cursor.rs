@@ -37,6 +37,8 @@ const SKIP_CHUNK_BYTES: usize = 1024 * 1024;
 const MEMBER_CHANGED_AFTER: u32 = 3;
 const INVALIDATION_KEYS: usize = 64;
 const PARKED_KEYS: usize = 64;
+/// The paused reader buffer keeps at least this much capacity.
+const PAUSED_BUFFER_BYTES: usize = 64 * 1024;
 const MEMO_ENTRIES: usize = 256;
 /// Bytes one memo lookup or record reads from the held file (head and
 /// boundary samples). Charged to the page's singleton budget (M3).
@@ -739,6 +741,10 @@ impl CursorLease {
     /// releasing least-recently-useful retained copies (K6). A job that does
     /// not fit ends as strict `JoinStateBound` debt.
     fn suspend(self, mut job: OwnedActiveFile, count: fn(&mut Counters)) -> PauseEnd {
+        // The slot charge walks the reader buffer's capacity (S3); shrink it
+        // first so one overlong record cannot pin `max_line_bytes`.
+        let keep = job.parser.reader.buf.len().max(PAUSED_BUFFER_BYTES);
+        job.parser.reader.buf.shrink_to(keep);
         let inputs = job.parser.take_live_reduction_inputs();
         let admitted =
             paused_charge(&mut job).filter(|charge| self.cache.cursor_make_room(*charge));
