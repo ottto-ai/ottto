@@ -1902,6 +1902,12 @@ pub struct ScanIndex {
     /// pages; an actual read/parse/budget failure invalidates it until recovery.
     #[serde(default)]
     claude_desktop_identity_census_complete: bool,
+    /// Same rule for desktop spawn lineage: links are asserted only from a
+    /// complete, error-free store sweep, and an incomplete page that changed a
+    /// lineage id invalidates it until the next complete sweep. Kept apart from
+    /// the identity census so lineage churn never moves identity evidence.
+    #[serde(default)]
+    claude_desktop_lineage_census_complete: bool,
     /// When the last complete, error-free Desktop store sweep finished, bound
     /// to this process and store inventory. Absent (unknown) for older indexes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2037,6 +2043,7 @@ impl Default for ScanIndex {
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
             claude_desktop_identity_census_complete: false,
+            claude_desktop_lineage_census_complete: false,
             claude_desktop_census_witness: None,
             claude_desktop_store_retry_attempt: 0,
             claude_desktop_store_retry_not_before_unix_seconds: None,
@@ -8640,8 +8647,9 @@ struct ClaudeTitleMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaudeDesktopSpawnLineage {
     parent_session_id: String,
-    root_session_id: String,
-    spawn_depth: usize,
+    /// Present only when the whole chain above resolves to a confirmed root.
+    root_session_id: Option<String>,
+    spawn_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -8783,11 +8791,14 @@ impl ClaudeTitleMetadata {
         // their fingerprint and only spawned children re-emit once.
         let spawn_depth;
         if let Some(lineage) = self.spawn_lineage.get(source_session_id) {
-            spawn_depth = lineage.spawn_depth.to_string();
+            spawn_depth = lineage
+                .spawn_depth
+                .map(|depth| depth.to_string())
+                .unwrap_or_default();
             parts.extend([
                 "desktop_spawn_lineage:v1",
                 lineage.parent_session_id.as_str(),
-                lineage.root_session_id.as_str(),
+                lineage.root_session_id.as_deref().unwrap_or(""),
                 spawn_depth.as_str(),
             ]);
         }
@@ -8900,6 +8911,7 @@ impl ClaudeTitleMetadata {
         let (session_files, sweep_complete, next_cursor, next_upper_bound) =
             selection.finish(census.discovered_file_count);
         let mut original_identity_changed = false;
+        let mut lineage_changed = false;
         for path in &session_files {
             let account_identifier_hash = store_dirs
                 .iter()
@@ -8918,6 +8930,12 @@ impl ClaudeTitleMetadata {
                         previous.cli_session_id != entry.cli_session_id
                             || previous.original_identity != entry.original_identity
                     });
+                    lineage_changed |= previous.map_or(true, |previous| {
+                        previous.cli_session_id != entry.cli_session_id
+                            || previous.desktop_session_id != entry.desktop_session_id
+                            || previous.spawned_from_desktop_session_id
+                                != entry.spawned_from_desktop_session_id
+                    });
                     index
                         .claude_desktop_title_files
                         .insert(local_index_key(path), entry);
@@ -8927,6 +8945,13 @@ impl ClaudeTitleMetadata {
                         .claude_desktop_title_files
                         .get(&local_index_key(path))
                         .is_some_and(|entry| entry.original_identity.is_some());
+                    lineage_changed |= index
+                        .claude_desktop_title_files
+                        .get(&local_index_key(path))
+                        .is_some_and(|entry| {
+                            entry.desktop_session_id.is_some()
+                                || entry.spawned_from_desktop_session_id.is_some()
+                        });
                     index
                         .claude_desktop_title_files
                         .remove(&local_index_key(path));
@@ -8952,6 +8977,11 @@ impl ClaudeTitleMetadata {
         }
         metadata.original_identity_census_incomplete =
             !index.claude_desktop_identity_census_complete;
+        if sweep_had_errors || (!sweep_complete && lineage_changed) {
+            index.claude_desktop_lineage_census_complete = false;
+        } else if sweep_complete {
+            index.claude_desktop_lineage_census_complete = true;
+        }
         index.claude_desktop_store_cursor = next_cursor;
         index.claude_desktop_store_upper_bound = next_upper_bound;
         index.claude_desktop_store_sweep_had_errors = if sweep_complete {
@@ -9019,8 +9049,10 @@ impl ClaudeTitleMetadata {
                 }
             }
         }
-        metadata.spawn_lineage =
-            claude_desktop_spawn_lineage(index.claude_desktop_title_files.values());
+        if index.claude_desktop_lineage_census_complete {
+            metadata.spawn_lineage =
+                claude_desktop_spawn_lineage(index.claude_desktop_title_files.values());
+        }
         let sidecar_parts = metadata
             .titles
             .iter()
@@ -9036,12 +9068,24 @@ impl ClaudeTitleMetadata {
 /// cyclic store.
 const MAX_CLAUDE_DESKTOP_SPAWN_DEPTH: usize = 9;
 
+/// What the store says about one session's starting session.
+#[derive(Clone, Copy)]
+enum ClaudeDesktopSpawnParent<'a> {
+    /// Every store file for the session says nobody started it.
+    Root,
+    Parent(&'a str),
+    /// Missing, conflicting, self-referential or unresolvable.
+    Unresolved,
+}
+
 /// Resolve each desktop `spawnedFrom` link to transcript ids.
 ///
-/// A link is kept only when every store file for the child agrees on one parent
-/// desktop id, that desktop id belongs to exactly one transcript, and the chain
-/// up to its root is acyclic within the depth bound. Anything else leaves the
-/// child unlinked rather than guessing.
+/// The direct edge is kept only when every store file for the child agrees on
+/// one parent desktop id, that desktop id belongs to exactly one other
+/// transcript, and the child is not on a cycle. Root and depth are added only
+/// when the whole chain above reaches a session the store confirms nobody
+/// started, acyclic and within the depth bound; an unresolved ancestor keeps the
+/// exact edge but withholds root and depth rather than guessing them.
 fn claude_desktop_spawn_lineage<'a>(
     entries: impl Iterator<Item = &'a ClaudeDesktopTitleIndexEntry>,
 ) -> BTreeMap<String, ClaudeDesktopSpawnLineage> {
@@ -9059,45 +9103,58 @@ fn claude_desktop_spawn_lineage<'a>(
             .or_default()
             .insert(entry.spawned_from_desktop_session_id.as_deref());
     }
-    let direct_parent = |child: &str| -> Option<&str> {
-        let parents = parent_desktop_by_cli.get(child)?;
-        let [Some(parent_desktop_id)] = parents.iter().copied().collect::<Vec<_>>()[..] else {
-            return None;
+    let resolve = |session: &str| -> ClaudeDesktopSpawnParent<'_> {
+        let Some(parents) = parent_desktop_by_cli.get(session) else {
+            return ClaudeDesktopSpawnParent::Unresolved;
         };
-        let clis = cli_by_desktop.get(parent_desktop_id)?;
-        let [parent] = clis.iter().copied().collect::<Vec<_>>()[..] else {
-            return None;
-        };
-        (parent != child).then_some(parent)
+        match parents.iter().copied().collect::<Vec<_>>()[..] {
+            [None] => ClaudeDesktopSpawnParent::Root,
+            [Some(parent_desktop_id)] => {
+                let clis = cli_by_desktop
+                    .get(parent_desktop_id)
+                    .map(|clis| clis.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                match clis[..] {
+                    [parent] if parent != session => ClaudeDesktopSpawnParent::Parent(parent),
+                    _ => ClaudeDesktopSpawnParent::Unresolved,
+                }
+            }
+            _ => ClaudeDesktopSpawnParent::Unresolved,
+        }
     };
     let mut lineage = BTreeMap::new();
-    for &child in parent_desktop_by_cli.keys() {
-        let Some(parent) = direct_parent(child) else {
+    'children: for &child in parent_desktop_by_cli.keys() {
+        let ClaudeDesktopSpawnParent::Parent(parent) = resolve(child) else {
             continue;
         };
         let mut seen = BTreeSet::from([child, parent]);
         let mut root = parent;
         let mut depth = 1;
-        let complete = loop {
-            let Some(next) = direct_parent(root) else {
-                break true;
-            };
-            if depth >= MAX_CLAUDE_DESKTOP_SPAWN_DEPTH || !seen.insert(next) {
-                break false;
+        let ancestry = loop {
+            match resolve(root) {
+                ClaudeDesktopSpawnParent::Root => break Some((root, depth)),
+                ClaudeDesktopSpawnParent::Unresolved => break None,
+                ClaudeDesktopSpawnParent::Parent(next) => {
+                    if next == child {
+                        // The child is on a cycle: no edge it is part of is real.
+                        continue 'children;
+                    }
+                    if depth >= MAX_CLAUDE_DESKTOP_SPAWN_DEPTH || !seen.insert(next) {
+                        break None;
+                    }
+                    root = next;
+                    depth += 1;
+                }
             }
-            root = next;
-            depth += 1;
         };
-        if complete {
-            lineage.insert(
-                child.to_string(),
-                ClaudeDesktopSpawnLineage {
-                    parent_session_id: parent.to_string(),
-                    root_session_id: root.to_string(),
-                    spawn_depth: depth,
-                },
-            );
-        }
+        lineage.insert(
+            child.to_string(),
+            ClaudeDesktopSpawnLineage {
+                parent_session_id: parent.to_string(),
+                root_session_id: ancestry.map(|(root, _)| root.to_string()),
+                spawn_depth: ancestry.map(|(_, depth)| depth),
+            },
+        );
     }
     lineage
 }
@@ -11464,7 +11521,7 @@ impl SnapshotAccumulator {
             let mut spawn_facts = crate::session_attribution::claude_desktop_spawn_facts(
                 &crate::session_attribution::ClaudeDesktopSpawnAttribution {
                     parent_session_ref: &lineage.parent_session_id,
-                    root_session_ref: &lineage.root_session_id,
+                    root_session_ref: lineage.root_session_id.as_deref(),
                     spawn_depth: lineage.spawn_depth,
                 },
                 &source_session_id,
@@ -25391,6 +25448,7 @@ impl ScanIndex {
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
             claude_desktop_identity_census_complete: self.claude_desktop_identity_census_complete,
+            claude_desktop_lineage_census_complete: self.claude_desktop_lineage_census_complete,
             claude_desktop_census_witness: self.claude_desktop_census_witness.clone(),
             claude_desktop_store_retry_attempt: self.claude_desktop_store_retry_attempt,
             claude_desktop_store_retry_not_before_unix_seconds: self
@@ -48849,16 +48907,16 @@ mod tests {
             lineage.get("mid-cli"),
             Some(&ClaudeDesktopSpawnLineage {
                 parent_session_id: "root-cli".to_string(),
-                root_session_id: "root-cli".to_string(),
-                spawn_depth: 1,
+                root_session_id: Some("root-cli".to_string()),
+                spawn_depth: Some(1),
             })
         );
         assert_eq!(
             lineage.get("leaf-cli"),
             Some(&ClaudeDesktopSpawnLineage {
                 parent_session_id: "mid-cli".to_string(),
-                root_session_id: "root-cli".to_string(),
-                spawn_depth: 2,
+                root_session_id: Some("root-cli".to_string()),
+                spawn_depth: Some(2),
             })
         );
         assert!(!lineage.contains_key("root-cli"));
@@ -48884,6 +48942,78 @@ mod tests {
         ];
         let lineage = claude_desktop_spawn_lineage(entries.iter());
         assert!(lineage.is_empty(), "{lineage:?}");
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_withholds_root_above_an_unresolved_ancestor() {
+        let entries = [
+            // P names a parent the store cannot resolve: C -> P is still exact,
+            // but P is not a confirmed root.
+            desktop_spawn_entry("p-missing", "local_p_missing", Some("local_gone")),
+            desktop_spawn_entry("c-missing", "local_c_missing", Some("local_p_missing")),
+            // P points at itself.
+            desktop_spawn_entry("p-self", "local_p_self", Some("local_p_self")),
+            desktop_spawn_entry("c-self", "local_c_self", Some("local_p_self")),
+            // P's own files disagree on whether anyone started it.
+            desktop_spawn_entry("p-mixed", "local_p_mixed_1", None),
+            desktop_spawn_entry("p-mixed", "local_p_mixed_2", Some("local_p_missing")),
+            desktop_spawn_entry("c-mixed", "local_c_mixed", Some("local_p_mixed_1")),
+            // A cycle above the child, not through it.
+            desktop_spawn_entry("x1", "local_x1", Some("local_x2")),
+            desktop_spawn_entry("x2", "local_x2", Some("local_x1")),
+            desktop_spawn_entry("c-cycle", "local_c_cycle", Some("local_x1")),
+        ];
+        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        for (child, parent) in [
+            ("c-missing", "p-missing"),
+            ("c-self", "p-self"),
+            ("c-mixed", "p-mixed"),
+            ("c-cycle", "x1"),
+        ] {
+            assert_eq!(
+                lineage.get(child),
+                Some(&ClaudeDesktopSpawnLineage {
+                    parent_session_id: parent.to_string(),
+                    root_session_id: None,
+                    spawn_depth: None,
+                }),
+                "{child}"
+            );
+        }
+        // The cycle members themselves get no edge at all.
+        assert!(!lineage.contains_key("x1"));
+        assert!(!lineage.contains_key("x2"));
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_waits_for_a_complete_store_census() {
+        let mut index = ScanIndex::default();
+        for (key, entry) in [
+            (
+                "parent",
+                desktop_spawn_entry("parent-cli", "local_parent", None),
+            ),
+            (
+                "child",
+                desktop_spawn_entry("child-cli", "local_child", Some("local_parent")),
+            ),
+        ] {
+            index
+                .claude_desktop_title_files
+                .insert(key.to_string(), entry);
+        }
+        assert!(!index.claude_desktop_lineage_census_complete);
+        let partial = ClaudeTitleMetadata::from_durable_index(&index, false);
+        assert!(partial.spawn_lineage("child-cli").is_none());
+
+        index.claude_desktop_lineage_census_complete = true;
+        let complete = ClaudeTitleMetadata::from_durable_index(&index, false);
+        assert_eq!(
+            complete
+                .spawn_lineage("child-cli")
+                .map(|lineage| lineage.parent_session_id.as_str()),
+            Some("parent-cli")
+        );
     }
 
     #[test]
@@ -58203,7 +58333,7 @@ crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verifi
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

@@ -1109,9 +1109,10 @@ pub const CLAUDE_DESKTOP_SPAWN_SOURCE_VERSION: &str = "claude_desktop_spawn:v1";
 pub struct ClaudeDesktopSpawnAttribution<'a> {
     /// The starting session's transcript id (its `cliSessionId`).
     pub parent_session_ref: &'a str,
-    /// The top of the desktop spawn chain; equals the parent at depth 1.
-    pub root_session_ref: &'a str,
-    pub spawn_depth: usize,
+    /// The top of the desktop spawn chain (the parent at depth 1). Absent when
+    /// an ancestor cannot be resolved, so no root or depth is guessed.
+    pub root_session_ref: Option<&'a str>,
+    pub spawn_depth: Option<usize>,
 }
 
 /// Fixed-name lineage facts for one desktop-spawned Claude Code session.
@@ -1129,29 +1130,25 @@ pub fn claude_desktop_spawn_facts(
         observed_at,
         source_version: CLAUDE_DESKTOP_SPAWN_SOURCE_VERSION,
     };
+    let spawn_depth = attribution.spawn_depth.map(|depth| depth.to_string());
     for (field, value) in [
-        ("parent_session_ref", attribution.parent_session_ref),
-        ("origin_kind", "agent_spawn"),
+        ("parent_session_ref", Some(attribution.parent_session_ref)),
+        ("origin_kind", Some("agent_spawn")),
         ("root_session_ref", attribution.root_session_ref),
-        ("agent_kind", "claude_desktop_session"),
+        ("agent_kind", Some("claude_desktop_session")),
+        ("spawn_depth", spawn_depth.as_deref()),
     ] {
-        push_fact(
-            &mut facts,
-            field,
-            value,
-            "provider_artifact",
-            "direct",
-            &evidence_context,
-        );
+        if let Some(value) = value {
+            push_fact(
+                &mut facts,
+                field,
+                value,
+                "provider_artifact",
+                "direct",
+                &evidence_context,
+            );
+        }
     }
-    push_fact(
-        &mut facts,
-        "spawn_depth",
-        &attribution.spawn_depth.to_string(),
-        "provider_artifact",
-        "direct",
-        &evidence_context,
-    );
     facts
 }
 
@@ -1853,8 +1850,8 @@ mod tests {
         let facts = claude_desktop_spawn_facts(
             &ClaudeDesktopSpawnAttribution {
                 parent_session_ref: "94bd328b-f2a9-4c31-bbfe-e174d41b4310",
-                root_session_ref: "11111111-2222-3333-4444-555555555555",
-                spawn_depth: 2,
+                root_session_ref: Some("11111111-2222-3333-4444-555555555555"),
+                spawn_depth: Some(2),
             },
             "da1dc804-1c50-4401-8c3c-0898b126772f",
             "2026-10-18T10:20:00Z",
@@ -1881,6 +1878,23 @@ mod tests {
             assert_eq!(fact.evidence.source_version, "claude_desktop_spawn:v1");
         }
         validate_fact_limits(&facts).expect("facts fit the wire contract");
+
+        let unresolved_root = claude_desktop_spawn_facts(
+            &ClaudeDesktopSpawnAttribution {
+                parent_session_ref: "94bd328b-f2a9-4c31-bbfe-e174d41b4310",
+                root_session_ref: None,
+                spawn_depth: None,
+            },
+            "da1dc804-1c50-4401-8c3c-0898b126772f",
+            "2026-10-18T10:20:00Z",
+        );
+        assert_eq!(
+            unresolved_root
+                .iter()
+                .map(|fact| fact.field.as_str())
+                .collect::<Vec<_>>(),
+            ["parent_session_ref", "origin_kind", "agent_kind"]
+        );
     }
 
     #[test]
