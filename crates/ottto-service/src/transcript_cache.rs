@@ -119,6 +119,12 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .map(|entry| entry.retained.checkpoint.sealed_offset())
     }
     #[cfg(test)]
+    pub(crate) fn checkpoint(&self, key: &str) -> Option<Checkpoint> {
+        self.entries
+            .get(key)
+            .map(|entry| entry.retained.checkpoint.clone())
+    }
+    #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) {
         self.entries.remove(key);
     }

@@ -55,6 +55,13 @@ impl SharedCache {
     pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
         self.inner.lock().ok()?.sealed_offset(key)
     }
+    #[cfg(test)]
+    pub(super) fn retained_checkpoint(
+        &self,
+        key: &str,
+    ) -> Option<crate::transcript_acquisition::Checkpoint> {
+        self.inner.lock().ok()?.checkpoint(key)
+    }
     pub(super) fn insert(
         &self,
         key: String,
@@ -270,7 +277,22 @@ impl OwnedSourceScan {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin this thread's scan clock (tests only); `None` restores real time.
+#[cfg(test)]
+pub(super) fn set_test_now(now: Option<u64>) {
+    TEST_NOW.with(|clock| clock.set(now));
+}
+
 pub(super) fn now_seconds() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -14303,12 +14303,26 @@ impl OwnedSourceScan {
                             );
                             codex_cursor_lease = Some(lease);
                             active_file = Some(job);
-                        } else {
-                            // Its path is still pending; a later page restarts it.
-                            context
-                                .cache
-                                .cursor_invalidate(lease, &local_index_key(&job.candidate.path));
+                        } else if let Some(disclosure) =
+                            context.cache.cursor_invalidate(lease, &job)
+                        {
+                            // Repeated real invalidations: `MemberChanged` residue.
+                            sampled_scan::codex_cursor::disclose_job_debt(
+                                &job,
+                                &disclosure,
+                                index,
+                                sampled_scan::codex_cursor::DisclosureTargets {
+                                    census: &mut census,
+                                    residue_index_keys: &mut residue_index_keys,
+                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                    codex_state_only_blocked_session_ids:
+                                        &mut codex_state_only_blocked_session_ids,
+                                    pending_finalization: &mut pending_finalization,
+                                },
+                            );
+                            sampled_scan::codex_cursor::dequeue(index, &job.candidate);
                         }
+                        // Otherwise its path is still pending; a later page restarts it.
                         pending!();
                     }
                 }
@@ -14349,23 +14363,46 @@ impl OwnedSourceScan {
                     if active.hold_offset.is_none()
                         && sampled_scan::codex_cursor::held_monotone(&active.parser.accumulator)
                     {
-                        active.hold_offset = Some(active.parser.reader.last_complete_line_end());
+                        // File offset: a tail's reader counts from its start.
+                        let start = active
+                            .parser
+                            .reader
+                            .acquisition
+                            .as_ref()
+                            .map_or(0, crate::transcript_acquisition::ReadPlan::start_offset);
+                        active.hold_offset =
+                            Some(start + active.parser.reader.last_complete_line_end());
                     }
                 }
                 match stepped {
                     Ok(false) => {
-                        if active
-                            .cursor
-                            .as_ref()
-                            .is_some_and(sampled_scan::codex_cursor::JobMeta::pausable)
+                        if active.cursor.is_some()
                             && codex_page
                                 .cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
                         {
                             if let Some(lease) = codex_cursor_lease.take() {
-                                if let Err(returned) = lease.pause(active) {
-                                    let (lease, job) = *returned;
-                                    codex_cursor_lease = Some(lease);
-                                    active_file = Some(job);
+                                if let sampled_scan::codex_cursor::PauseEnd::StateBound(
+                                    job,
+                                    disclosure,
+                                ) = lease.pause(active)
+                                {
+                                    // No unbounded fallback: `JoinStateBound`
+                                    // debt, prior body kept, file parked.
+                                    sampled_scan::codex_cursor::disclose_job_debt(
+                                        &job,
+                                        &disclosure,
+                                        index,
+                                        sampled_scan::codex_cursor::DisclosureTargets {
+                                            census: &mut census,
+                                            residue_index_keys: &mut residue_index_keys,
+                                            residue_blocked_session_ids:
+                                                &mut residue_blocked_session_ids,
+                                            codex_state_only_blocked_session_ids:
+                                                &mut codex_state_only_blocked_session_ids,
+                                            pending_finalization: &mut pending_finalization,
+                                        },
+                                    );
+                                    sampled_scan::codex_cursor::dequeue(index, &job.candidate);
                                 }
                                 pending!();
                             }
@@ -14383,7 +14420,7 @@ impl OwnedSourceScan {
                             source.api_slug()
                         );
                         if let Some(lease) = codex_cursor_lease.take() {
-                            lease.complete(&local_index_key(&active.candidate.path), false);
+                            lease.release();
                         }
                         if active.cursor.is_some() {
                             sampled_scan::codex_cursor::dequeue(index, &active.candidate);
@@ -14471,28 +14508,85 @@ impl OwnedSourceScan {
                     active.parser = parser;
                     active.charged_bytes = 0;
                     active.hold_offset = None;
-                    if active.cursor.take().is_some() {
-                        // A full replay restarts from byte zero; finish it unpaged.
+                    if active.cursor.is_some()
+                        && !sampled_scan::codex_cursor::restart_in_place(&mut active)
+                    {
+                        // The full replay cannot be frozen: end this attempt
+                        // (a retryable failure), never an unpaged read.
+                        active.cursor = None;
                         if let Some(lease) = codex_cursor_lease.take() {
-                            lease.complete(&local_index_key(&active.candidate.path), false);
+                            lease.release();
                         }
                         sampled_scan::codex_cursor::dequeue(index, &active.candidate);
+                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        pending!();
                     }
                     active_file = Some(active);
                     pending!();
                 }
-                if let Some(meta) = active.cursor.as_ref() {
-                    // Pre-certificate rule: only an unchanged object completes
-                    // cleanly; any change is counted against this file's paging.
-                    let clean = !active.parser.reader.sealed_fragment()
-                        && sampled_scan::codex_cursor::OpenStamp::capture(
-                            active.parser.reader.reader.get_ref(),
+                // S6: a cursor job commits only through its sealed-prefix
+                // certificate; an invalidated attempt publishes nothing.
+                let mut cursor_certificate = None;
+                if let Some(context) = sampling.as_ref().filter(|_| active.cursor.is_some()) {
+                    let current_scope = sampled_scan::reduction_dependencies(
+                        source,
+                        &active.candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    )
+                    .map(|dependency| {
+                        context.file_scope(
+                            source,
+                            &active.candidate,
+                            &dependency,
+                            true,
+                            context_curve_enabled,
+                            index,
                         )
-                        .is_ok_and(|now| &now == meta.stamp_open());
-                    if let Some(lease) = codex_cursor_lease.take() {
-                        lease.complete(&local_index_key(&active.candidate.path), clean);
+                    });
+                    match sampled_scan::codex_cursor::finish_job(
+                        &context.cache,
+                        codex_cursor_lease.take(),
+                        &mut active,
+                        current_scope.as_ref(),
+                    ) {
+                        sampled_scan::codex_cursor::JobEnd::Certified { checkpoint, grown } => {
+                            sampled_scan::codex_cursor::release_path(
+                                index,
+                                &active.candidate,
+                                grown,
+                            );
+                            cursor_certificate = Some(Some(checkpoint));
+                        }
+                        sampled_scan::codex_cursor::JobEnd::Uncertified { grown } => {
+                            sampled_scan::codex_cursor::release_path(
+                                index,
+                                &active.candidate,
+                                grown,
+                            );
+                            cursor_certificate = Some(None);
+                        }
+                        // Its path is still pending: the next page re-bootstraps.
+                        sampled_scan::codex_cursor::JobEnd::Restart => pending!(),
+                        sampled_scan::codex_cursor::JobEnd::MemberChanged(disclosure) => {
+                            sampled_scan::codex_cursor::disclose_job_debt(
+                                &active,
+                                &disclosure,
+                                index,
+                                sampled_scan::codex_cursor::DisclosureTargets {
+                                    census: &mut census,
+                                    residue_index_keys: &mut residue_index_keys,
+                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                    codex_state_only_blocked_session_ids:
+                                        &mut codex_state_only_blocked_session_ids,
+                                    pending_finalization: &mut pending_finalization,
+                                },
+                            );
+                            sampled_scan::codex_cursor::dequeue(index, &active.candidate);
+                            pending!();
+                        }
                     }
-                    sampled_scan::codex_cursor::dequeue(index, &active.candidate);
                 }
                 let memo_candidate = active
                     .hold_offset
@@ -14504,6 +14598,7 @@ impl OwnedSourceScan {
                     .and_then(|offset| {
                         let file = active.parser.reader.reader.get_ref();
                         let live = sampled_scan::codex_cursor::LiveWitness::read(file, offset)?;
+                        let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
                         let dependencies = sampled_scan::reduction_dependencies(
                             source,
                             &active.candidate,
@@ -14535,7 +14630,7 @@ impl OwnedSourceScan {
                                     .map(|ledger| ledger.opened_object_identity.clone());
                                 (parent, ledger)
                             });
-                        Some((digest, live, parent))
+                        Some((digest, live, stamp, parent))
                     });
                 let OwnedActiveFile {
                     comparison_target,
@@ -14606,7 +14701,23 @@ impl OwnedSourceScan {
                 let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
                     && aliases.is_empty()
                     && applied_receipts.values().all(Option::is_none);
-                let mut completed_acquisition = if let Some(acquisition) = file_sampling.as_ref() {
+                let mut completed_acquisition = if let Some(certificate) = cursor_certificate {
+                    // Retain the reduction only when every applied byte is in
+                    // the certified prefix `[0, s)`; a lossy job publishes
+                    // uncertified with its prepared debt, like a lossy full read.
+                    let sealed_only = parser.reader.sealed_fragment()
+                        || parser.reader.consumed_bytes() == parser.reader.last_complete_line_end();
+                    certificate.map(|checkpoint| {
+                        parser.retain_sealed_prefix(
+                            checkpoint,
+                            if cache_compatible && sealed_only {
+                                copy_budget
+                            } else {
+                                0
+                            },
+                        )
+                    })
+                } else if let Some(acquisition) = file_sampling.as_ref() {
                     // Known dependencies and the current path are separate from the
                     // sampled prefix promise. Neither may be stale at completion.
                     let current_scope = sampled_scan::reduction_dependencies(
@@ -14868,11 +14979,12 @@ impl OwnedSourceScan {
                         && recognized_usage_drop_count == 0
                         && dropped_usage_record_count == 0;
                     match memo_candidate.filter(|_| held) {
-                        Some((digest, live, parent)) => context.cache.memo_record(
+                        Some((digest, live, stamp, parent)) => context.cache.memo_record(
                             index_key.clone(),
                             sampled_scan::codex_cursor::MemoEntry::new(
                                 digest,
                                 live,
+                                stamp,
                                 parent,
                                 sampled_scan::codex_cursor::Disclosure {
                                     ownership_incomplete_file_count,
@@ -15859,12 +15971,12 @@ impl OwnedSourceScan {
                             sampled_scan::codex_cursor::memo_counting_decision(),
                         )
                     })
-                    .is_some_and(|digest| entry.matches(&digest, &opened_file, parent_ledger));
-                    if hit {
+                    .and_then(|digest| entry.matches(&digest, &opened_file, parent_ledger));
+                    if let Some(stamp) = hit {
                         // An append cannot cure this hold and no wake
                         // dependency changed: disclose the same terminal
                         // debt again at zero transcript bytes.
-                        context.cache.memo_hit(&key);
+                        context.cache.memo_hit(&key, stamp);
                         let keep_previous = decision != CandidateDecision::ReconcileLegacy
                             && !index
                                 .effective_upload_body_witness_revision_requires_adoption(&key);
@@ -15894,6 +16006,47 @@ impl OwnedSourceScan {
                     }
                     context.cache.memo_forget(&key);
                 }
+                // A parked `JoinStateBound` file is not read again until its
+                // revision or reduction dependencies change (§c.2, M-2).
+                let parked = context.cache.cursor_parked(
+                    &key,
+                    &candidate.source_file_fingerprint,
+                    sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    )
+                    .as_deref(),
+                );
+                if let Some(disclosure) = parked {
+                    let keep_previous = decision != CandidateDecision::ReconcileLegacy
+                        && !index.effective_upload_body_witness_revision_requires_adoption(&key);
+                    let previous = (
+                        keep_previous
+                            .then(|| index.last_snapshot_fingerprint(&candidate))
+                            .flatten(),
+                        keep_previous
+                            .then(|| index.last_upload_body_witness(&candidate))
+                            .flatten(),
+                    );
+                    sampled_scan::codex_cursor::disclose_terminal_codex_debt(
+                        &disclosure,
+                        &candidate,
+                        previous,
+                        index,
+                        sampled_scan::codex_cursor::DisclosureTargets {
+                            census: &mut census,
+                            residue_index_keys: &mut residue_index_keys,
+                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                            codex_state_only_blocked_session_ids:
+                                &mut codex_state_only_blocked_session_ids,
+                            pending_finalization: &mut pending_finalization,
+                        },
+                    );
+                    pending!();
+                }
                 // Fresh-first page budget, decided before any retained state is
                 // consumed: the optimistic read is the tail extent when a
                 // retained entry exists, the whole file otherwise.
@@ -15904,7 +16057,7 @@ impl OwnedSourceScan {
                     sampled_scan::codex_cursor::Limits::current(),
                     expected,
                     codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
-                    context.cache.cursor_paging_given_up(&key),
+                    crate::heap_layout_bound::layout_supported(),
                 ) == sampled_scan::codex_cursor::StartPlan::Defer
                 {
                     context.cache.cursor_note_deferred();
@@ -16159,14 +16312,19 @@ impl OwnedSourceScan {
                     }
                     _ => extent,
                 };
-                let key = local_index_key(&active.candidate.path);
-                match codex_page.plan(
+                let defer = match codex_page.plan(
                     sampled_scan::codex_cursor::Limits::current(),
                     expected,
                     codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
-                    context.cache.cursor_paging_given_up(&key),
+                    crate::heap_layout_bound::layout_supported(),
                 ) {
-                    sampled_scan::codex_cursor::StartPlan::Singleton => {}
+                    sampled_scan::codex_cursor::StartPlan::Singleton => false,
+                    sampled_scan::codex_cursor::StartPlan::Unpaged => {
+                        // Layout-unsupported build: the cursor is off as a
+                        // whole and this file reads in its page, as before.
+                        codex_page.disclose_disabled(&context.cache);
+                        false
+                    }
                     sampled_scan::codex_cursor::StartPlan::Cursor => {
                         let dependencies = sampled_scan::reduction_dependencies(
                             source,
@@ -16179,34 +16337,45 @@ impl OwnedSourceScan {
                             .as_ref()
                             .and_then(|inventory| inventory.owner_for_path(&active.candidate.path))
                             .map(str::to_owned);
-                        if let Some(lease) = context.cache.cursor_start(
+                        match context.cache.cursor_start(
                             &mut active,
                             &context.namespace,
                             dependencies,
                             owner,
                         ) {
-                            // The job's path holds the strict census until its
-                            // attempt ends (accepted or debt).
-                            sampled_scan::codex_cursor::requeue(
-                                index,
-                                &codex_selected_flags,
-                                &active.candidate,
-                            );
-                            codex_cursor_lease = Some(lease);
+                            Ok(lease) => {
+                                // The job's path holds the strict census until
+                                // its attempt ends (accepted or debt).
+                                sampled_scan::codex_cursor::requeue(
+                                    index,
+                                    &codex_selected_flags,
+                                    &active.candidate,
+                                );
+                                codex_cursor_lease = Some(lease);
+                                false
+                            }
+                            Err(sampled_scan::codex_cursor::StartRefusal::Busy) => true,
+                            Err(sampled_scan::codex_cursor::StartRefusal::Unstartable) => {
+                                // Never an unbounded in-page read of a file
+                                // larger than the singleton budget.
+                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                pending!();
+                            }
                         }
                     }
-                    sampled_scan::codex_cursor::StartPlan::Defer => {
-                        // Only a full read reaches here (a tail was planned
-                        // before its retained state was consumed).
-                        context.cache.cursor_note_deferred();
-                        scanned_file_count = scanned_file_count.saturating_sub(1);
-                        sampled_scan::codex_cursor::requeue(
-                            index,
-                            &codex_selected_flags,
-                            &active.candidate,
-                        );
-                        pending!();
-                    }
+                    sampled_scan::codex_cursor::StartPlan::Defer => true,
+                };
+                if defer {
+                    // Only a full read reaches here (a tail was planned
+                    // before its retained state was consumed).
+                    context.cache.cursor_note_deferred();
+                    scanned_file_count = scanned_file_count.saturating_sub(1);
+                    sampled_scan::codex_cursor::requeue(
+                        index,
+                        &codex_selected_flags,
+                        &active.candidate,
+                    );
+                    pending!();
                 }
             }
             active_file = Some(active);
@@ -17082,6 +17251,8 @@ impl OwnedJsonlParser {
         } = self;
         let mut reader = bounded.reader;
         let report = bounded.report;
+        // Only a resumable cursor job freezes its extent (S6).
+        let cursor_frozen_extent = bounded.extent_limit.is_some();
         let mut ownership_incomplete_file_count = 0;
         // The bounded reader cannot prove that a skipped physical line contained
         // no usage. Account one potential recognized usage record per line while
@@ -17091,7 +17262,12 @@ impl OwnedJsonlParser {
             recognized_usage_drop_count.saturating_add(report.over_line_cap_count);
         let observed_after_read = opened_object_identity(source, reader.get_mut())
             .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
-        if observed_after_read != expected_opened_object_identity {
+        // A cursor job read only up to the extent frozen at open; appended
+        // bytes belong to the next tail, so its object may have grown. Its
+        // caller already proved same dev/ino, no shrink, no same-size edit,
+        // unchanged held-FD samples and scope (`commit_sealed_prefix`) and
+        // discarded the result otherwise.
+        if observed_after_read != expected_opened_object_identity && !cursor_frozen_extent {
             return Err(anyhow::anyhow!(
                 "opened snapshot candidate changed while it was parsed"
             ));
@@ -17676,7 +17852,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
     }
 
     /// Start offset of the record the last `Line` step delivered.
-    #[cfg_attr(not(test), allow(dead_code))] // S6 prefix-certificate input.
+    // Tests only: S6 certifies `Samples::sealed_offset`, not record starts.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_start_offset(&self) -> u64 {
         self.record_start
     }
@@ -17687,7 +17864,6 @@ impl<R: BufRead> BoundedJsonlReader<R> {
     }
 
     /// Any skipped, salvaged, malformed or invalid line so far.
-    #[cfg_attr(not(test), allow(dead_code))] // S6 prefix-certificate input.
     fn lossy_prefix(&self) -> bool {
         self.report.over_line_cap_count > 0 || !self.report.complete_except_over_line_cap()
     }

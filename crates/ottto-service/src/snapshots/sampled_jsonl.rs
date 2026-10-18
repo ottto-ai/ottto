@@ -236,4 +236,40 @@ impl OwnedJsonlParser {
             reduction,
         }))
     }
+
+    /// Pair a cursor job's prefix certificate (`ReadPlan::commit_sealed_prefix`)
+    /// with a copy of its reduction. The caller passes a zero budget unless
+    /// every applied byte is inside the certified prefix `[0, s)`; the
+    /// certificate alone then still publishes without retention.
+    pub(super) fn retain_sealed_prefix(
+        &mut self,
+        checkpoint: Checkpoint,
+        remaining_copy_budget: usize,
+    ) -> CompletedNativeAcquisition {
+        let budget = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
+        if budget == 0
+            || !sampled_scan::compatible_reduction(&self.accumulator)
+            || self.retention_bound(budget).is_none()
+        {
+            return CompletedNativeAcquisition {
+                checkpoint,
+                reduction: None,
+            };
+        }
+        let inputs = self.take_live_reduction_inputs();
+        let accumulator = self.accumulator.clone();
+        self.restore_live_reduction_inputs(inputs);
+        let reduction = CachedJsonlReduction {
+            accumulator,
+            report: self.reader.report,
+            recognized_usage_drop_count: self.recognized_usage_drop_count,
+            positive_recognized_usage_count: self.positive_recognized_usage_count,
+            positive_usage_evidence: self.positive_usage_evidence,
+        };
+        let reduction = crate::heap_layout_bound::bound(&reduction, budget).map(|_| reduction);
+        CompletedNativeAcquisition {
+            checkpoint,
+            reduction,
+        }
+    }
 }
