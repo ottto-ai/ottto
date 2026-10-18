@@ -1835,7 +1835,7 @@ fn end_unavailable(
     job: Box<OwnedActiveFile>,
     lease: CursorLease,
     index: &mut ScanIndex,
-    mut targets: DisclosureTargets<'_>,
+    targets: DisclosureTargets<'_>,
 ) -> Resumed {
     let meta = job.cursor.as_ref();
     let rotation = meta.map(|meta| rotation_key(&meta.namespace, &meta.key));
