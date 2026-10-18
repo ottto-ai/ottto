@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 684,
-  "content_sha256": "334453a934a03b772af06418096eb3da3f9d4fcdcc137bf17699cc3026da7c16",
+  "candidate_file_count": 686,
+  "content_sha256": "3ce73a80f3be74926424d38d435510db64b0a8976c14b7b171aba1bc83687d8f",
   "files": [
     {
       "executable": false,
@@ -1077,8 +1077,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/provider_daily_reference.rs",
-      "sha256": "2c2a34044a37ec608f682ff39d48e69edafed3972decfe7c6d8e31e6818ea930",
-      "size_bytes": 225472
+      "sha256": "9cac5062eb9bb6eb428c213b58371016c4ccb39fd3ee8f92e35afaad8b860977",
+      "size_bytes": 236389
     },
     {
       "executable": false,
@@ -1259,8 +1259,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "960f87f333bd8a5148ae2271090faa209326be51c3592ec999b5deceb42e7603",
-      "size_bytes": 2541856
+      "sha256": "ea86c8f3763485f598ee272684d7da1d28c37f9001cea6b7486f475f7c49492f",
+      "size_bytes": 2542364
     },
     {
       "executable": false,
@@ -1301,8 +1301,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "2d454f1947ecad2250509a72366db70d2600c33bd797dba9c4f99fd8399b7e91",
-      "size_bytes": 47482
+      "sha256": "223e2f09376532069a75b188900a22c34fd7e9473a644918e1d7684408531775",
+      "size_bytes": 47569
     },
     {
       "executable": false,
@@ -1506,6 +1506,13 @@
       "path": "crates/ottto-service/src/snapshots/usage_occurrence_retention_tests.rs",
       "sha256": "4df126d99601807c5917d7cf1a9dbb9e7bd97ed755d3c02f5f80d56fb3afe0bc",
       "size_bytes": 5034
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/witness_reconstruct_scope_tests.rs",
+      "sha256": "2da898aba7800f69630b348c8f3983bb150e140156a5be1c18fc8687ad5a6cad",
+      "size_bytes": 6895
     },
     {
       "executable": false,
@@ -3025,6 +3032,13 @@
       "path": "docs/session-2026-10-17-snapshot-rejection-session-hash.md",
       "sha256": "8469fba0d62b9240dc96557d851a3e9387d2b2ea41aa609b523e6f862f4f1084",
       "size_bytes": 1294
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-page-scoped-witness-reconstruction.md",
+      "sha256": "e7fc1d9eea0a208f34f52f1afb9ed154a71cc66d930b8e6ba5e6c9e075a081f7",
+      "size_bytes": 2396
     },
     {
       "executable": false,
@@ -4793,7 +4807,7 @@
   ],
   "generated_at": "2026-10-17T23:00:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 685,
+  "output_file_count": 687,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
