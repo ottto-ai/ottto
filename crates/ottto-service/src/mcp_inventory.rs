@@ -240,7 +240,8 @@ fn normalize_claude_server(
 /// Normalize one Codex `[mcp_servers.*]` block into a [`Transport`].
 ///
 /// Mirrors `discover_codex` in harvest.py: a `url` is an HTTP transport, else
-/// stdio with `command` + `args`.
+/// stdio with `command` + `args`. An explicit `enabled = false` marks the
+/// server disabled (Codex does not load it); `true` or an absent key is enabled.
 fn normalize_codex_server(
     name: &str,
     cfg: &Value,
@@ -264,7 +265,7 @@ fn normalize_codex_server(
         config_dir: config_dir.map(Path::to_path_buf),
         name: name.to_string(),
         transport,
-        disabled: false,
+        disabled: cfg.get("enabled").and_then(Value::as_bool) == Some(false),
     })
 }
 
@@ -1060,7 +1061,7 @@ fn harvest_server(
             transport: Some(server.transport.label().to_string()),
             reachable: true,
             loading_mode: loading_mode.to_string(),
-            disabled: false,
+            disabled: server.disabled,
 
             tools,
         },
@@ -1069,7 +1070,7 @@ fn harvest_server(
             transport: Some(server.transport.label().to_string()),
             reachable: false,
             loading_mode: loading_mode.to_string(),
-            disabled: false,
+            disabled: server.disabled,
 
             tools: Vec::new(),
         },
@@ -1179,7 +1180,7 @@ fn unreachable_server(server: &ConfiguredServer, loading_mode: &str) -> McpServe
         transport: Some(server.transport.label().to_string()),
         reachable: false,
         loading_mode: loading_mode.to_string(),
-        disabled: false,
+        disabled: server.disabled,
 
         tools: Vec::new(),
     }
@@ -2215,6 +2216,50 @@ enabled = true
     fn codex_missing_config_yields_no_servers() {
         let home = test_home("codex-empty");
         assert!(discover_codex(&home).is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn codex_enabled_false_is_reported_disabled() {
+        // Codex skips a server with `enabled = false`. It stays in the
+        // inventory, carried as disabled on the wire so the backend leaves it
+        // out of the configured totals; `true` and an absent key stay enabled.
+        let home = test_home("codex-enabled-false");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex").join("config.toml"),
+            r#"
+[mcp_servers.off]
+url = "https://off.test/mcp"
+enabled = false
+
+[mcp_servers.on]
+url = "https://on.test/mcp"
+enabled = true
+
+[mcp_servers.unset]
+url = "https://unset.test/mcp"
+"#,
+        )
+        .unwrap();
+
+        let wire: BTreeMap<String, bool> = discover_codex(&home)
+            .iter()
+            .map(|server| {
+                let (input, _) = harvest_server(server, "always_on", &test_spawn_env());
+                (input.server, input.disabled)
+            })
+            .collect();
+
+        assert_eq!(
+            wire,
+            BTreeMap::from([
+                ("off".to_string(), true),
+                ("on".to_string(), false),
+                ("unset".to_string(), false),
+            ])
+        );
+
         let _ = fs::remove_dir_all(&home);
     }
 
