@@ -635,11 +635,6 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
         let current = f.items.clone();
         let before = std::fs::read(&f.index_path).unwrap();
         let mut page = bounded_native_capture(&f, Instant::now() - Duration::from_secs(61));
-        page.budget = crate::snapshot_retry::RetryBudget::after_shed(
-            Instant::now() - crate::snapshot_retry::RETENTION + Duration::from_millis(500),
-            Duration::ZERO,
-        )
-        .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let ack = bounded_native_ack(&current[0]);
@@ -664,6 +659,13 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
             }
             1
         });
+        // Start the 500ms retained budget with the measured turn, not before
+        // fixture setup (listener, ACK body, server thread).
+        page.budget = crate::snapshot_retry::RetryBudget::after_shed(
+            Instant::now() - crate::snapshot_retry::RETENTION + Duration::from_millis(500),
+            Duration::ZERO,
+        )
+        .unwrap();
         let started = Instant::now();
         let result = page.turn(
             &SnapshotApiClient::new(format!("http://{address}"))
@@ -675,13 +677,31 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
             &mut || Ok(()),
         );
         let elapsed = started.elapsed();
-        assert!(result.is_err());
+        // Record the client outcome before joining: a fixture panic must not
+        // hide the client's own error or timing.
+        let client = format!(
+            "stalled_token={stalled_token} elapsed={elapsed:?} posts_left={} result={:?}",
+            page.budget.posts_left(),
+            result.as_ref().map_err(|e| format!("{e:#}"))
+        );
+        eprintln!("bounded deadline client: {client}");
+        assert!(result.is_err(), "{client}");
         assert!(
             elapsed < Duration::from_millis(900),
-            "absolute timeout failed: {elapsed:?}"
+            "absolute timeout failed: {client}"
         );
-        assert_eq!(server.join().unwrap(), usize::from(!stalled_token));
-        assert_eq!(page.budget.posts_left(), if stalled_token { 3 } else { 2 });
+        assert_eq!(
+            server
+                .join()
+                .unwrap_or_else(|_| panic!("fixture server failed; client {client}")),
+            usize::from(!stalled_token),
+            "{client}"
+        );
+        assert_eq!(
+            page.budget.posts_left(),
+            if stalled_token { 3 } else { 2 },
+            "{client}"
+        );
         assert_eq!(std::fs::read(&f.index_path).unwrap(), before);
         let durable: SnapshotUploadProgress =
             serde_json::from_slice(&std::fs::read(&f.progress_path).unwrap()).unwrap();
