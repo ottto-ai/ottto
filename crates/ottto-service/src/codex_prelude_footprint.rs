@@ -884,9 +884,11 @@ struct UploadCacheEntry {
     identity: String,
     request_sha256: String,
     posted_at: String,
-    /// Watermark: start (unix seconds) of the newest session this scope has
-    /// sent or matched. A start at or before it is never sent again, even
-    /// when an older session resumes later (BR3).
+    /// Watermark: start (unix seconds) of the newest session this workspace
+    /// (the backend's snapshot series) has sent or matched. A start at or
+    /// before it is never sent again, even when an older session resumes
+    /// later (BR3). Another directory of the same repository is its own
+    /// series, so its unsent start is a first observation, not a replay.
     #[serde(default)]
     started_at: Option<i64>,
 }
@@ -1107,8 +1109,8 @@ fn select_candidates(
         if !seen_scopes.insert(scope) {
             continue;
         }
-        // Nothing newer than what this scope already sent: leave the slot to
-        // other scopes, so every repository gets measured.
+        // Nothing newer than what this workspace already sent: leave the slot
+        // to other scopes, so every repository gets measured.
         let sent = last_upload(support_dir, identity, &sha256_hex(&[cwd.as_str()]))
             .and_then(|entry| entry.started_at)
             .is_some_and(|sent| started <= sent);
