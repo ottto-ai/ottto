@@ -597,6 +597,10 @@ struct PeerScan {
     hits: Vec<BTreeMap<String, PeerHit>>,
     /// Per target: lines naming the target's own session (replicas, own forks).
     same_session_line_count: Vec<u64>,
+    /// Lines in a replica of one target carrying a request that target counts
+    /// and other targets share. That overlap is between targets, so B2
+    /// allocates it; the replica is not independent peer evidence.
+    shared_target_replica_line_count: u64,
     /// Per target: id-bearing usage lines naming the target's own session whose
     /// id the target does not count.
     replica_divergent_ids: Vec<BTreeSet<String>>,
@@ -604,7 +608,9 @@ struct PeerScan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Keeper {
-    Peer,
+    /// Excluded from every holder; the index names a holder whose peer hits
+    /// carry the witness.
+    Peer(usize),
     Target(usize),
 }
 
@@ -839,6 +845,7 @@ pub(crate) fn produce(
             "covered_symlink_count": peers.covered_symlink_count,
             "target_file_occurrences_under_peer_roots": peers.target_file_occurrences,
             "peer_unidentified_usage_line_count": peers.unidentified_usage_line_count,
+            "shared_target_replica_line_count": peers.shared_target_replica_line_count,
             "peer_unidentified_usage_note": "usage lines without a native request id cannot be compared; disclosed, not excluded",
         },
         "global_coverage": {
@@ -1206,6 +1213,7 @@ fn scan_peers(
     let mut scan = PeerScan {
         hits: vec![BTreeMap::new(); target_count],
         same_session_line_count: vec![0; target_count],
+        shared_target_replica_line_count: 0,
         replica_divergent_ids: vec![BTreeSet::new(); target_count],
         ..PeerScan::default()
     };
@@ -1332,6 +1340,7 @@ fn scan_peers(
                     continue;
                 }
                 let file_index = scan.files.len();
+                let bytes_before = scan.total_bytes;
                 let outcome = scan_peer_file(
                     &path,
                     file_index,
@@ -1343,10 +1352,9 @@ fn scan_peers(
                 );
                 scan.file_count += 1;
                 root_files += 1;
+                root_bytes += scan.total_bytes - bytes_before;
                 match outcome {
                     Ok((bytes, content_sha256)) => {
-                        scan.total_bytes += bytes;
-                        root_bytes += bytes;
                         scan.files.push(json!({
                             "class": class,
                             "path_sha256": path_sha256(&path),
@@ -1410,6 +1418,11 @@ fn scan_peer_file(
             break;
         }
         total += read as u64;
+        // Charged as read, so a failed or growing file still spends the budget.
+        scan.total_bytes += read as u64;
+        if total > bounds.max_peer_file_bytes || scan.total_bytes > bounds.max_peer_total_bytes {
+            return Err("read past the peer byte bounds".to_string());
+        }
         digest.update(&line);
         if read as u64 > bounds.max_line_bytes && line.last() != Some(&b'\n') {
             return Err("line over max_line_bytes".to_string());
@@ -1460,23 +1473,36 @@ fn scan_peer_file(
                 subagent_session.clone().or_else(|| file_session.clone())
             }
         };
-        if let Some(&own_index) = owner.as_deref().and_then(|owner| session_index.get(owner)) {
-            let counts_it = originals[own_index]
+        let owner_target = owner
+            .as_deref()
+            .and_then(|owner| session_index.get(owner))
+            .copied();
+        let mut owner_counts_it = false;
+        if let Some(own_index) = owner_target {
+            owner_counts_it = originals[own_index]
                 .request_ids
                 .as_ref()
                 .is_some_and(|request_ids| request_ids.contains(&request_id));
-            if !counts_it {
+            if !owner_counts_it {
                 scan.replica_divergent_ids[own_index].insert(request_id.clone());
             }
         }
         let Some(target_indexes) = holders.get(request_id.as_str()) else {
             continue;
         };
-        for &target in target_indexes {
-            if owner.as_deref().and_then(|owner| session_index.get(owner)) == Some(&target) {
-                scan.same_session_line_count[target] += 1;
-                continue;
+        if owner_counts_it {
+            // A replica of a target that counts this id: its own line for the
+            // owner, a target-to-target share for the rest, which B2 allocates.
+            for &target in target_indexes {
+                if Some(target) == owner_target {
+                    scan.same_session_line_count[target] += 1;
+                } else {
+                    scan.shared_target_replica_line_count += 1;
+                }
             }
+            continue;
+        }
+        for &target in target_indexes {
             scan.hits[target]
                 .entry(request_id.clone())
                 .or_insert_with(|| PeerHit {
@@ -1543,14 +1569,15 @@ fn allocate(
     let mut kept_shared = vec![BTreeMap::new(); target_count];
     let mut entries = Vec::new();
     for (request_id, holding) in &holders {
-        let peer_held = holding
+        let peer_witness = holding
             .iter()
-            .any(|target| peers.hits[*target].contains_key(*request_id));
-        if !peer_held && holding.len() < 2 {
+            .copied()
+            .find(|target| peers.hits[*target].contains_key(*request_id));
+        if peer_witness.is_none() && holding.len() < 2 {
             continue;
         }
-        let keeper = if peer_held {
-            Keeper::Peer
+        let keeper = if let Some(witness) = peer_witness {
+            Keeper::Peer(witness)
         } else {
             Keeper::Target(
                 *holding
@@ -1584,7 +1611,7 @@ fn allocate(
                 "request_sha256": sha256_hex(request_id.as_bytes()),
                 "holder_session_key_sha256s": holder_keys,
                 "kept_by": match keeper {
-                    Keeper::Peer => "peer".to_string(),
+                    Keeper::Peer(_) => "peer".to_string(),
                     Keeper::Target(target) => input.targets[target].session_key_sha256.clone(),
                 },
             }),
@@ -1716,30 +1743,39 @@ fn build_target(
             ),
         );
     };
-    let mut excluded_witnesses = excluded_map
-        .iter()
-        .map(|(request_id, keeper)| {
-            let mut witness = json!({
-                "request_sha256": sha256_hex(request_id.as_bytes()),
-            });
-            match keeper {
-                Keeper::Peer => {
-                    let hit = &peers.hits[index][request_id];
-                    witness["cause"] = json!("peer_overlap");
-                    witness["peer_path_sha256"] =
-                        peers.files[hit.peer_file_index]["path_sha256"].clone();
-                    witness["peer_owner_session_sha256"] = json!(hit.owner_session_sha256);
-                    witness["peer_line_count"] = json!(hit.line_count);
-                }
-                Keeper::Target(keeper) => {
-                    witness["cause"] = json!("b2_other_target");
-                    witness["kept_by_session_key_sha256"] =
-                        json!(members[*keeper].session_key_sha256);
-                }
+    let mut excluded_witnesses = Vec::with_capacity(excluded_map.len());
+    for (request_id, keeper) in excluded_map {
+        let mut witness = json!({
+            "request_sha256": sha256_hex(request_id.as_bytes()),
+        });
+        match keeper {
+            Keeper::Peer(witness_target) => {
+                let Some((hit, peer_path_sha256)) =
+                    peers.hits[*witness_target].get(request_id).and_then(|hit| {
+                        let path = peers.files.get(hit.peer_file_index)?.get("path_sha256")?;
+                        Some((hit, path.clone()))
+                    })
+                else {
+                    return hold(
+                        report,
+                        TargetHold::new(
+                            HeldReason::MissingEvidence,
+                            "peer exclusion has no recorded witness",
+                        ),
+                    );
+                };
+                witness["cause"] = json!("peer_overlap");
+                witness["peer_path_sha256"] = peer_path_sha256;
+                witness["peer_owner_session_sha256"] = json!(hit.owner_session_sha256);
+                witness["peer_line_count"] = json!(hit.line_count);
             }
-            witness
-        })
-        .collect::<Vec<_>>();
+            Keeper::Target(keeper) => {
+                witness["cause"] = json!("b2_other_target");
+                witness["kept_by_session_key_sha256"] = json!(members[*keeper].session_key_sha256);
+            }
+        }
+        excluded_witnesses.push(witness);
+    }
     excluded_witnesses.sort_by(|left, right| {
         left["request_sha256"]
             .as_str()
@@ -1749,8 +1785,8 @@ fn build_target(
         "excluded": {
             "request_count": excluded_ids.len(),
             "request_set_fingerprint": request_set_fingerprint(&excluded_ids),
-            "peer_overlap_count": excluded_map.values().filter(|keeper| **keeper == Keeper::Peer).count(),
-            "b2_other_target_count": excluded_map.values().filter(|keeper| **keeper != Keeper::Peer).count(),
+            "peer_overlap_count": excluded_map.values().filter(|keeper| matches!(keeper, Keeper::Peer(_))).count(),
+            "b2_other_target_count": excluded_map.values().filter(|keeper| matches!(keeper, Keeper::Target(_))).count(),
             "totals": excluded_dims.json(),
             "witnesses": excluded_witnesses,
         },

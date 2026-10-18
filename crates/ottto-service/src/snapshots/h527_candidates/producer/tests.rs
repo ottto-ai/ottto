@@ -77,7 +77,8 @@ fn write_transcript(path: &Path, session: &str, requests: &[Request<'_>]) {
 /// - targets 2 and 3 share `req-b2-ack`; target 3 is first-ACKed;
 /// - targets 4 and 5 share `req-b2-hash`; neither is ACK-ordered;
 /// - a fork child copies target 6's `req-t06-a` with a fork marker;
-/// - a peer under the held root shares target 7's `req-t07-b`.
+/// - a peer under the held root shares target 7's `req-t07-b`;
+/// - a replica of target 2 under the held root repeats its `req-b2-ack`.
 fn target_requests(ordinal: u64) -> Vec<(String, u64, u64, u64)> {
     let own = |suffix: &str, input: u64| (format!("req-t{ordinal:02}-{suffix}"), input, 2, 100);
     match ordinal {
@@ -142,6 +143,15 @@ fn fixture() -> Fixture {
             copied,
             assistant_line(FORK_CHILD_SESSION, 1, ("req-fork-own", 9, 1, 0)),
         ],
+    );
+    // A replica of target 2 is that target's own copy, not a peer: the
+    // `req-b2-ack` share stays between targets 2 and 3 and B2 allocates it.
+    write_transcript(
+        &held
+            .join("replica")
+            .join(format!("{}.jsonl", session_id(2))),
+        &session_id(2),
+        &[("req-t02-a", 20, 2, 100), ("req-b2-ack", 300, 30, 0)],
     );
     write_transcript(
         &held.join(format!("{HELD_SESSION}.jsonl")),
@@ -347,6 +357,14 @@ fn producer_excludes_each_overlap_once_and_reconciles_ordinary_bodies() {
     };
     assert_eq!(witness["cause"], "b2_other_target");
     assert_eq!(witness["kept_by_session_key_sha256"], key(&session_id(3)));
+    assert_eq!(
+        target_report(&artifact, 2)["same_session_peer_line_count"],
+        2
+    );
+    assert_eq!(
+        artifact["input_manifest"]["shared_target_replica_line_count"],
+        1
+    );
     let receipt = &target_report(&artifact, 3)["identity_receipt"];
     assert_eq!(receipt["kept_shared_request_count"], 1);
     assert_eq!(receipt["untagged_count"], 1);
@@ -443,6 +461,23 @@ fn producer_holds_every_target_without_a_body_on_unknown_or_capped_peers() {
     });
     let mut capped = fixture.input.clone();
     capped.bounds.max_peer_files = 1;
+    // A failed read still spends the byte budget.
+    let broken = fixture.root.join("broken");
+    fs::create_dir_all(&broken).expect("mkdir");
+    let broken_line = b"{\"requestId\": \"req-t01-a\", truncated\n";
+    fs::write(broken.join("broken.jsonl"), broken_line).expect("write");
+    let mut failed = fixture.input.clone();
+    failed.peer_roots = vec![InputPeerRoot {
+        class: "other".to_string(),
+        path: broken,
+    }];
+    let output = produce(&failed, &"0".repeat(64), &fixture_build()).expect("produce");
+    let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");
+    assert_eq!(artifact["global_coverage"]["complete"], false);
+    assert_eq!(
+        artifact["input_manifest"]["cumulative_peer_bytes_read"],
+        broken_line.len()
+    );
     for (input, reason) in [(unknown, "incomplete_census"), (capped, "cap_overflow")] {
         let output = produce(&input, &"0".repeat(64), &fixture_build()).expect("produce");
         let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");

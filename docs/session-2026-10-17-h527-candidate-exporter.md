@@ -142,6 +142,8 @@ Steps:
 2. Every `.jsonl` file under the peer roots is streamed once. Native request ids are compared exactly, in memory, against all targets. Fork-copied lines belong to the session they name. A subagent transcript belongs to its path identity; any other file belongs to its first named session, as in the parser.
    - These leave coverage unknown, and every target is then held without a body: a cap overflow, a file changed during the read, an unreadable file, a compressed transcript, an unparseable line carrying a request id key, an invalid fork marker, or a symlink leaving the roots.
    - A target's own replica that carries an id the target lacks is held as an unknown owner.
+   - A target's own replica that repeats an id the target counts is not peer evidence. When other targets share that id, the share stays between targets, and B2 allocates it.
+   - Bytes are charged as they are read, so a failed or growing file still spends the cumulative byte budget.
 3. B2 counting allocation is fixed for the whole batch before any body or money exists:
    - An id seen in any peer is excluded from every target.
    - An id shared only by targets is kept by the lowest `b2_first_ack_order`, else by the smaller `session_key_sha256`.
