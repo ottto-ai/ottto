@@ -133,9 +133,13 @@ pub(in crate::snapshots) struct PageBudget {
     disabled_disclosed: bool,
     page_noted: bool,
     resume_claimed: bool,
+    /// Process counters at this scan's page tick: the start of its
+    /// diagnostics window (`SharedCache::cursor_diagnostics`). Boxed so the
+    /// by-value scan object stays small.
+    window_start: Option<Box<Counters>>,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
-    disabled_disclosed, page_noted, resume_claimed);
+    disabled_disclosed, page_noted, resume_claimed, window_start);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -221,11 +225,13 @@ impl PageBudget {
         !std::mem::replace(&mut self.resume_claimed, true)
     }
 
-    /// Advance the cursor page clock once per scan object (K7, K10).
+    /// Advance the cursor page clock once per scan object (K7, K10). The
+    /// diagnostics window opens under this same lock (no extra lock).
     pub(in crate::snapshots) fn note_page(&mut self, cache: &SharedCache) {
         if !std::mem::replace(&mut self.page_noted, true) {
-            cache.with_cursor(|cursor| {
+            self.window_start = cache.with_cursor(|cursor| {
                 cursor.rotation.page = cursor.rotation.page.saturating_add(1);
+                Box::new(cursor.counters)
             });
         }
     }
@@ -424,8 +430,8 @@ enum Slot {
     ActiveElsewhere { token: u64 },
 }
 
-/// Content-free RAM counters. They reach the scan diagnostics through
-/// `SharedCache::cursor_counters` (hunk: `longjoin/counters-hunk.md`).
+/// Content-free RAM counters. They reach the scan's one completion log
+/// record through `SharedCache::cursor_diagnostics`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) jobs_started: u64,
@@ -1310,11 +1316,63 @@ impl SharedCache {
             .is_ok_and(|mut retained| retained.release_until(room))
     }
 
-    /// The cursor counters, for the content-free scan diagnostics.
-    #[allow(dead_code)] // Read by the S11 diagnostics hunk (longjoin/counters-hunk.md).
-    pub(in crate::snapshots) fn cursor_counters(&self) -> Counters {
-        self.with_cursor(|cursor| cursor.counters)
-            .unwrap_or_default()
+    /// Content-free cursor diagnostics for the scan's one completion log
+    /// record: process-global counter deltas since `page`'s window opened
+    /// (overlapping scans included; not attributed to this scan) and the
+    /// retained gauges. Read-only, and never waits: `None` (logged `null`,
+    /// unknown) when the window never opened or the cursor state is busy or
+    /// poisoned.
+    pub(in crate::snapshots) fn cursor_diagnostics(
+        &self,
+        page: &PageBudget,
+    ) -> Option<Box<crate::local_resource_diagnostics::CodexCursorCounts>> {
+        use crate::local_resource_diagnostics::{
+            CodexCursorCounts, CodexCursorEvents, CodexCursorRetained,
+        };
+        let start = page.window_start.as_deref()?;
+        let cursor = self.cursor.try_lock().ok()?;
+        let fixed = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        let now = &cursor.counters;
+        let d = |pick: fn(&Counters) -> u64| fixed(pick(now).saturating_sub(pick(start)));
+        Some(Box::new(CodexCursorCounts {
+            during_scan_window: CodexCursorEvents {
+                jobs_started: d(|c| c.jobs_started),
+                jobs_paused: d(|c| c.jobs_paused),
+                jobs_resumed: d(|c| c.jobs_resumed),
+                jobs_certified: d(|c| c.jobs_certified),
+                jobs_uncertified: d(|c| c.jobs_uncertified),
+                jobs_invalidated: d(|c| c.jobs_invalidated),
+                jobs_member_changed: d(|c| c.jobs_member_changed),
+                jobs_state_bound: d(|c| c.jobs_state_bound),
+                jobs_lost: d(|c| c.jobs_lost),
+                jobs_deferred_inputs: d(|c| c.jobs_deferred_inputs),
+                jobs_start_unstartable: d(|c| c.jobs_start_unstartable),
+                jobs_audit_restarted: d(|c| c.jobs_audit_restarted),
+                jobs_finish_failed: d(|c| c.jobs_finish_failed),
+                jobs_frame_returned: d(|c| c.jobs_frame_returned),
+                deferred: d(|c| c.deferred),
+                deferred_rotation: d(|c| c.deferred_rotation),
+                deferred_next_generation: d(|c| c.deferred_next_generation),
+                namespace_busy: d(|c| c.namespace_busy),
+                cursor_disabled_unsupported_layout: d(|c| c.cursor_disabled_unsupported_layout),
+                audit_overdue: d(|c| c.audit_overdue),
+                sealed_fragment_withheld: d(|c| c.sealed_fragment_withheld),
+                eof_record_applied: d(|c| c.eof_record_applied),
+                jobs_unavailable_ended: d(|c| c.jobs_unavailable_ended),
+                memo_hits: d(|c| c.memo_hits),
+                memo_records: d(|c| c.memo_records),
+                parked_hits: d(|c| c.parked_hits),
+            },
+            retained: CodexCursorRetained {
+                paused_job: matches!(cursor.slot, Slot::Paused(_)),
+                paused_job_charged_bytes: fixed(cursor.slot_charge as u64),
+                memo_entries: fixed(cursor.memo.entries.len() as u64),
+                parked_entries: fixed(cursor.parked.len() as u64),
+                invalidation_entries: fixed(cursor.invalidations.len() as u64),
+                rotation_waiters: fixed(cursor.rotation.waiting.len() as u64),
+                lifetime_audit_overdue_max_age_seconds: fixed(now.audit_overdue_max_age_seconds),
+            },
+        }))
     }
 
     pub(in crate::snapshots) fn cursor_slot_free(&self) -> bool {

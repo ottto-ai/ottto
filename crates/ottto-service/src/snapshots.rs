@@ -15855,6 +15855,7 @@ impl OwnedSourceScan {
                             overdue_audits: overdue,
                             oldest_due_age_seconds: oldest_due_age,
                         },
+                        codex_cursor: context.cache.cursor_diagnostics(&codex_page),
                     }
                 });
                 resource_probe.collection(
