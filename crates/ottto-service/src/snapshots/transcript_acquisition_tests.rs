@@ -1587,6 +1587,67 @@ fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate()
 }
 
 #[test]
+fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit() {
+    for blocked in [false, true] {
+        let f = ScanFixture::new(SnapshotSource::ClaudeCode);
+        f.file
+            .append(&usage(SnapshotSource::ClaudeCode, 100, 0, "fixture-model"));
+        let ((_, scan, _, _), rows) = crate::local_resource_diagnostics::capture(|| {
+            production_scan_at_with_setup(
+                &f,
+                SnapshotSource::ClaudeCode,
+                ScanIndex::default(),
+                Some(Arc::new(sampled_scan::SharedCache::default())),
+                "absence-fixture",
+                NOW,
+                |scan| scan.state_census_complete = !blocked,
+            )
+        });
+        let pages = rows
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 1);
+        let counts = &pages[0]["counts"]["sampled_acquisition"]["acquisition_admission"];
+        assert_eq!(counts["attempts"], 1);
+        assert_eq!(counts["retained_entry"], json!({"assessed":1,"matched":0}));
+        assert_eq!(counts["cache_lookup_miss_unknown_origin"], 1);
+        assert_eq!(
+            counts["state_census_complete"],
+            json!({"assessed":1,"matched":usize::from(!blocked)})
+        );
+        for field in [
+            "reduction_dependencies_available",
+            "index_entry_present",
+            "sampling_allowed",
+        ] {
+            assert_eq!(counts[field]["assessed"], usize::from(!blocked));
+        }
+        assert_eq!(counts["index_entry_present"]["matched"], 0);
+        assert_eq!(counts["sampling_allowed"]["matched"], 0);
+        assert_eq!(counts["prepare_started"], usize::from(!blocked));
+        assert_eq!(counts["prepare_failed"], 0);
+        let (_, control, _, _) = production_scan_at_with_setup(
+            &f,
+            SnapshotSource::ClaudeCode,
+            ScanIndex::default(),
+            None,
+            "absence-fixture",
+            NOW,
+            |scan| scan.state_census_complete = !blocked,
+        );
+        assert_eq!(
+            production_body(SnapshotSource::ClaudeCode, scan),
+            production_body(SnapshotSource::ClaudeCode, control)
+        );
+        let encoded = serde_json::to_string(pages[0]).unwrap();
+        assert!(!encoded.contains(f.dir.to_str().unwrap()));
+        assert!(!encoded.contains("expired"));
+        assert!(!encoded.contains("evicted"));
+    }
+}
+
+#[test]
 fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
     if !crate::heap_layout_bound::layout_supported() {
         return;

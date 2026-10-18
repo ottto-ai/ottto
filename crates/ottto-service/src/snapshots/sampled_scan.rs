@@ -81,11 +81,12 @@ pub(super) struct Context {
     pub(super) audits_completed: usize,
     pub(super) start_overdue_seconds: u64,
     pub(super) completion_overdue_seconds: u64,
+    pub(super) admission: crate::local_resource_diagnostics::AcquisitionAdmission,
 }
 crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supported, audit_slots,
     full_files, tail_files, unchanged_files, native_bytes, sample_bytes, full_reasons,
     priority_replays, audits_started, audits_completed, start_overdue_seconds,
-    completion_overdue_seconds);
+    completion_overdue_seconds, admission);
 
 pub(super) struct Active {
     pub(super) key: String,
@@ -194,6 +195,7 @@ impl OwnedSourceScan {
                 audits_completed: 0,
                 start_overdue_seconds: 0,
                 completion_overdue_seconds: 0,
+                admission: Default::default(),
             });
         }
         self

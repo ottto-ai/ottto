@@ -3389,9 +3389,17 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 format!("{:x}", digest.finalize())
             });
         if pending.sampled_audit_verified {
-            eprintln!("ottto-service: sampled full audit {}: body_comparison_available={} effective_body_changed={}; changes may include new suffix or policy output", source.api_slug(),
-                pending.previous_upload_body_witness.is_some(),
-                final_upload_body_witness != pending.previous_upload_body_witness);
+            crate::local_resource_diagnostics::sampled_audit_comparison(
+                source.api_slug(),
+                (
+                    final_group_fingerprint.as_deref(),
+                    pending.previous_snapshot_fingerprint.as_deref(),
+                ),
+                (
+                    final_upload_body_witness.as_deref(),
+                    pending.previous_upload_body_witness.as_deref(),
+                ),
+            );
         }
         let quarantine_retry_required = result.snapshots.iter().any(|snapshot| {
             snapshot.source_file_fingerprint.as_deref()
@@ -15064,6 +15072,7 @@ impl OwnedSourceScan {
                         unchanged_selections: context.unchanged_files,
                         completed_native_bytes: context.native_bytes,
                         completed_guard_bytes: context.sample_bytes,
+                        acquisition_admission: context.admission,
                         page_events: crate::local_resource_diagnostics::PageEvents {
                             full_reasons: crate::local_resource_diagnostics::FullReasons(
                                 context.full_reasons,
@@ -15323,6 +15332,17 @@ impl OwnedSourceScan {
             if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
                 let retained = context.cache.take(&key);
+                let retained_present = retained.is_some();
+                context.admission.attempts = context.admission.attempts.saturating_add(1);
+                context.admission.retained_entry.observe(retained_present);
+                if !retained_present {
+                    // No historical expiry/eviction/clear/admission reason is
+                    // carried by this lookup (including a failed cache lock).
+                    context.admission.cache_lookup_miss_unknown_origin = context
+                        .admission
+                        .cache_lookup_miss_unknown_origin
+                        .saturating_add(1);
+                }
                 let owning_header_is_current = source != SnapshotSource::Codex
                     || codex_join_inventory.as_ref().is_some_and(|inventory| {
                         inventory.complete
@@ -15331,22 +15351,42 @@ impl OwnedSourceScan {
                                 .iter()
                                 .any(|header| header.candidate.path == candidate.path)
                     });
+                context
+                    .admission
+                    .owning_header_current
+                    .observe(owning_header_is_current);
+                context
+                    .admission
+                    .state_census_complete
+                    .observe(state_census_complete);
+                context
+                    .admission
+                    .sidecar_census_complete
+                    .observe(sidecar_census_complete);
                 if owning_header_is_current && state_census_complete && sidecar_census_complete {
-                    if let Some(reduction_sidecar) = sampled_scan::reduction_dependencies(
+                    let reduction_sidecar = sampled_scan::reduction_dependencies(
                         source,
                         &candidate,
                         &codex_title_metadata,
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
-                    ) {
+                    );
+                    context
+                        .admission
+                        .reduction_dependencies_available
+                        .observe(reduction_sidecar.is_some());
+                    if let Some(reduction_sidecar) = reduction_sidecar {
                         let debt = index
                             .files
                             .get(&key)
                             .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
-                        let protected = index
-                            .files
-                            .get(&key)
-                            .is_some_and(ScanIndexEntry::codex_history_is_protected);
+                        let protected_entry = index.files.get(&key);
+                        context
+                            .admission
+                            .index_entry_present
+                            .observe(protected_entry.is_some());
+                        let protected =
+                            protected_entry.is_some_and(ScanIndexEntry::codex_history_is_protected);
                         let forced_family = claude_index_path_family_member(&candidate.path)
                             .is_some_and(|(root, _)| {
                                 forced_claude_family_reparses.contains(&root)
@@ -15365,6 +15405,32 @@ impl OwnedSourceScan {
                         && !comparison_target
                         && !parent_proof_required
                         && (debt.is_some() || context.audit_slots > 0);
+                        context
+                            .admission
+                            .audit_metadata_supported
+                            .observe(context.audit_metadata_supported);
+                        context.admission.protected_history.observe(protected);
+                        context.admission.forced_family.observe(forced_family);
+                        context
+                            .admission
+                            .comparison_target
+                            .observe(comparison_target);
+                        context
+                            .admission
+                            .parent_proof_required
+                            .observe(parent_proof_required);
+                        context.admission.audit_debt_present.observe(debt.is_some());
+                        context
+                            .admission
+                            .audit_slot_available
+                            .observe(context.audit_slots > 0);
+                        context.admission.sampling_allowed.observe(allow_sample);
+                        if retained_present && !allow_sample {
+                            context.admission.retained_entry_rejected_by_eligibility = context
+                                .admission
+                                .retained_entry_rejected_by_eligibility
+                                .saturating_add(1);
+                        }
                         let scope = context.file_scope(
                             source,
                             &candidate,
@@ -15374,6 +15440,8 @@ impl OwnedSourceScan {
                             index,
                         );
                         let old = retained.filter(|_| allow_sample);
+                        context.admission.prepare_started =
+                            context.admission.prepare_started.saturating_add(1);
                         let mode = match parser.prepare_acquisition(
                             old,
                             &scope,
@@ -15382,6 +15450,8 @@ impl OwnedSourceScan {
                         ) {
                             Ok(mode) => mode,
                             Err(_) => {
+                                context.admission.prepare_failed =
+                                    context.admission.prepare_failed.saturating_add(1);
                                 census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();
                             }
@@ -47581,6 +47651,71 @@ mod tests {
                 && entry.last_upload_body_witness.is_some()
         }));
         (home, root, loaded)
+    }
+
+    #[test]
+    fn sampled_audit_diagnostics_distinguish_semantic_only_change() {
+        for missing_previous_semantic in [false, true] {
+            let (home, root, mut index) = projection_adoption_fixture("audit-comparison", 1);
+            // Adoption intentionally omits previous witnesses. Select the
+            // ordinary due-audit path instead, which retains both comparisons.
+            let key = index.files.keys().next().unwrap().clone();
+            let fingerprint = index.files[&key].source_file_fingerprint.clone();
+            assert!(index.stage_sampled_audit(
+                &key,
+                &fingerprint,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: 1
+                },
+            ));
+            let mut scan =
+                projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+            assert_eq!(scan.pending_finalization.len(), 1);
+            assert!(scan.pending_finalization[0]
+                .previous_snapshot_fingerprint
+                .is_some());
+            assert!(scan.pending_finalization[0]
+                .previous_upload_body_witness
+                .is_some());
+            // Tokens change semantic identity, but not the canonical additive
+            // witness (curve/tool/account/cache evidence). Use the real builder.
+            let before_body = snapshot_upload_body_witness(&scan.snapshots[0]);
+            scan.snapshots[0].output_tokens += 1;
+            assert_eq!(
+                snapshot_upload_body_witness(&scan.snapshots[0]),
+                before_body
+            );
+            scan.pending_finalization[0].sampled_audit_verified = true;
+            if missing_previous_semantic {
+                scan.pending_finalization[0].previous_snapshot_fingerprint = None;
+            }
+            let mut control = scan.clone();
+            control.pending_finalization[0].sampled_audit_verified = false;
+            let mut control_index = index.clone();
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut control, &mut control_index);
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+            });
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["stage"], "sampled_audit_comparison");
+            assert_eq!(rows[0]["counts"]["body_comparison_available"], true);
+            assert_eq!(rows[0]["counts"]["effective_body_changed"], false);
+            assert_eq!(
+                rows[0]["counts"]["semantic_comparison_available"],
+                !missing_previous_semantic
+            );
+            assert_eq!(rows[0]["counts"]["semantic_changed"], true);
+            assert!(rows[0]["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert_eq!(
+                serde_json::to_value(&scan.snapshots).unwrap(),
+                serde_json::to_value(&control.snapshots).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&index).unwrap(),
+                serde_json::to_value(&control_index).unwrap()
+            );
+            fs::remove_dir_all(home).unwrap();
+        }
     }
 
     #[test]
