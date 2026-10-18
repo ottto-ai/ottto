@@ -1394,7 +1394,16 @@ fn live_transcript_does_not_fence_the_settled_files_of_its_workspace() {
     set_mtime(&live, now + Duration::from_secs(1));
     assert!(workspace_files_signature(&scan.files, deadline).is_err());
 
-    retain_settled_files(&mut scan.files, now);
+    // A live transcript the last upload included stays, keeping its history.
+    let uploaded = BTreeMap::from([(
+        live.to_string_lossy().to_string(),
+        transcript_file_metadata(&fs::metadata(&live).unwrap()).unwrap(),
+    )]);
+    let mut kept = scan.files.clone();
+    retain_settled_files(&mut kept, now, Some(&uploaded));
+    assert_eq!(kept, scan.files);
+    // A new live transcript waits for a later cycle.
+    retain_settled_files(&mut scan.files, now, None);
     assert_eq!(
         scan.files.iter().map(|(path, _)| path).collect::<Vec<_>>(),
         [&settled]

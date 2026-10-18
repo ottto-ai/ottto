@@ -1629,11 +1629,18 @@ fn transcript_copy_key(path: &Path) -> Vec<std::ffi::OsString> {
     session.into_iter().chain(name).collect()
 }
 
-/// Keeps only transcripts last modified at least `SETTLE_WINDOW` before `now`.
-fn retain_settled_files(files: &mut Vec<(PathBuf, SystemTime)>, now: SystemTime) {
-    files.retain(|(_, mtime)| {
+/// Leaves out transcripts modified within `SETTLE_WINDOW` of `now` that the
+/// last upload did not include; a later cycle picks them up. An uploaded
+/// transcript stays even when recent, so a replacement never drops its history.
+fn retain_settled_files(
+    files: &mut Vec<(PathBuf, SystemTime)>,
+    now: SystemTime,
+    uploaded: Option<&CompositionFilesSignature>,
+) {
+    files.retain(|(path, mtime)| {
         now.duration_since(*mtime)
             .is_ok_and(|age| age >= SETTLE_WINDOW)
+            || uploaded.is_some_and(|files| files.contains_key(path.to_string_lossy().as_ref()))
     });
 }
 
@@ -2000,7 +2007,13 @@ fn harvest_source(
         }
         let workspace_text = scan.workspace.to_string_lossy();
         let workspace_hash = sha256_hex(&[workspace_text.as_ref()]);
-        retain_settled_files(&mut scan.files, now);
+        let path = cache_path(support_dir, agent_source, &workspace_hash);
+        let cache = read_cache(&path);
+        retain_settled_files(
+            &mut scan.files,
+            now,
+            cache.as_ref().map(|entry| &entry.files),
+        );
         if scan.files.is_empty() {
             skipped += 1;
             continue;
@@ -2018,8 +2031,6 @@ fn harvest_source(
                 continue;
             }
         };
-        let path = cache_path(support_dir, agent_source, &workspace_hash);
-        let cache = read_cache(&path);
         let now_dt = OffsetDateTime::now_utc();
         if !should_rescan(
             cache.as_ref(),
