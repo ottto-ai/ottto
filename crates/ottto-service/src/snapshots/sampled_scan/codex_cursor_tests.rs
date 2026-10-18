@@ -1679,12 +1679,12 @@ fn quiescent_unterminated_last_record_is_tailed_with_main_eof_behavior() {
             for page_number in 0..64 {
                 let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
                 index = next;
-                if certified_page.is_some() {
+                if let Some(certified) = certified_page {
                     malformed_lines += scan.malformed_json_line_count;
                     if !scan.snapshots.is_empty() {
                         after.push(fingerprints(&scan));
                     }
-                    if page_number > certified_page.unwrap() + 3 {
+                    if page_number > certified + 3 {
                         break;
                     }
                 } else if counter(&cache, |c| c.jobs_certified) == 1 {
