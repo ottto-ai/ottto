@@ -9919,6 +9919,8 @@ mod tests {
     }
 
     #[test]
+    // A shed page records RatelimitBackoff in the shared client_report counters.
+    #[serial(client_report)]
     fn cache_effective_wire_existing143_context_parse_equal_body_requires_adoption() {
         let root = cache_effective_wire_fixture_root();
         let (mut index, mut progress) = cache_effective_wire_released143_index(&root);
@@ -13982,6 +13984,8 @@ mod tests {
     }
 
     #[test]
+    // A local preflight quarantine records Poisoned in the shared client_report counters.
+    #[serial(client_report)]
     fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
         let root = test_dir("admission-native-hourly");
         std::fs::create_dir_all(&root).unwrap();
@@ -18115,6 +18119,8 @@ mod tests {
         }
     }
     #[test]
+    // A rejected entity records Poisoned in the shared client_report counters.
+    #[serial(client_report)]
     fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_gate() {
         for priority in [false, true] {
             let root = crate::snapshots::native_join_fixture_root(priority);
@@ -19180,6 +19186,8 @@ mod tests {
     }
 
     #[test]
+    // A shed page records RatelimitBackoff in the shared client_report counters.
+    #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
         let (root, mut prior, _, _) =
             crate::snapshots::claude_request_account_mixed_fixture(2, true);
