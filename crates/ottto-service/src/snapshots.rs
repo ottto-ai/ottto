@@ -14664,8 +14664,10 @@ impl OwnedSourceScan {
                                 .map(|ledger| ledger.opened_object_identity.clone());
                             (parent, ledger)
                         });
+                    // Completing a withheld record also cures (N2).
                     let growth_may_cure =
-                        sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator);
+                        sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator)
+                            || active.parser.reader.sealed_fragment();
                     Some((digest, live, stamp, parent, sidecar, growth_may_cure))
                 });
                 let OwnedActiveFile {
@@ -17467,6 +17469,8 @@ impl OwnedJsonlParser {
         let report = bounded.report;
         // Present only for a cursor job whose prefix certificate passed (S12).
         let sealed_prefix = bounded.sealed_prefix;
+        // A cursor read withheld an unterminated final record (N2).
+        let sealed_fragment = bounded.sealed_fragment;
         let mut ownership_incomplete_file_count = 0;
         // The bounded reader cannot prove that a skipped physical line contained
         // no usage. Account one potential recognized usage record per line while
@@ -17524,8 +17528,9 @@ impl OwnedJsonlParser {
         // A parentless created thread is proven only by its complete physical
         // stream. Record an unread line before the ownership decision so the file
         // is held as ownership-incomplete (the generic marking below is too late).
+        // A withheld final record is unread too: the prefix is not that stream.
         if source == SnapshotSource::Codex
-            && !report.complete()
+            && (!report.complete() || sealed_fragment)
             && accumulator.codex_parentless_created_thread()
         {
             accumulator.codex_creator_evidence_conflicted = true;

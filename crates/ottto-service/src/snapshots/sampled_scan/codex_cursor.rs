@@ -243,8 +243,8 @@ impl OpenStamp {
 }
 
 /// The identity a cursor job proved against its held FD when its prefix
-/// certificate passed (S12). Only `finish_job` sets it, on `Certified` or
-/// lossy-with-intact-samples `Uncertified`; `finish` then accepts a grown
+/// certificate passed (S12). Only `finish_job` sets it, and only on
+/// `Certified` (never on a lossy `Uncertified`); `finish` then accepts a grown
 /// object only while the held FD is still this dev/ino and at least the
 /// frozen extent long.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -982,6 +982,14 @@ pub(in crate::snapshots) fn finish_job(
             due_unix_seconds: meta.started.saturating_add(AUDIT_INTERVAL_SECONDS),
         },
     });
+    // A parentless created thread is proven only by its complete physical
+    // stream, so `finish` holds it on the withheld record; the memo keeps
+    // that hold from being re-read before the file changes.
+    if let Some(fragment) =
+        fragment.filter(|_| parser.accumulator.codex_parentless_created_thread())
+    {
+        job.hold_offset = job.hold_offset.or(Some(fragment.offset));
+    }
     let key = rotation_key(&meta.namespace, &meta.key);
     let mut member_changed = false;
     let update = |cursor: &mut CursorState| match &result {
@@ -1007,9 +1015,11 @@ pub(in crate::snapshots) fn finish_job(
             cache.with_cursor(update);
         }
     }
-    if matches!(result, Ok(_) | Err(Some(PrefixRefusal::Lossy))) {
-        // Every object check passed against the held FD: the only grant
-        // `finish` honours for a grown object (S12).
+    if result.is_ok() {
+        // Only a passed certificate grants `finish` a grown object (S12).
+        // A lossy (uncertified) job keeps main's strict finish identity:
+        // if its file grew, the publication fails and the pending path
+        // restarts it, as main's lossy read of a growing file does.
         job.parser.reader.sealed_prefix = frozen_end.map(|extent| SealedPrefix {
             dev: meta.stamp_open.dev,
             ino: meta.stamp_open.ino,
