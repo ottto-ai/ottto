@@ -1,6 +1,7 @@
 //! Native reduction adapter for the shared acquisition/cache mechanism. The
 //! existing parser step and finish remain the only semantic implementation.
 use super::*;
+use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
 use crate::transcript_acquisition::{AuditDebt, Checkpoint, ReadMode, ReadPlan, Scope};
 use crate::transcript_cache::Retained;
 
@@ -198,13 +199,23 @@ impl OwnedJsonlParser {
             )
         {
             self.reader.acquisition = None;
+            record(Event::RetentionIncompleteOrLossy);
             return Ok(None);
         }
-        let admitted_copy = sampled_scan::compatible_reduction(&self.accumulator)
-            && self
-                .retention_bound(remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES))
-                .is_some();
+        let admitted_copy = if !sampled_scan::compatible_reduction(&self.accumulator) {
+            record(Event::RetentionIncompatible);
+            false
+        } else if self
+            .retention_bound(remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES))
+            .is_some()
+        {
+            true
+        } else {
+            record(Event::RetentionBoundRefused);
+            false
+        };
         let Some(plan) = self.reader.acquisition.take() else {
+            record(Event::RetentionNoPlan);
             return Ok(None);
         };
         let checkpoint =
@@ -212,9 +223,11 @@ impl OwnedJsonlParser {
         // Native EOF may apply an unterminated valid JSON row. Its reduction is
         // not the reduction through the sealed byte pointer. Conservatively
         // decline retention; keep the existing full-parser EOF output unchanged.
-        if checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len()
-            || !admitted_copy
-        {
+        let unsealed = checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
+        if unsealed {
+            record(Event::RetentionUnsealedEof);
+        }
+        if unsealed || !admitted_copy {
             return Ok(Some(CompletedNativeAcquisition {
                 checkpoint,
                 reduction: None,
@@ -237,6 +250,11 @@ impl OwnedJsonlParser {
             remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES),
         )
         .map(|_| reduction);
+        record(if reduction.is_some() {
+            Event::RetentionProduced
+        } else {
+            Event::RetentionCloneBoundRefused
+        });
         Ok(Some(CompletedNativeAcquisition {
             checkpoint,
             reduction,

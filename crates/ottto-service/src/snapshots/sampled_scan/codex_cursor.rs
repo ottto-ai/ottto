@@ -420,9 +420,6 @@ pub(in crate::snapshots) fn job_charge_estimate(
     estimate_charge(walked, job_position(job, consumed), buffer, feeds)
 }
 
-/// The job's input position for E3: the reader's `consumed`, plus the bytes
-/// a group's completed member readers consumed and their swap charges
-/// (R2-N4, R2-L3).
 /// Fixed per-member state a group member swap adds (round 4, L3): the
 /// applied receipt's B-tree slot share (a non-root node holds at least 5 of
 /// its 11 entries), the legacy baseline's and the proof's `MemberSeen` Vec
@@ -445,6 +442,9 @@ pub(in crate::snapshots) fn swap_charge(records: &[Option<usize>]) -> u64 {
         })
 }
 
+/// The job's input position for E3: the reader's `consumed`, plus the bytes
+/// a group's completed member readers consumed and their swap charges
+/// (R2-N4, R2-L3).
 fn job_position(job: &OwnedActiveFile, consumed: u64) -> u64 {
     job.group.as_ref().map_or(consumed, |group| {
         consumed.saturating_add(group.consumed_before)
@@ -2584,7 +2584,8 @@ pub(in crate::snapshots) fn dequeue(index: &mut ScanIndex, candidate: &Candidate
 }
 
 /// `requeue` for every member of a group in one pass over the pending
-/// paths (round 4, L2): O(P + n), not O(P) per member.
+/// paths (round 4, L2): O(P + n), not O(P) per member, and no pending path
+/// is cloned.
 pub(in crate::snapshots) fn requeue_members<'a>(
     index: &mut ScanIndex,
     flags: &BTreeMap<String, (bool, bool)>,
@@ -2593,13 +2594,21 @@ pub(in crate::snapshots) fn requeue_members<'a>(
     let Some(traversal) = index.traversal.as_mut() else {
         return;
     };
-    let mut pending = traversal
-        .pending_candidates
+    let members = members.into_iter().collect::<Vec<_>>();
+    // The members not pending yet; a repeated member is pushed once.
+    let mut absent = members
         .iter()
-        .map(|pending| pending.path.clone())
+        .copied()
+        .map(|member| member.path.as_path())
         .collect::<std::collections::HashSet<_>>();
+    for pending in &traversal.pending_candidates {
+        if absent.is_empty() {
+            break;
+        }
+        absent.remove(pending.path.as_path());
+    }
     for candidate in members {
-        if !pending.insert(candidate.path.clone()) {
+        if !absent.remove(candidate.path.as_path()) {
             continue;
         }
         let (census_member, watcher_hint) = flags
@@ -3099,11 +3108,38 @@ pub(in crate::snapshots) fn held_monotone(accumulator: &SnapshotAccumulator) -> 
 /// may be cured by an append, when the sidecar's rollout extent is ahead of
 /// the flushed file and the file catches up. Its memo entry hits only on the
 /// exact recorded stamp, so any growth re-reads it.
+///
+/// #635: a state-declared created thread whose rollout extent does not match
+/// the file binds no projection and no creation time, so its header is held
+/// as `AmbiguousFork`, not `NativeCreatedThread`: the same growth-curable
+/// hold. Memo eligibility only; admission is unchanged.
 pub(in crate::snapshots) fn growth_may_cure(accumulator: &SnapshotAccumulator) -> bool {
-    matches!(
-        accumulator.codex_ownership_boundary,
-        CodexOwnershipBoundary::NativeCreatedThread
-    ) && accumulator.codex_parent_session_ref.is_none()
+    match accumulator.codex_ownership_boundary {
+        CodexOwnershipBoundary::NativeCreatedThread => {
+            accumulator.codex_parent_session_ref.is_none()
+                && accumulator.codex_sidecar_projected_next_ordinal.is_none()
+        }
+        CodexOwnershipBoundary::AmbiguousFork => unbound_created_thread(accumulator),
+        _ => false,
+    }
+}
+
+/// A state-declared created thread whose sidecar bound neither a parent nor
+/// a projection (#635): no extent, any rollout mismatch (extent, path,
+/// inode or created time), or the identity-conflict / incomplete-detail
+/// return of the sidecar bind. The class keys on
+/// bound sidecar facts, not header claims, so it includes copy-evidence
+/// forks (`forked_from_id`, `history_base`) and parented threads whose
+/// binding was skipped: the created-thread branch overwrites
+/// `codex_parent_session_ref` with the trusted (bound) parent, so the ref
+/// conjunct only bites on the identity-ambiguous return. Excluding header
+/// lineage would bring the stale hit back for a parented thread that binds
+/// once its file catches up. A member pays an exact-stamp re-read on growth
+/// or sidecar change; admission is still decided by the classifier.
+fn unbound_created_thread(accumulator: &SnapshotAccumulator) -> bool {
+    accumulator.codex_sidecar_created_thread
+        && accumulator.codex_sidecar_parent.is_none()
+        && accumulator.codex_parent_session_ref.is_none()
         && accumulator.codex_sidecar_projected_next_ordinal.is_none()
 }
 
@@ -3114,12 +3150,14 @@ pub(in crate::snapshots) fn memo_key(namespace: &Scope, key: &str) -> String {
 
 /// Every hold except an ambiguous fork (cured by peer parent evidence, which
 /// the entry's parent ledger records) also wakes on sidecar change. When in
-/// doubt the sidecar is kept as a wake input (K3).
+/// doubt the sidecar is kept as a wake input (K3). An unbound created
+/// thread's `AmbiguousFork` is cured by its projection, so it wakes too
+/// (#635).
 pub(in crate::snapshots) fn sidecar_wakes(accumulator: &SnapshotAccumulator) -> bool {
     !matches!(
         accumulator.codex_ownership_boundary,
         CodexOwnershipBoundary::AmbiguousFork
-    )
+    ) || unbound_created_thread(accumulator)
 }
 
 /// The path's full sidecar facts (K3): the non-reduction sidecar

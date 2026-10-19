@@ -644,13 +644,47 @@ fn account_attribution(
 
 /// The request-evidence pass's withheld reason, while it still describes the
 /// snapshot: every usage row is still unattributed, as that pass left it.
+/// Contract-5 rows that disagree explain themselves: their own per-request
+/// telemetry logins name two or more accounts. One account beside untagged
+/// usage, or a login from any other basis, explains nothing.
 fn account_withheld_reason(snapshot: &SnapshotItem) -> Option<&'static str> {
-    let reason = snapshot.claude_account_withheld_reason?;
-    matches!(
-        exact_snapshot_account_hash(snapshot),
-        EvidenceResolution::Missing
-    )
-    .then_some(reason)
+    use crate::snapshots::claude_request_identity::{COLLECTOR, TELEMETRY, TELEMETRY_LOGIN};
+    let request_identity_rows = snapshot.provenance.collector == COLLECTOR;
+    if snapshot.claude_account_withheld_reason.is_none() && !request_identity_rows {
+        return None;
+    }
+    match exact_snapshot_account_hash(snapshot) {
+        EvidenceResolution::Missing => snapshot.claude_account_withheld_reason,
+        EvidenceResolution::Resolved(_) => None,
+        EvidenceResolution::Conflict if request_identity_rows => {
+            // Stops at the second account; nothing is collected.
+            let mut first = None;
+            snapshot
+                .model_usage
+                .iter()
+                .chain(
+                    snapshot
+                        .usage_buckets
+                        .iter()
+                        .flat_map(|bucket| bucket.model_usage.iter()),
+                )
+                .flat_map(|row| {
+                    std::iter::once((row.account_identifier_hash.as_deref(), row.evidence_ref))
+                        .chain(row.identity_parts.iter().flatten().map(|part| {
+                            (part.account_identifier_hash.as_deref(), part.evidence_ref)
+                        }))
+                })
+                .filter_map(|(hash, evidence_ref)| {
+                    let entry = snapshot.request_evidence.get(usize::from(evidence_ref?))?;
+                    matches!(entry.identity_basis.as_str(), TELEMETRY | TELEMETRY_LOGIN)
+                        .then_some(hash?)
+                        .filter(|hash| non_empty(hash))
+                })
+                .any(|hash| *first.get_or_insert(hash) != hash)
+                .then_some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS)
+        }
+        EvidenceResolution::Conflict => None,
+    }
 }
 
 enum EvidenceResolution<T> {
@@ -1832,6 +1866,98 @@ mod tests {
         assert_eq!(
             active.account_identifier_hash.as_deref(),
             Some("family_hash")
+        );
+        assert_eq!(active.account_withheld_reason, None);
+
+        // Contract-5 rows: each bucket row carries its own request login and the
+        // lifetime row splits into exact parts. Two accounts explain themselves
+        // with no stored reason, and still name nothing.
+        let part = |hash: &str| crate::snapshots::SnapshotIdentityPart {
+            account_identifier_hash: Some(hash.to_string()),
+            evidence_ref: Some(0),
+            input_tokens: 50,
+            output_tokens: 10,
+            cache_read_tokens: 40,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 0,
+            unattributed_total_tokens: 0,
+            request_count: 1,
+            cost_usd: None,
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
+        };
+        let mut tagged = test_snapshot("tagged", "2026-07-19T10:04:00Z");
+        tagged.provenance.collector =
+            crate::snapshots::claude_request_identity::COLLECTOR.to_string();
+        tagged
+            .attribution_facts
+            .push(direct_fact("parent_session_ref", "parent"));
+        tagged.request_evidence = vec![crate::snapshots::SnapshotRequestEvidence {
+            identity_basis: "telemetry".to_string(),
+            provider_workspace_hash: Some("organization_hash".to_string()),
+        }];
+        let mut later = tagged.usage_buckets[0].clone();
+        later.bucket_start = "2026-07-19T11:00:00Z".to_string();
+        tagged.usage_buckets.push(later);
+        tagged.model_usage[0].identity_parts = Some(vec![part("login_a"), part("login_b")]);
+        for (bucket, login) in tagged.usage_buckets.iter_mut().zip(["login_a", "login_b"]) {
+            bucket.model_usage[0].account_identifier_hash = Some(login.to_string());
+            bucket.model_usage[0].evidence_ref = Some(0);
+        }
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &tagged, Some(&status));
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+        assert_eq!(
+            active.account_withheld_reason.as_deref(),
+            Some("multiple_accounts")
+        );
+
+        // A login from a census basis is not the request's own telemetry.
+        let mut census = tagged.clone();
+        census.request_evidence[0].identity_basis = "transcript_sole_login".to_string();
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &census, Some(&status));
+        assert_eq!(active.account_attribution_source, None);
+        assert_eq!(active.account_withheld_reason, None);
+
+        // One account beside untagged usage is not several accounts.
+        let mut one_and_untagged = tagged.clone();
+        one_and_untagged.model_usage[0].identity_parts = Some(vec![
+            part("login_a"),
+            crate::snapshots::SnapshotIdentityPart {
+                account_identifier_hash: None,
+                evidence_ref: None,
+                ..part("login_a")
+            },
+        ]);
+        let untagged = &mut one_and_untagged.usage_buckets[1].model_usage[0];
+        untagged.account_identifier_hash = None;
+        untagged.evidence_ref = None;
+        let active = active_session_from_snapshot(
+            SnapshotSource::ClaudeCode,
+            &one_and_untagged,
+            Some(&status),
+        );
+        assert_eq!(active.account_attribution_source, None);
+        assert_eq!(active.account_withheld_reason, None);
+
+        // Every request on one account stays named, as today.
+        let mut single = tagged.clone();
+        single.model_usage[0].identity_parts = None;
+        single.model_usage[0].account_identifier_hash = Some("login_a".to_string());
+        single.model_usage[0].evidence_ref = Some(0);
+        single.usage_buckets[1].model_usage[0].account_identifier_hash =
+            Some("login_a".to_string());
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &single, Some(&status));
+        assert_eq!(active.account_identifier_hash.as_deref(), Some("login_a"));
+        assert_eq!(
+            active.account_attribution_source.as_deref(),
+            Some("snapshot_account_identity")
         );
         assert_eq!(active.account_withheld_reason, None);
     }

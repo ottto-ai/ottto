@@ -14160,13 +14160,14 @@ impl OwnedSourceScan {
                     // of its own (it pages through the cursor like any group).
                     // Round 3: so does a group whose probes outran a page's
                     // remaining singleton budget (`ProbeBudgetOrder`).
+                    let fence = sampled_scan::codex_cursor::census_token(index);
                     let own_page = |group: &codex_file_join::Group| {
                         group.members.len() > file_limit
                             || sampling.as_ref().is_some_and(|context| {
                                 context.cache.group_own_page(
                                     &context.namespace,
                                     &codex_file_join::job_key(group),
-                                    sampled_scan::codex_cursor::census_token(index).as_deref(),
+                                    fence.as_deref(),
                                 )
                             })
                     };
@@ -15490,6 +15491,11 @@ impl OwnedSourceScan {
                     crate::heap_layout_bound::completed_bound(&parsed_file, copy_budget);
                 if finalization_charge.is_none() {
                     if let Some(completed) = completed_acquisition.as_mut() {
+                        if completed.reduction.is_some() {
+                            crate::local_resource_diagnostics::cache_lifecycle::record(
+                                crate::local_resource_diagnostics::cache_lifecycle::Event::RetentionFinalizationBoundRefused,
+                            );
+                        }
                         completed.reduction = None;
                     }
                 }
@@ -16468,6 +16474,9 @@ impl OwnedSourceScan {
                         codex_cursor: context.cache.cursor_diagnostics(&codex_page),
                     }
                 });
+                if sampled_acquisition.is_some() {
+                    crate::local_resource_diagnostics::cache_lifecycle_totals();
+                }
                 resource_probe.collection(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
