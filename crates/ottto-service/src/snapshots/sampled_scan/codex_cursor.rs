@@ -3079,10 +3079,11 @@ fn revalidate_decisions(
 ///
 /// A parentless thread missing its sidecar projection (no `trace_id`, a
 /// state row that disagrees, or a sidecar rollout extent that lags the file)
-/// is cured by sidecar evidence, never by an append: it is memoized too, and
-/// wakes on any change of the path's full sidecar fingerprint (rollout
-/// extent, state row, title and decoration included) or identity conflicts,
-/// which the entry records (`sidecar_fingerprint`). Zero accepted usage is
+/// is cured by sidecar evidence or by the file catching up with its extent:
+/// it is memoized too, on its exact stamp (`growth_may_cure`), and wakes on
+/// any change of the path's full sidecar fingerprint (rollout extent, state
+/// row, title and decoration included) or conflicted candidate ids, which
+/// the entry records (`sidecar_fingerprint`). Zero accepted usage is
 /// append-curable and never memoized.
 pub(in crate::snapshots) fn held_monotone(accumulator: &SnapshotAccumulator) -> bool {
     match accumulator.codex_ownership_boundary {

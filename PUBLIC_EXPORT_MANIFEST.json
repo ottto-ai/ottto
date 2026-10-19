@@ -1546,15 +1546,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "babdb4c17b7eac52ddd0b1b55c29661537e7aeb6a6293bdda6021f80d8c35e5f",
-      "size_bytes": 144098
+      "sha256": "fe28016c1a57bb44253af8c904302e75f27cbb459fd4450cd9e425574716f22a",
+      "size_bytes": 144171
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "a98f30650d3c99bd92418a81f005b15a2185afde9bc881f1f01b17ea785cd744",
-      "size_bytes": 133501
+      "sha256": "84d6e304ccfc2f49e96f1559aba7e16c9dca0ae0a6f8bbe4f396effe6cd66d3b",
+      "size_bytes": 140484
     },
     {
       "executable": false,
