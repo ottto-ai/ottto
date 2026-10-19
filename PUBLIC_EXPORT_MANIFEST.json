@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 709,
-  "content_sha256": "51e989b93391fe26c38e03a626f2145cfd199a54740e901abd3913adf394984c",
+  "content_sha256": "2d8904607e62800ea61334240a9026be7d34523e8116f6ed09956359f0538aaf",
   "files": [
     {
       "executable": false,
@@ -3184,8 +3184,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-18-session-start-snapshot.md",
-      "sha256": "72dbe079b50dc6ae22a7f5358e93a88c8cb04e804192a9816dd4bc1e99830462",
-      "size_bytes": 3878
+      "sha256": "92816d4c85b5e13a0fd8b096342bc59ed23221039cfe15432a1809197e9744f9",
+      "size_bytes": 4029
     },
     {
       "executable": false,
@@ -4966,7 +4966,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-19T06:25:27+00:00",
+  "generated_at": "2026-10-19T06:25:45+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 710,
   "public_roots": [
@@ -5005,5 +5005,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "67525a425ec5d365f8c1ff128b3891c37cb2d6df"
+  "source_commit": "629b5f2e6125173efebd91d52cb9d359667bff44"
 }

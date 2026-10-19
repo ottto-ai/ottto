@@ -13,7 +13,7 @@ snapshot fingerprint or the upload-body witness.
 Fields:
 - Request 1 usage: uncached input, cache read, and cache writes split 5m/1h
   (Claude only; Codex logs no cache writes). Sent only when the parts add up
-  exactly to the item's first-turn context.
+  exactly to request 1's context and that is the item's first-turn context.
 - Opening request count, and context for requests 2 and 3.
 - Output tokens, tool calls and client-truncated outputs over the opening
   responses.
@@ -49,7 +49,9 @@ An entry with neither identity is counted in `opening_file_overflow`. If the
 instruction text outgrew its matching budget, file facts are unknown: no
 opening file and no overflow are sent. Tool labels outside admission's
 `[A-Za-z0-9_.:-]{1,64}` travel as `unknown`. Forks and
-transcripts that start with copied records keep only `client_version`. MCP tool
+transcripts that start with copied records keep only `client_version`; for
+Codex that includes the shared prelude parser's verdict (another session's
+`session_meta` before the first usage). MCP tool
 names collapse to `mcp`. No text leaves the Mac.
 
 The in-window state is held to 256 KiB under the daemon heap model: up to
