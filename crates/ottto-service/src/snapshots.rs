@@ -14980,6 +14980,10 @@ impl OwnedSourceScan {
                 } else {
                     copy_budget
                 };
+                // #631 review M1: the bytes this attempt read, taken before
+                // `finish_job` consumes the acquisition's start offset. An
+                // exact-stamp memo below must not cover anything past them.
+                let attempt_read_end = sampled_scan::codex_cursor::read_end(&active);
                 // S6: a cursor job commits only through its sealed-prefix
                 // certificate; an invalidated attempt publishes nothing.
                 let mut cursor_certificate = None;
@@ -15161,6 +15165,12 @@ impl OwnedSourceScan {
                     let growth_may_cure =
                         sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator)
                             || active.parser.reader.sealed_fragment();
+                    // #631 review M1: the exact stamp is captured here, after
+                    // `finish_job`'s check; an append in between must not be
+                    // anchored as read.
+                    if growth_may_cure && stamp.extent() != attempt_read_end {
+                        return None;
+                    }
                     Some((digest, live, stamp, parent, sidecar, growth_may_cure))
                 });
                 let OwnedActiveFile {
