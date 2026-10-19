@@ -3318,12 +3318,12 @@ fn upload_local_health_projection_reporting(
     machine_id: &str,
     daemon: &LocalDaemon,
 ) -> Result<()> {
-    if let Some(remaining) =
-        setup_run_refresh_hold_remaining(&setup_run_refresh_binding(device, device_secret))
+    if let Some(held) =
+        setup_run_refresh_hold_for(&setup_run_refresh_binding(device, device_secret))
     {
         // No request at all while held: the last `AuthRejected` upload event
         // stays the latest one, so local health keeps reporting the rejection.
-        return Err(anyhow::Error::new(LocalHealthRefreshHeld { remaining }));
+        return Err(anyhow::Error::new(held));
     }
     match upload_local_health_projection_with(
         client,
@@ -3352,7 +3352,10 @@ fn upload_local_health_projection_reporting(
                 }
                 let _ = daemon
                     .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected);
-                note_setup_run_refresh_failed(&setup_run_refresh_binding(device, device_secret));
+                note_setup_run_refresh_failed(
+                    &setup_run_refresh_binding(device, device_secret),
+                    crate::control::terminal_refresh_rejection(&refresh_error).is_some(),
+                );
                 return Err(error.context(format!(
                     "refresh setup-run credentials after relay auth rejection failed: {refresh_error}"
                 )));
@@ -3372,10 +3375,10 @@ fn upload_local_health_projection_reporting(
                 }
                 Err(retry_error) => {
                     if local_health_upload_should_refresh_setup_run(&retry_error) {
-                        note_setup_run_refresh_failed(&setup_run_refresh_binding(
-                            device,
-                            device_secret,
-                        ));
+                        note_setup_run_refresh_failed(
+                            &setup_run_refresh_binding(device, device_secret),
+                            false,
+                        );
                     }
                     let _ = daemon.record_local_health_upload_failed(
                         local_health_upload_failure_kind(&retry_error),
@@ -3401,30 +3404,38 @@ const SETUP_RUN_REFRESH_HOLD_CAP: Duration = Duration::from_secs(30 * 60);
 /// credential and setup-run binding was rejected and the refresh did not help.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LocalHealthRefreshHeld {
-    remaining: Duration,
+    /// `None` while parked until this Mac reconnects.
+    remaining: Option<Duration>,
 }
 
 impl std::fmt::Display for LocalHealthRefreshHeld {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "local health upload held after setup-run refresh failed; next attempt in {}s",
-            self.remaining.as_secs()
-        )
+        match self.remaining {
+            Some(remaining) => write!(
+                f,
+                "local health upload held after setup-run refresh failed; next attempt in {}s",
+                remaining.as_secs()
+            ),
+            None => write!(
+                f,
+                "local health upload held: Ottto ended this Mac's setup run or device credential; reconnect to resume"
+            ),
+        }
     }
 }
 
 impl std::error::Error for LocalHealthRefreshHeld {}
 
-/// Rejected-refresh streak for one binding. The backend does not yet type
-/// which rejections are permanent (revoked device, invalid secret) and which
-/// are recoverable (a paired run it can renew), so every rejection backs off
-/// on the same capped ladder and none is treated as final.
+/// Rejected-refresh streak for one binding. An authoritative terminal refresh
+/// answer ([`crate::control::terminal_refresh_rejection`]: the run ended, or
+/// the device credential is rejected) parks the binding until it changes;
+/// every other rejection backs off on a capped ladder and is never final.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SetupRunRefreshHold {
     binding: [u8; 32],
     failures: u32,
-    until: Instant,
+    /// `None`: parked until the binding changes.
+    until: Option<Instant>,
 }
 
 static SETUP_RUN_REFRESH_HOLD: OnceLock<Mutex<Option<SetupRunRefreshHold>>> = OnceLock::new();
@@ -3456,54 +3467,66 @@ fn setup_run_refresh_hold_duration(failures: u32) -> Duration {
         .min(SETUP_RUN_REFRESH_HOLD_CAP)
 }
 
-/// Remaining wait for `binding`, or `None` when a pass may run. A hold for a
+/// The hold on `binding`, or `None` when a pass may run. A hold for a
 /// different binding is dropped: the user reattached or the credential changed.
-fn setup_run_refresh_hold_remaining_at(
+fn setup_run_refresh_hold_at(
     hold: &mut Option<SetupRunRefreshHold>,
     binding: &[u8; 32],
     now: Instant,
-) -> Option<Duration> {
+) -> Option<LocalHealthRefreshHeld> {
     let current = (*hold)?;
     if &current.binding != binding {
         *hold = None;
         return None;
     }
-    current
-        .until
-        .checked_duration_since(now)
-        .filter(|remaining| !remaining.is_zero())
+    match current.until {
+        None => Some(LocalHealthRefreshHeld { remaining: None }),
+        Some(until) => until
+            .checked_duration_since(now)
+            .filter(|remaining| !remaining.is_zero())
+            .map(|remaining| LocalHealthRefreshHeld {
+                remaining: Some(remaining),
+            }),
+    }
 }
 
+/// Record a failed refresh for `binding`; returns the wait, or `None` when the
+/// failure was terminal and the binding is parked.
 fn note_setup_run_refresh_failed_at(
     hold: &mut Option<SetupRunRefreshHold>,
     binding: &[u8; 32],
     now: Instant,
-) -> Duration {
+    terminal: bool,
+) -> Option<Duration> {
     let failures = match *hold {
         Some(current) if &current.binding == binding => current.failures.saturating_add(1),
         _ => 1,
     };
-    let wait = setup_run_refresh_hold_duration(failures);
+    let wait = (!terminal).then(|| setup_run_refresh_hold_duration(failures));
     *hold = Some(SetupRunRefreshHold {
         binding: *binding,
         failures,
-        until: now + wait,
+        until: wait.map(|wait| now + wait),
     });
     wait
 }
 
-fn setup_run_refresh_hold_remaining(binding: &[u8; 32]) -> Option<Duration> {
+fn setup_run_refresh_hold_for(binding: &[u8; 32]) -> Option<LocalHealthRefreshHeld> {
     let mut hold = setup_run_refresh_hold().lock().ok()?;
-    setup_run_refresh_hold_remaining_at(&mut hold, binding, Instant::now())
+    setup_run_refresh_hold_at(&mut hold, binding, Instant::now())
 }
 
-fn note_setup_run_refresh_failed(binding: &[u8; 32]) {
+fn note_setup_run_refresh_failed(binding: &[u8; 32], terminal: bool) {
     if let Ok(mut hold) = setup_run_refresh_hold().lock() {
-        let wait = note_setup_run_refresh_failed_at(&mut hold, binding, Instant::now());
-        eprintln!(
-            "local health setup-run refresh rejected; next attempt in {}s",
-            wait.as_secs()
-        );
+        match note_setup_run_refresh_failed_at(&mut hold, binding, Instant::now(), terminal) {
+            Some(wait) => eprintln!(
+                "local health setup-run refresh rejected; next attempt in {}s",
+                wait.as_secs()
+            ),
+            None => eprintln!(
+                "local health setup-run refresh ended by Ottto; held until this Mac reconnects"
+            ),
+        }
     }
 }
 
@@ -15139,40 +15162,45 @@ mod tests {
         let now = Instant::now();
         let binding = [1u8; 32];
         let mut hold = None;
-        assert_eq!(
-            setup_run_refresh_hold_remaining_at(&mut hold, &binding, now),
-            None
-        );
+        let remaining = |hold: &mut Option<SetupRunRefreshHold>, binding: &[u8; 32], at| {
+            setup_run_refresh_hold_at(hold, binding, at).map(|held| held.remaining)
+        };
+        assert_eq!(remaining(&mut hold, &binding, now), None);
 
         let waits = (0..7)
-            .map(|_| note_setup_run_refresh_failed_at(&mut hold, &binding, now).as_secs())
+            .map(|_| note_setup_run_refresh_failed_at(&mut hold, &binding, now, false))
+            .map(|wait| wait.map(|wait| wait.as_secs()))
             .collect::<Vec<_>>();
-        assert_eq!(waits, vec![120, 240, 480, 960, 1800, 1800, 1800]);
         assert_eq!(
-            setup_run_refresh_hold_remaining_at(&mut hold, &binding, now),
-            Some(SETUP_RUN_REFRESH_HOLD_CAP)
+            waits,
+            [120, 240, 480, 960, 1800, 1800, 1800].map(Some).to_vec()
         );
-        // A rejection is never final: once the wait passes, the pass runs again.
         assert_eq!(
-            setup_run_refresh_hold_remaining_at(
-                &mut hold,
-                &binding,
-                now + SETUP_RUN_REFRESH_HOLD_CAP
-            ),
+            remaining(&mut hold, &binding, now),
+            Some(Some(SETUP_RUN_REFRESH_HOLD_CAP))
+        );
+        // A transient rejection is never final: once the wait passes, the pass runs again.
+        assert_eq!(
+            remaining(&mut hold, &binding, now + SETUP_RUN_REFRESH_HOLD_CAP),
             None
         );
         assert!(hold.is_some());
 
-        // A reattach or credential change drops the hold and restarts the ladder.
-        let reattached = [2u8; 32];
+        // A terminal refresh answer parks the same binding with no deadline.
         assert_eq!(
-            setup_run_refresh_hold_remaining_at(&mut hold, &reattached, now),
+            note_setup_run_refresh_failed_at(&mut hold, &binding, now, true),
             None
         );
+        let much_later = now + SETUP_RUN_REFRESH_HOLD_CAP * 100;
+        assert_eq!(remaining(&mut hold, &binding, much_later), Some(None));
+
+        // A reattach or credential change drops the hold and restarts the ladder.
+        let reattached = [2u8; 32];
+        assert_eq!(remaining(&mut hold, &reattached, much_later), None);
         assert!(hold.is_none());
         assert_eq!(
-            note_setup_run_refresh_failed_at(&mut hold, &reattached, now).as_secs(),
-            120
+            note_setup_run_refresh_failed_at(&mut hold, &reattached, now, false),
+            Some(Duration::from_secs(120))
         );
     }
 
@@ -15257,8 +15285,13 @@ mod tests {
             Some(crate::LatestLocalHealthUpload::AuthRejected { .. })
         ));
 
+        // "Telemetry device is not active" from the refresh endpoint is an
+        // authoritative terminal answer: parked, not merely backed off.
         let held = pass();
-        assert!(held.downcast_ref::<LocalHealthRefreshHeld>().is_some());
+        assert_eq!(
+            held.downcast_ref::<LocalHealthRefreshHeld>(),
+            Some(&LocalHealthRefreshHeld { remaining: None })
+        );
         assert!(local_health_upload_can_wait_quietly(&held));
         assert_eq!(requests(), 2, "a held pass sends nothing");
         // The rejection stays the latest recorded outcome while held.

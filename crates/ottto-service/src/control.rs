@@ -6552,6 +6552,7 @@ fn auth_reset(
     // unconfirmed cloud-session grant.
     let identity_reservation = reserve_identity_mutation(true)?;
     let mut cloud_disconnect: Option<SetupRunDisconnectResponse> = None;
+    let mut setup_run_already_ended = false;
 
     if !local_only {
         let connection = daemon
@@ -6561,12 +6562,22 @@ fn auth_reset(
             .load()
             .map_err(|_| cloud_logout_requires_connection_error())?;
         let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
-        cloud_disconnect = Some(disconnect_setup_run_with_refresh(
-            &api_base_url,
-            &connection,
-            &setup_run_token,
-        )?);
+        match disconnect_setup_run_with_refresh(&api_base_url, &connection, &setup_run_token) {
+            Ok(disconnect) => cloud_disconnect = Some(disconnect),
+            // Ottto already ended this run, so there is nothing left to
+            // disconnect. Fall through to the local-only cleanup (prior device
+            // proof kept for reconnecting) and report that Ottto was not
+            // changed. Every other failure still aborts with local state intact.
+            Err(error)
+                if terminal_refresh_rejection(&error)
+                    == Some(TerminalRefreshRejection::SetupRunEnded) =>
+            {
+                setup_run_already_ended = true;
+            }
+            Err(error) => return Err(error),
+        }
     }
+    let local_only = local_only || setup_run_already_ended;
 
     {
         let _identity_lifecycle_lock = lock_setup_run_binding();
@@ -6610,6 +6621,8 @@ fn auth_reset(
     reset.message = StableMessage {
         code: if forget_installation {
             "installation_forgotten".to_string()
+        } else if setup_run_already_ended {
+            "setup_run_already_ended".to_string()
         } else if local_only {
             "local_disconnect_complete".to_string()
         } else {
@@ -6617,6 +6630,9 @@ fn auth_reset(
         },
         text: if forget_installation {
             "Installation identity, account scope, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing."
+                .to_string()
+        } else if setup_run_already_ended {
+            "Ottto had already ended this Mac's setup run, so nothing changed in Ottto. Active local credentials were cleared; prior device proof was retained securely for reconnection."
                 .to_string()
         } else if local_only {
             "Active local credentials were cleared without changing cloud state; prior device proof was retained securely for reconnection."
@@ -7690,7 +7706,13 @@ fn cli_error_message(error: &LocalApiError) -> String {
                     return TIMEZONE_OVERRIDE_UNSUPPORTED.to_string();
                 }
                 Some("machine_filter_unsupported") => {
-                    return "Ottto can't filter this read to this Mac yet. Retry with --all-machines.".to_string();
+                    return "Ottto can't filter costs to one Mac yet. Remove --machine-id: the default answer is account-wide and its by_machine rows show each Mac.".to_string();
+                }
+                Some("no_committed_answer") => {
+                    return "Ottto has no numbers for this window yet. They are unavailable, not zero; try again later.".to_string();
+                }
+                Some("results_not_served") => {
+                    return "Ottto could not read these numbers from its current calculation. They are unavailable, not zero; try again later.".to_string();
                 }
                 // Typed Results refusals: a settled answer, not a setup failure.
                 Some(_) if backend.status == Some(422) => {
@@ -7702,9 +7724,16 @@ fn cli_error_message(error: &LocalApiError) -> String {
             // text that merely mentions expiry (a short-lived companion token
             // the daemon refreshes, for example) is not a dead setup run.
             if backend.status == Some(401)
-                && backend_error_detail(backend).as_deref() == Some("Setup run expired")
+                && backend.endpoint.contains("/local-client/")
+                && matches!(
+                    backend_error_detail(backend).as_deref(),
+                    Some(SETUP_RUN_EXPIRED_DETAIL | SETUP_RUN_CANCELLED_DETAIL)
+                )
             {
-                return "Setup run expired. Open the Ottto app from Ottto to attach an active setup run.".to_string();
+                return "Setup run expired. Run `ottto login` to reconnect this Mac.".to_string();
+            }
+            if terminal_refresh_rejection(error) == Some(TerminalRefreshRejection::DeviceRejected) {
+                return "Ottto no longer accepts this Mac's device credential. Run `ottto login` to reconnect this Mac.".to_string();
             }
             if backend.status == Some(401) || backend.status == Some(403) {
                 if diagnostics_upload {
@@ -7753,6 +7782,45 @@ fn backend_error_detail(backend: &BackendErrorDetails) -> Option<String> {
         .get("detail")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+const SETUP_RUN_EXPIRED_DETAIL: &str = "Setup run expired";
+const SETUP_RUN_CANCELLED_DETAIL: &str = "Setup run cancelled";
+
+/// Why a device-secret refresh can never succeed for the current binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalRefreshRejection {
+    /// Ottto ended the setup run (expired or cancelled); it is never revived.
+    SetupRunEnded,
+    /// Ottto no longer accepts this Mac's device credential.
+    DeviceRejected,
+}
+
+/// An authoritative terminal answer from `/local-client/refresh`. The backend
+/// does not type these yet, so this matches its exact JSON `detail` on that
+/// endpoint only (a compatibility path, never a substring). Any other 401,
+/// including an unrecognized detail, and every transport failure is not proof.
+pub(crate) fn terminal_refresh_rejection(
+    error: &LocalApiError,
+) -> Option<TerminalRefreshRejection> {
+    let LocalApiError::Backend(details) = error else {
+        return None;
+    };
+    if details.status != Some(401)
+        || !details.endpoint.contains("/api/v1/setup-runs/")
+        || !details.endpoint.ends_with("/local-client/refresh")
+    {
+        return None;
+    }
+    match backend_error_detail(details).as_deref()? {
+        SETUP_RUN_EXPIRED_DETAIL | SETUP_RUN_CANCELLED_DETAIL => {
+            Some(TerminalRefreshRejection::SetupRunEnded)
+        }
+        "Telemetry device is not active"
+        | "Telemetry device secret is invalid"
+        | "Telemetry device not found" => Some(TerminalRefreshRejection::DeviceRejected),
+        _ => None,
+    }
 }
 
 fn bounded_display_text(value: &str, max_chars: usize) -> String {
@@ -7907,10 +7975,33 @@ fn setup_run(
         && !claim_code_provided
         && requested_setup_run_id.is_none()
     {
+        let mut setup_run_id = connection
+            .as_ref()
+            .map(|binding| binding.setup_run_id.clone());
+        if let Some(binding) = connection.as_ref() {
+            // An explicit sign-in on a Mac that looks connected confirms the
+            // binding once with the device credential. Only an authoritative
+            // terminal refresh answer ends it: the existing local-only reset
+            // keeps the prior device proof, and `NeedsUserAction` sends the
+            // caller to a fresh browser claim. The ended run is never revived;
+            // any other failure keeps the binding and the no-op answer.
+            match refresh_setup_run_token_via_device_secret(&binding.api_base_url, binding) {
+                Ok(refreshed) => setup_run_id = Some(refreshed.connection.setup_run_id),
+                Err(error) if terminal_refresh_rejection(&error).is_some() => {
+                    // Only the binding Ottto just answered for is cleared; a
+                    // binding replaced meanwhile is left alone.
+                    if daemon.connection_for_authorized_client()?.as_ref() == Some(binding) {
+                        auth_reset(daemon, authorization, true, false)?;
+                    }
+                    return Err(LocalApiError::SetupRunConnectionMissing);
+                }
+                Err(_) => {}
+            }
+        }
         return Ok(json!({
             "status": "completed",
             "already_connected": true,
-            "setup_run_id": connection.as_ref().map(|binding| binding.setup_run_id.clone()),
+            "setup_run_id": setup_run_id,
             "claim_code_provided": false,
             "source_count": 0,
             "detected_sources": [],
@@ -15219,6 +15310,10 @@ fn agent_costs_url(
     if query.all_machines {
         params.push(("all_machines", "true".to_string()));
     }
+    push_non_empty_query(&mut params, "dimensions", query.dimensions.as_deref());
+    if query.daily {
+        params.push(("daily", "true".to_string()));
+    }
     url_with_query_params(url, params)
 }
 
@@ -20933,42 +21028,92 @@ for line in sys.stdin:
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
     }
 
-    #[test]
-    fn setup_on_connected_daemon_is_truthful_noop() {
-        let daemon = daemon();
-        daemon
-            .begin_auth_with_claim(crate::PendingAuthClaim {
-                claim_code: "claim_connected_setup".to_string(),
-                claim_token: "token_connected_setup".to_string(),
-                nonce: "nonce_connected_setup".to_string(),
-                claim_url: "https://ottto.net/setup/claim?code=claim_connected_setup".to_string(),
-                expires_at: "2100-01-01T00:00:00Z".to_string(),
-            })
-            .expect("begin claim");
-        daemon
-            .complete_auth_with_account(
-                "claim_connected_setup",
-                "nonce_connected_setup",
-                connected_account(),
-                "run_connected_setup".to_string(),
-                "2100-01-01T00:00:00Z".to_string(),
-                Some("machine_test".to_string()),
-            )
-            .expect("connect account");
+    /// A connected Mac with a device credential and a setup run bound to
+    /// `api_base_url`, inside hermetic support/secret directories.
+    fn connected_binding_fixture(
+        name: &str,
+        api_base_url: String,
+    ) -> (PathBuf, Vec<EnvVarGuard>, LocalDaemon, LocalDeviceBinding) {
+        let root = telemetry_key_store_root(name);
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let guards = vec![
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support")),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root),
+        ];
+        let account = connected_account();
+        let device = LocalDeviceBinding {
+            device_id: "device-connected".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let connection = LocalConnectionBinding {
+            setup_run_id: "run_connected_setup".to_string(),
+            setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url,
+        };
+        FileAccountStore::default().save(&account).unwrap();
+        FileDeviceStore::default().save(&device).unwrap();
+        FileConnectionStore::default().save(&connection).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("connected-secret")
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_connected")
+            .unwrap();
+        let daemon = daemon()
+            .with_account(account)
+            .with_connection(Some(connection));
+        (root, guards, daemon, device)
+    }
 
-        let payload = setup_run(
-            &daemon,
-            &RequestAuthorization::Token("token".to_string()),
-            Vec::new(),
-            None,
-            None,
-            None,
-        )
-        .expect("connected setup no-op");
+    #[test]
+    #[serial]
+    fn setup_on_connected_daemon_is_noop_until_ottto_ends_the_run() {
+        let _lock = lock_backend_test_env();
+        let (api_base_url, server) = scripted_json_backend(vec![
+            (401, r#"{"detail":"Setup run not found for this device"}"#),
+            (401, r#"{"detail":"Setup run expired"}"#),
+        ]);
+        let (root, _guards, daemon, device) =
+            connected_binding_fixture("connected-setup", api_base_url);
+        let authorization = RequestAuthorization::Token("token".to_string());
+
+        // A rejection that is not an authoritative terminal answer proves nothing.
+        let payload = setup_run(&daemon, &authorization, Vec::new(), None, None, None)
+            .expect("connected setup no-op");
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["already_connected"], true);
         assert_eq!(payload["setup_run_id"], "run_connected_setup");
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::Connected
+        );
+
+        // An ended run is not revived: local-only cleanup keeps the prior
+        // device proof and the caller is sent to a fresh browser claim.
+        let error = setup_run(&daemon, &authorization, Vec::new(), None, None, None)
+            .expect_err("an ended setup run is not connected");
+        assert_eq!(cli_error(error).code, CliErrorCode::NeedsUserAction);
+        let requests = server.join().expect("scripted backend");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request
+            .starts_with("POST /api/v1/setup-runs/run_connected_setup/local-client/refresh")));
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::NotConnected
+        );
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert_eq!(
+            FileDeviceStore::new(default_prior_device_path())
+                .load()
+                .unwrap(),
+            Some(device)
+        );
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -22237,6 +22382,77 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
+    fn logout_after_ottto_ended_the_run_cleans_up_locally_and_says_so() {
+        let _lock = lock_backend_test_env();
+        let expired = r#"{"detail":"Setup run expired"}"#;
+        let (api_base_url, server) = scripted_json_backend(vec![
+            (401, expired),
+            (401, r#"{"detail":"Setup run not found for this device"}"#),
+            (401, expired),
+            (401, expired),
+        ]);
+        let (root, _guards, daemon, device) =
+            connected_binding_fixture("logout-ended-run", api_base_url);
+        let logout = |request_id: &str| {
+            handle_request(
+                &daemon,
+                LocalControlRequest {
+                    request_id: request_id.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: Some("token".to_string()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: LocalControlCommand::AuthReset {
+                        local_only: false,
+                        forget_installation: false,
+                    },
+                },
+            )
+        };
+
+        // Not an authoritative end of the run: logout fails, nothing is cleared.
+        let refused = logout("req_logout_unproven");
+        assert!(!refused.ok);
+        assert_eq!(
+            refused.error.expect("error").code,
+            CliErrorCode::BackendRejected
+        );
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::Connected
+        );
+        assert_eq!(
+            FileDeviceStore::default().load().unwrap(),
+            Some(device.clone())
+        );
+
+        let ended = logout("req_logout_ended_run");
+        assert!(ended.ok, "{ended:?}");
+        let payload = ended.payload.expect("payload");
+        assert_eq!(payload["local_only"], true);
+        assert_eq!(payload["cloud_disconnected"], false);
+        assert_eq!(payload["message"]["code"], "setup_run_already_ended");
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::NotConnected
+        );
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert_eq!(
+            FileDeviceStore::new(default_prior_device_path())
+                .load()
+                .unwrap(),
+            Some(device)
+        );
+        let requests = server.join().expect("scripted backend");
+        assert!(requests[0].contains("/local-client/disconnect"));
+        assert!(requests[1].contains("/local-client/refresh"));
+        assert!(requests[2].contains("/local-client/disconnect"));
+        assert!(requests[3].contains("/local-client/refresh"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn raw_local_control_json_rejects_stale_protocol_version() {
         let response = handle_request_json_with_peer(
             &daemon(),
@@ -22408,12 +22624,14 @@ for line in sys.stdin:
                 bucket: Some("day".to_string()),
                 mode: Some("full".to_string()),
                 all_machines: false,
+                dimensions: Some("machine,model".to_string()),
+                daily: true,
             },
         );
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full"
+            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full&dimensions=machine%2Cmodel&daily=true"
         );
     }
 
@@ -29680,7 +29898,7 @@ X-API-Key = "otel_redacted"
 
         assert_eq!(
             error.message,
-            "Setup run expired. Open the Ottto app from Ottto to attach an active setup run."
+            "Setup run expired. Run `ottto login` to reconnect this Mac."
         );
         assert!(!error.message.contains("/api/v1"));
         assert!(!error.message.contains("req_private"));
@@ -30077,7 +30295,19 @@ X-API-Key = "otel_redacted"
                 "machine_filter_unsupported".to_string()
             ))
         );
-        assert!(machine.message.contains("--all-machines"));
+        // --all-machines is the no-op default; the explicit filter is what to drop.
+        assert!(machine.message.contains("--machine-id"));
+        assert!(!machine.message.contains("--all-machines"));
+
+        let unavailable = cli_error(LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Unavailable,
+            ..backend(
+                503,
+                r#"{"error":"ResultsUnavailable","code":"no_committed_answer","detail":"Ottto has no cost numbers for this window yet.","results_state":"pending"}"#,
+            )
+        }));
+        assert_eq!(unavailable.code.exit_code(), 16);
+        assert!(unavailable.message.contains("unavailable, not zero"));
 
         let retired = cli_error(LocalApiError::Backend(backend(
             422,
@@ -30100,6 +30330,49 @@ X-API-Key = "otel_redacted"
             r#"{"error":"AuthenticationError","detail":"Setup run expired","request_id":"req_3"}"#,
         )));
         assert!(expired.message.starts_with("Setup run expired."));
+
+        // Terminal only for the exact detail from the refresh endpoint.
+        let refresh = |detail: &str| {
+            LocalApiError::Backend(BackendErrorDetails {
+                endpoint: "https://api.ottto.net/api/v1/setup-runs/run_1/local-client/refresh"
+                    .to_string(),
+                ..backend(401, &format!(r#"{{"detail":"{detail}"}}"#))
+            })
+        };
+        for (detail, expected) in [
+            (
+                "Setup run expired",
+                Some(TerminalRefreshRejection::SetupRunEnded),
+            ),
+            (
+                "Setup run cancelled",
+                Some(TerminalRefreshRejection::SetupRunEnded),
+            ),
+            (
+                "Telemetry device is not active",
+                Some(TerminalRefreshRejection::DeviceRejected),
+            ),
+            ("Setup run not found for this device", None),
+            ("Setup run companion token expired", None),
+        ] {
+            assert_eq!(
+                terminal_refresh_rejection(&refresh(detail)),
+                expected,
+                "{detail}"
+            );
+        }
+        assert_eq!(
+            terminal_refresh_rejection(&LocalApiError::Backend(backend(
+                401,
+                r#"{"detail":"Setup run expired"}"#
+            ))),
+            None,
+            "a read endpoint's 401 is not a refresh answer"
+        );
+        assert_eq!(
+            terminal_refresh_rejection(&LocalApiError::NetworkUnavailable),
+            None
+        );
     }
 
     #[test]
@@ -31423,6 +31696,27 @@ X-API-Key = "otel_redacted"
             .split_once("\r\n\r\n")
             .map(|(_, body)| body)
             .unwrap_or("")
+    }
+
+    /// Loopback backend answering each request in order with `(status, body)`;
+    /// joining it returns the raw requests.
+    fn scripted_json_backend(
+        answers: Vec<(u16, &'static str)>,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted backend");
+        let address = listener.local_addr().expect("scripted backend address");
+        let server = thread::spawn(move || {
+            answers
+                .into_iter()
+                .map(|(status, body)| {
+                    let (mut stream, _) = listener.accept().expect("accept scripted request");
+                    let request = read_complete_http_request(&mut stream);
+                    write_json_response(&mut stream, status, "Scripted", body);
+                    request
+                })
+                .collect()
+        });
+        (format!("http://{address}"), server)
     }
 
     fn write_json_response(

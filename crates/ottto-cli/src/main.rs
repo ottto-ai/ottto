@@ -467,7 +467,7 @@ struct CostsArgs {
     #[arg(
         long,
         value_name = "MACHINE_ID",
-        help = "Override the local machine filter"
+        help = "Filter to one machine (refused while Ottto can't answer it; use by_machine rows)"
     )]
     machine_id: Option<String>,
     #[arg(
@@ -484,8 +484,19 @@ struct CostsArgs {
         help = "Breakdown mode such as full or overview"
     )]
     mode: Option<String>,
-    #[arg(long, help = "Request account-wide costs instead of this Mac")]
+    #[arg(
+        long,
+        help = "Accepted for compatibility; costs are account-wide by default"
+    )]
     all_machines: bool,
+    #[arg(
+        long,
+        value_name = "LIST",
+        help = "Comma-separated groups such as machine,model, or all"
+    )]
+    dimensions: Option<String>,
+    #[arg(long, help = "Include daily series for the selected groups")]
+    daily: bool,
 }
 
 impl CostsArgs {
@@ -502,6 +513,8 @@ impl CostsArgs {
             bucket: non_empty_option(self.bucket.as_deref()),
             mode: non_empty_option(self.mode.as_deref()),
             all_machines: self.all_machines,
+            dimensions: non_empty_option(self.dimensions.as_deref()),
+            daily: self.daily,
         }
     }
 }
@@ -564,7 +577,7 @@ struct SessionsArgs {
     #[arg(
         long,
         value_name = "MACHINE_ID",
-        help = "Override the local machine filter"
+        help = "Filter to one machine's sessions"
     )]
     machine_id: Option<String>,
     #[arg(
@@ -583,7 +596,10 @@ struct SessionsArgs {
     sort_dir: Option<String>,
     #[arg(long, value_name = "TEXT", help = "Search text")]
     search: Option<String>,
-    #[arg(long, help = "Request account-wide sessions instead of this Mac")]
+    #[arg(
+        long,
+        help = "Accepted for compatibility; sessions are account-wide by default"
+    )]
     all_machines: bool,
 }
 
@@ -4330,6 +4346,9 @@ mod tests {
             "day",
             "--mode",
             "full",
+            "--dimensions",
+            "machine,model",
+            "--daily",
         ]);
         validate_cli(&cli).expect("costs json valid");
         let invocation = invocation_from_cli(cli);
@@ -4352,6 +4371,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: Some("machine,model".to_string()),
+                    daily: true,
                 }
             }
         );
@@ -4379,6 +4400,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: Some("all".to_string()),
+                    daily: true,
                 }),
             },
             OutputMode::Json,

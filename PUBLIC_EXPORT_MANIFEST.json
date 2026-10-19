@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 693,
-  "content_sha256": "da7c1d733d0f7de7dbe93299f70b60723bee6ff7c4cd1d2041365d888714a3be",
+  "content_sha256": "62d8c208ca19e85b6579452ae05505a816cc5c85c05d5290d08a57984cad1565",
   "files": [
     {
       "executable": false,
@@ -468,8 +468,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "de6ce226215fe9aa2ce1a37ba2c03e1724577b72cc6b056f64bf7bf0b1e838bc",
-      "size_bytes": 185151
+      "sha256": "104dac51b3d48d8428bfbcb0d2718e286e6aecf5362b8382b0cfdeb34c5a73ec",
+      "size_bytes": 185894
     },
     {
       "executable": false,
@@ -615,8 +615,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "bd2a97d4ca0b135aa81bc51073e1352c7e0880f66efa79fc3f21223a6f5c8ab4",
-      "size_bytes": 343013
+      "sha256": "80b8fb32644453d1e0b53115ab725a7f86a77b26916bd441ecd2f581f4d44e67",
+      "size_bytes": 343438
     },
     {
       "executable": false,
@@ -923,8 +923,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "3a008aa156d075f632c7dd29a66334c8d6b650b94cd1ae978ffacd299f2345b2",
-      "size_bytes": 1267824
+      "sha256": "8f541163ed26d05921bf6c8e2524c47aa7fe8ce2ff5824786ef7a6d0f062d76a",
+      "size_bytes": 1281390
     },
     {
       "executable": false,
@@ -1196,8 +1196,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "6fdc989b72df6eb2055e12afb8166f3fab83166a1141df8d69386273e0d430ec",
-      "size_bytes": 826705
+      "sha256": "71ddeb40f91b0ce5dbf790df02660ade0f0c71f0de12c2c088c769d8d3730bb6",
+      "size_bytes": 828486
     },
     {
       "executable": false,
@@ -3443,8 +3443,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/costs-request.json",
-      "sha256": "4bccd8b9b7e8a9bd2759bf134f92a59944456397a4213eee71501b525b7eda50",
-      "size_bytes": 483
+      "sha256": "4482f612b1825c6a78f1105568422a82a9393427b7b311081dbdc86b21383f18",
+      "size_bytes": 527
     },
     {
       "executable": false,
@@ -3499,8 +3499,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
-      "sha256": "39c34e01194d8806e9b3739715e9bc44588fc32eb80bf61367f9378fc77f1186",
-      "size_bytes": 27479
+      "sha256": "b82715d9b7f8e1275eb010d6a9afed85f84586f6a3c51a3f49aa01a72f4a874d",
+      "size_bytes": 27713
     },
     {
       "executable": false,
