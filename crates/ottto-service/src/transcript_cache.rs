@@ -3,6 +3,7 @@
 //! Entries leave on take, capacity eviction, clear or restart; idle age alone
 //! never drops one, so a resume after a long idle gap can still reuse state.
 use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
+use crate::local_resource_diagnostics::cache_lifecycle::{add, record, Event};
 use crate::transcript_acquisition::Checkpoint;
 use std::collections::BTreeMap;
 
@@ -106,9 +107,16 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// while the provider mutates it. The active frame must count this allocation
     /// through its own existing HeapLayoutBound admission.
     pub(crate) fn take(&mut self, key: &str) -> Option<Retained<S>> {
-        self.entries.remove(key).map(|entry| entry.retained)
+        let retained = self.entries.remove(key).map(|entry| entry.retained);
+        record(if retained.is_some() {
+            Event::TakeHit
+        } else {
+            Event::TakeAbsent
+        });
+        retained
     }
     pub(crate) fn clear(&mut self) {
+        add(Event::ClearEntriesReleased, self.entries.len() as u64);
         self.entries.clear();
     }
     /// Evict in admission victim order (oldest source, then least recently
@@ -128,6 +136,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 return false;
             };
             self.entries.remove(&victim);
+            record(Event::CursorReservationEntriesEvicted);
         }
     }
     /// Sealed offset of a retained entry without taking it, so a page budget
@@ -188,23 +197,28 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     ) -> bool {
         self.entries.remove(&key);
         let Some(resident_limit) = self.byte_limit.checked_sub(live_bytes) else {
+            record(Event::InsertLiveReservationRefused);
             return false;
         };
         let Some(next) = self.clock.checked_add(1) else {
             // A safe local reset; no durable debt is owned here.
             self.entries.clear();
             self.clock = 0;
+            record(Event::InsertClockReset);
             return false;
         };
         if self.count_limit == 0 || !heap_layout_bound::layout_supported() {
+            record(Event::InsertDisabledOrLayoutRefused);
             return false;
         }
         let Some(heap_bytes) = heap_layout_bound::bound(&retained, self.entry_limit)
             .and_then(|bytes| bytes.checked_sub(std::mem::size_of_val(&retained)))
         else {
+            record(Event::InsertEntryBoundRefused);
             return false;
         };
         if !retained.state.supports_frozen_charge() {
+            record(Event::InsertFrozenChargeRefused);
             return false;
         }
         let clock_hint = (
@@ -223,9 +237,11 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             heap_bytes,
         };
         let Some(state_bytes) = heap_layout_bound::bound(&entry, self.entry_limit) else {
+            record(Event::InsertEntryBoundRefused);
             return false;
         };
         if heap_layout_bound::bound(&key, self.entry_limit.saturating_sub(state_bytes)).is_none() {
+            record(Event::InsertKeyBoundRefused);
             return false;
         }
         self.clock = next;
@@ -235,6 +251,11 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             if self.entries.len() <= self.count_limit
                 && heap_layout_bound::bound(self, resident_limit).is_some()
             {
+                record(if admitted {
+                    Event::InsertAdmitted
+                } else {
+                    Event::InsertSelfEvicted
+                });
                 return admitted;
             }
             let victim = self
@@ -244,9 +265,11 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 .map(|(candidate, _)| candidate.clone());
             let Some(victim) = victim else {
                 self.entries.remove(&key);
+                record(Event::InsertNoVictimRefused);
                 return false;
             };
             self.entries.remove(&victim);
+            record(Event::InsertEntriesEvicted);
             if victim == key {
                 // Even a rejected new entry must release enough older state
                 // for the caller's live allocation reservation.
@@ -259,6 +282,65 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_lifecycle_counts_real_transfers_refusals_and_eviction_causes() {
+        use crate::local_resource_diagnostics::cache_lifecycle::observe;
+        let (_, counts) = observe(|| {
+            let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 2);
+            assert!(cache.take("never-retained").is_none());
+            if !heap_layout_bound::layout_supported() {
+                assert!(!cache.insert("a".into(), retained("a".into())));
+                return;
+            }
+            let at = std::time::Duration::from_secs(100);
+            for (key, modified) in [("a", 90), ("b", 80)] {
+                assert!(cache.insert_at(
+                    key.into(),
+                    retained_at(key.into(), Some(modified)),
+                    0,
+                    at
+                ));
+            }
+            let moved = cache.take("a").unwrap();
+            assert_eq!(moved.state, "a");
+            assert!(cache.insert_at("a".into(), moved, 0, at));
+            assert!(!cache.insert_at("older".into(), retained_at("old".into(), Some(1)), 0, at));
+            assert!(cache.insert_at("newer".into(), retained_at("new".into(), Some(95)), 0, at));
+            assert!(cache.take("b").is_none());
+            assert!(!cache.insert("huge".into(), retained("x".repeat(256 * 1024))));
+            assert!(!cache.insert_reserving(
+                "no-room".into(),
+                retained("x".into()),
+                2 * 1024 * 1024
+            ));
+            // Cursor reservation still uses the same victim order. Leave room
+            // for the empty map; no policy or byte limit is changed.
+            let empty = TranscriptCache::<String>::new(1024 * 1024, 128 * 1024, 2);
+            let empty_bound = heap_layout_bound::bound(&empty, 1024 * 1024).unwrap();
+            assert!(cache.release_until(empty_bound));
+            assert!(cache.entries.is_empty());
+            assert!(cache.insert("clear".into(), retained("x".into())));
+            cache.clear();
+            assert!(cache.entries.is_empty());
+        });
+        assert_eq!(counts.take_poisoned_lock, 0);
+        if heap_layout_bound::layout_supported() {
+            assert_eq!(counts.take_hit, 1);
+            assert_eq!(counts.take_absent, 2);
+            assert_eq!(counts.insert_admitted, 5);
+            assert_eq!(counts.insert_self_evicted, 1);
+            assert_eq!(counts.insert_entries_evicted, 2);
+            assert_eq!(counts.cursor_reservation_entries_evicted, 2);
+            assert_eq!(counts.insert_entry_bound_refused, 1);
+            assert_eq!(counts.insert_live_reservation_refused, 1);
+            assert_eq!(counts.clear_entries_released, 1);
+        } else {
+            assert_eq!(counts.take_absent, 1);
+            assert_eq!(counts.insert_disabled_or_layout_refused, 1);
+            assert_eq!(counts.insert_admitted, 0);
+        }
+    }
 
     // Test states use the same accounting as production native accumulator
     // fields. Provider-native states are also exercised in the adapter fixtures.

@@ -182,6 +182,15 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
     view(evidence, cutover)
 }
 
+/// The counting view of a joined group (cursor K8): what
+/// `configure_group_once` would configure now from every member entry.
+pub(super) fn group_view<'a>(entries: impl IntoIterator<Item = &'a ScanIndexEntry>) -> String {
+    let Some(cutover) = cutover_unix_ms() else {
+        return INACTIVE_VIEW.to_owned();
+    };
+    view(AckEvidence::of_view(entries), cutover)
+}
+
 /// The recorded form of an active configuration.
 pub(super) fn view(evidence: AckEvidence, cutover_unix_ms: i64) -> String {
     format!("{cutover_unix_ms}:{}", evidence.view_name())

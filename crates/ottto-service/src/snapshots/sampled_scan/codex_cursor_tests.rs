@@ -101,6 +101,7 @@ fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_
         dependencies: dependencies.map(str::to_owned),
         disclosure: strict(DebtReason::JoinStateBound),
         used: 0,
+        exact: false,
     };
     let cache = SharedCache::default();
     cache.with_cursor(|cursor| park(cursor, "key".into(), parked(Some("dependencies"))));
@@ -597,7 +598,11 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         );
         (census, residue, residue_blocked, blocked, pending, index)
     };
-    for reason in [DebtReason::JoinStateBound, DebtReason::MemberChanged] {
+    for reason in [
+        DebtReason::JoinStateBound,
+        DebtReason::MemberChanged,
+        DebtReason::ProbeBudgetOrder,
+    ] {
         assert!(!reason.settleable());
         let (census, residue, residue_blocked, blocked, pending, index) = disclose(&strict(reason));
         assert!(residue.is_empty() && residue_blocked.is_empty());
@@ -1571,7 +1576,12 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
         )
         .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
         // No active file: the release takes its conservative full path.
-        claude.release_sampled_cache_for_copy_refusal();
+        let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            claude.release_sampled_cache_for_copy_refusal();
+        });
+        assert_eq!(lifecycle.clear_no_active, 1);
+        assert_eq!(lifecycle.clear_metadata_unsupported, 0);
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
         drop(claude);
         assert_eq!(cache.cursor_charge(), charge, "the paused job survives");
         assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
@@ -2531,7 +2541,8 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for grow in [false, true] {
+    // #635: the unbound created thread held as `AmbiguousFork` too.
+    for (grow, fork) in [(false, false), (true, false), (false, true), (true, true)] {
         let fixture = ScanRoot::new(40);
         let cache = Arc::new(SharedCache::default());
         let hold = with_test_limits(2048, 4096, 64, || {
@@ -2556,7 +2567,12 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
             // A parentless created thread held for a missing sidecar
             // projection: an append may cure it.
             let accumulator = &mut job.parser.accumulator;
-            accumulator.codex_ownership_boundary = CodexOwnershipBoundary::NativeCreatedThread;
+            accumulator.codex_ownership_boundary = if fork {
+                CodexOwnershipBoundary::AmbiguousFork
+            } else {
+                CodexOwnershipBoundary::NativeCreatedThread
+            };
+            accumulator.codex_sidecar_created_thread = true;
             accumulator.codex_parent_session_ref = None;
             accumulator.codex_sidecar_projected_next_ordinal = None;
             assert!(growth_may_cure(&job.parser.accumulator));
@@ -2564,9 +2580,448 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
             if grow {
                 fixture.append(SESSION, &token_line(41));
             }
-            let _ = finish_job(&cache, None, &mut job, None, "legacy", true);
+            let _ = finish_job(&cache, None, &mut job, None, "legacy", "", true);
             job.hold_offset
         });
-        assert_eq!(hold.is_some(), !grow, "grow: {grow}");
+        assert_eq!(hold.is_some(), !grow, "grow: {grow}, fork: {fork}");
     }
+}
+
+/// R2-N5: a group's legacy tee takes every consumed byte too, so the E3
+/// estimate counts each byte once per accumulator.
+#[test]
+fn estimate_counts_bytes_once_per_fed_accumulator() {
+    assert_eq!(
+        estimate_charge(Some((1_000, 10, 64)), 510, 64, 1),
+        Some(1_500)
+    );
+    assert_eq!(
+        estimate_charge(Some((1_000, 10, 64)), 510, 64, 2),
+        Some(2_000)
+    );
+}
+
+/// #635: an unbound created thread held as `AmbiguousFork` is growth-curable
+/// and woken by its sidecar; a bound projection or a trusted parent keeps the
+/// ordinary fork rule (growth matches, no sidecar wake).
+#[test]
+fn unbound_created_thread_fork_hold_is_growth_curable_and_sidecar_woken() {
+    let unbound = || {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        accumulator.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+        accumulator.codex_sidecar_created_thread = true;
+        accumulator
+    };
+    let mut fork = SnapshotAccumulator::new(SnapshotSource::Codex);
+    fork.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+    assert!(held_monotone(&fork) && !growth_may_cure(&fork) && !sidecar_wakes(&fork));
+    assert!(held_monotone(&unbound()) && growth_may_cure(&unbound()) && sidecar_wakes(&unbound()));
+    let bound: [fn(&mut SnapshotAccumulator); 3] = [
+        |a| a.codex_sidecar_projected_next_ordinal = Some(4),
+        |a| a.codex_sidecar_parent = Some(("child".into(), "parent".into())),
+        |a| a.codex_parent_session_ref = Some("parent".into()),
+    ];
+    for set in bound {
+        let mut accumulator = unbound();
+        set(&mut accumulator);
+        assert!(held_monotone(&accumulator));
+        assert!(!growth_may_cure(&accumulator) && !sidecar_wakes(&accumulator));
+    }
+}
+
+const CREATED: &str = "01a04e15-49cf-7460-9fd7-f7dbfd2f05e4";
+const FORK_SOURCE: &str = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+
+/// A Codex home with one state-declared created thread (no lineage, its
+/// rollout path, created now) and a thread-history projection of the FULL
+/// body (`body`, 10 records). The rollout holds `written` records: a
+/// projection ahead of the flushed file. The shape is
+/// `codex_created_thread_parentless_production_lineage_controls`' admitted
+/// thread (Σ last = 200 input over 3 requests); `fork` adds a
+/// `forked_from_id` (copied-history evidence that keeps it held).
+struct CreatedThreadHome {
+    fixture: ScanRoot,
+    path: PathBuf,
+    body: Vec<Vec<u8>>,
+    base_ms: i64,
+}
+
+impl CreatedThreadHome {
+    fn new(written: usize, fork: bool) -> Self {
+        let fixture = ScanRoot::with_sessions(&[]);
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let base_ms = now - now % 1_000;
+        let at = |offset: i64| bounded_rfc3339_millis(base_ms + offset).unwrap();
+        let second = |offset: i64| u64::try_from(base_ms / 1_000 + offset).unwrap();
+        let turn = |n: u64| format!("{}-5000-7000-8000-{n:012}", &CREATED[..8]);
+        let usage = |(input, cached, output, reasoning): (u64, u64, u64, u64)| {
+            json!({"input_tokens": input, "cached_input_tokens": cached,
+                "output_tokens": output, "reasoning_output_tokens": reasoning})
+        };
+        let tokens = |offset: i64, total, last| {
+            json!({"timestamp": at(offset), "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": usage(total),
+                "last_token_usage": usage(last), "model": "gpt-5.6-sol"}}})
+        };
+        let mut meta = json!({"id": CREATED, "session_id": CREATED, "timestamp": at(0),
+            "history_mode": "paginated", "thread_source": "agent_created_thread",
+            "source": "vscode", "originator": "Codex Desktop",
+            "creator_user_id": "synthetic-user", "creator_account_id": "synthetic-workspace"});
+        if fork {
+            meta["forked_from_id"] = json!(FORK_SOURCE);
+        }
+        let values = [
+            json!({"timestamp": at(500), "type": "session_meta", "payload": meta}),
+            json!({"timestamp": at(501), "type": "event_msg", "payload": {"type": "task_started",
+                "turn_id": turn(1), "started_at": second(0),
+                "trace_id": "0123456789abcdef0123456789abcdef"}}),
+            json!({"timestamp": at(1_000), "type": "turn_context",
+                "payload": {"turn_id": turn(1), "model": "gpt-5.6-sol"}}),
+            tokens(2_000, (120, 100, 6, 2), (120, 100, 6, 2)),
+            json!({"timestamp": at(3_000), "type": "compacted",
+                "payload": {"replacement_history": []}}),
+            json!({"timestamp": at(3_500), "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": turn(1)}}),
+            json!({"timestamp": at(4_000), "type": "event_msg", "payload": {"type": "task_started",
+                "turn_id": turn(2), "started_at": second(4)}}),
+            json!({"timestamp": at(4_100), "type": "turn_context",
+                "payload": {"turn_id": turn(2), "model": "gpt-5.6-sol"}}),
+            tokens(5_000, (50, 40, 3, 1), (50, 40, 3, 1)),
+            tokens(6_000, (80, 60, 5, 1), (30, 20, 2, 0)),
+        ];
+        let body = values
+            .into_iter()
+            .zip(0_u64..)
+            .map(|(mut value, ordinal)| {
+                value["ordinal"] = json!(ordinal);
+                codex_line(value)
+            })
+            .collect::<Vec<_>>();
+        let path = fixture.root.join(format!("rollout-{CREATED}.jsonl"));
+        fs::write(&path, body[..written].concat()).unwrap();
+        let home = Self {
+            fixture,
+            path,
+            body,
+            base_ms,
+        };
+        let state = rusqlite::Connection::open(home.codex().join("state_5.sqlite")).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                    thread_source TEXT, first_user_message TEXT, created_at_ms INTEGER,\
+                    rollout_path TEXT\
+                );\
+                CREATE TABLE thread_spawn_edges (\
+                    parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+                );",
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads VALUES \
+                    (?1, 'Thread', 1, 'agent_created_thread', 'Build the weekly report', ?2, ?3)",
+                rusqlite::params![
+                    CREATED,
+                    home.base_ms,
+                    home.path.to_string_lossy().into_owned()
+                ],
+            )
+            .unwrap();
+        let full = home.body.iter().map(Vec::len).sum::<usize>();
+        home.project(full, home.body.len());
+        home
+    }
+
+    /// Bytes of the first `records` body records.
+    fn bytes(&self, records: usize) -> usize {
+        self.body[..records].iter().map(Vec::len).sum()
+    }
+
+    fn codex(&self) -> PathBuf {
+        self.fixture.root.parent().unwrap().to_path_buf()
+    }
+
+    /// Replace the thread-history projection (the sidecar's rollout extent).
+    fn project(&self, bytes: usize, ordinals: usize) {
+        let history =
+            rusqlite::Connection::open(self.codex().join("thread_history_1.sqlite")).unwrap();
+        history
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS thread_history_projection_state (\
+                    thread_id TEXT NOT NULL, next_rollout_byte_offset INTEGER NOT NULL,\
+                    next_rollout_ordinal INTEGER NOT NULL\
+                );\
+                DELETE FROM thread_history_projection_state;",
+            )
+            .unwrap();
+        history
+            .execute(
+                "INSERT INTO thread_history_projection_state VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    CREATED,
+                    i64::try_from(bytes).unwrap(),
+                    i64::try_from(ordinals).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Append records `from..` of the body (the flush catching up).
+    fn flush_from(&self, from: usize) {
+        let mut file = OpenOptions::new().append(true).open(&self.path).unwrap();
+        file.write_all(&self.body[from..].concat()).unwrap();
+    }
+
+    /// One page of a new census generation `n` (a later window).
+    fn generation(
+        &self,
+        index: ScanIndex,
+        cache: &Arc<SharedCache>,
+        n: i64,
+    ) -> (ScanIndex, SourceScanResult) {
+        let mut index = index;
+        index.traversal = None;
+        let collected = bounded_rfc3339_millis(self.base_ms + 3_600_000 + n * 1_000).unwrap();
+        let (index, scan, _) = page_at(
+            &self.fixture,
+            index,
+            Some(Arc::clone(cache)),
+            "cursor-fixture",
+            &collected,
+        );
+        (index, scan)
+    }
+}
+
+/// The created thread's published usage: (input, requests) per snapshot.
+fn created_usage(scan: &SourceScanResult) -> Vec<(u64, u64)> {
+    scan.snapshots
+        .iter()
+        .filter(|snapshot| snapshot.source_session_id == CREATED)
+        .map(|snapshot| (snapshot.input_tokens, snapshot.request_count))
+        .collect()
+}
+
+/// #635 (a), #631 review L1: a projection ahead of the flushed rollout holds
+/// the created thread as `AmbiguousFork`. A held prefix with usage drops it
+/// and is never memoized; a usage-free prefix (header, first task and turn
+/// context, flushed before the first `token_count`) is, on its exact stamp.
+/// While unchanged it is a memo hit (not re-read); once the append that
+/// cures it lands, the next generation reads the appended bytes and admits
+/// the thread once, with its full usage. An unchanged generation after
+/// that publishes nothing new: no second admission, no resurrected hold.
+#[test]
+fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
+    let home = CreatedThreadHome::new(3, false);
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    // Unchanged: the exact stamp hits; the file is not read.
+    let (index, skipped) = home.generation(index, &cache, 1);
+    assert!(created_usage(&skipped).is_empty());
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    // The flush catches up with the projection: no stale hit.
+    home.flush_from(3);
+    let (index, cured) = home.generation(index, &cache, 2);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(
+        created_usage(&cured),
+        vec![(200, 3)],
+        "{}",
+        counters(&cache)
+    );
+    assert_admitted_once(&home, &cache, index, &cured, 3);
+}
+
+/// Fingerprints of the created thread's published snapshots.
+fn created_fingerprints(scan: &SourceScanResult) -> Vec<String> {
+    scan.snapshots
+        .iter()
+        .filter(|snapshot| snapshot.source_session_id == CREATED)
+        .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+        .collect()
+}
+
+/// R1-L2: the admitting generation's `index` no longer blocks the thread,
+/// and generation `n` after it, with nothing changed, admits nothing new and
+/// re-holds nothing. It publishes nothing, or republishes the same snapshots
+/// (same fingerprints, so idempotent); its index still does not block the
+/// thread (a re-hold re-inserts it); and the stale hold entry neither hits
+/// nor is recorded again.
+fn assert_admitted_once(
+    home: &CreatedThreadHome,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    admitted: &SourceScanResult,
+    n: i64,
+) {
+    let (hits, records) = (
+        counter(cache, |c| c.memo_hits),
+        counter(cache, |c| c.memo_records),
+    );
+    assert!(
+        !index.codex_state_only_blocked_session_ids.contains(CREATED),
+        "admitted: {}",
+        counters(cache)
+    );
+    let (index, again) = home.generation(index, cache, n);
+    assert!(
+        !index.codex_state_only_blocked_session_ids.contains(CREATED),
+        "no resurrected hold: {}",
+        counters(cache)
+    );
+    let usage = created_usage(&again);
+    assert!(
+        usage.is_empty()
+            || (usage == vec![(200, 3)]
+                && created_fingerprints(&again) == created_fingerprints(admitted)),
+        "no second admission: {usage:?} {}",
+        counters(cache)
+    );
+    assert_eq!(counter(cache, |c| c.memo_hits), hits, "{}", counters(cache));
+    assert_eq!(
+        counter(cache, |c| c.memo_records),
+        records,
+        "{}",
+        counters(cache)
+    );
+}
+
+/// #635 (b): the same hold wakes on its sidecar. A projection change is a
+/// memo miss: the file is re-read (still ahead, so held and memoized again)
+/// and the new entry hits while unchanged.
+#[test]
+fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
+    let home = CreatedThreadHome::new(3, false);
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    home.project(home.bytes(9), 9);
+    let (index, woken) = home.generation(index, &cache, 1);
+    assert!(created_usage(&woken).is_empty());
+    assert_eq!(counter(&cache, |c| c.memo_hits), 0, "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        2,
+        "re-read: {}",
+        counters(&cache)
+    );
+    let (_, unchanged) = home.generation(index, &cache, 2);
+    assert!(created_usage(&unchanged).is_empty());
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+}
+
+/// #635 R2-L2: a lagging projection catches up with an unchanged file. The
+/// file is ahead of its projection, so the sidecar binds nothing and the
+/// created thread is held as `AmbiguousFork`. It holds usage, so the hold is
+/// not memoized (pre-existing: a held file with dropped usage is re-read in
+/// full every generation); the projection change alone cures it, and the
+/// thread is admitted once with its full usage.
+#[test]
+fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
+    let home = CreatedThreadHome::new(10, false);
+    home.project(home.bytes(9), 9);
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        0,
+        "{}",
+        counters(&cache)
+    );
+    home.project(home.bytes(10), 10);
+    let (index, cured) = home.generation(index, &cache, 1);
+    assert_eq!(
+        created_usage(&cured),
+        vec![(200, 3)],
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), 0, "{}", counters(&cache));
+    assert_admitted_once(&home, &cache, index, &cured, 2);
+}
+
+/// #635 (c), negative control: a created thread with copied-history evidence
+/// (`forked_from_id`, no trusted parent) is a true fork. Its unchanged stamp
+/// hits; growth re-reads it, and once the projection binds the grown file it
+/// stays held (no admission), memoized again and hit again while unchanged.
+#[test]
+fn created_thread_fork_stays_held_after_growth_and_still_memo_hits() {
+    let home = CreatedThreadHome::new(2, true);
+    home.project(home.bytes(3), 3);
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let (index, _) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    // The turn context flushes: the file now matches its projection.
+    let mut file = OpenOptions::new().append(true).open(&home.path).unwrap();
+    file.write_all(&home.body[2]).unwrap();
+    let (index, grown) = home.generation(index, &cache, 2);
+    assert!(
+        created_usage(&grown).is_empty(),
+        "still held: {}",
+        counters(&cache)
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        1,
+        "re-read: {}",
+        counters(&cache)
+    );
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        2,
+        "{}",
+        counters(&cache)
+    );
+    let (_, unchanged) = home.generation(index, &cache, 3);
+    assert!(created_usage(&unchanged).is_empty());
+    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
 }

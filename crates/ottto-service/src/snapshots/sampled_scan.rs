@@ -2,6 +2,7 @@
 //! cycles; provider parsing, durable index/CAS and delivery remain native.
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{TranscriptCache, CACHE_BYTES, CACHE_ENTRIES};
 
@@ -46,13 +47,21 @@ impl SharedCache {
     pub(super) fn clear(&self) {
         if let Ok(mut cache) = self.inner.lock() {
             cache.clear();
+        } else {
+            record(Event::ClearPoisonedLock);
         }
     }
     pub(super) fn take(
         &self,
         key: &str,
     ) -> Option<crate::transcript_cache::Retained<sampled_jsonl::CachedJsonlReduction>> {
-        self.inner.lock().ok()?.take(key)
+        match self.inner.lock() {
+            Ok(mut cache) => cache.take(key),
+            Err(_) => {
+                record(Event::TakePoisonedLock);
+                None
+            }
+        }
     }
     pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
         self.inner.lock().ok()?.sealed_offset(key)
@@ -84,6 +93,8 @@ impl SharedCache {
                     },
                     live_bytes,
                 );
+            } else {
+                record(Event::InsertPoisonedLock);
             }
         }
     }
@@ -257,11 +268,17 @@ pub(super) fn release_cache_for_copy_refusal(
                 .as_ref()
                 .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
         });
-        if native_full_baseline
-            && context.audit_metadata_supported
-            && crate::heap_layout_bound::bound(context, STATE_BYTES).is_some()
-        {
-            return;
+        if native_full_baseline && context.audit_metadata_supported {
+            if crate::heap_layout_bound::bound(context, STATE_BYTES).is_some() {
+                return;
+            }
+            record(Event::ClearFullResidentBoundUnknown);
+        } else if !context.audit_metadata_supported {
+            record(Event::ClearMetadataUnsupported);
+        } else if active.is_none() {
+            record(Event::ClearNoActive);
+        } else {
+            record(Event::ClearOtherActive);
         }
         context.cache.clear();
     }
@@ -305,11 +322,9 @@ pub(super) fn copy_budget_beside(
     let active = active.map_or(Some(0), |active| {
         let consumed = active.parser.reader.consumed_bytes();
         let buffer = active.parser.reader.buf.capacity();
-        let estimate = active
-            .cursor
-            .as_ref()
-            .filter(|_| !completing)
-            .and_then(|meta| meta.charge_estimate(consumed, buffer));
+        let estimate = (!completing)
+            .then(|| codex_cursor::job_charge_estimate(active, consumed, buffer))
+            .flatten();
         if let Some(estimate) = estimate {
             return Some(estimate);
         }
@@ -317,16 +332,25 @@ pub(super) fn copy_budget_beside(
         // refreshed on reuse, and are absent from every retained copy.
         // All active owned parser/acquisition/path/receipt state stays charged.
         let inputs = active.parser.take_live_reduction_inputs();
+        // A group's legacy tee holds the same inputs (P2).
+        let tee_inputs = active
+            .group
+            .as_mut()
+            .and_then(|group| group.take_tee_inputs());
         // The walk charges the file itself, as before it was boxed.
         let file: &OwnedActiveFile = active;
-        let bound = if active.cursor.is_some() {
+        let byte_charged = codex_cursor::byte_charged(file);
+        let bound = if byte_charged {
             crate::heap_layout_bound::completed_bound(file, remaining)
         } else {
             crate::heap_layout_bound::bound(file, remaining)
         };
         active.parser.restore_live_reduction_inputs(inputs);
-        if let Some(meta) = active.cursor.as_mut() {
-            meta.record_charge(bound.unwrap_or(usize::MAX), consumed, buffer);
+        if let Some(group) = active.group.as_mut() {
+            group.restore_tee_inputs(tee_inputs);
+        }
+        if byte_charged {
+            codex_cursor::record_job_charge(active, bound.unwrap_or(usize::MAX), consumed, buffer);
         }
         bound
     });
@@ -459,3 +483,27 @@ pub(super) fn reduction_dependencies(
 #[cfg(test)]
 #[path = "claude_sidecar_reduction_tests.rs"]
 mod claude_sidecar_reduction_tests;
+
+#[cfg(test)]
+mod cache_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn cache_lifecycle_poisoned_lock_is_not_reported_as_absent() {
+        let cache = SharedCache::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.inner.lock().unwrap();
+            panic!("synthetic cache lock poison");
+        }));
+        assert!(result.is_err());
+        let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            assert!(cache.take("synthetic").is_none());
+            cache.clear();
+        });
+        assert_eq!(counts.take_poisoned_lock, 1);
+        assert_eq!(counts.take_absent, 0);
+        assert_eq!(counts.take_hit, 0);
+        assert_eq!(counts.clear_poisoned_lock, 1);
+        assert_eq!(counts.clear_entries_released, 0);
+    }
+}
