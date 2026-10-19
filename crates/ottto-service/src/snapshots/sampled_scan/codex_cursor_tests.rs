@@ -652,6 +652,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     let mut held = SnapshotAccumulator::new(SnapshotSource::Codex);
     held.codex_ownership_boundary = CodexOwnershipBoundary::NativeCreatedThread;
     held.codex_sidecar_projected_next_ordinal = None;
+    // `NativeCreatedThread` is set only in the classifier's created-thread
+    // branch, which also sets `codex_created_thread_native_only` (B1).
+    held.codex_created_thread_native_only = true;
     assert!(held_monotone(&held) && sidecar_wakes(&held));
     let recorded = sidecar_fingerprint(&codex, &path);
     let entry = |sidecar: Option<String>| {
@@ -698,8 +701,10 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     assert!(caught_up_entry
         .matches("digest", &file, None, &caught_up)
         .is_some());
-    // A fork hold is cured by peer parent evidence only.
+    // An ordinary (not created-thread) fork hold is cured by peer parent
+    // evidence only.
     held.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+    held.codex_created_thread_native_only = false;
     assert!(!growth_may_cure(&held));
     assert!(!sidecar_wakes(&held));
     let fork = entry(sidecar_wakes(&held).then(|| recorded.clone()));
@@ -2601,36 +2606,108 @@ fn estimate_counts_bytes_once_per_fed_accumulator() {
     );
 }
 
-/// #635: an unbound created thread held as `AmbiguousFork` is growth-curable
-/// and woken by its sidecar; a bound projection or a trusted parent keeps the
-/// ordinary fork rule (growth matches, no sidecar wake).
+/// B1 (steady-state rev 2), replacing #635's unbound-only class: every hold
+/// from the classifier's created-thread branch or identity-ambiguous return
+/// (`codex_created_thread_native_only`) is growth-curable and sidecar-woken,
+/// whether the thread is state- or rollout-declared, and whether or not its
+/// sidecar bound a parent or projection: the bind itself depends on the file
+/// length, so a bound parent can come undone with growth. An ordinary fork
+/// (NC2) keeps the fork rule: growth matches, no sidecar wake.
 #[test]
-fn unbound_created_thread_fork_hold_is_growth_curable_and_sidecar_woken() {
-    let unbound = || {
+fn created_thread_holds_are_exact_and_sidecar_woken() {
+    let created = || {
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
         accumulator.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
-        accumulator.codex_sidecar_created_thread = true;
+        accumulator.codex_created_thread_native_only = true;
         accumulator
     };
     let mut fork = SnapshotAccumulator::new(SnapshotSource::Codex);
     fork.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
     assert!(held_monotone(&fork) && !growth_may_cure(&fork) && !sidecar_wakes(&fork));
-    assert!(held_monotone(&unbound()) && growth_may_cure(&unbound()) && sidecar_wakes(&unbound()));
-    let bound: [fn(&mut SnapshotAccumulator); 3] = [
+    // The state flag alone no longer decides: a state-declared row on an
+    // ordinary fork's accumulator (never produced by the classifier) is not
+    // a member; a rollout-declared thread with no state flag is.
+    fork.codex_sidecar_created_thread = true;
+    assert!(!growth_may_cure(&fork) && !sidecar_wakes(&fork));
+    assert!(held_monotone(&created()) && growth_may_cure(&created()) && sidecar_wakes(&created()));
+    let variants: [fn(&mut SnapshotAccumulator); 5] = [
+        |a| a.codex_sidecar_created_thread = true,
         |a| a.codex_sidecar_projected_next_ordinal = Some(4),
         |a| a.codex_sidecar_parent = Some(("child".into(), "parent".into())),
         |a| a.codex_parent_session_ref = Some("parent".into()),
+        // NC3: the identity-ambiguous return, created or not.
+        |a| a.codex_sidecar_identity_ambiguous = true,
     ];
-    for set in bound {
-        let mut accumulator = unbound();
+    for set in variants {
+        let mut accumulator = created();
         set(&mut accumulator);
         assert!(held_monotone(&accumulator));
-        assert!(!growth_may_cure(&accumulator) && !sidecar_wakes(&accumulator));
+        assert!(growth_may_cure(&accumulator) && sidecar_wakes(&accumulator));
     }
+}
+
+/// R1-L1 / class 7 (NC4, NC5): the sidecar fingerprint and the memo digest
+/// carry the set of the path's conflicted candidate ids, not their count. A
+/// conflict moving between two candidates at an equal count, or appearing on
+/// an ordinary fork's id (whose entry has no sidecar wake), changes them.
+#[test]
+fn memo_wakes_on_the_conflicted_identity_set() {
+    // A timestamp-shaped name has two candidate ids: the whole raw stem
+    // (legacy grammar) and the trailing session id (current grammar).
+    let path = PathBuf::from(format!(
+        "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
+    ));
+    let candidates = codex_session_id_candidates_from_path(&path);
+    assert_eq!(candidates.len(), 2, "{candidates:?}");
+    let (a, b) = (candidates[0].as_str(), candidates[1].as_str());
+    let with_conflict = |id: &str| {
+        let mut codex = CodexTitleMetadata::default();
+        codex.identity_conflicts.insert(id.into());
+        codex
+    };
+    let (on_a, on_b) = (with_conflict(a), with_conflict(b));
+    let none = CodexTitleMetadata::default();
+    assert_ne!(
+        sidecar_fingerprint(&on_a, &path),
+        sidecar_fingerprint(&on_b, &path)
+    );
+    assert_ne!(
+        sidecar_fingerprint(&none, &path),
+        sidecar_fingerprint(&on_a, &path)
+    );
+    let temp = Temp::new("memo-conflict-digest", b"{\"n\":1}\n");
+    let file = File::open(&temp.0).unwrap();
+    let candidate = CandidateFile {
+        scan_root: PathBuf::from("/synthetic/sessions"),
+        path: path.clone(),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: "revision".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let digest = |codex: &CodexTitleMetadata| {
+        memo_digest(
+            &ScanIndex::default(),
+            &candidate,
+            &file,
+            "dependencies",
+            codex,
+            1,
+            "counting",
+        )
+        .unwrap()
+    };
+    assert_ne!(digest(&on_a), digest(&on_b));
+    assert_ne!(digest(&none), digest(&on_a));
+    assert_eq!(digest(&on_a), digest(&with_conflict(a)));
 }
 
 const CREATED: &str = "01a04e15-49cf-7460-9fd7-f7dbfd2f05e4";
 const FORK_SOURCE: &str = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+const SPAWN_PARENT: &str = "01a0c0de-5e24-7f10-8a93-a0c1968d8a3a";
 
 /// A Codex home with one state-declared created thread (no lineage, its
 /// rollout path, created now) and a thread-history projection of the FULL
@@ -2648,6 +2725,18 @@ struct CreatedThreadHome {
 
 impl CreatedThreadHome {
     fn new(written: usize, fork: bool) -> Self {
+        Self::with_lineage(written, fork, "agent_created_thread", None)
+    }
+
+    /// `new` with the state row's `thread_source` (anything but
+    /// `agent_created_thread` leaves the thread declared by its rollout
+    /// header only) and an optional `thread_spawn_edges` parent.
+    fn with_lineage(
+        written: usize,
+        fork: bool,
+        state_source: &str,
+        spawn_parent: Option<&str>,
+    ) -> Self {
         let fixture = ScanRoot::with_sessions(&[]);
         let now = i64::try_from(
             SystemTime::now()
@@ -2727,14 +2816,23 @@ impl CreatedThreadHome {
         state
             .execute(
                 "INSERT INTO threads VALUES \
-                    (?1, 'Thread', 1, 'agent_created_thread', 'Build the weekly report', ?2, ?3)",
+                    (?1, 'Thread', 1, ?4, 'Build the weekly report', ?2, ?3)",
                 rusqlite::params![
                     CREATED,
                     home.base_ms,
-                    home.path.to_string_lossy().into_owned()
+                    home.path.to_string_lossy().into_owned(),
+                    state_source
                 ],
             )
             .unwrap();
+        if let Some(parent) = spawn_parent {
+            state
+                .execute(
+                    "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                    rusqlite::params![parent, CREATED],
+                )
+                .unwrap();
+        }
         let full = home.body.iter().map(Vec::len).sum::<usize>();
         home.project(full, home.body.len());
         home
@@ -2892,7 +2990,7 @@ fn assert_admitted_once(
     let usage = created_usage(&again);
     assert!(
         usage.is_empty()
-            || (usage == vec![(200, 3)]
+            || (usage == created_usage(admitted)
                 && created_fingerprints(&again) == created_fingerprints(admitted)),
         "no second admission: {usage:?} {}",
         counters(cache)
@@ -3021,6 +3119,177 @@ fn created_thread_fork_stays_held_after_growth_and_still_memo_hits() {
         "{}",
         counters(&cache)
     );
+    let (_, unchanged) = home.generation(index, &cache, 3);
+    assert!(created_usage(&unchanged).is_empty());
+    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
+}
+
+impl CreatedThreadHome {
+    /// The same generation `n` scanned cold (fresh index and cache): what a
+    /// full parse of the current files and sidecar publishes and blocks.
+    fn oracle(&self, n: i64) -> (ScanIndex, SourceScanResult) {
+        self.generation(ScanIndex::default(), &Arc::new(SharedCache::default()), n)
+    }
+
+    /// The created thread's memo entry, if any.
+    fn memo_entry(&self, cache: &SharedCache) -> Option<MemoEntry> {
+        let scope = Scope("cursor-fixture".into());
+        [self.path.clone(), fs::canonicalize(&self.path).unwrap()]
+            .iter()
+            .find_map(|path| cache.memo_lookup(&memo_key(&scope, &local_index_key(path))))
+    }
+}
+
+/// A warm generation publishes and blocks exactly what a cold full parse of
+/// the same files does.
+fn assert_oracle(
+    home: &CreatedThreadHome,
+    cache: &SharedCache,
+    index: &ScanIndex,
+    scan: &SourceScanResult,
+    n: i64,
+) {
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(
+        created_usage(scan),
+        created_usage(&oracle),
+        "{}",
+        counters(cache)
+    );
+    assert_eq!(
+        index.codex_state_only_blocked_session_ids.contains(CREATED),
+        oracle_index
+            .codex_state_only_blocked_session_ids
+            .contains(CREATED),
+        "{}",
+        counters(cache)
+    );
+}
+
+/// B1 (N1a, R1's failing case): a thread declared created by its rollout
+/// header only (the state row says `user`), with a spawn-edge parent and a
+/// projection ahead of the flushed file. The bind refuses the mismatched
+/// extent, so no trusted parent binds, the parentless proof needs the state
+/// flag, and the header is held as `AmbiguousFork`. The append that brings
+/// the file to its extent binds the parent and cures it: the memo must miss
+/// (exact stamp), and the thread is admitted once, exactly as a cold parse.
+#[test]
+fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
+    let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    // NC1: unchanged, the hold stays quiet: two exact-stamp hits.
+    let (index, _) = home.generation(index, &cache, 1);
+    let (index, skipped) = home.generation(index, &cache, 2);
+    assert!(created_usage(&skipped).is_empty());
+    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
+    home.flush_from(3);
+    let (index, cured) = home.generation(index, &cache, 3);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        2,
+        "no stale hit: {}",
+        counters(&cache)
+    );
+    assert!(
+        !created_usage(&cured).is_empty(),
+        "admitted: {}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &cured, 3);
+    assert_admitted_once(&home, &cache, index, &cured, 4);
+}
+
+/// B1 (N1b): the same rollout-declared hold on an unchanged file, cured by
+/// the projection catching up with it. The entry wakes on its sidecar (a
+/// miss), and the re-read classifies the file exactly as a cold parse.
+#[test]
+fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
+    let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    home.project(home.bytes(3), 3);
+    let (index, woken) = home.generation(index, &cache, 1);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        0,
+        "no stale hit: {}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &woken, 1);
+}
+
+/// B1 second symptom (N1c): a state-declared created thread whose sidecar
+/// binds a spawn parent that contradicts its header's `forked_from_id` is
+/// held as `AmbiguousFork` with the bound parent as its ref. Growth past the
+/// projected extent undoes the bind, so a fresh parse has no parent ref:
+/// the entry must miss on growth, and the re-recorded entry carries the
+/// fresh parse's ref (none), not the stale bound one.
+#[test]
+fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() {
+    let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
+    home.project(home.bytes(2), 2);
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let entry = home.memo_entry(&cache).expect("recorded entry");
+    assert_eq!(entry.parent_ref(), Some(SPAWN_PARENT));
+    let (index, _) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    // The turn context flushes past the projection: the bind no longer
+    // matches the file.
+    let mut file = OpenOptions::new().append(true).open(&home.path).unwrap();
+    file.write_all(&home.body[2]).unwrap();
+    let (index, grown) = home.generation(index, &cache, 2);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        1,
+        "no stale hit: {}",
+        counters(&cache)
+    );
+    assert!(created_usage(&grown).is_empty(), "{}", counters(&cache));
+    assert_oracle(&home, &cache, &index, &grown, 2);
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        2,
+        "re-read and re-recorded: {}",
+        counters(&cache)
+    );
+    let entry = home.memo_entry(&cache).expect("re-recorded entry");
+    assert_eq!(entry.parent_ref(), None);
     let (_, unchanged) = home.generation(index, &cache, 3);
     assert!(created_usage(&unchanged).is_empty());
     assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
