@@ -42,9 +42,10 @@ use ottto_protocol::{
     ProviderDailyReferenceControlAction, RedactedValue, RelayRuntimeState, RelayState,
     ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
     RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
-    SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
-    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
-    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
+    SourceRouteVerificationResult, SourceVerificationCheck, SourceVerificationMethod,
+    SourceVerificationResult, SourceVerificationScope, SourceVerificationStatus, StableMessage,
+    TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
+    DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -8103,7 +8104,7 @@ fn setup_action(
             ))
         }
     };
-    queue_setup_action(&api_base_url, &mut credentials, &source, &action_type)?;
+    let queued = queue_setup_action(&api_base_url, &mut credentials, &source, &action_type)?;
     let action_results =
         process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
     request_snapshot_sync_after_setup_actions(daemon, &action_results);
@@ -8115,7 +8116,11 @@ fn setup_action(
                 "queued setup action did not return a setup-run detail".to_string(),
             )
         })?;
-    setup_result_from_detail(&credentials.connection, detail, false, action_results)
+    let mut result =
+        setup_result_from_detail(&credentials.connection, detail, false, action_results)?;
+    // Lets the client bind a completion to the action this request queued.
+    result["queued_action_id"] = json!(queued.id);
+    Ok(result)
 }
 
 #[derive(Debug, Deserialize)]
@@ -8208,6 +8213,10 @@ struct SetupActionResult {
     source: Option<String>,
     status: String,
     detail: Option<SetupRunDetailApiResponse>,
+    /// The result a verify_source action computed; it appears only in the
+    /// response of the call that ran the action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<SourceVerificationResult>,
 }
 
 fn request_snapshot_sync_after_setup_actions(
@@ -8887,12 +8896,14 @@ fn process_setup_actions(
                 source: source_slug,
                 status,
                 detail: Some(detail),
+                verification: None,
             });
             continue;
         }
         let action_outcome = match action.action_type.as_str() {
             "install_source" => {
                 run_install_source_action(daemon, api_base_url, credentials, &action, machine)
+                    .map(|(status, message, result)| (status, message, result, None))
             }
             "verify_source" => {
                 if let Some(source) = source.clone() {
@@ -8917,6 +8928,7 @@ fn process_setup_actions(
                             "error_code": "source_missing",
                             "error_message": "Setup action source was missing",
                         }),
+                        None,
                     ))
                 }
             }
@@ -8927,11 +8939,16 @@ fn process_setup_actions(
                     "error_code": "unsupported_action",
                     "error_message": format!("Unsupported setup action {}", action.action_type),
                 }),
+                None,
             )),
         };
-        let (status, message, result) = match action_outcome {
+        let (status, message, result, verification) = match action_outcome {
             Ok(outcome) => outcome,
-            Err(error) => setup_action_execution_error_result(&action, source.as_ref(), &error),
+            Err(error) => {
+                let (status, message, result) =
+                    setup_action_execution_error_result(&action, source.as_ref(), &error);
+                (status, message, result, None)
+            }
         };
         let detail = complete_setup_action(
             api_base_url,
@@ -8947,6 +8964,7 @@ fn process_setup_actions(
             source: source_slug,
             status,
             detail: Some(detail),
+            verification,
         });
     }
     Ok(results)
@@ -11454,13 +11472,22 @@ fn claude_code_relay_env_for_machine_id(
     ]
 }
 
+/// Status, message and backend result of a setup action, plus the
+/// verification result a verify_source action computed.
+type SetupVerifyActionOutcome = (
+    String,
+    String,
+    serde_json::Value,
+    Option<SourceVerificationResult>,
+);
+
 fn run_verify_source_action(
     daemon: &LocalDaemon,
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
     source: SourceKind,
-) -> Result<(String, String, serde_json::Value), LocalApiError> {
+) -> Result<SetupVerifyActionOutcome, LocalApiError> {
     if source == SourceKind::Pi {
         return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
     }
@@ -11484,13 +11511,15 @@ fn run_verify_source_action(
                 "error_code": if ready { serde_json::Value::Null } else { json!(result.message.code) },
                 "error_message": if ready { serde_json::Value::Null } else { json!(result.message.text) }
             }),
+            Some(result),
         ));
     }
 
     if !source_binary_present(&source) {
-        let result =
+        let mut result =
             not_installed_verification_result(source.clone(), empty_source_config(&source));
         daemon.record_verification_result(&result)?;
+        attach_verification_check(&mut result);
         let message = result.message.text.clone();
         return Ok((
             "succeeded".to_string(),
@@ -11505,6 +11534,7 @@ fn run_verify_source_action(
                 "error_code": SOURCE_NOT_INSTALLED_CODE,
                 "error_message": message,
             }),
+            Some(result),
         ));
     }
     let smoke_after = current_rfc3339();
@@ -11531,8 +11561,10 @@ fn run_verify_source_action(
         },
     )?;
     if !smoke.succeeded {
-        let result = smoke_failure_verification_result(source.clone(), &smoke, Some(smoke_after));
+        let mut result =
+            smoke_failure_verification_result(source.clone(), &smoke, Some(smoke_after));
         daemon.record_verification_result(&result)?;
+        attach_verification_check(&mut result);
         let message = result.message.text.clone();
         let action_status = match result.status {
             SourceVerificationStatus::Verified | SourceVerificationStatus::Warning => "succeeded",
@@ -11552,6 +11584,7 @@ fn run_verify_source_action(
                 "error_code": smoke.error_code.as_deref().unwrap_or("smoke_command_failed"),
                 "error_message": message,
             }),
+            Some(result),
         ));
     }
     let _ = emit_setup_run_fast_verification_marker_with_refresh_mut(
@@ -11573,7 +11606,7 @@ fn run_verify_source_action(
             verification.clear_condition.as_deref(),
         )
     };
-    let result = verification_result(
+    let mut result = verification_result(
         source.clone(),
         if verification.verified {
             SourceVerificationStatus::Verified
@@ -11593,6 +11626,7 @@ fn run_verify_source_action(
         &verification_message,
     );
     daemon.record_verification_result(&result)?;
+    attach_verification_check(&mut result);
     let status = if verification.verified {
         "succeeded"
     } else {
@@ -11612,6 +11646,7 @@ fn run_verify_source_action(
             "error_code": if verification.verified { serde_json::Value::Null } else { json!(failure_code) },
             "error_message": if verification.verified { serde_json::Value::Null } else { json!(result.message.text) },
         }),
+        Some(result),
     ))
 }
 
@@ -11620,8 +11655,8 @@ fn run_pi_verify_source_action(
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
-) -> Result<(String, String, serde_json::Value), LocalApiError> {
-    let result = run_pi_route_verification_with_credentials(api_base_url, credentials)?;
+) -> Result<SetupVerifyActionOutcome, LocalApiError> {
+    let mut result = run_pi_route_verification_with_credentials(api_base_url, credentials)?;
     record_setup_action_event(
         api_base_url,
         credentials,
@@ -11656,23 +11691,27 @@ fn run_pi_verify_source_action(
         SourceVerificationStatus::Verified | SourceVerificationStatus::Warning => "succeeded",
         _ => "failed",
     };
+    let backend_result = json!({
+        "status": verification_status_slug(&result.status),
+        "verified": result.verified,
+        "records_seen": result.records_seen,
+        "last_record_id": result.last_record_id,
+        "last_received_at": result.last_received_at,
+        "smoke_after": result.smoke_after,
+        "route_results": result.route_results,
+        "routes_total": routes_total,
+        "routes_verified": routes_verified,
+        "routes_failed": routes_failed,
+        "error_code": if result.status == SourceVerificationStatus::Verified { serde_json::Value::Null } else { json!(result.message.code) },
+        "error_message": if result.status == SourceVerificationStatus::Verified { serde_json::Value::Null } else { json!(message) },
+    });
+    // Classify after building the backend payload so its bytes are unchanged.
+    attach_verification_check(&mut result);
     Ok((
         action_status.to_string(),
-        message.clone(),
-        json!({
-            "status": verification_status_slug(&result.status),
-            "verified": result.verified,
-            "records_seen": result.records_seen,
-            "last_record_id": result.last_record_id,
-            "last_received_at": result.last_received_at,
-            "smoke_after": result.smoke_after,
-            "route_results": result.route_results,
-            "routes_total": routes_total,
-            "routes_verified": routes_verified,
-            "routes_failed": routes_failed,
-            "error_code": if result.status == SourceVerificationStatus::Verified { serde_json::Value::Null } else { json!(result.message.code) },
-            "error_message": if result.status == SourceVerificationStatus::Verified { serde_json::Value::Null } else { json!(message) },
-        }),
+        message,
+        backend_result,
+        Some(result),
     ))
 }
 
@@ -13742,6 +13781,17 @@ fn verify_source(
     source: SourceKind,
     repair: bool,
 ) -> Result<SourceVerificationResult, LocalApiError> {
+    let mut result = verify_source_unchecked(daemon, authorization, source, repair)?;
+    attach_verification_check(&mut result);
+    Ok(result)
+}
+
+fn verify_source_unchecked(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    source: SourceKind,
+    repair: bool,
+) -> Result<SourceVerificationResult, LocalApiError> {
     let mut config = source_config_state_for_daemon(daemon, &source)?;
     if source_requires_config_patch(&source) && source_patch_disabled(&source) {
         let message = patch_disabled_message(&source);
@@ -14265,6 +14315,7 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
                 pi_route_label(route)
             ),
         },
+        check: None,
     }
 }
 
@@ -14309,6 +14360,7 @@ fn pi_route_post_smoke_census_failure(
                 pi_route_label(route)
             ),
         },
+        check: None,
     }
 }
 
@@ -14331,8 +14383,14 @@ const PI_PASSIVE_LOOKBACK_HOURS: u32 = 6;
 /// auth_mode=oauth: openai-codex / anthropic / github-copilot). These must not be
 /// live-smoked.
 fn route_is_subscription_oauth(route: &PiModelRoute) -> bool {
-    route.classification.auth_mode.as_deref() == Some("oauth")
-        && route.classification.billing_channel.as_deref() == Some("subscription")
+    is_subscription_oauth(
+        route.classification.auth_mode.as_deref(),
+        route.classification.billing_channel.as_deref(),
+    )
+}
+
+fn is_subscription_oauth(auth_mode: Option<&str>, billing_channel: Option<&str>) -> bool {
+    auth_mode == Some("oauth") && billing_channel == Some("subscription")
 }
 
 /// `now - hours` as an RFC3339 UTC timestamp (mirrors `current_rfc3339`'s
@@ -14521,6 +14579,7 @@ fn pi_route_passive_result(
         error_code,
         local_session_observed,
         message: StableMessage { code, text },
+        check: None,
     }
 }
 
@@ -14618,6 +14677,7 @@ fn pi_route_result_from_smoke(
                 smoke.message
             ),
         },
+        check: None,
     }
 }
 
@@ -14688,6 +14748,7 @@ fn pi_route_result_from_verification(
         },
         local_session_observed: smoke.local_session_observed,
         message: StableMessage { code, text },
+        check: None,
     }
 }
 
@@ -14736,6 +14797,7 @@ fn pi_route_result_from_backend_error(
                 source_result.message.text
             ),
         },
+        check: None,
     }
 }
 
@@ -14858,6 +14920,7 @@ fn pi_route_aggregate_result(
             text,
         },
         route_results,
+        check: None,
     }
 }
 
@@ -15655,6 +15718,97 @@ fn verification_result_with_config(
             text: text.to_string(),
         },
         route_results: Vec::new(),
+        check: None,
+    }
+}
+
+/// Record what kind of check produced `result` and what it established, from
+/// the result alone. A positive scope needs a Verified/Warning status, and no
+/// scope names an account: nothing in a result binds accepted usage to one.
+fn attach_verification_check(result: &mut SourceVerificationResult) {
+    let positive_status = matches!(
+        result.status,
+        SourceVerificationStatus::Verified | SourceVerificationStatus::Warning
+    );
+    let check = match result.source {
+        SourceKind::Codex => SourceVerificationCheck {
+            method: Some(SourceVerificationMethod::ConfigurationCheck),
+            scope: if positive_status
+                && !result.verified
+                && result.message.code == "codex_local_import"
+                && result.config.drift.is_empty()
+            {
+                SourceVerificationScope::Configuration
+            } else {
+                SourceVerificationScope::NotEstablished
+            },
+        },
+        SourceKind::ClaudeCode => SourceVerificationCheck {
+            method: Some(SourceVerificationMethod::LivePrompt),
+            scope: if result.verified && result.status == SourceVerificationStatus::Verified {
+                SourceVerificationScope::UsageReceived
+            } else {
+                SourceVerificationScope::NotEstablished
+            },
+        },
+        SourceKind::Pi => {
+            for route in &mut result.route_results {
+                route.check = Some(pi_route_verification_check(route));
+            }
+            let checks = result
+                .route_results
+                .iter()
+                .filter_map(|route| route.check.as_ref())
+                .collect::<Vec<_>>();
+            let method = checks.first().and_then(|first| {
+                if checks.iter().all(|check| check.method == first.method) {
+                    first.method
+                } else {
+                    Some(SourceVerificationMethod::Mixed)
+                }
+            });
+            let all =
+                |scope: SourceVerificationScope| checks.iter().all(|check| check.scope == scope);
+            let established = checks
+                .iter()
+                .filter(|check| check.scope != SourceVerificationScope::NotEstablished)
+                .count();
+            let scope = if !positive_status || established == 0 {
+                SourceVerificationScope::NotEstablished
+            } else if all(SourceVerificationScope::UsageReceived) {
+                SourceVerificationScope::UsageReceived
+            } else if all(SourceVerificationScope::LocalEvidence) {
+                SourceVerificationScope::LocalEvidence
+            } else {
+                SourceVerificationScope::Partial
+            };
+            SourceVerificationCheck { method, scope }
+        }
+    };
+    result.check = Some(check);
+}
+
+/// Same route split as Verify's dispatch and the aggregate's route counting.
+fn pi_route_verification_check(route: &SourceRouteVerificationResult) -> SourceVerificationCheck {
+    let passive =
+        is_subscription_oauth(route.auth_mode.as_deref(), route.billing_channel.as_deref());
+    SourceVerificationCheck {
+        method: Some(if passive {
+            SourceVerificationMethod::PassiveRecentUsage
+        } else {
+            SourceVerificationMethod::LivePrompt
+        }),
+        scope: if !route.verified {
+            SourceVerificationScope::NotEstablished
+        } else if route.status == SourceVerificationStatus::Verified {
+            SourceVerificationScope::UsageReceived
+        } else if route.status == SourceVerificationStatus::Warning
+            && route.error_code.as_deref() == Some(PI_LOCAL_ONLY_CODE)
+        {
+            SourceVerificationScope::LocalEvidence
+        } else {
+            SourceVerificationScope::NotEstablished
+        },
     }
 }
 
@@ -27349,6 +27503,7 @@ for line in sys.stdin:
                     code: "verified".to_string(),
                     text: "ok".to_string(),
                 },
+                check: None,
             },
             SourceRouteVerificationResult {
                 provider: Some("google-vertex".to_string()),
@@ -27382,6 +27537,7 @@ for line in sys.stdin:
                     code: "no_fresh_telemetry".to_string(),
                     text: "missing".to_string(),
                 },
+                check: None,
             },
         ];
 
@@ -27428,6 +27584,7 @@ for line in sys.stdin:
                     code: PI_LOCAL_ONLY_CODE.to_string(),
                     text: "Pi route created a local session. Pi is local-only.".to_string(),
                 },
+                check: None,
             },
             SourceRouteVerificationResult {
                 provider: Some("google-vertex".to_string()),
@@ -27461,6 +27618,7 @@ for line in sys.stdin:
                     code: "smoke_command_failed".to_string(),
                     text: "Pi route failed smoke.".to_string(),
                 },
+                check: None,
             },
         ];
 
@@ -27471,6 +27629,164 @@ for line in sys.stdin:
         assert_eq!(result.message.code, "pi_route_warnings");
         assert!(result.message.text.contains("0 live and 1 local-only"));
         assert!(!result.message.text.contains("No Pi model routes passed"));
+    }
+
+    #[test]
+    fn verification_check_states_what_each_completed_check_established() {
+        fn checked(mut result: SourceVerificationResult) -> SourceVerificationResult {
+            attach_verification_check(&mut result);
+            result
+        }
+        let check = |method, scope| Some(SourceVerificationCheck { method, scope });
+        use SourceVerificationMethod::{ConfigurationCheck, LivePrompt, Mixed, PassiveRecentUsage};
+        use SourceVerificationScope::{
+            Configuration, LocalEvidence, NotEstablished, Partial, UsageReceived,
+        };
+
+        // Codex: configuration only. The legacy fields stay unchanged.
+        let codex = checked(codex_local_import_verification(empty_source_config(
+            &SourceKind::Codex,
+        )));
+        assert_eq!(codex.check, check(Some(ConfigurationCheck), Configuration));
+        assert_eq!(codex.status, SourceVerificationStatus::Warning);
+        assert!(!codex.verified);
+        let mut drifted = empty_source_config(&SourceKind::Codex);
+        drifted
+            .drift
+            .push(config_drift("otel", "managed", "missing"));
+        let codex_drift = checked(codex_local_import_verification(drifted));
+        assert_eq!(
+            codex_drift.check,
+            check(Some(ConfigurationCheck), NotEstablished)
+        );
+
+        // Claude: only fresh usage after the prompt establishes anything;
+        // warnings (not installed, quiet window) do not.
+        let claude = |status: SourceVerificationStatus, verified: bool, code: &str| {
+            checked(verification_result(
+                SourceKind::ClaudeCode,
+                status,
+                verified,
+                u64::from(verified),
+                None,
+                None,
+                None,
+                code,
+                "text",
+            ))
+        };
+        assert_eq!(
+            claude(SourceVerificationStatus::Verified, true, "verified").check,
+            check(Some(LivePrompt), UsageReceived)
+        );
+        for (status, code) in [
+            (
+                SourceVerificationStatus::Warning,
+                CLAUDE_LOGIN_REFRESH_PENDING_CODE,
+            ),
+            (SourceVerificationStatus::Warning, SOURCE_NOT_INSTALLED_CODE),
+            (
+                SourceVerificationStatus::NoFreshTelemetry,
+                "no_fresh_telemetry",
+            ),
+        ] {
+            assert_eq!(
+                claude(status, false, code).check,
+                check(Some(LivePrompt), NotEstablished)
+            );
+        }
+
+        // Pi: per-route method and scope; partial keeps the legacy verified bit.
+        let smoke = SmokeResult {
+            command_found: true,
+            succeeded: true,
+            exit_status: Some(0),
+            duration_ms: 1,
+            message: "ok".to_string(),
+            diagnostic: None,
+            error_code: None,
+            local_session_observed: Some(false),
+        };
+        let live_verified = pi_route_result_from_verification(
+            &live_pi_route(),
+            &smoke,
+            SetupRunVerificationResponse {
+                verified: true,
+                records_seen: 1,
+                last_record_id: Some("record_1".to_string()),
+                last_received_at: Some("2026-10-19T10:00:00Z".to_string()),
+                smoke_after: "2026-10-19T09:59:00Z".to_string(),
+                error_code: None,
+                clear_condition: None,
+            },
+        );
+        let passive = |status, verified, code: Option<&str>| {
+            pi_route_passive_result(
+                &subscription_oauth_route(),
+                status,
+                verified,
+                0,
+                None,
+                None,
+                Some("2026-10-19T04:00:00Z".to_string()),
+                code.map(str::to_string),
+                "text".to_string(),
+                Some(true),
+            )
+        };
+        let reauth = passive(
+            SourceVerificationStatus::Warning,
+            false,
+            Some(PI_OAUTH_REAUTH_CODE),
+        );
+        let local_only = passive(
+            SourceVerificationStatus::Warning,
+            true,
+            Some(PI_LOCAL_ONLY_CODE),
+        );
+
+        let partial = checked(pi_route_aggregate_result(vec![
+            live_verified.clone(),
+            reauth.clone(),
+        ]));
+        assert_eq!(partial.status, SourceVerificationStatus::Warning);
+        assert!(partial.verified);
+        assert_eq!(partial.message.code, "pi_route_warnings");
+        assert_eq!(partial.check, check(Some(Mixed), Partial));
+        assert_eq!(
+            partial.route_results[0].check,
+            check(Some(LivePrompt), UsageReceived)
+        );
+        assert_eq!(
+            partial.route_results[1].check,
+            check(Some(PassiveRecentUsage), NotEstablished)
+        );
+
+        let local = checked(pi_route_aggregate_result(vec![local_only]));
+        assert_eq!(local.message.code, PI_LOCAL_ONLY_CODE);
+        assert_eq!(local.check, check(Some(PassiveRecentUsage), LocalEvidence));
+
+        let reauth_only = checked(pi_route_aggregate_result(vec![reauth]));
+        assert_eq!(
+            reauth_only.check,
+            check(Some(PassiveRecentUsage), NotEstablished)
+        );
+        let live_only = checked(pi_route_aggregate_result(vec![live_verified]));
+        assert_eq!(live_only.check, check(Some(LivePrompt), UsageReceived));
+
+        // Pi stopped before any route ran: the kind is not determined.
+        let unrouted = checked(verification_result(
+            SourceKind::Pi,
+            SourceVerificationStatus::ReconnectRequired,
+            false,
+            0,
+            None,
+            None,
+            None,
+            "reconnect_required",
+            "text",
+        ));
+        assert_eq!(unrouted.check, check(None, NotEstablished));
     }
 
     /// Inside the quiet window the Verify smoke does not start Claude Code
@@ -30371,6 +30687,20 @@ X-API-Key = "otel_redacted"
                 .and_then(serde_json::Value::as_str),
             Some("succeeded")
         );
+        // The completion is bound to the queued action and carries what the
+        // check established, with no account.
+        assert_eq!(
+            response.get("queued_action_id"),
+            response.pointer("/actions/0/action_id")
+        );
+        assert_eq!(
+            response.pointer("/actions/0/action_id"),
+            Some(&json!("action_verify_claude"))
+        );
+        assert_eq!(
+            response.pointer("/actions/0/verification/check"),
+            Some(&json!({"method": "live_prompt", "scope": "usage_received"}))
+        );
         let body_guard = completed_body.lock().expect("completed body lock");
         let body = body_guard.as_ref().expect("complete body observed");
         assert_eq!(
@@ -30382,6 +30712,7 @@ X-API-Key = "otel_redacted"
             result.get("verified").and_then(serde_json::Value::as_bool),
             Some(true)
         );
+        assert!(result.get("check").is_none());
         assert_eq!(
             KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
                 .load()
@@ -30435,6 +30766,7 @@ X-API-Key = "otel_redacted"
         assert_eq!(results[0].action_type, "verify_source");
         assert_eq!(results[0].source.as_deref(), Some("claude_code"));
         assert_eq!(results[0].status, "failed");
+        assert!(results[0].verification.is_none());
         let body_guard = completed_body.lock().expect("completed body lock");
         let body = body_guard.as_ref().expect("complete body observed");
         assert_eq!(
