@@ -127,6 +127,35 @@ pub(in crate::snapshots) fn with_test_limits<T>(
     run()
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_STATE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The state budget a paused job must fit beside the cursor state (K6).
+/// Tests may scale it down (`with_test_state_budget`); production never.
+fn state_budget() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_STATE_BUDGET.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    STATE_BYTES
+}
+
+/// Scaled state budget for tests only (a pause that cannot fit).
+#[cfg(test)]
+pub(in crate::snapshots) fn with_test_state_budget<T>(bytes: usize, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_STATE_BUDGET.with(|budget| budget.set(None));
+        }
+    }
+    TEST_STATE_BUDGET.with(|budget| budget.set(Some(bytes)));
+    let _reset = Reset;
+    run()
+}
+
 /// Decoded bytes consumed in this scan object (one page).
 #[derive(Debug, Default)]
 pub(in crate::snapshots) struct PageBudget {
@@ -316,16 +345,7 @@ impl JobMeta {
         consumed: u64,
         buffer: usize,
     ) -> Option<usize> {
-        let (charge, at, buffer_at) = self.charge?;
-        let since = consumed.checked_sub(at)?;
-        if since >= CHARGE_REFRESH_BYTES {
-            return None;
-        }
-        usize::try_from(since).ok().map(|since| {
-            charge
-                .saturating_add(since)
-                .saturating_add(buffer.saturating_sub(buffer_at))
-        })
+        estimate_charge(self.charge, consumed, buffer)
     }
 
     /// Record a walked charge (`usize::MAX` when the walk refused) taken at
@@ -337,6 +357,61 @@ impl JobMeta {
         buffer: usize,
     ) {
         self.charge = Some((charge, consumed, buffer));
+    }
+}
+
+/// E3 from a walked `(charge, consumed, buffer)`; see `charge_estimate`.
+fn estimate_charge(
+    walked: Option<(usize, u64, usize)>,
+    consumed: u64,
+    buffer: usize,
+) -> Option<usize> {
+    let (charge, at, buffer_at) = walked?;
+    let since = consumed.checked_sub(at)?;
+    if since >= CHARGE_REFRESH_BYTES {
+        return None;
+    }
+    usize::try_from(since).ok().map(|since| {
+        charge
+            .saturating_add(since)
+            .saturating_add(buffer.saturating_sub(buffer_at))
+    })
+}
+
+/// A job charged by bytes like a cursor job (E3): any cursor job, and a
+/// group job read in one page (R2-M2). Its state is walked with
+/// `completed_bound` at most once per `CHARGE_REFRESH_BYTES` of input (and
+/// at each member's new reader), never with the visit-limited `bound` per
+/// line, so a large group cannot refuse the copy budget by visits alone and
+/// clear every retained singleton copy.
+pub(in crate::snapshots) fn byte_charged(job: &OwnedActiveFile) -> bool {
+    job.cursor.is_some() || job.group.is_some()
+}
+
+/// The E3 estimate of a byte-charged job, if its last walk is recent.
+pub(in crate::snapshots) fn job_charge_estimate(
+    job: &OwnedActiveFile,
+    consumed: u64,
+    buffer: usize,
+) -> Option<usize> {
+    match (job.cursor.as_ref(), job.group.as_ref()) {
+        (Some(meta), _) => meta.charge_estimate(consumed, buffer),
+        (None, Some(group)) => estimate_charge(group.walked, consumed, buffer),
+        (None, None) => None,
+    }
+}
+
+/// Record a byte-charged job's walk (`usize::MAX` when it refused).
+pub(in crate::snapshots) fn record_job_charge(
+    job: &mut OwnedActiveFile,
+    charge: usize,
+    consumed: u64,
+    buffer: usize,
+) {
+    if let Some(meta) = job.cursor.as_mut() {
+        meta.record_charge(charge, consumed, buffer);
+    } else if let Some(group) = job.group.as_mut() {
+        group.walked = Some((charge, consumed, buffer));
     }
 }
 
@@ -422,6 +497,56 @@ crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, 
 /// `"legacy"` while the counting cutover is inactive.
 pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
     crate::snapshots::codex_counting_version::singleton_view(candidate, index)
+}
+
+/// A group's counting view (§k.4, §5.2 rule 3; R1-M2): built from every
+/// member's index entry, keyed by member path, so a counting change on any
+/// member (not only the live one) changes the group decision at start,
+/// resume, emission and in the memo digest.
+pub(in crate::snapshots) fn group_counting_view<'a>(
+    members: impl IntoIterator<Item = &'a CandidateFile>,
+    index: &ScanIndex,
+) -> String {
+    let mut views = members
+        .into_iter()
+        .map(|member| (local_index_key(&member.path), counting_view(member, index)))
+        .collect::<Vec<_>>();
+    views.sort();
+    let mut parts = vec!["codex_group_counting:v1".to_owned()];
+    for (key, view) in views {
+        parts.push(key);
+        parts.push(view);
+    }
+    sha256_hex_owned(&parts)
+}
+
+/// The counting view a job is decided under: a group's over all members.
+pub(in crate::snapshots) fn job_counting_view(job: &OwnedActiveFile, index: &ScanIndex) -> String {
+    match job.group.as_ref() {
+        Some(group) => group_counting_view(&group.members, index),
+        None => counting_view(&job.candidate, index),
+    }
+}
+
+/// A group job's `scope_job` (§a.6, §p; R1-M1): the receipt scope (upload
+/// context), the historical replay generation, and the parser, identity and
+/// proof versions. Recorded at job start; a change at any resume or at
+/// emission invalidates the job (receipts must not mix scopes).
+pub(in crate::snapshots) fn group_scope(index: &ScanIndex) -> String {
+    sha256_hex(&[
+        "codex_group_scope:v1",
+        CODEX_JOIN_PROOF_VERSION,
+        SnapshotSource::Codex.parser_version(),
+        SnapshotSource::Codex.scan_identity_version(),
+        index
+            .active_upload_context_fingerprint
+            .as_deref()
+            .unwrap_or("none"),
+        index
+            .historical_replay_generation
+            .as_deref()
+            .unwrap_or("none"),
+    ])
 }
 
 /// The one counting reuse predicate for a restored accumulator, shared with
@@ -665,7 +790,7 @@ pub(in crate::snapshots) struct CursorState {
     slot_members: BTreeSet<String>,
     /// Owners B blocked for queued groups, with their compact member keys
     /// (§d.1.3 provenance, L-1). RAM only; bounded.
-    join_owners: BTreeMap<String, Vec<u64>>,
+    join_owners: BTreeMap<String, (u64, Vec<u64>)>,
     /// Requested-layout charge of the paused job, measured when it paused.
     slot_charge: usize,
     /// Cursor page when the paused job last paused or resumed (K10).
@@ -964,11 +1089,20 @@ impl CursorLease {
                 if let Some(meta) = job.cursor.as_ref() {
                     cursor.invalidations.remove(&meta.key);
                     let used = cursor.tick();
+                    // A group parks under its live member's boot stamp, the
+                    // file its lookup opens (R2-H1); sealed members wake it
+                    // through the identities in its dependencies.
+                    let stamp = job
+                        .group
+                        .as_ref()
+                        .and_then(|group| group.stamps.last())
+                        .unwrap_or(&meta.stamp_open)
+                        .clone();
                     park(
                         cursor,
                         meta.key.clone(),
                         Parked {
-                            stamp: meta.stamp_open.clone(),
+                            stamp,
                             dependencies: meta.dependencies.clone(),
                             disclosure: disclosure.clone(),
                             used,
@@ -1106,6 +1240,7 @@ pub(in crate::snapshots) fn finish_job(
     job: &mut OwnedActiveFile,
     current_scope: Option<&Scope>,
     counting_now: &str,
+    group_scope_now: &str,
     census_trusted: bool,
 ) -> JobEnd {
     let Some(meta) = job.cursor.take() else {
@@ -1134,7 +1269,12 @@ pub(in crate::snapshots) fn finish_job(
         );
     let consumed = parser.reader.consumed_bytes();
     let now = super::now_seconds();
-    let counting_holds = counting_reusable(&parser.accumulator, &meta.counting, counting_now);
+    // A group's receipts and replay are bound to its start scope (R1-M1).
+    let counting_holds = counting_reusable(&parser.accumulator, &meta.counting, counting_now)
+        && job
+            .group
+            .as_ref()
+            .map_or(true, |group| group.scope == group_scope_now);
     let mut frozen_end = None;
     let mut read_start = 0;
     let mut lossy_identity = None;
@@ -1495,9 +1635,7 @@ pub(in crate::snapshots) fn group_memo_digest(
         SnapshotSource::Codex.scan_identity_version().to_owned(),
         owner.to_owned(),
         receipt_scope.to_owned(),
-        members
-            .last()
-            .map_or_else(String::new, |last| counting_view(last, index)),
+        group_counting_view(members.iter().copied(), index),
         format!("{}:{}", live.dev, live.ino),
         if codex.created_thread_census_unscoped_incomplete {
             "created_incomplete".to_owned()
@@ -1522,9 +1660,13 @@ pub(in crate::snapshots) fn group_memo_digest(
     sha256_hex_owned(&parts)
 }
 
-/// Reduction dependencies of a group job: every member's path facts.
+/// Reduction dependencies of a group job: every member's path facts, and
+/// the opened identity of every member but the canonical last (`live`), so
+/// a sealed member's change wakes a parked `JoinStateBound` record while the
+/// live member's growth keeps it parked (R2-H1).
 pub(in crate::snapshots) fn group_dependencies(
     members: &[CandidateFile],
+    live: &Path,
     codex: &CodexTitleMetadata,
 ) -> String {
     // Keyed by member path, so boot and canonical order agree.
@@ -1534,14 +1676,20 @@ pub(in crate::snapshots) fn group_dependencies(
             (
                 local_index_key(&member.path),
                 codex.path_reduction_fingerprint(&member.path),
+                if member.path == live {
+                    String::new()
+                } else {
+                    member.opened_object_identity.clone()
+                },
             )
         })
         .collect::<Vec<_>>();
     members.sort();
-    let mut parts = vec!["codex_group_dependencies:v1".to_owned()];
-    for (key, fingerprint) in members {
+    let mut parts = vec!["codex_group_dependencies:v2".to_owned()];
+    for (key, fingerprint, identity) in members {
         parts.push(key);
         parts.push(fingerprint);
+        parts.push(identity);
     }
     sha256_hex_owned(&parts)
 }
@@ -1588,7 +1736,7 @@ impl SharedCache {
         else {
             return false;
         };
-        let Some(room) = STATE_BYTES
+        let Some(room) = state_budget()
             .checked_sub(state)
             .and_then(|room| room.checked_sub(charge))
         else {
@@ -1695,6 +1843,16 @@ impl SharedCache {
         .flatten()
     }
 
+    /// The paused group job's current canonical member (tests).
+    #[cfg(test)]
+    pub(in crate::snapshots) fn paused_group_position(&self) -> Option<usize> {
+        self.with_cursor(|cursor| match &cursor.slot {
+            Slot::Paused(job) => job.group.as_ref().map(|group| group.current),
+            Slot::Empty | Slot::ActiveElsewhere { .. } => None,
+        })
+        .flatten()
+    }
+
     #[cfg(test)]
     pub(in crate::snapshots) fn counters_for_test(&self) -> Counters {
         self.with_cursor(|cursor| cursor.counters)
@@ -1760,14 +1918,20 @@ impl SharedCache {
             .map(|member| compact_key(&local_index_key(&member.path)))
             .collect::<Vec<_>>();
         self.with_cursor(|cursor| {
+            let used = cursor.tick();
             if !cursor.join_owners.contains_key(owner) && cursor.join_owners.len() >= JOIN_OWNERS {
-                // Forgetting provenance only keeps that owner blocked (today's
-                // behavior); it never releases one.
-                if let Some(first) = cursor.join_owners.keys().next().cloned() {
-                    cursor.join_owners.remove(&first);
+                // Forgetting the least recent provenance only keeps that owner
+                // blocked (today's behavior); it never releases one.
+                if let Some(oldest) = cursor
+                    .join_owners
+                    .iter()
+                    .min_by_key(|(_, (used, _))| *used)
+                    .map(|(owner, _)| owner.clone())
+                {
+                    cursor.join_owners.remove(&oldest);
                 }
             }
-            cursor.join_owners.insert(owner.to_owned(), keys);
+            cursor.join_owners.insert(owner.to_owned(), (used, keys));
         });
     }
 
@@ -1783,7 +1947,7 @@ impl SharedCache {
             let released = cursor
                 .join_owners
                 .iter()
-                .filter(|(owner, members)| {
+                .filter(|(owner, (_, members))| {
                     !keep(owner) && members.iter().all(|member| !present.contains(member))
                 })
                 .map(|(owner, _)| owner.clone())
@@ -2019,10 +2183,7 @@ impl SharedCache {
         let key = group.key.clone();
         let owner = group.owner.clone();
         let boot = group.stamps.first().cloned();
-        let counting = group
-            .members
-            .last()
-            .map_or_else(String::new, |live| counting_view(live, index));
+        let counting = group_counting_view(&group.members, index);
         let members = group
             .members
             .iter()
@@ -2324,6 +2485,8 @@ pub(in crate::snapshots) struct ResumeInputs<'a> {
     pub(in crate::snapshots) scope: Option<Scope>,
     /// `counting_view` recomputed from the resuming scan's index (K8).
     pub(in crate::snapshots) counting: String,
+    /// `group_scope` recomputed from the resuming scan's index (R1-M1).
+    pub(in crate::snapshots) group_scope: String,
     /// The state and sidecar census are complete now (R1-M1).
     pub(in crate::snapshots) census_complete: bool,
 }
@@ -2394,15 +2557,8 @@ pub(in crate::snapshots) fn resume_paused_job(
             )
         })
     });
-    // A group's counting view is its live member's (the file `finish_job`
-    // compares at completion).
-    let counting = counting_view(
-        job.group
-            .as_ref()
-            .and_then(|group| group.members.last())
-            .unwrap_or(&job.candidate),
-        index,
-    );
+    // A group's counting view is built over every member (R1-M2).
+    let counting = job_counting_view(&job, index);
     let verdict = revalidate(
         &mut job,
         ResumeInputs {
@@ -2414,6 +2570,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             inventory: context.inventory,
             scope,
             counting,
+            group_scope: group_scope(index),
             census_complete: context.census_complete,
         },
     );
@@ -2599,6 +2756,7 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     };
     if !meta.stamp_open.append_compatible(&now)
         || !counting_reusable(&job.parser.accumulator, &meta.counting, &inputs.counting)
+        || group.scope != inputs.group_scope
     {
         return Resume::Changed;
     }
@@ -2616,8 +2774,11 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     } else {
         Resume::Unavailable
     };
+    let live = group.members.last().map(|member| member.path.as_path());
     if meta.dependencies.as_deref()
-        != Some(group_dependencies(&group.members, inputs.codex).as_str())
+        != live
+            .map(|live| group_dependencies(&group.members, live, inputs.codex))
+            .as_deref()
     {
         return changed;
     }

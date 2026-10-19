@@ -297,7 +297,9 @@ impl GroupBoot {
                     self.headers.push(header);
                     Boot::Pending
                 }
-                None => Boot::Refused(JoinRefusal::Corrupt),
+                // The inventory parsed this header: a failure now is a
+                // change under the read (TOCTOU), never proof debt (R1-M3).
+                None => Boot::Strict,
             };
         }
         if self.plan.is_none() {
@@ -452,6 +454,18 @@ impl GroupBoot {
         Some((&self.group.members[last], self.stamps.get(last)?))
     }
 
+    /// The group's reduction dependencies with every sealed member's opened
+    /// identity (R2-H1): a parked record wakes on a sealed member's change,
+    /// never on the live member's growth.
+    pub(in crate::snapshots) fn dependencies(&self, codex: &CodexTitleMetadata) -> Option<String> {
+        let (live, _) = self.live()?;
+        Some(cursor::group_dependencies(
+            &self.group.members,
+            &live.path,
+            codex,
+        ))
+    }
+
     /// M-1 `scope_job` with the group's wake dependencies (§d.4).
     pub(in crate::snapshots) fn memo_digest(
         &self,
@@ -595,6 +609,8 @@ impl GroupBoot {
                 charge: 0,
                 probe_bound,
                 memo_digest,
+                scope: cursor::group_scope(index),
+                walked: None,
             })),
         }))
     }
@@ -675,10 +691,16 @@ pub(in crate::snapshots) struct GroupJob {
     charge: u64,
     pub(in crate::snapshots) probe_bound: bool,
     pub(in crate::snapshots) memo_digest: Option<String>,
+    /// `cursor::group_scope` at job start (§p, R1-M1): every resume and the
+    /// emission compare it with the current index.
+    pub(in crate::snapshots) scope: String,
+    /// The last walked copy-budget charge of a group read without the
+    /// cursor (E3, R2-M2; a cursor job keeps it in its `JobMeta`).
+    pub(in crate::snapshots) walked: Option<(usize, u64, usize)>,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
-    charge, probe_bound, memo_digest);
+    charge, probe_bound, memo_digest, scope, walked);
 
 impl GroupJob {
     pub(in crate::snapshots) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
@@ -760,6 +782,14 @@ pub(in crate::snapshots) struct StepInputs<'a> {
         &'a dyn Fn(&CandidateFile) -> Option<crate::transcript_acquisition::Scope>,
 }
 
+/// The reader skipped a line (malformed, invalid UTF-8 or over the line
+/// cap) or failed: a refusal seen after that may be the loss's own effect
+/// (an ordinal jump, a broken chain), so it is strict, never settleable
+/// debt or a memo entry (R1-B1).
+fn reader_lossy(parser: &OwnedJsonlParser) -> bool {
+    !parser.reader.report.complete() || parser.reader.failure.is_some()
+}
+
 fn join_refusal(parser: &OwnedJsonlParser) -> Option<(JoinRefusal, usize)> {
     parser
         .accumulator
@@ -799,6 +829,9 @@ pub(in crate::snapshots) fn step_group(
         Err(error) => return GroupStep::Read(Err(error)),
     };
     if let Some((reason, position)) = join_refusal(&active.parser) {
+        if reader_lossy(&active.parser) {
+            return GroupStep::End(GroupEnd::Strict);
+        }
         return GroupStep::End(GroupEnd::Refused {
             reason,
             position,
@@ -821,7 +854,7 @@ fn member_eof(
     active: &mut OwnedActiveFile,
     inputs: &StepInputs<'_>,
 ) -> std::result::Result<bool, GroupEnd> {
-    if !active.parser.reader.report.complete() {
+    if reader_lossy(&active.parser) {
         return Err(GroupEnd::Strict);
     }
     let paged = active.cursor.is_some();
@@ -1028,8 +1061,10 @@ pub(in crate::snapshots) struct EndInputs<'a> {
 }
 
 /// End a group job that did not complete. Terminal proof debt is disclosed
-/// through the one writer for every member (outcome R) and memoized when an
-/// append cannot cure it; the attempt is fenced for the generation.
+/// through the one writer for every member (outcome R) and memoized; an
+/// append-curable refusal in the live member only while that member's stamp
+/// is exactly unchanged (§d.4, R2-M1). The attempt is fenced for the
+/// generation.
 pub(in crate::snapshots) fn end_group(
     active: Box<OwnedActiveFile>,
     end: GroupEnd,
@@ -1054,8 +1089,10 @@ pub(in crate::snapshots) fn end_group(
             let live_failed = position + 1 == group.members.len();
             if let Some(context) = sampling {
                 context.cache.note_join_refusal(reason);
-                // §d.4: append-incurable, or the first failing member is sealed.
-                let memoize = !reason.append_curable() || !live_failed;
+                // §d.4: growth of the live member may cure this refusal, so
+                // its entry matches only the exact recorded stamp: any
+                // append or touch wakes it, an unchanged group is not re-read.
+                let growth_may_cure = reason.append_curable() && live_failed;
                 let held = active.parser.reader.reader.get_ref();
                 let anchor = if live_failed {
                     OpenStamp::capture(held).ok()
@@ -1067,9 +1104,7 @@ pub(in crate::snapshots) fn end_group(
                 let live = live_failed
                     .then(|| cursor::LiveWitness::read(held, offset))
                     .flatten();
-                if let (true, Some(digest), Some(stamp)) =
-                    (memoize, group.memo_digest.clone(), anchor)
-                {
+                if let (Some(digest), Some(stamp)) = (group.memo_digest.clone(), anchor) {
                     if !live_failed || live.is_some() {
                         context.cache.memo_record(
                             cursor::memo_key(&context.namespace, &group.key),
@@ -1080,7 +1115,8 @@ pub(in crate::snapshots) fn end_group(
                                 None,
                                 None,
                                 disclosure.clone(),
-                            ),
+                            )
+                            .growth_may_cure(growth_may_cure),
                         );
                     }
                 }

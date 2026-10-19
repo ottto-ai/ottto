@@ -8,7 +8,6 @@ pub(super) use group_job::{
     take_charge, Boot, EndInputs, GroupBoot, GroupEnd, GroupJob, GroupStep, JobInputs, StepInputs,
 };
 
-pub(super) const MAX_MEMBERS: usize = 32;
 pub(super) const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 pub(super) const MAX_HEADER_FILES: usize = 32_768;
@@ -17,7 +16,6 @@ pub(super) const MAX_HEADER_FILES: usize = 32_768;
 // 32MiB ceiling permanently refused otherwise-valid inventories. Reads still
 // yield one header per step, and no decoded header is retained between steps.
 const MAX_HEADER_READ_BYTES: usize = MAX_HEADER_FILES * (MAX_HEADER_BYTES + 1);
-pub(super) const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
 
 fn metadata_witness(metadata: &fs::Metadata) -> String {
     let mut digest = Sha256::new();
@@ -804,8 +802,12 @@ pub(super) enum JoinRefusal {
     CandidateCopy,
     V2UiOnlyTurn,
     V2UnboundUi,
+    /// A `history_base.thread_id` names no inventoried member: typically a
+    /// compressed (`.zst`, not yet scanned) predecessor of the same owner,
+    /// never a fork (forks carry `forked_from_id`).
+    MissingPredecessor,
 }
-pub(super) const JOIN_REFUSALS: usize = 18;
+pub(super) const JOIN_REFUSALS: usize = 19;
 impl JoinRefusal {
     pub(super) fn slot(self) -> usize {
         self as usize
@@ -907,22 +909,41 @@ pub(super) struct StreamProof {
     unbound_ui: bool,
 }
 
+/// Heap bytes of a std B-tree of `len` inline entries (R2-M4). Every
+/// non-root node holds at least `MIN_LEN = 5` of its 11 slots (std
+/// `btree/map.rs` invariant) and every entry lives in exactly one node, so a
+/// tree has at most `len / 5 + 1` nodes. Each is charged as a full internal
+/// node (11 slots, 12 edges) plus the same 256-byte header slack as
+/// `tree_nodes`, which charges one such node per entry (five times this).
+fn proof_tree_bytes<K, V>(len: usize) -> Option<usize> {
+    let node = 256usize
+        .checked_add(12 * size_of::<usize>())?
+        .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)?;
+    (len / 5).checked_add(1)?.checked_mul(node)
+}
+
 impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
     // Fixed visits per walk: the compact sets and balance maps are charged by
-    // length (`tree_nodes`), never element by element, so a large group stays
-    // within one walk's visit limit and its bytes are still counted.
+    // length (`proof_tree_bytes`), never element by element, so a large
+    // group stays within one walk's visit limit and its bytes are counted.
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        use crate::heap_layout_bound::tree_nodes;
         self.owner.heap_bound(c)?;
         self.plans.heap_bound(c)?;
         self.seen.heap_bound(c)?;
         self.member.starts.heap_bound(c)?;
-        tree_nodes::<Tokens, i64>(self.member.balance.len(), c)?;
-        tree_nodes::<Tokens, u64>(self.member.repeat.len(), c)?;
-        tree_nodes::<u64, ()>(self.responses.len(), c)?;
-        tree_nodes::<u64, ()>(self.ui.len(), c)?;
-        tree_nodes::<u64, ()>(self.native_turns.len(), c)?;
-        tree_nodes::<u64, ()>(self.ui_turns.len(), c)
+        let trees = [
+            proof_tree_bytes::<Tokens, i64>(self.member.balance.len())?,
+            proof_tree_bytes::<Tokens, u64>(self.member.repeat.len())?,
+            proof_tree_bytes::<u64, ()>(self.responses.len())?,
+            proof_tree_bytes::<u64, ()>(self.ui.len())?,
+            proof_tree_bytes::<u64, ()>(self.native_turns.len())?,
+            proof_tree_bytes::<u64, ()>(self.ui_turns.len())?,
+        ];
+        c.add(
+            trees
+                .iter()
+                .try_fold(0usize, |sum, bytes| sum.checked_add(*bytes))?,
+        )
     }
 }
 
@@ -1330,15 +1351,15 @@ pub(super) fn plan_group(
         return Err(JoinRefusal::ForkedFromOtherSession);
     }
     if let Some((thread, _, _)) = &first.history_base {
-        let named = thread.as_ref().is_some_and(|thread| {
+        let named = thread.as_ref().map(|thread| {
             headers
                 .iter()
                 .any(|header| header.names.iter().any(|name| name == thread))
         });
-        return Err(if named {
-            JoinRefusal::HistoryBase
-        } else {
-            JoinRefusal::ForkedFromOtherSession
+        return Err(match named {
+            // The predecessor is outside the inventory (R1-M3).
+            Some(false) => JoinRefusal::MissingPredecessor,
+            Some(true) | None => JoinRefusal::HistoryBase,
         });
     }
     let mut plans = vec![MemberPlan::default(); n];
@@ -1391,8 +1412,10 @@ pub(super) fn plan_group(
         let mut named = (0..n).filter(|other| {
             *other != *member && headers[*other].names.iter().any(|name| name == thread)
         });
-        let (Some(predecessor), None) = (named.next(), named.next()) else {
-            return Err(JoinRefusal::AmbiguousPredecessor);
+        let predecessor = match (named.next(), named.next()) {
+            (Some(predecessor), None) => predecessor,
+            (None, _) => return Err(JoinRefusal::MissingPredecessor),
+            (Some(_), Some(_)) => return Err(JoinRefusal::AmbiguousPredecessor),
         };
         // Topological, and the continuation starts exactly at its base.
         if header.ordinal != Some(*end) || position[predecessor] >= at {
@@ -3558,7 +3581,7 @@ pub(super) mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
-    fn legacy_index(
+    pub(crate) fn legacy_index(
         inventory: &HeaderInventory,
         traces: Option<Arc<CodexTurnTraceMap>>,
     ) -> ScanIndex {

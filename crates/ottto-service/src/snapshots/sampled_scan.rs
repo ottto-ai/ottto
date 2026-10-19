@@ -305,11 +305,9 @@ pub(super) fn copy_budget_beside(
     let active = active.map_or(Some(0), |active| {
         let consumed = active.parser.reader.consumed_bytes();
         let buffer = active.parser.reader.buf.capacity();
-        let estimate = active
-            .cursor
-            .as_ref()
-            .filter(|_| !completing)
-            .and_then(|meta| meta.charge_estimate(consumed, buffer));
+        let estimate = (!completing)
+            .then(|| codex_cursor::job_charge_estimate(active, consumed, buffer))
+            .flatten();
         if let Some(estimate) = estimate {
             return Some(estimate);
         }
@@ -317,16 +315,25 @@ pub(super) fn copy_budget_beside(
         // refreshed on reuse, and are absent from every retained copy.
         // All active owned parser/acquisition/path/receipt state stays charged.
         let inputs = active.parser.take_live_reduction_inputs();
+        // A group's legacy tee holds the same inputs (P2).
+        let tee_inputs = active
+            .group
+            .as_mut()
+            .and_then(|group| group.take_tee_inputs());
         // The walk charges the file itself, as before it was boxed.
         let file: &OwnedActiveFile = active;
-        let bound = if active.cursor.is_some() {
+        let byte_charged = codex_cursor::byte_charged(file);
+        let bound = if byte_charged {
             crate::heap_layout_bound::completed_bound(file, remaining)
         } else {
             crate::heap_layout_bound::bound(file, remaining)
         };
         active.parser.restore_live_reduction_inputs(inputs);
-        if let Some(meta) = active.cursor.as_mut() {
-            meta.record_charge(bound.unwrap_or(usize::MAX), consumed, buffer);
+        if let Some(group) = active.group.as_mut() {
+            group.restore_tee_inputs(tee_inputs);
+        }
+        if byte_charged {
+            codex_cursor::record_job_charge(active, bound.unwrap_or(usize::MAX), consumed, buffer);
         }
         bound
     });

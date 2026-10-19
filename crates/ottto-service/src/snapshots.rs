@@ -14233,7 +14233,6 @@ impl OwnedSourceScan {
                             || owners
                                 .get(&group.owner)
                                 .is_some_and(|homes| homes.len() > 1)
-                            || group.members.len() > codex_file_join::MAX_MEMBERS
                             || group.members.len() < 2
                             || group.members.len() > file_limit
                         {
@@ -14348,6 +14347,16 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     codex_file_join::Boot::Unchanged => {
+                        // R1-L3: the accepted joined body is current, with no
+                        // job or debt: the persisted block F8 (or a previous
+                        // process) set is released, as an accepted exclusive
+                        // body releases it, unless this scan holds the owner
+                        // as residue.
+                        if !residue_blocked_session_ids.contains(&boot.group.owner) {
+                            index
+                                .codex_state_only_blocked_session_ids
+                                .remove(&boot.group.owner);
+                        }
                         semantic_noop_count += members;
                         codex_join_completed.push(boot.group);
                         pending!();
@@ -14396,6 +14405,7 @@ impl OwnedSourceScan {
                     codex_file_join::Boot::Ready => {}
                 }
                 let expected = boot.expected_bytes();
+                let dependencies = boot.dependencies(&codex_title_metadata);
                 let mut paged = false;
                 if let Some(context) = sampling.as_ref() {
                     if boot.probe_bound {
@@ -14435,14 +14445,10 @@ impl OwnedSourceScan {
                         }
                         context.cache.memo_forget(&memo_key);
                     }
-                    let dependencies = sampled_scan::codex_cursor::group_dependencies(
-                        &boot.group.members,
-                        &codex_title_metadata,
-                    );
                     let parked = live_file.as_ref().and_then(|file| {
                         context
                             .cache
-                            .cursor_parked(&boot.key, file, Some(dependencies.as_str()))
+                            .cursor_parked(&boot.key, file, dependencies.as_deref())
                     });
                     if let Some(disclosure) = parked {
                         codex_file_join::disclose_members(
@@ -14495,22 +14501,10 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                if !paged && expected > codex_file_join::MAX_GROUP_BYTES {
-                    // Never an unbounded in-page group read (no cursor).
-                    codex_file_join::disclose_strict(
-                        &boot.group.owner,
-                        &boot.group.members,
-                        sampled_scan::codex_cursor::DisclosureTargets {
-                            census: &mut census,
-                            residue_index_keys: &mut residue_index_keys,
-                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                            codex_state_only_blocked_session_ids:
-                                &mut codex_state_only_blocked_session_ids,
-                            pending_finalization: &mut pending_finalization,
-                        },
-                    );
-                    pending!();
-                }
+                // No group byte or member cap (R1-M4): a group larger than
+                // the singleton budget pages through the cursor; without one
+                // (unsupported layout, uncached scan) it is read in one page
+                // exactly like a singleton of the same size.
                 let owner = boot.group.owner.clone();
                 let group_members = boot.group.members.clone();
                 let job = boot.into_job(codex_file_join::JobInputs {
@@ -14537,10 +14531,6 @@ impl OwnedSourceScan {
                     pending!();
                 };
                 if let Some(context) = sampling.as_ref().filter(|_| paged) {
-                    let dependencies = Some(sampled_scan::codex_cursor::group_dependencies(
-                        &group_members,
-                        &codex_title_metadata,
-                    ));
                     match context.cache.cursor_start_group(
                         &mut job,
                         &context.namespace,
@@ -14963,7 +14953,8 @@ impl OwnedSourceScan {
                         )
                     });
                     let counting_now =
-                        sampled_scan::codex_cursor::counting_view(&active.candidate, index);
+                        sampled_scan::codex_cursor::job_counting_view(&active, index);
+                    let group_scope_now = sampled_scan::codex_cursor::group_scope(index);
                     let census_trusted = state_census_complete
                         && sidecar_census_complete
                         && active
@@ -14978,6 +14969,7 @@ impl OwnedSourceScan {
                         &mut active,
                         current_scope.as_ref(),
                         &counting_now,
+                        &group_scope_now,
                         census_trusted,
                     ) {
                         sampled_scan::codex_cursor::JobEnd::Certified {
