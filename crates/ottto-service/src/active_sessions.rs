@@ -2300,6 +2300,7 @@ mod tests {
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
+            session_start: None,
             model_usage: vec![model_usage.clone()],
             usage_buckets: vec![crate::snapshots::SnapshotUsageBucket {
                 bucket_start: "2026-07-19T10:00:00Z".to_string(),

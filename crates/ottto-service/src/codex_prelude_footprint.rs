@@ -84,6 +84,60 @@ const LOCAL_DISABLE_ENV: &str = "OTTTO_CODEX_SESSION_START_HARVEST_DISABLED";
 // Prelude parsing.
 // -------------------------------------------------------------------------
 
+/// Labels of the request-1 blocks whose loaded text is counted elsewhere.
+pub(crate) const AGENTS_MD_KIND: &str = "agents_md.instructions";
+pub(crate) const HOST_SKILLS_KIND: &str = "host_skills.instructions";
+/// The developer copy of `session_meta.base_instructions`; count one of them.
+pub(crate) const BASE_INSTRUCTIONS_KIND: &str = "model.base_instructions";
+const HOOK_CONTEXT_KIND: &str = "hooks.additional_context";
+const DEFERRED_NAMESPACES_KIND: &str = "tools.deferred_namespaces";
+/// Ids, paths and model names longer than this are treated as absent, so a
+/// held parser has a fixed size beside its AGENTS.md cap.
+pub(crate) const MAX_SMALL_TEXT_BYTES: usize = 1024;
+
+/// What one labeled prelude message block is, by its `content_item_kinds`
+/// label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockKind {
+    BaseInstructions,
+    AgentsMd,
+    Skills,
+    DeferredTools,
+    Hooks,
+    /// Permissions, environment, collaboration mode, plugins and apps.
+    Environment,
+    Prompt,
+    Other,
+}
+pub(crate) const BLOCK_KINDS: usize = 8;
+
+impl BlockKind {
+    pub(crate) fn of(label: &str) -> Self {
+        match label {
+            BASE_INSTRUCTIONS_KIND => Self::BaseInstructions,
+            AGENTS_MD_KIND => Self::AgentsMd,
+            HOST_SKILLS_KIND => Self::Skills,
+            DEFERRED_NAMESPACES_KIND => Self::DeferredTools,
+            HOOK_CONTEXT_KIND => Self::Hooks,
+            label if label.starts_with("user.") => Self::Prompt,
+            label
+                if [
+                    "permissions.",
+                    "environments.",
+                    "collaboration_mode.",
+                    "plugins.",
+                    "apps.",
+                ]
+                .iter()
+                .any(|prefix| label.starts_with(prefix)) =>
+            {
+                Self::Environment
+            }
+            _ => Self::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LoadedAgentsMd {
     pub(crate) directory: Option<String>,
@@ -109,13 +163,29 @@ pub(crate) struct CodexPrelude {
     /// Injected developer/user text other than AGENTS.md, skills and hooks.
     pub(crate) other_harness_chars: u64,
     pub(crate) hook_chars: u64,
+    /// Request 1's rendered developer/user blocks by kind, counted until the
+    /// model's first output (the session-start snapshot's parts).
+    pub(crate) block_chars: [u64; BLOCK_KINDS],
+    /// A request-1 message without one string label per block, or an image
+    /// block: `block_chars` misses part of request 1.
+    pub(crate) blocks_incomplete: bool,
+    /// Request 1's input ended: the model answered, or its usage was logged.
+    pub(crate) input_closed: bool,
+    pub(crate) world_state_seen: bool,
     pub(crate) agents_md: Option<LoadedAgentsMd>,
+    /// The AGENTS.md text was longer than the parser keeps; `agents_md` holds
+    /// its prefix.
+    pub(crate) agents_md_capped: bool,
     pub(crate) skills_body: Option<String>,
 }
 
 impl CodexPrelude {
     pub(crate) fn is_owned_fresh_start(&self) -> bool {
         self.complete && !self.is_fork && self.cwd.is_some()
+    }
+
+    pub(crate) fn chars(&self, kind: BlockKind) -> u64 {
+        self.block_chars[kind as usize]
     }
 }
 
@@ -152,18 +222,64 @@ pub(crate) enum PreludeStep {
 /// already decoded, until it says [`PreludeStep::Done`]; callers that decode
 /// rows for another purpose share this instead of parsing the prelude again.
 /// Requires `world_state` (cli >= 0.159); older rollouts are not supported.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct CodexPreludeParser {
     prelude: CodexPrelude,
     session_id: Option<String>,
-    world_state_seen: bool,
     /// Rows after the first request are read only for its context window,
     /// which a `token_count` event can carry right after the usage record.
     rows_after_first_request: usize,
+    /// Most bytes of AGENTS.md text kept.
+    agents_md_cap: usize,
+    keep_skills_body: bool,
+}
+
+impl Default for CodexPreludeParser {
+    /// Keeps every loaded text; the caller bounds what it feeds.
+    fn default() -> Self {
+        Self {
+            prelude: CodexPrelude::default(),
+            session_id: None,
+            rows_after_first_request: 0,
+            agents_md_cap: usize::MAX,
+            keep_skills_body: true,
+        }
+    }
 }
 
 impl CodexPreludeParser {
+    /// For a caller that holds the parser while it reads on (the session-start
+    /// snapshot): keeps at most `agents_md_cap` bytes of the AGENTS.md text,
+    /// for path matching, and no skills body.
+    pub(crate) fn matching_only(agents_md_cap: usize) -> Self {
+        Self {
+            agents_md_cap,
+            keep_skills_body: false,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn prelude(&self) -> &CodexPrelude {
+        &self.prelude
+    }
+
+    /// Drops the kept texts; every count stays.
+    pub(crate) fn release_text(&mut self) {
+        self.prelude.agents_md = None;
+        self.prelude.skills_body = None;
+    }
+
     pub(crate) fn observe(&mut self, value: &Value) -> PreludeStep {
+        self.observe_with(value, |_, _| {})
+    }
+
+    /// [`Self::observe`], also lending each request-1 block counted in
+    /// `block_chars` to `on_block`. Nothing is copied for it.
+    pub(crate) fn observe_with(
+        &mut self,
+        value: &Value,
+        on_block: impl FnMut(BlockKind, &str),
+    ) -> PreludeStep {
         let prelude = &mut self.prelude;
         if prelude.complete {
             self.rows_after_first_request += 1;
@@ -189,61 +305,82 @@ impl CodexPreludeParser {
                 }
             }
             "turn_context" if prelude.model.is_none() => {
-                prelude.model = payload
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                prelude.model = small_text(payload.get("model"));
             }
-            "world_state" if !self.world_state_seen => {
+            "world_state" if !prelude.world_state_seen => {
                 if let Some(state) = payload.get("state").filter(|s| s.is_object()) {
-                    self.world_state_seen = true;
-                    prelude.agents_md = state.get("agents_md").and_then(|agents| {
-                        Some(LoadedAgentsMd {
-                            directory: agents
-                                .get("directory")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            text: agents.get("text")?.as_str()?.to_string(),
-                        })
-                    });
-                    prelude.skills_body = state
-                        .get("host_skills")
-                        .and_then(|skills| skills.get("body"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                    prelude.world_state_seen = true;
+                    let agents = state.get("agents_md");
+                    if let Some(text) = agents.and_then(|a| a.get("text")).and_then(Value::as_str) {
+                        let mut end = text.len().min(self.agents_md_cap);
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        prelude.agents_md_capped = end < text.len();
+                        prelude.agents_md = Some(LoadedAgentsMd {
+                            directory: small_text(agents.and_then(|a| a.get("directory"))),
+                            text: text[..end].to_string(),
+                        });
+                    }
+                    if self.keep_skills_body {
+                        prelude.skills_body = state
+                            .get("host_skills")
+                            .and_then(|skills| skills.get("body"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
                 }
             }
             "token_usage_record" => {
-                prelude.first_input_tokens = payload
+                let input = payload
                     .get("usage")
                     .and_then(|usage| usage.get("input_tokens"))
                     .and_then(Value::as_u64);
+                // A zero-input record is a context estimate, not a request.
+                if input == Some(0) {
+                    return PreludeStep::More;
+                }
+                prelude.first_input_tokens = input;
                 prelude.complete = true;
+                prelude.input_closed = true;
                 if prelude.context_window.is_some() {
                     return PreludeStep::Done;
                 }
             }
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("token_count") => {
                 let info = payload.get("info").unwrap_or(&Value::Null);
+                // An all-zero context estimate before the first request is
+                // not a request.
                 let Some(input) = info
                     .get("last_token_usage")
                     .and_then(|usage| usage.get("input_tokens"))
                     .and_then(Value::as_u64)
+                    .filter(|input| *input > 0 || prelude.complete)
                 else {
                     return PreludeStep::More;
                 };
                 if !prelude.complete {
                     prelude.first_input_tokens = Some(input);
                     prelude.complete = true;
+                    prelude.input_closed = true;
                 }
                 if let Some(window) = info.get("model_context_window").and_then(Value::as_u64) {
                     prelude.context_window.get_or_insert(window);
                 }
                 return PreludeStep::Done;
             }
-            "response_item" if payload.get("type").and_then(Value::as_str) == Some("message") => {
-                note_message(prelude, payload);
-            }
+            "response_item" => match payload.get("type").and_then(Value::as_str) {
+                Some("message") => match payload.get("role").and_then(Value::as_str) {
+                    Some("developer" | "user") => note_message(prelude, payload, on_block),
+                    _ => prelude.input_closed = true,
+                },
+                // The model's own output: request 1's input is over.
+                Some(
+                    "reasoning" | "function_call" | "custom_tool_call" | "local_shell_call"
+                    | "web_search_call",
+                ) => prelude.input_closed = true,
+                _ => {}
+            },
             _ => {}
         }
         PreludeStep::More
@@ -255,11 +392,7 @@ impl CodexPreludeParser {
 }
 
 fn note_session_meta(prelude: &mut CodexPrelude, session_id: &mut Option<String>, meta: &Value) {
-    let id = meta
-        .get("id")
-        .or_else(|| meta.get("session_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let id = small_text(meta.get("id").or_else(|| meta.get("session_id")));
     if let Some(first) = session_id.as_ref() {
         // A second meta row with another id is a copied parent thread.
         if id.as_ref().is_some_and(|id| id != first) {
@@ -268,7 +401,7 @@ fn note_session_meta(prelude: &mut CodexPrelude, session_id: &mut Option<String>
         return;
     }
     *session_id = id.or_else(|| Some(String::new()));
-    prelude.cwd = meta.get("cwd").and_then(Value::as_str).map(str::to_string);
+    prelude.cwd = small_text(meta.get("cwd"));
     prelude.context_window = meta.get("context_window").and_then(Value::as_u64);
     let present = |key: &str| meta.get(key).is_some_and(|value| !value.is_null());
     prelude.is_fork = meta.get("thread_source").and_then(Value::as_str)
@@ -293,41 +426,79 @@ fn note_session_meta(prelude: &mut CodexPrelude, session_id: &mut Option<String>
 /// Harness text outside `world_state`, by its `content_item_kinds` label.
 /// Every supported rollout labels its message blocks; unlabeled blocks are
 /// not counted. AGENTS.md and the skills listing come from `world_state`.
-fn note_message(prelude: &mut CodexPrelude, payload: &Value) {
-    let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
-    if role != "developer" && role != "user" {
-        return;
-    }
-    let Some(blocks) = payload.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    let Some(kinds) = payload
-        .get("internal_chat_message_metadata_passthrough")
-        .and_then(|meta| meta.get("content_item_kinds"))
+/// Until the model's first output the blocks also go to `block_chars`, but
+/// only from a message labeled one string per block.
+fn note_message(
+    prelude: &mut CodexPrelude,
+    payload: &Value,
+    mut on_block: impl FnMut(BlockKind, &str),
+) {
+    let request_1 = !prelude.input_closed;
+    let labeled = payload
+        .get("content")
         .and_then(Value::as_array)
-        .filter(|kinds| kinds.len() == blocks.len())
-    else {
+        .zip(
+            payload
+                .get("internal_chat_message_metadata_passthrough")
+                .and_then(|meta| meta.get("content_item_kinds"))
+                .and_then(Value::as_array),
+        )
+        .filter(|(blocks, kinds)| blocks.len() == kinds.len());
+    let Some((blocks, kinds)) = labeled else {
+        prelude.blocks_incomplete |= request_1;
         return;
     };
+    let request_1 = request_1 && kinds.iter().all(Value::is_string);
+    prelude.blocks_incomplete |= !prelude.input_closed && !request_1;
     for (block, kind) in blocks.iter().zip(kinds) {
+        if request_1 && block.get("type").and_then(Value::as_str) == Some("input_image") {
+            prelude.blocks_incomplete = true;
+            continue;
+        }
         let (Some(text), Some(kind)) = (block.get("text").and_then(Value::as_str), kind.as_str())
         else {
             continue;
         };
+        let kind = BlockKind::of(kind);
+        let chars = char_count(text);
         match kind {
-            "hooks.additional_context" => prelude.hook_chars += char_count(text),
+            BlockKind::Hooks => prelude.hook_chars += chars,
             // Counted from world_state / session_meta, or the user's own text.
-            "agents_md.instructions" | "host_skills.instructions" | "model.base_instructions" => {}
-            kind if kind.starts_with("user.") => {}
-            _ => prelude.other_harness_chars += char_count(text),
+            BlockKind::AgentsMd
+            | BlockKind::Skills
+            | BlockKind::BaseInstructions
+            | BlockKind::Prompt => {}
+            BlockKind::DeferredTools | BlockKind::Environment | BlockKind::Other => {
+                prelude.other_harness_chars += chars
+            }
+        }
+        if request_1 {
+            prelude.block_chars[kind as usize] += chars;
+            on_block(kind, text);
         }
     }
 }
 
-/// UTF-16 code units, the unit of the Claude file counts and the backend ratio.
-fn char_count(text: &str) -> u64 {
-    text.encode_utf16().count() as u64
+fn small_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| text.len() <= MAX_SMALL_TEXT_BYTES)
+        .map(str::to_string)
 }
+
+/// UTF-16 code units, the unit of the Claude file counts and the backend ratio.
+pub(crate) fn char_count(text: &str) -> u64 {
+    // ASCII, the common case, is one unit per byte; `is_ascii` is vectorized.
+    if text.is_ascii() {
+        text.len() as u64
+    } else {
+        text.encode_utf16().count() as u64
+    }
+}
+
+crate::heap_layout_bound::fields!(LoadedAgentsMd; directory, text);
+crate::heap_layout_bound::fields!(CodexPrelude; cwd, started_at, is_fork, complete, model, context_window, first_input_tokens, base_instructions_chars, other_harness_chars, hook_chars, block_chars, blocks_incomplete, input_closed, world_state_seen, agents_md, agents_md_capped, skills_body);
+crate::heap_layout_bound::fields!(CodexPreludeParser; prelude, session_id, rows_after_first_request, agents_md_cap, keep_skills_body);
 
 // -------------------------------------------------------------------------
 // AGENTS.md chain -> per-file items.

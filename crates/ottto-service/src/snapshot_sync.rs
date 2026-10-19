@@ -3096,6 +3096,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         activity_summary: item.activity_summary.clone(),
         tool_usage: item.tool_usage.clone(),
         tool_usage_truncated: item.tool_usage_truncated,
+        session_start: item.session_start.clone(),
         model_usage: item.model_usage.clone(),
         usage_buckets: item.usage_buckets.clone(),
         cost: item.cost.clone(),
