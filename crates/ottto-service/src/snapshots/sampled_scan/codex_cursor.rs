@@ -65,9 +65,11 @@ const UNAVAILABLE_RESUMES: u32 = 3;
 const WAITER_ACTIVE_PAGES: u64 = 16;
 const WAITER_FORGET_PAGES: u64 = 64;
 const ROTATION_KEYS: usize = 64;
+/// Owners with B's blocked-owner provenance (§d.1.3, L-1).
+const JOIN_OWNERS: usize = 64;
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
-const CODEX_JOIN_PROOF_VERSION: &str = "codex_join_proof:v1";
+const CODEX_JOIN_PROOF_VERSION: &str = "codex_join_proof:v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) struct Limits {
@@ -250,19 +252,29 @@ crate::heap_layout_bound::fields!(OpenStamp; dev, ino, extent, modified, changed
 
 impl OpenStamp {
     pub(in crate::snapshots) fn capture(file: &File) -> std::io::Result<Self> {
-        let metadata = file.metadata()?;
-        Ok(Self {
+        Ok(Self::of(&file.metadata()?))
+    }
+
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
             extent: metadata.len(),
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
-        })
+        }
+    }
+
+    /// The object `path` names now, without following a final symlink.
+    fn of_path(path: &Path) -> Option<Self> {
+        fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| Self::of(&metadata))
     }
 
     /// Same object, no shrink, and no equal-length in-place change. Growth
     /// is compatible: appended bytes are outside the frozen extent.
-    fn append_compatible(&self, now: &Self) -> bool {
+    pub(in crate::snapshots) fn append_compatible(&self, now: &Self) -> bool {
         self.same_object(now) && (now.extent > self.extent || now == self)
     }
 
@@ -503,6 +515,17 @@ pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) memo_hits: u64,
     pub(in crate::snapshots) memo_records: u64,
     pub(in crate::snapshots) parked_hits: u64,
+    /// P2 (RAM only; not yet in the diagnostics projection): group cursor
+    /// jobs started, group memo hits, entries skipped because a job owns
+    /// them (L1), group attempts skipped by the generation fence, groups
+    /// whose probe hit `PROBE_BYTES` (chronological order kept), and
+    /// terminal group debt by `JoinRefusal` slot (§d.1.1).
+    pub(in crate::snapshots) groups_started: u64,
+    pub(in crate::snapshots) group_memo_hits: u64,
+    pub(in crate::snapshots) join_in_progress_members: u64,
+    pub(in crate::snapshots) groups_fenced: u64,
+    pub(in crate::snapshots) probe_bound: u64,
+    pub(in crate::snapshots) join_terminal_debt: [u64; codex_file_join::JOIN_REFUSALS],
 }
 crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resumed,
     jobs_certified, jobs_uncertified, jobs_invalidated, jobs_member_changed, jobs_state_bound,
@@ -510,7 +533,8 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
     jobs_finish_failed, jobs_frame_returned, deferred, deferred_rotation,
     deferred_next_generation, namespace_busy, cursor_disabled_unsupported_layout, audit_overdue,
     audit_overdue_max_age_seconds, sealed_fragment_withheld, eof_record_applied,
-    jobs_unavailable_ended, memo_hits, memo_records, parked_hits);
+    jobs_unavailable_ended, memo_hits, memo_records, parked_hits, groups_started,
+    group_memo_hits, join_in_progress_members, groups_fenced, probe_bound, join_terminal_debt);
 
 /// A `JoinStateBound` file waits here until its object or reduction
 /// dependencies change. Its job ran out of a build constant
@@ -636,6 +660,12 @@ fn bounded_insert<V>(
 pub(in crate::snapshots) struct CursorState {
     slot: Slot,
     slot_key: Option<String>,
+    /// Member keys of the slot's group job (empty for a singleton): selection
+    /// skips them while the job exists (§d.1.2 c).
+    slot_members: BTreeSet<String>,
+    /// Owners B blocked for queued groups, with their compact member keys
+    /// (§d.1.3 provenance, L-1). RAM only; bounded.
+    join_owners: BTreeMap<String, Vec<u64>>,
     /// Requested-layout charge of the paused job, measured when it paused.
     slot_charge: usize,
     /// Cursor page when the paused job last paused or resumed (K10).
@@ -655,6 +685,8 @@ impl Default for CursorState {
         Self {
             slot: Slot::Empty,
             slot_key: None,
+            slot_members: BTreeSet::new(),
+            join_owners: BTreeMap::new(),
             slot_charge: 0,
             slot_touched: 0,
             next_token: 1,
@@ -673,6 +705,8 @@ impl HeapLayoutBound for CursorState {
         let Self {
             slot,
             slot_key,
+            slot_members,
+            join_owners,
             slot_charge,
             slot_touched,
             next_token,
@@ -690,6 +724,9 @@ impl HeapLayoutBound for CursorState {
             Slot::Paused(_) => c.add(*slot_charge)?,
         }
         slot_key.heap_bound(c)?;
+        slot_members.heap_bound(c)?;
+        // Owner strings are visited; member keys are inline u64s.
+        join_owners.heap_bound(c)?;
         slot_touched.heap_bound(c)?;
         next_token.heap_bound(c)?;
         clock.heap_bound(c)?;
@@ -732,6 +769,7 @@ impl Drop for CursorLease {
                 if matches!(cursor.slot, Slot::ActiveElsewhere { token } if token == self.token) {
                     cursor.slot = Slot::Empty;
                     cursor.slot_key = None;
+                    cursor.slot_members.clear();
                     cursor.counters.jobs_lost += 1;
                 }
             });
@@ -912,9 +950,13 @@ impl CursorLease {
         // first so one overlong record cannot pin `max_line_bytes`.
         shrink_paused_buffer(&mut job.parser.reader.buf);
         let inputs = job.parser.take_live_reduction_inputs();
+        let tee_inputs = job.group.as_mut().and_then(|group| group.take_tee_inputs());
         let admitted = paused_charge(&job).filter(|charge| self.cache.cursor_make_room(*charge));
         let Some(charge) = admitted else {
             job.parser.restore_live_reduction_inputs(inputs);
+            if let Some(group) = job.group.as_mut() {
+                group.restore_tee_inputs(tee_inputs);
+            }
             let owner = job.cursor.as_ref().and_then(|meta| meta.owner.clone());
             let disclosure = strict_disclosure(&job, owner, DebtReason::JoinStateBound);
             self.end(|cursor| {
@@ -941,6 +983,7 @@ impl CursorLease {
             return PauseEnd::StateBound(job, disclosure);
         };
         drop(inputs);
+        drop(tee_inputs);
         record_paused_charge(&mut job, charge);
         self.store(job, charge, count);
         PauseEnd::Paused
@@ -951,6 +994,7 @@ impl CursorLease {
     fn return_job(self, mut job: Box<OwnedActiveFile>) {
         shrink_paused_buffer(&mut job.parser.reader.buf);
         drop(job.parser.take_live_reduction_inputs());
+        drop(job.group.as_mut().and_then(|group| group.take_tee_inputs()));
         match paused_charge(&job).filter(|charge| self.cache.cursor_make_room(*charge)) {
             Some(charge) => {
                 record_paused_charge(&mut job, charge);
@@ -989,6 +1033,7 @@ impl CursorLease {
             if matches!(cursor.slot, Slot::ActiveElsewhere { token: held } if held == token) {
                 cursor.slot = Slot::Empty;
                 cursor.slot_key = None;
+                cursor.slot_members.clear();
             }
         });
         self.armed = false;
@@ -1338,6 +1383,177 @@ fn read_end(job: &OwnedActiveFile) -> u64 {
         .saturating_add(job.parser.reader.consumed_bytes())
 }
 
+/// First eight bytes of SHA-256 of a path key: L-1 provenance is matched
+/// against the walk's rollout paths through the same digest.
+pub(in crate::snapshots) fn compact_key(key: &str) -> u64 {
+    let digest = Sha256::digest(key.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+/// Arm a group job's freshly opened member reader (P2). A sealed member
+/// reads to its boot extent and is fenced by exact identity at its EOF. The
+/// live (last) member must be the boot object, grown at most; it gets a fresh
+/// acquisition (`Full`, no retained state: a group retains none) whose frozen
+/// extent and certificate `finish_job` uses, like a singleton.
+pub(in crate::snapshots) fn arm_group_member(
+    job: &mut OwnedActiveFile,
+    boot: &OpenStamp,
+    live: Option<&Scope>,
+) -> std::result::Result<(), codex_file_join::GroupEnd> {
+    use codex_file_join::GroupEnd;
+    let reader = &mut job.parser.reader;
+    let now = OpenStamp::capture(reader.reader.get_ref()).map_err(|_| GroupEnd::Strict)?;
+    if !boot.append_compatible(&now) {
+        return Err(GroupEnd::Changed);
+    }
+    reader.set_chunked_skip(Limits::current().skip_chunk);
+    match live {
+        Some(scope) => {
+            let plan = crate::transcript_acquisition::ReadPlan::prepare(
+                reader.reader.get_mut(),
+                None,
+                scope,
+                None,
+                super::now_seconds(),
+            )
+            .map_err(|_| GroupEnd::Strict)?;
+            let limit = plan
+                .frozen_length()
+                .min(now.extent)
+                .saturating_sub(plan.start_offset());
+            reader.acquisition = Some(plan);
+            reader.set_extent_limit(limit);
+        }
+        None => reader.set_extent_limit(boot.extent),
+    }
+    if let Some(meta) = job.cursor.as_mut() {
+        meta.stamp_open = now;
+        meta.started = super::now_seconds();
+        meta.eof_applied = false;
+    }
+    Ok(())
+}
+
+/// The live member's legacy baseline (P2) reads the job's frozen prefix:
+/// it may finish a grown same object, like the job's own certificate.
+pub(in crate::snapshots) fn frozen_grant(meta: &JobMeta, extent: u64) -> FinishGrant {
+    FinishGrant::Certified(SealedPrefix {
+        dev: meta.stamp_open.dev,
+        ino: meta.stamp_open.ino,
+        extent,
+    })
+}
+
+/// The live member's grant after `finish_job` certified a group job.
+pub(in crate::snapshots) fn certified_prefix(job: &OwnedActiveFile) -> Option<SealedPrefix> {
+    match job.parser.reader.sealed_prefix.as_ref()? {
+        FinishGrant::Certified(prefix) => Some(*prefix),
+        FinishGrant::LossySameObject(_) => None,
+    }
+}
+
+/// A group job ended as terminal debt (outcome R): free the slot, forget its
+/// invalidations, and fence it for its generation.
+pub(in crate::snapshots) fn end_group_lease(lease: CursorLease, job: &OwnedActiveFile) {
+    let meta = job.cursor.as_ref();
+    let rotation = meta.map(|meta| rotation_key(&meta.namespace, &meta.key));
+    lease.end(|cursor| {
+        if let (Some(meta), Some(rotation)) = (meta, rotation.as_ref()) {
+            cursor.invalidations.remove(&meta.key);
+            cursor.rotation.complete(rotation, meta.fence.as_deref());
+        }
+    });
+}
+
+/// The live member's acquisition evidence is unavailable (K9): free the
+/// slot uncounted; the members stay pending and a later page boots again.
+pub(in crate::snapshots) fn defer_group_lease(lease: CursorLease) {
+    lease.end(|cursor| cursor.counters.jobs_deferred_inputs += 1);
+}
+
+/// M-1 `scope_job` of a group, with its wake dependencies (§d.4): parser,
+/// identity and proof versions, owner, canonical member keys, every sealed
+/// member's opened identity and the live member's `{dev, ino}` (never its
+/// growing length), header digests, receipt scope, counting view, each
+/// member's path reduction facts and the census flags.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::snapshots) fn group_memo_digest(
+    owner: &str,
+    members: &[&CandidateFile],
+    live: &OpenStamp,
+    digests: &[&str],
+    index: &ScanIndex,
+    codex: &CodexTitleMetadata,
+    receipt_scope: &str,
+) -> String {
+    let mut parts = vec![
+        "codex_group_memo:v1".to_owned(),
+        CODEX_JOIN_PROOF_VERSION.to_owned(),
+        SnapshotSource::Codex.parser_version().to_owned(),
+        SnapshotSource::Codex.scan_identity_version().to_owned(),
+        owner.to_owned(),
+        receipt_scope.to_owned(),
+        members
+            .last()
+            .map_or_else(String::new, |last| counting_view(last, index)),
+        format!("{}:{}", live.dev, live.ino),
+        if codex.created_thread_census_unscoped_incomplete {
+            "created_incomplete".to_owned()
+        } else {
+            "created_complete".to_owned()
+        },
+        if codex.state_census_unscoped_incomplete || codex.sidecar_census_unscoped_incomplete {
+            "sidecar_incomplete".to_owned()
+        } else {
+            "sidecar_complete".to_owned()
+        },
+    ];
+    let sealed = members.len().saturating_sub(1);
+    for (i, member) in members.iter().enumerate() {
+        parts.push(local_index_key(&member.path));
+        if i < sealed {
+            parts.push(member.opened_object_identity.clone());
+        }
+        parts.push(codex.path_reduction_fingerprint(&member.path));
+    }
+    parts.extend(digests.iter().map(|digest| (*digest).to_owned()));
+    sha256_hex_owned(&parts)
+}
+
+/// Reduction dependencies of a group job: every member's path facts.
+pub(in crate::snapshots) fn group_dependencies(
+    members: &[CandidateFile],
+    codex: &CodexTitleMetadata,
+) -> String {
+    // Keyed by member path, so boot and canonical order agree.
+    let mut members = members
+        .iter()
+        .map(|member| {
+            (
+                local_index_key(&member.path),
+                codex.path_reduction_fingerprint(&member.path),
+            )
+        })
+        .collect::<Vec<_>>();
+    members.sort();
+    let mut parts = vec!["codex_group_dependencies:v1".to_owned()];
+    for (key, fingerprint) in members {
+        parts.push(key);
+        parts.push(fingerprint);
+    }
+    sha256_hex_owned(&parts)
+}
+
+/// Every file a job holds: a group's members, else the singleton's file.
+pub(in crate::snapshots) fn job_files(job: &OwnedActiveFile) -> Vec<&CandidateFile> {
+    match job.group.as_ref() {
+        Some(group) => group.members.iter().collect(),
+        None => vec![&job.candidate],
+    }
+}
+
 impl SharedCache {
     fn with_cursor<T>(&self, run: impl FnOnce(&mut CursorState) -> T) -> Option<T> {
         self.cursor.lock().ok().map(|mut cursor| run(&mut cursor))
@@ -1447,14 +1663,137 @@ impl SharedCache {
             .unwrap_or(false)
     }
 
-    /// The file a paused or active job owns. Selection must not read it as
-    /// an ordinary file while the job exists.
+    /// The key of the paused or active job (tests; selection uses
+    /// `cursor_job_owns`).
+    #[cfg(test)]
     pub(in crate::snapshots) fn cursor_job_key(&self) -> Option<String> {
         self.with_cursor(|cursor| match cursor.slot {
             Slot::Empty => None,
             Slot::Paused(_) | Slot::ActiveElsewhere { .. } => cursor.slot_key.clone(),
         })
         .flatten()
+    }
+
+    /// A paused or active job owns this path key: the singleton's own file or
+    /// any member of the group job (§d.1.2 c). Selection skips it.
+    pub(in crate::snapshots) fn cursor_job_owns(&self, key: &str) -> bool {
+        self.with_cursor(|cursor| match cursor.slot {
+            Slot::Empty => false,
+            Slot::Paused(_) | Slot::ActiveElsewhere { .. } => {
+                cursor.slot_key.as_deref() == Some(key) || cursor.slot_members.contains(key)
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// The owner of the paused or active group job, if any.
+    pub(in crate::snapshots) fn cursor_group_owner(&self) -> Option<String> {
+        self.with_cursor(|cursor| match &cursor.slot {
+            Slot::Paused(job) => job.group.as_ref().map(|group| group.owner.clone()),
+            Slot::Empty | Slot::ActiveElsewhere { .. } => None,
+        })
+        .flatten()
+    }
+
+    #[cfg(test)]
+    pub(in crate::snapshots) fn counters_for_test(&self) -> Counters {
+        self.with_cursor(|cursor| cursor.counters)
+            .unwrap_or_default()
+    }
+
+    /// Count one selected entry skipped because a job owns it (L1).
+    pub(in crate::snapshots) fn note_join_in_progress(&self) {
+        self.with_cursor(|cursor| cursor.counters.join_in_progress_members += 1);
+    }
+
+    /// Terminal group debt by reason (§d.1.1 S11 counter).
+    pub(in crate::snapshots) fn note_join_refusal(&self, reason: codex_file_join::JoinRefusal) {
+        self.with_cursor(|cursor| {
+            let slot = &mut cursor.counters.join_terminal_debt[reason.slot()];
+            *slot = slot.saturating_add(1);
+        });
+    }
+
+    pub(in crate::snapshots) fn note_group_memo_hit(&self) {
+        self.with_cursor(|cursor| cursor.counters.group_memo_hits += 1);
+    }
+
+    pub(in crate::snapshots) fn note_probe_bound(&self) {
+        self.with_cursor(|cursor| cursor.counters.probe_bound += 1);
+    }
+
+    /// M-5: this group's attempt ended as terminal debt in generation
+    /// `fence`; a later selection in the same generation is skipped.
+    pub(in crate::snapshots) fn group_attempted(
+        &self,
+        namespace: &Scope,
+        key: &str,
+        fence: Option<&str>,
+    ) {
+        let key = rotation_key(&namespace.0, key);
+        self.with_cursor(|cursor| cursor.rotation.complete(&key, fence));
+    }
+
+    /// M-5 (b) at pop: the group's attempt already ended in this generation.
+    /// Counted in `groups_fenced`; its members are not processed again.
+    pub(in crate::snapshots) fn group_fenced(
+        &self,
+        namespace: &Scope,
+        key: &str,
+        fence: Option<&str>,
+    ) -> bool {
+        let key = rotation_key(&namespace.0, key);
+        self.with_cursor(|cursor| {
+            let fenced = cursor.rotation.fenced(&key, fence);
+            if fenced {
+                cursor.counters.groups_fenced += 1;
+            }
+            fenced
+        })
+        .unwrap_or(false)
+    }
+
+    /// §d.1.3: B blocked `owner` for a queued group of `members`.
+    pub(in crate::snapshots) fn record_join_owner(&self, owner: &str, members: &[CandidateFile]) {
+        let keys = members
+            .iter()
+            .map(|member| compact_key(&local_index_key(&member.path)))
+            .collect::<Vec<_>>();
+        self.with_cursor(|cursor| {
+            if !cursor.join_owners.contains_key(owner) && cursor.join_owners.len() >= JOIN_OWNERS {
+                // Forgetting provenance only keeps that owner blocked (today's
+                // behavior); it never releases one.
+                if let Some(first) = cursor.join_owners.keys().next().cloned() {
+                    cursor.join_owners.remove(&first);
+                }
+            }
+            cursor.join_owners.insert(owner.to_owned(), keys);
+        });
+    }
+
+    /// L-1: owners whose every recorded member is absent from `present`
+    /// (compact keys of the completed walk's rollout paths) and for which
+    /// `keep` is false. Their provenance is dropped with the release.
+    pub(in crate::snapshots) fn release_join_owners(
+        &self,
+        present: &BTreeSet<u64>,
+        keep: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        self.with_cursor(|cursor| {
+            let released = cursor
+                .join_owners
+                .iter()
+                .filter(|(owner, members)| {
+                    !keep(owner) && members.iter().all(|member| !present.contains(member))
+                })
+                .map(|(owner, _)| owner.clone())
+                .collect::<Vec<_>>();
+            for owner in &released {
+                cursor.join_owners.remove(owner);
+            }
+            released
+        })
+        .unwrap_or_default()
     }
 
     /// The disclosure of a parked `JoinStateBound` file that is the same
@@ -1661,6 +2000,101 @@ impl SharedCache {
         })
     }
 
+    /// Start a group job (P2): claim the empty slot for the group key and its
+    /// members, keep every turn witness exactly, and freeze the first member
+    /// at its boot extent. Each later member is armed at its open
+    /// (`arm_group_member`); the live (last) member gets its acquisition and
+    /// frozen extent there.
+    pub(in crate::snapshots) fn cursor_start_group(
+        self: &Arc<Self>,
+        job: &mut OwnedActiveFile,
+        namespace: &Scope,
+        dependencies: Option<String>,
+        census_trusted: bool,
+        index: &ScanIndex,
+    ) -> std::result::Result<CursorLease, StartRefusal> {
+        let Some(group) = job.group.as_ref() else {
+            return Err(StartRefusal::Unstartable);
+        };
+        let key = group.key.clone();
+        let owner = group.owner.clone();
+        let boot = group.stamps.first().cloned();
+        let counting = group
+            .members
+            .last()
+            .map_or_else(String::new, |live| counting_view(live, index));
+        let members = group
+            .members
+            .iter()
+            .map(|member| local_index_key(&member.path))
+            .collect::<BTreeSet<_>>();
+        let waiter = rotation_key(&namespace.0, &key);
+        let refuse = |refusal: StartRefusal| {
+            self.with_cursor(|cursor| {
+                cursor.rotation.waiting.remove(&waiter);
+                if refusal == StartRefusal::Unstartable {
+                    cursor.counters.jobs_start_unstartable += 1;
+                }
+            });
+            refusal
+        };
+        // Compressed members larger than B keep refusing until P4 (named debt).
+        if job.parser.reader.reader.is_compressed() {
+            return Err(refuse(StartRefusal::Unstartable));
+        }
+        let (Ok(stamp_open), Some(boot)) =
+            (OpenStamp::capture(job.parser.reader.reader.get_ref()), boot)
+        else {
+            return Err(refuse(StartRefusal::Unstartable));
+        };
+        let token = self
+            .with_cursor(|cursor| {
+                if !matches!(cursor.slot, Slot::Empty) {
+                    return None;
+                }
+                let token = cursor.next_token;
+                cursor.next_token = cursor.next_token.wrapping_add(1).max(1);
+                cursor.slot = Slot::ActiveElsewhere { token };
+                cursor.slot_key = Some(key.clone());
+                cursor.slot_members = members;
+                cursor.rotation.waiting.remove(&waiter);
+                cursor.counters.jobs_started += 1;
+                cursor.counters.groups_started += 1;
+                Some(token)
+            })
+            .flatten()
+            .ok_or(StartRefusal::Busy)?;
+        let limits = Limits::current();
+        let accumulator = &mut job.parser.accumulator;
+        accumulator.codex_priority_witnesses_uncapped = true;
+        // Resume revalidates every priority decision against the witnesses.
+        accumulator
+            .codex_observed_priority_turns
+            .get_or_insert_with(BTreeMap::new);
+        job.parser.reader.set_chunked_skip(limits.skip_chunk);
+        job.parser.reader.set_extent_limit(boot.extent);
+        job.cursor = Some(JobMeta {
+            counting,
+            fence: census_token(index),
+            key,
+            namespace: namespace.0.clone(),
+            stamp_open,
+            started: super::now_seconds(),
+            dependencies,
+            owner: Some(owner),
+            census_trusted,
+            pages: 1,
+            unavailable_resumes: 0,
+            charge: None,
+            eof_applied: false,
+        });
+        Ok(CursorLease {
+            cache: Arc::clone(self),
+            token,
+            armed: true,
+        })
+    }
+
     /// Take the paused job for this scan namespace and claim the slot. A
     /// live job of another namespace is left alone (K10): this scan's large
     /// files wait their rotation turn. Only a stale job (not paused or
@@ -1687,6 +2121,7 @@ impl SharedCache {
                 }
                 cursor.slot = Slot::Empty;
                 cursor.slot_key = None;
+                cursor.slot_members.clear();
                 cursor.slot_charge = 0;
                 cursor.counters.jobs_lost += 1;
                 return None;
@@ -1723,7 +2158,11 @@ impl SharedCache {
         lease: CursorLease,
         job: &OwnedActiveFile,
     ) -> Option<Disclosure> {
-        let key = local_index_key(&job.candidate.path);
+        // The job key: a singleton's path key, a group's job key.
+        let key = job.cursor.as_ref().map_or_else(
+            || local_index_key(&job.candidate.path),
+            |meta| meta.key.clone(),
+        );
         let rotation = job
             .cursor
             .as_ref()
@@ -1955,7 +2394,15 @@ pub(in crate::snapshots) fn resume_paused_job(
             )
         })
     });
-    let counting = counting_view(&job.candidate, index);
+    // A group's counting view is its live member's (the file `finish_job`
+    // compares at completion).
+    let counting = counting_view(
+        job.group
+            .as_ref()
+            .and_then(|group| group.members.last())
+            .unwrap_or(&job.candidate),
+        index,
+    );
     let verdict = revalidate(
         &mut job,
         ResumeInputs {
@@ -1975,11 +2422,13 @@ pub(in crate::snapshots) fn resume_paused_job(
             if let Some(meta) = job.cursor.as_mut() {
                 meta.unavailable_resumes = 0;
             }
-            // This page also selected the job's path; read it once, through
-            // the job, and keep it pending so the census still waits if the
-            // job pauses.
-            identified_candidates.retain(|candidate| candidate.path != job.candidate.path);
-            requeue(index, context.flags, &job.candidate);
+            // This page also selected the job's paths; read them once,
+            // through the job, and keep them pending so the census still
+            // waits if the job pauses.
+            for file in job_files(&job) {
+                identified_candidates.retain(|candidate| candidate.path != file.path);
+                requeue(index, context.flags, file);
+            }
             return Resumed::Active(job, lease);
         }
         // Unavailable evidence is not a member change: the job waits in the
@@ -2007,7 +2456,9 @@ pub(in crate::snapshots) fn resume_paused_job(
         // Strict debt (`JoinStateBound`, or `MemberChanged` after repeated
         // real invalidations).
         disclose_job_debt(&job, &disclosure, index, targets);
-        dequeue(index, &job.candidate);
+        for file in job_files(&job) {
+            dequeue(index, file);
+        }
     }
     // Otherwise its path is still pending; a later page resumes or
     // restarts it.
@@ -2051,7 +2502,9 @@ fn end_unavailable(
     targets
         .census
         .record_unreadable(UnreadableCause::Reduction, 1);
-    dequeue(index, &job.candidate);
+    for file in job_files(&job) {
+        dequeue(index, file);
+    }
     Resumed::Spent
 }
 
@@ -2077,6 +2530,9 @@ pub(in crate::snapshots) fn revalidate(
     job: &mut OwnedActiveFile,
     inputs: ResumeInputs<'_>,
 ) -> Resume {
+    if job.group.is_some() {
+        return revalidate_group(job, inputs);
+    }
     let Some(meta) = job.cursor.as_ref() else {
         return Resume::Changed;
     };
@@ -2126,6 +2582,78 @@ pub(in crate::snapshots) fn revalidate(
         // A continuation appeared: the owner is now a group, never a singleton.
         return Resume::Changed;
     }
+    revalidate_decisions(job, inputs.traces, inputs.parents)
+}
+
+/// The group subset of the revalidation checklist (P2): the member being
+/// read is the same object without shrink or in-place edit; every member
+/// already read still names exactly its boot object; the group's reduction
+/// dependencies, member set and counting view are unchanged; then the
+/// singleton's priority-decision and live-input rules.
+fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resume {
+    let (Some(meta), Some(group)) = (job.cursor.as_ref(), job.group.as_ref()) else {
+        return Resume::Changed;
+    };
+    let Ok(now) = OpenStamp::capture(job.parser.reader.reader.get_ref()) else {
+        return Resume::Changed;
+    };
+    if !meta.stamp_open.append_compatible(&now)
+        || !counting_reusable(&job.parser.accumulator, &meta.counting, &inputs.counting)
+    {
+        return Resume::Changed;
+    }
+    let sealed_changed = group
+        .members
+        .iter()
+        .zip(&group.stamps)
+        .take(group.current)
+        .any(|(member, stamp)| OpenStamp::of_path(&member.path).as_ref() != Some(stamp));
+    if sealed_changed {
+        return Resume::Changed;
+    }
+    let changed = if meta.census_trusted && inputs.census_complete {
+        Resume::Changed
+    } else {
+        Resume::Unavailable
+    };
+    if meta.dependencies.as_deref()
+        != Some(group_dependencies(&group.members, inputs.codex).as_str())
+    {
+        return changed;
+    }
+    let Some(inventory) = inputs.inventory.filter(|inventory| inventory.complete) else {
+        return Resume::Unavailable;
+    };
+    let current = inventory
+        .headers
+        .iter()
+        .filter(|header| header.owner == group.owner && header.home == group.home)
+        .map(|header| local_index_key(&header.candidate.path))
+        .collect::<BTreeSet<_>>();
+    let members = group
+        .members
+        .iter()
+        .map(|member| local_index_key(&member.path))
+        .collect::<BTreeSet<_>>();
+    if current != members {
+        // A member appeared or vanished: another job.
+        return Resume::Changed;
+    }
+    let traces = inputs.traces;
+    let parents = inputs.parents;
+    if let Some(group) = job.group.as_mut() {
+        group.reinstall_tee_inputs(traces.clone(), parents.clone());
+    }
+    revalidate_decisions(job, traces, parents)
+}
+
+/// Every priority decision so far still holds under this cycle's traces;
+/// then this cycle's traces and parent ledgers are installed.
+fn revalidate_decisions(
+    job: &mut OwnedActiveFile,
+    traces: Option<Arc<CodexTurnTraceMap>>,
+    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+) -> Resume {
     let Some(observed) = job
         .parser
         .accumulator
@@ -2134,7 +2662,7 @@ pub(in crate::snapshots) fn revalidate(
     else {
         return Resume::Changed;
     };
-    match inputs.traces.as_ref() {
+    match traces.as_ref() {
         None if observed.values().any(|priority| *priority) => return Resume::Unavailable,
         traces => {
             let decisions_hold = observed.iter().all(|(turn, priority)| {
@@ -2151,8 +2679,8 @@ pub(in crate::snapshots) fn revalidate(
         }
     }
     let accumulator = &mut job.parser.accumulator;
-    accumulator.codex_turn_traces = inputs.traces;
-    accumulator.codex_parent_ownership_ledgers = inputs.parents;
+    accumulator.codex_turn_traces = traces;
+    accumulator.codex_parent_ownership_ledgers = parents;
     Resume::Valid
 }
 
@@ -2350,7 +2878,9 @@ fn strict_disclosure(
 #[derive(Clone, Debug)]
 pub(in crate::snapshots) struct MemoEntry {
     digest: String,
-    live: LiveWitness,
+    /// Absent for a group refused in a sealed member: growth of the live
+    /// member cannot cure it (§d.4).
+    live: Option<LiveWitness>,
     /// The held file's stamp when recorded or last matched.
     stamp: OpenStamp,
     /// Parent ref and its ledger identity: a new or changed parent ledger
@@ -2373,6 +2903,19 @@ impl MemoEntry {
     pub(in crate::snapshots) fn new(
         digest: String,
         live: LiveWitness,
+        stamp: OpenStamp,
+        parent: Option<(String, Option<String>)>,
+        sidecar: Option<String>,
+        disclosure: Disclosure,
+    ) -> Self {
+        Self::new_group(digest, Some(live), stamp, parent, sidecar, disclosure)
+    }
+
+    /// A group's entry (P2): `stamp` is the live member's, `live` its witness
+    /// when the refusal was in the live member.
+    pub(in crate::snapshots) fn new_group(
+        digest: String,
+        live: Option<LiveWitness>,
         stamp: OpenStamp,
         parent: Option<(String, Option<String>)>,
         sidecar: Option<String>,
@@ -2432,7 +2975,9 @@ impl MemoEntry {
                 .sidecar
                 .as_deref()
                 .map_or(true, |sidecar| sidecar == sidecar_now)
-            && LiveWitness::read(file, self.live.offset).as_ref() == Some(&self.live))
+            && self.live.as_ref().map_or(true, |live| {
+                LiveWitness::read(file, live.offset).as_ref() == Some(live)
+            }))
         .then_some(now)
     }
 }
@@ -2558,6 +3103,19 @@ pub(in crate::snapshots) struct DisclosureTargets<'a> {
     pub(in crate::snapshots) pending_finalization: &'a mut Vec<PendingIndexFinalization>,
 }
 
+impl DisclosureTargets<'_> {
+    /// The same targets for one more disclosure.
+    pub(in crate::snapshots) fn reborrow(&mut self) -> DisclosureTargets<'_> {
+        DisclosureTargets {
+            census: &mut *self.census,
+            residue_index_keys: &mut *self.residue_index_keys,
+            residue_blocked_session_ids: &mut *self.residue_blocked_session_ids,
+            codex_state_only_blocked_session_ids: &mut *self.codex_state_only_blocked_session_ids,
+            pending_finalization: &mut *self.pending_finalization,
+        }
+    }
+}
+
 /// Disclose a finished job's strict debt (`JoinStateBound`, `MemberChanged`)
 /// through the one writer, keeping the job's prior body.
 pub(in crate::snapshots) fn disclose_job_debt(
@@ -2566,6 +3124,10 @@ pub(in crate::snapshots) fn disclose_job_debt(
     index: &mut ScanIndex,
     targets: DisclosureTargets<'_>,
 ) {
+    if let Some(group) = job.group.as_ref() {
+        codex_file_join::disclose_members(disclosure, &group.members, index, targets);
+        return;
+    }
     disclose_terminal_codex_debt(
         disclosure,
         &job.candidate,
