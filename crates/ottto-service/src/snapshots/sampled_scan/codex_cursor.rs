@@ -3125,7 +3125,9 @@ pub(in crate::snapshots) fn growth_may_cure(accumulator: &SnapshotAccumulator) -
 }
 
 /// A state-declared created thread whose sidecar bound neither a parent nor
-/// a projection: an extent mismatch, or no extent (#635). The class keys on
+/// a projection (#635): no extent, any rollout mismatch (extent, path,
+/// inode or created time), or the identity-conflict / incomplete-detail
+/// return of the sidecar bind. The class keys on
 /// bound sidecar facts, not header claims, so it includes copy-evidence
 /// forks (`forked_from_id`, `history_base`) and parented threads whose
 /// binding was skipped: the created-thread branch overwrites

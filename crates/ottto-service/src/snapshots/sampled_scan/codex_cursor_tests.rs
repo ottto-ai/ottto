@@ -2861,10 +2861,12 @@ fn created_fingerprints(scan: &SourceScanResult) -> Vec<String> {
         .collect()
 }
 
-/// R1-L2: generation `n` after the admitting one, with nothing changed,
-/// admits nothing new. It publishes nothing, or republishes the same
-/// snapshots (same fingerprints, so idempotent), and the stale hold entry
-/// neither hits nor is recorded again.
+/// R1-L2: the admitting generation's `index` no longer blocks the thread,
+/// and generation `n` after it, with nothing changed, admits nothing new and
+/// re-holds nothing. It publishes nothing, or republishes the same snapshots
+/// (same fingerprints, so idempotent); its index still does not block the
+/// thread (a re-hold re-inserts it); and the stale hold entry neither hits
+/// nor is recorded again.
 fn assert_admitted_once(
     home: &CreatedThreadHome,
     cache: &Arc<SharedCache>,
@@ -2876,7 +2878,17 @@ fn assert_admitted_once(
         counter(cache, |c| c.memo_hits),
         counter(cache, |c| c.memo_records),
     );
-    let (_, again) = home.generation(index, cache, n);
+    assert!(
+        !index.codex_state_only_blocked_session_ids.contains(CREATED),
+        "admitted: {}",
+        counters(cache)
+    );
+    let (index, again) = home.generation(index, cache, n);
+    assert!(
+        !index.codex_state_only_blocked_session_ids.contains(CREATED),
+        "no resurrected hold: {}",
+        counters(cache)
+    );
     let usage = created_usage(&again);
     assert!(
         usage.is_empty()
