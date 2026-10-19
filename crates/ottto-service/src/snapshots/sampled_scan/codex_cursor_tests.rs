@@ -2521,3 +2521,52 @@ fn accumulator_heap_bound_at_measured_event_counts() {
         assert!(peak >= first);
     }
 }
+
+/// R1-H1 (#630 review): a hold an append may cure is memoized on the held
+/// file's exact stamp only when the job's read reached the file's end.
+/// Bytes appended past the frozen extent may already cure it, so the job
+/// keeps no hold offset (no memo entry) and its next attempt reads them.
+#[test]
+fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for grow in [false, true] {
+        let fixture = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let hold = with_test_limits(2048, 4096, 64, || {
+            let mut index = ScanIndex::default();
+            for _ in 0..64 {
+                let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+                index = next;
+                if counter(&cache, |c| c.jobs_paused) > 0 {
+                    break;
+                }
+            }
+            let mut job = cache
+                .with_cursor(
+                    |cursor| match std::mem::replace(&mut cursor.slot, Slot::Empty) {
+                        Slot::Paused(job) => Some(job),
+                        _ => None,
+                    },
+                )
+                .flatten()
+                .expect("a paused job");
+            while !job.parser.step().unwrap() {}
+            // A parentless created thread held for a missing sidecar
+            // projection: an append may cure it.
+            let accumulator = &mut job.parser.accumulator;
+            accumulator.codex_ownership_boundary = CodexOwnershipBoundary::NativeCreatedThread;
+            accumulator.codex_parent_session_ref = None;
+            accumulator.codex_sidecar_projected_next_ordinal = None;
+            assert!(growth_may_cure(&job.parser.accumulator));
+            job.hold_offset = Some(job.parser.reader.last_complete_line_end());
+            if grow {
+                fixture.append(SESSION, &token_line(41));
+            }
+            let _ = finish_job(&cache, None, &mut job, None, "legacy", true);
+            job.hold_offset
+        });
+        assert_eq!(hold.is_some(), !grow, "grow: {grow}");
+    }
+}

@@ -1067,6 +1067,7 @@ pub(in crate::snapshots) fn finish_job(
         return JobEnd::Restart;
     };
     let held = OpenStamp::capture(job.parser.reader.reader.get_ref()).ok();
+    let read_to = read_end(job);
     // Only dev/ino of the path are compared; no byte is read from it.
     let path_same_object = held.as_ref().is_some_and(|held| {
         fs::symlink_metadata(&job.candidate.path)
@@ -1141,6 +1142,15 @@ pub(in crate::snapshots) fn finish_job(
         fragment.filter(|_| parser.accumulator.codex_parentless_created_thread())
     {
         job.hold_offset = job.hold_offset.or(Some(fragment.offset));
+    }
+    // R1-H1 (#630 review): a hold an append may cure is memoized on the held
+    // file's exact stamp, which must not cover bytes this read never
+    // consumed: they may already cure it. Such a hold records no entry, so
+    // its next attempt reads them.
+    if held.as_ref().map_or(true, |held| held.extent != read_to)
+        && (growth_may_cure(&job.parser.accumulator) || job.parser.reader.sealed_fragment())
+    {
+        job.hold_offset = None;
     }
     let key = rotation_key(&meta.namespace, &meta.key);
     let mut member_changed = false;
@@ -1315,6 +1325,17 @@ pub(in crate::snapshots) fn apply_eof_record(job: &mut OwnedActiveFile) {
     if let Some(meta) = job.cursor.as_mut() {
         meta.eof_applied = applied;
     }
+}
+
+/// The file offset where the job's reader stopped (a tail's reader counts
+/// from its start).
+fn read_end(job: &OwnedActiveFile) -> u64 {
+    job.parser
+        .reader
+        .acquisition
+        .as_ref()
+        .map_or(0, crate::transcript_acquisition::ReadPlan::start_offset)
+        .saturating_add(job.parser.reader.consumed_bytes())
 }
 
 impl SharedCache {
