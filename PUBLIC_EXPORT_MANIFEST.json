@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 687,
-  "content_sha256": "1bbbb34b6933ecd19dc4e5cdaedc1595bce487130145e7eab3c5b01f9e07bf67",
+  "content_sha256": "65dc9d394d0fa20fc5c3a89736a0b5c02ca4cb15cb73e861b96301aeb7415265",
   "files": [
     {
       "executable": false,
@@ -692,15 +692,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "8a8320ac2f5ede67c00c1b2b9c43c075c03e424677f45c527de4e34da6ab1aca",
-      "size_bytes": 1582407
+      "sha256": "3f92e3085d9c8be38bbf717bd81892e7dcb13595d7bb21dce0d2cb5fa33d3d63",
+      "size_bytes": 1584427
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/claude_credit_pools.rs",
-      "sha256": "9711bb7e4a57d77958994874f98b1ec780c7784bace6f7ba0d05e0a8606c635f",
-      "size_bytes": 166420
+      "sha256": "88b4b960b7f4e761c6813bdf74b1d9eda147608f2dc26b4a2622c329cf7cb78f",
+      "size_bytes": 166643
     },
     {
       "executable": false,
@@ -2757,8 +2757,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-10-claude-credit-pools-cadence.md",
-      "sha256": "9915269dd3d3f5a3d67673b5fd84ea9ac954557734a79e525daff0a0b2c137ae",
-      "size_bytes": 14082
+      "sha256": "b39946cef118bc0438eb1f5f2596bffe524b23efae6fe1ea4a71872bb98daa89",
+      "size_bytes": 15236
     },
     {
       "executable": false,
