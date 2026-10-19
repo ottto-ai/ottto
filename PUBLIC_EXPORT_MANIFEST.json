@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 699,
-  "content_sha256": "1baea698aa438df024ed41729ff886c063fe2bf30b4b6230f3ec888b96abf6d4",
+  "content_sha256": "fb4ed7bc64a49ed9bab1962dcd133026cf8550979659168ce90d4072d5ece13b",
   "files": [
     {
       "executable": false,
@@ -1266,8 +1266,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "e10f9a624ea884bd9931d8f4162c640d1b30b34b1498696026dafb0d4eb1b5a3",
-      "size_bytes": 2640122
+      "sha256": "8f67a2214f84b0994dfe71d9ad131d4cf3ba152007feefde224d68ef7bf7166e",
+      "size_bytes": 2639201
     },
     {
       "executable": false,
@@ -1511,8 +1511,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/witness_reconstruct_scope_tests.rs",
-      "sha256": "0e9d2e41e9aafcb02e6e2fb1240010ca96506b299e5dc96e7153da829378a00c",
-      "size_bytes": 9831
+      "sha256": "2da898aba7800f69630b348c8f3983bb150e140156a5be1c18fc8687ad5a6cad",
+      "size_bytes": 6895
     },
     {
       "executable": false,
@@ -1539,8 +1539,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_cache.rs",
-      "sha256": "a9ae44aec20403b161649519016f04241d8454f54e44c763fdeb737e7b7b11dc",
-      "size_bytes": 18157
+      "sha256": "b0f9311058a6b5ce8c301704eb6a04b8b09eb0934b1b0bb85e3ae357efba7d0c",
+      "size_bytes": 19019
     },
     {
       "executable": false,
@@ -3036,13 +3036,6 @@
     {
       "executable": false,
       "mode": "0644",
-      "path": "docs/session-2026-10-18-claude-join-row-retention.md",
-      "sha256": "78a4fdafc3107a99779ba4b42531399531755aa3a6e508cd2f70627433ea4264",
-      "size_bytes": 1483
-    },
-    {
-      "executable": false,
-      "mode": "0644",
       "path": "docs/session-2026-10-18-codex-composition-user-role.md",
       "sha256": "2a3307b19db557dbe9102433be2ed62af797c5ab0c4240902ff87df213e64604",
       "size_bytes": 1123
@@ -3137,6 +3130,13 @@
       "path": "docs/session-2026-10-18-skill-detector-v2.md",
       "sha256": "c64008b93ab5cca8accbd54a02623a7e4613cacf2a78e1f7ec46b73275a4475b",
       "size_bytes": 6939
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-transcript-cache-idle-retention.md",
+      "sha256": "26cd81fd59ed9edcb8c3f382f2bb2e9b824fc6714076dd3c216d28b135a065ee",
+      "size_bytes": 2517
     },
     {
       "executable": false,
@@ -4896,7 +4896,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-18T23:51:18+00:00",
+  "generated_at": "2026-10-18T23:34:17+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 700,
   "public_roots": [
@@ -4935,5 +4935,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "29dc3063376a096ad7491754b54261b48908cfb8"
+  "source_commit": "fbec701fd19dd00a146330aac40d0a0bf1c0d15a"
 }
