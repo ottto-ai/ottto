@@ -9552,6 +9552,8 @@ fn derive_unresolved_claude_accounts(
                     ),
                     account_identifier_hash: Some(account_identifier_hash),
                     organization_identifier_hash: Some(organization_identifier_hash),
+                    account_label: pair.observation.account_label.clone(),
+                    organization_label: pair.observation.organization_label.clone(),
                     observed_at: Some(observed_at),
                     evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
                 }
@@ -9607,6 +9609,8 @@ fn derive_unresolved_claude_accounts(
             unresolved_id,
             account_identifier_hash: Some(account_hash),
             organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
             observed_at: Some(observed_at),
             evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
         }
@@ -33727,18 +33731,49 @@ for line in sys.stdin:
                 unresolved_id: format!("claude-unresolved-{account}-{organization}"),
                 account_identifier_hash: Some(account.to_string()),
                 organization_identifier_hash: Some(organization.to_string()),
+                account_label: None,
+                organization_label: None,
                 observed_at: Some("2026-08-23T00:00:00Z".to_string()),
                 evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
             };
+        // Two organizations of one account are two targets; an account-only
+        // row keeps today's shape: no organization, no target, ambiguous.
         status.unresolved_accounts = vec![
             desktop_pair("account-1", "organization-desktop"),
+            desktop_pair("account-1", "organization-desktop-2"),
             desktop_pair("account-0", "organization-0"),
+            ClaudeUnresolvedAccountDescriptorV1 {
+                organization_identifier_hash: None,
+                ..desktop_pair("account-legacy", "unused")
+            },
         ];
         let coverage = derive_claude_account_anchor_coverage(&status);
-        assert_eq!(coverage.observed_accounts, 7);
+        assert_eq!(coverage.observed_accounts, 9);
         assert_eq!(coverage.anchored_accounts, 5);
-        assert_eq!(coverage.unresolved_accounts, 1);
-        assert_eq!(coverage.ambiguous_identity_accounts, 0);
+        assert_eq!(coverage.unresolved_accounts, 3);
+        assert_eq!(coverage.ambiguous_identity_accounts, 1);
+        let legacy = coverage
+            .accounts
+            .iter()
+            .find(|account| account.account_identifier_hash == "account-legacy")
+            .expect("account-only row");
+        assert_eq!(legacy.target_id, None);
+        assert_eq!(legacy.organization_identifier_hash, None);
+        assert_eq!(
+            legacy.setup_blockers,
+            vec![ClaudeAccountAnchorSetupBlockerV1::AmbiguousIdentity]
+        );
+        let second =
+            ClaudeStrongBinding::new("account-1", "organization-desktop-2").expect("binding");
+        let pair_targets = coverage
+            .accounts
+            .iter()
+            .filter(|account| account.account_identifier_hash == "account-1")
+            .filter(|account| account.durability == ClaudeAccountAnchorDurabilityV1::Unresolved)
+            .map(|account| account.target_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(pair_targets.len(), 2);
+        assert!(pair_targets.contains(&Some(claude_anchor_target_id(&second))));
         let exact = ClaudeStrongBinding::new("account-1", "organization-desktop").expect("binding");
         let target = coverage
             .accounts
@@ -33754,6 +33789,18 @@ for line in sys.stdin:
         assert_eq!(target.target_id, Some(claude_anchor_target_id(&exact)));
         assert_eq!(target.health, None);
         assert!(target.setup_blockers.is_empty());
+        // No slot left: a pair target is blocked, never silently connectable.
+        status.capacity.remaining_slots = 0;
+        let coverage = derive_claude_account_anchor_coverage(&status);
+        for account in coverage.accounts.iter().filter(|account| {
+            account.durability == ClaudeAccountAnchorDurabilityV1::Unresolved
+                && account.target_id.is_some()
+        }) {
+            assert_eq!(
+                account.setup_blockers,
+                vec![ClaudeAccountAnchorSetupBlockerV1::CapacityReached]
+            );
+        }
     }
 
     #[test]
@@ -35926,7 +35973,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 ..observation(Some(account), AgentStatusConfidence::High)
             },
         };
-        let pairs = ClaudeDesktopPairs {
+        let mut pairs = ClaudeDesktopPairs {
             pairs: vec![
                 pair("resolved", "resolved-org"),
                 pair("resolved", "other-org"),
@@ -35934,6 +35981,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             ],
             duplicate_sessions: Vec::new(),
         };
+        pairs.pairs[1].observation.organization_label = Some("Other org".to_string());
         let unresolved = derive_unresolved_claude_accounts(
             &desktop,
             &pairs,
@@ -35954,6 +36002,12 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 (Some("strong-unresolved"), Some("unresolved-org")),
             ]
         );
+        // Labels are the pair's own, display only.
+        assert_eq!(
+            unresolved[0].organization_label.as_deref(),
+            Some("Other org")
+        );
+        assert_eq!(unresolved[1].organization_label, None);
     }
 
     #[test]
@@ -36069,6 +36123,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 unresolved_id: "claude-unresolved-test".to_string(),
                 account_identifier_hash: Some("account-full".to_string()),
                 organization_identifier_hash: None,
+                account_label: None,
+                organization_label: None,
                 observed_at: Some("2026-08-04T10:00:00Z".to_string()),
                 evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
             }],
@@ -36129,6 +36185,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             unresolved_id: "claude-unresolved-stale".to_string(),
             account_identifier_hash: Some("account-full".to_string()),
             organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
             observed_at: Some("2026-08-04T10:00:00Z".to_string()),
             evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
         };
