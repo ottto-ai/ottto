@@ -292,6 +292,38 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
 }
 
 #[test]
+fn bounded_retry_owner_due_boundary_preserves_ordinary_deadline() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = SameSourceAckFixture::new();
+    let now = Instant::now();
+    let due = now + Duration::from_secs(60);
+    let ordinary = now + Duration::from_secs(90);
+    let mut owner = super::bounded_snapshot_retry::RetryOwner::default();
+    assert!(owner.admit(bounded_native_capture(&f, now)));
+    assert_eq!(owner.wake_before(ordinary), due);
+    let mut turns = 0;
+    owner.boundary(std::iter::empty(), due - Duration::from_nanos(1), |_| {
+        turns += 1;
+        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+    });
+    assert_eq!(turns, 0);
+    assert_eq!(owner.wake_before(ordinary), due);
+    owner.boundary(std::iter::empty(), due, |_| {
+        turns += 1;
+        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+    });
+    assert_eq!(turns, 1);
+    assert_eq!(owner.wake_before(ordinary), ordinary);
+    owner.boundary(std::iter::empty(), ordinary, |_| {
+        turns += 1;
+        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+    });
+    assert_eq!(turns, 1);
+}
+
+#[test]
 // The bounded turn leases the shared client_report counters across its token/batch I/O.
 #[serial(client_report)]
 fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_and_ack() {
@@ -334,6 +366,15 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         let daemon = &f.daemon;
         let mut turns = 0;
         let mut anchored = None;
+        // Synchronize fixture eligibility before starting the ordinary wait.
+        // A 30ms sleep inside that 150ms wait can resume after its deadline;
+        // the production loop then correctly returns without entering a turn.
+        // Due/wake ordering is tested above with explicit Instants, independent
+        // of scheduler latency. This native test retains the real idle boundary,
+        // transport, exact ACK and unchanged ordinary wait/anchor assertions.
+        let due = owner.wake_before(Instant::now() + Duration::from_secs(1));
+        bounded_native_wait_until(due);
+        assert!(Instant::now() >= due);
         let started = Instant::now();
         collect_file_activity_with_retry(
             Duration::from_millis(150),

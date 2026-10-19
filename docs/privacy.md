@@ -312,6 +312,21 @@ no relationship at all. This intake reads only that directory, only while
 session attribution is enabled, and adds no watcher, process inspection, or
 permission prompt.
 
+Codex session-start footprint: for each new Codex session (in `~/.codex` and
+in Ottto-managed Codex account folders) the daemon reads only the rows before
+its first model request, once, and uploads per repository the sizes of what
+Codex loaded, dated at that session's start. For each AGENTS.md file that is
+its loaded size in characters, its byte size (omitted above 1 MiB) and whether
+Codex's `project_doc_max_bytes` limit cut it; a file loaded whole
+also gets its lines, UTF-16 characters and the same device-salted hash as the
+Claude Code file counts (the salt never leaves the Mac, so hashes cannot be
+matched to known files or compared across machines). For each listed skill it
+is the name, the size of its listing line and whether its root is the project,
+the user, the system or a plugin. Paths are repository-relative. Instruction
+and skill text never leave the Mac. The context-footprint opt-outs (including
+`<support>/context_footprint/disabled`) apply, and
+`OTTTO_CODEX_SESSION_START_HARVEST_DISABLED=1` turns off this collector alone.
+
 ## Live Telemetry
 
 Live telemetry is source-level opt-in. Setup can mint scoped setup keys and

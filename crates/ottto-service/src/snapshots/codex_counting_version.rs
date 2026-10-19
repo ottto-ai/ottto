@@ -66,6 +66,20 @@ pub(super) enum AckEvidence {
 }
 
 impl AckEvidence {
+    fn view_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::V2Marked => "v2_marked",
+            Self::LegacyAcked => "legacy_acked",
+        }
+    }
+
+    fn of_view_name(name: &str) -> Option<Self> {
+        [Self::None, Self::V2Marked, Self::LegacyAcked]
+            .into_iter()
+            .find(|evidence| evidence.view_name() == name)
+    }
+
     /// The session view: the candidate entry plus any twin/alias/member
     /// entries the caller owns (COST rule 2). Any Legacy-acknowledged entry
     /// (ACK facts without a V2 mark) forces Legacy, whatever else is marked;
@@ -153,6 +167,61 @@ pub(super) fn configure_singleton(
     };
     let evidence = AckEvidence::of_view(index.files.get(&local_index_key(&candidate.path)));
     configure(&mut parser.accumulator, evidence, Some(cutover));
+}
+
+/// The cursor's view while inactive: no counting state is configured.
+const INACTIVE_VIEW: &str = "legacy";
+
+/// The counting view of a singleton's index entry (cursor K8): what
+/// `configure_singleton` would configure now, as the cursor job records it.
+pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
+    let Some(cutover) = cutover_unix_ms() else {
+        return INACTIVE_VIEW.to_owned();
+    };
+    let evidence = AckEvidence::of_view(index.files.get(&local_index_key(&candidate.path)));
+    view(evidence, cutover)
+}
+
+/// The recorded form of an active configuration.
+pub(super) fn view(evidence: AckEvidence, cutover_unix_ms: i64) -> String {
+    format!("{cutover_unix_ms}:{}", evidence.view_name())
+}
+
+/// The one counting reuse predicate for both restore paths, a retained
+/// reduction (`old.filter`) and a paused cursor job: the restored state
+/// continues only under the rule a parser configured now would select.
+/// Both unset while inactive.
+pub(super) fn reusable(
+    old: Option<&codex_usage_occurrence::CodexCounting>,
+    fresh: Option<&codex_usage_occurrence::CodexCounting>,
+) -> bool {
+    match (old, fresh) {
+        (None, None) => true,
+        (Some(old), Some(fresh)) => old.reusable_under(fresh),
+        _ => false,
+    }
+}
+
+/// `reusable` against a `singleton_view` instead of a configured parser. An
+/// unrecognised view never continues.
+pub(super) fn reusable_under_view(accumulator: &SnapshotAccumulator, view: &str) -> bool {
+    let fresh = if view == INACTIVE_VIEW {
+        None
+    } else {
+        let Some((cutover, evidence)) = view.split_once(':') else {
+            return false;
+        };
+        let (Ok(cutover), Some(evidence)) =
+            (cutover.parse::<i64>(), AckEvidence::of_view_name(evidence))
+        else {
+            return false;
+        };
+        Some(codex_usage_occurrence::CodexCounting::new(
+            evidence,
+            Some(cutover),
+        ))
+    };
+    reusable(accumulator.codex_counting.as_deref(), fresh.as_ref())
 }
 
 /// A joined group's member evidence. Inactive, the member view is never

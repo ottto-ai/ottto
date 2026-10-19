@@ -1,5 +1,7 @@
 //! Optional process-owned reduction cache. Losing an entry never clears the
 //! file index's audit debt. The caller owns both active scans and durable ACKs.
+//! Entries leave on take, capacity eviction, clear or restart; idle age alone
+//! never drops one, so a resume after a long idle gap can still reuse state.
 use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
 use crate::transcript_acquisition::Checkpoint;
 use std::collections::BTreeMap;
@@ -43,7 +45,6 @@ struct Entry<S> {
     // take transfers it out. Reinsertion always measures the mutated graph.
     heap_bytes: usize,
     modified_hint: (i64, i64),
-    admitted_at: u64,
 }
 impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
@@ -52,7 +53,6 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
             used: _,
             heap_bytes,
             modified_hint: _,
-            admitted_at: _,
         } = self;
         c.add(*heap_bytes)
     }
@@ -110,6 +110,38 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     }
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+    }
+    /// Evict in admission victim order (oldest source, then least recently
+    /// used) until the resident state fits `limit`. False when even an empty
+    /// cache does not fit. The cursor makes room for a paused job this way.
+    pub(crate) fn release_until(&mut self, limit: usize) -> bool {
+        loop {
+            if heap_layout_bound::bound(self, limit).is_some() {
+                return true;
+            }
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| (entry.modified_hint, entry.used))
+                .map(|(key, _)| key.clone())
+            else {
+                return false;
+            };
+            self.entries.remove(&victim);
+        }
+    }
+    /// Sealed offset of a retained entry without taking it, so a page budget
+    /// can plan a tail read before the frame consumes retained state.
+    pub(crate) fn sealed_offset(&self, key: &str) -> Option<u64> {
+        self.entries
+            .get(key)
+            .map(|entry| entry.retained.checkpoint.sealed_offset())
+    }
+    #[cfg(test)]
+    pub(crate) fn checkpoint(&self, key: &str) -> Option<Checkpoint> {
+        self.entries
+            .get(key)
+            .map(|entry| entry.retained.checkpoint.clone())
     }
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) {
@@ -179,19 +211,16 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
             i64::from(now.subsec_nanos()),
         );
-        // Future source timestamps cannot pin an entry forever. Inactive
-        // entries also expire at the existing audit interval, so backdated new
-        // work can regain space. Neither decision suppresses a native full read.
-        self.entries.retain(|_, entry| {
-            now.as_secs().saturating_sub(entry.admitted_at)
-                < crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS
-        });
+        // Future source timestamps are clipped to admission time, so they
+        // cannot rank an entry ahead of later live work. Only the count/byte
+        // caps and the victim order below decide residency, never idle age:
+        // under pressure, older-modified work loses to newer resident state.
+        // Neither decision suppresses a native full read or audit.
         let entry = Entry {
             modified_hint: retained.checkpoint.modified_hint().min(clock_hint),
             retained,
             used: next,
             heap_bytes,
-            admitted_at: now.as_secs(),
         };
         let Some(state_bytes) = heap_layout_bound::bound(&entry, self.entry_limit) else {
             return false;
@@ -376,7 +405,7 @@ mod tests {
         assert!(cache.resident_bound().unwrap() < 64 * 1024);
     }
     #[test]
-    fn sampled_cache_recent_admission_expiry_and_ambiguous_time_are_bounded() {
+    fn sampled_cache_idle_reuse_pressure_and_ambiguous_time_are_bounded() {
         if !heap_layout_bound::layout_supported() {
             return;
         }
@@ -410,14 +439,35 @@ mod tests {
             at(101)
         ));
         assert!(cache.take("live").is_some());
-        // No permanent cache priority starvation for backdated source work.
+        // Idle age drops nothing: admissions 2h and 5h later leave reusable
+        // state in place. Capacity and the victim order still decide.
         assert!(cache.insert_at(
+            "live".into(),
+            retained_at("x".into(), Some(101)),
+            0,
+            at(101)
+        ));
+        // Backdated work is the oldest candidate at the count cap: it is
+        // refused instead of displacing newer idle state.
+        assert!(!cache.insert_at(
             "backdated".into(),
             retained_at("x".into(), Some(1)),
             0,
-            at(3700)
+            at(101 + 2 * 3600)
         ));
-        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.take("backdated").is_none());
+        assert_eq!(cache.entries.len(), 2);
+        // Newer work still evicts the oldest resident, not the idle entry.
+        let five_hours = 101 + 5 * 3600;
+        assert!(cache.insert_at(
+            "newer".into(),
+            retained_at("x".into(), Some(five_hours)),
+            0,
+            at(five_hours)
+        ));
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.take("c").is_none());
+        assert!(cache.take("live").is_some());
         let mut restarted = TranscriptCache::<String>::default();
         assert!(restarted.take("backdated").is_none());
     }

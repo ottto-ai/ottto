@@ -3054,6 +3054,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         request_evidence: Vec::new(),
         request_identity_refusals: 0,
         claude_org_markers: None,
+        claude_account_withheld_reason: None,
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -3095,6 +3096,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         activity_summary: item.activity_summary.clone(),
         tool_usage: item.tool_usage.clone(),
         tool_usage_truncated: item.tool_usage_truncated,
+        session_start: item.session_start.clone(),
         model_usage: item.model_usage.clone(),
         usage_buckets: item.usage_buckets.clone(),
         cost: item.cost.clone(),
@@ -14141,7 +14143,7 @@ mod tests {
                     "sessionId": format!("synthetic-{hours}"),
                     "requestId": format!("request-{hours}-{n}"),
                     "message": {"id": format!("message-{hours}-{n}"), "role": "assistant",
-                        "model": "claude-sonnet-4", "content": [],
+                        "model": "claude-opus-4-8", "content": [],
                         "usage": {"input_tokens": 100, "output_tokens": 10,
                             "cache_read_input_tokens": 50, "cache_creation_input_tokens": 20}}
                 });

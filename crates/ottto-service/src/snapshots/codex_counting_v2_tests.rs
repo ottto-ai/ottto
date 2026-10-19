@@ -753,6 +753,42 @@ fn codex_counting_retained_reduction_reuse_requires_the_same_rule() {
     let acked_legacy = decided(&[header(POST)], AckEvidence::LegacyAcked);
     assert!(acked_legacy.reusable_under(&fresh(AckEvidence::LegacyAcked)));
     assert!(!acked_legacy.reusable_under(&fresh(AckEvidence::None)));
+
+    // A paused cursor job, checked against its recorded view, applies the
+    // same predicate as the retained reduction's `old.filter`.
+    let evidences = [
+        AckEvidence::None,
+        AckEvidence::V2Marked,
+        AckEvidence::LegacyAcked,
+    ];
+    for decided_under in evidences {
+        let mut paused = SnapshotAccumulator::new(SnapshotSource::Codex);
+        codex_counting_version::configure(&mut paused, decided_under, Some(CUTOVER));
+        apply_codex_line(&header(POST), &mut paused);
+        for now in evidences {
+            assert_eq!(
+                codex_counting_version::reusable_under_view(
+                    &paused,
+                    &codex_counting_version::view(now, CUTOVER)
+                ),
+                codex_counting_version::reusable(
+                    paused.codex_counting.as_deref(),
+                    Some(&fresh(now))
+                ),
+            );
+        }
+        assert!(!codex_counting_version::reusable_under_view(
+            &paused, "legacy"
+        ));
+    }
+    let inactive = SnapshotAccumulator::new(SnapshotSource::Codex);
+    assert!(codex_counting_version::reusable_under_view(
+        &inactive, "legacy"
+    ));
+    assert!(!codex_counting_version::reusable_under_view(
+        &inactive,
+        &codex_counting_version::view(AckEvidence::None, CUTOVER)
+    ));
 }
 
 #[test]

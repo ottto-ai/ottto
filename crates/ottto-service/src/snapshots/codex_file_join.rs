@@ -1093,7 +1093,7 @@ impl GroupReader {
             );
             if let Some(parser) = self.parser.as_mut() {
                 parser.reader =
-                    BoundedJsonlReader::new(BufReader::new(file), MAX_JSONL_LINE_BYTES, true);
+                    BoundedJsonlReader::new(OpenedInput::plain(file), MAX_JSONL_LINE_BYTES, true);
                 // Context that was inferred in one physical file must not price
                 // an unrelated record at the beginning of another file.
                 parser.accumulator.current_selector = SelectorCapture::default();
