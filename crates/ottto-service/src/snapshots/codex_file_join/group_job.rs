@@ -968,6 +968,12 @@ fn member_eof(
         });
     }
     let receipt = replay.finish().map_err(|_| GroupEnd::Strict)?;
+    // The variable records this member leaves in the job (round 4, L3).
+    let mut retained = [
+        crate::heap_layout_bound::completed_bound(&receipt, usize::MAX),
+        crate::heap_layout_bound::completed_bound(&key, usize::MAX),
+        Some(0),
+    ];
     active.applied_receipts.insert(key.clone(), receipt);
     let report = active.parser.reader.report;
     let group = active.group.as_deref_mut().expect("group job");
@@ -1004,12 +1010,14 @@ fn member_eof(
         for snapshot in &mut snapshots {
             apply_codex_state_evidence(snapshot, inputs.metadata);
         }
-        group.legacy_baselines.push(LegacyBaseline {
+        let baseline = LegacyBaseline {
             owner: group.owner.clone(),
             index_key: key,
             expected,
             snapshots,
-        });
+        };
+        retained[2] = crate::heap_layout_bound::completed_bound(&baseline, usize::MAX);
+        group.legacy_baselines.push(baseline);
     }
     group.lines.0 += report.physical_line_count;
     group.lines.1 += report.parsed_json_line_count;
@@ -1038,6 +1046,10 @@ fn member_eof(
         .charge
         .saturating_add(end.saturating_sub(active.charged_bytes));
     active.charged_bytes = 0;
+    // E3: the swap's retained state is charged, not walked (round 4, L3).
+    group.consumed_before = group
+        .consumed_before
+        .saturating_add(cursor::swap_charge(&retained));
     group.current += 1;
     open_member(active, join, inputs)?;
     Ok(false)
@@ -1227,13 +1239,13 @@ pub(in crate::snapshots) fn end_group(
                         .request_group_own_page(&context.namespace, &group.key);
                 }
             }
+            // Round 4 (L1): the attempt ends like every terminal group end,
+            // completing its rotation (waiter removed, served, fenced).
             if let Some(lease) = lease {
-                lease.release();
+                cursor::end_group_lease(lease, &active);
             }
             disclose_strict(&group.owner, &group.members, targets.reborrow());
-            for member in &group.members {
-                cursor::dequeue(index, member);
-            }
+            cursor::dequeue_members(index, &group.members);
         }
         GroupEnd::Refused {
             reason,
@@ -1295,18 +1307,14 @@ pub(in crate::snapshots) fn end_group(
                 cursor::end_group_lease(lease, &active);
             }
             disclose_members(&disclosure, &group.members, index, targets.reborrow());
-            for member in &group.members {
-                cursor::dequeue(index, member);
-            }
+            cursor::dequeue_members(index, &group.members);
         }
         GroupEnd::Changed if lease.is_some() => {
             let lease = lease.expect("checked lease");
             let cache = &sampling.expect("a cursor job has a sampling context").cache;
             if let Some(disclosure) = cache.cursor_invalidate(lease, &active) {
                 disclose_members(&disclosure, &group.members, index, targets.reborrow());
-                for member in &group.members {
-                    cursor::dequeue(index, member);
-                }
+                cursor::dequeue_members(index, &group.members);
             }
             // Otherwise its members are still pending: a later page boots
             // the group again.
@@ -1321,9 +1329,7 @@ pub(in crate::snapshots) fn end_group(
                 lease.release();
             }
             disclose_strict(&group.owner, &group.members, targets.reborrow());
-            for member in &group.members {
-                cursor::dequeue(index, member);
-            }
+            cursor::dequeue_members(index, &group.members);
         }
     }
 }

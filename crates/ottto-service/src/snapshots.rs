@@ -14166,6 +14166,7 @@ impl OwnedSourceScan {
                                 context.cache.group_own_page(
                                     &context.namespace,
                                     &codex_file_join::job_key(group),
+                                    sampled_scan::codex_cursor::census_token(index).as_deref(),
                                 )
                             })
                     };
@@ -14217,18 +14218,19 @@ impl OwnedSourceScan {
                                     .cursor_job_owns(&local_index_key(&member.path))
                             })
                         }) {
-                            for member in group
+                            let owned = group
                                 .members
                                 .iter()
                                 .filter(|member| selected.contains(&local_index_key(&member.path)))
-                            {
+                                .collect::<Vec<_>>();
+                            for _ in &owned {
                                 context.cache.note_join_in_progress();
-                                sampled_scan::codex_cursor::requeue(
-                                    index,
-                                    &codex_selected_flags,
-                                    member,
-                                );
                             }
+                            sampled_scan::codex_cursor::requeue_members(
+                                index,
+                                &codex_selected_flags,
+                                owned,
+                            );
                             continue;
                         }
                         let malformed_pending = group.members.iter().any(|member| {
@@ -14398,13 +14400,11 @@ impl OwnedSourceScan {
                             }
                             scanned_file_count =
                                 scanned_file_count.saturating_sub(boot.group.members.len());
-                            for member in &boot.group.members {
-                                sampled_scan::codex_cursor::requeue(
-                                    index,
-                                    &codex_selected_flags,
-                                    member,
-                                );
-                            }
+                            sampled_scan::codex_cursor::requeue_members(
+                                index,
+                                &codex_selected_flags,
+                                &boot.group.members,
+                            );
                             pending!();
                         }
                         sampled_scan::codex_cursor::StartPlan::Fenced => {
@@ -14580,13 +14580,11 @@ impl OwnedSourceScan {
                                     .request_group_own_page(&context.namespace, &boot.key);
                             }
                             scanned_file_count = scanned_file_count.saturating_sub(members);
-                            for member in &boot.group.members {
-                                sampled_scan::codex_cursor::requeue(
-                                    index,
-                                    &codex_selected_flags,
-                                    member,
-                                );
-                            }
+                            sampled_scan::codex_cursor::requeue_members(
+                                index,
+                                &codex_selected_flags,
+                                &boot.group.members,
+                            );
                             pending!();
                         }
                         // Processed for this generation (K7 fence).
@@ -14604,6 +14602,7 @@ impl OwnedSourceScan {
                 // (R2-N7, disclosed).
                 let owner = boot.group.owner.clone();
                 let group_members = boot.group.members.clone();
+                let boot_key = boot.key.clone();
                 let job = boot.into_job(codex_file_join::JobInputs {
                     metadata: &codex_title_metadata,
                     traces: codex_turn_traces.clone(),
@@ -14613,6 +14612,11 @@ impl OwnedSourceScan {
                     index,
                 });
                 let Ok(mut job) = job else {
+                    // Round 4 (L1): no lease exists yet; a waiter it left is
+                    // dropped like the boot-`Strict` exit's.
+                    if let Some(context) = sampling.as_ref() {
+                        context.cache.cursor_unwait(&context.namespace, &boot_key);
+                    }
                     codex_file_join::disclose_strict(
                         &owner,
                         &group_members,
@@ -14638,25 +14642,21 @@ impl OwnedSourceScan {
                         Ok(lease) => {
                             // The members hold the strict census until the
                             // job's attempt ends (accepted or debt).
-                            for member in &group_members {
-                                sampled_scan::codex_cursor::requeue(
-                                    index,
-                                    &codex_selected_flags,
-                                    member,
-                                );
-                            }
+                            sampled_scan::codex_cursor::requeue_members(
+                                index,
+                                &codex_selected_flags,
+                                &group_members,
+                            );
                             codex_cursor_lease = Some(lease);
                         }
                         Err(sampled_scan::codex_cursor::StartRefusal::Busy) => {
                             context.cache.cursor_note_deferred();
                             scanned_file_count = scanned_file_count.saturating_sub(members);
-                            for member in &group_members {
-                                sampled_scan::codex_cursor::requeue(
-                                    index,
-                                    &codex_selected_flags,
-                                    member,
-                                );
-                            }
+                            sampled_scan::codex_cursor::requeue_members(
+                                index,
+                                &codex_selected_flags,
+                                &group_members,
+                            );
                             pending!();
                         }
                         // Never an unbounded in-page read of a group larger
@@ -14868,9 +14868,10 @@ impl OwnedSourceScan {
                                             pending_finalization: &mut pending_finalization,
                                         },
                                     );
-                                    for file in sampled_scan::codex_cursor::job_files(&job) {
-                                        sampled_scan::codex_cursor::dequeue(index, file);
-                                    }
+                                    sampled_scan::codex_cursor::dequeue_members(
+                                        index,
+                                        sampled_scan::codex_cursor::job_files(&job),
+                                    );
                                 }
                                 pending!();
                             }
@@ -14911,9 +14912,7 @@ impl OwnedSourceScan {
                                     pending_finalization: &mut pending_finalization,
                                 },
                             );
-                            for member in &group.members {
-                                sampled_scan::codex_cursor::dequeue(index, member);
-                            }
+                            sampled_scan::codex_cursor::dequeue_members(index, &group.members);
                             pending!();
                         }
                         if active.cursor.is_some() {
@@ -15135,22 +15134,23 @@ impl OwnedSourceScan {
                                     pending_finalization: &mut pending_finalization,
                                 },
                             );
-                            for file in sampled_scan::codex_cursor::job_files(&active) {
-                                sampled_scan::codex_cursor::dequeue(index, file);
-                            }
+                            sampled_scan::codex_cursor::dequeue_members(
+                                index,
+                                sampled_scan::codex_cursor::job_files(&active),
+                            );
                             pending!();
                         }
                     }
                     // A group's sealed members ended with the job; only its
                     // live member's path follows `release_path` above.
                     if let Some(group) = active.group.as_ref() {
-                        for member in group
-                            .members
-                            .iter()
-                            .filter(|member| member.path != active.candidate.path)
-                        {
-                            sampled_scan::codex_cursor::dequeue(index, member);
-                        }
+                        sampled_scan::codex_cursor::dequeue_members(
+                            index,
+                            group
+                                .members
+                                .iter()
+                                .filter(|member| member.path != active.candidate.path),
+                        );
                     }
                 }
                 // S12: the live member's certified grant reaches validation.

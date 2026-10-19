@@ -398,7 +398,9 @@ fn estimate_charge(
 /// with the visit-limited `bound` per line, so a large group cannot refuse
 /// the copy budget by visits alone and clear every retained singleton copy.
 /// A group's input position is cumulative over its members (round 3,
-/// R2-L3): a member swap needs no walk.
+/// R2-L3): a member swap needs no walk. Each swap also advances it by the
+/// state the swap adds that no consumed byte pays for (`swap_charge`,
+/// round 4), so the estimate stays an upper bound.
 pub(in crate::snapshots) fn byte_charged(job: &OwnedActiveFile) -> bool {
     job.cursor.is_some() || job.group.is_some()
 }
@@ -419,7 +421,30 @@ pub(in crate::snapshots) fn job_charge_estimate(
 }
 
 /// The job's input position for E3: the reader's `consumed`, plus the bytes
-/// a group's completed member readers consumed (R2-N4, R2-L3).
+/// a group's completed member readers consumed and their swap charges
+/// (R2-N4, R2-L3).
+/// Fixed per-member state a group member swap adds (round 4, L3): the
+/// applied receipt's B-tree slot share (a non-root node holds at least 5 of
+/// its 11 entries), the legacy baseline's and the proof's `MemberSeen` Vec
+/// slots (at most twice the element under doubling). A test checks it
+/// against the layout.
+pub(in crate::snapshots) const MEMBER_SWAP_CHARGE: u64 = 4 * 1024;
+
+/// The E3 position charge of one member swap: `MEMBER_SWAP_CHARGE` plus the
+/// walked bound of the variable records the swap retains (the applied
+/// receipt, its key and the legacy baseline). An unbounded or overlong
+/// record charges a whole refresh window, so the next step walks.
+pub(in crate::snapshots) fn swap_charge(records: &[Option<usize>]) -> u64 {
+    records
+        .iter()
+        .try_fold(MEMBER_SWAP_CHARGE, |sum, record| {
+            sum.checked_add(u64::try_from((*record)?).ok()?)
+        })
+        .map_or(CHARGE_REFRESH_BYTES, |charge| {
+            charge.min(CHARGE_REFRESH_BYTES)
+        })
+}
+
 fn job_position(job: &OwnedActiveFile, consumed: u64) -> u64 {
     job.group.as_ref().map_or(consumed, |group| {
         consumed.saturating_add(group.consumed_before)
@@ -1064,7 +1089,7 @@ pub(in crate::snapshots) fn paused_charge(job: &OwnedActiveFile) -> Option<usize
 /// The pause walk is the resumed page's starting copy-budget charge (E3):
 /// both exclude the live source-wide inputs.
 fn record_paused_charge(job: &mut OwnedActiveFile, charge: usize) {
-    let consumed = job.parser.reader.consumed_bytes();
+    let consumed = job_position(job, job.parser.reader.consumed_bytes());
     let buffer = job.parser.reader.buf.capacity();
     if let Some(meta) = job.cursor.as_mut() {
         meta.record_charge(charge, consumed, buffer);
@@ -2097,11 +2122,19 @@ impl SharedCache {
         self.with_cursor(|cursor| cursor.rotation.waiting.remove(&key));
     }
 
-    /// The group asked for a page of its own (round 3).
-    pub(in crate::snapshots) fn group_own_page(&self, namespace: &Scope, key: &str) -> bool {
+    /// The group asked for a page of its own (round 3) and is not fenced in
+    /// this generation (round 4: a fenced pop would waste the page).
+    pub(in crate::snapshots) fn group_own_page(
+        &self,
+        namespace: &Scope,
+        key: &str,
+        fence: Option<&str>,
+    ) -> bool {
         let key = rotation_key(&namespace.0, key);
-        self.with_cursor(|cursor| cursor.rotation.own_page.contains_key(&key))
-            .unwrap_or(false)
+        self.with_cursor(|cursor| {
+            cursor.rotation.own_page.contains_key(&key) && !cursor.rotation.fenced(&key, fence)
+        })
+        .unwrap_or(false)
     }
 
     /// The group's boot takes its own-page request: true when it was asked.
@@ -2547,6 +2580,54 @@ pub(in crate::snapshots) fn dequeue(index: &mut ScanIndex, candidate: &Candidate
         traversal
             .pending_candidates
             .retain(|pending| pending.path != candidate.path);
+    }
+}
+
+/// `requeue` for every member of a group in one pass over the pending
+/// paths (round 4, L2): O(P + n), not O(P) per member.
+pub(in crate::snapshots) fn requeue_members<'a>(
+    index: &mut ScanIndex,
+    flags: &BTreeMap<String, (bool, bool)>,
+    members: impl IntoIterator<Item = &'a CandidateFile>,
+) {
+    let Some(traversal) = index.traversal.as_mut() else {
+        return;
+    };
+    let mut pending = traversal
+        .pending_candidates
+        .iter()
+        .map(|pending| pending.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for candidate in members {
+        if !pending.insert(candidate.path.clone()) {
+            continue;
+        }
+        let (census_member, watcher_hint) = flags
+            .get(&local_index_key(&candidate.path))
+            .copied()
+            .unwrap_or((true, false));
+        traversal.pending_candidates.push_back(ScanTraversalPath {
+            scan_root: candidate.scan_root.clone(),
+            path: candidate.path.clone(),
+            census_member,
+            watcher_hint,
+        });
+    }
+}
+
+/// `dequeue` for every member of a group in one pass (round 4, L2).
+pub(in crate::snapshots) fn dequeue_members<'a>(
+    index: &mut ScanIndex,
+    members: impl IntoIterator<Item = &'a CandidateFile>,
+) {
+    if let Some(traversal) = index.traversal.as_mut() {
+        let paths = members
+            .into_iter()
+            .map(|member| member.path.as_path())
+            .collect::<std::collections::HashSet<_>>();
+        traversal
+            .pending_candidates
+            .retain(|pending| !paths.contains(pending.path.as_path()));
     }
 }
 

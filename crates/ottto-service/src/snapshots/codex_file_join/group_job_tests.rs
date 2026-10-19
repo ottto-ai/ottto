@@ -1561,24 +1561,70 @@ fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
 /// chronological fallback order breaks the chain (a `Gap` at sealed `a`).
 fn probe_order_corpus(tag: &str, padding: usize) -> PathBuf {
     let root = temp_root(tag);
-    let mut a = vec![meta(OWNER, "2026-10-01T10:00:00Z", json!({}))];
-    // Padding before `a`'s first native: past `PROBE_BYTES` when large.
-    a.extend((0..padding).map(|i| {
+    write_probe_order(&root, OWNER, ["a", "b"], padding, 0);
+    root
+}
+
+/// The probe-order fixture of `owner` in `<first>.jsonl` and
+/// `<second>.jsonl`: `first` is created first but continues `second`'s
+/// counter. `extra` native/UI pairs after `first`'s make the group large.
+fn write_probe_order(root: &Path, owner: &str, names: [&str; 2], padding: usize, extra: u64) {
+    let [first, second] = names;
+    let mut rows = vec![meta(owner, "2026-10-01T10:00:00Z", json!({}))];
+    // Padding before the first native: past `PROBE_BYTES` when large.
+    rows.extend((0..padding).map(|i| {
         json!({"type": "event_msg", "timestamp": "2026-10-01T10:00:01Z", "payload": {
             "type": "agent_message", "message": format!("{i}:{}", "p".repeat(4096))}})
     }));
-    a.push(native(OWNER, "r-a", 200, 300));
-    a.push(ui(200, 300, "2026-10-01T10:05:01Z"));
-    write_rows(&root.join("sessions/a.jsonl"), &a);
+    rows.push(native(owner, &format!("r-{first}"), 200, 300));
+    rows.push(ui(200, 300, "2026-10-01T10:05:01Z"));
+    for i in 0..extra {
+        let after = 300 + 10 * (i + 1);
+        rows.push(native(owner, &format!("r-{first}-{i}"), 10, after));
+        rows.push(ui(
+            10,
+            after,
+            &format!("2026-10-01T10:{:02}:{:02}Z", 6 + i / 60, i % 60),
+        ));
+    }
+    write_rows(&root.join(format!("sessions/{first}.jsonl")), &rows);
     write_rows(
-        &root.join("sessions/b.jsonl"),
+        &root.join(format!("sessions/{second}.jsonl")),
         &[
-            meta(OWNER, "2026-10-01T10:05:00Z", json!({})),
-            native(OWNER, "r-b", 100, 100),
+            meta(owner, "2026-10-01T10:05:00Z", json!({})),
+            native(owner, &format!("r-{second}"), 100, 100),
             ui(100, 100, "2026-10-01T10:00:01Z"),
         ],
     );
-    root
+}
+
+/// Bytes of the first `lines` lines of `path`.
+fn head_bytes(path: &Path, lines: usize) -> u64 {
+    fs::read(path)
+        .unwrap()
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(lines)
+        .map(|line| line.len() as u64)
+        .sum()
+}
+
+/// The owner of the first group in inventory (page selection) order.
+fn first_group_owner(root: &Path) -> String {
+    let sessions = root.join("sessions");
+    let paths = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| local_index_key(&entry.unwrap().path()))
+        .collect::<BTreeSet<_>>();
+    let mut directories = DirectoryCensus::new();
+    directories.observe(&sessions, &fs::metadata(&sessions).unwrap());
+    let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&directories));
+    while !inventory.step(&CodexTitleMetadata::default()) {}
+    inventory
+        .groups()
+        .into_values()
+        .next()
+        .expect("a group")
+        .owner
 }
 
 /// Round 3 (R1-L1, R2-L2 (a)): a `ProbeBudgetOrder` the page's remaining
@@ -1657,6 +1703,146 @@ fn probe_limit_bound_order_parks_until_a_member_changes() {
     assert!(parked.unreadable_path_count > 0, "disclosed as strict debt");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     fs::remove_dir_all(root).unwrap();
+}
+
+/// Round 4 (L4): the own-page cure. A group read first leaves the shared
+/// page's singleton remainder short of this paged group's probes
+/// (`ProbeBudgetOrder`); on its own page the remainder covers them, the
+/// probes order it and the join is accepted once, equal to the unpaged scan.
+#[test]
+fn allowance_bound_probe_order_joins_on_its_own_page() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("probe-cure");
+    write_probe_order(&root, OTHER, ["c", "d"], 0, 40);
+    // Each header read takes at most one 1 KiB buffer; probes read line 0
+    // and the first native.
+    let probes = head_bytes(&root.join("sessions/c.jsonl"), 2)
+        + head_bytes(&root.join("sessions/d.jsonl"), 2);
+    let singleton = 2 * 1024 + probes + 1024;
+    // A two-member group that sorts first and charges its headers and
+    // probes to the shared page before `c`/`d` boot.
+    let filler = (0..64u64)
+        .map(|i| format!("aaaaaaaa-bbbb-4ccc-8ddd-{i:012x}"))
+        .find(|owner| {
+            write_rows(
+                &root.join("sessions/f1.jsonl"),
+                &member(owner, "f-1", 100, 100),
+            );
+            write_rows(
+                &root.join("sessions/f2.jsonl"),
+                &member(owner, "f-2", 200, 300),
+            );
+            first_group_owner(&root) == *owner
+        });
+    assert!(filler.is_some(), "a filler group that sorts first");
+    let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
+    let expected = unpaged
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.source_session_id == OTHER)
+        .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected.len(), 2, "one alias per member");
+    let order = JoinRefusal::ProbeBudgetOrder.slot();
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(8192, singleton, 64, || {
+        let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+        let shared = counters(&cache);
+        assert_eq!(shared.join_terminal_debt[order], 1, "{shared:?}");
+        index.traversal = None;
+        let (_, joined, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+            completions(&cache) == 1
+        });
+        let after = counters(&cache);
+        assert_eq!(
+            after.join_terminal_debt[order], 1,
+            "no second refusal: {after:?}"
+        );
+        assert_eq!(after.parked_hits, 0, "{after:?}");
+        assert_eq!(after.jobs_certified, 1, "{after:?}");
+        let accepted = joined
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_session_id == OTHER)
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(accepted, expected, "counted once, as unpaged");
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Round 4 (L1): a paged group that waited behind a P1 singleton and then
+/// ends as `ProbeBudgetOrder` completes its rotation: no waiter remains and
+/// a later P1 singleton takes the slot without a rotation deferral.
+#[test]
+fn probe_order_end_leaves_no_waiter_ahead_of_p1_singletons() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("probe-waiter");
+    write_rows(
+        &root.join("sessions/s.jsonl"),
+        &chain_rows(OTHER, "s", "2026-10-01T11:00:00Z", 0, 30),
+    );
+    let order = JoinRefusal::ProbeBudgetOrder.slot();
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1, 64, || {
+        // `s` takes the slot and pauses in it.
+        let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+            counters(&cache).jobs_paused > 0
+        });
+        write_probe_order(&root, OWNER, ["a", "b"], 0, 0);
+        index.traversal = None;
+        let (index, _, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+            counters(&cache).join_terminal_debt[order] == 1
+        });
+        let ended = counters(&cache);
+        assert!(
+            ended.deferred >= 1,
+            "the group waited behind `s`: {ended:?}"
+        );
+        assert_eq!(completions(&cache), 1, "`s` completed first: {ended:?}");
+        assert_eq!(cache.rotation_waiters_for_test(), 0, "{ended:?}");
+        // A later large P1 singleton is not deferred behind the group.
+        write_rows(
+            &root.join("sessions/u.jsonl"),
+            &chain_rows(UNKNOWN, "u", "2026-10-01T12:00:00Z", 0, 30),
+        );
+        let _ = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+            completions(&cache) == 2
+        });
+        let after = counters(&cache);
+        assert_eq!(
+            after.deferred_rotation, ended.deferred_rotation,
+            "{after:?}"
+        );
+        assert_eq!(after.join_terminal_debt[order], 1, "fenced: {after:?}");
+        assert_eq!(cache.rotation_waiters_for_test(), 0, "{after:?}");
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Round 4 (L3): `MEMBER_SWAP_CHARGE` covers the fixed records a member swap
+/// adds: the applied receipt's B-tree slot share (a non-root node holds at
+/// least 5 of its 11 entries) and the baseline and `MemberSeen` Vec slots
+/// (at most twice the element under doubling).
+#[test]
+fn member_swap_charge_covers_the_fixed_per_member_records() {
+    let entry = size_of::<String>() + size_of::<AppliedTierReceipt>();
+    let node = 11 * entry + 12 * size_of::<usize>() + 2 * size_of::<usize>();
+    let fixed = node / 5 + 2 * size_of::<LegacyBaseline>() + 2 * size_of::<MemberSeen>();
+    assert!(cursor::MEMBER_SWAP_CHARGE as usize >= fixed, "{fixed}");
+    // An unbounded record walks at the next step.
+    assert_eq!(
+        cursor::swap_charge(&[Some(10), None]),
+        cursor::swap_charge(&[Some(usize::MAX)])
+    );
+    assert_eq!(
+        cursor::swap_charge(&[Some(10), Some(0), Some(0)]),
+        cursor::MEMBER_SWAP_CHARGE + 10
+    );
 }
 
 /// Round 3 (R2-M1): a memoized group larger than the singleton budget
