@@ -3828,6 +3828,13 @@ pub struct AgentCostsQuery {
     pub mode: Option<String>,
     #[serde(default)]
     pub all_machines: bool,
+    /// Comma-separated grouped families for `mode=full`; Ottto owns the list
+    /// and its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<String>,
+    /// Include the selected families' daily/hourly series (`mode=full`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub daily: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -6361,6 +6368,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: None,
+                    daily: false,
                 }
             }
         );
