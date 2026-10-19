@@ -9521,11 +9521,6 @@ fn derive_unresolved_claude_accounts(
                 <= CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS
         })
     };
-    let pair_accounts = desktop_pairs
-        .pairs
-        .iter()
-        .map(|pair| pair.binding.account_identifier_hash.as_str())
-        .collect::<BTreeSet<_>>();
     let mut descriptors = desktop_pairs
         .pairs
         .iter()
@@ -9561,6 +9556,12 @@ fn derive_unresolved_claude_accounts(
         })
         .take(CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX)
         .collect::<Vec<_>>();
+    // Only an emitted pair row stands in for its account's account-only row;
+    // a stale, resolved or capped-out pair must not hide recent evidence.
+    let pair_accounts = descriptors
+        .iter()
+        .filter_map(|descriptor| descriptor.account_identifier_hash.clone())
+        .collect::<BTreeSet<_>>();
     let mut by_hash = BTreeMap::<String, String>::new();
     for observation in &desktop_snapshot.plan_observations {
         if observation.evidence_method.as_deref() != Some("claude_desktop_session_bucket")
@@ -9573,7 +9574,7 @@ fn derive_unresolved_claude_accounts(
         };
         if account_hash.is_empty()
             || resolved.contains(account_hash)
-            || pair_accounts.contains(account_hash.as_str())
+            || pair_accounts.contains(account_hash)
         {
             continue;
         }
@@ -36008,6 +36009,27 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             Some("Other org")
         );
         assert_eq!(unresolved[1].organization_label, None);
+
+        // A pair too old for a connect row does not hide the account's recent
+        // account-only row.
+        pairs
+            .pairs
+            .retain(|pair| pair.binding.account_identifier_hash == "strong-unresolved");
+        pairs.pairs[0].observation.observed_at = Some("2026-05-05T09:59:59Z".to_string());
+        let unresolved = derive_unresolved_claude_accounts(
+            &desktop,
+            &pairs,
+            &[],
+            &BTreeMap::new(),
+            OffsetDateTime::parse("2026-08-04T10:00:00Z", &Rfc3339).expect("fixed now"),
+        );
+        assert!(unresolved.iter().any(|row| {
+            row.account_identifier_hash.as_deref() == Some("strong-unresolved")
+                && row.organization_identifier_hash.is_none()
+        }));
+        assert!(unresolved
+            .iter()
+            .all(|row| row.organization_identifier_hash.is_none()));
     }
 
     #[test]
