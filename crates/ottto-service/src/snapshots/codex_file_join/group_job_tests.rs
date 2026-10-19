@@ -155,11 +155,23 @@ fn sampled(
     limit: usize,
     cache: &Arc<SharedCache>,
 ) -> (ScanIndex, SourceScanResult) {
+    sampled_at(root, index, limit, cache, "2026-10-06T23:00:00Z")
+}
+
+/// `sampled` at `collected_at`: a new traversal's census window ends there,
+/// so a later `collected_at` is a new generation (K7 fence token).
+fn sampled_at(
+    root: &Path,
+    index: ScanIndex,
+    limit: usize,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+) -> (ScanIndex, SourceScanResult) {
     let mut owned = OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root.join("sessions")],
         index,
-        "2026-10-06T23:00:00Z",
+        collected_at,
         7,
         limit,
         false,
@@ -799,16 +811,37 @@ fn paged_corpus(tag: &str) -> PathBuf {
     root
 }
 
-/// Sampled pages until `done`; returns the last page and every page before.
-fn pages(
+/// The next generation (`n` minutes later): a new walk and fence token.
+fn next_generation(
     root: &Path,
     mut index: ScanIndex,
     cache: &Arc<SharedCache>,
+    n: u32,
+) -> (ScanIndex, SourceScanResult) {
+    index.traversal = None;
+    sampled_at(root, index, 10, cache, &format!("2026-10-06T23:{n:02}:00Z"))
+}
+
+/// Sampled pages until `done`; returns the last page and every page before.
+fn pages(
+    root: &Path,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    done: impl FnMut() -> bool,
+) -> (ScanIndex, SourceScanResult, Vec<SourceScanResult>) {
+    pages_at(root, index, cache, "2026-10-06T23:00:00Z", done)
+}
+
+fn pages_at(
+    root: &Path,
+    mut index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
     mut done: impl FnMut() -> bool,
 ) -> (ScanIndex, SourceScanResult, Vec<SourceScanResult>) {
     let mut earlier = Vec::new();
     for _ in 0..256 {
-        let (next, result) = sampled(root, index, 10, cache);
+        let (next, result) = sampled_at(root, index, 10, cache, collected_at);
         index = next;
         if done() {
             return (index, result, earlier);
@@ -872,7 +905,7 @@ fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
     let root = refused_fixture();
     let cache = Arc::new(SharedCache::default());
     let overlap = JoinRefusal::Overlap.slot();
-    let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let first = counters(&cache);
     assert_eq!(first.join_terminal_debt[overlap], 1, "{first:?}");
     assert_eq!(first.memo_records, 1, "{first:?}");
@@ -881,8 +914,7 @@ fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
         &root.join("sessions/b.jsonl"),
         &[turn("44444444-aaaa-4aaa-8aaa-444444444444")],
     );
-    index.traversal = None;
-    let (index, again) = sampled(&root, index, 10, &cache);
+    let (index, again) = next_generation(&root, index, &cache, 1);
     let after = counters(&cache);
     assert_eq!(after.group_memo_hits, 1, "{after:?}");
     assert_eq!(
@@ -922,13 +954,12 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
     );
     let unmatched = JoinRefusal::UiUnmatched.slot();
     let cache = Arc::new(SharedCache::default());
-    let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let refused = counters(&cache);
     assert_eq!(refused.join_terminal_debt[unmatched], 1, "{refused:?}");
     assert_eq!(refused.memo_records, 1, "recorded with an exact stamp");
     // Unchanged: the next generation does not re-read the group (R2-M1).
-    index.traversal = None;
-    let (mut index, _) = sampled(&root, index, 10, &cache);
+    let (index, _) = next_generation(&root, index, &cache, 1);
     let unchanged = counters(&cache);
     assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
     assert_eq!(unchanged.join_terminal_debt[unmatched], 1, "{unchanged:?}");
@@ -937,8 +968,7 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
         &root.join("sessions/b.jsonl"),
         &[turn("55555555-aaaa-4aaa-8aaa-555555555555")],
     );
-    index.traversal = None;
-    let (_, _) = sampled(&root, index, 10, &cache);
+    let _ = next_generation(&root, index, &cache, 2);
     let grown = counters(&cache);
     assert_eq!(grown.group_memo_hits, 1, "{grown:?}");
     assert_eq!(grown.join_terminal_debt[unmatched], 2, "{grown:?}");
@@ -955,7 +985,7 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
     with_test_limits(2048, 1024, 64, || {
         // The first pause (inside sealed member a) cannot fit the scaled
         // state budget: strict `JoinStateBound`, parked.
-        let (mut index, first) =
+        let (index, first) =
             with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache));
         let bound = counters(&cache);
         assert_eq!(bound.jobs_state_bound, 1, "{bound:?}");
@@ -963,8 +993,7 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
         assert!(first.snapshots.is_empty());
         assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
         // A new generation without a capacity or input change: no attempt.
-        index.traversal = None;
-        let (mut index, _) = sampled(&root, index, 10, &cache);
+        let (index, _) = next_generation(&root, index, &cache, 1);
         let parked = counters(&cache);
         assert_eq!(parked.parked_hits, 1, "{parked:?}");
         assert_eq!(
@@ -976,8 +1005,7 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
             &root.join("sessions/b.jsonl"),
             &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 2)[1..],
         );
-        index.traversal = None;
-        let (mut index, _) = sampled(&root, index, 10, &cache);
+        let (index, _) = next_generation(&root, index, &cache, 2);
         let grown = counters(&cache);
         assert_eq!(grown.parked_hits, 2, "{grown:?}");
         assert_eq!(grown.groups_started, 1, "{grown:?}");
@@ -986,8 +1014,7 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
             &root.join("sessions/a.jsonl"),
             &[turn("66666666-aaaa-4aaa-8aaa-666666666666")],
         );
-        index.traversal = None;
-        let _ = sampled(&root, index, 10, &cache);
+        let _ = next_generation(&root, index, &cache, 3);
         let woken = counters(&cache);
         assert_eq!(woken.parked_hits, 2, "{woken:?}");
         assert_eq!(woken.groups_started, 2, "{woken:?}");
@@ -1061,7 +1088,9 @@ fn live_member_growth_mid_job_publishes_frozen_prefix_then_replaces_it() {
         // The appended tail stays pending; the next generation replaces
         // the body.
         index.traversal = None;
-        let (_, second, _) = pages(&root, index, &cache, || completions(&cache) > 1);
+        let (_, second, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+            completions(&cache) > 1
+        });
         (first, second)
     });
     assert!(!first.snapshots.is_empty());
