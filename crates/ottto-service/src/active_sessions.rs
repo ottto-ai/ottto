@@ -570,11 +570,25 @@ fn account_attribution(
         EvidenceResolution::Resolved(account_hash) => Some(account_hash),
         EvidenceResolution::Conflict => return None,
     };
+    // One own login beside untagged usage names nothing by itself, but any
+    // other account contradicts the session's own requests.
+    let own_login = match snapshot_account_hash {
+        Some(_) => None,
+        None => match own_request_logins(snapshot) {
+            OwnRequestLogins::One(login) => Some(login),
+            OwnRequestLogins::Absent | OwnRequestLogins::Several => None,
+        },
+    };
+    let contradicts_own_login =
+        |account_hash: Option<&str>| own_login.is_some_and(|login| account_hash != Some(login));
 
     if exact_observation
         .and_then(|observation| observation.account_identifier_hash.as_deref())
         .zip(snapshot_account_hash.as_deref())
         .is_some_and(|(observation, snapshot)| observation != snapshot)
+        || exact_observation.is_some_and(|observation| {
+            contradicts_own_login(observation.account_identifier_hash.as_deref())
+        })
     {
         return None;
     }
@@ -596,14 +610,6 @@ fn account_attribution(
     if account_withheld_reason(snapshot) == Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS) {
         return None;
     }
-    // One own login beside untagged usage names nothing by itself, but a
-    // fallback naming any other account contradicts the session's own requests.
-    let own_login = match own_request_logins(snapshot) {
-        OwnRequestLogins::One(login) => Some(login),
-        OwnRequestLogins::Absent | OwnRequestLogins::Several => None,
-    };
-    let contradicts_own_login =
-        |account_hash: Option<&str>| own_login.is_some_and(|login| account_hash != Some(login));
     match lineage_account_attribution(snapshot, status) {
         EvidenceResolution::Resolved(lineage) => {
             return (!contradicts_own_login(lineage.account_identifier_hash.as_deref()))
@@ -2301,8 +2307,9 @@ mod tests {
         assert_eq!(attribution(&mixed, &lineage(c.as_str())), (None, None));
         assert_eq!(attribution(&mixed, &lineage(a.as_str())), (None, None));
 
-        // One own login beside an untagged request: a fallback naming another
-        // account is refused, the same account keeps its source.
+        // One own login beside an untagged request: lineage, an exact
+        // observation or the current login naming another account is refused;
+        // the same account keeps its source.
         let one = tagged([Some(a.as_str()), None]);
         assert_eq!(attribution(&one, &lineage(b.as_str())), (None, None));
         assert_eq!(
@@ -2310,6 +2317,24 @@ mod tests {
             (
                 Some(a.clone()),
                 Some("lineage_plan_observation".to_string())
+            )
+        );
+        let session = one.source_session_id.clone();
+        let exact = |account_hash: &str| {
+            let mut status = test_status();
+            status.plan_observations.push(test_plan_observation(
+                &session,
+                account_hash,
+                AgentStatusConfidence::High,
+            ));
+            status
+        };
+        assert_eq!(attribution(&one, &exact(b.as_str())), (None, None));
+        assert_eq!(
+            attribution(&one, &exact(a.as_str())),
+            (
+                Some(a.clone()),
+                Some("session_plan_observation".to_string())
             )
         );
         let mut one = one;
