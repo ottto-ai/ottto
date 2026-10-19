@@ -147,6 +147,19 @@ static CLAUDE_SLOT_COLLECTION_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
 const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
 const CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX: usize = 64;
+/// Most plan observations one Desktop pair status carries: exact pairs first,
+/// then their duplicate-session observations. The backend accepts at most 20
+/// plan observations per snapshot and refuses the whole upload over it.
+const CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX: usize = 20;
+/// The backend accepts at most this many status snapshots in one upload.
+const AGENT_STATUS_UPLOAD_SNAPSHOT_MAX: usize = 10;
+/// Whether the account-less Desktop pair status uploads. The backend keeps a
+/// login's metered current row when this status arrives: an account-less,
+/// meterless status no longer takes the profile of its newest linked
+/// observation, so the current-row cleanup cannot delete this Mac's metered
+/// row for that profile. Pair connect targets are local and do not depend on
+/// this.
+const CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED: bool = true;
 // Reuse the daemon's existing detected-use/session retention contract. This
 // warning is a view of the same local activity evidence, not a new lifetime.
 const CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS: i64 =
@@ -1440,6 +1453,21 @@ struct ClaudeDesktopCodeSessionMetadata {
     last_activity_at: Option<Value>,
     #[serde(rename = "createdAt")]
     created_at: Option<Value>,
+    /// Any `importedFrom` tag, null or malformed included, means the session
+    /// was copied into this folder: not native evidence for its folder pair.
+    /// The tag's value is never kept.
+    #[serde(
+        rename = "importedFrom",
+        default,
+        deserialize_with = "deserialize_field_present"
+    )]
+    imported: bool,
+}
+
+fn deserialize_field_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1484,6 +1512,71 @@ struct ClaudeDesktopProfileBuilder {
     session_activity_by_id: BTreeMap<String, Option<i64>>,
     code_session_count: usize,
     agent_mode_session_count: usize,
+}
+
+/// One Desktop `<account>/<organization>` folder pair, across the Code and
+/// agent-mode stores. Every folder takes part in duplicate-session ownership;
+/// only an `exact` one (both names canonical UUIDs) can become a pair. Labels
+/// and plan come only from the same folder pair, never from the account's
+/// other folders.
+#[derive(Debug, Clone, Default)]
+struct ClaudeDesktopPairBuilder {
+    exact: bool,
+    account_label: Option<String>,
+    account_name: Option<String>,
+    organization_label: Option<String>,
+    plan_type: Option<String>,
+    /// Every session seen in the folder pair, imported copies and agent-mode
+    /// sessions included: input to the duplicate-session ownership rule.
+    session_activity_by_id: BTreeMap<String, Option<i64>>,
+    /// Native Code sessions (no `importedFrom`) whose metadata carries a
+    /// parseable activity time. Only these qualify the pair.
+    native_activity_by_id: BTreeMap<String, i64>,
+}
+
+/// One Desktop folder pair: the canonical UUIDs where the names are UUIDs,
+/// otherwise the names as found (a non-UUID name never equals a canonical one).
+type ClaudeDesktopPairKey = (String, String);
+
+fn claude_desktop_pair_builder<'a>(
+    pair_builders: &'a mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
+    account: &str,
+    organization: &str,
+) -> &'a mut ClaudeDesktopPairBuilder {
+    let canonical_account = crate::claude_local_otel::canonical_uuid(account);
+    let canonical_organization = crate::claude_local_otel::canonical_uuid(organization);
+    let exact = canonical_account.is_some() && canonical_organization.is_some();
+    pair_builders
+        .entry((
+            canonical_account.unwrap_or_else(|| account.to_string()),
+            canonical_organization.unwrap_or_else(|| organization.to_string()),
+        ))
+        .or_insert_with(|| ClaudeDesktopPairBuilder {
+            exact,
+            ..ClaudeDesktopPairBuilder::default()
+        })
+}
+
+/// One Desktop metadata scan per status pass: today's per-account observations
+/// for the default snapshot, and the qualified exact folder pairs.
+struct ClaudeDesktopScan {
+    observations: Vec<AgentStatusPlanObservation>,
+    pairs: ClaudeDesktopPairs,
+}
+
+/// Qualified exact Desktop folder pairs, newest native activity first, and the
+/// duplicate sessions they own, newest first. Nothing here is uploaded until
+/// `claude_desktop_pairs_snapshot` subtracts the pairs another upload covers.
+#[derive(Debug, Clone, Default)]
+struct ClaudeDesktopPairs {
+    pairs: Vec<ClaudeDesktopPairObservation>,
+    duplicate_sessions: Vec<ClaudeDesktopPairObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeDesktopPairObservation {
+    binding: ClaudeStrongBinding,
+    observation: AgentStatusPlanObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3870,12 +3963,14 @@ pub(crate) fn claude_refresher_skip_reason(
 /// Snapshot diagnostic for the default login's lifetime warning.
 const CLAUDE_RELOGIN_APPROACHING_CODE: &str = "claude_relogin_approaching";
 
+/// Also returns this pass's exact Claude Desktop folder pairs, read in the same
+/// single scan as the default snapshot's Desktop readings.
 fn collect_claude_status(
     captured_at: String,
     expires_at: String,
     slot_owned_bindings: &BTreeSet<ClaudeStrongBinding>,
     keep_signed_in: bool,
-) -> AgentStatusSnapshot {
+) -> (AgentStatusSnapshot, ClaudeDesktopPairs) {
     // Presence is decided by the canonical detector, which requires the `claude`
     // binary. A lone `~/.claude/settings.json` — which Ottto's own relay-base
     // patch writes during onboarding — must NOT read as "installed", or a Mac
@@ -3885,7 +3980,10 @@ fn collect_claude_status(
     let claude_cli_present =
         crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode);
     if !claude_cli_present && !claude_desktop_metadata_present(&claude_desktop_root) {
-        return not_installed_snapshot(SourceKind::ClaudeCode, "claude", captured_at, expires_at);
+        return (
+            not_installed_snapshot(SourceKind::ClaudeCode, "claude", captured_at, expires_at),
+            ClaudeDesktopPairs::default(),
+        );
     }
     let mut snapshot = base_snapshot(
         SourceKind::ClaudeCode,
@@ -4108,8 +4206,10 @@ fn collect_claude_status(
         .as_ref()
         .map(|(account_hash, _)| account_hash.clone())
         .unwrap_or_default();
-    let desktop_plan_observations =
-        claude_desktop_plan_observations_from_root(&claude_desktop_root, &snapshot.captured_at);
+    let ClaudeDesktopScan {
+        observations: desktop_plan_observations,
+        pairs: desktop_pairs,
+    } = claude_desktop_scan_from_root(&claude_desktop_root, &snapshot.captured_at);
     let observable_account_identifier_hashes =
         claude_account_identifier_hashes_from_observations(&desktop_plan_observations);
     let apply_statusline_quota = |snapshot: &mut AgentStatusSnapshot,
@@ -4360,7 +4460,7 @@ fn collect_claude_status(
             "Claude Desktop Code account/session bucket metadata was detected.",
         ));
     }
-    snapshot
+    (snapshot, desktop_pairs)
 }
 
 /// The registered-slot settings for one collection pass. A failed read is
@@ -4460,7 +4560,7 @@ fn collect_claude_status_snapshots(
     let upkeep_consent = settings.as_ref().is_ok_and(|status| {
         status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
     });
-    let mut default_snapshot = collect_claude_status(
+    let (mut default_snapshot, desktop_pairs) = collect_claude_status(
         captured_at.clone(),
         expires_at.clone(),
         &slot_owned_bindings,
@@ -4911,8 +5011,10 @@ fn collect_claude_status_snapshots(
         &captured_at,
         &expires_at,
     ));
+    append_claude_desktop_pairs_snapshot(&mut snapshots, &desktop_pairs, &captured_at, &expires_at);
     let unresolved_accounts = derive_unresolved_claude_accounts(
         &default_snapshot,
+        &desktop_pairs,
         &snapshots,
         &slot_states,
         OffsetDateTime::parse(&captured_at, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc()),
@@ -8675,6 +8777,10 @@ fn persist_claude_slot_collection_states_with_registry(
         let Some(account_hash) = unresolved.account_identifier_hash.as_deref() else {
             return true;
         };
+        if let Some(organization_hash) = unresolved.organization_identifier_hash.as_deref() {
+            return ClaudeStrongBinding::new(account_hash, organization_hash)
+                .map_or(true, |binding| !resolved_full_bindings.contains(&binding));
+        }
         resolved_full_bindings
             .iter()
             .filter(|binding| binding.account_identifier_hash == account_hash)
@@ -8745,8 +8851,13 @@ fn persist_one_claude_slot_collection_state_with(
                 })
                 .count();
             persisted.unresolved_accounts.retain(|unresolved| {
-                unresolved.account_identifier_hash.as_deref() != Some(account_hash)
-                    || exact_binding_count != 1
+                if unresolved.account_identifier_hash.as_deref() != Some(account_hash) {
+                    return true;
+                }
+                match unresolved.organization_identifier_hash.as_deref() {
+                    Some(organization) => organization != organization_hash,
+                    None => exact_binding_count != 1,
+                }
             });
         }
     }
@@ -9174,6 +9285,9 @@ fn derive_claude_account_anchor_coverage(
 
     let mut ambiguous = Vec::new();
     for unresolved in &status.unresolved_accounts {
+        if unresolved.organization_identifier_hash.is_some() {
+            continue;
+        }
         let Some(account_hash) = unresolved
             .account_identifier_hash
             .as_deref()
@@ -9196,6 +9310,34 @@ fn derive_claude_account_anchor_coverage(
                 observed_at: unresolved.observed_at.clone(),
             });
         }
+    }
+
+    // An exact Desktop folder pair without full limits is a connect target of
+    // its own. Its binding never replaces an anchored or default row.
+    for unresolved in &status.unresolved_accounts {
+        let Some(binding) = unresolved
+            .account_identifier_hash
+            .as_deref()
+            .and_then(|account| {
+                ClaudeStrongBinding::new(
+                    account,
+                    unresolved.organization_identifier_hash.as_deref()?,
+                )
+            })
+        else {
+            continue;
+        };
+        by_binding
+            .entry(binding.clone())
+            .or_insert_with(|| ClaudeAccountAnchorDescriptorV1 {
+                target_id: Some(claude_anchor_target_id(&binding)),
+                account_identifier_hash: binding.account_identifier_hash.clone(),
+                organization_identifier_hash: Some(binding.organization_identifier_hash.clone()),
+                durability: ClaudeAccountAnchorDurabilityV1::Unresolved,
+                health: None,
+                setup_blockers: Vec::new(),
+                observed_at: unresolved.observed_at.clone(),
+            });
     }
 
     if status.capacity.remaining_slots == 0 {
@@ -9306,13 +9448,19 @@ pub(crate) fn prune_claude_slot_collection_state(slot_id: &str) -> std::io::Resu
     write_persisted_claude_slot_collection_state(&persisted)
 }
 
+/// Desktop evidence for Claude accounts without full limits on this Mac.
+///
+/// Each qualified exact Desktop folder pair is its own row (with its
+/// organization hash, so it is a connect target) unless that exact pair has
+/// full limits. An account with no qualified pair keeps the account-only row.
 fn derive_unresolved_claude_accounts(
     desktop_snapshot: &AgentStatusSnapshot,
+    desktop_pairs: &ClaudeDesktopPairs,
     full_snapshots: &[AgentStatusSnapshot],
     current_slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
     now: OffsetDateTime,
 ) -> Vec<ClaudeUnresolvedAccountDescriptorV1> {
-    let mut resolved = full_snapshots
+    let mut full_accounts = full_snapshots
         .iter()
         .filter(|snapshot| {
             claude_has_account_windows(
@@ -9326,9 +9474,14 @@ fn derive_unresolved_claude_accounts(
             })
         })
         .filter_map(|snapshot| snapshot.account.as_ref())
-        .filter_map(|account| account.account_identifier_hash.clone())
-        .collect::<BTreeSet<_>>();
-    resolved.extend(
+        .filter_map(|account| {
+            Some((
+                account.account_identifier_hash.clone()?,
+                account.organization_identifier_hash.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    full_accounts.extend(
         read_persisted_claude_slot_collection_state()
             .slots
             .into_iter()
@@ -9339,8 +9492,70 @@ fn derive_unresolved_claude_accounts(
                     && state.has_account_windows
                     && state.has_scoped_limits
             })
-            .filter_map(|state| state.account_identifier_hash),
+            .filter_map(|state| {
+                Some((
+                    state.account_identifier_hash?,
+                    state.organization_identifier_hash,
+                ))
+            }),
     );
+    let resolved = full_accounts
+        .iter()
+        .map(|(account, _)| account.clone())
+        .collect::<BTreeSet<_>>();
+    let resolved_bindings = full_accounts
+        .iter()
+        .filter_map(|(account, organization)| {
+            ClaudeStrongBinding::new(account, organization.as_deref()?)
+        })
+        .collect::<BTreeSet<_>>();
+    let recent = |observed_at: &str| {
+        OffsetDateTime::parse(observed_at, &Rfc3339).is_ok_and(|observed| {
+            now.unix_timestamp() - observed.unix_timestamp()
+                <= CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS
+        })
+    };
+    let mut descriptors = desktop_pairs
+        .pairs
+        .iter()
+        .filter(|pair| !resolved_bindings.contains(&pair.binding))
+        .filter_map(|pair| {
+            let observed_at = pair.observation.observed_at.clone()?;
+            recent(&observed_at).then(|| {
+                let ClaudeStrongBinding {
+                    account_identifier_hash,
+                    organization_identifier_hash,
+                } = pair.binding.clone();
+                ClaudeUnresolvedAccountDescriptorV1 {
+                    unresolved_id: format!(
+                        "claude-unresolved-{}",
+                        &format!(
+                            "{:x}",
+                            Sha256::digest(
+                                format!(
+                                    "unresolved:{account_identifier_hash}:{organization_identifier_hash}"
+                                )
+                                .as_bytes()
+                            )
+                        )[..16]
+                    ),
+                    account_identifier_hash: Some(account_identifier_hash),
+                    organization_identifier_hash: Some(organization_identifier_hash),
+                    account_label: pair.observation.account_label.clone(),
+                    organization_label: pair.observation.organization_label.clone(),
+                    observed_at: Some(observed_at),
+                    evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+                }
+            })
+        })
+        .take(CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX)
+        .collect::<Vec<_>>();
+    // Only an emitted pair row stands in for its account's account-only row;
+    // a stale, resolved or capped-out pair must not hide recent evidence.
+    let pair_accounts = descriptors
+        .iter()
+        .filter_map(|descriptor| descriptor.account_identifier_hash.clone())
+        .collect::<BTreeSet<_>>();
     let mut by_hash = BTreeMap::<String, String>::new();
     for observation in &desktop_snapshot.plan_observations {
         if observation.evidence_method.as_deref() != Some("claude_desktop_session_bucket")
@@ -9351,7 +9566,10 @@ fn derive_unresolved_claude_accounts(
         let Some(account_hash) = observation.account_identifier_hash.as_ref() else {
             continue;
         };
-        if account_hash.is_empty() || resolved.contains(account_hash) {
+        if account_hash.is_empty()
+            || resolved.contains(account_hash)
+            || pair_accounts.contains(account_hash)
+        {
             continue;
         }
         let Some(observed_at) = observation.observed_at.clone() else {
@@ -9374,24 +9592,25 @@ fn derive_unresolved_claude_accounts(
             })
             .or_insert(observed_at);
     }
-    by_hash
-        .into_iter()
-        .map(|(account_hash, observed_at)| {
-            let unresolved_id = format!(
-                "claude-unresolved-{}",
-                &format!(
-                    "{:x}",
-                    Sha256::digest(format!("unresolved:{account_hash}").as_bytes())
-                )[..16]
-            );
-            ClaudeUnresolvedAccountDescriptorV1 {
-                unresolved_id,
-                account_identifier_hash: Some(account_hash),
-                observed_at: Some(observed_at),
-                evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
-            }
-        })
-        .collect()
+    descriptors.extend(by_hash.into_iter().map(|(account_hash, observed_at)| {
+        let unresolved_id = format!(
+            "claude-unresolved-{}",
+            &format!(
+                "{:x}",
+                Sha256::digest(format!("unresolved:{account_hash}").as_bytes())
+            )[..16]
+        );
+        ClaudeUnresolvedAccountDescriptorV1 {
+            unresolved_id,
+            account_identifier_hash: Some(account_hash),
+            organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
+            observed_at: Some(observed_at),
+            evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+        }
+    }));
+    descriptors
 }
 
 /// Takes the observations rather than recomputing them: the statusLine
@@ -9442,10 +9661,15 @@ fn claude_desktop_metadata_present(root: &Path) -> bool {
         || root.join("local-agent-mode-sessions").is_dir()
 }
 
+#[cfg(test)]
 fn claude_desktop_plan_observations_from_root(
     root: &Path,
     observed_at: &str,
 ) -> Vec<AgentStatusPlanObservation> {
+    claude_desktop_scan_from_root(root, observed_at).observations
+}
+
+fn claude_desktop_scan_from_root(root: &Path, observed_at: &str) -> ClaudeDesktopScan {
     let config = read_claude_desktop_config(root);
     let last_known_account_uuid = config
         .last_known_account_uuid
@@ -9453,16 +9677,21 @@ fn claude_desktop_plan_observations_from_root(
         .and_then(safe_local_identifier)
         .map(ToString::to_string);
     let mut builders: BTreeMap<String, ClaudeDesktopProfileBuilder> = BTreeMap::new();
+    let mut pair_builders: BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder> =
+        BTreeMap::new();
 
     collect_claude_desktop_code_sessions(
         &root.join("claude-code-sessions"),
         last_known_account_uuid.as_deref(),
         &mut builders,
+        &mut pair_builders,
     );
     collect_claude_desktop_agent_mode_sessions(
         &root.join("local-agent-mode-sessions"),
         &mut builders,
+        &mut pair_builders,
     );
+    let pairs = claude_desktop_qualified_pairs(pair_builders);
 
     let builders = builders
         .into_values()
@@ -9531,7 +9760,10 @@ fn claude_desktop_plan_observations_from_root(
         }
     }
 
-    observations
+    ClaudeDesktopScan {
+        observations,
+        pairs,
+    }
 }
 
 /// Returns only duplicated Desktop session IDs. A session is attributed when
@@ -9540,13 +9772,26 @@ fn claude_desktop_plan_observations_from_root(
 fn claude_desktop_unambiguous_duplicate_session_owners(
     builders: &[ClaudeDesktopProfileBuilder],
 ) -> BTreeMap<String, Option<(String, Option<i64>)>> {
-    let mut candidates: BTreeMap<String, Vec<(String, Option<i64>)>> = BTreeMap::new();
-    for builder in builders {
-        for (session_id, activity) in &builder.session_activity_by_id {
+    claude_desktop_duplicate_session_owners(builders.iter().map(|builder| {
+        (
+            builder.account_uuid.clone(),
+            &builder.session_activity_by_id,
+        )
+    }))
+}
+
+/// The same rule over any bucket key: Desktop account buckets for the
+/// per-account readings, exact account/organization folders for pairs.
+fn claude_desktop_duplicate_session_owners<'a, K: Clone + PartialEq>(
+    buckets: impl IntoIterator<Item = (K, &'a BTreeMap<String, Option<i64>>)>,
+) -> BTreeMap<String, Option<(K, Option<i64>)>> {
+    let mut candidates: BTreeMap<String, Vec<(K, Option<i64>)>> = BTreeMap::new();
+    for (key, sessions) in buckets {
+        for (session_id, activity) in sessions {
             candidates
                 .entry(session_id.clone())
                 .or_default()
-                .push((builder.account_uuid.clone(), *activity));
+                .push((key.clone(), *activity));
         }
     }
 
@@ -9585,6 +9830,7 @@ fn collect_claude_desktop_code_sessions(
     root: &Path,
     last_known_account_uuid: Option<&str>,
     builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
+    pair_builders: &mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
 ) {
     let Ok(accounts) = fs::read_dir(root) else {
         return;
@@ -9638,16 +9884,20 @@ fn collect_claude_desktop_code_sessions(
                 .take(CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG)
             {
                 let metadata = read_json_file::<ClaudeDesktopCodeSessionMetadata>(&file.path());
-                let activity = metadata
-                    .as_ref()
-                    .and_then(|metadata| {
-                        timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
-                            .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
-                    })
-                    .or_else(|| file_modified_epoch_seconds(&file.path()));
+                let metadata_activity = metadata.as_ref().and_then(|metadata| {
+                    timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
+                        .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
+                });
+                let activity =
+                    metadata_activity.or_else(|| file_modified_epoch_seconds(&file.path()));
+                let imported = metadata.as_ref().is_some_and(|metadata| metadata.imported);
                 let session_id = metadata
                     .and_then(|metadata| metadata.cli_session_id)
                     .and_then(|value| safe_local_identifier(&value).map(ToString::to_string));
+                if let Some(session_id) = session_id.as_deref() {
+                    claude_desktop_pair_builder(pair_builders, &account_uuid, &org_uuid)
+                        .record_session(session_id, activity, metadata_activity, imported);
+                }
                 let builder = builders.get_mut(&account_uuid).expect("builder exists");
                 builder.code_session_count += 1;
                 if builder.record_activity(activity, session_id)
@@ -9663,6 +9913,7 @@ fn collect_claude_desktop_code_sessions(
 fn collect_claude_desktop_agent_mode_sessions(
     root: &Path,
     builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
+    pair_builders: &mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
 ) {
     let Ok(accounts) = fs::read_dir(root) else {
         return;
@@ -9706,7 +9957,7 @@ fn collect_claude_desktop_agent_mode_sessions(
                     ..Default::default()
                 }
             });
-            builder.organization_uuids.insert(org_uuid);
+            builder.organization_uuids.insert(org_uuid.clone());
             let Ok(files) = fs::read_dir(org.path()) else {
                 continue;
             };
@@ -9728,6 +9979,13 @@ fn collect_claude_desktop_agent_mode_sessions(
                     .as_deref()
                     .and_then(safe_local_identifier)
                     .map(ToString::to_string);
+                // Agent-mode sessions compete for duplicate-session ownership
+                // and label their own folder pair, but never qualify one.
+                let pair = claude_desktop_pair_builder(pair_builders, &account_uuid, &org_uuid);
+                if let Some(session_id) = session_id.as_deref() {
+                    pair.record_session(session_id, activity, None, true);
+                }
+                pair.record_agent_mode_metadata(&metadata);
                 let builder = builders.get_mut(&account_uuid).expect("builder exists");
                 builder.agent_mode_session_count += 1;
                 builder.record_activity(activity, session_id);
@@ -9797,13 +10055,7 @@ fn claude_desktop_builder_plan_observation(
         return None;
     }
     let plan_type = builder.plan_type;
-    let subscription_product = plan_type.clone().map(|plan| {
-        if plan.starts_with("claude_") {
-            plan
-        } else {
-            format!("claude_{plan}")
-        }
-    });
+    let subscription_product = plan_type.clone().map(claude_desktop_subscription_product);
     let is_current = last_known_account_uuid == Some(builder.account_uuid.as_str());
     let activity_observed_at = builder
         .latest_activity_epoch_seconds
@@ -9842,6 +10094,370 @@ fn claude_desktop_builder_plan_observation(
         },
         is_current: Some(is_current),
     })
+}
+
+fn claude_desktop_subscription_product(plan: String) -> String {
+    if plan.starts_with("claude_") {
+        plan
+    } else {
+        format!("claude_{plan}")
+    }
+}
+
+/// Qualify each exact Desktop folder pair and describe it.
+///
+/// A pair qualifies only with at least one native (never imported) Code
+/// session that carries a parseable activity time and that this folder owns:
+/// a session copied into several folders counts only for the folder with its
+/// unambiguously newest activity, and a tie or a missing time counts for none.
+/// Ownership is decided over every Desktop folder pair the scan saw, Code and
+/// agent-mode, UUID-named or not, so no copy the per-account rule sees is
+/// ignored here. Imported-only and ambiguous copied evidence therefore never
+/// makes a pair. `observed_at` is the newest qualifying native activity, and
+/// the pair's session is that activity's session. No organization is ever
+/// chosen for an account: every folder speaks only for itself.
+fn claude_desktop_qualified_pairs(
+    pair_builders: BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
+) -> ClaudeDesktopPairs {
+    let owners = claude_desktop_duplicate_session_owners(
+        pair_builders
+            .iter()
+            .map(|(key, pair)| (key.clone(), &pair.session_activity_by_id)),
+    );
+    let owns = |key: &ClaudeDesktopPairKey, session_id: &str| match owners.get(session_id) {
+        None => true,
+        Some(owner) => owner.as_ref().is_some_and(|(owner, _)| owner == key),
+    };
+    let mut qualified = pair_builders
+        .into_iter()
+        .filter(|(_, pair)| pair.exact)
+        .filter_map(|(key, pair)| {
+            let newest = pair
+                .native_activity_by_id
+                .iter()
+                .filter(|(session_id, _)| owns(&key, session_id.as_str()))
+                .map(|(session_id, activity)| (*activity, session_id.clone()))
+                .max()?;
+            Some((key, newest, pair))
+        })
+        .collect::<Vec<_>>();
+    // Newest first; equal activity falls back to the pair so every pass with
+    // the same folders orders them the same way.
+    qualified.sort_by(
+        |(left_key, (left_activity, _), _), (right_key, (right_activity, _), _)| {
+            right_activity
+                .cmp(left_activity)
+                .then_with(|| left_key.cmp(right_key))
+        },
+    );
+    let mut pairs = Vec::with_capacity(qualified.len());
+    let mut index_by_key = BTreeMap::new();
+    for (key, (activity, session_id), pair) in qualified {
+        if let Some(observation) =
+            claude_desktop_pair_observation(&key, &pair, activity, session_id)
+        {
+            index_by_key.insert(key, pairs.len());
+            pairs.push(observation);
+        }
+    }
+
+    let mut owned_duplicates = owners
+        .into_iter()
+        .filter_map(|(session_id, owner)| {
+            let (key, activity) = owner?;
+            Some((session_id, *index_by_key.get(&key)?, activity?))
+        })
+        .collect::<Vec<_>>();
+    owned_duplicates.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+    let duplicate_sessions = owned_duplicates
+        .into_iter()
+        .filter_map(|(session_id, index, activity)| {
+            let pair: &ClaudeDesktopPairObservation = &pairs[index];
+            if pair.observation.source_session_id.as_deref() == Some(session_id.as_str()) {
+                return None;
+            }
+            let mut duplicate = pair.clone();
+            duplicate.observation.source_session_id = Some(session_id);
+            duplicate.observation.observed_at = u64::try_from(activity)
+                .ok()
+                .and_then(rfc3339_from_unix_seconds);
+            Some(duplicate)
+        })
+        .take(CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX)
+        .collect();
+    ClaudeDesktopPairs {
+        pairs,
+        duplicate_sessions,
+    }
+}
+
+/// One exact Desktop folder pair as a plan observation: raw canonical account
+/// and organization UUIDs with their hashes, so the backend can rebuild the
+/// same pair the session evidence carries. Plan and labels only when that
+/// folder's own agent-mode metadata states them.
+///
+/// Never `is_current`: the backend turns a current observation into a current
+/// account row keyed by the same account and organization as a login's
+/// metered row, so a meterless Desktop reading would replace those meters
+/// whenever the login is not uploaded. A non-current reading still carries
+/// the exact pair.
+fn claude_desktop_pair_observation(
+    (account_id, organization_id): &ClaudeDesktopPairKey,
+    pair: &ClaudeDesktopPairBuilder,
+    activity: i64,
+    session_id: String,
+) -> Option<ClaudeDesktopPairObservation> {
+    let account_identifier_hash = billing_identity_hash("anthropic", "account", account_id)?;
+    let organization_identifier_hash =
+        billing_identity_hash("anthropic", "organization", organization_id)?;
+    let binding =
+        ClaudeStrongBinding::new(&account_identifier_hash, &organization_identifier_hash)?;
+    let account_identifier_hash = Some(account_identifier_hash);
+    let organization_identifier_hash = Some(organization_identifier_hash);
+    let billing_identity_evidence = billing_identity_evidence_for(
+        &account_identifier_hash,
+        &organization_identifier_hash,
+        &None,
+    );
+    Some(ClaudeDesktopPairObservation {
+        binding,
+        observation: AgentStatusPlanObservation {
+            observed_at: u64::try_from(activity)
+                .ok()
+                .and_then(rfc3339_from_unix_seconds),
+            evidence_method: Some("claude_desktop_session_bucket".to_string()),
+            source_session_id: Some(session_id),
+            provider: Some("anthropic".to_string()),
+            billing_provider: Some("anthropic".to_string()),
+            model_provider: Some("anthropic".to_string()),
+            billing_channel: Some("subscription".to_string()),
+            auth_mode: Some("claude_desktop".to_string()),
+            gateway_provider: None,
+            subscription_product: pair
+                .plan_type
+                .clone()
+                .map(claude_desktop_subscription_product),
+            plan_type: pair.plan_type.clone(),
+            account_label: pair
+                .account_label
+                .clone()
+                .or_else(|| pair.account_name.clone()),
+            account_id: Some(account_id.clone()),
+            organization_label: pair.organization_label.clone(),
+            organization_id: Some(organization_id.clone()),
+            account_identifier_hash,
+            organization_identifier_hash,
+            superseded_account_identifier_hash: None,
+            superseded_organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence,
+            billing_identity_confidence: AgentStatusConfidence::High,
+            confidence: AgentStatusConfidence::Medium,
+            is_current: Some(false),
+        },
+    })
+}
+
+/// The Claude Desktop pair status for this pass: one `claude_code` snapshot
+/// whose plan observations are the exact Desktop folder pairs that no other
+/// upload of this pass already carries (its strong account binding, or a plan
+/// observation with both hashes). On a Mac without an uploadable Claude Code
+/// login that is every pair; beside uploaded logins it is only the rest.
+///
+/// It has no root account, so it never stands in for a login or its meters,
+/// and it reports usage as unsupported. Pairs come newest first within the
+/// backend's per-snapshot observation limit; the duplicate sessions they own
+/// fill what is left, and anything left out is disclosed.
+fn claude_desktop_pairs_snapshot(
+    desktop: &ClaudeDesktopPairs,
+    uploads: &[AgentStatusSnapshot],
+    captured_at: &str,
+    expires_at: &str,
+) -> Option<AgentStatusSnapshot> {
+    let exact_binding = |account: Option<&String>, organization: Option<&String>| {
+        ClaudeStrongBinding::new(account?.as_str(), organization?.as_str())
+    };
+    let mut covered = BTreeSet::new();
+    let mut uploaded_sessions = BTreeSet::new();
+    for snapshot in uploads {
+        if let Some(account) = snapshot.account.as_ref() {
+            covered.extend(exact_binding(
+                account.account_identifier_hash.as_ref(),
+                account.organization_identifier_hash.as_ref(),
+            ));
+        }
+        for observation in &snapshot.plan_observations {
+            covered.extend(exact_binding(
+                observation.account_identifier_hash.as_ref(),
+                observation.organization_identifier_hash.as_ref(),
+            ));
+            uploaded_sessions.extend(observation.source_session_id.clone());
+        }
+    }
+    let uncovered = desktop
+        .pairs
+        .iter()
+        .filter(|pair| !covered.contains(&pair.binding))
+        .collect::<Vec<_>>();
+    if uncovered.is_empty() {
+        return None;
+    }
+    let mut plan_observations = Vec::with_capacity(CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX);
+    let mut emitted = BTreeSet::new();
+    for pair in uncovered.iter().take(CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX) {
+        plan_observations.push(pair.observation.clone());
+        emitted.insert(&pair.binding);
+    }
+    let left_out_pairs = uncovered.len() - plan_observations.len();
+    let duplicates = desktop
+        .duplicate_sessions
+        .iter()
+        .filter(|duplicate| {
+            emitted.contains(&duplicate.binding)
+                && duplicate
+                    .observation
+                    .source_session_id
+                    .as_ref()
+                    .is_some_and(|session_id| !uploaded_sessions.contains(session_id))
+        })
+        .collect::<Vec<_>>();
+    let room = CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX - plan_observations.len();
+    let left_out_duplicates = duplicates.len().saturating_sub(room);
+    plan_observations.extend(
+        duplicates
+            .into_iter()
+            .take(room)
+            .map(|duplicate| duplicate.observation.clone()),
+    );
+
+    let mut snapshot = base_snapshot(
+        SourceKind::ClaudeCode,
+        AgentStatusState::Available,
+        AgentStatusCollectionMethod::CommandProbe,
+        captured_at.to_string(),
+        expires_at.to_string(),
+    );
+    snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+    snapshot.capabilities = vec![
+        supported_capability(
+            "desktop_identity",
+            "Read display-safe Claude Desktop account/organization session-folder metadata.",
+        ),
+        unsupported_capability(
+            "quota_windows",
+            "Claude Desktop session folders carry no usage limits; a Claude Code login for the account is needed to show them.",
+        ),
+    ];
+    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+        "claude_desktop_profile_detected",
+        AgentDiagnosticSeverity::Info,
+        "Claude Desktop Code account/session bucket metadata was detected.",
+    ));
+    snapshot.diagnostics.push(if uploads.is_empty() {
+        AgentStatusDiagnostic::source(
+            "claude_desktop_only_no_cli_login",
+            AgentDiagnosticSeverity::Info,
+            "No Claude Code login on this Mac can be uploaded; Claude Desktop account/organization folders are reported without limits.",
+        )
+    } else {
+        AgentStatusDiagnostic::source(
+            "claude_desktop_uncovered_pairs",
+            AgentDiagnosticSeverity::Info,
+            "Claude Desktop account/organization folders that no uploaded Claude Code login covers are reported without limits.",
+        )
+    });
+    if left_out_pairs + left_out_duplicates > 0 {
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "claude_desktop_pairs_truncated",
+            AgentDiagnosticSeverity::Warning,
+            format!(
+                "{left_out_pairs} Claude Desktop folder pair(s) and {left_out_duplicates} duplicate-session reading(s) were left out to stay within the upload limit; the newest were kept."
+            ),
+        ));
+    }
+    snapshot.plan_observations = plan_observations;
+    Some(snapshot)
+}
+
+/// Append this pass's Desktop pair status to the Claude uploads, after every
+/// login and degraded snapshot so coverage is computed from what actually
+/// uploads. The uploads already present are never changed.
+fn append_claude_desktop_pairs_snapshot(
+    snapshots: &mut Vec<AgentStatusSnapshot>,
+    desktop: &ClaudeDesktopPairs,
+    captured_at: &str,
+    expires_at: &str,
+) {
+    if !CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED {
+        return;
+    }
+    let Some(snapshot) = claude_desktop_pairs_snapshot(desktop, snapshots, captured_at, expires_at)
+    else {
+        return;
+    };
+    // One more snapshot past the backend's per-upload limit would refuse every
+    // Claude upload of the pass, the metered ones included.
+    if snapshots.len() < AGENT_STATUS_UPLOAD_SNAPSHOT_MAX {
+        snapshots.push(snapshot);
+    } else {
+        eprintln!("claude_status desktop_pairs=withheld reason=upload_snapshot_limit");
+    }
+}
+
+impl ClaudeDesktopPairBuilder {
+    fn record_session(
+        &mut self,
+        session_id: &str,
+        activity: Option<i64>,
+        metadata_activity: Option<i64>,
+        imported: bool,
+    ) {
+        let recorded = self
+            .session_activity_by_id
+            .entry(session_id.to_string())
+            .or_insert(activity);
+        if activity.is_some_and(|next| recorded.map_or(true, |current| next > current)) {
+            *recorded = activity;
+        }
+        if let (false, Some(activity)) = (imported, metadata_activity) {
+            let native = self
+                .native_activity_by_id
+                .entry(session_id.to_string())
+                .or_insert(activity);
+            *native = (*native).max(activity);
+        }
+    }
+
+    fn record_agent_mode_metadata(&mut self, metadata: &ClaudeDesktopAgentModeSessionMetadata) {
+        self.account_label = self.account_label.take().or_else(|| {
+            first_non_empty([
+                metadata.email_address.as_deref(),
+                metadata.account_email.as_deref(),
+                metadata.email.as_deref(),
+            ])
+            .map(ToString::to_string)
+        });
+        self.account_name = self
+            .account_name
+            .take()
+            .or_else(|| safe_display_label(metadata.account_name.as_deref()));
+        self.organization_label = self.organization_label.take().or_else(|| {
+            first_non_empty([
+                metadata.organization_name.as_deref(),
+                metadata.workspace_name.as_deref(),
+                metadata.team_name.as_deref(),
+            ])
+            .and_then(|value| safe_display_label(Some(value)))
+        });
+        self.plan_type = self.plan_type.take().or_else(|| {
+            first_non_empty([
+                metadata.subscription_type.as_deref(),
+                metadata.plan_type.as_deref(),
+                metadata.plan.as_deref(),
+            ])
+            .map(|value| normalize_plan_type(value.to_string()))
+        });
+    }
 }
 
 impl ClaudeDesktopProfileBuilder {
@@ -28364,6 +28980,355 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn claude_desktop_pairs_are_exact_native_uuid_folders() {
+        let root =
+            std::env::temp_dir().join(format!("ottto-claude-desktop-pairs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let (current, other, imported, tied) = (uuid(1), uuid(2), uuid(3), uuid(4));
+        let (org_x, org_y, org_z, org_w) = (uuid(11), uuid(12), uuid(13), uuid(14));
+        let (contested, agent_copied) = (uuid(5), uuid(6));
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("config.json"),
+            format!(r#"{{"lastKnownAccountUuid":"{current}"}}"#),
+        )
+        .expect("write config");
+        let write = |store: &str, account: &str, org: &str, file: &str, body: String| {
+            let directory = root.join(store).join(account).join(org);
+            std::fs::create_dir_all(&directory).expect("create bucket");
+            std::fs::write(directory.join(file), body).expect("write metadata");
+        };
+        let session = |id: &str, activity: i64| {
+            format!(r#"{{"cliSessionId":"{id}","lastActivityAt":{activity}}}"#)
+        };
+        let code = "claude-code-sessions";
+        // The current account, plus a non-current account with two orgs.
+        write(
+            code,
+            &current,
+            &org_x,
+            "local_a.json",
+            session("current-x", 300),
+        );
+        write(
+            code,
+            &other,
+            &org_y,
+            "local_b.json",
+            session("other-y", 200),
+        );
+        write(
+            code,
+            &other,
+            &org_z,
+            "local_c.json",
+            session("other-z", 100),
+        );
+        // Labels come only from the pair's own agent-mode folder.
+        write(
+            "local-agent-mode-sessions",
+            &other,
+            &org_y,
+            "local_label.json",
+            r#"{"emailAddress":"other@example.com","organizationName":"Org Y"}"#.to_string(),
+        );
+        // Imported-only (any importedFrom, null included) is not a pair.
+        write(
+            code,
+            &imported,
+            &org_w,
+            "local_d.json",
+            r#"{"cliSessionId":"copied","lastActivityAt":250,"importedFrom":null}"#.to_string(),
+        );
+        // A tied copy witnesses neither folder; `other`/Y still has its own.
+        write(code, &tied, &org_w, "local_e.json", session("tied", 120));
+        write(code, &other, &org_y, "local_f.json", session("tied", 120));
+        // Non-UUID folders keep their account reading but never form a pair.
+        write(
+            code,
+            "legacy-account",
+            "legacy-org",
+            "local_g.json",
+            session("legacy", 400),
+        );
+        // Copies the per-account rule sees also decide pair ownership: a tie
+        // with a non-UUID folder, and a newer agent-mode copy elsewhere.
+        write(
+            code,
+            &contested,
+            &org_w,
+            "local_h.json",
+            session("contested", 130),
+        );
+        write(
+            code,
+            "legacy-account",
+            "legacy-org",
+            "local_i.json",
+            session("contested", 130),
+        );
+        write(
+            code,
+            &agent_copied,
+            &org_w,
+            "local_j.json",
+            session("agent-copied", 140),
+        );
+        write(
+            "local-agent-mode-sessions",
+            &other,
+            &org_y,
+            "local_k.json",
+            session("agent-copied", 500),
+        );
+
+        let scan = claude_desktop_scan_from_root(&root, "2026-08-12T08:00:00Z");
+        let pairs = scan
+            .pairs
+            .pairs
+            .iter()
+            .map(|pair| &pair.observation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| (pair.account_id.clone(), pair.organization_id.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(current.clone()), Some(org_x.clone())),
+                (Some(other.clone()), Some(org_y.clone())),
+                (Some(other.clone()), Some(org_z.clone())),
+            ],
+            "newest first; imported-only, tied, outranked and non-UUID folders are not pairs"
+        );
+        for pair in &pairs {
+            assert_eq!(
+                pair.account_identifier_hash,
+                billing_identity_hash("anthropic", "account", pair.account_id.as_deref().unwrap())
+            );
+            assert_eq!(
+                pair.organization_identifier_hash,
+                billing_identity_hash(
+                    "anthropic",
+                    "organization",
+                    pair.organization_id.as_deref().unwrap()
+                )
+            );
+            assert_eq!(
+                pair.billing_identity_confidence,
+                AgentStatusConfidence::High
+            );
+            assert_eq!(pair.plan_type, None);
+            // Never current: a current reading would replace a login's
+            // metered row for the same pair on the backend.
+            assert_eq!(pair.is_current, Some(false));
+        }
+        assert_eq!(pairs[0].source_session_id.as_deref(), Some("current-x"));
+        assert_eq!(pairs[1].account_label.as_deref(), Some("other@example.com"));
+        assert_eq!(pairs[1].organization_label.as_deref(), Some("Org Y"));
+        assert_eq!(pairs[2].account_label, None);
+        assert_eq!(pairs[2].organization_label, None);
+        assert!(scan
+            .observations
+            .iter()
+            .any(|observation| observation.account_id.as_deref() == Some("legacy-account")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_desktop_pairs_snapshot_sends_only_uncovered_pairs_within_upload_limits() {
+        let pair = |n: u32| {
+            claude_desktop_pair_observation(
+                &(
+                    format!("00000000-0000-4000-8000-{n:012}"),
+                    format!("00000000-0000-4000-9000-{n:012}"),
+                ),
+                &ClaudeDesktopPairBuilder::default(),
+                1_786_000_000 - i64::from(n),
+                format!("session-{n}"),
+            )
+            .expect("pair")
+        };
+        let mut duplicate = pair(0);
+        duplicate.observation.source_session_id = Some("duplicate-0".to_string());
+        let desktop = ClaudeDesktopPairs {
+            pairs: (0..22).map(pair).collect(),
+            duplicate_sessions: vec![duplicate],
+        };
+        let at = "2026-08-12T08:00:00Z";
+        let until = "2026-08-12T08:15:00Z";
+
+        // Desktop only: newest 20 pairs fill the backend's observation limit.
+        let mut uploads = Vec::new();
+        append_claude_desktop_pairs_snapshot(&mut uploads, &desktop, at, until);
+        assert_eq!(uploads.len(), 1);
+        let only = &uploads[0];
+        assert_eq!(only.source, SourceKind::ClaudeCode);
+        assert!(
+            only.account.is_none(),
+            "a Desktop pair never becomes the root account"
+        );
+        assert_eq!(only.quota_windows, vec![unsupported_quota_window("usage")]);
+        assert_eq!(
+            only.plan_observations.len(),
+            CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX
+        );
+        assert_eq!(
+            only.plan_observations[0].source_session_id.as_deref(),
+            Some("session-0")
+        );
+        let codes = |snapshot: &AgentStatusSnapshot| {
+            snapshot
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(codes(only).contains(&"claude_desktop_only_no_cli_login".to_string()));
+        assert!(codes(only).contains(&"claude_desktop_pairs_truncated".to_string()));
+
+        // Beside an uploaded login: the pairs it carries (root binding or an
+        // exact plan observation) are subtracted, nothing else, and the login
+        // snapshot is left exactly as it was.
+        let mut metered = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            at.to_string(),
+            until.to_string(),
+        );
+        let mut account = unsupported_account("anthropic");
+        account.account_identifier_hash =
+            Some(desktop.pairs[0].binding.account_identifier_hash.clone());
+        account.organization_identifier_hash = Some(
+            desktop.pairs[0]
+                .binding
+                .organization_identifier_hash
+                .clone(),
+        );
+        metered.account = Some(account);
+        metered.plan_observations = vec![desktop.pairs[1].observation.clone()];
+        let mut uploads = vec![metered.clone()];
+        append_claude_desktop_pairs_snapshot(&mut uploads, &desktop, at, until);
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0], metered);
+        let mixed = &uploads[1];
+        assert_eq!(
+            mixed.plan_observations.len(),
+            CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX
+        );
+        assert_eq!(
+            mixed.plan_observations[0].source_session_id.as_deref(),
+            Some("session-2")
+        );
+        assert!(!mixed
+            .plan_observations
+            .iter()
+            .any(|observation| observation.source_session_id.as_deref() == Some("duplicate-0")));
+        assert!(codes(mixed).contains(&"claude_desktop_uncovered_pairs".to_string()));
+
+        // A full upload batch is never pushed past the backend's limit.
+        let mut full = vec![metered; AGENT_STATUS_UPLOAD_SNAPSHOT_MAX];
+        append_claude_desktop_pairs_snapshot(&mut full, &desktop, at, until);
+        assert_eq!(full.len(), AGENT_STATUS_UPLOAD_SNAPSHOT_MAX);
+
+        // Every pair covered: no Desktop status at all.
+        let mut covered = vec![uploads[1].clone()];
+        let covered_desktop = ClaudeDesktopPairs {
+            pairs: desktop.pairs[2..22].to_vec(),
+            duplicate_sessions: Vec::new(),
+        };
+        append_claude_desktop_pairs_snapshot(&mut covered, &covered_desktop, at, until);
+        assert_eq!(covered.len(), 1);
+    }
+
+    #[test]
+    fn claude_desktop_pairs_upload_appends_beside_an_unchanged_metered_login() {
+        let pair = |n: u32| {
+            claude_desktop_pair_observation(
+                &(
+                    format!("00000000-0000-4000-8000-{n:012}"),
+                    format!("00000000-0000-4000-9000-{n:012}"),
+                ),
+                &ClaudeDesktopPairBuilder::default(),
+                1_786_000_000 - i64::from(n),
+                format!("session-{n}"),
+            )
+            .expect("pair")
+        };
+        let desktop = ClaudeDesktopPairs {
+            pairs: vec![pair(0), pair(1)],
+            duplicate_sessions: Vec::new(),
+        };
+        let covered = desktop.pairs[0].binding.clone();
+        let at = "2026-08-12T08:00:00Z";
+        let until = "2026-08-12T08:15:00Z";
+
+        // An ordinary metered login for pair 0, with its current plan reading.
+        let mut metered = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            at.to_string(),
+            until.to_string(),
+        );
+        let mut account = unsupported_account("anthropic");
+        account.account_identifier_hash = Some(covered.account_identifier_hash.clone());
+        account.organization_identifier_hash = Some(covered.organization_identifier_hash.clone());
+        metered.account = Some(account);
+        metered.quota_windows = claude_oauth_quota_windows(&serde_json::json!({
+            "five_hour": {"utilization": 24.0, "resets_at": "2026-08-12T10:00:00+00:00"},
+            "seven_day": {"utilization": 72.0, "resets_at": "2026-08-15T05:00:00+00:00"}
+        }));
+        let mut current = desktop.pairs[0].observation.clone();
+        current.evidence_method =
+            Some(collection_method_key(&AgentStatusCollectionMethod::CliJson).to_string());
+        current.source_session_id = Some("login-session".to_string());
+        current.is_current = Some(true);
+        metered.plan_observations = vec![current];
+        let mut uploads = vec![metered.clone()];
+
+        append_claude_desktop_pairs_snapshot(&mut uploads, &desktop, at, until);
+
+        // The pass's upload path appends the pair status; the login is untouched.
+        assert_eq!(uploads.len(), 2, "the Desktop pair status uploads");
+        assert_eq!(uploads[0], metered);
+        let pairs = &uploads[1];
+        assert_eq!(pairs.source, SourceKind::ClaudeCode);
+        assert!(pairs.account.is_none());
+        assert_eq!(pairs.quota_windows, vec![unsupported_quota_window("usage")]);
+        assert!(pairs.credit_balances.is_empty());
+        // Only the uncovered pair, never current: the covered pair is not
+        // uploaded twice and no Desktop reading competes with the meters.
+        assert_eq!(
+            pairs.plan_observations,
+            vec![desktop.pairs[1].observation.clone()]
+        );
+        assert!(pairs
+            .plan_observations
+            .iter()
+            .all(|observation| observation.is_current == Some(false)));
+        let carries_covered = |snapshot: &AgentStatusSnapshot| {
+            snapshot.plan_observations.iter().any(|observation| {
+                observation.account_identifier_hash.as_deref()
+                    == Some(covered.account_identifier_hash.as_str())
+                    && observation.organization_identifier_hash.as_deref()
+                        == Some(covered.organization_identifier_hash.as_str())
+            })
+        };
+        assert!(!carries_covered(pairs));
+        assert_eq!(
+            uploads
+                .iter()
+                .filter(|snapshot| carries_covered(snapshot))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn claude_desktop_duplicate_session_owner_fails_closed_on_tie() {
         let builders = vec![
             ClaudeDesktopProfileBuilder {
@@ -32883,6 +33848,86 @@ for line in sys.stdin:
         let coverage = derive_claude_account_anchor_coverage(&status);
         assert_eq!(coverage.default_only_accounts, 1);
         assert_eq!(coverage.capacity_blocked_accounts, 1);
+
+        // An exact Desktop pair without full limits is a target of its own:
+        // the target-bound login then expects that account AND organization.
+        // A pair that is already anchored stays the anchor.
+        status.capacity.remaining_slots = 4;
+        let desktop_pair =
+            |account: &str, organization: &str| ClaudeUnresolvedAccountDescriptorV1 {
+                unresolved_id: format!("claude-unresolved-{account}-{organization}"),
+                account_identifier_hash: Some(account.to_string()),
+                organization_identifier_hash: Some(organization.to_string()),
+                account_label: None,
+                organization_label: None,
+                observed_at: Some("2026-08-23T00:00:00Z".to_string()),
+                evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+            };
+        // Two organizations of one account are two targets; an account-only
+        // row keeps today's shape: no organization, no target, ambiguous.
+        status.unresolved_accounts = vec![
+            desktop_pair("account-1", "organization-desktop"),
+            desktop_pair("account-1", "organization-desktop-2"),
+            desktop_pair("account-0", "organization-0"),
+            ClaudeUnresolvedAccountDescriptorV1 {
+                organization_identifier_hash: None,
+                ..desktop_pair("account-legacy", "unused")
+            },
+        ];
+        let coverage = derive_claude_account_anchor_coverage(&status);
+        assert_eq!(coverage.observed_accounts, 9);
+        assert_eq!(coverage.anchored_accounts, 5);
+        assert_eq!(coverage.unresolved_accounts, 3);
+        assert_eq!(coverage.ambiguous_identity_accounts, 1);
+        let legacy = coverage
+            .accounts
+            .iter()
+            .find(|account| account.account_identifier_hash == "account-legacy")
+            .expect("account-only row");
+        assert_eq!(legacy.target_id, None);
+        assert_eq!(legacy.organization_identifier_hash, None);
+        assert_eq!(
+            legacy.setup_blockers,
+            vec![ClaudeAccountAnchorSetupBlockerV1::AmbiguousIdentity]
+        );
+        let second =
+            ClaudeStrongBinding::new("account-1", "organization-desktop-2").expect("binding");
+        let pair_targets = coverage
+            .accounts
+            .iter()
+            .filter(|account| account.account_identifier_hash == "account-1")
+            .filter(|account| account.durability == ClaudeAccountAnchorDurabilityV1::Unresolved)
+            .map(|account| account.target_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(pair_targets.len(), 2);
+        assert!(pair_targets.contains(&Some(claude_anchor_target_id(&second))));
+        let exact = ClaudeStrongBinding::new("account-1", "organization-desktop").expect("binding");
+        let target = coverage
+            .accounts
+            .iter()
+            .find(|account| {
+                account.organization_identifier_hash.as_deref() == Some("organization-desktop")
+            })
+            .expect("exact desktop pair target");
+        assert_eq!(
+            target.durability,
+            ClaudeAccountAnchorDurabilityV1::Unresolved
+        );
+        assert_eq!(target.target_id, Some(claude_anchor_target_id(&exact)));
+        assert_eq!(target.health, None);
+        assert!(target.setup_blockers.is_empty());
+        // No slot left: a pair target is blocked, never silently connectable.
+        status.capacity.remaining_slots = 0;
+        let coverage = derive_claude_account_anchor_coverage(&status);
+        for account in coverage.accounts.iter().filter(|account| {
+            account.durability == ClaudeAccountAnchorDurabilityV1::Unresolved
+                && account.target_id.is_some()
+        }) {
+            assert_eq!(
+                account.setup_blockers,
+                vec![ClaudeAccountAnchorSetupBlockerV1::CapacityReached]
+            );
+        }
     }
 
     #[test]
@@ -35024,7 +36069,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         ];
         let unresolved = derive_unresolved_claude_accounts(
             &desktop,
-            &[full],
+            &ClaudeDesktopPairs::default(),
+            &[full.clone()],
             &BTreeMap::new(),
             OffsetDateTime::parse("2026-08-04T10:00:00Z", &Rfc3339).expect("fixed now"),
         );
@@ -35033,10 +36079,83 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             unresolved[0].account_identifier_hash.as_deref(),
             Some("strong-unresolved")
         );
+        assert_eq!(unresolved[0].organization_identifier_hash, None);
         assert_eq!(
             unresolved[0].evidence,
             vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession]
         );
+
+        // Exact Desktop folder pairs: full limits resolve only their own exact
+        // pair, so the account's other organization stays a connect row, and
+        // the account-only row gives way to the exact ones.
+        full.account
+            .as_mut()
+            .expect("full account")
+            .organization_identifier_hash = Some("resolved-org".to_string());
+        let pair = |account: &str, organization: &str| ClaudeDesktopPairObservation {
+            binding: ClaudeStrongBinding::new(account, organization).expect("binding"),
+            observation: AgentStatusPlanObservation {
+                account_identifier_hash: Some(account.to_string()),
+                organization_identifier_hash: Some(organization.to_string()),
+                ..observation(Some(account), AgentStatusConfidence::High)
+            },
+        };
+        let mut pairs = ClaudeDesktopPairs {
+            pairs: vec![
+                pair("resolved", "resolved-org"),
+                pair("resolved", "other-org"),
+                pair("strong-unresolved", "unresolved-org"),
+            ],
+            duplicate_sessions: Vec::new(),
+        };
+        pairs.pairs[1].observation.organization_label = Some("Other org".to_string());
+        let unresolved = derive_unresolved_claude_accounts(
+            &desktop,
+            &pairs,
+            &[full],
+            &BTreeMap::new(),
+            OffsetDateTime::parse("2026-08-04T10:00:00Z", &Rfc3339).expect("fixed now"),
+        );
+        assert_eq!(
+            unresolved
+                .iter()
+                .map(|row| (
+                    row.account_identifier_hash.as_deref(),
+                    row.organization_identifier_hash.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("resolved"), Some("other-org")),
+                (Some("strong-unresolved"), Some("unresolved-org")),
+            ]
+        );
+        // Labels are the pair's own, display only.
+        assert_eq!(
+            unresolved[0].organization_label.as_deref(),
+            Some("Other org")
+        );
+        assert_eq!(unresolved[1].organization_label, None);
+
+        // A pair too old for a connect row does not hide the account's recent
+        // account-only row.
+        pairs
+            .pairs
+            .retain(|pair| pair.binding.account_identifier_hash == "strong-unresolved");
+        pairs.pairs[0].observation.observed_at = Some("2026-05-05T09:59:59Z".to_string());
+        let unresolved = derive_unresolved_claude_accounts(
+            &desktop,
+            &pairs,
+            &[],
+            &BTreeMap::new(),
+            OffsetDateTime::parse("2026-08-04T10:00:00Z", &Rfc3339).expect("fixed now"),
+        );
+        assert!(unresolved.iter().any(|row| {
+            row.account_identifier_hash.as_deref() == Some("strong-unresolved")
+                && row.organization_identifier_hash.is_none()
+        }));
+        assert!(unresolved
+            .iter()
+            .all(|row| row.organization_identifier_hash.is_none()));
     }
 
     #[test]
@@ -35151,6 +36270,9 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             unresolved_accounts: vec![ClaudeUnresolvedAccountDescriptorV1 {
                 unresolved_id: "claude-unresolved-test".to_string(),
                 account_identifier_hash: Some("account-full".to_string()),
+                organization_identifier_hash: None,
+                account_label: None,
+                organization_label: None,
                 observed_at: Some("2026-08-04T10:00:00Z".to_string()),
                 evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
             }],
@@ -35210,6 +36332,9 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let stale_unresolved = ClaudeUnresolvedAccountDescriptorV1 {
             unresolved_id: "claude-unresolved-stale".to_string(),
             account_identifier_hash: Some("account-full".to_string()),
+            organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
             observed_at: Some("2026-08-04T10:00:00Z".to_string()),
             evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
         };

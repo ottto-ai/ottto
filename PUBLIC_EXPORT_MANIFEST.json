@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 716,
-  "content_sha256": "0c2cc7c907f9e7527000ddeceeb3fb9cb8299e094965de43ce25b2cdd96d2e4e",
+  "content_sha256": "8b8f97cb9cc1a844fa36b0be26a0cf27996afc1450766c5e77dc69546f1f7973",
   "files": [
     {
       "executable": false,
@@ -468,8 +468,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "01488639b1c98120177c8ea86187bc456738c917d7f131f5037bab90a9ef2051",
-      "size_bytes": 185843
+      "sha256": "5abd0a94336c22808d1556a35f988ff3c22d7b993f624d40205d5a1083740a1f",
+      "size_bytes": 186898
     },
     {
       "executable": false,
@@ -615,8 +615,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "630f30faf30565ba9b5cae40ab541a56834af1ae3ccaf25cf1c51b8f4540ba2d",
-      "size_bytes": 348524
+      "sha256": "030641fb5c9f2c9f0b53f9eddfdea073744ab6571c123f707ea70577dfb65820",
+      "size_bytes": 349761
     },
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/active_sessions.rs",
-      "sha256": "178ab0f7c58877da39ae78a6d5f40624c3a458be586d9fbe546ca4fdb8d79665",
-      "size_bytes": 90607
+      "sha256": "5c7a8f54d7108925d6d1aa9efd26721ab58d37bcd2e996b94611dd04e8fcde69",
+      "size_bytes": 108521
     },
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "3f92e3085d9c8be38bbf717bd81892e7dcb13595d7bb21dce0d2cb5fa33d3d63",
-      "size_bytes": 1584427
+      "sha256": "48f1a280fbf8a6bf772a6047f218a277bf7c10db1d209fee99b6373f2e1eab93",
+      "size_bytes": 1632395
     },
     {
       "executable": false,
@@ -937,8 +937,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "f3c10c5728da94212aaa452bf72a53f7ad1505d2ec6144858ec2e4a9fd335120",
-      "size_bytes": 1290528
+      "sha256": "b6d96aa1a2f255093e253ea3a9e91e5426c471462d39b26d623643ccaf149f0e",
+      "size_bytes": 1319027
     },
     {
       "executable": false,
@@ -1014,8 +1014,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "67ec41287ca9008b3ef8fa06597755bf55b89b4740344aea11c27e5b8868a84a",
-      "size_bytes": 349958
+      "sha256": "34eadfc56009218e67486c9944498765a460dffc8dc7107dd222e157f495af76",
+      "size_bytes": 350064
     },
     {
       "executable": false,
@@ -1217,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "c3d5d91d2257048291d249f85a5beafd0a54a0d33db0b4983261f2f4bc58bf9e",
-      "size_bytes": 822409
+      "sha256": "5c57cd02ff76d6bb16ae0b2cb3b6595e2822c0f2b82709fc27d362441ff45f4c",
+      "size_bytes": 841452
     },
     {
       "executable": false,
@@ -3597,8 +3597,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/costs-request.json",
-      "sha256": "4bccd8b9b7e8a9bd2759bf134f92a59944456397a4213eee71501b525b7eda50",
-      "size_bytes": 483
+      "sha256": "4482f612b1825c6a78f1105568422a82a9393427b7b311081dbdc86b21383f18",
+      "size_bytes": 527
     },
     {
       "executable": false,
@@ -3653,8 +3653,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
-      "sha256": "269fc3ef6ca0a3c9cb1c9611468db11eca123b26ec17a1d25e481a326a0a5af3",
-      "size_bytes": 27720
+      "sha256": "06bbe805bfdc0c58b0cb67745af7207d7c3552fecb397feb46916ad3936743a6",
+      "size_bytes": 27753
     },
     {
       "executable": false,
@@ -5015,7 +5015,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-19T20:52:38+00:00",
+  "generated_at": "2026-10-19T23:02:16+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 717,
   "public_roots": [
@@ -5054,5 +5054,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a746eec68a639a125c369cf13fd9401b4f037ce4"
+  "source_commit": "2310282e45bce25f1b9e6cd82d8936f19c9b2733"
 }
