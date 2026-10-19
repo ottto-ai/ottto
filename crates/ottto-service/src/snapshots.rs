@@ -13052,7 +13052,7 @@ pub(crate) struct OwnedSourceScan {
     codex_join_inventory: Option<codex_file_join::HeaderInventory>,
     codex_join_prepared: bool,
     codex_join_groups: VecDeque<codex_file_join::Group>,
-    codex_join_active: Option<(codex_file_join::Group, codex_file_join::GroupReader)>,
+    codex_join_active: Option<Box<codex_file_join::GroupBoot>>,
     codex_join_completed: Vec<codex_file_join::Group>,
     codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
     /// Decoded bytes this page consumed; the cursor job and ordinary Codex
@@ -13080,6 +13080,8 @@ struct OwnedActiveFile {
     charged_bytes: u64,
     /// End of the record after which a hold no append can cure first held.
     hold_offset: Option<u64>,
+    /// Present while this job replays a Codex file group (P2).
+    group: Option<Box<codex_file_join::GroupJob>>,
 }
 #[allow(clippy::large_enum_variant)] // One active context moves between native collection steps.
 pub(crate) enum OwnedSourceScanStep {
@@ -14185,6 +14187,30 @@ impl OwnedSourceScan {
                                 .iter()
                                 .map(|member| local_index_key(&member.path)),
                         );
+                        // §d.1.2 c: a paused or active cursor job owns a
+                        // member. Its selected members stay pending (holding
+                        // the census) and are not read again while it lives.
+                        if let Some(context) = sampling.as_ref().filter(|context| {
+                            group.members.iter().any(|member| {
+                                context
+                                    .cache
+                                    .cursor_job_owns(&local_index_key(&member.path))
+                            })
+                        }) {
+                            for member in group
+                                .members
+                                .iter()
+                                .filter(|member| selected.contains(&local_index_key(&member.path)))
+                            {
+                                context.cache.note_join_in_progress();
+                                sampled_scan::codex_cursor::requeue(
+                                    index,
+                                    &codex_selected_flags,
+                                    member,
+                                );
+                            }
+                            continue;
+                        }
                         let malformed_pending = group.members.iter().any(|member| {
                             index
                                 .files
@@ -14249,7 +14275,28 @@ impl OwnedSourceScan {
                                     .any(|member| member.path == pending.path)
                             });
                         }
+                        // F8 (§d.1.3): a queued group's owner has no state-only
+                        // body in this scan object or across a restart until
+                        // its exclusive body is accepted; B records the
+                        // provenance for the L-1 release.
+                        codex_state_only_blocked_session_ids.insert(group.owner.clone());
+                        index
+                            .codex_state_only_blocked_session_ids
+                            .insert(group.owner.clone());
+                        if let Some(context) = sampling.as_ref() {
+                            context
+                                .cache
+                                .record_join_owner(&group.owner, &group.members);
+                        }
                         codex_join_groups.push_back(group);
+                    }
+                    // F8: the paused group job's owner, in every scan object.
+                    if let Some(owner) = sampling
+                        .as_ref()
+                        .and_then(|context| context.cache.cursor_group_owner())
+                    {
+                        codex_state_only_blocked_session_ids.insert(owner.clone());
+                        index.codex_state_only_blocked_session_ids.insert(owner);
                     }
                     identified_candidates.retain(|candidate| {
                         !grouped_paths.contains(&local_index_key(&candidate.path))
@@ -14290,99 +14337,253 @@ impl OwnedSourceScan {
                 codex_join_prepared = true;
                 pending!();
             }
-            if let Some((mut group, mut reader)) = codex_join_active.take() {
-                if reader.unchanged_joined(index) {
-                    semantic_noop_count += reader.members.len();
-                    group.members = reader.members;
-                    codex_join_completed.push(group);
-                    pending!();
-                }
-                match reader.step(
-                    &codex_title_metadata,
-                    codex_turn_traces.clone(),
-                    codex_parent_ownership_ledgers.clone(),
-                    artifacts_enabled,
-                    context_curve_enabled,
-                    attribution_context,
-                ) {
-                    Ok(false) => {
-                        codex_join_active = Some((group, reader));
+            if let Some(mut boot) = codex_join_active.take() {
+                let outcome = boot.step(attribution_context, index);
+                // Header and probe bytes are singleton-budget reads (§d.2).
+                codex_page.charge(false, boot.take_charge());
+                let members = boot.group.members.len();
+                match outcome {
+                    codex_file_join::Boot::Pending => {
+                        codex_join_active = Some(boot);
                         pending!();
                     }
-                    Ok(true) => {
-                        let baselines = reader.take_legacy_baselines();
-                        match reader.finish().and_then(|replayed| {
-                            let actual_owner = replayed
-                                .0
-                                .accumulator
-                                .source_session_id
-                                .as_deref()
-                                .map(resolve_codex_identity);
-                            anyhow::ensure!(
-                                actual_owner.as_deref() == Some(group.owner.as_str()),
-                                "Codex replay owner changed after inventory"
+                    codex_file_join::Boot::Unchanged => {
+                        semantic_noop_count += members;
+                        codex_join_completed.push(boot.group);
+                        pending!();
+                    }
+                    codex_file_join::Boot::Strict => {
+                        codex_file_join::disclose_strict(
+                            &boot.group.owner,
+                            &boot.group.members,
+                            sampled_scan::codex_cursor::DisclosureTargets {
+                                census: &mut census,
+                                residue_index_keys: &mut residue_index_keys,
+                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                codex_state_only_blocked_session_ids:
+                                    &mut codex_state_only_blocked_session_ids,
+                                pending_finalization: &mut pending_finalization,
+                            },
+                        );
+                        pending!();
+                    }
+                    codex_file_join::Boot::Refused(reason) => {
+                        // Decided from headers at no replay cost: terminal
+                        // debt (outcome R), fenced, never memoized.
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.note_join_refusal(reason);
+                            context.cache.group_attempted(
+                                &context.namespace,
+                                &boot.key,
+                                sampled_scan::codex_cursor::census_token(index).as_deref(),
                             );
-                            Ok(replayed)
-                        }) {
-                            Ok((parser, candidate, members, applied_receipts)) => {
-                                // Member content/object fences were checked at EOF.
-                                // The shared validator checks each home roster once
-                                // at capture/send/checkpoint, after all page replays.
-                                let source_file_fingerprint =
-                                    candidate.source_file_fingerprint.clone();
-                                active_file = Some(Box::new(OwnedActiveFile {
-                                    comparison_target: false,
-                                    sampling: None,
-                                    previous_snapshot_fingerprint: index
-                                        .last_snapshot_fingerprint(&candidate),
-                                    previous_upload_body_witness: index
-                                        .last_upload_body_witness(&candidate),
-                                    projection_adoption_required: index
-                                        .effective_upload_body_witness_revision_requires_adoption(
-                                            &local_index_key(&candidate.path),
-                                        ),
-                                    candidate,
-                                    decision: CandidateDecision::Parse,
-                                    source_file_fingerprint,
-                                    parser,
-                                    aliases: members,
-                                    applied_receipts,
-                                    cursor: None,
-                                    charged_bytes: 0,
-                                    hold_offset: None,
-                                }));
-                                codex_legacy_join_baselines.extend(baselines);
-                                pending!();
-                            }
-                            Err(_) => {
-                                census.ownership_incomplete_file_count += group.members.len();
-                                census.record_unreadable(UnreadableCause::AliasParser, 1);
-                                residue_index_keys.extend(
-                                    group
-                                        .members
-                                        .iter()
-                                        .map(|member| local_index_key(&member.path)),
+                        }
+                        codex_file_join::disclose_members(
+                            &codex_file_join::refusal_disclosure(&boot.group.owner),
+                            &boot.group.members,
+                            index,
+                            sampled_scan::codex_cursor::DisclosureTargets {
+                                census: &mut census,
+                                residue_index_keys: &mut residue_index_keys,
+                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                codex_state_only_blocked_session_ids:
+                                    &mut codex_state_only_blocked_session_ids,
+                                pending_finalization: &mut pending_finalization,
+                            },
+                        );
+                        pending!();
+                    }
+                    codex_file_join::Boot::Ready => {}
+                }
+                let expected = boot.expected_bytes();
+                let mut paged = false;
+                if let Some(context) = sampling.as_ref() {
+                    if boot.probe_bound {
+                        context.cache.note_probe_bound();
+                    }
+                    let live_file = boot.live().and_then(|(live, _)| {
+                        open_candidate_file(SnapshotSource::Codex, &mut live.clone()).ok()
+                    });
+                    let memo_key =
+                        sampled_scan::codex_cursor::memo_key(&context.namespace, &boot.key);
+                    if let Some(entry) = context.cache.memo_lookup(&memo_key) {
+                        // The match re-reads two samples of the live member (M3).
+                        codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                        let hit = boot
+                            .memo_digest(index, &codex_title_metadata)
+                            .zip(live_file.as_ref())
+                            .and_then(|(digest, file)| entry.matches(&digest, file, None, ""));
+                        if let Some(stamp) = hit {
+                            // No wake dependency changed: the same terminal
+                            // debt again, per member, at zero replay bytes.
+                            context.cache.memo_hit(&memo_key, stamp);
+                            context.cache.note_group_memo_hit();
+                            codex_file_join::disclose_members(
+                                entry.disclosure(),
+                                &boot.group.members,
+                                index,
+                                sampled_scan::codex_cursor::DisclosureTargets {
+                                    census: &mut census,
+                                    residue_index_keys: &mut residue_index_keys,
+                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                    codex_state_only_blocked_session_ids:
+                                        &mut codex_state_only_blocked_session_ids,
+                                    pending_finalization: &mut pending_finalization,
+                                },
+                            );
+                            pending!();
+                        }
+                        context.cache.memo_forget(&memo_key);
+                    }
+                    let dependencies = sampled_scan::codex_cursor::group_dependencies(
+                        &boot.group.members,
+                        &codex_title_metadata,
+                    );
+                    let parked = live_file.as_ref().and_then(|file| {
+                        context
+                            .cache
+                            .cursor_parked(&boot.key, file, Some(dependencies.as_str()))
+                    });
+                    if let Some(disclosure) = parked {
+                        codex_file_join::disclose_members(
+                            &disclosure,
+                            &boot.group.members,
+                            index,
+                            sampled_scan::codex_cursor::DisclosureTargets {
+                                census: &mut census,
+                                residue_index_keys: &mut residue_index_keys,
+                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                codex_state_only_blocked_session_ids:
+                                    &mut codex_state_only_blocked_session_ids,
+                                pending_finalization: &mut pending_finalization,
+                            },
+                        );
+                        pending!();
+                    }
+                    match context.cache.cursor_plan(
+                        &mut codex_page,
+                        sampled_scan::codex_cursor::Limits::current(),
+                        expected,
+                        codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
+                        crate::heap_layout_bound::layout_supported(),
+                        &context.namespace,
+                        &boot.key,
+                        sampled_scan::codex_cursor::census_token(index).as_deref(),
+                    ) {
+                        sampled_scan::codex_cursor::StartPlan::Singleton => {}
+                        sampled_scan::codex_cursor::StartPlan::Cursor => paged = true,
+                        sampled_scan::codex_cursor::StartPlan::Unpaged => {
+                            codex_page.disclose_disabled(&context.cache);
+                        }
+                        sampled_scan::codex_cursor::StartPlan::Defer => {
+                            // The whole group waits its turn on a later page.
+                            context.cache.cursor_note_deferred();
+                            scanned_file_count = scanned_file_count.saturating_sub(members);
+                            for member in &boot.group.members {
+                                sampled_scan::codex_cursor::requeue(
+                                    index,
+                                    &codex_selected_flags,
+                                    member,
                                 );
-                                residue_blocked_session_ids.insert(group.owner.clone());
-                                codex_state_only_blocked_session_ids.insert(group.owner);
-                                pending!();
                             }
+                            pending!();
+                        }
+                        // Processed for this generation (K7 fence).
+                        sampled_scan::codex_cursor::StartPlan::Fenced => {
+                            scanned_file_count = scanned_file_count.saturating_sub(members);
+                            pending!();
                         }
                     }
-                    Err(_) => {
-                        census.ownership_incomplete_file_count += group.members.len();
-                        census.record_unreadable(UnreadableCause::AliasParser, 1);
-                        residue_index_keys.extend(
-                            group
-                                .members
-                                .iter()
-                                .map(|member| local_index_key(&member.path)),
-                        );
-                        residue_blocked_session_ids.insert(group.owner.clone());
-                        codex_state_only_blocked_session_ids.insert(group.owner);
-                        pending!();
+                }
+                if !paged && expected > codex_file_join::MAX_GROUP_BYTES {
+                    // Never an unbounded in-page group read (no cursor).
+                    codex_file_join::disclose_strict(
+                        &boot.group.owner,
+                        &boot.group.members,
+                        sampled_scan::codex_cursor::DisclosureTargets {
+                            census: &mut census,
+                            residue_index_keys: &mut residue_index_keys,
+                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                            codex_state_only_blocked_session_ids:
+                                &mut codex_state_only_blocked_session_ids,
+                            pending_finalization: &mut pending_finalization,
+                        },
+                    );
+                    pending!();
+                }
+                let owner = boot.group.owner.clone();
+                let group_members = boot.group.members.clone();
+                let job = boot.into_job(codex_file_join::JobInputs {
+                    metadata: &codex_title_metadata,
+                    traces: codex_turn_traces.clone(),
+                    ledgers: codex_parent_ownership_ledgers.clone(),
+                    artifacts: artifacts_enabled,
+                    context_curve: context_curve_enabled,
+                    index,
+                });
+                let Ok(mut job) = job else {
+                    codex_file_join::disclose_strict(
+                        &owner,
+                        &group_members,
+                        sampled_scan::codex_cursor::DisclosureTargets {
+                            census: &mut census,
+                            residue_index_keys: &mut residue_index_keys,
+                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                            codex_state_only_blocked_session_ids:
+                                &mut codex_state_only_blocked_session_ids,
+                            pending_finalization: &mut pending_finalization,
+                        },
+                    );
+                    pending!();
+                };
+                if let Some(context) = sampling.as_ref().filter(|_| paged) {
+                    let dependencies = Some(sampled_scan::codex_cursor::group_dependencies(
+                        &group_members,
+                        &codex_title_metadata,
+                    ));
+                    match context.cache.cursor_start_group(
+                        &mut job,
+                        &context.namespace,
+                        dependencies,
+                        state_census_complete && sidecar_census_complete,
+                        index,
+                    ) {
+                        Ok(lease) => {
+                            // The members hold the strict census until the
+                            // job's attempt ends (accepted or debt).
+                            for member in &group_members {
+                                sampled_scan::codex_cursor::requeue(
+                                    index,
+                                    &codex_selected_flags,
+                                    member,
+                                );
+                            }
+                            codex_cursor_lease = Some(lease);
+                        }
+                        Err(sampled_scan::codex_cursor::StartRefusal::Busy) => {
+                            context.cache.cursor_note_deferred();
+                            scanned_file_count = scanned_file_count.saturating_sub(members);
+                            for member in &group_members {
+                                sampled_scan::codex_cursor::requeue(
+                                    index,
+                                    &codex_selected_flags,
+                                    member,
+                                );
+                            }
+                            pending!();
+                        }
+                        // Never an unbounded in-page read of a group larger
+                        // than the singleton budget (compressed members > B
+                        // keep refusing, named debt).
+                        Err(_) => {
+                            census.record_unreadable(UnreadableCause::OpenRead, 1);
+                            codex_state_only_blocked_session_ids.insert(owner);
+                            pending!();
+                        }
                     }
                 }
+                active_file = Some(job);
+                pending!();
             }
             if source == SnapshotSource::Codex
                 && active_file.is_none()
@@ -14443,35 +14644,74 @@ impl OwnedSourceScan {
             }
             if active_file.is_none() {
                 if let Some(group) = codex_join_groups.pop_front() {
-                    scanned_file_count += group.members.len();
-                    match codex_file_join::GroupReader::new(group.members.clone()) {
-                        Ok(mut reader) => {
-                            reader.configure_launch_owner(&group.owner);
-                            reader.configure_receipts(index);
-                            codex_join_active = Some((group, reader));
-                        }
-                        Err(_) => {
-                            census.ownership_incomplete_file_count += group.members.len();
-                            census.record_unreadable(UnreadableCause::OpenRead, 1);
-                            residue_index_keys.extend(
-                                group
-                                    .members
-                                    .iter()
-                                    .map(|member| local_index_key(&member.path)),
-                            );
-                            codex_state_only_blocked_session_ids.insert(group.owner);
-                        }
+                    // M-5 (b): a group whose attempt already ended as terminal
+                    // debt in this generation is not attempted again; its
+                    // members were disclosed then.
+                    let fenced = sampling.as_ref().is_some_and(|context| {
+                        context.cache.group_fenced(
+                            &context.namespace,
+                            &codex_file_join::job_key(&group),
+                            sampled_scan::codex_cursor::census_token(index).as_deref(),
+                        )
+                    });
+                    if !fenced {
+                        scanned_file_count += group.members.len();
+                        codex_join_active =
+                            Some(Box::new(codex_file_join::GroupBoot::new(group, index)));
                     }
                     pending!();
                 }
             }
             if let Some(mut active) = active_file.take() {
-                let stepped = active.parser.step();
+                let mut group_end = None;
+                let stepped = if active.group.is_some() {
+                    // A group job: one record of the current member, or one
+                    // member transition (P2).
+                    let live_scope = |member: &CandidateFile| {
+                        let context = sampling.as_ref()?;
+                        let dependency = sampled_scan::reduction_dependencies(
+                            source,
+                            member,
+                            &codex_title_metadata,
+                            &claude_title_metadata,
+                            claude_effort_support_dir_ref,
+                        )?;
+                        Some(context.file_scope(
+                            source,
+                            member,
+                            &dependency,
+                            true,
+                            context_curve_enabled,
+                            index,
+                        ))
+                    };
+                    match codex_file_join::step_group(
+                        &mut active,
+                        &codex_file_join::StepInputs {
+                            metadata: &codex_title_metadata,
+                            attribution: attribution_context,
+                            artifacts: artifacts_enabled,
+                            context_curve: context_curve_enabled,
+                            live_scope: &live_scope,
+                        },
+                    ) {
+                        codex_file_join::GroupStep::Read(result) => result,
+                        codex_file_join::GroupStep::End(end) => {
+                            group_end = Some(end);
+                            Ok(false)
+                        }
+                    }
+                } else {
+                    active.parser.step()
+                };
                 if source == SnapshotSource::Codex {
                     let consumed = active.parser.reader.consumed_bytes();
+                    let moved = codex_file_join::take_charge(&mut active);
                     codex_page.charge(
                         active.cursor.is_some(),
-                        consumed.saturating_sub(active.charged_bytes),
+                        consumed
+                            .saturating_sub(active.charged_bytes)
+                            .saturating_add(moved),
                     );
                     active.charged_bytes = consumed;
                     if active.hold_offset.is_none()
@@ -14487,6 +14727,26 @@ impl OwnedSourceScan {
                         active.hold_offset =
                             Some(start + active.parser.reader.last_complete_line_end());
                     }
+                }
+                if let Some(end) = group_end {
+                    codex_file_join::end_group(
+                        active,
+                        end,
+                        codex_cursor_lease.take(),
+                        codex_file_join::EndInputs {
+                            sampling: sampling.as_ref(),
+                            index,
+                            targets: sampled_scan::codex_cursor::DisclosureTargets {
+                                census: &mut census,
+                                residue_index_keys: &mut residue_index_keys,
+                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                codex_state_only_blocked_session_ids:
+                                    &mut codex_state_only_blocked_session_ids,
+                                pending_finalization: &mut pending_finalization,
+                            },
+                        },
+                    );
+                    pending!();
                 }
                 match stepped {
                     Ok(false) => {
@@ -14516,7 +14776,9 @@ impl OwnedSourceScan {
                                             pending_finalization: &mut pending_finalization,
                                         },
                                     );
-                                    sampled_scan::codex_cursor::dequeue(index, &job.candidate);
+                                    for file in sampled_scan::codex_cursor::job_files(&job) {
+                                        sampled_scan::codex_cursor::dequeue(index, file);
+                                    }
                                 }
                                 pending!();
                             }
@@ -14543,6 +14805,25 @@ impl OwnedSourceScan {
                         if let Some(lease) = codex_cursor_lease.take() {
                             lease.release();
                         }
+                        if let Some(group) = active.group.as_ref() {
+                            // A member read failure: strict, as before P2.
+                            codex_file_join::disclose_strict(
+                                &group.owner,
+                                &group.members,
+                                sampled_scan::codex_cursor::DisclosureTargets {
+                                    census: &mut census,
+                                    residue_index_keys: &mut residue_index_keys,
+                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                    codex_state_only_blocked_session_ids:
+                                        &mut codex_state_only_blocked_session_ids,
+                                    pending_finalization: &mut pending_finalization,
+                                },
+                            );
+                            for member in &group.members {
+                                sampled_scan::codex_cursor::dequeue(index, member);
+                            }
+                            pending!();
+                        }
                         if active.cursor.is_some() {
                             sampled_scan::codex_cursor::dequeue(index, &active.candidate);
                         }
@@ -14551,8 +14832,10 @@ impl OwnedSourceScan {
                     }
                     Ok(true) => {}
                 }
-                if active.cursor.is_some() {
-                    // E1 before the protected-tier gate below (R1-H1).
+                if active.cursor.is_some() && active.group.is_none() {
+                    // E1 before the protected-tier gate below (R1-H1). A group
+                    // job's live member keeps a withheld tail pending (E1 is
+                    // singleton-only, named in the P2 handoff).
                     sampled_scan::codex_cursor::apply_eof_record(&mut active);
                 }
                 if let Some(context) = attribution_context {
@@ -14713,8 +14996,12 @@ impl OwnedSourceScan {
                             // N1: a cursor-only job (census incomplete at start
                             // or now) publishes like main's unsampled read: the
                             // certificate fenced the object, but no checkpoint,
-                            // copy or verification is kept.
-                            cursor_certificate = Some(Some(checkpoint).filter(|_| census_trusted));
+                            // copy or verification is kept. A group job retains
+                            // no reduction (its replay is joined).
+                            cursor_certificate = Some(
+                                Some(checkpoint)
+                                    .filter(|_| census_trusted && active.group.is_none()),
+                            );
                             cursor_publication = Some(publication);
                             cursor_fragment = fragment;
                         }
@@ -14750,11 +15037,30 @@ impl OwnedSourceScan {
                                     pending_finalization: &mut pending_finalization,
                                 },
                             );
-                            sampled_scan::codex_cursor::dequeue(index, &active.candidate);
+                            for file in sampled_scan::codex_cursor::job_files(&active) {
+                                sampled_scan::codex_cursor::dequeue(index, file);
+                            }
                             pending!();
                         }
                     }
+                    // A group's sealed members ended with the job; only its
+                    // live member's path follows `release_path` above.
+                    if let Some(group) = active.group.as_ref() {
+                        for member in group
+                            .members
+                            .iter()
+                            .filter(|member| member.path != active.candidate.path)
+                        {
+                            sampled_scan::codex_cursor::dequeue(index, member);
+                        }
+                    }
                 }
+                // S12: the live member's certified grant reaches validation.
+                let group_live = active
+                    .group
+                    .as_ref()
+                    .and_then(|_| sampled_scan::codex_cursor::certified_prefix(&active))
+                    .map(|prefix| (local_index_key(&active.candidate.path), prefix));
                 let memo_offset = active.hold_offset.filter(|_| {
                     source == SnapshotSource::Codex
                         && active.aliases.is_empty()
@@ -14829,7 +15135,11 @@ impl OwnedSourceScan {
                     cursor: _,
                     charged_bytes: _,
                     hold_offset: _,
+                    group,
                 } = *active;
+                if let Some(mut group) = group {
+                    codex_legacy_join_baselines.extend(group.take_legacy_baselines());
+                }
                 let mut parser = parser;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
                     match replay.finish() {
@@ -15109,6 +15419,7 @@ impl OwnedSourceScan {
                             .expect("joined replay owner was bound before native finish"),
                         home: codex_file_join::member_home(&candidate.scan_root),
                         members: aliases.clone(),
+                        live: group_live.clone(),
                     });
                 }
                 let diagnostic_reason = if parse_complete {
@@ -15391,6 +15702,7 @@ impl OwnedSourceScan {
                             owner: resolve_codex_identity(&item.source_session_id),
                             home: codex_file_join::member_home(&candidate.scan_root),
                             members: vec![candidate.clone()],
+                            live: None,
                         });
                     }
                 }
@@ -15701,6 +16013,44 @@ impl OwnedSourceScan {
                     // veto the settlement inside the helper.
                     if let Some(traversal) = index.traversal.as_mut() {
                         traversal.counts.settle_non_progressing_residue();
+                    }
+                    // L-1 (§d.1.3): on a clean completed walk, release every
+                    // owner B blocked for a group whose members all left the
+                    // rollout census, unless an inventoried header or a live,
+                    // paused or queued group job still holds it.
+                    let clean = index
+                        .traversal
+                        .as_ref()
+                        .is_some_and(|traversal| !traversal.counts.has_retryable_problems());
+                    let inventory = codex_join_inventory
+                        .as_ref()
+                        .filter(|inventory| inventory.complete);
+                    if let (SnapshotSource::Codex, true, Some(context), Some(inventory)) =
+                        (source, clean, sampling.as_ref(), inventory)
+                    {
+                        let present = index
+                            .traversal
+                            .as_ref()
+                            .map(|traversal| {
+                                traversal
+                                    .codex_rollout_paths
+                                    .iter()
+                                    .map(|key| sampled_scan::codex_cursor::compact_key(key))
+                                    .collect::<BTreeSet<_>>()
+                            })
+                            .unwrap_or_default();
+                        let paused = context.cache.cursor_group_owner();
+                        let released = context.cache.release_join_owners(&present, |owner| {
+                            inventory.headers.iter().any(|header| header.owner == owner)
+                                || paused.as_deref() == Some(owner)
+                                || codex_join_groups.iter().any(|group| group.owner == owner)
+                                || codex_join_active
+                                    .as_ref()
+                                    .is_some_and(|boot| boot.group.owner == owner)
+                        });
+                        for owner in released {
+                            index.codex_state_only_blocked_session_ids.remove(&owner);
+                        }
                     }
                 }
                 let traversal_snapshot = index
@@ -16032,11 +16382,14 @@ impl OwnedSourceScan {
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)
             {
-                if context.cache.cursor_job_key().as_deref()
-                    == Some(local_index_key(&candidate.path).as_str())
+                if context
+                    .cache
+                    .cursor_job_owns(&local_index_key(&candidate.path))
                 {
-                    // The paused or active cursor job owns this file; it stays
-                    // pending (holding the census) until that job's attempt ends.
+                    // The paused or active cursor job owns this file (a group
+                    // job owns every member); it stays pending (holding the
+                    // census) until that job's attempt ends (§d.1.2 c).
+                    context.cache.note_join_in_progress();
                     sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
                     pending!();
                 }
@@ -16655,6 +17008,7 @@ impl OwnedSourceScan {
                 cursor: None,
                 charged_bytes: 0,
                 hold_offset: None,
+                group: None,
             });
             if let Some(context) = sampling
                 .as_ref()
@@ -17586,6 +17940,12 @@ impl OwnedJsonlParser {
     fn step_with_observer(&mut self, observe: impl FnMut(&Value)) -> Result<bool> {
         let step = self.with_line_sink(observe, |reader, sink| reader.step(sink))?;
         Ok(matches!(step, JsonlReaderStep::Complete(_)))
+    }
+
+    /// Apply one record another parser's reader produced (a group's legacy
+    /// tee, P2) through this parser's line sink; this reader is not read.
+    fn tee_line(&mut self, value: &Value) {
+        self.with_line_sink(|_| {}, |_, sink| sink(value))
     }
 
     /// E1: at a genuine unchanged EOF (proved by the cursor caller), apply a
@@ -20060,6 +20420,13 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         if admitted.is_some() {
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.admitted(applied_tier);
+                // S10: the group proof sees only actually admitted usage.
+                replay.admitted_usage(
+                    value,
+                    last_usage.is_some(),
+                    usage_event_identity.as_deref(),
+                    accumulator.latest_turn_id.as_deref(),
+                );
             }
         }
         if let (Some(_), Some(last_usage)) = (admitted.as_ref(), last_usage.as_ref()) {
@@ -21122,12 +21489,17 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
 }
 
 fn codex_last_usage(value: &Value) -> Option<UsageTotals> {
-    let root = value
+    codex_usage_from_root(codex_last_usage_root(value)?, false)
+}
+
+/// The one `last_token_usage` root the parser admits (shared with the group
+/// proof, S10).
+fn codex_last_usage_root(value: &Value) -> Option<&Value> {
+    value
         .pointer("/token_count/info/last_token_usage")
         .or_else(|| value.pointer("/payload/info/last_token_usage"))
         .or_else(|| value.pointer("/payload/last_token_usage"))
-        .or_else(|| value.pointer("/last_token_usage"))?;
-    codex_usage_from_root(root, false)
+        .or_else(|| value.pointer("/last_token_usage"))
 }
 
 fn codex_model_context_window(value: &Value) -> Option<u64> {
@@ -62248,7 +62620,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
