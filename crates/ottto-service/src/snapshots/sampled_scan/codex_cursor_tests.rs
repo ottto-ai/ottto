@@ -1576,7 +1576,12 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
         )
         .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
         // No active file: the release takes its conservative full path.
-        claude.release_sampled_cache_for_copy_refusal();
+        let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            claude.release_sampled_cache_for_copy_refusal();
+        });
+        assert_eq!(lifecycle.clear_no_active, 1);
+        assert_eq!(lifecycle.clear_metadata_unsupported, 0);
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
         drop(claude);
         assert_eq!(cache.cursor_charge(), charge, "the paused job survives");
         assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
