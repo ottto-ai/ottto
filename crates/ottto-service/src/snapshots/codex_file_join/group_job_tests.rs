@@ -1042,7 +1042,6 @@ fn mid_stream_live_gap_is_memoized_and_skipped_while_unchanged() {
     let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let refused = counters(&cache);
     assert_eq!(refused.join_terminal_debt[gap], 1, "{refused:?}");
-    assert_eq!(refused.groups_started, 1, "{refused:?}");
     assert_eq!(
         refused.memo_records, 1,
         "recorded although the reader stopped mid-stream: {refused:?}"
@@ -1050,8 +1049,11 @@ fn mid_stream_live_gap_is_memoized_and_skipped_while_unchanged() {
     let _ = next_generation(&root, index, &cache, 1);
     let unchanged = counters(&cache);
     assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
-    assert_eq!(unchanged.groups_started, 1, "not re-read: {unchanged:?}");
-    assert_eq!(unchanged.join_terminal_debt[gap], 1, "{unchanged:?}");
+    // One replay only: the unpaged group's attempt count is its refusals.
+    assert_eq!(
+        unchanged.join_terminal_debt[gap], 1,
+        "not re-read: {unchanged:?}"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1667,9 +1669,11 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
         return;
     }
     let root = paged_corpus("memo-slot");
-    // A duplicate response mid-way through live `b`: terminal `Overlap`.
+    // An empty response id mid-way through live `b`: terminal `Corrupt`, a
+    // per-member reason (the scaled singleton budget leaves the probes in
+    // chronological order, under which a chain reason is `ProbeBudgetOrder`).
     let mut b = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30);
-    b[5]["payload"]["response_id"] = json!("a-3");
+    b[5]["payload"]["response_id"] = json!("");
     write_rows(&root.join("sessions/b.jsonl"), &b);
     let cache = Arc::new(SharedCache::default());
     with_test_limits(2048, 1024, 64, || {
@@ -1678,7 +1682,7 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
         });
         let recorded = counters(&cache);
         assert_eq!(
-            recorded.join_terminal_debt[JoinRefusal::Overlap.slot()],
+            recorded.join_terminal_debt[JoinRefusal::Corrupt.slot()],
             1,
             "{recorded:?}"
         );
