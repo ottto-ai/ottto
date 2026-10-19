@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 712,
-  "content_sha256": "205753ed2339c8b6a96085f3daaa1a8ce179127400c0f819f512c486d604042a",
+  "content_sha256": "2d1ae22092cc594429af6c8c306fddd587c248267add0838a7bb439d22f85531",
   "files": [
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "25e11b2c2c0f095eac186add379a12c18bd1d69328ee2524bf71052f1a66f751",
-      "size_bytes": 1622353
+      "sha256": "0457450b635f5e7c2c507d44865b58b30b981425ff622dce4027db89da39fd36",
+      "size_bytes": 1622905
     },
     {
       "executable": false,

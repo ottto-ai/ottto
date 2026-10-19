@@ -153,6 +153,12 @@ const CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX: usize = 64;
 const CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX: usize = 20;
 /// The backend accepts at most this many status snapshots in one upload.
 const AGENT_STATUS_UPLOAD_SNAPSHOT_MAX: usize = 10;
+/// Whether the account-less Desktop pair status uploads. Held off until the
+/// backend keeps a login's metered current row when it arrives: today an
+/// account-less status takes the profile of its newest linked observation,
+/// and the current-row cleanup then deletes this Mac's older metered row for
+/// that profile. Pair connect targets are local and do not depend on this.
+const CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED: bool = false;
 // Reuse the daemon's existing detected-use/session retention contract. This
 // warning is a view of the same local activity evidence, not a new lifetime.
 const CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS: i64 =
@@ -5004,7 +5010,14 @@ fn collect_claude_status_snapshots(
         &captured_at,
         &expires_at,
     ));
-    append_claude_desktop_pairs_snapshot(&mut snapshots, &desktop_pairs, &captured_at, &expires_at);
+    if CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED {
+        append_claude_desktop_pairs_snapshot(
+            &mut snapshots,
+            &desktop_pairs,
+            &captured_at,
+            &expires_at,
+        );
+    }
     let unresolved_accounts = derive_unresolved_claude_accounts(
         &default_snapshot,
         &desktop_pairs,
