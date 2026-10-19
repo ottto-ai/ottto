@@ -101,6 +101,7 @@ fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_
         dependencies: dependencies.map(str::to_owned),
         disclosure: strict(DebtReason::JoinStateBound),
         used: 0,
+        exact: false,
     };
     let cache = SharedCache::default();
     cache.with_cursor(|cursor| park(cursor, "key".into(), parked(Some("dependencies"))));
@@ -597,7 +598,11 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         );
         (census, residue, residue_blocked, blocked, pending, index)
     };
-    for reason in [DebtReason::JoinStateBound, DebtReason::MemberChanged] {
+    for reason in [
+        DebtReason::JoinStateBound,
+        DebtReason::MemberChanged,
+        DebtReason::ProbeBudgetOrder,
+    ] {
         assert!(!reason.settleable());
         let (census, residue, residue_blocked, blocked, pending, index) = disclose(&strict(reason));
         assert!(residue.is_empty() && residue_blocked.is_empty());
@@ -2564,9 +2569,23 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
             if grow {
                 fixture.append(SESSION, &token_line(41));
             }
-            let _ = finish_job(&cache, None, &mut job, None, "legacy", true);
+            let _ = finish_job(&cache, None, &mut job, None, "legacy", "", true);
             job.hold_offset
         });
         assert_eq!(hold.is_some(), !grow, "grow: {grow}");
     }
+}
+
+/// R2-N5: a group's legacy tee takes every consumed byte too, so the E3
+/// estimate counts each byte once per accumulator.
+#[test]
+fn estimate_counts_bytes_once_per_fed_accumulator() {
+    assert_eq!(
+        estimate_charge(Some((1_000, 10, 64)), 510, 64, 1),
+        Some(1_500)
+    );
+    assert_eq!(
+        estimate_charge(Some((1_000, 10, 64)), 510, 64, 2),
+        Some(2_000)
+    );
 }
