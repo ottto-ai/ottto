@@ -2816,7 +2816,8 @@ fn created_usage(scan: &SourceScanResult) -> Vec<(u64, u64)> {
 /// context, flushed before the first `token_count`) is, on its exact stamp.
 /// While unchanged it is a memo hit (not re-read); once the append that
 /// cures it lands, the next generation reads the appended bytes and admits
-/// the thread once, with its full usage.
+/// the thread once, with its full usage. An unchanged generation after
+/// that publishes nothing new: no second admission, no resurrected hold.
 #[test]
 fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
     let home = CreatedThreadHome::new(3, false);
@@ -2840,13 +2841,56 @@ fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
     // The flush catches up with the projection: no stale hit.
     home.flush_from(3);
-    let (_, cured) = home.generation(index, &cache, 2);
+    let (index, cured) = home.generation(index, &cache, 2);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
     assert_eq!(
         created_usage(&cured),
         vec![(200, 3)],
         "{}",
         counters(&cache)
+    );
+    assert_admitted_once(&home, &cache, index, &cured, 3);
+}
+
+/// Fingerprints of the created thread's published snapshots.
+fn created_fingerprints(scan: &SourceScanResult) -> Vec<String> {
+    scan.snapshots
+        .iter()
+        .filter(|snapshot| snapshot.source_session_id == CREATED)
+        .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+        .collect()
+}
+
+/// R1-L2: generation `n` after the admitting one, with nothing changed,
+/// admits nothing new. It publishes nothing, or republishes the same
+/// snapshots (same fingerprints, so idempotent), and the stale hold entry
+/// neither hits nor is recorded again.
+fn assert_admitted_once(
+    home: &CreatedThreadHome,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    admitted: &SourceScanResult,
+    n: i64,
+) {
+    let (hits, records) = (
+        counter(cache, |c| c.memo_hits),
+        counter(cache, |c| c.memo_records),
+    );
+    let (_, again) = home.generation(index, cache, n);
+    let usage = created_usage(&again);
+    assert!(
+        usage.is_empty()
+            || (usage == vec![(200, 3)]
+                && created_fingerprints(&again) == created_fingerprints(admitted)),
+        "no second admission: {usage:?} {}",
+        counters(cache)
+    );
+    assert_eq!(counter(cache, |c| c.memo_hits), hits, "{}", counters(cache));
+    assert_eq!(
+        counter(cache, |c| c.memo_records),
+        records,
+        "{}",
+        counters(cache)
     );
 }
 
@@ -2882,6 +2926,42 @@ fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
     let (_, unchanged) = home.generation(index, &cache, 2);
     assert!(created_usage(&unchanged).is_empty());
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+}
+
+/// #635 R2-L2: a lagging projection catches up with an unchanged file. The
+/// file is ahead of its projection, so the sidecar binds nothing and the
+/// created thread is held as `AmbiguousFork`. It holds usage, so the hold is
+/// not memoized (pre-existing: a held file with dropped usage is re-read in
+/// full every generation); the projection change alone cures it, and the
+/// thread is admitted once with its full usage.
+#[test]
+fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
+    let home = CreatedThreadHome::new(10, false);
+    home.project(home.bytes(9), 9);
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        0,
+        "{}",
+        counters(&cache)
+    );
+    home.project(home.bytes(10), 10);
+    let (index, cured) = home.generation(index, &cache, 1);
+    assert_eq!(
+        created_usage(&cured),
+        vec![(200, 3)],
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), 0, "{}", counters(&cache));
+    assert_admitted_once(&home, &cache, index, &cured, 2);
 }
 
 /// #635 (c), negative control: a created thread with copied-history evidence

@@ -3124,8 +3124,16 @@ pub(in crate::snapshots) fn growth_may_cure(accumulator: &SnapshotAccumulator) -
     }
 }
 
-/// A state-declared created thread with no trusted parent and no bound
-/// projection (#635).
+/// A state-declared created thread whose sidecar bound neither a parent nor
+/// a projection: an extent mismatch, or no extent (#635). The class keys on
+/// bound sidecar facts, not header claims, so it includes copy-evidence
+/// forks (`forked_from_id`, `history_base`) and parented threads whose
+/// binding was skipped: the created-thread branch overwrites
+/// `codex_parent_session_ref` with the trusted (bound) parent, so the ref
+/// conjunct only bites on the identity-ambiguous return. Excluding header
+/// lineage would bring the stale hit back for a parented thread that binds
+/// once its file catches up. A member pays an exact-stamp re-read on growth
+/// or sidecar change; admission is still decided by the classifier.
 fn unbound_created_thread(accumulator: &SnapshotAccumulator) -> bool {
     accumulator.codex_sidecar_created_thread
         && accumulator.codex_sidecar_parent.is_none()
