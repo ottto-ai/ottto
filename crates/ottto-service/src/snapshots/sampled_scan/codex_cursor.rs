@@ -348,7 +348,9 @@ impl JobMeta {
     /// the pause and completion walks are exact. None when no charge is
     /// recorded, the reader restarted, or `CHARGE_REFRESH_BYTES` were
     /// consumed since (the caller walks again: at most one walk per that
-    /// many bytes, never one per line).
+    /// many bytes, never one per line). The scanner reads it through
+    /// `job_charge_estimate`, which also covers group jobs.
+    #[cfg(test)]
     pub(in crate::snapshots) fn charge_estimate(
         &self,
         consumed: u64,
