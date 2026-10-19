@@ -20,7 +20,7 @@
 //! HMAC and follows attribution consent. No text leaves the Mac.
 
 use super::UsageTotals;
-use crate::codex_prelude;
+use crate::codex_prelude::{char_count as units, BlockKind, CodexPreludeParser};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -37,6 +37,9 @@ pub(crate) const MAX_OPENING_FILES: usize = 64;
 const MAX_HELD_BYTES: usize = 256 * 1024;
 const MAX_HELD_INSTRUCTION_BYTES: usize = MAX_HELD_BYTES / 2;
 const MAX_HELD_COLLECTION_BYTES: usize = MAX_HELD_BYTES - MAX_HELD_INSTRUCTION_BYTES - 1024;
+/// Codex keeps its AGENTS.md text inside the shared prelude parser, beside
+/// the parser's own small strings (`codex_prelude::MAX_SMALL_TEXT_BYTES` each).
+const MAX_CODEX_AGENTS_MD_BYTES: usize = MAX_HELD_INSTRUCTION_BYTES - 8 * 1024;
 const MAX_SHELL_PATH_TOKENS: usize = 16;
 const MAX_PATH_BYTES: usize = 512;
 /// Tool call ids are short; a longer one is not tracked.
@@ -93,15 +96,6 @@ const CLAUDE_SYSTEM_SECTIONS: [(&str, Part); 7] = [
 ];
 /// Written mid-line (`SessionStart hook additional context: ...`).
 const CLAUDE_HOOK_SECTION: &str = "hook additional context";
-
-fn units(text: &str) -> u64 {
-    // ASCII, the common case, is one unit per byte; `is_ascii` is vectorized.
-    if text.is_ascii() {
-        text.len() as u64
-    } else {
-        text.encode_utf16().count() as u64
-    }
-}
 
 /// UTF-16 units of `value` serialized with Python `json.dumps` separators
 /// (`", "`, `": "`), the basis the tool-schema ratio was calibrated on. Counted
@@ -212,10 +206,11 @@ fn fold_digest(digest: &mut Option<ConfigDigest>, bytes: &[u8]) {
         .update(bytes);
 }
 
-fn push_capped(held: &mut String, text: &str) {
+/// Appends what fits under the instruction budget; false when text was cut.
+fn push_capped(held: &mut String, text: &str) -> bool {
     let room = MAX_HELD_INSTRUCTION_BYTES.saturating_sub(held.len() + 1);
     if room == 0 {
-        return;
+        return text.is_empty();
     }
     let mut end = text.len().min(room);
     while !text.is_char_boundary(end) {
@@ -227,6 +222,7 @@ fn push_capped(held: &mut String, text: &str) {
         held.push('\n');
     }
     held.push_str(&text[..end]);
+    end == text.len()
 }
 
 /// One B-tree node per entry, as `heap_layout_bound::tree_nodes` charges it.
@@ -267,13 +263,22 @@ fn is_client_version(value: &str) -> bool {
 }
 
 /// Raw client tool name; MCP tools collapse to `mcp` (their server and tool
-/// names already travel through the activity counters).
+/// names already travel through the activity counters). A name outside
+/// admission's `[A-Za-z0-9_.:-]{1,64}` travels as `unknown`.
 fn tool_label(name: &str) -> String {
     if name.starts_with("mcp__") {
-        "mcp".to_string()
-    } else {
-        name.chars().take(MAX_TOOL_LABEL_CHARS).collect()
+        return "mcp".to_string();
     }
+    // A valid label is ASCII, so a non-boundary cut is invalid anyway.
+    name.get(..name.len().min(MAX_TOOL_LABEL_CHARS))
+        .filter(|label| {
+            !label.is_empty()
+                && label.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-')
+                })
+        })
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// `ext` of a path's last segment: 1-8 ASCII alphanumerics after the last dot.
@@ -315,8 +320,11 @@ fn shell_changes_directory(command: &str) -> bool {
                 )
         })
         .any(|word| {
-            matches!(word, "cd" | "pushd" | "popd" | "chdir" | "-C")
+            matches!(word, "cd" | "pushd" | "popd" | "chdir")
+                // `-C dir` and attached `-Cdir` (git, make, tar, `env -C`).
+                || word.starts_with("-C")
                 || [
+                    "--chdir",
                     "--directory",
                     "--git-dir",
                     "--work-tree",
@@ -345,10 +353,54 @@ fn is_repo_relative(path: &str) -> bool {
         && !path.split('/').any(|segment| segment == "..")
 }
 
-/// `(key, repo-relative path)`: the key is the repo-relative path when the file
-/// is inside the session's working directory (a lexical prefix test), else
-/// the path as written, which can only travel hashed. A relative path counts
-/// as inside only when `trust_relative` (its base is the session directory).
+/// Admission's forbidden fragments for any plain path
+/// (`backend/app/schemas/context_footprint.py`), matched case-insensitively.
+const PLAIN_PATH_FORBIDDEN_FRAGMENTS: [&str; 15] = [
+    "/users/",
+    "\\users\\",
+    "/home/",
+    "\\home\\",
+    "file://",
+    "transcript_path",
+    "workspace_path",
+    "full_transcript_path",
+    "authorization:",
+    "bearer ",
+    "otdev_",
+    "otsi_",
+    "otsr_",
+    "otel_",
+    "otrelay_",
+];
+
+/// True when admission takes `path` as a plain `repo_path` unchanged (its
+/// `_safe_relative_path`): any other path travels hashed or is withheld, so
+/// one unsafe path never clears the whole session-start block.
+fn is_plain_path(path: &str) -> bool {
+    let lowered = path.to_lowercase();
+    is_repo_relative(path)
+        && path.chars().count() <= MAX_PATH_BYTES
+        // No backslash form (`\x`, `a\..\b`, `C:\x`) and no drive or URL form.
+        && !path.contains('\\')
+        && !path.contains(":/")
+        // Admission collapses whitespace runs; only single inner spaces survive it.
+        && !path.starts_with(' ')
+        && !path.ends_with(' ')
+        && !path.contains("  ")
+        && !path
+            .chars()
+            .any(|ch| ch != ' ' && (ch.is_whitespace() || ch.is_control()))
+        && !PLAIN_PATH_FORBIDDEN_FRAGMENTS
+            .iter()
+            .any(|fragment| lowered.contains(fragment))
+}
+
+/// `(key, plain path)`: the key is the repo-relative path when the file is
+/// inside the session's working directory (a lexical prefix test), else the
+/// path as written. The plain path is set only when admission accepts it and
+/// its base is proven: an absolute path under `cwd`, or a relative one when
+/// `trust_relative` and the session directory is known. Every other file can
+/// only travel hashed.
 fn normalize_path(
     raw: &str,
     cwd: Option<&Path>,
@@ -366,14 +418,15 @@ fn normalize_path(
             .and_then(|rest| rest.strip_prefix('/'))
             .filter(|rest| is_repo_relative(rest));
         return Some(match inside {
-            Some(rest) => (rest.to_string(), Some(rest.to_string())),
+            Some(rest) => (
+                rest.to_string(),
+                is_plain_path(rest).then(|| rest.to_string()),
+            ),
             None => (raw.to_string(), None),
         });
     }
-    Some((
-        raw.to_string(),
-        (trust_relative && is_repo_relative(raw)).then(|| raw.to_string()),
-    ))
+    let plain = trust_relative && cwd.is_some() && is_plain_path(raw);
+    Some((raw.to_string(), plain.then(|| raw.to_string())))
 }
 
 /// How many trailing path segments (basename, then parent/basename, ...)
@@ -450,6 +503,8 @@ struct OpeningRequest {
     cache_read_tokens: u64,
     cache_write_5m_tokens: Option<u64>,
     cache_write_1h_tokens: Option<u64>,
+    /// The parts above add up to `context_tokens` (D6 is exact).
+    parts_reconcile: bool,
     output_tokens: u64,
 }
 
@@ -497,7 +552,8 @@ pub(super) struct SessionStartState {
     requests: [Option<OpeningRequest>; WINDOW_REQUESTS],
     codex_requests: u8,
     response_tool_calls: [u64; 2],
-    truncated_outputs: u64,
+    /// Client-recorded truncations by the request they arrive in (2, 3).
+    truncated_outputs: [u64; 2],
     parts: [u64; PARTS],
     parts_closed: bool,
     parts_unmeasurable: bool,
@@ -507,11 +563,19 @@ pub(super) struct SessionStartState {
     claude_blobs: BTreeMap<String, ClaudeBlob>,
     memory_units: Option<u64>,
     instruction_load_cut: Option<bool>,
+    /// Claude's request-1 instruction text, held for path matching.
     instructions: Option<String>,
+    /// The instruction text outgrew its budget, so path matching is
+    /// incomplete and no file fact is sent.
+    instructions_capped: bool,
+    /// Codex: the one prelude parser, which also holds the AGENTS.md text
+    /// for path matching.
+    codex_prelude: Option<Box<CodexPreludeParser>>,
     calls: BTreeMap<String, OpeningCall>,
     last_codex_call: Option<String>,
     files: BTreeMap<String, OpeningFileState>,
-    files_untracked: u64,
+    /// Files refused by the memory budget, by the request they arrive in.
+    files_untracked: [u64; 2],
     /// Collection bytes charged against `MAX_HELD_COLLECTION_BYTES`.
     held_bytes: usize,
     /// A Claude Bash command changed directory; the shell keeps that cwd, so
@@ -521,12 +585,12 @@ pub(super) struct SessionStartState {
     collapsed_requests: bool,
 }
 
-crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, output_tokens);
+crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, parts_reconcile, output_tokens);
 crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest);
 crate::heap_layout_bound::fields!(ConfigDigest; a, b, len);
 crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
 crate::heap_layout_bound::fields!(OpeningFileState; ordinal, request, tool, repo_path, instruction_segments, chars, reads, client_loaded, truncated);
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
+crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
 
 impl SessionStartState {
     pub(super) fn note_user_turn(&mut self) {
@@ -551,6 +615,9 @@ impl SessionStartState {
             self.parts_unmeasurable = true;
         }
         self.instructions = None;
+        if let Some(parser) = self.codex_prelude.as_mut() {
+            parser.release_text();
+        }
         self.calls = BTreeMap::new();
         self.claude_blobs = BTreeMap::new();
         self.claude_shape = None;
@@ -666,7 +733,7 @@ impl SessionStartState {
                         memory += units(content);
                         cut |= content.contains(MEMORY_CUT_MARKER);
                     }
-                    push_capped(&mut held, content);
+                    self.instructions_capped |= !push_capped(&mut held, content);
                 }
                 self.instructions = Some(held);
                 self.memory_units = Some(memory);
@@ -878,6 +945,9 @@ impl SessionStartState {
             cache_read_tokens: usage.cache_read_tokens,
             cache_write_5m_tokens: Some(usage.cache_creation_5m_tokens),
             cache_write_1h_tokens: Some(usage.cache_creation_1h_tokens),
+            // The item's first turn takes the larger of the billing counters
+            // and any single `usage.iterations[]` entry; D6 must equal it.
+            parts_reconcile: usage.effective_input_context() == context_tokens,
             output_tokens: usage.output_tokens,
         });
         if let Some(calls) = self.response_tool_calls.get_mut(sequence as usize) {
@@ -887,13 +957,36 @@ impl SessionStartState {
 
     // ---- Codex ----------------------------------------------------------
 
-    /// `session_meta`, read before ownership so a fork keeps its version.
-    pub(super) fn note_codex_session_meta(&mut self, meta: &Value) {
-        self.note_client_version(str_at(meta, "cli_version"));
-        if !self.parts_closed && self.parts[Part::System as usize] == 0 {
-            self.parts[Part::System as usize] =
-                codex_prelude::base_instructions_text(meta).map_or(0, units);
+    /// Codex `session_meta` row, read before ownership so a fork keeps its
+    /// version. It starts the shared prelude parser.
+    pub(super) fn note_codex_session_meta(&mut self, row: &Value) {
+        if let Some(meta) = row.get("payload") {
+            self.note_client_version(str_at(meta, "cli_version"));
         }
+        if self.frozen {
+            return;
+        }
+        self.feed_codex_prelude(row);
+    }
+
+    /// Feeds the one Codex prelude parser (CROSS-LANE R1) and folds the
+    /// configuration blocks it counts into the start fingerprint.
+    fn feed_codex_prelude(&mut self, row: &Value) {
+        let parser = self.codex_prelude.get_or_insert_with(|| {
+            Box::new(CodexPreludeParser::matching_only(MAX_CODEX_AGENTS_MD_BYTES))
+        });
+        let digest = &mut self.config_digest;
+        parser.observe_with(row, |kind, text| {
+            if codex_part(kind).is_some_and(Part::is_config) {
+                fold_digest(&mut *digest, text.as_bytes());
+            }
+        });
+    }
+
+    fn codex_input_closed(&self) -> bool {
+        self.codex_prelude
+            .as_ref()
+            .is_some_and(|parser| parser.prelude().input_closed)
     }
 
     /// One owned Codex line.
@@ -901,20 +994,15 @@ impl SessionStartState {
         if self.frozen {
             return;
         }
+        // `session_meta` rows reach the parser before ownership.
+        if str_at(value, "type") != Some("session_meta") {
+            self.feed_codex_prelude(value);
+        }
         let Some(payload) = value.get("payload") else {
             return;
         };
         match (str_at(value, "type"), str_at(payload, "type")) {
-            (Some("response_item"), Some("message")) => {
-                if matches!(str_at(payload, "role"), Some("developer" | "user")) {
-                    if !self.parts_closed {
-                        self.codex_prelude_message(payload);
-                    }
-                } else {
-                    self.parts_closed = true;
-                }
-            }
-            (Some("response_item"), Some("additional_tools")) if !self.parts_closed => {
+            (Some("response_item"), Some("additional_tools")) if !self.codex_input_closed() => {
                 self.codex_tools_logged = true;
                 self.parts[Part::Tools as usize] += payload
                     .get("tools")
@@ -924,9 +1012,7 @@ impl SessionStartState {
                     .map(json_units)
                     .sum::<u64>();
             }
-            (Some("response_item"), Some("reasoning")) => self.parts_closed = true,
             (Some("response_item"), Some("function_call" | "custom_tool_call")) => {
-                self.parts_closed = true;
                 let response = self.codex_requests + 1;
                 if response <= 2 {
                     self.response_tool_calls[usize::from(response - 1)] += 1;
@@ -965,50 +1051,6 @@ impl SessionStartState {
         }
     }
 
-    fn codex_prelude_message(&mut self, payload: &Value) {
-        let Some(blocks) = codex_prelude::labeled_blocks(payload) else {
-            self.parts_unmeasurable = true;
-            return;
-        };
-        for (kind, block) in blocks {
-            if str_at(block, "type") == Some("input_image") {
-                self.parts_unmeasurable = true;
-                continue;
-            }
-            let Some(text) = str_at(block, "text") else {
-                continue;
-            };
-            let part = match kind {
-                codex_prelude::AGENTS_MD_KIND => {
-                    push_capped(
-                        self.instructions.get_or_insert_with(String::new),
-                        codex_prelude::agents_md_instructions(text),
-                    );
-                    Part::Instructions
-                }
-                codex_prelude::HOST_SKILLS_KIND => Part::Skills,
-                codex_prelude::DEFERRED_NAMESPACES_KIND => Part::McpNames,
-                codex_prelude::BASE_INSTRUCTIONS_KIND => continue,
-                kind if kind.starts_with("user.") => Part::Prompt,
-                kind if [
-                    "hooks.",
-                    "permissions.",
-                    "environments.",
-                    "collaboration_mode.",
-                    "plugins.",
-                    "apps.",
-                ]
-                .iter()
-                .any(|prefix| kind.starts_with(prefix)) =>
-                {
-                    Part::HooksEnv
-                }
-                _ => Part::Other,
-            };
-            self.add_part(part, text);
-        }
-    }
-
     fn codex_parsed_command(&mut self, call_id: &str, record: &Value, cwd: Option<&Path>) {
         // `exec_command_end` and `item_completed` can both describe one call.
         if self
@@ -1019,13 +1061,14 @@ impl SessionStartState {
             return;
         }
         // Each Codex command runs in a fresh shell at its own `cwd`; relative
-        // paths are in the checkout only when that is the session directory
-        // and the command does not change directory.
+        // paths are in the checkout only when the record states that `cwd`,
+        // it is the session directory, and the command does not change
+        // directory. A record without `cwd` proves no base.
         let session_dir = cwd
             .and_then(Path::to_str)
             .map(|dir| dir.trim_end_matches('/'));
         let mut trust_relative = str_at(record, "cwd")
-            .map_or(true, |dir| Some(dir.trim_end_matches('/')) == session_dir)
+            .is_some_and(|dir| Some(dir.trim_end_matches('/')) == session_dir)
             && match record.get("command") {
                 Some(Value::String(command)) => !shell_changes_directory(command),
                 Some(Value::Array(parts)) => !parts
@@ -1065,22 +1108,50 @@ impl SessionStartState {
             cache_read_tokens: usage.cache_read_tokens,
             cache_write_5m_tokens: None,
             cache_write_1h_tokens: None,
+            parts_reconcile: usage.cache_read_tokens <= usage.input_tokens,
             output_tokens: usage.output_tokens,
         });
         self.codex_requests += 1;
-        self.parts_closed = true;
         if index + 1 == WINDOW_REQUESTS {
             self.freeze();
         }
     }
 
+    /// Request-1 parts from the prelude parser: `None` unless request 1's
+    /// input is over, every block was labeled and `world_state` was logged.
+    fn codex_parts(&self) -> Option<[u64; PARTS]> {
+        let prelude = self.codex_prelude.as_ref()?.prelude();
+        if !prelude.input_closed || prelude.blocks_incomplete || !prelude.world_state_seen {
+            return None;
+        }
+        let mut parts = [0; PARTS];
+        parts[Part::Tools as usize] = self.parts[Part::Tools as usize];
+        parts[Part::System as usize] = prelude.base_instructions_chars;
+        for kind in [
+            BlockKind::AgentsMd,
+            BlockKind::Skills,
+            BlockKind::DeferredTools,
+            BlockKind::Hooks,
+            BlockKind::Environment,
+            BlockKind::Prompt,
+            BlockKind::Other,
+        ] {
+            if let Some(part) = codex_part(kind) {
+                parts[part as usize] += prelude.chars(kind);
+            }
+        }
+        Some(parts)
+    }
+
     // ---- shared ---------------------------------------------------------
 
-    fn add_part(&mut self, part: Part, text: &str) {
-        self.parts[part as usize] += units(text);
-        if part.is_config() {
-            fold_digest(&mut self.config_digest, text.as_bytes());
-        }
+    /// The injected instruction text paths are matched against: Claude's
+    /// request-1 instructions, or the AGENTS.md body Codex loaded.
+    fn haystack(&self) -> Option<&str> {
+        self.instructions.as_deref().or_else(|| {
+            let agents = self.codex_prelude.as_ref()?.prelude().agents_md.as_ref()?;
+            Some(agents.text.as_str())
+        })
     }
 
     fn open_call(&mut self, id: &str, response: u8, name: &str) {
@@ -1114,8 +1185,7 @@ impl SessionStartState {
                 continue;
             };
             let segments = self
-                .instructions
-                .as_deref()
+                .haystack()
                 .map_or(0, |haystack| instruction_segments(&key, haystack));
             if self.upsert_file(&key, repo_path, segments, &tool, request, false) {
                 keys.push(key);
@@ -1156,7 +1226,7 @@ impl SessionStartState {
             return;
         };
         call.truncated = true;
-        self.truncated_outputs += 1;
+        self.truncated_outputs[usize::from(call.response.clamp(1, 2) - 1)] += 1;
         for key in &call.files {
             if let Some(file) = self.files.get_mut(key) {
                 file.truncated = true;
@@ -1176,8 +1246,7 @@ impl SessionStartState {
             return;
         };
         let segments = self
-            .instructions
-            .as_deref()
+            .haystack()
             .map_or(0, |haystack| instruction_segments(&key, haystack));
         if self.upsert_file(&key, repo_path, segments, record_type, request, true) {
             if let Some(file) = self.files.get_mut(&key) {
@@ -1215,7 +1284,7 @@ impl SessionStartState {
             ..OpeningFileState::default()
         };
         if !self.charge(file_bytes(key, &file)) {
-            self.files_untracked += 1;
+            self.files_untracked[usize::from(request.clamp(2, 3) - 2)] += 1;
             return false;
         }
         self.files.insert(key.to_string(), file);
@@ -1225,6 +1294,10 @@ impl SessionStartState {
     /// The wire value. `fresh_start` is false for forks and copied prefixes,
     /// which keep only `client_version`. Path hashes need the tenant
     /// attribution key; the configuration fingerprint uses the device salt.
+    ///
+    /// Everything request-indexed is cut to the contiguous requests actually
+    /// observed: a file, truncation or tool call staged for a request the
+    /// transcript has not reached yet is not sent (nor counted as overflow).
     pub(super) fn finish(
         self,
         fresh_start: bool,
@@ -1232,6 +1305,12 @@ impl SessionStartState {
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
         device_salt: Option<&[u8; 32]>,
     ) -> Option<SnapshotSessionStart> {
+        let matching_incomplete = self.file_matching_incomplete();
+        let parts = if method == CODEX_PARTS_METHOD {
+            self.codex_parts()
+        } else {
+            (self.parts_closed && !self.parts_unmeasurable).then_some(self.parts)
+        };
         let mut start = SnapshotSessionStart {
             client_version: self.client_version,
             ..SnapshotSessionStart::default()
@@ -1248,58 +1327,78 @@ impl SessionStartState {
         } else {
             self.requests
         };
-        if let Some(first) = requests[0] {
+        let observed = requests
+            .iter()
+            .take_while(|request| request.is_some())
+            .count();
+        // D6 only when its parts add up to the item's first-turn context: the
+        // first request must be that turn (positive) and reconcile exactly.
+        if let Some(first) = requests[0].filter(|r| r.parts_reconcile && r.context_tokens > 0) {
             start.first_request_uncached_input_tokens = Some(first.uncached_input_tokens);
             start.first_request_cache_read_tokens = Some(first.cache_read_tokens);
             start.first_request_cache_write_5m_tokens = first.cache_write_5m_tokens;
             start.first_request_cache_write_1h_tokens = first.cache_write_1h_tokens;
         }
-        let observed = requests
-            .iter()
-            .take_while(|request| request.is_some())
-            .count();
         if observed > 0 {
+            let reached = |request: usize| request <= observed;
+            // Responses 1-2 issue the window's calls; response N is request N.
+            let responses = observed.min(2);
             start.opening_request_count = Some(observed as u64);
-            start.request_2_context_tokens = requests[1].map(|r| r.context_tokens);
-            start.request_3_context_tokens = requests[2].map(|r| r.context_tokens);
+            start.request_2_context_tokens =
+                requests[1].filter(|_| reached(2)).map(|r| r.context_tokens);
+            start.request_3_context_tokens =
+                requests[2].filter(|_| reached(3)).map(|r| r.context_tokens);
             start.opening_output_tokens = Some(
-                requests[..2]
+                requests[..responses]
                     .iter()
                     .flatten()
                     .map(|r| r.output_tokens)
                     .sum(),
             );
-            start.opening_tool_calls = Some(self.response_tool_calls.iter().sum());
-            start.opening_truncated_outputs = Some(self.truncated_outputs);
-            let mut files = self.files.into_iter().collect::<Vec<_>>();
-            files.sort_by_key(|(_, file)| file.ordinal);
-            start.files_over_guard =
-                self.files_untracked + files.len().saturating_sub(MAX_OPENING_FILES) as u64;
-            files.truncate(MAX_OPENING_FILES);
-            start.file_candidates = files
-                .into_iter()
-                .map(|(key, file)| OpeningFileCandidate {
-                    path_hash: attribution
-                        .and_then(|context| context.opaque_id("opening_path", &key)),
-                    ext: extension(&key).map(str::to_string),
-                    repo_path: file.repo_path,
-                    row: SnapshotOpeningFile {
-                        request: file.request,
-                        tool: file.tool,
-                        repo_path: None,
-                        path_hash: None,
-                        ext: None,
-                        chars: file.chars,
-                        reads: file.reads,
-                        instruction_segments: file.instruction_segments,
-                        client_loaded: file.client_loaded,
-                        truncated: file.truncated,
-                    },
-                })
-                .collect();
+            start.opening_tool_calls = Some(self.response_tool_calls[..responses].iter().sum());
+            // Request N+1 carries the outputs of response N's calls.
+            let arrived = observed.saturating_sub(1);
+            start.opening_truncated_outputs = Some(self.truncated_outputs[..arrived].iter().sum());
+            if matching_incomplete {
+                // Unknown, not zero: a file named past the cap went unseen.
+                start.opening_files_unknown = true;
+            } else {
+                let mut files = self
+                    .files
+                    .into_iter()
+                    .filter(|(_, file)| reached(usize::from(file.request)))
+                    .collect::<Vec<_>>();
+                files.sort_by_key(|(_, file)| file.ordinal);
+                start.files_over_guard = self.files_untracked[..arrived].iter().sum::<u64>()
+                    + files.len().saturating_sub(MAX_OPENING_FILES) as u64;
+                files.truncate(MAX_OPENING_FILES);
+                start.file_candidates = files
+                    .into_iter()
+                    .map(|(key, file)| OpeningFileCandidate {
+                        path_hash: attribution
+                            .and_then(|context| context.opaque_id("opening_path", &key)),
+                        ext: extension(&key).map(str::to_string),
+                        repo_path: file.repo_path,
+                        row: SnapshotOpeningFile {
+                            request: file.request,
+                            tool: file.tool,
+                            repo_path: None,
+                            path_hash: None,
+                            ext: None,
+                            chars: file.chars,
+                            reads: file.reads,
+                            instruction_segments: file.instruction_segments,
+                            client_loaded: file.client_loaded,
+                            truncated: file.truncated,
+                        },
+                    })
+                    .collect();
+                // Nothing identifies a file until the upload policy is known.
+                start.opening_file_overflow =
+                    Some(start.files_over_guard + start.file_candidates.len() as u64);
+            }
         }
-        if self.parts_closed && !self.parts_unmeasurable {
-            let mut parts = self.parts;
+        if let Some(mut parts) = parts {
             if let Some(memory) = self.memory_units {
                 // Claude carries memory inside the instruction block.
                 parts[Part::Instructions as usize] =
@@ -1328,9 +1427,17 @@ impl SessionStartState {
             let hash = crate::context_file_counts::salted_content_hash(salt, &material);
             start.start_config_fingerprint = Some(hash[..16].to_string());
         }
-        // Nothing crosses the wire until the upload policy is known.
-        start.apply_upload_policy(false, false);
         start.into_measured()
+    }
+
+    /// Path matching saw only part of the injected instruction text (its
+    /// budget, or a Codex rollout without `world_state`).
+    fn file_matching_incomplete(&self) -> bool {
+        self.instructions_capped
+            || self.codex_prelude.as_ref().is_some_and(|parser| {
+                let prelude = parser.prelude();
+                prelude.agents_md_capped || !prelude.world_state_seen
+            })
     }
 }
 
@@ -1344,6 +1451,20 @@ impl ClaudeBlob {
             fold_digest(&mut self.config_digest, text.as_bytes());
         }
     }
+}
+
+/// Where a labeled Codex prelude block counts; base instructions come from
+/// `session_meta` (the System part) instead.
+fn codex_part(kind: BlockKind) -> Option<Part> {
+    Some(match kind {
+        BlockKind::BaseInstructions => return None,
+        BlockKind::AgentsMd => Part::Instructions,
+        BlockKind::Skills => Part::Skills,
+        BlockKind::DeferredTools => Part::McpNames,
+        BlockKind::Hooks | BlockKind::Environment => Part::HooksEnv,
+        BlockKind::Prompt => Part::Prompt,
+        BlockKind::Other => Part::Other,
+    })
 }
 
 fn split_claude_system_text(text: &str, blob: &mut ClaudeBlob) {
@@ -1459,38 +1580,69 @@ pub struct SnapshotSessionStart {
     pub start_chars_other: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_config_fingerprint: Option<String>,
+    /// Local only until the upload policy picks each entry's identity; then
+    /// released (only `opening_files` stays).
     #[serde(skip)]
     pub(crate) file_candidates: Vec<OpeningFileCandidate>,
     #[serde(skip)]
     pub(crate) files_over_guard: u64,
+    /// The candidates were consumed by an upload policy.
+    #[serde(skip)]
+    pub(crate) policy_applied: bool,
+    /// Path matching was incomplete: no file row and a NULL overflow.
+    #[serde(skip)]
+    pub(crate) opening_files_unknown: bool,
 }
 
 crate::heap_layout_bound::fields!(SnapshotOpeningFile; request, tool, repo_path, path_hash, ext, chars, reads, instruction_segments, client_loaded, truncated);
 crate::heap_layout_bound::fields!(OpeningFileCandidate; row, repo_path, path_hash, ext);
-crate::heap_layout_bound::fields!(SnapshotSessionStart; client_version, user_turn_count, first_request_uncached_input_tokens, first_request_cache_read_tokens, first_request_cache_write_5m_tokens, first_request_cache_write_1h_tokens, opening_request_count, request_2_context_tokens, request_3_context_tokens, opening_output_tokens, opening_tool_calls, opening_truncated_outputs, opening_files, opening_file_overflow, instruction_load_cut, start_parts_method, start_chars_tools, start_chars_system, start_chars_instructions, start_chars_memory, start_chars_skills, start_chars_agents, start_chars_mcp_names, start_chars_mcp_instructions, start_chars_hooks_env, start_chars_prompt, start_chars_other, start_config_fingerprint, file_candidates, files_over_guard);
+crate::heap_layout_bound::fields!(SnapshotSessionStart; client_version, user_turn_count, first_request_uncached_input_tokens, first_request_cache_read_tokens, first_request_cache_write_5m_tokens, first_request_cache_write_1h_tokens, opening_request_count, request_2_context_tokens, request_3_context_tokens, opening_output_tokens, opening_tool_calls, opening_truncated_outputs, opening_files, opening_file_overflow, instruction_load_cut, start_parts_method, start_chars_tools, start_chars_system, start_chars_instructions, start_chars_memory, start_chars_skills, start_chars_agents, start_chars_mcp_names, start_chars_mcp_instructions, start_chars_hooks_env, start_chars_prompt, start_chars_other, start_config_fingerprint, file_candidates, files_over_guard, policy_applied, opening_files_unknown);
 
 impl SnapshotSessionStart {
     /// Picks each entry's identity under the current consent: a plain path
     /// needs workspace labels, a hash needs attribution. Entries with neither
     /// are counted in `opening_file_overflow`, with those over the 64 guard.
+    /// The local candidates are released here, so a later application (the
+    /// same cycle's policy again) can only narrow what is sent.
     pub(crate) fn apply_upload_policy(&mut self, labels_enabled: bool, attribution_enabled: bool) {
-        if self.opening_request_count.is_none() {
+        if self.opening_request_count.is_none() || self.opening_files_unknown {
             return;
         }
-        let mut withheld = self.files_over_guard;
-        self.opening_files.clear();
-        for candidate in &self.file_candidates {
-            let mut row = candidate.row.clone();
-            if labels_enabled && candidate.repo_path.is_some() {
-                row.repo_path = candidate.repo_path.clone();
-            } else if attribution_enabled && candidate.path_hash.is_some() {
-                row.path_hash = candidate.path_hash.clone();
-                row.ext = candidate.ext.clone();
-            } else {
-                withheld += 1;
-                continue;
+        let mut withheld = if self.policy_applied {
+            self.opening_file_overflow.unwrap_or(0)
+        } else {
+            self.files_over_guard
+        };
+        let allowed = |row: &SnapshotOpeningFile| {
+            (labels_enabled && row.repo_path.is_some())
+                || (attribution_enabled && row.path_hash.is_some())
+        };
+        let before = self.opening_files.len();
+        self.opening_files.retain(allowed);
+        withheld += (before - self.opening_files.len()) as u64;
+        if !self.policy_applied {
+            self.policy_applied = true;
+            let candidates = std::mem::take(&mut self.file_candidates);
+            self.opening_files.reserve_exact(candidates.len());
+            for candidate in candidates {
+                let OpeningFileCandidate {
+                    mut row,
+                    repo_path,
+                    path_hash,
+                    ext,
+                } = candidate;
+                if labels_enabled && repo_path.is_some() {
+                    row.repo_path = repo_path;
+                } else if attribution_enabled && path_hash.is_some() {
+                    row.path_hash = path_hash;
+                    row.ext = ext;
+                } else {
+                    withheld += 1;
+                    continue;
+                }
+                self.opening_files.push(row);
             }
-            self.opening_files.push(row);
+            self.opening_files.shrink_to_fit();
         }
         self.opening_file_overflow = Some(withheld);
     }
@@ -1513,9 +1665,10 @@ impl SnapshotSessionStart {
 mod tests {
     use super::super::{
         parse_claude_code_jsonl_file_with_title_metadata_and_attribution, parse_codex_jsonl_file,
-        ClaudeTitleMetadata, SnapshotSource,
+        ClaudeTitleMetadata, SnapshotItem, SnapshotSource,
     };
     use super::*;
+    use crate::codex_prelude;
     use crate::session_attribution::{
         SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION,
     };
@@ -1554,72 +1707,94 @@ mod tests {
         fingerprint
     }
 
-    #[test]
-    fn claude_fixture_yields_exact_session_start() {
-        let dir = crate::test_scratch::ScratchDir::new("session-start-claude");
-        let path = dir.join("ss-claude-1.jsonl");
-        let usage = |input: u64, read: u64, output: u64| json!({"input_tokens": input, "cache_read_input_tokens": read, "output_tokens": output});
-        write_lines(
-            &path,
-            json!({"sessionId": "ss-claude-1", "cwd": "/w/repo", "version": "2.1.300", "timestamp": "2026-10-18T10:00:00Z"}),
-            vec![
-                json!({"type": "attachment", "attachment": {"type": "instructions", "files": [
-                    {"type": "Project", "content": "Read docs/guide.md first."},
-                    {"type": "AutoMem", "content": "mem note"}]}}),
-                json!({"type": "user", "message": {"role": "user", "content": "hello \u{1f600}"}}),
-                json!({"type": "api-request-shape", "shapeHash": "s1", "shape": {
-                    "system": [{"type": "text", "text": "You are Claude."}],
-                    "tools": [{"name": "Read"}]}}),
-                json!({"type": "api-request-blob", "hash": "b1", "message": {"role": "user", "content": [
-                    {"type": "text", "text": "<system-reminder>\nCodebase and user instructions Read docs/guide.md first. mem note"},
-                    {"type": "text", "text": "hello \u{1f600}"},
-                    {"type": "tool_addition", "tool": {"name": "mcp__x__y"}}]}}),
-                json!({"type": "api-request-blob", "hash": "b2", "message": {"role": "system", "content": [
-                    {"type": "text", "text": "intro\n# Environment cwd"}]}}),
-                json!({"type": "api-request", "shapeHash": "s1", "tail": ["b1", "b2"]}),
-                json!({"type": "assistant", "requestId": "r1", "message": {"id": "m1", "role": "assistant", "model": "claude-fable-5-1",
-                    "usage": {"input_tokens": 10, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50,
-                        "cache_creation": {"ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 30}, "output_tokens": 7},
-                    "content": [
-                        {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/w/repo/docs/guide.md"}},
-                        {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "cat docs/guide.md README.md"}}]}}),
-                json!({"type": "user", "message": {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": "abcdefghij"},
-                    {"type": "tool_result", "tool_use_id": "t2", "content": [{"type": "text", "text": "0123456789AB"}]}]}}),
-                json!({"type": "attachment", "attachment": {"type": "nested_memory", "path": "/w/repo/src/CLAUDE.md", "content": "nested!"}}),
-                json!({"type": "attachment", "attachment": {"type": "read_truncation_notice", "toolUseID": "t1"}}),
-                json!({"type": "assistant", "requestId": "r2", "message": {"id": "m2", "role": "assistant", "model": "claude-fable-5-1",
-                    "usage": usage(5, 300, 3),
-                    "content": [{"type": "tool_use", "id": "t3", "name": "Read", "input": {"file_path": "/other/docs/guide.md"}}]}}),
-                json!({"type": "user", "message": {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t3", "content": "xyz"}]}}),
-                // Request 3 is cache-only (no uncached input) and still counts.
-                json!({"type": "assistant", "requestId": "r3", "message": {"id": "m3", "role": "assistant", "model": "claude-fable-5-1",
-                    "usage": usage(0, 400, 2), "content": [{"type": "text", "text": "done"}]}}),
-            ],
-        );
-        let context = SessionAttributionContext::from_activity_hint(
+    fn attribution_context(dir: &Path) -> SessionAttributionContext {
+        SessionAttributionContext::from_activity_hint(
             SnapshotSource::ClaudeCode,
-            &dir,
+            dir,
             true,
             Some(&URL_SAFE_NO_PAD.encode([11u8; 32])),
             Some(SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
         )
-        .expect("attribution context");
-        let items = parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
-            &path,
+        .expect("attribution context")
+    }
+
+    fn parse_claude(
+        path: &Path,
+        attribution: Option<&SessionAttributionContext>,
+    ) -> Vec<SnapshotItem> {
+        parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
+            path,
             "2026-10-18T10:05:00Z",
             "file-fingerprint".to_string(),
             &ClaudeTitleMetadata::default(),
             false,
-            Some(&context),
+            attribution,
         )
-        .expect("parse");
-        let mut start = items[0].session_start.clone().expect("session_start");
+        .expect("parse")
+    }
+
+    const CLAUDE_COMMON: &str = r#"{"sessionId": "ss-claude-1", "cwd": "/w/repo", "version": "2.1.300", "timestamp": "2026-10-18T10:00:00Z"}"#;
+
+    /// Requests 1-3 of a fresh Claude session; responses end at lines 6, 10
+    /// and 12.
+    fn claude_fixture_lines() -> Vec<Value> {
+        let usage = |input: u64, read: u64, output: u64| json!({"input_tokens": input, "cache_read_input_tokens": read, "output_tokens": output});
+        vec![
+            json!({"type": "attachment", "attachment": {"type": "instructions", "files": [
+                {"type": "Project", "content": "Read docs/guide.md first."},
+                {"type": "AutoMem", "content": "mem note"}]}}),
+            json!({"type": "user", "message": {"role": "user", "content": "hello \u{1f600}"}}),
+            json!({"type": "api-request-shape", "shapeHash": "s1", "shape": {
+                "system": [{"type": "text", "text": "You are Claude."}],
+                "tools": [{"name": "Read"}]}}),
+            json!({"type": "api-request-blob", "hash": "b1", "message": {"role": "user", "content": [
+                {"type": "text", "text": "<system-reminder>\nCodebase and user instructions Read docs/guide.md first. mem note"},
+                {"type": "text", "text": "hello \u{1f600}"},
+                {"type": "tool_addition", "tool": {"name": "mcp__x__y"}}]}}),
+            json!({"type": "api-request-blob", "hash": "b2", "message": {"role": "system", "content": [
+                {"type": "text", "text": "intro\n# Environment cwd"}]}}),
+            json!({"type": "api-request", "shapeHash": "s1", "tail": ["b1", "b2"]}),
+            json!({"type": "assistant", "requestId": "r1", "message": {"id": "m1", "role": "assistant", "model": "claude-fable-5-1",
+                "usage": {"input_tokens": 10, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 30}, "output_tokens": 7},
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/w/repo/docs/guide.md"}},
+                    {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "cat docs/guide.md README.md"}}]}}),
+            json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "abcdefghij"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": [{"type": "text", "text": "0123456789AB"}]}]}}),
+            json!({"type": "attachment", "attachment": {"type": "nested_memory", "path": "/w/repo/src/CLAUDE.md", "content": "nested!"}}),
+            json!({"type": "attachment", "attachment": {"type": "read_truncation_notice", "toolUseID": "t1"}}),
+            json!({"type": "assistant", "requestId": "r2", "message": {"id": "m2", "role": "assistant", "model": "claude-fable-5-1",
+                "usage": usage(5, 300, 3),
+                "content": [{"type": "tool_use", "id": "t3", "name": "Read", "input": {"file_path": "/other/docs/guide.md"}}]}}),
+            json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t3", "content": "xyz"}]}}),
+            // Request 3 is cache-only (no uncached input) and still counts.
+            json!({"type": "assistant", "requestId": "r3", "message": {"id": "m3", "role": "assistant", "model": "claude-fable-5-1",
+                "usage": usage(0, 400, 2), "content": [{"type": "text", "text": "done"}]}}),
+        ]
+    }
+
+    #[test]
+    fn claude_fixture_yields_exact_session_start() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-claude");
+        let path = dir.join("ss-claude-1.jsonl");
+        write_lines(
+            &path,
+            serde_json::from_str(CLAUDE_COMMON).unwrap(),
+            claude_fixture_lines(),
+        );
+        let context = attribution_context(&dir);
+        let items = parse_claude(&path, Some(&context));
+        let parsed = items[0].session_start.clone().expect("session_start");
         // Nothing identifies a file until the upload policy is applied.
-        assert!(start.opening_files.is_empty());
-        assert_eq!(start.opening_file_overflow, Some(3));
+        assert!(parsed.opening_files.is_empty());
+        assert_eq!(parsed.opening_file_overflow, Some(3));
+        let mut start = (*parsed).clone();
         start.apply_upload_policy(true, true);
+        // The policy releases the local candidates (no duplicate retention).
+        assert!(start.file_candidates.is_empty());
         let mut actual = serde_json::to_value(&start).expect("serialize");
         let fingerprint = take_fingerprint(&mut actual);
         let outside_hash = context
@@ -1669,23 +1844,20 @@ mod tests {
         // Request-1 parts reconcile with the first request's usage (D6).
         assert_eq!(items[0].first_turn_context_tokens, Some(10 + 100 + 20 + 30));
         // Labels off: every entry travels hashed, no plain path.
-        start.apply_upload_policy(false, true);
-        assert_eq!(start.opening_files.len(), 3);
-        assert_eq!(start.opening_file_overflow, Some(0));
-        assert!(start
+        let mut hashed = (*parsed).clone();
+        hashed.apply_upload_policy(false, true);
+        assert_eq!(hashed.opening_files.len(), 3);
+        assert_eq!(hashed.opening_file_overflow, Some(0));
+        assert!(hashed
             .opening_files
             .iter()
             .all(|file| file.repo_path.is_none() && file.path_hash.is_some()));
+        // A later, narrower application can only withhold more.
+        hashed.apply_upload_policy(false, false);
+        assert!(hashed.opening_files.is_empty());
+        assert_eq!(hashed.opening_file_overflow, Some(3));
         // The same configuration text yields the same fingerprint.
-        let reparsed = parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
-            &path,
-            "2026-10-18T10:06:00Z",
-            "file-fingerprint".to_string(),
-            &ClaudeTitleMetadata::default(),
-            false,
-            None,
-        )
-        .expect("reparse");
+        let reparsed = parse_claude(&path, None);
         let reparsed = reparsed[0].session_start.clone().expect("session_start");
         assert_eq!(
             reparsed.start_config_fingerprint.as_deref(),
@@ -1699,50 +1871,137 @@ mod tests {
     }
 
     #[test]
-    fn codex_fixture_yields_exact_session_start() {
-        let dir = crate::test_scratch::ScratchDir::new("session-start-codex");
-        let session = "019e253c-7777-7000-9000-aaaaaaaaaaaa";
-        let path = dir.join(format!("rollout-2026-10-18T10-00-00-{session}.jsonl"));
-        let token_count = |total: (u64, u64, u64), last: (u64, u64, u64)| {
-            let usage = |(input, cached, output): (u64, u64, u64)| json!({"input_tokens": input, "cached_input_tokens": cached, "output_tokens": output});
-            json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
-                "total_token_usage": usage(total), "last_token_usage": usage(last), "model": "gpt-5.5"}}})
-        };
-        let call = |id: &str| json!({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": id, "arguments": "{}"}});
+    fn partial_windows_send_only_reached_requests() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-partial");
+        // Ends after response 1 and its tool results, then after response 2.
+        for (end, count) in [(10, 1), (12, 2)] {
+            let path = dir.join(format!("ss-claude-partial-{count}.jsonl"));
+            let mut lines = claude_fixture_lines();
+            lines.truncate(end);
+            write_lines(&path, serde_json::from_str(CLAUDE_COMMON).unwrap(), lines);
+            let items = parse_claude(&path, None);
+            let mut start = (*items[0].session_start.clone().expect("session_start")).clone();
+            start.apply_upload_policy(true, true);
+            assert_eq!(start.opening_request_count, Some(count));
+            assert_eq!(start.request_3_context_tokens, None);
+            assert_eq!(start.opening_file_overflow, Some(0));
+            // Admission drops a row beyond the count; none is sent.
+            assert!(start
+                .opening_files
+                .iter()
+                .all(|file| u64::from(file.request) <= count));
+            if count == 1 {
+                assert_eq!(start.request_2_context_tokens, None);
+                assert!(start.opening_files.is_empty());
+                assert_eq!(start.opening_tool_calls, Some(2));
+                assert_eq!(start.opening_truncated_outputs, Some(0));
+            } else {
+                assert_eq!(start.request_2_context_tokens, Some(305));
+                let shown = start
+                    .opening_files
+                    .iter()
+                    .map(|file| file.repo_path.as_deref())
+                    .collect::<Vec<_>>();
+                assert_eq!(shown, [Some("docs/guide.md"), Some("src/CLAUDE.md")]);
+                assert_eq!(start.opening_tool_calls, Some(3));
+                assert_eq!(start.opening_truncated_outputs, Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn single_iteration_context_omits_unreconciled_first_request_parts() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-iteration");
+        let path = dir.join("ss-claude-iteration.jsonl");
         write_lines(
             &path,
-            json!({"timestamp": "2026-10-18T10:00:00Z"}),
+            serde_json::from_str(CLAUDE_COMMON).unwrap(),
             vec![
-                json!({"type": "session_meta", "payload": {"id": session, "cwd": "/w/repo", "cli_version": "0.160.0",
+                json!({"type": "user", "message": {"role": "user", "content": "hi"}}),
+                json!({"type": "assistant", "requestId": "r1", "message": {"id": "m1", "role": "assistant", "model": "claude-fable-5-1",
+                    "usage": {"input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1,
+                        "iterations": [{"input_tokens": 100, "cache_read_input_tokens": 200}]},
+                    "content": [{"type": "text", "text": "ok"}]}}),
+            ],
+        );
+        let items = parse_claude(&path, None);
+        // The item's first turn is the iteration's context; billing usage says 0.
+        assert_eq!(items[0].first_turn_context_tokens, Some(300));
+        let start = items[0].session_start.clone().expect("session_start");
+        assert_eq!(start.opening_request_count, Some(1));
+        assert_eq!(start.first_request_uncached_input_tokens, None);
+        assert_eq!(start.first_request_cache_read_tokens, None);
+        assert_eq!(start.first_request_cache_write_5m_tokens, None);
+        assert_eq!(start.first_request_cache_write_1h_tokens, None);
+    }
+
+    const CODEX_SESSION: &str = "019e253c-7777-7000-9000-aaaaaaaaaaaa";
+
+    fn codex_token_count(total: (u64, u64, u64), last: (u64, u64, u64)) -> Value {
+        let usage = |(input, cached, output): (u64, u64, u64)| json!({"input_tokens": input, "cached_input_tokens": cached, "output_tokens": output});
+        json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": usage(total), "last_token_usage": usage(last), "model": "gpt-5.5"}}})
+    }
+
+    fn codex_call(id: &str) -> Value {
+        json!({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": id, "arguments": "{}"}})
+    }
+
+    fn codex_message(role: &str, blocks: &[(&str, &str)]) -> Value {
+        json!({"type": "response_item", "payload": {"type": "message", "role": role,
+            "content": blocks.iter().map(|(_, text)| json!({"type": "input_text", "text": text})).collect::<Vec<_>>(),
+            "internal_chat_message_metadata_passthrough": {"content_item_kinds":
+                blocks.iter().map(|(kind, _)| *kind).collect::<Vec<_>>()}}})
+    }
+
+    fn write_codex(dir: &Path, name: &str, lines: Vec<Value>) -> std::path::PathBuf {
+        let path = dir.join(format!("rollout-2026-10-18T10-00-00-{name}.jsonl"));
+        write_lines(&path, json!({"timestamp": "2026-10-18T10:00:00Z"}), lines);
+        path
+    }
+
+    #[test]
+    fn codex_fixture_yields_exact_session_start() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-codex");
+        let path = write_codex(
+            &dir,
+            CODEX_SESSION,
+            vec![
+                json!({"type": "session_meta", "payload": {"id": CODEX_SESSION, "cwd": "/w/repo", "cli_version": "0.160.0",
                     "base_instructions": {"text": "BASE instructions"}}}),
-                json!({"type": "response_item", "payload": {"type": "message", "role": "developer",
-                    "content": [{"type": "input_text", "text": "BASE instructions"},
-                        {"type": "input_text", "text": "<permissions>p</permissions>"}],
-                    "internal_chat_message_metadata_passthrough": {"content_item_kinds": [
-                        codex_prelude::BASE_INSTRUCTIONS_KIND, "permissions.instructions"]}}}),
-                json!({"type": "response_item", "payload": {"type": "message", "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nSee docs/guide.md\n</INSTRUCTIONS>"},
-                        {"type": "input_text", "text": "<skills>s</skills>"},
-                        {"type": "input_text", "text": "fix it"}],
-                    "internal_chat_message_metadata_passthrough": {"content_item_kinds": [
-                        codex_prelude::AGENTS_MD_KIND, codex_prelude::HOST_SKILLS_KIND, "user.text"]}}}),
+                codex_message(
+                    "developer",
+                    &[
+                        (codex_prelude::BASE_INSTRUCTIONS_KIND, "BASE instructions"),
+                        ("permissions.instructions", "<permissions>p</permissions>"),
+                    ],
+                ),
+                codex_message(
+                    "user",
+                    &[
+                        (codex_prelude::AGENTS_MD_KIND, "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nSee docs/guide.md\n</INSTRUCTIONS>"),
+                        (codex_prelude::HOST_SKILLS_KIND, "<skills>s</skills>"),
+                        ("user.text", "fix it"),
+                    ],
+                ),
+                json!({"type": "world_state", "payload": {"full": true, "state": {
+                    "agents_md": {"directory": "/w/repo", "text": "See docs/guide.md"}}}}),
                 json!({"type": "response_item", "payload": {"type": "additional_tools", "tools": [{"name": "x"}]}}),
                 json!({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}}),
-                call("c1"),
-                json!({"type": "event_msg", "payload": {"type": "exec_command_end", "call_id": "c1", "parsed_cmd": [
+                codex_call("c1"),
+                json!({"type": "event_msg", "payload": {"type": "exec_command_end", "call_id": "c1", "cwd": "/w/repo", "parsed_cmd": [
                     {"type": "read", "cmd": "cat docs/guide.md", "name": "guide.md", "path": "docs/guide.md"}]}}),
                 json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1",
                     "output": "Warning: truncated output\nabc"}}),
-                token_count((1000, 800, 50), (1000, 800, 50)),
+                codex_token_count((1000, 800, 50), (1000, 800, 50)),
                 // A re-emitted record is not a second request.
-                token_count((1000, 800, 50), (1000, 800, 50)),
-                call("c2"),
+                codex_token_count((1000, 800, 50), (1000, 800, 50)),
+                codex_call("c2"),
                 json!({"type": "event_msg", "payload": {"type": "exec_command_end", "call_id": "c2", "parsed_cmd": [
                     {"type": "unknown", "cmd": "sed -n 1,5p /w/repo/docs/guide.md"}]}}),
                 json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c2", "output": "0123456789"}}),
-                token_count((2100, 1800, 80), (1100, 1000, 30)),
-                token_count((3300, 2900, 100), (1200, 1100, 20)),
+                codex_token_count((2100, 1800, 80), (1100, 1000, 30)),
+                codex_token_count((3300, 2900, 100), (1200, 1100, 20)),
             ],
         );
         let items =
@@ -1788,16 +2047,131 @@ mod tests {
         assert_eq!(items[0].first_turn_context_tokens, Some(1000));
     }
 
-    fn measured_codex_state() -> SessionStartState {
+    /// The snapshot pass and the footprint reader see one prelude: the same
+    /// rows through `parse_prelude` and through the snapshot's decoded-line
+    /// hooks give the same parse, and the wire parts are its counts.
+    #[test]
+    fn codex_prelude_parity_between_reader_and_decoded_lines() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-codex-parity");
+        let cwd = Path::new("/w/repo");
+        let rows = |malformed: bool| {
+            let mut rows = vec![
+                json!({"type": "session_meta", "payload": {"id": CODEX_SESSION, "cwd": "/w/repo", "cli_version": "0.160.0",
+                    "base_instructions": "BASE"}}),
+                codex_message("developer", &[("permissions.instructions", "PERMS")]),
+                // The rendered copy differs from the loaded body in world_state.
+                codex_message(
+                    "user",
+                    &[
+                        (codex_prelude::AGENTS_MD_KIND, "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nWRAPPED copy\n</INSTRUCTIONS>"),
+                        ("environments.environment_context", "<env/>"),
+                    ],
+                ),
+                json!({"type": "world_state", "payload": {"full": true, "state": {
+                    "agents_md": {"directory": "/w/repo", "text": "Body names docs/guide.md"},
+                    "host_skills": {"body": "SKILLS BODY"}}}}),
+                codex_message("developer", &[("hooks.additional_context", "HOOK")]),
+                json!({"type": "response_item", "payload": {"type": "additional_tools", "tools": [{"name": "x"}]}}),
+                codex_message("user", &[("user.text", "go")]),
+                json!({"type": "response_item", "payload": {"type": "reasoning"}}),
+                // After the model answered: request 2's input, never request 1's.
+                codex_message("developer", &[("hooks.additional_context", "LATE")]),
+                codex_call("c1"),
+                json!({"type": "event_msg", "payload": {"type": "exec_command_end", "call_id": "c1", "cwd": "/w/repo", "parsed_cmd": [
+                    {"type": "read", "cmd": "cat docs/guide.md", "path": "docs/guide.md"}]}}),
+                json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "abc"}}),
+                codex_token_count((1000, 800, 50), (1000, 800, 50)),
+                codex_token_count((2100, 1800, 80), (1100, 1000, 30)),
+            ];
+            if malformed {
+                let mut row = codex_message("user", &[("user.text", "x")]);
+                row["payload"]["internal_chat_message_metadata_passthrough"]
+                    ["content_item_kinds"] = json!([7]);
+                rows.insert(6, row);
+            }
+            rows
+        };
+        let reader = |rows: &[Value]| {
+            let bytes = rows
+                .iter()
+                .map(|row| row.to_string() + "\n")
+                .collect::<String>();
+            codex_prelude::parse_prelude(std::io::Cursor::new(bytes)).expect("reader")
+        };
+        let decoded = |rows: &[Value]| {
+            let mut state = SessionStartState::default();
+            for row in rows {
+                if str_at(row, "type") == Some("session_meta") {
+                    state.note_codex_session_meta(row);
+                } else {
+                    state.observe_codex_line(row, Some(cwd));
+                }
+            }
+            state.codex_prelude.expect("parser").finish()
+        };
+        let read = reader(&rows(false));
+        assert!(read.world_state_seen && read.input_closed && !read.blocks_incomplete);
+        assert_eq!(read.skills_body.as_deref(), Some("SKILLS BODY"));
+        // The snapshot keeps no skills body; everything else is identical.
+        assert_eq!(
+            decoded(&rows(false)),
+            codex_prelude::CodexPrelude {
+                skills_body: None,
+                ..read.clone()
+            }
+        );
+        let path = write_codex(&dir, CODEX_SESSION, rows(false));
+        let items =
+            parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
+        let mut start = items[0].session_start.clone().expect("session_start");
+        assert_eq!(start.start_chars_system, Some(read.base_instructions_chars));
+        assert_eq!(
+            start.start_chars_instructions,
+            Some(read.chars(BlockKind::AgentsMd))
+        );
+        assert_eq!(
+            start.start_chars_hooks_env,
+            Some(read.chars(BlockKind::Hooks) + read.chars(BlockKind::Environment))
+        );
+        assert_eq!(start.start_chars_prompt, Some(2));
+        assert_eq!(start.start_chars_skills, Some(0));
+        assert_eq!(start.start_chars_tools, Some(13));
+        // Paths match the loaded body, not its rendered copy.
+        start.apply_upload_policy(true, false);
+        assert_eq!(start.opening_files.len(), 1);
+        assert_eq!(
+            start.opening_files[0].repo_path.as_deref(),
+            Some("docs/guide.md")
+        );
+        assert_eq!(start.opening_files[0].instruction_segments, 2);
+
+        // A request-1 block without a string label: no parts on either path.
+        let read = reader(&rows(true));
+        assert!(read.blocks_incomplete);
+        assert!(decoded(&rows(true)).blocks_incomplete);
+        let path = write_codex(&dir, "019e253c-7777-7000-9000-bbbbbbbbbbbb", rows(true));
+        let items =
+            parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
+        let start = items[0].session_start.clone().expect("session_start");
+        assert_eq!(start.start_parts_method, None);
+        assert_eq!(start.opening_request_count, Some(2));
+    }
+
+    fn measured_codex_state(agents_md: &str, requests: usize) -> SessionStartState {
         let mut state = SessionStartState::default();
-        state.note_codex_session_meta(
-            &json!({"cli_version": "0.160.0", "base_instructions": "BASE"}),
+        state.note_codex_session_meta(&json!({"type": "session_meta", "payload": {
+            "id": "s1", "cwd": "/w/repo", "cli_version": "0.160.0", "base_instructions": "BASE"}}));
+        state.observe_codex_line(
+            &json!({"type": "world_state", "payload": {"state": {"agents_md": {"text": agents_md}}}}),
+            None,
         );
         state.note_user_turn();
-        state.note_codex_request(&UsageTotals {
-            input_tokens: 10,
-            ..UsageTotals::default()
-        });
+        for _ in 0..requests {
+            state.note_codex_request(&UsageTotals {
+                input_tokens: 10,
+                ..UsageTotals::default()
+            });
+        }
         state
     }
 
@@ -1807,15 +2181,15 @@ mod tests {
             client_version: Some("0.160.0".to_string()),
             ..SnapshotSessionStart::default()
         });
-        let fresh = measured_codex_state()
+        let fresh = measured_codex_state("", 1)
             .finish(true, CODEX_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         assert_eq!(fresh.opening_request_count, Some(1));
         assert_eq!(
-            measured_codex_state().finish(false, CODEX_PARTS_METHOD, None, Some(&SALT)),
+            measured_codex_state("", 1).finish(false, CODEX_PARTS_METHOD, None, Some(&SALT)),
             only_version
         );
-        let mut copied = measured_codex_state();
+        let mut copied = measured_codex_state("", 1);
         copied.note_inherited_prefix();
         assert_eq!(
             copied.finish(true, CODEX_PARTS_METHOD, None, Some(&SALT)),
@@ -1831,9 +2205,75 @@ mod tests {
     }
 
     #[test]
+    fn full_parser_forks_keep_only_client_version() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-forks");
+        // Claude: a fork copies its parent's records first.
+        let path = dir.join("ss-claude-fork.jsonl");
+        let mut lines = claude_fixture_lines();
+        lines.insert(
+            0,
+            json!({"type": "user", "forkedFrom": {"sessionId": "parent", "messageUuid": "u0"},
+                "message": {"role": "user", "content": "copied"}}),
+        );
+        write_lines(&path, serde_json::from_str(CLAUDE_COMMON).unwrap(), lines);
+        let items = parse_claude(&path, None);
+        assert_eq!(
+            items[0].session_start.as_deref(),
+            Some(&SnapshotSessionStart {
+                client_version: Some("2.1.300".to_string()),
+                ..SnapshotSessionStart::default()
+            })
+        );
+        // Codex: a subagent fork with its parent's copied prefix (the shape
+        // of `codex_legacy_full_fork_excludes_inherited_usage_activity_and_posture`).
+        let token = |at: &str, total: (u64, u64, u64), last: (u64, u64, u64)| {
+            let mut row = codex_token_count(total, last);
+            row["timestamp"] = json!(at);
+            row
+        };
+        let path = dir.join("rollout-2026-08-02T06-00-00-child-fork.jsonl");
+        let rows = [
+            json!({"timestamp": "2026-08-02T06:00:00Z", "type": "session_meta", "payload": {
+                "id": "child-fork", "forked_from_id": "root", "cli_version": "0.160.0",
+                "thread_source": "subagent",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root"}}}}}),
+            token("2026-08-02T06:00:01Z", (1_000, 800, 100), (1_000, 800, 100)),
+            json!({"timestamp": "2026-08-02T06:00:02Z", "type": "compacted", "payload": {"replacement_history": []}}),
+            json!({"timestamp": "2026-08-02T06:00:03Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "inherited"}}),
+            json!({"timestamp": "2026-08-02T06:00:04Z", "type": "event_msg", "payload": {"type": "task_complete", "duration_ms": 900, "time_to_first_token_ms": 90}}),
+            json!({"timestamp": "2026-08-02T06:00:05Z", "type": "session_meta", "payload": {"id": "root", "thread_source": "user"}}),
+            json!({"timestamp": "2026-08-02T06:00:58Z", "type": "event_msg", "payload": {"type": "task_started"}}),
+            json!({"timestamp": "2026-08-02T06:00:59Z", "type": "turn_context", "payload": {"model": "gpt-5.6-sol", "turn_id": "owned-turn", "effort": "high"}}),
+            json!({"timestamp": "2026-08-02T06:01:00Z", "type": "inter_agent_communication_metadata", "payload": {"trigger_turn": true}}),
+            token("2026-08-02T06:01:02Z", (1_100, 880, 110), (100, 80, 10)),
+            json!({"timestamp": "2026-08-02T06:01:04Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "owned"}}),
+            json!({"timestamp": "2026-08-02T06:01:05Z", "type": "event_msg", "payload": {"type": "task_complete", "duration_ms": 100, "time_to_first_token_ms": 10}}),
+        ];
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(|row| row.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .expect("write fork fixture");
+        let items =
+            parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
+        assert!(!items.is_empty());
+        for item in items {
+            assert_eq!(
+                item.session_start.as_deref(),
+                Some(&SnapshotSessionStart {
+                    client_version: Some("0.160.0".to_string()),
+                    ..SnapshotSessionStart::default()
+                })
+            );
+        }
+    }
+
+    #[test]
     fn opening_files_cap_at_64_and_count_withheld_entries() {
         let cwd = Path::new("/w/repo");
-        let mut state = measured_codex_state();
+        let mut state = measured_codex_state("", 2);
         state.note_client_load("/elsewhere/x.md", "nested_memory", 1, 2, Some(cwd));
         for index in 0..70 {
             state.note_client_load(
@@ -1844,6 +2284,8 @@ mod tests {
                 Some(cwd),
             );
         }
+        // Staged for request 3, which the session never reached.
+        state.note_client_load("/w/repo/late.md", "nested_memory", 1, 3, Some(cwd));
         let mut start = state
             .finish(true, CODEX_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
@@ -1858,20 +2300,70 @@ mod tests {
         assert!(start
             .opening_files
             .iter()
-            .all(|file| file.path_hash.is_none()));
+            .all(|file| file.path_hash.is_none() && file.request == 2));
+        // Applying the same policy again changes nothing.
+        let applied = start.clone();
+        start.apply_upload_policy(true, false);
+        assert_eq!(start, applied);
         let wire = serde_json::to_value(&start).expect("serialize");
         assert_eq!(wire["opening_files"].as_array().expect("files").len(), 63);
         assert!(wire.get("file_candidates").is_none());
     }
 
     #[test]
+    fn instruction_cap_makes_file_facts_unknown() {
+        let cwd = Path::new("/w/repo");
+        let mut state = SessionStartState::default();
+        let content = "x".repeat(MAX_HELD_INSTRUCTION_BYTES) + " docs/late.md";
+        state.observe_claude_line(
+            &json!({"type": "attachment", "version": "2.1.300", "attachment": {"type": "instructions",
+                "files": [{"type": "Project", "content": content}]}}),
+            0,
+            Some(cwd),
+        );
+        state.observe_claude_line(
+            &json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/w/repo/docs/late.md"}}]}}),
+            1,
+            Some(cwd),
+        );
+        state.note_claude_response(0, &UsageTotals::default(), 1, 1);
+        state.note_claude_response(1, &UsageTotals::default(), 2, 0);
+        let mut start = state
+            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .expect("measured");
+        start.apply_upload_policy(true, true);
+        assert!(start.opening_files.is_empty());
+        assert_eq!(start.opening_file_overflow, None);
+        // Every other fact stays.
+        assert_eq!(start.opening_request_count, Some(2));
+        assert_eq!(start.request_2_context_tokens, Some(2));
+        assert_eq!(start.opening_tool_calls, Some(1));
+        let wire = serde_json::to_value(&start).expect("serialize");
+        assert!(wire.get("opening_files").is_none() && wire.get("opening_file_overflow").is_none());
+    }
+
+    #[test]
     fn held_state_stays_within_its_capacity_budget() {
-        let mut state = measured_codex_state();
         let mut held = String::new();
-        push_capped(&mut held, &"x".repeat(300 * 1024));
-        push_capped(&mut held, "more");
+        assert!(!push_capped(&mut held, &"x".repeat(300 * 1024)));
+        assert!(!push_capped(&mut held, "more"));
         assert_eq!(held.capacity(), MAX_HELD_INSTRUCTION_BYTES);
-        state.instructions = Some(held);
+        // Codex: the shared parser holds the AGENTS.md text and its own small
+        // strings beside the collections.
+        let mut state = SessionStartState::default();
+        let long = "p".repeat(codex_prelude::MAX_SMALL_TEXT_BYTES);
+        state.note_codex_session_meta(&json!({"type": "session_meta", "payload": {
+            "id": long, "cwd": long, "cli_version": "0.160.0"}}));
+        state.observe_codex_line(
+            &json!({"type": "turn_context", "payload": {"model": long}}),
+            None,
+        );
+        state.observe_codex_line(
+            &json!({"type": "world_state", "payload": {"state": {"agents_md": {
+                "directory": long, "text": "y".repeat(300 * 1024)}}}}),
+            None,
+        );
         let deep = "d/".repeat(200);
         for index in 0..2000 {
             state.note_client_load(
@@ -1883,13 +2375,19 @@ mod tests {
             );
             state.open_call(&format!("call-{index}"), 1, "exec_command");
         }
-        assert!(state.files_untracked > 1900);
+        assert!(state.files_untracked[0] > 1900);
+        assert!(state.file_matching_incomplete());
         let held = crate::heap_layout_bound::bound(&state, usize::MAX).expect("layout");
         assert!(held <= MAX_HELD_BYTES, "held {held}");
         state.freeze();
         assert!(state.instructions.is_none() && state.calls.is_empty());
         let frozen = crate::heap_layout_bound::bound(&state, usize::MAX).expect("layout");
-        assert!(frozen <= MAX_HELD_COLLECTION_BYTES, "frozen {frozen}");
+        assert!(
+            frozen
+                <= MAX_HELD_COLLECTION_BYTES + MAX_HELD_INSTRUCTION_BYTES
+                    - MAX_CODEX_AGENTS_MD_BYTES,
+            "frozen {frozen}"
+        );
     }
 
     #[test]
@@ -1903,25 +2401,34 @@ mod tests {
             2
         );
         assert_eq!(instruction_segments("guide.md", "nothing"), 0);
+        let cwd = Some(Path::new("/w/repo"));
         assert_eq!(
-            normalize_path("/w/repo/a/b.rs", Some(Path::new("/w/repo")), true),
+            normalize_path("/w/repo/a/b.rs", cwd, true),
             Some(("a/b.rs".to_string(), Some("a/b.rs".to_string())))
         );
         assert_eq!(
-            normalize_path("/w/repo-other/b.rs", Some(Path::new("/w/repo")), true),
+            normalize_path("/w/repo-other/b.rs", cwd, true),
             Some(("/w/repo-other/b.rs".to_string(), None))
         );
         assert_eq!(
-            normalize_path("../up.rs", None, true),
+            normalize_path("../up.rs", cwd, true),
             Some(("../up.rs".to_string(), None))
         );
         assert_eq!(
-            normalize_path("a/b.rs", None, false),
+            normalize_path("a/b.rs", cwd, false),
+            Some(("a/b.rs".to_string(), None))
+        );
+        // No session directory: a relative path has no proven base.
+        assert_eq!(
+            normalize_path("a/b.rs", None, true),
             Some(("a/b.rs".to_string(), None))
         );
         assert!(shell_changes_directory("cd /tmp && cat x.md"));
         assert!(shell_changes_directory("(pushd d; ls)"));
         assert!(shell_changes_directory("git -C ../other status"));
+        assert!(shell_changes_directory("env -C/private/notes cat x.md"));
+        assert!(shell_changes_directory("make -Cdir all"));
+        assert!(shell_changes_directory("env --chdir=/p cat x.md"));
         assert!(shell_changes_directory("bash -lc 'cd /p && cat x.md'"));
         assert!(shell_changes_directory("sh -c \"cd /p; cat x.md\""));
         assert!(!shell_changes_directory("cat docs/cdn.md"));
@@ -1932,26 +2439,101 @@ mod tests {
         assert_eq!(json_units(&json!({"a": [1, "\u{1f600}"]})), 16);
     }
 
+    /// Plain paths follow admission's `_safe_relative_path`; anything it would
+    /// reject travels hashed or is withheld, never sent plain.
     #[test]
-    fn relative_shell_paths_after_a_directory_change_stay_private() {
+    fn plain_paths_and_tool_labels_follow_admission() {
+        for path in [
+            "src/users/model.rs",
+            "docs/home/setup.md",
+            "Docs/Transcript_Path.md",
+            "a\\..\\b.md",
+            "C:/x.md",
+            "a  b.md",
+            " x.md",
+            "x.md ",
+            "a\tb.md",
+            "../x.md",
+            "~/x.md",
+            "/x.md",
+            "",
+        ] {
+            assert!(!is_plain_path(path), "{path:?}");
+        }
+        for path in [
+            "docs/guide.md",
+            "users/model.rs",
+            "a b.md",
+            "src/.hidden/x.rs",
+        ] {
+            assert!(is_plain_path(path), "{path:?}");
+        }
+        assert_eq!(tool_label("mcp__server__tool"), "mcp");
+        assert_eq!(tool_label("exec_command"), "exec_command");
+        assert_eq!(tool_label("Bad Name"), "unknown");
+        assert_eq!(tool_label(""), "unknown");
+        assert_eq!(tool_label(&"x".repeat(70)).len(), MAX_TOOL_LABEL_CHARS);
+
+        // End to end: an ordinary path admission would refuse travels hashed.
+        let dir = crate::test_scratch::ScratchDir::new("session-start-plain-path");
+        let context = attribution_context(&dir);
         let cwd = Path::new("/w/repo");
         let mut state = SessionStartState {
-            instructions: Some("Notes live in customer-plan.md and docs/guide.md".to_string()),
+            instructions: Some("Models live in src/users/model.rs".to_string()),
             ..SessionStartState::default()
         };
+        state.observe_claude_line(
+            &json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/w/repo/src/users/model.rs"}}]}}),
+            1,
+            Some(cwd),
+        );
+        state.note_claude_response(0, &UsageTotals::default(), 1, 1);
+        state.note_claude_response(1, &UsageTotals::default(), 2, 0);
+        let start = state
+            .finish(true, CLAUDE_PARTS_METHOD, Some(&context), Some(&SALT))
+            .expect("measured");
+        let mut labels_only = start.clone();
+        labels_only.apply_upload_policy(true, false);
+        assert!(labels_only.opening_files.is_empty());
+        assert_eq!(labels_only.opening_file_overflow, Some(1));
+        let mut hashed = start;
+        hashed.apply_upload_policy(true, true);
+        let wire = serde_json::to_value(&hashed).expect("serialize");
+        assert_eq!(
+            wire["opening_files"],
+            json!([{"request": 2, "tool": "Read",
+                "path_hash": context.opaque_id("opening_path", "src/users/model.rs").expect("hash"),
+                "ext": "rs", "chars": 0, "reads": 1, "instruction_segments": 3,
+                "client_loaded": false, "truncated": false}])
+        );
+    }
+
+    #[test]
+    fn relative_shell_paths_without_a_proven_base_stay_private() {
+        let cwd = Path::new("/w/repo");
         let bash = |id: &str, command: &str| {
             json!({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}})
         };
+        let mut state = SessionStartState {
+            instructions: Some(
+                "Notes live in customer-plan.md, plan.md and docs/guide.md".to_string(),
+            ),
+            ..SessionStartState::default()
+        };
         state.observe_claude_line(&bash("t1", "cat docs/guide.md"), 1, Some(cwd));
+        // An attached `-C<dir>` moves the shell too.
         state.observe_claude_line(
-            &bash("t2", "cd /private/notes && cat customer-plan.md"),
+            &bash("t2", "env -C/private/notes cat plan.md"),
             1,
             Some(cwd),
         );
         // Claude's shell keeps the new directory for later calls too.
         state.observe_claude_line(&bash("t3", "cat other/customer-plan.md"), 2, Some(cwd));
-        state.note_claude_response(0, &UsageTotals::default(), 1, 2);
+        for sequence in 0..3 {
+            state.note_claude_response(sequence, &UsageTotals::default(), 1, 1);
+        }
         let mut start = state
             .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
@@ -1964,9 +2546,24 @@ mod tests {
         assert_eq!(shown, [Some("docs/guide.md")]);
         assert_eq!(start.opening_file_overflow, Some(2));
 
-        // Codex: a command at another cwd, or one that changes directory.
-        let mut codex = measured_codex_state();
-        codex.instructions = Some("customer-plan.md docs/guide.md".to_string());
+        // No session directory: nothing relative is shown.
+        let mut state = SessionStartState {
+            instructions: Some("docs/guide.md".to_string()),
+            ..SessionStartState::default()
+        };
+        state.observe_claude_line(&bash("t1", "cat docs/guide.md"), 1, None);
+        state.note_claude_response(0, &UsageTotals::default(), 1, 1);
+        state.note_claude_response(1, &UsageTotals::default(), 1, 0);
+        let mut start = state
+            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .expect("measured");
+        start.apply_upload_policy(true, false);
+        assert!(start.opening_files.is_empty());
+        assert_eq!(start.opening_file_overflow, Some(1));
+
+        // Codex: a record at another cwd, one that changes directory, or one
+        // without a cwd (whatever its call's `workdir`) proves no base.
+        let mut codex = measured_codex_state("customer-plan.md docs/guide.md notes/todo.md", 2);
         for (id, record) in [
             (
                 "c1",
@@ -1976,15 +2573,28 @@ mod tests {
                 "c2",
                 json!({"cwd": "/w/repo/", "command": ["bash", "-lc", "cd .. && cat docs/guide.md"], "parsed_cmd": [{"type": "read", "cmd": "cat docs/guide.md", "path": "docs/guide.md"}]}),
             ),
+            (
+                "c3",
+                json!({"parsed_cmd": [{"type": "read", "cmd": "cat docs/guide.md", "path": "docs/guide.md"}]}),
+            ),
+            (
+                "c4",
+                json!({"cwd": "/w/repo", "parsed_cmd": [{"type": "read", "cmd": "cat notes/todo.md", "path": "notes/todo.md"}]}),
+            ),
         ] {
-            codex.open_call(id, 2, "exec_command");
+            codex.open_call(id, 1, "exec_command");
             codex.codex_parsed_command(id, &record, Some(cwd));
         }
         let mut start = codex
             .finish(true, CODEX_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         start.apply_upload_policy(true, false);
-        assert!(start.opening_files.is_empty());
+        let shown = start
+            .opening_files
+            .iter()
+            .map(|file| file.repo_path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(shown, [Some("notes/todo.md")]);
         assert_eq!(start.opening_file_overflow, Some(2));
     }
 
@@ -2019,7 +2629,7 @@ mod tests {
 
     #[test]
     fn oversized_call_ids_are_not_retained() {
-        let mut state = measured_codex_state();
+        let mut state = measured_codex_state("", 1);
         let id = "x".repeat(300 * 1024);
         state.observe_codex_line(
             &json!({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": id}}),
@@ -2028,7 +2638,6 @@ mod tests {
         assert!(state.calls.is_empty());
         assert!(state.last_codex_call.is_none());
     }
-
     /// Cost receipt over local transcripts listed in
     /// `OTTTO_SESSION_START_COST_FILES` (`claude|codex<TAB>path` per line).
     /// A shadow state replays each file beside the real parser (its own state
@@ -2103,9 +2712,7 @@ mod tests {
                     );
                 } else {
                     if str_at(value, "type") == Some("session_meta") {
-                        if let Some(meta) = value.get("payload") {
-                            shadow.note_codex_session_meta(meta);
-                        }
+                        shadow.note_codex_session_meta(value);
                     }
                     if parser.codex_ownership_boundary == CodexOwnershipBoundary::AllLocal {
                         shadow.observe_codex_line(value, parser.workspace_path.as_deref());

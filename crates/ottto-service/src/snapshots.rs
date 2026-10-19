@@ -19738,9 +19738,7 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     accumulator.note_codex_physical_signature(value);
     apply_codex_envelope_line(value, accumulator);
     if string_eq_at(value, &["type"], "session_meta") {
-        if let Some(meta) = value.get("payload") {
-            accumulator.session_start.note_codex_session_meta(meta);
-        }
+        accumulator.session_start.note_codex_session_meta(value);
     }
     accumulator.configure_codex_ownership(value);
     if !accumulator.codex_record_is_owned(value) {
