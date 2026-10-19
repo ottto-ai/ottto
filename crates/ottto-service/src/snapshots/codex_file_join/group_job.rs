@@ -13,8 +13,9 @@ use super::*;
 use sampled_scan::codex_cursor::{self as cursor, DisclosureTargets, OpenStamp};
 
 /// A legacy-shape member's probe reads at most this many bytes looking for
-/// its first native record. Past it the group keeps chronological order and
-/// the counter chain decides (`probe_bound`).
+/// its first native record. Past it, or past the boot's probe allowance, the
+/// group keeps chronological order and the counter chain decides
+/// (`probe_bound`); a refusal then is strict `ProbeBudgetOrder` (R1-M1).
 const PROBE_BYTES: usize = 1024 * 1024;
 
 /// Counting evidence of a group's session view (§k.4): every member entry,
@@ -198,6 +199,9 @@ pub(in crate::snapshots) struct GroupBoot {
     probed: usize,
     ordered: bool,
     pub(in crate::snapshots) probe_bound: bool,
+    /// Probe bytes this boot may still read (R2-N2): the page's remaining
+    /// singleton budget, set by the scanner before each step.
+    probe_allowance: u64,
     charge: u64,
     previous_receipts: BTreeMap<String, (Option<AppliedTierReceipt>, bool)>,
     receipt_scope: String,
@@ -205,8 +209,8 @@ pub(in crate::snapshots) struct GroupBoot {
     evidence: GroupCountingEvidence,
 }
 crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, headers, plan,
-    probes, probed, ordered, probe_bound, charge, previous_receipts, receipt_scope,
-    legacy_expected, evidence);
+    probes, probed, ordered, probe_bound, probe_allowance, charge, previous_receipts,
+    receipt_scope, legacy_expected, evidence);
 
 impl GroupBoot {
     pub(in crate::snapshots) fn new(group: Group, index: &ScanIndex) -> Self {
@@ -248,6 +252,7 @@ impl GroupBoot {
             probed: 0,
             ordered: false,
             probe_bound: false,
+            probe_allowance: u64::MAX,
             charge: 0,
             previous_receipts,
             receipt_scope,
@@ -259,6 +264,18 @@ impl GroupBoot {
     /// Header and probe bytes read since the last call.
     pub(in crate::snapshots) fn take_charge(&mut self) -> u64 {
         std::mem::take(&mut self.charge)
+    }
+
+    /// No member was opened yet: nothing of this boot was read.
+    pub(in crate::snapshots) fn fresh(&self) -> bool {
+        self.identified == 0
+    }
+
+    /// Cap this boot's remaining probe reads (R2-N2). A probe cut by it ends
+    /// probing like `PROBE_BYTES`: the group keeps chronological order, and
+    /// a refusal in that order is `ProbeBudgetOrder` (strict, R1-M1).
+    pub(in crate::snapshots) fn allow_probe_bytes(&mut self, bytes: u64) {
+        self.probe_allowance = bytes;
     }
 
     /// Sum of the identified member lengths: the read this group needs.
@@ -411,9 +428,10 @@ impl GroupBoot {
     /// One legacy-shape member up to its first native record, bounded.
     fn probe(&mut self, i: usize) -> Boot {
         let member = &self.group.members[i];
+        let cap = self.probe_allowance.min(PROBE_BYTES as u64);
         let result = (|| -> std::io::Result<(Option<Tokens>, bool, u64)> {
             let file = open_candidate_beneath_root(member)?;
-            let mut reader = BufReader::with_capacity(64 * 1024, file.take(PROBE_BYTES as u64 + 1));
+            let mut reader = BufReader::with_capacity(64 * 1024, file.take(cap + 1));
             let mut line = Vec::new();
             let mut read = 0u64;
             loop {
@@ -422,7 +440,7 @@ impl GroupBoot {
                 read = read.saturating_add(n as u64);
                 if n == 0 || line.last() != Some(&b'\n') {
                     // EOF (or a withheld tail) before any native record.
-                    return Ok((None, read > PROBE_BYTES as u64, read));
+                    return Ok((None, read > cap, read));
                 }
                 if let Some(before) = serde_json::from_slice::<Value>(&line)
                     .ok()
@@ -437,6 +455,7 @@ impl GroupBoot {
             return Boot::Strict;
         };
         self.charge = self.charge.saturating_add(read);
+        self.probe_allowance = self.probe_allowance.saturating_sub(read);
         self.probes[i] = before;
         self.probe_bound |= bound;
         self.probed += 1;
@@ -703,6 +722,11 @@ crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, d
     charge, probe_bound, memo_digest, scope, walked);
 
 impl GroupJob {
+    /// A legacy tee takes every consumed record too (E3, R2-N5).
+    pub(in crate::snapshots) fn has_tee(&self) -> bool {
+        self.tee.is_some()
+    }
+
     pub(in crate::snapshots) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
         std::mem::take(&mut self.legacy_baselines)
     }
@@ -887,6 +911,10 @@ fn member_eof(
             Err(_) => return Err(GroupEnd::Strict),
         }
     }
+    if last && paged {
+        apply_live_eof_record(active);
+    }
+    let eof_applied = cursor::eof_applied(active);
     let end = active.parser.reader.consumed_bytes();
     let Some(mut replay) = active.parser.accumulator.codex_tier_replay.take() else {
         return Err(GroupEnd::Strict);
@@ -915,7 +943,7 @@ fn member_eof(
             .ok_or(GroupEnd::Strict)?;
         tee.reader.finished = true;
         tee.reader.report = report;
-        if last && paged {
+        if last && paged && !eof_applied {
             // The live member's legacy baseline reads the same frozen prefix.
             tee.reader.sealed_prefix = active
                 .cursor
@@ -979,6 +1007,51 @@ fn member_eof(
     Ok(false)
 }
 
+/// E1 for a paged group's live member (R2-N1), at its genuine unchanged
+/// EOF only (`cursor::group_eof_record_due`): the withheld final record is
+/// applied from the buffered bytes through the same line sink, the proof
+/// and the legacy tee included, before the member's proof ends. The job
+/// then gets no S12 grant (`finish_job`), so strict finish identity covers
+/// the record. Without it, a quiescent live member ending in an
+/// unterminated record would stage hourly audit debt and re-read the whole
+/// group each time.
+fn apply_live_eof_record(active: &mut OwnedActiveFile) {
+    let Some(boot) = active
+        .group
+        .as_ref()
+        .and_then(|group| group.stamps.last().cloned())
+    else {
+        return;
+    };
+    if !cursor::group_eof_record_due(active, &boot) {
+        return;
+    }
+    let offset = active.parser.reader.last_complete_line_end();
+    let applied = {
+        let OwnedActiveFile { parser, group, .. } = &mut *active;
+        if let Some(join) = parser
+            .accumulator
+            .codex_tier_replay
+            .as_mut()
+            .and_then(|replay| replay.join.as_deref_mut())
+        {
+            join.set_record_start(offset);
+        }
+        let mut tee = group.as_mut().and_then(|group| group.tee.as_deref_mut());
+        parser.with_line_sink(
+            |value| {
+                if let Some(tee) = tee.as_mut() {
+                    tee.tee_line(value);
+                }
+            },
+            |reader, sink| reader.apply_sealed_fragment(sink),
+        )
+    };
+    if applied {
+        cursor::mark_eof_applied(active);
+    }
+}
+
 /// Swap in the next canonical member's reader and its proof context.
 fn open_member(
     active: &mut OwnedActiveFile,
@@ -1037,6 +1110,8 @@ fn open_member(
     parser.accumulator.latest_model = None;
     parser.accumulator.latest_reasoning_effort = None;
     parser.accumulator.latest_turn_id = None;
+    // The new reader counts from zero: walk the job again (E3, R2-N4).
+    cursor::forget_job_charge(active);
     if paged {
         let scope = if last {
             Some((inputs.live_scope)(&member).ok_or(GroupEnd::Unavailable)?)
@@ -1080,6 +1155,27 @@ pub(in crate::snapshots) fn end_group(
         return;
     };
     match end {
+        // R1-M1: the chronological fallback order may itself break the
+        // chain (a budget artifact, not a property of the files): strict,
+        // never settleable or memoized, named for S11. Per-member reasons
+        // (UI balance, shape) do not depend on the order.
+        GroupEnd::Refused {
+            reason: JoinRefusal::Gap | JoinRefusal::Overlap,
+            ..
+        } if group.probe_bound => {
+            if let Some(context) = sampling {
+                context
+                    .cache
+                    .note_join_refusal(JoinRefusal::ProbeBudgetOrder);
+            }
+            if let Some(lease) = lease {
+                lease.release();
+            }
+            disclose_strict(&group.owner, &group.members, targets.reborrow());
+            for member in &group.members {
+                cursor::dequeue(index, member);
+            }
+        }
         GroupEnd::Refused {
             reason,
             position,
@@ -1095,7 +1191,12 @@ pub(in crate::snapshots) fn end_group(
                 let growth_may_cure = reason.append_curable() && live_failed;
                 let held = active.parser.reader.reader.get_ref();
                 let anchor = if live_failed {
-                    OpenStamp::capture(held).ok()
+                    // R1-H1: an exact-stamp entry never covers bytes the job
+                    // did not read (growth past a paged cut): they may
+                    // already cure it, so the next generation reads them.
+                    OpenStamp::capture(held).ok().filter(|stamp| {
+                        !growth_may_cure || stamp.extent() == cursor::read_end(&active)
+                    })
                 } else {
                     group.stamps.last().cloned()
                 };

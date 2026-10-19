@@ -779,9 +779,9 @@ impl TierReplay {
 crate::heap_layout_bound::fields!(AppliedTierReceipt; version, derivation, scope, records, prefix_digest, tiers);
 crate::heap_layout_bound::fields!(TierReplay; previous, digest, records, matched, tiers, scope, prefix_matched, invalid, join);
 /// Named group refusals (§i). The discriminant is the RAM counter slot of
-/// `codex_join_terminal_debt`. Every reason is terminal debt for the attempt
-/// (outcome R): the members are disclosed as settleable residue, never as an
-/// unreadable file.
+/// `codex_join_terminal_debt`. Every reason but `ProbeBudgetOrder` is
+/// terminal debt for the attempt (outcome R): the members are disclosed as
+/// settleable residue, never as an unreadable file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum JoinRefusal {
     Overlap,
@@ -802,12 +802,17 @@ pub(super) enum JoinRefusal {
     CandidateCopy,
     V2UiOnlyTurn,
     V2UnboundUi,
-    /// A `history_base.thread_id` names no inventoried member: typically a
-    /// compressed (`.zst`, not yet scanned) predecessor of the same owner,
-    /// never a fork (forks carry `forked_from_id`).
+    /// A `history_base.thread_id` names no member of this owner's group:
+    /// typically a compressed (`.zst`, not yet scanned) predecessor, or
+    /// another owner's file named without `forked_from_id`.
     MissingPredecessor,
+    /// A chain refusal (`Gap`, `Overlap`) of a legacy group replayed in
+    /// chronological order because its probes exceeded their budget (R1-M1,
+    /// R2-N2): the order may be our own artifact, so it is strict, never
+    /// settleable or memoized.
+    ProbeBudgetOrder,
 }
-pub(super) const JOIN_REFUSALS: usize = 19;
+pub(super) const JOIN_REFUSALS: usize = 20;
 impl JoinRefusal {
     pub(super) fn slot(self) -> usize {
         self as usize

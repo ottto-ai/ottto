@@ -216,6 +216,11 @@ impl PageBudget {
         self.cursor_decoded >= limits.cursor
     }
 
+    /// Singleton-budget bytes this page may still read (group probes, R2-N2).
+    pub(in crate::snapshots) fn singleton_remaining(&self, limits: Limits) -> u64 {
+        limits.singleton.saturating_sub(self.singleton_decoded)
+    }
+
     /// `expected` is the read this file needs now: its length for a full
     /// read, the appended extent for a tail, zero when unchanged.
     /// `cursor_enabled` is `layout_supported()`.
@@ -310,6 +315,10 @@ impl OpenStamp {
     fn same_object(&self, other: &Self) -> bool {
         self.dev == other.dev && self.ino == other.ino
     }
+
+    pub(in crate::snapshots) fn extent(&self) -> u64 {
+        self.extent
+    }
 }
 
 /// The identity a cursor job proved against its held FD when its prefix
@@ -345,7 +354,7 @@ impl JobMeta {
         consumed: u64,
         buffer: usize,
     ) -> Option<usize> {
-        estimate_charge(self.charge, consumed, buffer)
+        estimate_charge(self.charge, consumed, buffer, 1)
     }
 
     /// Record a walked charge (`usize::MAX` when the walk refused) taken at
@@ -361,10 +370,13 @@ impl JobMeta {
 }
 
 /// E3 from a walked `(charge, consumed, buffer)`; see `charge_estimate`.
+/// `feeds` accumulators take every consumed byte (a group's legacy tee is
+/// the second, R2-N5).
 fn estimate_charge(
     walked: Option<(usize, u64, usize)>,
     consumed: u64,
     buffer: usize,
+    feeds: usize,
 ) -> Option<usize> {
     let (charge, at, buffer_at) = walked?;
     let since = consumed.checked_sub(at)?;
@@ -373,17 +385,17 @@ fn estimate_charge(
     }
     usize::try_from(since).ok().map(|since| {
         charge
-            .saturating_add(since)
+            .saturating_add(since.saturating_mul(feeds))
             .saturating_add(buffer.saturating_sub(buffer_at))
     })
 }
 
 /// A job charged by bytes like a cursor job (E3): any cursor job, and a
 /// group job read in one page (R2-M2). Its state is walked with
-/// `completed_bound` at most once per `CHARGE_REFRESH_BYTES` of input (and
-/// at each member's new reader), never with the visit-limited `bound` per
-/// line, so a large group cannot refuse the copy budget by visits alone and
-/// clear every retained singleton copy.
+/// `completed_bound` at most once per `CHARGE_REFRESH_BYTES` of input and
+/// at each member's new reader (`forget_job_charge`), never with the
+/// visit-limited `bound` per line, so a large group cannot refuse the copy
+/// budget by visits alone and clear every retained singleton copy.
 pub(in crate::snapshots) fn byte_charged(job: &OwnedActiveFile) -> bool {
     job.cursor.is_some() || job.group.is_some()
 }
@@ -394,10 +406,23 @@ pub(in crate::snapshots) fn job_charge_estimate(
     consumed: u64,
     buffer: usize,
 ) -> Option<usize> {
-    match (job.cursor.as_ref(), job.group.as_ref()) {
-        (Some(meta), _) => meta.charge_estimate(consumed, buffer),
-        (None, Some(group)) => estimate_charge(group.walked, consumed, buffer),
-        (None, None) => None,
+    let feeds = 1 + usize::from(job.group.as_ref().is_some_and(|group| group.has_tee()));
+    let walked = match (job.cursor.as_ref(), job.group.as_ref()) {
+        (Some(meta), _) => meta.charge,
+        (None, Some(group)) => group.walked,
+        (None, None) => return None,
+    };
+    estimate_charge(walked, consumed, buffer, feeds)
+}
+
+/// A group job swapped its member reader (R2-N4): the new reader counts
+/// from zero, so the next copy-budget step walks the job again.
+pub(in crate::snapshots) fn forget_job_charge(job: &mut OwnedActiveFile) {
+    if let Some(meta) = job.cursor.as_mut() {
+        meta.charge = None;
+    }
+    if let Some(group) = job.group.as_mut() {
+        group.walked = None;
     }
 }
 
@@ -502,7 +527,9 @@ pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &Sca
 /// A group's counting view (§k.4, §5.2 rule 3; R1-M2): built from every
 /// member's index entry, keyed by member path, so a counting change on any
 /// member (not only the live one) changes the group decision at start,
-/// resume, emission and in the memo digest.
+/// resume, emission and in the memo digest. It is an opaque digest: for a
+/// group job `counting_reusable` must stay digest equality (or use its own
+/// predicate over `group_counting_evidence`), never parse this view.
 pub(in crate::snapshots) fn group_counting_view<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
@@ -643,8 +670,9 @@ pub(in crate::snapshots) struct Counters {
     /// P2 (RAM only; not yet in the diagnostics projection): group cursor
     /// jobs started, group memo hits, entries skipped because a job owns
     /// them (L1), group attempts skipped by the generation fence, groups
-    /// whose probe hit `PROBE_BYTES` (chronological order kept), and
-    /// terminal group debt by `JoinRefusal` slot (§d.1.1).
+    /// whose probe hit `PROBE_BYTES` or the boot's probe allowance
+    /// (chronological order kept), and group refusals by `JoinRefusal` slot
+    /// (§d.1.1; terminal debt except `ProbeBudgetOrder`, which is strict).
     pub(in crate::snapshots) groups_started: u64,
     pub(in crate::snapshots) group_memo_hits: u64,
     pub(in crate::snapshots) join_in_progress_members: u64,
@@ -1485,36 +1513,63 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
 /// grown file keeps the record withheld. Idempotent across re-entered
 /// completion steps.
 pub(in crate::snapshots) fn apply_eof_record(job: &mut OwnedActiveFile) {
-    let Some(stamp_open) = job
-        .cursor
-        .as_ref()
-        .filter(|meta| !meta.eof_applied)
-        .map(|meta| meta.stamp_open.clone())
-    else {
-        return;
+    if eof_record_due(job) && job.parser.apply_sealed_fragment() {
+        mark_eof_applied(job);
+    }
+}
+
+/// E1's predicate: a withheld record not yet applied, the held FD exactly
+/// the opened object (dev, ino, length, mtime, ctime) and the read at that
+/// length.
+fn eof_record_due(job: &OwnedActiveFile) -> bool {
+    let Some(meta) = job.cursor.as_ref().filter(|meta| !meta.eof_applied) else {
+        return false;
     };
-    if !job.parser.reader.sealed_fragment() {
-        return;
+    job.parser.reader.sealed_fragment()
+        && read_end(job) == meta.stamp_open.extent
+        && OpenStamp::capture(job.parser.reader.reader.get_ref())
+            .ok()
+            .as_ref()
+            == Some(&meta.stamp_open)
+}
+
+/// E1 for a group job's live member (R2-N1): `eof_record_due`, the member
+/// still exactly its `boot` object (so strict finish identity holds against
+/// its boot identity), and a record main's trailing-line rule applies
+/// without loss (`apply_physical_line`: within the line cap, UTF-8, blank
+/// or one JSON value). A group refuses any line loss (R1-B1), so a
+/// malformed final record stays withheld, as before.
+pub(in crate::snapshots) fn group_eof_record_due(job: &OwnedActiveFile, boot: &OpenStamp) -> bool {
+    let reader = &job.parser.reader;
+    let mut bytes = reader.buf.as_slice();
+    if bytes.last() == Some(&b'\r') {
+        bytes = &bytes[..bytes.len() - 1];
     }
-    let read_end = job
-        .parser
-        .reader
-        .acquisition
-        .as_ref()
-        .map_or(0, crate::transcript_acquisition::ReadPlan::start_offset)
-        .saturating_add(job.parser.reader.consumed_bytes());
-    let held = OpenStamp::capture(job.parser.reader.reader.get_ref()).ok();
-    let applied = held.as_ref() == Some(&stamp_open)
-        && read_end == stamp_open.extent
-        && job.parser.apply_sealed_fragment();
+    eof_record_due(job)
+        && job
+            .cursor
+            .as_ref()
+            .is_some_and(|meta| &meta.stamp_open == boot)
+        && matches!(reader.sealed_fragment, Some((false, _)))
+        && std::str::from_utf8(bytes).is_ok_and(|line| {
+            line.trim().is_empty() || serde_json::from_str::<serde_json::Value>(line).is_ok()
+        })
+}
+
+/// The withheld record was applied (E1): the job gets no S12 grant.
+pub(in crate::snapshots) fn mark_eof_applied(job: &mut OwnedActiveFile) {
     if let Some(meta) = job.cursor.as_mut() {
-        meta.eof_applied = applied;
+        meta.eof_applied = true;
     }
+}
+
+pub(in crate::snapshots) fn eof_applied(job: &OwnedActiveFile) -> bool {
+    job.cursor.as_ref().is_some_and(|meta| meta.eof_applied)
 }
 
 /// The file offset where the job's reader stopped (a tail's reader counts
 /// from its start).
-fn read_end(job: &OwnedActiveFile) -> u64 {
+pub(in crate::snapshots) fn read_end(job: &OwnedActiveFile) -> u64 {
     job.parser
         .reader
         .acquisition

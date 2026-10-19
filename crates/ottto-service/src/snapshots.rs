@@ -14155,7 +14155,12 @@ impl OwnedSourceScan {
                     }
                     let mut grouped_paths = BTreeSet::new();
                     let mut used = 0usize;
-                    for group in inventory.groups().into_values() {
+                    // R2-N6: a group with more members than the page's file
+                    // limit is never excluded; it goes first and takes a page
+                    // of its own (it pages through the cursor like any group).
+                    let mut groups = inventory.groups().into_values().collect::<Vec<_>>();
+                    groups.sort_by_key(|group| group.members.len() <= file_limit);
+                    for group in groups {
                         let protected_history_missing = missing_unknown_owner
                             || missing_protected_owners
                                 .contains(&codex_protected_owner(&group.owner));
@@ -14234,7 +14239,6 @@ impl OwnedSourceScan {
                                 .get(&group.owner)
                                 .is_some_and(|homes| homes.len() > 1)
                             || group.members.len() < 2
-                            || group.members.len() > file_limit
                         {
                             census.ownership_incomplete_file_count += group.members.len();
                             census.record_unreadable(UnreadableCause::AliasParser, 1);
@@ -14248,7 +14252,7 @@ impl OwnedSourceScan {
                             codex_state_only_blocked_session_ids.insert(group.owner.clone());
                             continue;
                         }
-                        if used + group.members.len() > file_limit {
+                        if used > 0 && used + group.members.len() > file_limit {
                             // Keep the existing traversal as the only queue. A whole
                             // group is selected on a subsequent ordinary page.
                             if let Some(traversal) = index.traversal.as_mut() {
@@ -14320,7 +14324,9 @@ impl OwnedSourceScan {
                         codex_state_only_blocked_session_ids.extend(held_owners);
                         identified_candidates.clear();
                     }
-                    while used + identified_candidates.len() > file_limit {
+                    while !identified_candidates.is_empty()
+                        && used + identified_candidates.len() > file_limit
+                    {
                         if let Some(candidate) = identified_candidates.pop_back() {
                             if let Some(traversal) = index.traversal.as_mut() {
                                 traversal.pending_candidates.push_front(ScanTraversalPath {
@@ -14337,6 +14343,49 @@ impl OwnedSourceScan {
                 pending!();
             }
             if let Some(mut boot) = codex_join_active.take() {
+                // R2-N2: a group larger than the singleton budget asks for
+                // the cursor before any member is opened; one that would
+                // wait (or is fenced) reads no header or probe this page.
+                if let Some(context) = sampling.as_ref().filter(|_| {
+                    boot.fresh()
+                        && crate::heap_layout_bound::layout_supported()
+                        && boot.expected_bytes()
+                            > sampled_scan::codex_cursor::Limits::current().singleton()
+                }) {
+                    match context.cache.cursor_plan(
+                        &mut codex_page,
+                        sampled_scan::codex_cursor::Limits::current(),
+                        boot.expected_bytes(),
+                        codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
+                        true,
+                        &context.namespace,
+                        &boot.key,
+                        sampled_scan::codex_cursor::census_token(index).as_deref(),
+                    ) {
+                        sampled_scan::codex_cursor::StartPlan::Defer => {
+                            context.cache.cursor_note_deferred();
+                            scanned_file_count =
+                                scanned_file_count.saturating_sub(boot.group.members.len());
+                            for member in &boot.group.members {
+                                sampled_scan::codex_cursor::requeue(
+                                    index,
+                                    &codex_selected_flags,
+                                    member,
+                                );
+                            }
+                            pending!();
+                        }
+                        sampled_scan::codex_cursor::StartPlan::Fenced => {
+                            scanned_file_count =
+                                scanned_file_count.saturating_sub(boot.group.members.len());
+                            pending!();
+                        }
+                        _ => {}
+                    }
+                }
+                boot.allow_probe_bytes(
+                    codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
+                );
                 let outcome = boot.step(attribution_context, index);
                 // Header and probe bytes are singleton-budget reads (§d.2).
                 codex_page.charge(false, boot.take_charge());
@@ -14504,7 +14553,9 @@ impl OwnedSourceScan {
                 // No group byte or member cap (R1-M4): a group larger than
                 // the singleton budget pages through the cursor; without one
                 // (unsupported layout, uncached scan) it is read in one page
-                // exactly like a singleton of the same size.
+                // like main's unpaged read: each member at most
+                // `MAX_CODEX_JSONL_FILE_BYTES`, the group's total uncapped
+                // (R2-N7, disclosed).
                 let owner = boot.group.owner.clone();
                 let group_members = boot.group.members.clone();
                 let job = boot.into_job(codex_file_join::JobInputs {
@@ -14824,8 +14875,8 @@ impl OwnedSourceScan {
                 }
                 if active.cursor.is_some() && active.group.is_none() {
                     // E1 before the protected-tier gate below (R1-H1). A group
-                    // job's live member keeps a withheld tail pending (E1 is
-                    // singleton-only, named in the P2 handoff).
+                    // job applies it to its live member in `member_eof`, before
+                    // that member's proof ends (R2-N1).
                     sampled_scan::codex_cursor::apply_eof_record(&mut active);
                 }
                 if let Some(context) = attribution_context {

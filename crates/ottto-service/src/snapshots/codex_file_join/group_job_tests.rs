@@ -1334,3 +1334,142 @@ fn proof_charge_uses_proven_btree_fill() {
     assert!(charged <= ceiling, "{charged} > {ceiling}");
     assert!(charged >= 2 * 100_000 * size_of::<u64>(), "{charged}");
 }
+
+/// R1-H1 (round 2): an append-curable refusal at a paged group's frozen cut
+/// is not memoized while the live member already holds bytes past the cut:
+/// they may cure it, so the next generation reads them and accepts.
+#[test]
+fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("frozen-cut");
+    write_rows(
+        &root.join("sessions/a.jsonl"),
+        &chain_rows(OWNER, "a", "2026-10-01T10:00:00Z", 0, 30),
+    );
+    // The final turn's UI record is written before its native.
+    let mut live = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30);
+    live.push(ui(20, 620, "2026-10-01T10:10:20Z"));
+    write_rows(&root.join("sessions/b.jsonl"), &live);
+    let unmatched = JoinRefusal::UiUnmatched.slot();
+    let cache = Arc::new(SharedCache::default());
+    let done = with_test_limits(2048, 1024, 64, || {
+        let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+            cache.paused_group_position() == Some(1)
+        });
+        // The native lands past the live member's frozen extent.
+        append_rows(
+            &root.join("sessions/b.jsonl"),
+            &[native(OWNER, "b-30", 20, 620)],
+        );
+        let (mut index, _, _) = pages(&root, index, &cache, || {
+            counters(&cache).join_terminal_debt[unmatched] > 0
+        });
+        let refused = counters(&cache);
+        assert_eq!(refused.memo_records, 0, "{refused:?}");
+        index.traversal = None;
+        let (_, done, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+            completions(&cache) > 0
+        });
+        done
+    });
+    let after = counters(&cache);
+    assert_eq!(after.group_memo_hits, 0, "{after:?}");
+    assert_eq!(after.groups_started, 2, "one new attempt: {after:?}");
+    assert_eq!(after.join_terminal_debt[unmatched], 1, "{after:?}");
+    let (_, full) = scan(&root, ScanIndex::default(), 10);
+    assert_eq!(fingerprints(&done), fingerprints(&full), "a body accepted");
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// R2-N1: E1 for a paged group's live member. A quiescent live member
+/// ending in a valid unterminated record has it applied at its genuine
+/// unchanged EOF, like a singleton: counted once, verified, and the next
+/// generation reads nothing (no hourly audit debt).
+#[test]
+fn quiescent_live_member_unterminated_record_applied_at_genuine_eof() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = paged_corpus("eof");
+    let live = root.join("sessions/b.jsonl");
+    let mut body = fs::read(&live).unwrap();
+    assert_eq!(body.pop(), Some(b'\n'));
+    fs::write(&live, body).unwrap();
+    let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
+    let cache = Arc::new(SharedCache::default());
+    let (index, done) = with_test_limits(2048, 1024, 64, || {
+        let (index, done, _) = pages(&root, ScanIndex::default(), &cache, || {
+            completions(&cache) > 0
+        });
+        (index, done)
+    });
+    let applied = counters(&cache);
+    assert_eq!(applied.eof_record_applied, 1, "{applied:?}");
+    assert_eq!(applied.sealed_fragment_withheld, 0, "{applied:?}");
+    assert_eq!(
+        fingerprints(&done),
+        fingerprints(&unpaged),
+        "counted once, like main's read"
+    );
+    assert!(!index
+        .files
+        .get(&local_index_key(&live))
+        .is_some_and(|entry| entry.has_unverified_source()));
+    with_test_limits(2048, 1024, 64, || {
+        let (_, again) = next_generation(&root, index, &cache, 1);
+        assert!(again.snapshots.is_empty());
+    });
+    assert_eq!(counters(&cache).groups_started, 1, "no re-read");
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// R1-M1 / R2-N2: probes are capped by the page's remaining singleton
+/// budget. Past it the group keeps chronological order; a refusal in that
+/// order is our own artifact: strict `ProbeBudgetOrder`, never settleable
+/// or memoized. With the budget, the probes order the same group and it is
+/// accepted.
+#[test]
+fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("probe-budget");
+    // Legacy (non-ordinal) members whose header times disagree with their
+    // counter order: only the probes order them.
+    write_rows(
+        &root.join("sessions/a.jsonl"),
+        &[
+            meta(OWNER, "2026-10-01T10:00:00Z", json!({})),
+            native(OWNER, "r-a", 200, 300),
+            ui(200, 300, "2026-10-01T10:05:01Z"),
+        ],
+    );
+    write_rows(
+        &root.join("sessions/b.jsonl"),
+        &[
+            meta(OWNER, "2026-10-01T10:05:00Z", json!({})),
+            native(OWNER, "r-b", 100, 100),
+            ui(100, 100, "2026-10-01T10:00:01Z"),
+        ],
+    );
+    let (_, ordered) = scan(&root, ScanIndex::default(), 10);
+    assert!(!ordered.snapshots.is_empty(), "probes order the group");
+    let cache = Arc::new(SharedCache::default());
+    let (index, result) = with_test_limits(2048, 1, 64, || {
+        sampled(&root, ScanIndex::default(), 10, &cache)
+    });
+    let after = counters(&cache);
+    assert!(after.probe_bound >= 1, "{after:?}");
+    assert_eq!(
+        after.join_terminal_debt[JoinRefusal::ProbeBudgetOrder.slot()],
+        1,
+        "{after:?}"
+    );
+    assert_eq!(after.memo_records, 0, "{after:?}");
+    assert!(result.snapshots.is_empty());
+    assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
+    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+    fs::remove_dir_all(root).unwrap();
+}

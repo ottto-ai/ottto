@@ -2570,3 +2570,17 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
         assert_eq!(hold.is_some(), !grow, "grow: {grow}");
     }
 }
+
+/// R2-N5: a group's legacy tee takes every consumed byte too, so the E3
+/// estimate counts each byte once per accumulator.
+#[test]
+fn estimate_counts_bytes_once_per_fed_accumulator() {
+    assert_eq!(
+        estimate_charge(Some((1_000, 10, 64)), 510, 64, 1),
+        Some(1_500)
+    );
+    assert_eq!(
+        estimate_charge(Some((1_000, 10, 64)), 510, 64, 2),
+        Some(2_000)
+    );
+}
