@@ -3320,9 +3320,11 @@ fn upload_local_health_projection_reporting(
     machine_id: &str,
     daemon: &LocalDaemon,
 ) -> Result<()> {
-    if let Some(held) =
-        setup_run_refresh_hold_for(&setup_run_refresh_binding(device, device_secret))
-    {
+    // The binding this pass's requests are for, captured before any of them.
+    // A failure is recorded against it, never against a setup run attached
+    // while a request was in flight.
+    let binding = setup_run_refresh_binding(device, device_secret);
+    if let Some(held) = setup_run_refresh_hold_for(&binding) {
         // No request at all while held: the last `AuthRejected` upload event
         // stays the latest one, so local health keeps reporting the rejection.
         return Err(anyhow::Error::new(held));
@@ -3355,7 +3357,7 @@ fn upload_local_health_projection_reporting(
                 let _ = daemon
                     .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected);
                 note_setup_run_refresh_failed(
-                    &setup_run_refresh_binding(device, device_secret),
+                    &binding,
                     crate::control::terminal_refresh_rejection(&refresh_error).is_some(),
                 );
                 return Err(error.context(format!(
@@ -3377,10 +3379,7 @@ fn upload_local_health_projection_reporting(
                 }
                 Err(retry_error) => {
                     if local_health_upload_should_refresh_setup_run(&retry_error) {
-                        note_setup_run_refresh_failed(
-                            &setup_run_refresh_binding(device, device_secret),
-                            false,
-                        );
+                        note_setup_run_refresh_failed(&binding, false);
                     }
                     let _ = daemon.record_local_health_upload_failed(
                         local_health_upload_failure_kind(&retry_error),
@@ -15451,6 +15450,134 @@ mod tests {
         assert!(
             captured[3].contains("POST /api/v1/setup-runs/setup_reattached/local-client/refresh")
         );
+
+        clear_setup_run_refresh_hold();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn local_health_refresh_hold_stays_on_the_binding_its_requests_used() {
+        clear_setup_run_refresh_hold();
+        let root = test_dir("local-health-refresh-hold-request-binding");
+        let support_dir = root.join("support");
+        let secrets_dir = root.join("secrets");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        let api_base_url = format!("http://{}", listener.local_addr().expect("local address"));
+        let connection = {
+            let api_base_url = api_base_url.clone();
+            move |setup_run_id: &str| LocalConnectionBinding {
+                setup_run_id: setup_run_id.to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("otm_test".to_string()),
+                claim_code: None,
+                api_base_url: api_base_url.clone(),
+            }
+        };
+        const DEVICE_REJECTED: &str =
+            r#"{"error":"AuthenticationError","detail":"Telemetry device is not active"}"#;
+        // (status, body, setup run the user attaches while this request is in flight)
+        let script: Vec<(u16, &'static str, Option<&'static str>)> = vec![
+            // Run A: relay token, then a refresh answered terminally while B is attached.
+            (401, DEVICE_REJECTED, None),
+            (401, DEVICE_REJECTED, Some("setup_b")),
+            // Run B: relay token, refresh succeeds, retry rejected while C is attached.
+            (401, DEVICE_REJECTED, None),
+            (
+                200,
+                r#"{"setup_run_token":"otsr_b","expires_at":"2026-05-05T11:00:00Z"}"#,
+                None,
+            ),
+            (401, DEVICE_REJECTED, Some("setup_c")),
+            // Run C: tried again.
+            (401, DEVICE_REJECTED, None),
+            (
+                401,
+                r#"{"detail":"Setup run not found for this device"}"#,
+                None,
+            ),
+        ];
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let server_captured = captured.clone();
+        let server_connection = connection.clone();
+        let server = std::thread::spawn(move || {
+            for (status, body, reattach) in script {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_complete_http_request(&mut stream);
+                server_captured
+                    .lock()
+                    .expect("capture request")
+                    .push(request);
+                if let Some(setup_run_id) = reattach {
+                    FileConnectionStore::default()
+                        .save(&server_connection(setup_run_id))
+                        .expect("reattach during the request");
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileDeviceStore::default()
+            .save(&device)
+            .expect("save device");
+        FileConnectionStore::default()
+            .save(&connection("setup_a"))
+            .expect("save connection");
+        std::fs::write(
+            secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .expect("save device secret");
+        let daemon = test_daemon("otm_test");
+        let client = SnapshotApiClient::new(api_base_url);
+        let pass = || {
+            let error = upload_local_health_projection_reporting(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::Codex,
+                "otm_test",
+                &daemon,
+            )
+            .expect_err("a rejected device cannot upload");
+            assert!(error.downcast_ref::<LocalHealthRefreshHeld>().is_none());
+        };
+        let requests = || captured.lock().expect("captured requests").len();
+
+        // A's terminal refresh answer parks A, not B attached meanwhile.
+        pass();
+        assert_eq!(requests(), 2);
+        pass();
+        assert_eq!(requests(), 5, "B is tried, not held by A's answer");
+        // B's rejected retry backs off B, not C attached meanwhile.
+        pass();
+        assert_eq!(requests(), 7, "C is tried, not held by B's rejection");
+
+        server.join().expect("scripted backend");
+        let captured = captured.lock().expect("captured requests").clone();
+        for (index, setup_run_id) in [(1, "setup_a"), (3, "setup_b"), (6, "setup_c")] {
+            assert!(
+                captured[index].contains(&format!(
+                    "POST /api/v1/setup-runs/{setup_run_id}/local-client/refresh"
+                )),
+                "request {index} refreshes {setup_run_id}"
+            );
+        }
 
         clear_setup_run_refresh_hold();
         let _ = std::fs::remove_dir_all(root);

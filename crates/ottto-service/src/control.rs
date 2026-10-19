@@ -215,6 +215,14 @@ fn reserve_identity_mutation(
     pause_enabled_on_cleanup_required: bool,
 ) -> Result<IdentityMutationReservation, LocalApiError> {
     let _identity_lifecycle_lock = lock_setup_run_binding();
+    reserve_identity_mutation_locked(pause_enabled_on_cleanup_required)
+}
+
+/// [`reserve_identity_mutation`] for a caller already holding the identity
+/// lifecycle lock.
+fn reserve_identity_mutation_locked(
+    pause_enabled_on_cleanup_required: bool,
+) -> Result<IdentityMutationReservation, LocalApiError> {
     require_identity_mutation_reservation(None)?;
     let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
     if pause_enabled_on_cleanup_required {
@@ -994,6 +1002,7 @@ fn handle_command(
             &authorization,
             local_only,
             forget_installation,
+            None,
         )?),
         LocalControlCommand::Account => to_value(account_for(daemon, &authorization)?),
         LocalControlCommand::ClaudeAccountsStatus => {
@@ -6557,17 +6566,24 @@ fn claim_completion_response_unexpected(detail: &str) -> LocalApiError {
     })
 }
 
+/// `only_if_bound`: reset only while this setup run is still the bound one
+/// (the automatic reset after a terminal refresh answer about it).
 fn auth_reset(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     local_only: bool,
     forget_installation: bool,
+    only_if_bound: Option<&LocalConnectionBinding>,
 ) -> Result<AuthResetResponse, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
     // Both ordinary and explicit local-only logout clear the account/device
     // authority needed for exact backend cleanup, so neither may strand an
     // unconfirmed cloud-session grant.
-    let identity_reservation = reserve_identity_mutation(true)?;
+    let identity_reservation = {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        require_setup_run_still_bound(daemon, only_if_bound)?;
+        reserve_identity_mutation_locked(true)?
+    };
     let mut cloud_disconnect: Option<SetupRunDisconnectResponse> = None;
     let mut setup_run_already_ended = false;
 
@@ -6607,9 +6623,13 @@ fn auth_reset(
     }
     let local_only = local_only || setup_run_already_ended;
 
-    {
+    // Every local deletion, Keychain included, happens under the identity
+    // lifecycle lock after the binding is rechecked, so a setup run attached
+    // meanwhile (which takes the same lock) is never cleared by this reset.
+    let mut reset = {
         let _identity_lifecycle_lock = lock_setup_run_binding();
         identity_reservation.validate_locked()?;
+        require_setup_run_still_bound(daemon, only_if_bound)?;
         require_cloud_session_cleanup_before_identity_change_without_pause(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
         )?;
@@ -6631,13 +6651,13 @@ fn auth_reset(
         if forget_installation {
             forget_installation_state_locked()?;
         }
-    }
-    let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
-    let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
-    if !local_only || forget_installation {
-        let _ = KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT).delete();
-    }
-    let mut reset = daemon.reset_account_for_authorized_client()?;
+        let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
+        let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+        if !local_only || forget_installation {
+            let _ = KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+        }
+        daemon.reset_account_for_authorized_client()?
+    };
     reset.local_only = local_only;
     reset.cloud_disconnected = cloud_disconnect.is_some();
     reset.setup_run_id = cloud_disconnect
@@ -8050,11 +8070,10 @@ fn setup_run(
             match refresh_setup_run_token_via_device_secret(&binding.api_base_url, binding) {
                 Ok(refreshed) => setup_run_id = Some(refreshed.connection.setup_run_id),
                 Err(error) if terminal_refresh_rejection(&error).is_some() => {
-                    // Only the binding Ottto just answered for is cleared; a
-                    // binding replaced meanwhile is left alone.
-                    if daemon.connection_for_authorized_client()?.as_ref() == Some(binding) {
-                        auth_reset(daemon, authorization, true, false)?;
-                    }
+                    // Only the binding Ottto just answered for is cleared:
+                    // `auth_reset` rechecks it under the identity lifecycle
+                    // lock, so a binding attached meanwhile is left alone.
+                    auth_reset(daemon, authorization, true, false, Some(binding))?;
                     return Err(LocalApiError::SetupRunConnectionMissing);
                 }
                 Err(_) => {}
@@ -8180,6 +8199,31 @@ fn setup_run_binding_matches(
     expected: &LocalConnectionBinding,
 ) -> bool {
     current.setup_run_id == expected.setup_run_id && current.api_base_url == expected.api_base_url
+}
+
+/// Under the identity lifecycle lock: `expected`, when given, must still be
+/// the persisted and the daemon's bound setup run. Otherwise a reattach or a
+/// completed sign-in replaced it and nothing of the replacement is touched.
+fn require_setup_run_still_bound(
+    daemon: &LocalDaemon,
+    expected: Option<&LocalConnectionBinding>,
+) -> Result<(), LocalApiError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let persisted = FileConnectionStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let bound = daemon.connection_for_authorized_client()?;
+    if [persisted, bound].iter().all(|binding| {
+        binding
+            .as_ref()
+            .is_some_and(|binding| setup_run_binding_matches(binding, expected))
+    }) {
+        Ok(())
+    } else {
+        Err(LocalApiError::SetupRunConnectionMissing)
+    }
 }
 
 fn is_terminal_setup_run_scan_error(error: &LocalApiError) -> bool {
@@ -21387,6 +21431,100 @@ for line in sys.stdin:
             Some(device)
         );
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn setup_terminal_refresh_reset_leaves_a_setup_run_attached_meanwhile() {
+        let _lock = lock_backend_test_env();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind gated backend");
+        let api_base_url = format!("http://{}", listener.local_addr().expect("backend address"));
+        let (request_seen_tx, request_seen) = mpsc::channel();
+        let (allow_response, allow_response_rx) = mpsc::channel::<()>();
+        let (response_sent_tx, response_sent) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept refresh");
+            let request = read_complete_http_request(&mut stream);
+            request_seen_tx.send(()).unwrap();
+            allow_response_rx.recv().unwrap();
+            write_json_response(
+                &mut stream,
+                401,
+                "Unauthorized",
+                r#"{"detail":"Setup run expired"}"#,
+            );
+            response_sent_tx.send(()).unwrap();
+            request
+        });
+        let (root, _guards, daemon, device) =
+            connected_binding_fixture("connected-setup-reattach-race", api_base_url.clone());
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let reattached = LocalConnectionBinding {
+            setup_run_id: "run_reattached".to_string(),
+            setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: Some("claim_reattached".to_string()),
+            api_base_url,
+        };
+
+        thread::scope(|scope| {
+            let login =
+                scope.spawn(|| setup_run(&daemon, &authorization, Vec::new(), None, None, None));
+            request_seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("login refreshes the bound run");
+            // Ottto answers that the old run ended. Before the login's reset
+            // runs, run B is attached the way the claim path does it: under
+            // the lifecycle lock, token, connection file, then daemon state.
+            let lifecycle_lock = lock_setup_run_binding();
+            allow_response.send(()).unwrap();
+            response_sent
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal refresh answer sent");
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .save("otsr_reattached")
+                .unwrap();
+            FileConnectionStore::default().save(&reattached).unwrap();
+            daemon
+                .bind_setup_run_for_authorized_client(reattached.clone())
+                .unwrap();
+            drop(lifecycle_lock);
+            let error = login.join().unwrap().expect_err("the old run ended");
+            assert_eq!(cli_error(error).code, CliErrorCode::NeedsUserAction);
+        });
+        assert!(server
+            .join()
+            .expect("gated backend")
+            .starts_with("POST /api/v1/setup-runs/run_connected_setup/local-client/refresh"));
+
+        // Nothing of run B was cleared.
+        assert_eq!(
+            FileConnectionStore::default().load().unwrap(),
+            Some(reattached.clone())
+        );
+        assert_eq!(
+            daemon.connection_for_authorized_client().unwrap(),
+            Some(reattached)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .unwrap(),
+            "otsr_reattached"
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .unwrap(),
+            "connected-secret"
+        );
+        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::Connected
+        );
+        assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
         let _ = fs::remove_dir_all(root);
     }
 
