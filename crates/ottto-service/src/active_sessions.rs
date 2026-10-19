@@ -2432,6 +2432,19 @@ mod tests {
         let mixed = tagged([Some(a.as_str()), Some(b.as_str())]);
         assert_eq!(attribution(&mixed, &lineage(c.as_str())), (None, None));
         assert_eq!(attribution(&mixed, &lineage(a.as_str())), (None, None));
+        // A stored mixed-account reason still explains the withheld account.
+        let mut mixed = mixed;
+        mixed.claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
+        for status in [lineage(c.as_str()), lineage(a.as_str())] {
+            let active =
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, &mixed, Some(&status));
+            assert_eq!(active.account_identifier_hash, None);
+            assert_eq!(active.account_attribution_source, None);
+            assert_eq!(
+                active.account_withheld_reason.as_deref(),
+                Some("multiple_accounts")
+            );
+        }
 
         // One own login beside an untagged request: lineage, an exact
         // observation or the current login naming another account is refused;
