@@ -1507,25 +1507,48 @@ struct ClaudeDesktopProfileBuilder {
     agent_mode_session_count: usize,
 }
 
-/// One `claude-code-sessions/<account>/<organization>` folder, keyed by its
-/// canonical UUID pair. Labels and plan come only from the same pair's
-/// agent-mode folder; nothing is filled in from the account's other folders.
+/// One Desktop `<account>/<organization>` folder pair, across the Code and
+/// agent-mode stores. Every folder takes part in duplicate-session ownership;
+/// only an `exact` one (both names canonical UUIDs) can become a pair. Labels
+/// and plan come only from the same folder pair, never from the account's
+/// other folders.
 #[derive(Debug, Clone, Default)]
 struct ClaudeDesktopPairBuilder {
+    exact: bool,
     account_label: Option<String>,
     account_name: Option<String>,
     organization_label: Option<String>,
     plan_type: Option<String>,
-    /// Every Code session in the folder, imported copies included: input to
-    /// the duplicate-session ownership rule.
+    /// Every session seen in the folder pair, imported copies and agent-mode
+    /// sessions included: input to the duplicate-session ownership rule.
     session_activity_by_id: BTreeMap<String, Option<i64>>,
     /// Native Code sessions (no `importedFrom`) whose metadata carries a
     /// parseable activity time. Only these qualify the pair.
     native_activity_by_id: BTreeMap<String, i64>,
 }
 
-/// Canonical (account UUID, organization UUID) of one Desktop folder pair.
+/// One Desktop folder pair: the canonical UUIDs where the names are UUIDs,
+/// otherwise the names as found (a non-UUID name never equals a canonical one).
 type ClaudeDesktopPairKey = (String, String);
+
+fn claude_desktop_pair_builder<'a>(
+    pair_builders: &'a mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
+    account: &str,
+    organization: &str,
+) -> &'a mut ClaudeDesktopPairBuilder {
+    let canonical_account = crate::claude_local_otel::canonical_uuid(account);
+    let canonical_organization = crate::claude_local_otel::canonical_uuid(organization);
+    let exact = canonical_account.is_some() && canonical_organization.is_some();
+    pair_builders
+        .entry((
+            canonical_account.unwrap_or_else(|| account.to_string()),
+            canonical_organization.unwrap_or_else(|| organization.to_string()),
+        ))
+        .or_insert_with(|| ClaudeDesktopPairBuilder {
+            exact,
+            ..ClaudeDesktopPairBuilder::default()
+        })
+}
 
 /// One Desktop metadata scan per status pass: today's per-account observations
 /// for the default snapshot, and the qualified exact folder pairs.
@@ -9656,13 +9679,7 @@ fn claude_desktop_scan_from_root(root: &Path, observed_at: &str) -> ClaudeDeskto
         &mut builders,
         &mut pair_builders,
     );
-    let pairs = claude_desktop_qualified_pairs(
-        pair_builders,
-        last_known_account_uuid
-            .as_deref()
-            .and_then(crate::claude_local_otel::canonical_uuid)
-            .as_deref(),
-    );
+    let pairs = claude_desktop_qualified_pairs(pair_builders);
 
     let builders = builders
         .into_values()
@@ -9846,10 +9863,6 @@ fn collect_claude_desktop_code_sessions(
                 }
             });
             builder.organization_uuids.insert(org_uuid.clone());
-            // Only canonical UUID folder names form an exact pair, so its
-            // hashes always equal the session pair's (`snapshots.rs`).
-            let pair_key = crate::claude_local_otel::canonical_uuid(&account_uuid)
-                .zip(crate::claude_local_otel::canonical_uuid(&org_uuid));
             let Ok(files) = fs::read_dir(org.path()) else {
                 continue;
             };
@@ -9869,11 +9882,8 @@ fn collect_claude_desktop_code_sessions(
                 let session_id = metadata
                     .and_then(|metadata| metadata.cli_session_id)
                     .and_then(|value| safe_local_identifier(&value).map(ToString::to_string));
-                if let (Some(pair_key), Some(session_id)) = (pair_key.as_ref(), session_id.as_ref())
-                {
-                    pair_builders
-                        .entry(pair_key.clone())
-                        .or_default()
+                if let Some(session_id) = session_id.as_deref() {
+                    claude_desktop_pair_builder(pair_builders, &account_uuid, &org_uuid)
                         .record_session(session_id, activity, metadata_activity, imported);
                 }
                 let builder = builders.get_mut(&account_uuid).expect("builder exists");
@@ -9935,11 +9945,7 @@ fn collect_claude_desktop_agent_mode_sessions(
                     ..Default::default()
                 }
             });
-            // Labels and plan for an exact pair come only from its own
-            // folder; agent-mode sessions never create or qualify a pair.
-            let pair_key = crate::claude_local_otel::canonical_uuid(&account_uuid)
-                .zip(crate::claude_local_otel::canonical_uuid(&org_uuid));
-            builder.organization_uuids.insert(org_uuid);
+            builder.organization_uuids.insert(org_uuid.clone());
             let Ok(files) = fs::read_dir(org.path()) else {
                 continue;
             };
@@ -9961,6 +9967,13 @@ fn collect_claude_desktop_agent_mode_sessions(
                     .as_deref()
                     .and_then(safe_local_identifier)
                     .map(ToString::to_string);
+                // Agent-mode sessions compete for duplicate-session ownership
+                // and label their own folder pair, but never qualify one.
+                let pair = claude_desktop_pair_builder(pair_builders, &account_uuid, &org_uuid);
+                if let Some(session_id) = session_id.as_deref() {
+                    pair.record_session(session_id, activity, None, true);
+                }
+                pair.record_agent_mode_metadata(&metadata);
                 let builder = builders.get_mut(&account_uuid).expect("builder exists");
                 builder.agent_mode_session_count += 1;
                 builder.record_activity(activity, session_id);
@@ -9992,12 +10005,6 @@ fn collect_claude_desktop_agent_mode_sessions(
                     ])
                     .map(|value| normalize_plan_type(value.to_string()))
                 });
-                if let Some(pair) = pair_key
-                    .as_ref()
-                    .and_then(|pair_key| pair_builders.get_mut(pair_key))
-                {
-                    pair.record_agent_mode_metadata(&metadata);
-                }
             }
         }
     }
@@ -10091,14 +10098,14 @@ fn claude_desktop_subscription_product(plan: String) -> String {
 /// session that carries a parseable activity time and that this folder owns:
 /// a session copied into several folders counts only for the folder with its
 /// unambiguously newest activity, and a tie or a missing time counts for none.
-/// Imported-only and ambiguous copied evidence therefore never makes a pair.
-/// `observed_at` is the newest qualifying native activity, and the pair's
-/// session is that activity's session. Only the newest pair of the Desktop
-/// app's last known account is current; no organization is ever chosen for an
-/// account, every folder speaks only for itself.
+/// Ownership is decided over every Desktop folder pair the scan saw, Code and
+/// agent-mode, UUID-named or not, so no copy the per-account rule sees is
+/// ignored here. Imported-only and ambiguous copied evidence therefore never
+/// makes a pair. `observed_at` is the newest qualifying native activity, and
+/// the pair's session is that activity's session. No organization is ever
+/// chosen for an account: every folder speaks only for itself.
 fn claude_desktop_qualified_pairs(
     pair_builders: BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
-    last_known_account_uuid: Option<&str>,
 ) -> ClaudeDesktopPairs {
     let owners = claude_desktop_duplicate_session_owners(
         pair_builders
@@ -10111,6 +10118,7 @@ fn claude_desktop_qualified_pairs(
     };
     let mut qualified = pair_builders
         .into_iter()
+        .filter(|(_, pair)| pair.exact)
         .filter_map(|(key, pair)| {
             let newest = pair
                 .native_activity_by_id
@@ -10130,18 +10138,11 @@ fn claude_desktop_qualified_pairs(
                 .then_with(|| left_key.cmp(right_key))
         },
     );
-    let current = last_known_account_uuid.and_then(|account| {
-        qualified
-            .iter()
-            .find(|(key, _, _)| key.0 == account)
-            .map(|(key, _, _)| key.clone())
-    });
     let mut pairs = Vec::with_capacity(qualified.len());
     let mut index_by_key = BTreeMap::new();
     for (key, (activity, session_id), pair) in qualified {
-        let is_current = current.as_ref() == Some(&key);
         if let Some(observation) =
-            claude_desktop_pair_observation(&key, &pair, activity, session_id, is_current)
+            claude_desktop_pair_observation(&key, &pair, activity, session_id)
         {
             index_by_key.insert(key, pairs.len());
             pairs.push(observation);
@@ -10182,12 +10183,17 @@ fn claude_desktop_qualified_pairs(
 /// and organization UUIDs with their hashes, so the backend can rebuild the
 /// same pair the session evidence carries. Plan and labels only when that
 /// folder's own agent-mode metadata states them.
+///
+/// Never `is_current`: the backend turns a current observation into a current
+/// account row keyed by the same account and organization as a login's
+/// metered row, so a meterless Desktop reading would replace those meters
+/// whenever the login is not uploaded. A non-current reading still carries
+/// the exact pair.
 fn claude_desktop_pair_observation(
     (account_id, organization_id): &ClaudeDesktopPairKey,
     pair: &ClaudeDesktopPairBuilder,
     activity: i64,
     session_id: String,
-    is_current: bool,
 ) -> Option<ClaudeDesktopPairObservation> {
     let account_identifier_hash = billing_identity_hash("anthropic", "account", account_id)?;
     let organization_identifier_hash =
@@ -10223,8 +10229,7 @@ fn claude_desktop_pair_observation(
             account_label: pair
                 .account_label
                 .clone()
-                .or_else(|| pair.account_name.clone())
-                .or_else(|| is_current.then(|| "Claude Desktop".to_string())),
+                .or_else(|| pair.account_name.clone()),
             account_id: Some(account_id.clone()),
             organization_label: pair.organization_label.clone(),
             organization_id: Some(organization_id.clone()),
@@ -10235,12 +10240,8 @@ fn claude_desktop_pair_observation(
             credential_fingerprint_hash: None,
             billing_identity_evidence,
             billing_identity_confidence: AgentStatusConfidence::High,
-            confidence: if is_current {
-                AgentStatusConfidence::High
-            } else {
-                AgentStatusConfidence::Medium
-            },
-            is_current: Some(is_current),
+            confidence: AgentStatusConfidence::Medium,
+            is_current: Some(false),
         },
     })
 }
@@ -28967,6 +28968,7 @@ for line in sys.stdin:
         let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
         let (current, other, imported, tied) = (uuid(1), uuid(2), uuid(3), uuid(4));
         let (org_x, org_y, org_z, org_w) = (uuid(11), uuid(12), uuid(13), uuid(14));
+        let (contested, agent_copied) = (uuid(5), uuid(6));
         std::fs::create_dir_all(&root).expect("create root");
         std::fs::write(
             root.join("config.json"),
@@ -29031,6 +29033,36 @@ for line in sys.stdin:
             "local_g.json",
             session("legacy", 400),
         );
+        // Copies the per-account rule sees also decide pair ownership: a tie
+        // with a non-UUID folder, and a newer agent-mode copy elsewhere.
+        write(
+            code,
+            &contested,
+            &org_w,
+            "local_h.json",
+            session("contested", 130),
+        );
+        write(
+            code,
+            "legacy-account",
+            "legacy-org",
+            "local_i.json",
+            session("contested", 130),
+        );
+        write(
+            code,
+            &agent_copied,
+            &org_w,
+            "local_j.json",
+            session("agent-copied", 140),
+        );
+        write(
+            "local-agent-mode-sessions",
+            &other,
+            &org_y,
+            "local_k.json",
+            session("agent-copied", 500),
+        );
 
         let scan = claude_desktop_scan_from_root(&root, "2026-08-12T08:00:00Z");
         let pairs = scan
@@ -29049,7 +29081,7 @@ for line in sys.stdin:
                 (Some(other.clone()), Some(org_y.clone())),
                 (Some(other.clone()), Some(org_z.clone())),
             ],
-            "newest first; imported-only, tied and non-UUID folders are not pairs"
+            "newest first; imported-only, tied, outranked and non-UUID folders are not pairs"
         );
         for pair in &pairs {
             assert_eq!(
@@ -29069,10 +29101,11 @@ for line in sys.stdin:
                 AgentStatusConfidence::High
             );
             assert_eq!(pair.plan_type, None);
+            // Never current: a current reading would replace a login's
+            // metered row for the same pair on the backend.
+            assert_eq!(pair.is_current, Some(false));
         }
-        assert_eq!(pairs[0].is_current, Some(true));
         assert_eq!(pairs[0].source_session_id.as_deref(), Some("current-x"));
-        assert_eq!(pairs[1].is_current, Some(false));
         assert_eq!(pairs[1].account_label.as_deref(), Some("other@example.com"));
         assert_eq!(pairs[1].organization_label.as_deref(), Some("Org Y"));
         assert_eq!(pairs[2].account_label, None);
@@ -29096,7 +29129,6 @@ for line in sys.stdin:
                 &ClaudeDesktopPairBuilder::default(),
                 1_786_000_000 - i64::from(n),
                 format!("session-{n}"),
-                false,
             )
             .expect("pair")
         };
