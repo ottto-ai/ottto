@@ -4,7 +4,19 @@ use serde::{ser::SerializeMap, Serialize};
 use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod cache_lifecycle;
+
 const SCHEMA_VERSION: u8 = 2;
+
+/// Cumulative shared-process totals, NOT events attributed to the finishing
+/// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
+pub(crate) fn cache_lifecycle_totals() {
+    traversal_point(
+        "process_retained_cache_lifecycle_totals",
+        "unknown",
+        &cache_lifecycle::snapshot(),
+    );
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1084,6 +1096,28 @@ mod tests {
                 "unsupported_identity"
             ]
         );
+    }
+
+    #[test]
+    fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_retained_cache_lifecycle_totals",
+                "unknown",
+                &cache_lifecycle::Counts::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
+        assert_eq!(record["source"], "unknown");
+        assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        assert!(serde_json::to_string(record).unwrap().len() < 2048);
+        let (_, actual) = capture(cache_lifecycle_totals);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
     }
 
     #[test]
