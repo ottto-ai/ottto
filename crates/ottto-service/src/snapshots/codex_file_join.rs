@@ -1915,13 +1915,38 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     /// The two-member fixture with creation times, so a cutover can select V2.
+    /// Each member's native and UI share one bound turn (#630: a V2 group
+    /// proves native-turn UI, §k.3 rule 2).
     pub(crate) fn counting_v2_fixture() -> (PathBuf, [String; 2]) {
+        counting_v2_fixture_with(true)
+    }
+    /// #603's original rows: UI in an unbound span, which a V2 group holds
+    /// (§k.3 rule 5).
+    pub(crate) fn counting_v2_unbound_fixture() -> (PathBuf, [String; 2]) {
+        counting_v2_fixture_with(false)
+    }
+    fn counting_v2_fixture_with(bound: bool) -> (PathBuf, [String; 2]) {
         let (root, _) = fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        for (name, rows) in [
+        for (name, mut rows) in [
             ("a", member(owner, "r-a", 100, 100)),
             ("b", member(owner, "r-b", 200, 300)),
         ] {
+            if bound {
+                let turn = format!("turn-{name}");
+                // The native names its turn (`payload.turn_id`), as Codex
+                // writes it; the UI follows inside the same open turn.
+                rows[1]["payload"]["turn_id"] = json!(turn);
+                let at = rows[0]["timestamp"].clone();
+                rows.insert(
+                    1,
+                    json!({"type":"event_msg","timestamp":at,
+                        "payload":{"type":"task_started","turn_id":turn}}),
+                );
+                let at = rows[rows.len() - 1]["timestamp"].clone();
+                rows.push(json!({"type":"event_msg","timestamp":at,
+                    "payload":{"type":"task_complete","turn_id":turn}}));
+            }
             let body = rows
                 .into_iter()
                 .map(|mut row| {
@@ -1986,7 +2011,6 @@ pub(super) mod tests {
         ScanIndex::load(&path).unwrap()
     }
     #[test]
-    #[ignore = "#603 fixture UI is unbound-span; under P2 a V2 group with unbound UI is held (design v3.1 §k.3 rule 5, V2UnboundUi) - owner decision pending (integration-603-result.md)"]
     fn counting_v2_group_is_configured_once_and_folded_once() {
         let (root, keys) = counting_v2_fixture();
         let (legacy_index, legacy) = scan(&root, ScanIndex::default(), 2);
@@ -1998,9 +2022,10 @@ pub(super) mod tests {
             .as_deref()
             .expect("an executed configured group parse owns receipts");
         assert_eq!(receipts.v2_sessions, 1, "a joined group folds once");
-        // One carried accumulator saw both members' records.
-        assert_eq!(receipts.native_outside_open_turn, 2);
-        assert_eq!(receipts.ui_in_unbound_span, 2);
+        // One carried accumulator saw both members' records, each inside
+        // its member's bound turn (#630 re-fixture: was 2 and 2 unbound).
+        assert_eq!(receipts.native_outside_open_turn, 0);
+        assert_eq!(receipts.ui_in_unbound_span, 0);
         for key in &keys {
             assert!(index.files[key].codex_counting_v2, "V2 marks every member");
             assert!(!legacy_index.files[key].codex_counting_v2);
@@ -2016,7 +2041,6 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    #[ignore = "#603 fixture UI is unbound-span; under P2 a V2 group with unbound UI is held (design v3.1 §k.3 rule 5, V2UnboundUi) - owner decision pending (integration-603-result.md)"]
     fn counting_v2_member_mark_moves_only_with_the_selected_saved_ack() {
         let (root, keys) = counting_v2_fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";

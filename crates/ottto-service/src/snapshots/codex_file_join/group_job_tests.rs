@@ -2,7 +2,7 @@
 //! Every fixture is synthetic; no provider account content. Scaled budgets
 //! come from `codex_cursor::with_test_limits` only.
 use super::super::tests::{
-    counting_v2_fixture, fixture, legacy_index, member, replay_group, scan, usage,
+    counting_v2_unbound_fixture, fixture, legacy_index, member, replay_group, scan, usage,
 };
 use super::*;
 use crate::transcript_acquisition::Scope;
@@ -1485,7 +1485,7 @@ fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
 /// is unbound-span, which §k.3 rule 5 holds under V2; inactive, it replays.
 #[test]
 fn counting_v2_decision_reaches_the_group_proof() {
-    let (root, _) = counting_v2_fixture();
+    let (root, _) = counting_v2_unbound_fixture();
     assert!(replay_group(group_of(&root), None, &ScanIndex::default()).is_ok());
     let _cutover = codex_counting_version::TestCutover::set(0);
     assert_eq!(
