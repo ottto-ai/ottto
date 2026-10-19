@@ -420,9 +420,6 @@ pub(in crate::snapshots) fn job_charge_estimate(
     estimate_charge(walked, job_position(job, consumed), buffer, feeds)
 }
 
-/// The job's input position for E3: the reader's `consumed`, plus the bytes
-/// a group's completed member readers consumed and their swap charges
-/// (R2-N4, R2-L3).
 /// Fixed per-member state a group member swap adds (round 4, L3): the
 /// applied receipt's B-tree slot share (a non-root node holds at least 5 of
 /// its 11 entries), the legacy baseline's and the proof's `MemberSeen` Vec
@@ -445,6 +442,9 @@ pub(in crate::snapshots) fn swap_charge(records: &[Option<usize>]) -> u64 {
         })
 }
 
+/// The job's input position for E3: the reader's `consumed`, plus the bytes
+/// a group's completed member readers consumed and their swap charges
+/// (R2-N4, R2-L3).
 fn job_position(job: &OwnedActiveFile, consumed: u64) -> u64 {
     job.group.as_ref().map_or(consumed, |group| {
         consumed.saturating_add(group.consumed_before)
@@ -2584,7 +2584,8 @@ pub(in crate::snapshots) fn dequeue(index: &mut ScanIndex, candidate: &Candidate
 }
 
 /// `requeue` for every member of a group in one pass over the pending
-/// paths (round 4, L2): O(P + n), not O(P) per member.
+/// paths (round 4, L2): O(P + n), not O(P) per member, and no pending path
+/// is cloned.
 pub(in crate::snapshots) fn requeue_members<'a>(
     index: &mut ScanIndex,
     flags: &BTreeMap<String, (bool, bool)>,
@@ -2593,13 +2594,21 @@ pub(in crate::snapshots) fn requeue_members<'a>(
     let Some(traversal) = index.traversal.as_mut() else {
         return;
     };
-    let mut pending = traversal
-        .pending_candidates
+    let members = members.into_iter().collect::<Vec<_>>();
+    // The members not pending yet; a repeated member is pushed once.
+    let mut absent = members
         .iter()
-        .map(|pending| pending.path.clone())
+        .copied()
+        .map(|member| member.path.as_path())
         .collect::<std::collections::HashSet<_>>();
+    for pending in &traversal.pending_candidates {
+        if absent.is_empty() {
+            break;
+        }
+        absent.remove(pending.path.as_path());
+    }
     for candidate in members {
-        if !pending.insert(candidate.path.clone()) {
+        if !absent.remove(candidate.path.as_path()) {
             continue;
         }
         let (census_member, watcher_hint) = flags

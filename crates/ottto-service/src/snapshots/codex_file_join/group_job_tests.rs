@@ -1608,8 +1608,8 @@ fn head_bytes(path: &Path, lines: usize) -> u64 {
         .sum()
 }
 
-/// The owner of the first group in inventory (page selection) order.
-fn first_group_owner(root: &Path) -> String {
+/// The inventory's groups in page selection order.
+fn inventory_groups(root: &Path) -> Vec<Group> {
     let sessions = root.join("sessions");
     let paths = fs::read_dir(&sessions)
         .unwrap()
@@ -1619,12 +1619,26 @@ fn first_group_owner(root: &Path) -> String {
     directories.observe(&sessions, &fs::metadata(&sessions).unwrap());
     let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&directories));
     while !inventory.step(&CodexTitleMetadata::default()) {}
-    inventory
-        .groups()
-        .into_values()
+    inventory.groups().into_values().collect()
+}
+
+/// The owner of the first group in inventory (page selection) order.
+fn first_group_owner(root: &Path) -> String {
+    inventory_groups(root)
+        .into_iter()
         .next()
         .expect("a group")
         .owner
+}
+
+/// The job key of `owner`'s group (its rotation and fence key).
+fn group_job_key(root: &Path, owner: &str) -> String {
+    job_key(
+        &inventory_groups(root)
+            .into_iter()
+            .find(|group| group.owner == owner)
+            .expect("the owner's group"),
+    )
 }
 
 /// Round 3 (R1-L1, R2-L2 (a)): a `ProbeBudgetOrder` the page's remaining
@@ -1776,8 +1790,9 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
 }
 
 /// Round 4 (L1): a paged group that waited behind a P1 singleton and then
-/// ends as `ProbeBudgetOrder` completes its rotation: no waiter remains and
-/// a later P1 singleton takes the slot without a rotation deferral.
+/// ends as `ProbeBudgetOrder` completes its rotation: it is fenced for the
+/// generation (#630 delta L-a), no waiter remains and a later P1 singleton
+/// takes the slot without a rotation deferral.
 #[test]
 fn probe_order_end_leaves_no_waiter_ahead_of_p1_singletons() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1807,6 +1822,18 @@ fn probe_order_end_leaves_no_waiter_ahead_of_p1_singletons() {
         );
         assert_eq!(completions(&cache), 1, "`s` completed first: {ended:?}");
         assert_eq!(cache.rotation_waiters_for_test(), 0, "{ended:?}");
+        // The end completed the group's rotation: fenced for the generation
+        // (a `release()` end leaves it unfenced).
+        let fence = cursor::census_token(&index);
+        assert!(fence.is_some(), "the generation continues");
+        assert!(
+            cache.group_fenced(
+                &Scope("group-fixture".into()),
+                &group_job_key(&root, OWNER),
+                fence.as_deref(),
+            ),
+            "{ended:?}"
+        );
         // A later large P1 singleton is not deferred behind the group.
         write_rows(
             &root.join("sessions/u.jsonl"),
@@ -1829,13 +1856,17 @@ fn probe_order_end_leaves_no_waiter_ahead_of_p1_singletons() {
 /// Round 4 (L3): `MEMBER_SWAP_CHARGE` covers the fixed records a member swap
 /// adds: the applied receipt's B-tree slot share (a non-root node holds at
 /// least 5 of its 11 entries) and the baseline and `MemberSeen` Vec slots
-/// (at most twice the element under doubling).
+/// (at most twice the element under doubling). The first swap also covers
+/// the one-time first allocations: the root node and the Vec minimum
+/// capacity of 4 (two elements past the doubling share).
 #[test]
 fn member_swap_charge_covers_the_fixed_per_member_records() {
     let entry = size_of::<String>() + size_of::<AppliedTierReceipt>();
     let node = 11 * entry + 12 * size_of::<usize>() + 2 * size_of::<usize>();
     let fixed = node / 5 + 2 * size_of::<LegacyBaseline>() + 2 * size_of::<MemberSeen>();
     assert!(cursor::MEMBER_SWAP_CHARGE as usize >= fixed, "{fixed}");
+    let first = fixed + node + 2 * (size_of::<LegacyBaseline>() + size_of::<MemberSeen>());
+    assert!(cursor::MEMBER_SWAP_CHARGE as usize >= first, "{first}");
     // An unbounded record walks at the next step.
     assert_eq!(
         cursor::swap_charge(&[Some(10), None]),
