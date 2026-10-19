@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 716,
-  "content_sha256": "19089142c78bf28072f8bcf950bcb4303a079b04ec9ce417ba2bb768f88667e8",
+  "content_sha256": "6929d1b15e4c8538cafc855466e280c954d25c5a1428f27f116d8e22f295b61d",
   "files": [
     {
       "executable": false,
@@ -468,8 +468,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "5abd0a94336c22808d1556a35f988ff3c22d7b993f624d40205d5a1083740a1f",
-      "size_bytes": 186898
+      "sha256": "01488639b1c98120177c8ea86187bc456738c917d7f131f5037bab90a9ef2051",
+      "size_bytes": 185843
     },
     {
       "executable": false,
@@ -615,8 +615,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "030641fb5c9f2c9f0b53f9eddfdea073744ab6571c123f707ea70577dfb65820",
-      "size_bytes": 349761
+      "sha256": "6ea96f3ddb4e23d8a3858df491118d222227e7aae7560dae98fe75d2f9a15712",
+      "size_bytes": 349336
     },
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/active_sessions.rs",
-      "sha256": "178ab0f7c58877da39ae78a6d5f40624c3a458be586d9fbe546ca4fdb8d79665",
-      "size_bytes": 90607
+      "sha256": "62ae1e9fdf36b7effaf61d01874f15eb81d1469cc133db8c545f0d5e3dc7daa9",
+      "size_bytes": 96797
     },
     {
       "executable": false,
@@ -937,8 +937,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "b6d96aa1a2f255093e253ea3a9e91e5426c471462d39b26d623643ccaf149f0e",
-      "size_bytes": 1319027
+      "sha256": "f3c10c5728da94212aaa452bf72a53f7ad1505d2ec6144858ec2e4a9fd335120",
+      "size_bytes": 1290528
     },
     {
       "executable": false,
@@ -1014,8 +1014,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "34eadfc56009218e67486c9944498765a460dffc8dc7107dd222e157f495af76",
-      "size_bytes": 350064
+      "sha256": "67ec41287ca9008b3ef8fa06597755bf55b89b4740344aea11c27e5b8868a84a",
+      "size_bytes": 349958
     },
     {
       "executable": false,
@@ -1217,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "5c57cd02ff76d6bb16ae0b2cb3b6595e2822c0f2b82709fc27d362441ff45f4c",
-      "size_bytes": 841452
+      "sha256": "c3d5d91d2257048291d249f85a5beafd0a54a0d33db0b4983261f2f4bc58bf9e",
+      "size_bytes": 822409
     },
     {
       "executable": false,
@@ -3597,8 +3597,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/costs-request.json",
-      "sha256": "4482f612b1825c6a78f1105568422a82a9393427b7b311081dbdc86b21383f18",
-      "size_bytes": 527
+      "sha256": "4bccd8b9b7e8a9bd2759bf134f92a59944456397a4213eee71501b525b7eda50",
+      "size_bytes": 483
     },
     {
       "executable": false,
@@ -3653,8 +3653,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
-      "sha256": "06bbe805bfdc0c58b0cb67745af7207d7c3552fecb397feb46916ad3936743a6",
-      "size_bytes": 27753
+      "sha256": "269fc3ef6ca0a3c9cb1c9611468db11eca123b26ec17a1d25e481a326a0a5af3",
+      "size_bytes": 27720
     },
     {
       "executable": false,
@@ -5015,7 +5015,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-19T13:24:25+00:00",
+  "generated_at": "2026-10-19T21:07:47+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 717,
   "public_roots": [
@@ -5054,5 +5054,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9adfb25e4ced065345332c64f734a0428386e5a7"
+  "source_commit": "541970150fdc60c25799af729b22309f6b8493d6"
 }
