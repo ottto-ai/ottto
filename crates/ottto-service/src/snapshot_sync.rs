@@ -14122,7 +14122,7 @@ mod tests {
                     "sessionId": format!("synthetic-{hours}"),
                     "requestId": format!("request-{hours}-{n}"),
                     "message": {"id": format!("message-{hours}-{n}"), "role": "assistant",
-                        "model": "claude-sonnet-4", "content": [],
+                        "model": "claude-opus-4-8", "content": [],
                         "usage": {"input_tokens": 100, "output_tokens": 10,
                             "cache_read_input_tokens": 50, "cache_creation_input_tokens": 20}}
                 });

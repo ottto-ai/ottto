@@ -373,6 +373,36 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // codex v34 revisits retained rollouts once for the v39 skill extractor and the
 // v2 capability marker; unchanged sessions then converge as semantic no-ops.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v34";
+// The per-request long-context price bucket (`provider_context_bucket`)
+// restates recent Codex history once. It rides the release's single bundled
+// parser-version bump rather than bumping here. Rollouts last modified on or
+// after the price-line effective date are revisited; older rollouts are never
+// re-read for it. That is file selection only, not a guaranteed superset: a
+// rollout copied or restored with an older preserved mtime is missed, and
+// compressed `.jsonl.zst` rollouts are never scanned at all, so recent history
+// is restated only where its `.jsonl` is still present. Inside a revisited file
+// only requests dated on or after that instant gain a bucket, so older hours
+// re-parse to the rows they already had. The instant is fixed, not relative to
+// now, so the revisit set never moves; each file settles once its fingerprint
+// carrying this token is durably saved.
+const CODEX_CONTEXT_BUCKET_REVISIT: &str = "codex_context_bucket_revisit:v1";
+const CODEX_CONTEXT_BUCKET_REVISIT_FROM_UNIX_NANOS: u64 =
+    PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS * 1_000_000_000;
+
+/// Scan identity folded into one candidate's file fingerprint: the source's
+/// identity plus the bounded Codex price-bucket revisit for recent rollouts.
+fn candidate_scan_identity(source: SnapshotSource, modified_unix_nanos: u64) -> String {
+    if source == SnapshotSource::Codex
+        && modified_unix_nanos >= CODEX_CONTEXT_BUCKET_REVISIT_FROM_UNIX_NANOS
+    {
+        format!(
+            "{};{CODEX_CONTEXT_BUCKET_REVISIT}",
+            source.scan_identity_version()
+        )
+    } else {
+        source.scan_identity_version().to_string()
+    }
+}
 // v28 revisits Claude history once because the v34 MCP-tool selector changes
 // transcript-derived session semantics for operators who enabled attribution
 // capture. Sessions parsed with capture off remain semantic no-ops.
@@ -486,8 +516,9 @@ pub const SNAPSHOT_MANIFEST_SCOPE: &str = "semantic_activity_window";
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
 /// context)" window enabled — the regular Claude context cap is 200K tokens.
-/// Turns strictly over this boundary tag `context_bucket=long`; everything at
-/// or below tags `short`. 1M usage bills at standard per-token rates but drives
+/// For the flat-priced 1M-window models in `PROVIDER_PRICE_LINES`, turns
+/// strictly over this boundary tag `context_bucket=long`; everything at or
+/// below tags `short`. 1M usage bills at standard per-token rates but drives
 /// cost via token VOLUME, so the product analyzes it separately.
 ///
 /// MUST stay in lockstep with the backend pricing catalog's
@@ -497,6 +528,202 @@ pub const SNAPSHOT_MANIFEST_SCOPE: &str = "semantic_activity_window";
 /// coding-agents-observability backend/app/services/telemetry_cost_projector.py
 /// and backend/app/domain/pricing/selector_context.py.
 pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
+
+/// How a model's price line bills a request over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderPriceLineKind {
+    /// Prompt-length tiered: a request strictly over the line bills ALL of
+    /// its tokens at the provider's long-context rate.
+    Tiered,
+    /// Flat price at every prompt length: the line only separates 1M-window
+    /// usage for analysis (the Claude 200K boundary above).
+    Analysis,
+}
+
+#[cfg(test)]
+impl ProviderPriceLineKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tiered => "tiered",
+            Self::Analysis => "analysis",
+        }
+    }
+}
+
+/// Provider prompt-length price lines: the one table every source stamps its
+/// per-request `context_bucket` from, keyed by the pricing catalog's canonical
+/// model key. A model is listed only where the catalog publishes a
+/// `context_bucket_threshold_tokens` for it, at that exact value; every other
+/// model (GPT-5.4 mini/nano, codex variants, Claude 4.5 and earlier, unknown
+/// models) gets no bucket. The prompt counts uncached input, cache reads and
+/// cache writes (Codex `input_tokens` already includes its cached prefix).
+///
+/// The table is pinned as `fixtures/snapshot-audit/provider-price-lines-v1.json`
+/// and the backend compares that artifact with the catalog thresholds
+/// (backend/tests/unit/test_daemon_price_line_mirror.py). Change both together.
+const PROVIDER_PRICE_LINES: &[(&str, u64, ProviderPriceLineKind)] = &[
+    // OpenAI: 2x input and cache, 1.5x output for the whole request.
+    ("gpt-5-4", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-5-4-pro", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-5-5", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-5-5-pro", 272_000, ProviderPriceLineKind::Tiered),
+    // GPT-5.6 Luna/Terra publish long rates; the catalog's missing threshold
+    // for them is a known catalog gap (COST, 2026-10-18), not a flat price.
+    ("gpt-5-6-luna", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-5-6-sol", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-5-6-terra", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-6-astra", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-6-luna", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-6-sol", 272_000, ProviderPriceLineKind::Tiered),
+    ("gpt-6-1-sol", 272_000, ProviderPriceLineKind::Tiered),
+    // Anthropic: every Haiku 5.5 rate 5x above 100K.
+    ("claude-haiku-5-5", 100_000, ProviderPriceLineKind::Tiered),
+    // Anthropic full 1M window at standard rates.
+    (
+        "claude-fable-5",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-fable-5-1",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-mythos-5",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-mythos-5-1",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-opus-4-6",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-opus-4-7",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-opus-4-8",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-opus-5",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-opus-5-5",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-sonnet-4-6",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-sonnet-5",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+    (
+        "claude-sonnet-5-5",
+        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
+        ProviderPriceLineKind::Analysis,
+    ),
+];
+
+/// The catalog's canonical key for a raw model id: provider and Bedrock route
+/// prefixes, a Bedrock `-vN:M` suffix, a dated snapshot (`-YYYY-MM-DD`,
+/// `-YYYYMMDD`, `@YYYYMMDD`) and `-latest` dropped; dots become dashes.
+fn provider_price_line_model_key(model: &str) -> String {
+    // Byte checks only: model ids come from transcripts and may be non-ASCII,
+    // and every cut below lands just before an ASCII `-`/`@`, a char boundary.
+    let all_digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+    let mut key = model.trim().to_ascii_lowercase();
+    for marker in ["anthropic.", "anthropic/", "openai/"] {
+        if let Some(index) = key.find(marker) {
+            key = key[index + marker.len()..].to_string();
+        }
+    }
+    if let Some((head, version)) = key.rsplit_once("-v") {
+        if version.split_once(':').is_some_and(|(major, minor)| {
+            all_digits(major.as_bytes()) && all_digits(minor.as_bytes())
+        }) {
+            key = head.to_string();
+        }
+    }
+    if let Some(head) = key.strip_suffix("-latest") {
+        key = head.to_string();
+    }
+    let bytes = key.as_bytes();
+    let dated_suffix = if bytes.len() > 11
+        && bytes[bytes.len() - 11] == b'-'
+        && bytes[bytes.len() - 6] == b'-'
+        && bytes[bytes.len() - 3] == b'-'
+        && all_digits(&bytes[bytes.len() - 10..bytes.len() - 6])
+        && all_digits(&bytes[bytes.len() - 5..bytes.len() - 3])
+        && all_digits(&bytes[bytes.len() - 2..])
+    {
+        11
+    } else if bytes.len() > 9
+        && matches!(bytes[bytes.len() - 9], b'-' | b'@')
+        && all_digits(&bytes[bytes.len() - 8..])
+    {
+        9
+    } else {
+        0
+    };
+    key.truncate(key.len() - dated_suffix);
+    key.replace('.', "-")
+}
+
+fn provider_price_line(model: &str) -> Option<(u64, ProviderPriceLineKind)> {
+    let key = provider_price_line_model_key(model);
+    PROVIDER_PRICE_LINES
+        .iter()
+        .find(|(listed, _, _)| *listed == key)
+        .map(|&(_, tokens, kind)| (tokens, kind))
+}
+
+/// Tiered price lines apply to requests whose own usage time is on or after
+/// 2026-09-01T00:00:00Z (the start of the previous month at release). Earlier
+/// usage keeps exactly the rows it had, even when its file is re-read, so
+/// restating the price split never touches older history.
+const PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS: u64 = 1_788_220_800;
+
+/// One request's bucket from its prompt size, its model and its own usage
+/// timestamp. `None` when the model has no catalog line. A tiered line also
+/// needs a known, non-zero prompt dated on or after the effective date: an
+/// unmeasured request is never silently short. Flat Claude analysis lines keep
+/// the stamp they always had (every request, any date).
+pub(crate) fn provider_context_bucket(
+    model: &str,
+    prompt_tokens: u64,
+    observed_at: Option<&str>,
+) -> Option<&'static str> {
+    let (line, kind) = provider_price_line(model)?;
+    if kind == ProviderPriceLineKind::Tiered
+        && (prompt_tokens == 0
+            || observed_at.and_then(rfc3339_unix_seconds)?
+                < PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS)
+    {
+        return None;
+    }
+    Some(if prompt_tokens > line {
+        "long"
+    } else {
+        "short"
+    })
+}
 // Generous ceilings: scanning is incremental (per-file fingerprint) and
 // streaming, so a larger history is a one-time backfill cost with bounded
 // memory. The finite caps still guard a pathological ~/.codex.
@@ -10978,17 +11205,22 @@ impl SnapshotAccumulator {
                 .computed_effective_input_context
                 .unwrap_or_else(|| response.usage.effective_input_context());
             if !response.selector.context.contains_key("context_bucket") {
-                let context_bucket =
-                    if effective_input_context > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
-                        "long"
-                    } else {
-                        "short"
-                    };
-                response.selector.insert(
-                    "context_bucket",
-                    context_bucket.to_string(),
-                    "derived_from_effective_input_volume",
-                );
+                // Stamped only against the model's catalog line: Haiku 5.5's
+                // 100K price line or the 200K analysis line of flat 1M-window
+                // models. Models without a catalog line carry no bucket.
+                if let Some(context_bucket) = response.model.as_deref().and_then(|model| {
+                    provider_context_bucket(
+                        model,
+                        effective_input_context,
+                        response.terminal_timestamp.as_deref(),
+                    )
+                }) {
+                    response.selector.insert(
+                        "context_bucket",
+                        context_bucket.to_string(),
+                        "derived_from_effective_input_volume",
+                    );
+                }
             }
             if let Some(request_id) = response.request_id.take() {
                 let request_id_was_new = self.claude_usage_request_ids.insert(request_id.clone());
@@ -18559,6 +18791,27 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 accumulator.latest_turn_id.as_deref(),
             )
         });
+        // Stamp this response's long-context price bucket on the same per-line
+        // selector, after the tier replay key above (which must not change): a
+        // prompt over the model's provider line bills the whole request at the
+        // long rate. The size is the already-parsed per-response
+        // `last_token_usage.input_tokens`; no price line, no stamp.
+        if !usage_selector.context.contains_key("context_bucket") {
+            let bucket = model
+                .as_deref()
+                .or(accumulator.latest_model.as_deref())
+                .zip(codex_last_turn_input_context(value))
+                .and_then(|(model, prompt_tokens)| {
+                    provider_context_bucket(model, prompt_tokens, timestamp.as_deref())
+                });
+            if let Some(bucket) = bucket {
+                usage_selector.insert(
+                    "context_bucket",
+                    bucket.to_string(),
+                    "derived_from_last_token_usage",
+                );
+            }
+        }
         let last_usage = codex_last_usage(value);
         let usage_event_identity = codex_usage_event_identity(value);
         let admitted = accumulator.set_cumulative_usage_with_selector(
@@ -22224,6 +22477,9 @@ fn scan_traversal_context_fingerprint(
     // resumable; reviewed scan/open identity changes start a fresh bounded
     // traversal so every pre-existing candidate is reconsidered.
     update_length_prefixed(&mut digest, source.scan_identity_version().as_bytes());
+    if source == SnapshotSource::Codex {
+        update_length_prefixed(&mut digest, CODEX_CONTEXT_BUCKET_REVISIT.as_bytes());
+    }
     update_length_prefixed(&mut digest, LOCAL_SCAN_INDEX_IDENTITY_VERSION.as_bytes());
     update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
     update_length_prefixed(
@@ -23443,7 +23699,7 @@ fn open_and_identify_scan_candidate(
         &candidate.path,
         candidate.size_bytes,
         candidate.modified_unix_nanos,
-        source.scan_identity_version(),
+        &candidate_scan_identity(source, candidate.modified_unix_nanos),
         &session_sidecar_fingerprint,
         &candidate.opened_object_identity,
     );
@@ -51756,6 +52012,294 @@ mod tests {
         // Item totals reconcile with the row sum.
         assert_eq!(item.input_tokens, 14);
         assert_eq!(item.output_tokens, 8);
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn bucket_of(row: &SnapshotModelUsage) -> Option<&str> {
+        row.selector_context
+            .get("context_bucket")
+            .map(String::as_str)
+    }
+
+    /// Raw model ids the pinned price-line artifact resolves, so the backend
+    /// can check the daemon's raw-to-canonical keys and its no-line models
+    /// against the catalog.
+    const PROVIDER_PRICE_LINE_ALIAS_CASES: &[&str] = &[
+        "gpt-5.4",
+        "gpt-5.4-2026-03-05",
+        "openai/gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-6-astra",
+        "gpt-6-luna",
+        "openai/gpt-6-luna-2026-09-30",
+        "gpt-5.4-pro",
+        "gpt-5.5-pro-2026-05-01",
+        "gpt-6-sol",
+        "gpt-6.1-sol",
+        "gpt-6.1-sol-2026-09-30",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.3-codex",
+        "gpt-4.1",
+        "o3",
+        "claude-haiku-5-5",
+        "claude-haiku-5-5-20261015",
+        "claude-opus-4-8",
+        "anthropic/claude-opus-4-8",
+        "us.anthropic.claude-opus-4-8-v1:0",
+        "claude-opus-5-5",
+        "claude-sonnet-4-6",
+        "claude-fable-5-1",
+        "claude-opus-4-5-20251101",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5-20251001",
+    ];
+
+    fn provider_price_lines_artifact() -> Value {
+        let lines: Vec<Value> = PROVIDER_PRICE_LINES
+            .iter()
+            .map(|(model, tokens, kind)| {
+                json!({"model": model, "tokens": tokens, "kind": kind.as_str()})
+            })
+            .collect();
+        let aliases: Vec<Value> = PROVIDER_PRICE_LINE_ALIAS_CASES
+            .iter()
+            .map(|raw| {
+                let line = provider_price_line(raw);
+                json!({
+                    "raw_model": raw,
+                    "model": provider_price_line_model_key(raw),
+                    "tokens": line.map(|(tokens, _)| tokens),
+                    "kind": line.map(|(_, kind)| kind.as_str()),
+                })
+            })
+            .collect();
+        json!({
+            "contract_version": "provider_price_lines:v1",
+            "comparison": "long_when_prompt_tokens_greater_than_line",
+            "prompt_tokens": "uncached_input_plus_cache_read_plus_cache_write",
+            "tiered_effective_from_utc": "2026-09-01T00:00:00Z",
+            "lines": lines,
+            "aliases": aliases,
+        })
+    }
+
+    #[test]
+    fn provider_price_lines_artifact_pins_the_table_for_the_backend_catalog_check() {
+        // Regenerate with OTTTO_PROVIDER_PRICE_LINES_OUT=<path>, then copy the
+        // file to the backend's tests/fixtures/daemon_contract/.
+        let artifact = provider_price_lines_artifact();
+        assert_eq!(
+            rfc3339_unix_seconds("2026-09-01T00:00:00Z"),
+            Some(PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS)
+        );
+        if let Ok(output) = std::env::var("OTTTO_PROVIDER_PRICE_LINES_OUT") {
+            let mut body = serde_json::to_string_pretty(&artifact).unwrap();
+            body.push('\n');
+            std::fs::write(output, body).unwrap();
+            return;
+        }
+        let pinned: Value = serde_json::from_slice(
+            &std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/snapshot-audit/provider-price-lines-v1.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(artifact, pinned, "provider price lines changed");
+    }
+
+    #[test]
+    fn provider_price_lines_stamp_only_catalog_models_from_the_effective_date() {
+        let now = Some("2026-10-01T00:00:00Z");
+        for (model, line) in [
+            (
+                "claude-haiku-5-5-20261015",
+                (100_000, ProviderPriceLineKind::Tiered),
+            ),
+            (
+                "gpt-5.4-2026-03-05",
+                (272_000, ProviderPriceLineKind::Tiered),
+            ),
+            (
+                "openai/gpt-6.1-sol",
+                (272_000, ProviderPriceLineKind::Tiered),
+            ),
+            (
+                "us.anthropic.claude-opus-4-8-v1:0",
+                (200_000, ProviderPriceLineKind::Analysis),
+            ),
+        ] {
+            assert_eq!(provider_price_line(model), Some(line), "{model}");
+        }
+        for model in [
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.3-codex",
+            "o3",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-5",
+            // Non-ASCII ids resolve to no line rather than panicking.
+            "éabcdefghij",
+            "gpt-5.4-2026-03-0é",
+            "é20260101",
+        ] {
+            assert_eq!(provider_price_line(model), None, "{model}");
+            assert_eq!(
+                provider_context_bucket(model, 400_000, now),
+                None,
+                "{model}"
+            );
+        }
+        // Strict `>`: the line itself is short.
+        assert_eq!(
+            provider_context_bucket("gpt-6.1-sol", 272_000, now),
+            Some("short")
+        );
+        assert_eq!(
+            provider_context_bucket("gpt-6.1-sol", 272_001, now),
+            Some("long")
+        );
+        // Older, undated or empty requests are never stamped on a tiered line.
+        assert_eq!(
+            provider_context_bucket("gpt-6.1-sol", 400_000, Some("2026-08-31T23:59:59Z")),
+            None
+        );
+        assert_eq!(provider_context_bucket("gpt-6.1-sol", 400_000, None), None);
+        assert_eq!(provider_context_bucket("gpt-6.1-sol", 0, now), None);
+        // Flat Claude keeps its analysis stamp at any date.
+        assert_eq!(
+            provider_context_bucket("claude-opus-4-8", 250_000, Some("2026-05-29T09:05:00Z")),
+            Some("long")
+        );
+        // Only rollouts modified from the effective date join the one-shot revisit.
+        let from = CODEX_CONTEXT_BUCKET_REVISIT_FROM_UNIX_NANOS;
+        assert_eq!(
+            candidate_scan_identity(SnapshotSource::Codex, from - 1),
+            CODEX_SCAN_IDENTITY_VERSION
+        );
+        assert_ne!(
+            candidate_scan_identity(SnapshotSource::Codex, from),
+            CODEX_SCAN_IDENTITY_VERSION
+        );
+        assert_eq!(
+            candidate_scan_identity(SnapshotSource::ClaudeCode, from),
+            CLAUDE_CODE_SCAN_IDENTITY_VERSION
+        );
+    }
+
+    #[test]
+    fn codex_usage_splits_per_request_at_the_272k_price_line() {
+        // gpt-6.1-sol: a 300K prompt (mostly cached) bills the whole request
+        // long; a prompt exactly at 272K stays short; a pre-effective-date
+        // request keeps its unbucketed row.
+        let path = temp_file("codex-long-context-bucket");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019ee443-4c18-71c3-843e-847232f69400\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6.1-sol\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":400000,\"cached_input_tokens\":0,\"output_tokens\":7},\"last_token_usage\":{\"input_tokens\":400000,\"cached_input_tokens\":0,\"output_tokens\":7}}}}\n",
+                "{\"timestamp\":\"2026-10-01T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":700000,\"cached_input_tokens\":290000,\"output_tokens\":107},\"last_token_usage\":{\"input_tokens\":300000,\"cached_input_tokens\":290000,\"output_tokens\":100}}}}\n",
+                "{\"timestamp\":\"2026-10-01T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":972000,\"cached_input_tokens\":560000,\"output_tokens\":157},\"last_token_usage\":{\"input_tokens\":272000,\"cached_input_tokens\":270000,\"output_tokens\":50}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file_with_title_metadata(
+            &path,
+            "2026-10-01T11:00:00Z",
+            "codex-long-bucket-fingerprint".to_string(),
+            &CodexTitleMetadata::default(),
+            None,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.model_usage.len(), 3, "{:?}", item.model_usage);
+        let row = |bucket: Option<&str>| {
+            item.model_usage
+                .iter()
+                .find(|row| bucket_of(row) == bucket)
+                .unwrap_or_else(|| panic!("row for {bucket:?}"))
+        };
+        let (older, long, short) = (row(None), row(Some("long")), row(Some("short")));
+        assert_eq!((older.output_tokens, older.request_count), (7, 1));
+        assert_eq!((long.output_tokens, long.request_count), (100, 1));
+        assert_eq!(long.cache_read_tokens, 290_000);
+        assert_eq!((short.output_tokens, short.request_count), (50, 1));
+        for row in [long, short] {
+            assert_eq!(
+                row.selector_sources
+                    .get("context_bucket")
+                    .map(String::as_str),
+                Some("derived_from_last_token_usage")
+            );
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_haiku_5_5_uses_its_100k_price_line_and_only_catalog_flat_models_keep_200k() {
+        // Per request, before hourly aggregation: Haiku 5.5 at 100K stays
+        // short, 150K and 200K are long; Opus at 150K stays short (200K
+        // analysis line); Haiku 4.5 has no catalog line and no bucket.
+        let line = |n: u32, model: &str, input: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-10-01T09:0{n}:00Z\",\"sessionId\":\"haiku-tier\",\"requestId\":\"req_011CbU3R6JKp2myJL8gtuRp{n}\",\"message\":{{\"id\":\"msg_01VYXWshPjnW6L97x52sQb{n}\",\"model\":\"{model}\",\"usage\":{{\"input_tokens\":{input},\"output_tokens\":{n}}}}}}}\n"
+            )
+        };
+        let path = temp_file("claude-haiku-price-line");
+        fs::write(
+            &path,
+            [
+                line(1, "claude-haiku-5-5", 100_000),
+                line(2, "claude-haiku-5-5", 150_000),
+                line(3, "claude-haiku-5-5", 200_000),
+                line(4, "claude-opus-5-5", 150_000),
+                line(5, "claude-haiku-4-5", 250_000),
+            ]
+            .concat(),
+        )
+        .expect("write fixture");
+
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-10-01T10:00:00Z",
+            "haiku-price-line-fingerprint".to_string(),
+        )
+        .expect("parse");
+        let rows = &items[0].model_usage;
+        let find = |model: &str, bucket: &str| {
+            rows.iter()
+                .find(|row| row.model == model && bucket_of(row) == Some(bucket))
+                .unwrap_or_else(|| panic!("{model} {bucket}: {rows:?}"))
+        };
+        let haiku_short = find("claude-haiku-5-5", "short");
+        assert_eq!(
+            (haiku_short.input_tokens, haiku_short.request_count),
+            (100_000, 1)
+        );
+        let haiku_long = find("claude-haiku-5-5", "long");
+        assert_eq!(
+            (haiku_long.input_tokens, haiku_long.request_count),
+            (350_000, 2)
+        );
+        let opus = find("claude-opus-5-5", "short");
+        assert_eq!((opus.input_tokens, opus.request_count), (150_000, 1));
+        // No catalog line: no bucket at all.
+        let unlisted = rows
+            .iter()
+            .find(|row| row.model == "claude-haiku-4-5")
+            .expect("haiku 4.5 row");
+        assert_eq!(bucket_of(unlisted), None);
 
         let _ = fs::remove_file(path);
     }

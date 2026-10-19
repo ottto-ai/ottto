@@ -631,7 +631,11 @@ fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues()
                 .iter()
                 .filter(|i| i.snapshot_fingerprint == rejected_fp)
                 .count();
-            let mut ack = response(&batch, rejected);
+            // `response` rejects the batch tail; batch order follows the
+            // fingerprints, so put the refused probe last explicitly.
+            let mut ordered = batch.clone();
+            ordered.sort_by_key(|i| i.snapshot_fingerprint == rejected_fp);
+            let mut ack = response(&ordered, rejected);
             if cas {
                 for reference in ack
                     .accepted_entities
