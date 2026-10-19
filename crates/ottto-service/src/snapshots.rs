@@ -12118,12 +12118,14 @@ impl SnapshotAccumulator {
         let session_start = match self.source {
             SnapshotSource::ClaudeCode => std::mem::take(&mut *self.session_start).finish(
                 true,
+                self.first_turn_context_tokens,
                 session_start::CLAUDE_PARTS_METHOD,
                 attribution_context,
                 crate::context_file_counts::device_salt().as_ref(),
             ),
             SnapshotSource::Codex => std::mem::take(&mut *self.session_start).finish(
                 !self.codex_is_fork,
+                self.first_turn_context_tokens,
                 session_start::CODEX_PARTS_METHOD,
                 attribution_context,
                 crate::context_file_counts::device_salt().as_ref(),

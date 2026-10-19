@@ -1301,8 +1301,11 @@ impl SessionStartState {
     }
 
     /// The wire value. `fresh_start` is false for forks and copied prefixes,
-    /// which keep only `client_version`. Path hashes need the tenant
-    /// attribution key; the configuration fingerprint uses the device salt.
+    /// which keep only `client_version`; so is a Codex prelude the shared
+    /// parser found copied. `first_turn_context_tokens` is the item's own
+    /// first-turn context, which D6 must add up to. Path hashes need the
+    /// tenant attribution key; the configuration fingerprint uses the device
+    /// salt.
     ///
     /// Everything request-indexed is cut to the contiguous requests actually
     /// observed: a file, truncation or tool call staged for a request the
@@ -1310,6 +1313,7 @@ impl SessionStartState {
     pub(super) fn finish(
         self,
         fresh_start: bool,
+        first_turn_context_tokens: Option<u64>,
         method: &'static str,
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
         device_salt: Option<&[u8; 32]>,
@@ -1324,7 +1328,11 @@ impl SessionStartState {
             client_version: self.client_version,
             ..SnapshotSessionStart::default()
         };
-        if !fresh_start || self.inherited_prefix {
+        let copied_prelude = self
+            .codex_prelude
+            .as_ref()
+            .is_some_and(|parser| parser.prelude().is_fork);
+        if !fresh_start || self.inherited_prefix || copied_prelude {
             return start.into_measured();
         }
         start.user_turn_count = (self.user_turns > 0).then_some(u64::from(self.user_turns));
@@ -1341,8 +1349,13 @@ impl SessionStartState {
             .take_while(|request| request.is_some())
             .count();
         // D6 only when its parts add up to the item's first-turn context: the
-        // first request must be that turn (positive) and reconcile exactly.
-        if let Some(first) = requests[0].filter(|r| r.parts_reconcile && r.context_tokens > 0) {
+        // first request must reconcile exactly and be that turn. Codex takes
+        // the first turn from a response the request count may not admit.
+        if let Some(first) = requests[0].filter(|r| {
+            r.parts_reconcile
+                && r.context_tokens > 0
+                && Some(r.context_tokens) == first_turn_context_tokens
+        }) {
             start.first_request_uncached_input_tokens = Some(first.uncached_input_tokens);
             start.first_request_cache_read_tokens = Some(first.cache_read_tokens);
             start.first_request_cache_write_5m_tokens = first.cache_write_5m_tokens;
@@ -1952,7 +1965,7 @@ mod tests {
         state.note_claude_response(0, &UsageTotals::default(), 1, 1);
         state.note_claude_response(1, &UsageTotals::default(), 2, 1);
         let mut start = state
-            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         start.apply_upload_policy(true, false);
         assert_eq!(start.opening_request_count, Some(2));
@@ -2244,23 +2257,23 @@ mod tests {
             ..SnapshotSessionStart::default()
         });
         let fresh = measured_codex_state("", 1)
-            .finish(true, CODEX_PARTS_METHOD, None, Some(&SALT))
+            .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         assert_eq!(fresh.opening_request_count, Some(1));
         assert_eq!(
-            measured_codex_state("", 1).finish(false, CODEX_PARTS_METHOD, None, Some(&SALT)),
+            measured_codex_state("", 1).finish(false, None, CODEX_PARTS_METHOD, None, Some(&SALT)),
             only_version
         );
         let mut copied = measured_codex_state("", 1);
         copied.note_inherited_prefix();
         assert_eq!(
-            copied.finish(true, CODEX_PARTS_METHOD, None, Some(&SALT)),
+            copied.finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT)),
             only_version
         );
         assert_eq!(fresh.inherited(), only_version);
         // Nothing measured: the field is omitted.
         assert_eq!(
-            SessionStartState::default().finish(true, CODEX_PARTS_METHOD, None, Some(&SALT)),
+            SessionStartState::default().finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT)),
             None
         );
         assert_eq!(SnapshotSessionStart::default().inherited(), None);
@@ -2332,6 +2345,73 @@ mod tests {
         }
     }
 
+    /// The shared prelude parser's copied-history verdict also gates the
+    /// snapshot: an ordinary first header followed by another session's
+    /// header before the first usage is not a fresh start.
+    #[test]
+    fn copied_codex_prelude_keeps_only_client_version() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-copied-prelude");
+        let path = write_codex(
+            &dir,
+            CODEX_SESSION,
+            vec![
+                json!({"type": "session_meta", "payload": {"id": CODEX_SESSION, "cwd": "/w/repo",
+                    "cli_version": "0.160.0", "thread_source": "user"}}),
+                json!({"type": "session_meta", "payload": {"id": "019e253c-7777-7000-9000-bbbbbbbbbbbb",
+                    "cwd": "/w/repo", "thread_source": "user"}}),
+                codex_message("user", &[("user.text", "fix it")]),
+                json!({"type": "world_state", "payload": {"full": true, "state": {
+                    "agents_md": {"directory": "/w/repo", "text": "See docs/guide.md"}}}}),
+                codex_token_count((1000, 800, 50), (1000, 800, 50)),
+            ],
+        );
+        let items =
+            parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
+                .expect("parse");
+        assert!(!items.is_empty());
+        for item in items {
+            assert_eq!(
+                item.session_start.as_deref(),
+                Some(&SnapshotSessionStart {
+                    client_version: Some("0.160.0".to_string()),
+                    ..SnapshotSessionStart::default()
+                })
+            );
+        }
+    }
+
+    /// The item's first turn can come from a response the request count does
+    /// not admit (no cumulative usage); D6 then describes another request.
+    #[test]
+    fn codex_first_turn_without_cumulative_usage_omits_first_request_parts() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-codex-first-turn");
+        let usage = |input: u64, cached: u64| json!({"input_tokens": input, "cached_input_tokens": cached, "output_tokens": 1});
+        let path = write_codex(
+            &dir,
+            CODEX_SESSION,
+            vec![
+                json!({"type": "session_meta", "payload": {"id": CODEX_SESSION, "cwd": "/w/repo",
+                    "cli_version": "0.160.0", "thread_source": "user"}}),
+                codex_message("user", &[("user.text", "fix it")]),
+                json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "last_token_usage": usage(100, 20), "model": "gpt-5.5"}}}),
+                json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "total_token_usage": usage(200, 50), "last_token_usage": usage(200, 50),
+                    "model": "gpt-5.5"}}}),
+            ],
+        );
+        let items =
+            parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
+                .expect("parse");
+        assert_eq!(items[0].first_turn_context_tokens, Some(100));
+        let start = items[0].session_start.clone().expect("session_start");
+        assert_eq!(start.opening_request_count, Some(1));
+        assert_eq!(start.first_request_uncached_input_tokens, None);
+        assert_eq!(start.first_request_cache_read_tokens, None);
+        assert_eq!(start.first_request_cache_write_5m_tokens, None);
+        assert_eq!(start.first_request_cache_write_1h_tokens, None);
+    }
+
     #[test]
     fn opening_files_cap_at_64_and_count_withheld_entries() {
         let cwd = Path::new("/w/repo");
@@ -2349,7 +2429,7 @@ mod tests {
         // Staged for request 3, which the session never reached.
         state.note_client_load("/w/repo/late.md", "nested_memory", 1, 3, Some(cwd));
         let mut start = state
-            .finish(true, CODEX_PARTS_METHOD, None, Some(&SALT))
+            .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         assert!(start.opening_files.is_empty());
         assert_eq!(start.opening_file_overflow, Some(71));
@@ -2392,7 +2472,7 @@ mod tests {
         state.note_claude_response(0, &UsageTotals::default(), 1, 1);
         state.note_claude_response(1, &UsageTotals::default(), 2, 0);
         let mut start = state
-            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         start.apply_upload_policy(true, true);
         assert!(start.opening_files.is_empty());
@@ -2553,7 +2633,7 @@ mod tests {
         state.note_claude_response(0, &UsageTotals::default(), 1, 1);
         state.note_claude_response(1, &UsageTotals::default(), 2, 0);
         let start = state
-            .finish(true, CLAUDE_PARTS_METHOD, Some(&context), Some(&SALT))
+            .finish(true, None, CLAUDE_PARTS_METHOD, Some(&context), Some(&SALT))
             .expect("measured");
         let mut labels_only = start.clone();
         labels_only.apply_upload_policy(true, false);
@@ -2597,7 +2677,7 @@ mod tests {
             state.note_claude_response(sequence, &UsageTotals::default(), 1, 1);
         }
         let mut start = state
-            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         start.apply_upload_policy(true, false);
         let shown = start
@@ -2617,7 +2697,7 @@ mod tests {
         state.note_claude_response(0, &UsageTotals::default(), 1, 1);
         state.note_claude_response(1, &UsageTotals::default(), 1, 0);
         let mut start = state
-            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         start.apply_upload_policy(true, false);
         assert!(start.opening_files.is_empty());
@@ -2648,7 +2728,7 @@ mod tests {
             codex.codex_parsed_command(id, &record, Some(cwd));
         }
         let mut start = codex
-            .finish(true, CODEX_PARTS_METHOD, None, Some(&SALT))
+            .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT))
             .expect("measured");
         start.apply_upload_policy(true, false);
         let shown = start
@@ -2679,7 +2759,7 @@ mod tests {
             0,
         );
         let start = state
-            .finish(true, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+            .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
             .expect("client version");
         assert_eq!(start.client_version.as_deref(), Some("2.1.300"));
         assert_eq!(start.opening_request_count, None);
@@ -2817,7 +2897,9 @@ mod tests {
             } else {
                 CODEX_PARTS_METHOD
             };
-            let finished = shadow.finish(true, method, None, Some(&SALT));
+            // Upper bound on the wire: D6 is kept whenever request 1 reconciles.
+            let first_turn = shadow.requests[0].map(|request| request.context_tokens);
+            let finished = shadow.finish(true, first_turn, method, None, Some(&SALT));
             total.shadow += started.elapsed();
             total.peak_held.push(peak);
             if let Some(mut start) = finished {
