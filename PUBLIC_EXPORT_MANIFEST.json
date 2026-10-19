@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 714,
-  "content_sha256": "e6785c8edacf6f44a38495263647dc07f9d53872cd8b0781413d19f264ff42d6",
+  "content_sha256": "4a193823af0147e8e91302406b7f44b051d5189dc88ba5f837da61bce866e2c6",
   "files": [
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join/group_job_tests.rs",
-      "sha256": "7d54ddc6171c2ffca1f4c4fd6be53bdb98b8ae8044bfa1e56f556f984bc8c78d",
-      "size_bytes": 74128
+      "sha256": "9bcc3f3513325ca8c6ad722c8f7a0cd04786f15c197957453fab9dc347b8b52a",
+      "size_bytes": 74160
     },
     {
       "executable": false,

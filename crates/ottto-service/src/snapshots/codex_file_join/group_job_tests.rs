@@ -1737,14 +1737,22 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
             first_group_owner(&root) == *owner
         });
     assert!(filler.is_some(), "a filler group that sorts first");
+    // The group's physical aliases share one body fingerprint.
+    let other = |scan: &SourceScanResult| {
+        let snapshots = scan
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_session_id == OTHER)
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect::<Vec<_>>();
+        (
+            snapshots.len(),
+            snapshots.into_iter().collect::<BTreeSet<_>>(),
+        )
+    };
     let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
-    let expected = unpaged
-        .snapshots
-        .iter()
-        .filter(|snapshot| snapshot.source_session_id == OTHER)
-        .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(expected.len(), 2, "one alias per member");
+    let expected = other(&unpaged);
+    assert_eq!(expected.0, 2, "one alias per member");
     let order = JoinRefusal::ProbeBudgetOrder.slot();
     let cache = Arc::new(SharedCache::default());
     with_test_limits(8192, singleton, 64, || {
@@ -1762,13 +1770,7 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
         );
         assert_eq!(after.parked_hits, 0, "{after:?}");
         assert_eq!(after.jobs_certified, 1, "{after:?}");
-        let accepted = joined
-            .snapshots
-            .iter()
-            .filter(|snapshot| snapshot.source_session_id == OTHER)
-            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(accepted, expected, "counted once, as unpaged");
+        assert_eq!(other(&joined), expected, "counted once, as unpaged");
     });
     fs::remove_dir_all(root).unwrap();
 }
