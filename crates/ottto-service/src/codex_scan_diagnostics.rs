@@ -594,6 +594,67 @@ impl LoaderEvidence {
     }
 }
 
+/// Content-free counts of Codex sidecar identity-conflict keys, taken from the
+/// loaders' existing comparisons. New `state_threads` conflict keys split
+/// exactly into alias, intra-root row and cross-root row keys. A cross-root
+/// key is progress-only when `created_at`, `model` and `rollout_path` agree;
+/// that classifies fields only and does not prove the copies harmless.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct IdentityConflictTaxonomy {
+    pub state_alias_keys: u32,
+    pub state_intra_root_row_keys: u32,
+    pub state_cross_root_keys: u32,
+    pub state_cross_root_progress_only_keys: u32,
+    pub state_cross_root_identity_field_keys: u32,
+    pub state_cross_root_field_differs: StateRowFieldDiffs,
+    /// All loaders' conflict keys after every home, and the subsets the merged
+    /// created classification and the prior scan's durable state-only
+    /// entities still name. Spawn edges whose parent is a conflict key count
+    /// once per child.
+    pub conflict_keys_total: u32,
+    pub conflict_keys_state_created: u32,
+    pub conflict_keys_prior_state_only: u32,
+    pub conflict_parent_child_edges: u32,
+}
+impl IdentityConflictTaxonomy {
+    pub fn observe_state_cross_root(&mut self, differs: StateRowFieldDiffs) {
+        self.state_cross_root_keys = self.state_cross_root_keys.saturating_add(1);
+        let identity_field_differs =
+            differs.created_at != 0 || differs.model != 0 || differs.rollout_path != 0;
+        let class = if identity_field_differs {
+            &mut self.state_cross_root_identity_field_keys
+        } else {
+            &mut self.state_cross_root_progress_only_keys
+        };
+        *class = class.saturating_add(1);
+        let total = &mut self.state_cross_root_field_differs;
+        for (slot, add) in [
+            (&mut total.title, differs.title),
+            (&mut total.tokens_used, differs.tokens_used),
+            (&mut total.archived, differs.archived),
+            (&mut total.created_at, differs.created_at),
+            (&mut total.updated_at, differs.updated_at),
+            (&mut total.model, differs.model),
+            (&mut total.rollout_path, differs.rollout_path),
+        ] {
+            *slot = slot.saturating_add(add);
+        }
+    }
+}
+
+/// Per-field counts of differing `state_threads` rows; one key counts once in
+/// every field it differs on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct StateRowFieldDiffs {
+    pub title: u32,
+    pub tokens_used: u32,
+    pub archived: u32,
+    pub created_at: u32,
+    pub updated_at: u32,
+    pub model: u32,
+    pub rollout_path: u32,
+}
+
 #[derive(Debug)]
 pub(crate) struct IncompleteShape;
 impl std::fmt::Display for IncompleteShape {
@@ -688,6 +749,7 @@ pub(crate) struct CodexScanDiagnostics {
     pub spawn_edges: LoaderEvidence,
     pub rollout_extents: LoaderEvidence,
     pub session_index: LoaderEvidence,
+    pub identity_conflict_taxonomy: IdentityConflictTaxonomy,
     pub gates: CensusGates,
     pub unreadable_causes: UnreadableCauses,
     pub quarantine_count: u64,
@@ -697,10 +759,12 @@ pub(crate) struct CodexScanDiagnostics {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, identity_conflict_taxonomy, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
+crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_keys_prior_state_only, conflict_parent_child_edges);
+crate::heap_layout_bound::fields!(StateRowFieldDiffs; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 impl crate::heap_layout_bound::HeapLayoutBound for LoaderReason {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
@@ -805,6 +869,37 @@ mod tests {
         diagnostics.spawn_edges = evidence;
         diagnostics.rollout_extents = evidence;
         diagnostics.session_index = evidence;
+        let field_differs = StateRowFieldDiffs {
+            title: u32::MAX,
+            tokens_used: u32::MAX,
+            archived: u32::MAX,
+            created_at: u32::MAX,
+            updated_at: u32::MAX,
+            model: u32::MAX,
+            rollout_path: u32::MAX,
+        };
+        diagnostics.identity_conflict_taxonomy = IdentityConflictTaxonomy {
+            state_alias_keys: u32::MAX,
+            state_intra_root_row_keys: u32::MAX,
+            state_cross_root_keys: u32::MAX,
+            state_cross_root_progress_only_keys: u32::MAX,
+            state_cross_root_identity_field_keys: u32::MAX,
+            state_cross_root_field_differs: field_differs,
+            conflict_keys_total: u32::MAX,
+            conflict_keys_state_created: u32::MAX,
+            conflict_keys_prior_state_only: u32::MAX,
+            conflict_parent_child_edges: u32::MAX,
+        };
+        // Counters saturate instead of wrapping.
+        diagnostics
+            .identity_conflict_taxonomy
+            .observe_state_cross_root(field_differs);
+        assert_eq!(
+            diagnostics
+                .identity_conflict_taxonomy
+                .state_cross_root_field_differs,
+            field_differs
+        );
         let mut lineage = RecoveryLineage::new(
             "raw session id /Users/private credential",
             SnapshotQuarantineDisposition::RetryPending,
