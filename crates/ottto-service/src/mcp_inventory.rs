@@ -206,7 +206,7 @@ const CLAUDE_DEFERRAL_MIN_VERSION: (u64, u64, u64) = (2, 1, 170);
 
 /// Earliest Codex version seen finding MCP tools through code mode's runtime
 /// `ALL_TOOLS` list (0.149). Code-mode builds send no user MCP server names,
-/// schemas or instructions in the first request; older builds sent schemas.
+/// schemas or instructions in the first request. Older builds are not assumed.
 const CODEX_CODE_MODE_MIN_VERSION: (u64, u64, u64) = (0, 149, 0);
 
 /// Claude Code's default `ENABLE_TOOL_SEARCH=auto` threshold, in percent of
@@ -392,10 +392,11 @@ fn claude_loading_decision(
 }
 
 /// Codex code-mode builds keep `[mcp_servers]` tools out of the first request.
+/// Older builds are reported as `unknown`, like older Claude Code builds.
 fn codex_loading_decision(version: Option<&str>) -> LoadingDecision {
     match version.and_then(parse_version) {
         Some(parsed) if parsed < CODEX_CODE_MODE_MIN_VERSION => {
-            LoadingDecision::client_default("always_on", "legacy_client")
+            LoadingDecision::client_default("unknown", "legacy_client")
         }
         _ => LoadingDecision::client_default("on_demand", "client_default"),
     }
@@ -3013,9 +3014,10 @@ url = "https://unset.test/mcp"
             codex_loading_decision(Some("0.149.0-alpha.4.1")),
             LoadingDecision::client_default("on_demand", "client_default")
         );
+        // Builds older than code mode are not assumed either way.
         assert_eq!(
             codex_loading_decision(Some("0.146.0-alpha.3.1")),
-            LoadingDecision::client_default("always_on", "legacy_client")
+            LoadingDecision::client_default("unknown", "legacy_client")
         );
         assert_eq!(codex_loading_decision(None).mode, "on_demand");
     }

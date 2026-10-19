@@ -15,6 +15,7 @@ pub(crate) mod claude_status_coverage;
 pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;
+pub mod codex_prelude_footprint;
 mod codex_process_homes;
 mod codex_scan_diagnostics;
 pub mod codex_sign_in;
@@ -983,6 +984,7 @@ impl LocalDaemon {
             cloud_disconnected: false,
             setup_run_id: None,
             disconnected_at: None,
+            device_released: None,
             message: StableMessage {
                 code: "disconnected".to_string(),
                 text: "This Mac is disconnected from Ottto.".to_string(),

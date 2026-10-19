@@ -46,10 +46,19 @@ pub(crate) fn measure_file(
     file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .ok()?;
+    measure_bytes(&bytes, auto_memory, salt)
+}
+
+/// Counts for complete file bytes already in memory (never a partial prefix).
+pub(crate) fn measure_bytes(
+    bytes: &[u8],
+    auto_memory: bool,
+    salt: Option<&[u8; 32]>,
+) -> Option<FileCounts> {
     if bytes.len() > MAX_FILE_BYTES {
         return None;
     }
-    let text = std::str::from_utf8(&bytes).ok()?;
+    let text = std::str::from_utf8(bytes).ok()?;
     // split_terminator excludes the phantom line after a final newline, while
     // retaining empty lines and CR units in CRLF input.
     let mut file_lines = 0usize;
@@ -71,7 +80,7 @@ pub(crate) fn measure_file(
         file_bytes: Some(bytes.len() as u64),
         file_lines: Some(file_lines as u64),
         file_chars: Some(text.encode_utf16().count() as u64),
-        content_hash: salt.map(|salt| salted_content_hash(salt, &bytes)),
+        content_hash: salt.map(|salt| salted_content_hash(salt, bytes)),
         loaded_lines: auto_memory.then_some(loaded_lines as u64),
         truncated_by_limit: auto_memory.then_some(loaded_lines < file_lines),
     })
@@ -86,6 +95,20 @@ pub(crate) fn salted_content_hash(salt: &[u8; 32], bytes: &[u8]) -> String {
     digest.update(salt);
     digest.update(bytes);
     format!("{:x}", digest.finalize())
+}
+
+/// The device salt for collectors without a support-dir handle (the snapshot
+/// pass), read once per process. Tests use a fixed salt and touch no files.
+pub(crate) fn device_salt() -> Option<[u8; 32]> {
+    #[cfg(test)]
+    {
+        Some([0x5a; 32])
+    }
+    #[cfg(not(test))]
+    {
+        static SALT: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+        *SALT.get_or_init(|| load_or_create_salt(&ottto_core::default_support_dir()))
+    }
 }
 
 pub(crate) fn load_or_create_salt(support_dir: &Path) -> Option<[u8; 32]> {

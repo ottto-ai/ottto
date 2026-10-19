@@ -200,8 +200,12 @@
         "reasoning_effort": "high",
         "reasoning_output_tokens": 0,
         "request_count": 3,
-        "selector_context": {},
-        "selector_sources": {}
+        "selector_context": {
+          "context_bucket": "short"
+        },
+        "selector_sources": {
+          "context_bucket": "derived_from_last_token_usage"
+        }
       }
     ],
     "output_tokens": 3,
@@ -223,15 +227,15 @@
         "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
         "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
         "lifecycle_activity": "95c24d9640f43a112ba680558c8b0af3a27cf9f6f5fdca388076356bb305f341",
-        "usage_accounting": "b13e1ddc2c6f47ffb4754cde2debc4e6ef2680083cb487e846fe40437fb92f5a"
+        "usage_accounting": "ae0628ecb13e610dcf19728c72785c15322758135891179e590f713d5981033a"
       },
-      "content_hash": "7d3bbac2652260a3ae9147f7bb5b0b9a55bd0160e758adb6e80df874e5c48fae",
+      "content_hash": "19fd8fb2e372459f7ac670cad4cfd15accdb70668f82174622d82adb007a046b",
       "hash_epoch": 1,
       "revision_contract_version": "snapshot_revision:v1",
-      "revision_hash": "6ed1709cca6efdf3756c42348267cc1c2b8ad5cebcdb929c89bf11a7f0355bf5",
+      "revision_hash": "0e9d072c6c73bf636e8b5bf835b984bed55866bf71e9cf7d0a5886c6625d57a6",
       "revision_v2_canonicalization": "rfc8785:integers-only:v1",
       "revision_v2_contract_version": "snapshot_revision:v2",
-      "revision_v2_hash": "84d948483fc264f9426b217bd6ff9b1bde5e4aa46944ae5218e08a25cb13891f",
+      "revision_v2_hash": "c95258dad51f2072def13dc6bdb5cbe156fb31d7d470e41acef9a146b128c093",
       "revision_v2_parser_version": "codex_jsonl:v39",
       "revision_v2_scan_identity_version": "codex_jsonl:v34",
       "upload_policy": {
@@ -244,7 +248,7 @@
     },
     "session_display_name": null,
     "session_display_name_source": null,
-    "snapshot_fingerprint": "faba6099cf230c54af5169300c6c6a5fbeb746e9f5fe57c4eb958d18dd85ed63",
+    "snapshot_fingerprint": "e3221306a30b49b47dd52a6afbad3313072a82c78dd6378efb51a775256a9a11",
     "source_ended_at": null,
     "source_file_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "source_last_activity_at": "2026-09-30T10:00:02Z",
@@ -270,8 +274,12 @@
             "reasoning_effort": "high",
             "reasoning_output_tokens": 0,
             "request_count": 3,
-            "selector_context": {},
-            "selector_sources": {}
+            "selector_context": {
+              "context_bucket": "short"
+            },
+            "selector_sources": {
+              "context_bucket": "derived_from_last_token_usage"
+            }
           }
         ]
       }

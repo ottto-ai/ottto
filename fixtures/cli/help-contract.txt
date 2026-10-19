@@ -459,7 +459,7 @@ Options:
       --socket <SOCKET>      Override the ottto-service Unix socket path
       --local-only           Clear local credentials without first disconnecting this Mac in Ottto
       --token <TOKEN>        Override the local-control token for CLI and agent requests
-      --forget-installation  Forget installation identity, account scope, credentials, and local sync receipts
+      --forget-installation  Forget installation identity, credentials, and local sync receipts; without --local-only, first release this Mac in Ottto
       --no-autostart         Do not kickstart the standard per-user ottto-service
       --confirm              Confirm destructive installation reset and local receipt removal
       --watch                Emit NDJSON progress events and a final event; requires --json

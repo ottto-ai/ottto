@@ -12,13 +12,19 @@ const AUDIT_AND_SCRATCH_BYTES: usize = 1024 * 1024;
 const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
+pub(super) mod codex_cursor;
+
 pub(crate) struct SharedCache {
     inner: Mutex<TranscriptCache<sampled_jsonl::CachedJsonlReduction>>,
+    /// The resumable Codex job slot and held-singleton memo. Charged once,
+    /// here; copy budgets and insert admission see it through this cache.
+    cursor: Mutex<codex_cursor::CursorState>,
 }
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
+            cursor: Mutex::new(codex_cursor::CursorState::default()),
         }
     }
 }
@@ -29,10 +35,14 @@ impl std::fmt::Debug for SharedCache {
 }
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        self.inner.heap_bound(c)
+        self.inner.heap_bound(c)?;
+        self.cursor.heap_bound(c)
     }
 }
 impl SharedCache {
+    /// Copy-refusal release: evicts retained copies only. The paused cursor
+    /// job, the held-singleton memo, parked records and rotation state are
+    /// charged and bounded in `heap_bound`, and survive (K6).
     pub(super) fn clear(&self) {
         if let Ok(mut cache) = self.inner.lock() {
             cache.clear();
@@ -44,6 +54,16 @@ impl SharedCache {
     ) -> Option<crate::transcript_cache::Retained<sampled_jsonl::CachedJsonlReduction>> {
         self.inner.lock().ok()?.take(key)
     }
+    pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
+        self.inner.lock().ok()?.sealed_offset(key)
+    }
+    #[cfg(test)]
+    pub(super) fn retained_checkpoint(
+        &self,
+        key: &str,
+    ) -> Option<crate::transcript_acquisition::Checkpoint> {
+        self.inner.lock().ok()?.checkpoint(key)
+    }
     pub(super) fn insert(
         &self,
         key: String,
@@ -51,6 +71,10 @@ impl SharedCache {
         live_bytes: usize,
     ) {
         if let Some(state) = completed.reduction {
+            // The whole cursor state (paused job, memo, parked and rotation
+            // records) keeps its charge: admission may not fill the state
+            // budget underneath it.
+            let live_bytes = live_bytes.saturating_add(self.cursor_resident());
             if let Ok(mut cache) = self.inner.lock() {
                 cache.insert_reserving(
                     key,
@@ -67,7 +91,7 @@ impl SharedCache {
 
 pub(super) struct Context {
     pub(super) cache: Arc<SharedCache>,
-    namespace: Scope,
+    pub(super) namespace: Scope,
     pub(super) audit_metadata_supported: bool,
     pub(super) audit_slots: usize,
     pub(super) full_files: usize,
@@ -201,62 +225,133 @@ impl OwnedSourceScan {
         self
     }
     pub(crate) fn release_sampled_cache_for_copy_refusal(&self) {
-        if let Some(context) = self.sampling.as_ref() {
-            // A full parser's native accumulator is the unchanged synchronous
-            // baseline. Its local layout refusal forbids optional copies, but
-            // does not invalidate other already bounded resident reductions.
-            // Acquisition/path scratch still uses the separate 1MiB reserve.
-            // Borrowed tail state, unsupported audit metadata and an unbounded
-            // resident graph retain the existing conservative release behavior.
-            let native_full_baseline = self.active_file.as_ref().is_some_and(|active| {
-                active
-                    .sampling
-                    .as_ref()
-                    .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
-            });
-            if native_full_baseline
-                && context.audit_metadata_supported
-                && crate::heap_layout_bound::bound(context, STATE_BYTES).is_some()
-            {
-                return;
-            }
-            context.cache.clear();
-        }
+        release_cache_for_copy_refusal(self.sampling.as_ref(), self.active_file.as_deref());
     }
     /// Charge only optimization-owned native state, samples/keys and copies.
     /// The unchanged serial index/metadata is baseline; parked/proof/send
     /// frames still use their existing aggregate 32MiB allocation/lifetime gate.
     pub(super) fn sampled_copy_budget(&mut self) -> usize {
-        let Some(context) = self
-            .sampling
-            .as_ref()
-            .filter(|context| context.audit_metadata_supported)
-        else {
-            return 0;
-        };
-        let Some(resident) = crate::heap_layout_bound::bound(context, STATE_BYTES) else {
-            return 0;
-        };
-        let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
-            return 0;
-        };
-        let active = self.active_file.as_mut().map_or(Some(0), |active| {
-            // These native source-wide inputs predate the optimization, are
-            // refreshed on reuse, and are absent from every retained copy.
-            // All active owned parser/acquisition/path/receipt state stays charged.
-            let inputs = active.parser.take_live_reduction_inputs();
-            let bound = crate::heap_layout_bound::bound(active, remaining);
-            active.parser.restore_live_reduction_inputs(inputs);
-            bound
-        });
-        active
-            .and_then(|used| remaining.checked_sub(used))
-            .map(|remaining| remaining / 2)
-            .unwrap_or(0)
+        copy_budget_beside(
+            self.sampling.as_ref(),
+            self.active_file.as_deref_mut(),
+            false,
+        )
     }
 }
 
+/// The copy-refusal release for `sampling` beside `active`.
+pub(super) fn release_cache_for_copy_refusal(
+    sampling: Option<&Context>,
+    active: Option<&OwnedActiveFile>,
+) {
+    if let Some(context) = sampling {
+        // A full parser's native accumulator is the unchanged synchronous
+        // baseline. Its local layout refusal forbids optional copies, but
+        // does not invalidate other already bounded resident reductions.
+        // Acquisition/path scratch still uses the separate 1MiB reserve.
+        // Borrowed tail state, unsupported audit metadata and an unbounded
+        // resident graph retain the existing conservative release behavior.
+        let native_full_baseline = active.is_some_and(|active| {
+            active
+                .sampling
+                .as_ref()
+                .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
+        });
+        if native_full_baseline
+            && context.audit_metadata_supported
+            && crate::heap_layout_bound::bound(context, STATE_BYTES).is_some()
+        {
+            return;
+        }
+        context.cache.clear();
+    }
+}
+
+/// A completing cursor job's exact copy budget (E3), with the same
+/// refusal release the step start applies to an ordinary file.
+pub(super) fn completion_copy_budget(
+    sampling: Option<&Context>,
+    active: &mut OwnedActiveFile,
+) -> usize {
+    let budget = copy_budget_beside(sampling, Some(&mut *active), true);
+    if budget == 0 {
+        release_cache_for_copy_refusal(sampling, Some(&*active));
+    }
+    budget
+}
+
+/// The copy budget left beside the active file. A cursor job's state grows
+/// past the ordinary walk's visit limit (usage hours, witnesses), so it is
+/// charged by bytes like its pause (N3), but never walked per line (E3):
+/// mid-job it uses the last walk plus the bytes consumed and the reader
+/// buffer growth since (`JobMeta::charge_estimate`, bounded slack corrected
+/// at the next walk, at most every `CHARGE_REFRESH_BYTES`); `completing`
+/// walks exactly, once, on the step that consumes the budget.
+/// This accounting is amortized across the job, not completion-only.
+pub(super) fn copy_budget_beside(
+    sampling: Option<&Context>,
+    active: Option<&mut OwnedActiveFile>,
+    completing: bool,
+) -> usize {
+    let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
+        return 0;
+    };
+    let Some(resident) = crate::heap_layout_bound::bound(context, STATE_BYTES) else {
+        return 0;
+    };
+    let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
+        return 0;
+    };
+    let active = active.map_or(Some(0), |active| {
+        let consumed = active.parser.reader.consumed_bytes();
+        let buffer = active.parser.reader.buf.capacity();
+        let estimate = active
+            .cursor
+            .as_ref()
+            .filter(|_| !completing)
+            .and_then(|meta| meta.charge_estimate(consumed, buffer));
+        if let Some(estimate) = estimate {
+            return Some(estimate);
+        }
+        // These native source-wide inputs predate the optimization, are
+        // refreshed on reuse, and are absent from every retained copy.
+        // All active owned parser/acquisition/path/receipt state stays charged.
+        let inputs = active.parser.take_live_reduction_inputs();
+        // The walk charges the file itself, as before it was boxed.
+        let file: &OwnedActiveFile = active;
+        let bound = if active.cursor.is_some() {
+            crate::heap_layout_bound::completed_bound(file, remaining)
+        } else {
+            crate::heap_layout_bound::bound(file, remaining)
+        };
+        active.parser.restore_live_reduction_inputs(inputs);
+        if let Some(meta) = active.cursor.as_mut() {
+            meta.record_charge(bound.unwrap_or(usize::MAX), consumed, buffer);
+        }
+        bound
+    });
+    active
+        .and_then(|used| remaining.checked_sub(used))
+        .map(|remaining| remaining / 2)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin this thread's scan clock (tests only); `None` restores real time.
+#[cfg(test)]
+pub(super) fn set_test_now(now: Option<u64>) {
+    TEST_NOW.with(|clock| clock.set(now));
+}
+
 pub(super) fn now_seconds() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -303,6 +398,7 @@ pub(super) fn new_source_parser(
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);
+        codex_counting_version::configure_singleton(&mut parser, candidate, index);
     }
     Ok(parser)
 }

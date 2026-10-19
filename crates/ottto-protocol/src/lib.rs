@@ -683,6 +683,11 @@ pub struct AuthResetResponse {
     pub setup_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected_at: Option<Rfc3339Timestamp>,
+    /// Whether Ottto released this Mac's server registration during a cloud
+    /// reset. Absent for local-only resets and from older daemons; `false`
+    /// means the registration may still be active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_released: Option<bool>,
     pub message: StableMessage,
 }
 
@@ -845,6 +850,15 @@ pub struct ActiveSession {
     pub subscription_product: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_attribution_source: Option<String>,
+    /// Content-free reason the daemon withheld this session's account, so an
+    /// app can say why instead of a bare "unknown". Closed values:
+    /// `multiple_accounts` (the session's own request evidence names more than
+    /// one account) and `incomplete_request_evidence` (one account, but not
+    /// every billed request has a request witness). Only ever set while
+    /// `account_identifier_hash` is absent, and never names an account. Apps
+    /// must treat an unknown value as no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_withheld_reason: Option<String>,
     /// Model the session was MOST RECENTLY seen running, not its lifetime
     /// primary. An active session's card answers "what is it running right
     /// now", so a long session that switched models must not keep showing the
@@ -8007,6 +8021,7 @@ mod tests {
                 organization_identifier_hash: Some("org-hash".to_string()),
                 subscription_product: Some("chatgpt_pro".to_string()),
                 account_attribution_source: Some("current_login_at_reconciliation".to_string()),
+                account_withheld_reason: None,
                 latest_model: Some("claude-opus-5".to_string()),
                 latest_reasoning_effort: Some("high".to_string()),
             }],
@@ -8030,9 +8045,28 @@ mod tests {
         // Snake-case keys the Swift Companion decodes for the session card.
         assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
         assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");
+        // Absent, not null, when the daemon has no withheld reason.
+        assert!(value["sessions"][0]
+            .as_object()
+            .is_some_and(|session| !session.contains_key("account_withheld_reason")));
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
+
+        let mut withheld = reconciliation.clone();
+        withheld.sessions[0].account_identifier_hash = None;
+        withheld.sessions[0].organization_identifier_hash = None;
+        withheld.sessions[0].subscription_product = None;
+        withheld.sessions[0].account_attribution_source = None;
+        withheld.sessions[0].account_withheld_reason = Some("multiple_accounts".to_string());
+        let value = serde_json::to_value(&withheld).expect("serialize withheld reconciliation");
+        assert_eq!(
+            value["sessions"][0]["account_withheld_reason"],
+            "multiple_accounts"
+        );
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize withheld reconciliation");
+        assert_eq!(round_tripped, withheld);
     }
 
     #[test]
