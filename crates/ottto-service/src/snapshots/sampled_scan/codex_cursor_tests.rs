@@ -2546,7 +2546,7 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    // #635: the unbound created thread held as `AmbiguousFork` too.
+    // #635: the created thread held as `AmbiguousFork` too.
     for (grow, fork) in [(false, false), (true, false), (false, true), (true, true)] {
         let fixture = ScanRoot::new(40);
         let cache = Arc::new(SharedCache::default());
@@ -2570,8 +2570,10 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
                 .expect("a paused job");
             while !job.parser.step().unwrap() {}
             // A parentless created thread held for a missing sidecar
-            // projection: an append may cure it.
+            // projection: an append may cure it. The classifier sets
+            // `codex_created_thread_native_only` with either boundary (B1).
             let accumulator = &mut job.parser.accumulator;
+            accumulator.codex_created_thread_native_only = true;
             accumulator.codex_ownership_boundary = if fork {
                 CodexOwnershipBoundary::AmbiguousFork
             } else {
