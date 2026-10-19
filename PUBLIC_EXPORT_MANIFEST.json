@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 698,
-  "content_sha256": "9f87859882db7e7cb7fa32ee1ef3aecf62ea66d53f3a3fb0f78f61e053475695",
+  "candidate_file_count": 699,
+  "content_sha256": "fb4ed7bc64a49ed9bab1962dcd133026cf8550979659168ce90d4072d5ece13b",
   "files": [
     {
       "executable": false,
@@ -1539,8 +1539,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_cache.rs",
-      "sha256": "a9ae44aec20403b161649519016f04241d8454f54e44c763fdeb737e7b7b11dc",
-      "size_bytes": 18157
+      "sha256": "b0f9311058a6b5ce8c301704eb6a04b8b09eb0934b1b0bb85e3ae357efba7d0c",
+      "size_bytes": 19019
     },
     {
       "executable": false,
@@ -3130,6 +3130,13 @@
       "path": "docs/session-2026-10-18-skill-detector-v2.md",
       "sha256": "c64008b93ab5cca8accbd54a02623a7e4613cacf2a78e1f7ec46b73275a4475b",
       "size_bytes": 6939
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-18-transcript-cache-idle-retention.md",
+      "sha256": "26cd81fd59ed9edcb8c3f382f2bb2e9b824fc6714076dd3c216d28b135a065ee",
+      "size_bytes": 2517
     },
     {
       "executable": false,
@@ -4891,7 +4898,7 @@
   ],
   "generated_at": "2026-10-18T23:34:17+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 699,
+  "output_file_count": 700,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
