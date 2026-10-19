@@ -14,4 +14,4 @@ What it uploads: per repository scope, the newest owned fresh start, through the
 - `skills`: one item per listing line with its root kind (Project, User, System, Plugin, Other). Categories: `System prompt`, `Memory files`, `Skills`, `Hook context`.
 - Not included: `additional_tools` / Codex Desktop `codex_app` tool-schema size (D7 belongs to session_start, CROSS-LANE S12).
 
-Order: the backend must convert `codex_rollout_prelude_chars_v1` characters to tokens and accept the `Hook context` category (part `hooks_env`, owner "yours") before this merges. No release is part of this change.
+Order: the backend converts `codex_rollout_prelude_chars_v1` characters to tokens with its `start_parts` ratio table (`start_parts_ratios_v1`), recomputes category `pct`, admits `Hook context` as part `hooks_env` (owner "yours"), and rejects any category without a Codex ratio (coding-agents-observability #11287). That backend must be live before this ships. No release is part of this change.
