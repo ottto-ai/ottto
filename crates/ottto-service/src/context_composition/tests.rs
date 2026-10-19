@@ -303,8 +303,10 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
     let mut bytes = record(&damaged);
     bytes.extend_from_slice(b"\n\xff\n");
     fs::write(&bad_file, bytes).unwrap();
-    // Discovery resolves the valid first cwd; the newest report then fails.
-    set_mtime(&bad_file, SystemTime::now() + Duration::from_secs(1));
+    // Both are settled. Discovery resolves the valid first cwd; the newest
+    // report then fails.
+    set_mtime(&good_file, SystemTime::now() - 2 * SETTLE_WINDOW);
+    set_mtime(&bad_file, SystemTime::now() - SETTLE_WINDOW);
     let source = SnapshotSource::ClaudeCode;
     let source_label = agent_source_label(source);
     let bad_cache_file = cache_path(
@@ -394,7 +396,7 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
             "synthetic-secret",
             "synthetic-machine",
             &api,
-            &home,
+            std::slice::from_ref(&transcripts),
             &support,
             source,
         )
@@ -532,7 +534,7 @@ fn measure_synthetic_workspace() {
     };
     let start = Instant::now();
     let scans = discover_workspaces(
-        &root.join("transcripts"),
+        &[root.join("transcripts")],
         SystemTime::now(),
         Instant::now() + Duration::from_secs(300),
     )
@@ -1279,18 +1281,143 @@ fn discovery_incomplete_transcript_refuses_partial_workspace_set() {
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
-    let scans = discover_workspaces(&transcripts, SystemTime::now(), deadline).unwrap();
+    let roots = [transcripts.clone()];
+    let scans = discover_workspaces(&roots, SystemTime::now(), deadline).unwrap();
     assert_eq!(scans.len(), 1);
     assert_eq!(scans[0].workspace, workspace);
     fs::write(transcripts.join("unresolved.jsonl"), b"\xff\n").unwrap();
-    assert!(discover_workspaces(&transcripts, SystemTime::now(), deadline).is_err());
+    assert!(discover_workspaces(&roots, SystemTime::now(), deadline).is_err());
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn discovery_expired_budget_is_not_complete_empty_coverage() {
     let root = crate::test_scratch::private_dir("composition-discovery-expired");
-    assert!(discover_workspaces(&root, SystemTime::now(), Instant::now()).is_err());
+    assert!(discover_workspaces(
+        std::slice::from_ref(&root),
+        SystemTime::now(),
+        Instant::now()
+    )
+    .is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn discovery_spans_registered_roots_and_counts_each_transcript_once() {
+    let root = crate::test_scratch::private_dir("composition-discovery-roots");
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let default_root = root.join("default/projects");
+    let slot_root = root.join("slot/projects");
+    for dir in [&default_root, &slot_root] {
+        fs::create_dir_all(dir.join("-workspace")).unwrap();
+    }
+    let record = json!({"cwd": workspace}).to_string();
+    fs::write(default_root.join("-workspace/default-only.jsonl"), &record).unwrap();
+    fs::write(slot_root.join("-workspace/slot-only.jsonl"), &record).unwrap();
+    // The same session copied into both folders counts once: the newest copy.
+    let older = default_root.join("-workspace/copied.jsonl");
+    let newer = slot_root.join("-workspace/copied.jsonl");
+    fs::write(&older, &record).unwrap();
+    fs::write(&newer, &record).unwrap();
+    set_mtime(&older, SystemTime::now() - Duration::from_secs(60));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let scans = discover_workspaces(
+        &[default_root.clone(), slot_root.clone()],
+        SystemTime::now(),
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(scans.len(), 1);
+    let mut files = scans[0]
+        .files
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            default_root.join("-workspace/default-only.jsonl"),
+            newer,
+            slot_root.join("-workspace/slot-only.jsonl"),
+        ]
+    );
+    // Subagent ids repeat across parent sessions; those are distinct files.
+    for session in ["session-a", "session-b"] {
+        let dir = slot_root.join("-workspace").join(session).join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("agent-1.jsonl"), &record).unwrap();
+    }
+    let scans = discover_workspaces(
+        &[default_root.clone(), slot_root.clone()],
+        SystemTime::now(),
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(scans[0].files.len(), 5);
+    // The default folder alone is the pre-registration view.
+    let default_only = discover_workspaces(&[default_root], SystemTime::now(), deadline).unwrap();
+    assert_eq!(default_only[0].files.len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_transcript_does_not_fence_the_settled_files_of_its_workspace() {
+    let root = crate::test_scratch::private_dir("composition-settle-window");
+    let workspace = root.join("workspace");
+    let transcripts = root.join("transcripts");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&transcripts).unwrap();
+    let record = json!({"type":"attachment","cwd":workspace,
+        "timestamp":iso_utc(OffsetDateTime::now_utc()),"attachment":{"content":"evidence"}})
+    .to_string();
+    let settled = transcripts.join("settled.jsonl");
+    let live = transcripts.join("live.jsonl");
+    fs::write(&settled, &record).unwrap();
+    fs::write(&live, &record).unwrap();
+    set_mtime(&settled, SystemTime::now() - 2 * SETTLE_WINDOW);
+
+    let now = SystemTime::now();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut scans = discover_workspaces(std::slice::from_ref(&transcripts), now, deadline).unwrap();
+    let mut scan = scans.remove(0);
+    assert_eq!(scan.files.len(), 2);
+    // The live session appends between discovery and the signature check.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&live)
+        .unwrap()
+        .write_all(format!("\n{record}").as_bytes())
+        .unwrap();
+    set_mtime(&live, now + Duration::from_secs(1));
+    assert!(workspace_files_signature(&scan.files, deadline).is_err());
+
+    // A live transcript the last upload included stays, keeping its history.
+    let uploaded = BTreeMap::from([(
+        live.to_string_lossy().to_string(),
+        transcript_file_metadata(&fs::metadata(&live).unwrap()).unwrap(),
+    )]);
+    let mut kept = scan.files.clone();
+    retain_settled_files(&mut kept, now, Some(&uploaded));
+    assert_eq!(kept, scan.files);
+    // A new live transcript waits for a later cycle.
+    retain_settled_files(&mut scan.files, now, None);
+    assert_eq!(
+        scan.files.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        [&settled]
+    );
+    let signature = workspace_files_signature(&scan.files, deadline).unwrap();
+    let report = build_report_for_scan(
+        &scan,
+        &signature,
+        SnapshotSource::ClaudeCode,
+        wide_window(),
+        deadline,
+    )
+    .unwrap();
+    assert!(build_request(&report, &workspace, "machine", "claude-code", false).is_some());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1326,4 +1453,221 @@ fn report_expired_budget_does_not_return_empty_or_partial_replacement() {
     )
     .is_none());
     fs::remove_file(path).unwrap();
+}
+
+// -------------------------------------------------------------------------
+// Copied history: fork/resume records count once as entered context, and
+// only stay resident for the copying session's own requests.
+// -------------------------------------------------------------------------
+
+fn codex_dev(ordinal: u64, text: &str) -> Value {
+    json!({"type":"response_item","ordinal":ordinal,"payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":text}]}})
+}
+
+fn codex_turn(ordinal: u64) -> Value {
+    json!({"type":"response_item","ordinal":ordinal,"payload":{"type":"agent_message","content":[{"type":"output_text","text":"ok"}]}})
+}
+
+fn parse_codex_records(name: &str, records: &[Value]) -> WorkspaceReport {
+    let mut report = WorkspaceReport::new(wide_window());
+    let fallback = Date::from_calendar_date(2026, Month::October, 18).unwrap();
+    let path = write_jsonl(name, records);
+    parse_codex_session(&path, &mut report, fallback).unwrap();
+    fs::remove_file(path).unwrap();
+    report
+}
+
+#[test]
+fn codex_ordinal_fork_counts_copied_history_once() {
+    // Ordinals 0-3 are the copied parent: its header, instructions and turn.
+    let report = parse_codex_records(
+        "codex-ordinal-fork",
+        &[
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"child","forked_from_id":"parent","thread_source":"subagent","subagent_history_start_ordinal":4}}),
+            json!({"type":"session_meta","ordinal":1,"payload":{"id":"parent"}}),
+            codex_dev(2, "COPIEDDV"),
+            codex_turn(3),
+            codex_dev(4, "OWNDEVXX"),
+            json!({"type":"response_item","ordinal":5,"payload":{"type":"function_call","name":"exec","call_id":"c1","arguments":"{}"}}),
+            json!({"type":"response_item","ordinal":6,"payload":{"type":"function_call_output","call_id":"c1","output":"SHELL123"}}),
+            codex_turn(7),
+        ],
+    );
+    // Entered once (own block, 2 tokens). Residency: own block and the copied
+    // block each stay for the child's two own requests; the parent's turn
+    // is not one of them.
+    assert_eq!(
+        report.category_totals(Category::HarnessAttachments),
+        (1, 2, 8, 0)
+    );
+    assert_eq!(report.copied_history_sessions, 1);
+    assert_eq!(report.excluded_not_fresh, 0);
+    assert_eq!(report.sessions["child"].total, 4);
+}
+
+#[test]
+fn codex_legacy_subagent_fork_starts_at_trigger_turn() {
+    let header = json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","thread_source":"subagent"}});
+    let trigger =
+        json!({"type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}});
+    let report = parse_codex_records(
+        "codex-legacy-subagent",
+        &[
+            header.clone(),
+            codex_dev(1, "COPIEDDV"),
+            codex_turn(2),
+            trigger,
+            codex_dev(4, "OWNDEVXX"),
+            codex_turn(5),
+        ],
+    );
+    assert_eq!(
+        report.category_totals(Category::HarnessAttachments),
+        (1, 2, 4, 0)
+    );
+    assert_eq!(report.copied_history_sessions, 1);
+
+    // Without the trigger the copied part has no boundary: skip the session.
+    let report = parse_codex_records(
+        "codex-legacy-subagent-no-trigger",
+        &[header, codex_dev(1, "COPIEDDV"), codex_turn(2)],
+    );
+    assert!(report.daily.is_empty() && report.sessions.is_empty());
+    assert_eq!(report.excluded_not_fresh, 1);
+}
+
+#[test]
+fn codex_fork_without_boundary_is_excluded_and_paginated_fork_is_local() {
+    let records = |header: Value| vec![header, codex_dev(1, "OWNDEVXX"), codex_turn(2)];
+    let legacy = parse_codex_records(
+        "codex-legacy-user-fork",
+        &records(
+            json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","thread_source":"user"}}),
+        ),
+    );
+    assert!(legacy.daily.is_empty() && legacy.sessions.is_empty());
+    assert_eq!(legacy.excluded_not_fresh, 1);
+
+    for header in [
+        json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","history_base":{"cursor":"x"},"thread_source":"user"}}),
+        json!({"type":"session_meta","payload":{"id":"child","thread_source":"agent_created_thread","history_base":{"cursor":"x"}}}),
+        json!({"type":"session_meta","payload":{"id":"child","thread_source":"user"}}),
+    ] {
+        let report = parse_codex_records("codex-local-history", &records(header));
+        assert_eq!(
+            report.category_totals(Category::HarnessAttachments),
+            (1, 2, 2, 0)
+        );
+        assert_eq!(report.copied_history_sessions, 0);
+        assert_eq!(report.excluded_not_fresh, 0);
+    }
+}
+
+#[test]
+fn claude_resumed_transcript_counts_copied_records_once_in_any_order() {
+    let attachment = |uuid: &str, session: &str| json!({"type":"attachment","uuid":uuid,"sessionId":session,"attachment":{"content":"same harness text"}});
+    let turn = |uuid: &str, session: &str, id: &str| json!({"type":"assistant","uuid":uuid,"sessionId":session,"message":{"id":id,"content":[]}});
+    let original = write_jsonl(
+        "claude-original",
+        &[attachment("u1", "A"), turn("u2", "A", "m1")],
+    );
+    // The resumed transcript repeats u1/u2 under its own session id.
+    let resumed = write_jsonl(
+        "claude-resumed",
+        &[
+            attachment("u1", "B"),
+            turn("u2", "B", "m1"),
+            attachment("u3", "B"),
+            turn("u4", "B", "m2"),
+        ],
+    );
+    let fallback = Date::from_calendar_date(2026, Month::October, 18).unwrap();
+    let parse = |order: [&PathBuf; 2]| {
+        let mut report = WorkspaceReport::new(wide_window());
+        for path in order {
+            parse_claude_session(path, &mut report, fallback, true).unwrap();
+        }
+        report
+    };
+    let forward = parse([&original, &resumed]);
+    let reverse = parse([&resumed, &original]);
+    let (events, tokens, residency, _) = forward.category_totals(Category::HarnessAttachments);
+    // Two distinct records entered; u1 stays for both sessions' requests
+    // (2 turns), u3 for one.
+    assert_eq!(events, 2);
+    assert_eq!(residency, tokens / 2 * 3);
+    assert_eq!(
+        reverse.category_totals(Category::HarnessAttachments),
+        forward.category_totals(Category::HarnessAttachments)
+    );
+    assert_eq!(
+        (forward.copied_history_sessions, forward.excluded_not_fresh),
+        (1, 0)
+    );
+    // Parsed second, the original holds only already-counted records.
+    assert_eq!(
+        (reverse.copied_history_sessions, reverse.excluded_not_fresh),
+        (0, 1)
+    );
+    fs::remove_file(original).unwrap();
+    fs::remove_file(resumed).unwrap();
+}
+
+#[test]
+fn claude_copied_records_stay_with_the_transcript_created_first() {
+    let root = crate::test_scratch::private_dir("composition-copied-owner");
+    let attachment = |uuid: &str, session: &str| json!({"type":"attachment","uuid":uuid,"sessionId":session,"attachment":{"content":"same harness text"}});
+    let turn = |uuid: &str, session: &str| json!({"type":"assistant","uuid":uuid,"sessionId":session,"message":{"id":uuid,"content":[]}});
+    let write = |name: &str, records: &[Value]| {
+        let path = root.join(name);
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+        path
+    };
+    let original = write("original.jsonl", &[attachment("u1", "A"), turn("u2", "A")]);
+    std::thread::sleep(Duration::from_millis(20));
+    let fork = write(
+        "fork.jsonl",
+        &[attachment("u1", "B"), turn("u2", "B"), turn("u3", "B")],
+    );
+    let created_order_known = fs::metadata(&original)
+        .and_then(|metadata| metadata.created())
+        .is_ok();
+    // The original keeps working after the fork, so it is modified last.
+    let later = SystemTime::now() + Duration::from_secs(60);
+    set_mtime(&original, later);
+    let scan = WorkspaceScan {
+        workspace: root.clone(),
+        files: vec![
+            (
+                original.clone(),
+                fs::metadata(&original).unwrap().modified().unwrap(),
+            ),
+            (
+                fork.clone(),
+                fs::metadata(&fork).unwrap().modified().unwrap(),
+            ),
+        ],
+        last_seen: later,
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let signature = workspace_files_signature(&scan.files, deadline).unwrap();
+    let report = build_report_for_scan(
+        &scan,
+        &signature,
+        SnapshotSource::ClaudeCode,
+        wide_window(),
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(report.category_totals(Category::HarnessAttachments).0, 1);
+    if created_order_known {
+        assert!(report.sessions["A"].total > 0);
+        assert!(!report.sessions.contains_key("B"));
+        assert_eq!(report.copied_history_sessions, 1);
+    }
+    fs::remove_dir_all(root).unwrap();
 }

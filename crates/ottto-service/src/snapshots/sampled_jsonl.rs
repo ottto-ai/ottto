@@ -1,6 +1,7 @@
 //! Native reduction adapter for the shared acquisition/cache mechanism. The
 //! existing parser step and finish remain the only semantic implementation.
 use super::*;
+use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
 use crate::transcript_acquisition::{AuditDebt, Checkpoint, ReadMode, ReadPlan, Scope};
 use crate::transcript_cache::Retained;
 
@@ -74,6 +75,12 @@ impl OwnedJsonlParser {
         debt: Option<AuditDebt>,
         now: u64,
     ) -> Result<ReadMode> {
+        // Checkpoints, samples and resume offsets are physical-file bytes. A
+        // compressed stream has none, so it is never sampled or resumed.
+        anyhow::ensure!(
+            !self.reader.reader.is_compressed(),
+            "compressed input has no physical acquisition offsets"
+        );
         anyhow::ensure!(
             self.reader.reader.buffer().is_empty() && !self.reader.finished,
             "acquisition must begin before native parsing"
@@ -85,6 +92,12 @@ impl OwnedJsonlParser {
                 // is not the same as a prefix without markers.
                 && old.state.accumulator.claude_request_identity_capture
                     == self.accumulator.claude_request_identity_capture
+                // A retained reduction continues only under the counting rule
+                // this parse's own evidence selects. Both unset while inactive.
+                && codex_counting_version::reusable(
+                    old.state.accumulator.codex_counting.as_deref(),
+                    self.accumulator.codex_counting.as_deref(),
+                )
                 && (self.source != SnapshotSource::Codex
                     || old
                         .state
@@ -186,13 +199,23 @@ impl OwnedJsonlParser {
             )
         {
             self.reader.acquisition = None;
+            record(Event::RetentionIncompleteOrLossy);
             return Ok(None);
         }
-        let admitted_copy = sampled_scan::compatible_reduction(&self.accumulator)
-            && self
-                .retention_bound(remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES))
-                .is_some();
+        let admitted_copy = if !sampled_scan::compatible_reduction(&self.accumulator) {
+            record(Event::RetentionIncompatible);
+            false
+        } else if self
+            .retention_bound(remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES))
+            .is_some()
+        {
+            true
+        } else {
+            record(Event::RetentionBoundRefused);
+            false
+        };
         let Some(plan) = self.reader.acquisition.take() else {
+            record(Event::RetentionNoPlan);
             return Ok(None);
         };
         let checkpoint =
@@ -200,9 +223,11 @@ impl OwnedJsonlParser {
         // Native EOF may apply an unterminated valid JSON row. Its reduction is
         // not the reduction through the sealed byte pointer. Conservatively
         // decline retention; keep the existing full-parser EOF output unchanged.
-        if checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len()
-            || !admitted_copy
-        {
+        let unsealed = checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
+        if unsealed {
+            record(Event::RetentionUnsealedEof);
+        }
+        if unsealed || !admitted_copy {
             return Ok(Some(CompletedNativeAcquisition {
                 checkpoint,
                 reduction: None,
@@ -225,9 +250,83 @@ impl OwnedJsonlParser {
             remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES),
         )
         .map(|_| reduction);
+        record(if reduction.is_some() {
+            Event::RetentionProduced
+        } else {
+            Event::RetentionCloneBoundRefused
+        });
         Ok(Some(CompletedNativeAcquisition {
             checkpoint,
             reduction,
         }))
+    }
+
+    /// Pair a cursor job's prefix certificate (`ReadPlan::commit_sealed_prefix`)
+    /// with a copy of its reduction. The caller passes a zero budget unless
+    /// every applied byte is inside the certified prefix `[0, s)`; the
+    /// certificate alone then still publishes without retention.
+    pub(super) fn retain_sealed_prefix(
+        &mut self,
+        checkpoint: Checkpoint,
+        remaining_copy_budget: usize,
+    ) -> CompletedNativeAcquisition {
+        let budget = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
+        // The job kept every turn witness (K1); a retained copy keeps the
+        // cache-only caps that govern every other retained reduction.
+        let witnesses_retainable = self
+            .accumulator
+            .codex_observed_priority_turns
+            .as_ref()
+            .map_or(true, |observed| {
+                observed.len() <= MAX_PRIORITY_WITNESSES
+                    && observed
+                        .keys()
+                        .all(|turn| turn.len() <= MAX_PRIORITY_WITNESS_ID_BYTES)
+            });
+        if budget == 0
+            || !witnesses_retainable
+            || !sampled_scan::compatible_reduction(&self.accumulator)
+        {
+            return CompletedNativeAcquisition {
+                checkpoint,
+                reduction: None,
+            };
+        }
+        // The certificate consumed the acquisition plan, so charge the
+        // certificate itself where `retention_bound` charges the plan.
+        let inputs = self.take_live_reduction_inputs();
+        let admitted = (|| {
+            let state = crate::heap_layout_bound::bound(&self.accumulator, budget)?;
+            let certificate =
+                crate::heap_layout_bound::bound(&checkpoint, budget.checked_sub(state)?)?;
+            let inline = std::mem::size_of::<CachedJsonlReduction>()
+                .checked_sub(std::mem::size_of::<SnapshotAccumulator>())?;
+            let total = state.checked_add(certificate)?.checked_add(inline)?;
+            (total <= budget).then_some(())
+        })();
+        let accumulator = admitted.map(|()| {
+            let mut copy = self.accumulator.clone();
+            copy.codex_priority_witnesses_uncapped = false;
+            copy
+        });
+        self.restore_live_reduction_inputs(inputs);
+        let Some(accumulator) = accumulator else {
+            return CompletedNativeAcquisition {
+                checkpoint,
+                reduction: None,
+            };
+        };
+        let reduction = CachedJsonlReduction {
+            accumulator,
+            report: self.reader.report,
+            recognized_usage_drop_count: self.recognized_usage_drop_count,
+            positive_recognized_usage_count: self.positive_recognized_usage_count,
+            positive_usage_evidence: self.positive_usage_evidence,
+        };
+        let reduction = crate::heap_layout_bound::bound(&reduction, budget).map(|_| reduction);
+        CompletedNativeAcquisition {
+            checkpoint,
+            reduction,
+        }
     }
 }

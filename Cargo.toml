@@ -40,3 +40,4 @@ unicode-normalization = "0.1"
 ureq = { version = "2", features = ["json"] }
 webpki-roots = "0.26.11"
 zeroize = { version = "1", features = ["alloc"] }
+zstd = { version = "0.13", default-features = false, features = ["experimental"] }

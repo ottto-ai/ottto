@@ -1,7 +1,7 @@
 //! Transcript roots are registration metadata, never account evidence.
 use crate::snapshots::SnapshotSource;
 use anyhow::{Context, Result};
-use ottto_core::FileClaudeConfigSlotSettingsStore;
+use ottto_core::{FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn scan_roots(
@@ -17,6 +17,37 @@ pub(crate) fn scan_roots(
         Vec::new()
     };
     Ok(compose_roots(source, home, codex_homes, &claude_homes))
+}
+
+/// Roots for collectors that run without an agent-status collection, such as
+/// context composition. Codex slot homes come from accepted registrations,
+/// the homes the status collection hands the session sink; running-process
+/// homes are not probed. Registrations are read without credentials.
+///
+/// Unlike the status collection, an unreadable registration or slot home is an
+/// error: a collector that replaces whole aggregates must not mistake a
+/// missing root for removed transcripts.
+pub(crate) fn registered_scan_roots(source: SnapshotSource, home: &Path) -> Result<Vec<PathBuf>> {
+    let codex_homes = if source == SnapshotSource::Codex {
+        registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())?
+    } else {
+        Vec::new()
+    };
+    scan_roots(source, home, &codex_homes)
+}
+
+fn registered_codex_homes(store: &FileCodexAccountSlotSettingsStore) -> Result<Vec<PathBuf>> {
+    store
+        .registered_bindings()
+        .context("read registered Codex transcript homes")?
+        .into_iter()
+        .filter(|binding| binding.accepted)
+        .map(|binding| {
+            store
+                .slot_home(&binding.slot_id)
+                .context("resolve registered Codex transcript home")
+        })
+        .collect()
 }
 
 fn compose_roots(
