@@ -3773,6 +3773,13 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    // Identical-input terminal fixture keeps the pre-elimination row lifetime
+    // in its BASE arm. No production switch or persisted state is added.
+    static RETAIN_ALL_CLAUDE_PROVEN_ROWS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Replace transcript-only Claude usage with the exact union of transcript
 /// responses and locally reported API-request occurrences, but only after a
 /// complete filesystem census and an exact enhanced-trace ownership join.
@@ -4038,8 +4045,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let legacy_exclusions = derive_claude_legacy_usage_exclusions(
             &complete_families,
             &index.claude_usage_family_pending,
-            api_report,
-            trace_report,
+            legacy_request_owners.as_ref(),
         );
         for (root_session_id, members) in &complete_families {
             let Some(base_pending) = index.claude_usage_family_pending.get(root_session_id) else {
@@ -4070,7 +4076,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             {
                 continue;
             }
-            let Some(family) = prove_claude_usage_family(
+            let Some(mut family) = prove_claude_usage_family(
                 root_session_id,
                 members,
                 &pending,
@@ -4080,6 +4086,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             ) else {
                 continue;
             };
+            // Only page-item roots consume these rows below. Keep every
+            // proven key and witness for rebind, retention and rearm.
+            let retain_rows = item_roots.contains(root_session_id);
+            #[cfg(test)]
+            let retain_rows =
+                retain_rows || RETAIN_ALL_CLAUDE_PROVEN_ROWS_FOR_TEST.with(std::cell::Cell::get);
+            if !retain_rows {
+                family.rows_by_member = BTreeMap::new();
+            }
             proven.insert(root_session_id.clone(), family);
         }
         reconstructed = index
@@ -5322,10 +5337,9 @@ struct ClaudeLegacyRequestOwner {
 fn derive_claude_legacy_usage_exclusions(
     complete_families: &BTreeMap<String, BTreeSet<String>>,
     pending_by_root: &BTreeMap<String, ClaudeUsageFamilyPending>,
-    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
-    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
 ) -> BTreeMap<String, ClaudeLegacyUsageExclusion> {
-    let Some(request_owners) = claude_legacy_request_owners(api_report, trace_report) else {
+    let Some(request_owners) = request_owners else {
         return BTreeMap::new();
     };
     let sequences = complete_families
@@ -5393,7 +5407,7 @@ fn derive_claude_legacy_usage_exclusions(
         let Some(evidence_fingerprint) = claude_legacy_exclusion_evidence_fingerprint(
             child_root,
             &excluded_request_id_hashes,
-            &request_owners,
+            request_owners,
         ) else {
             continue;
         };
@@ -5442,7 +5456,15 @@ fn claude_legacy_request_owners_from_rows<'a>(
                     .map(|row| claude_trace_owner_session_id(root_session_id, &row.agent_id)),
             )
             .collect::<BTreeSet<_>>();
-        let reduced = reduce_claude_usage_ledger(root_session_id, &members, api_rows, trace_rows)?;
+        // This graph reads request ids and fingerprints only; the canonical
+        // reducer can borrow rows instead of cloning their payload strings.
+        let reduced = reduce_claude_usage_ledger_with_rows(
+            root_session_id,
+            &members,
+            api_rows,
+            trace_rows,
+            |row| row,
+        )?;
         let trace_by_request = trace_rows
             .iter()
             .map(|row| (row.request_id.as_str(), row))
@@ -41742,8 +41764,7 @@ mod tests {
         let exclusions = derive_claude_legacy_usage_exclusions(
             &complete_families,
             &pending_by_root,
-            &api_report,
-            &trace_report,
+            claude_legacy_request_owners(&api_report, &trace_report).as_ref(),
         );
         assert!(!exclusions.contains_key(ancestor));
         assert!(
