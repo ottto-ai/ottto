@@ -20461,6 +20461,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.latest_reasoning_effort.clone(),
         );
         if admitted.is_some() {
+            let v2 = codex_file_join::group_counting_is_v2(accumulator);
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.admitted(applied_tier);
                 // S10: the group proof sees only actually admitted usage.
@@ -20469,6 +20470,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                     last_usage.is_some(),
                     usage_event_identity.as_deref(),
                     accumulator.latest_turn_id.as_deref(),
+                    v2,
                 );
             }
         }

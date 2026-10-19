@@ -18,29 +18,11 @@ use sampled_scan::codex_cursor::{self as cursor, DisclosureTargets, OpenStamp};
 /// (`probe_bound`); a refusal then is strict `ProbeBudgetOrder` (R1-M1).
 const PROBE_BYTES: usize = 1024 * 1024;
 
-/// Counting evidence of a group's session view (§k.4): every member entry,
-/// twin, alias and protected-missing entries included. A placeholder until the
-/// counting writer's `codex_counting_version::group_evidence` lands (#603).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::snapshots) struct GroupCountingEvidence;
-impl crate::heap_layout_bound::HeapLayoutBound for GroupCountingEvidence {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
-
-/// #603 replaces this body with `codex_counting_version::group_evidence`.
-pub(in crate::snapshots) fn group_counting_evidence<'a>(
-    _entries: impl Iterator<Item = Option<&'a ScanIndexEntry>>,
-) -> GroupCountingEvidence {
-    GroupCountingEvidence
-}
-
-/// The ONE accumulator creation point for group replay (§k.4). The counting
-/// writer configures the group's counting decision here, once, at creation:
-/// `codex_counting_version::configure_group_once(&mut parser.accumulator,
-/// evidence)` (#603, H1).
+/// The ONE accumulator creation point for group replay (§k.4): the group's
+/// counting state is configured here, once, from every member's evidence
+/// (#603 `configure_group_once`). Only the reader is swapped per member, so
+/// no member reconfigures it. The legacy tee (`legacy_tee`) stays
+/// unconfigured: it is baseline evidence, not a second counted stream.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn new_group_parser(
     file: File,
@@ -50,10 +32,9 @@ pub(in crate::snapshots) fn new_group_parser(
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     artifacts: bool,
     context_curve: bool,
-    evidence: GroupCountingEvidence,
+    evidence: codex_counting_version::AckEvidence,
 ) -> Result<OwnedJsonlParser> {
-    let _ = evidence;
-    OwnedJsonlParser::new(
+    let mut parser = OwnedJsonlParser::new(
         file,
         &member.path,
         SnapshotSource::Codex,
@@ -63,7 +44,9 @@ pub(in crate::snapshots) fn new_group_parser(
         ledgers,
         artifacts,
         context_curve,
-    )
+    )?;
+    codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
+    Ok(parser)
 }
 
 #[cfg(test)]
@@ -85,14 +68,15 @@ pub(in crate::snapshots) fn with_test_v2<T>(run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// The replay counts under V2 (§k.3). #603 replaces this body with
-/// `accumulator.codex_counting_v2()`; false while the cutover is None.
-pub(in crate::snapshots) fn group_counting_is_v2(_accumulator: &SnapshotAccumulator) -> bool {
+/// The replay counts under V2 (§k.3): the accumulator's own decision, made
+/// on the session's first owned record (false before it and while the
+/// cutover is None).
+pub(in crate::snapshots) fn group_counting_is_v2(accumulator: &SnapshotAccumulator) -> bool {
     #[cfg(test)]
     if TEST_V2.with(std::cell::Cell::get) {
         return true;
     }
-    false
+    accumulator.codex_counting_v2()
 }
 
 /// The group job's logical key: home, owner and the sorted member keys. A
@@ -206,7 +190,7 @@ pub(in crate::snapshots) struct GroupBoot {
     previous_receipts: BTreeMap<String, (Option<AppliedTierReceipt>, bool)>,
     receipt_scope: String,
     legacy_expected: BTreeMap<String, String>,
-    evidence: GroupCountingEvidence,
+    evidence: codex_counting_version::AckEvidence,
 }
 crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, headers, plan,
     probes, probed, ordered, probe_bound, probe_allowance, charge, previous_receipts,
@@ -235,11 +219,11 @@ impl GroupBoot {
                 previous_receipts.insert(key, receipt_state(Some(entry)));
             }
         }
-        let evidence = group_counting_evidence(
+        let evidence = codex_counting_version::group_evidence(
             group
                 .members
                 .iter()
-                .map(|member| index.files.get(&local_index_key(&member.path))),
+                .filter_map(|member| index.files.get(&local_index_key(&member.path))),
         );
         Self {
             key: job_key(&group),
@@ -920,6 +904,9 @@ fn member_eof(
         return Err(GroupEnd::Strict);
     };
     let mut join = replay.join.take().ok_or(GroupEnd::Strict)?;
+    // The version is decided on the first owned record, after the proof
+    // was built; the member-end rules follow it.
+    join.decide_v2(group_counting_is_v2(&active.parser.accumulator));
     join.end_member(end);
     if last {
         join.finish_group();

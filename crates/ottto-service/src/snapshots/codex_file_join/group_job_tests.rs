@@ -1,7 +1,9 @@
 //! P2 group StreamProof, ordinal domain and census fencing tests (§n P2).
 //! Every fixture is synthetic; no provider account content. Scaled budgets
 //! come from `codex_cursor::with_test_limits` only.
-use super::super::tests::{fixture, legacy_index, member, replay_group, scan, usage};
+use super::super::tests::{
+    counting_v2_fixture, fixture, legacy_index, member, replay_group, scan, usage,
+};
 use super::*;
 use crate::transcript_acquisition::Scope;
 use sampled_scan::codex_cursor::{with_test_limits, with_test_state_budget, Counters};
@@ -330,6 +332,9 @@ fn selection_skips_job_owned_entries() {
     eprintln!("CODEX_GROUP_PAGED counters={after:?}");
     assert_eq!(after.groups_started, 1, "one job, never restarted");
     assert!(after.jobs_paused > 0 && after.jobs_resumed > 0);
+    // #603: with the cutover inactive the group view is the inactive view
+    // and `counting_reusable` lets every unchanged pause resume.
+    assert_eq!(after.jobs_invalidated, 0, "{after:?}");
     assert!(
         after.join_in_progress_members > 0,
         "selected members of the paused job are skipped, not read again"
@@ -1472,4 +1477,66 @@ fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
     assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     fs::remove_dir_all(root).unwrap();
+}
+
+/// #603 integration: the group parser is configured once from every member's
+/// evidence and the proof follows the accumulator's own V2 decision (made on
+/// the first owned record, after the proof was built). The #603 fixture's UI
+/// is unbound-span, which §k.3 rule 5 holds under V2; inactive, it replays.
+#[test]
+fn counting_v2_decision_reaches_the_group_proof() {
+    let (root, _) = counting_v2_fixture();
+    assert!(replay_group(group_of(&root), None, &ScanIndex::default()).is_ok());
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    assert_eq!(
+        refused(replay_group(group_of(&root), None, &ScanIndex::default())),
+        Some((JoinRefusal::V2UnboundUi, 1))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// #603 integration (K8 for groups): with the cutover active, a paused V2
+/// group resumes only while `configure_group_once` would still pick its
+/// rule from every member's current entry. A Legacy ACK on any member, here
+/// the sealed first one, takes precedence and invalidates the job; a V2 mark
+/// there keeps it resuming.
+#[test]
+fn active_cutover_resume_follows_every_member_ack() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for legacy_ack in [false, true] {
+        let root = paged_corpus(if legacy_ack { "ack-legacy" } else { "ack-v2" });
+        let cache = Arc::new(SharedCache::default());
+        let _cutover = codex_counting_version::TestCutover::set(0);
+        let invalidated = with_test_limits(2048, 1024, 64, || {
+            let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+                counters(&cache).jobs_paused > 0
+            });
+            let key = local_index_key(&root.join("sessions/a.jsonl"));
+            let entry = index.files.entry(key).or_insert_with(|| {
+                serde_json::from_value(json!({
+                    "size_bytes": 1, "modified_unix_seconds": 1, "modified_unix_nanos": 1,
+                    "source_file_fingerprint": "source",
+                    "scan_identity_version": LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+                }))
+                .unwrap()
+            });
+            entry
+                .last_snapshot_fingerprint
+                .get_or_insert_with(|| "acknowledged".into());
+            entry.codex_counting_v2 = !legacy_ack;
+            let before = counters(&cache);
+            pages(&root, index, &cache, || {
+                counters(&cache).jobs_resumed > before.jobs_resumed
+            });
+            counters(&cache).jobs_invalidated - before.jobs_invalidated
+        });
+        assert_eq!(
+            invalidated,
+            u64::from(legacy_ack),
+            "legacy_ack: {legacy_ack}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

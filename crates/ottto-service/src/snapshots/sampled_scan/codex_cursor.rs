@@ -526,27 +526,22 @@ pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &Sca
     crate::snapshots::codex_counting_version::singleton_view(candidate, index)
 }
 
-/// A group's counting view (§k.4, §5.2 rule 3; R1-M2): built from every
-/// member's index entry, keyed by member path, so a counting change on any
-/// member (not only the live one) changes the group decision at start,
-/// resume, emission and in the memo digest. It is an opaque digest: for a
-/// group job `counting_reusable` must stay digest equality (or use its own
-/// predicate over `group_counting_evidence`), never parse this view.
+/// A group's counting view (§k.4, §5.2 rule 3; R1-M2; #603): what
+/// `configure_group_once` would configure now from every member's index
+/// entry (`codex_counting_version::group_view`, the same evidence as
+/// `group_evidence` at boot). A counting change on any member, not only the
+/// live one, changes it; `counting_reusable` decides resume and emission
+/// against it exactly as for a singleton (any member's Legacy ACK takes
+/// precedence).
 pub(in crate::snapshots) fn group_counting_view<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
 ) -> String {
-    let mut views = members
-        .into_iter()
-        .map(|member| (local_index_key(&member.path), counting_view(member, index)))
-        .collect::<Vec<_>>();
-    views.sort();
-    let mut parts = vec!["codex_group_counting:v1".to_owned()];
-    for (key, view) in views {
-        parts.push(key);
-        parts.push(view);
-    }
-    sha256_hex_owned(&parts)
+    crate::snapshots::codex_counting_version::group_view(
+        members
+            .into_iter()
+            .filter_map(|member| index.files.get(&local_index_key(&member.path))),
+    )
 }
 
 /// The counting view a job is decided under: a group's over all members.
