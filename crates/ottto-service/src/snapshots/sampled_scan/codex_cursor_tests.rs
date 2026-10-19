@@ -3241,6 +3241,11 @@ fn census(
 /// parse of the same files and sidecar does, and, with `usage`, publishes
 /// the same created-thread usage. `usage` is false only where the warm scan
 /// legitimately skips an unchanged admitted file that a cold scan publishes.
+///
+/// `sticky` names sessions the warm index still blocks although a cold parse
+/// does not: the index drops a state-only block only when the session
+/// publishes a snapshot, so a usage-free cure leaves it (pre-existing index
+/// rule, not memo state). Each must be warm-only; every other id matches.
 fn assert_oracle(
     home: &CreatedThreadHome,
     cache: &SharedCache,
@@ -3248,11 +3253,21 @@ fn assert_oracle(
     scan: &SourceScanResult,
     n: i64,
     usage: bool,
+    sticky: &[&str],
 ) {
     let (oracle_index, oracle) = home.oracle(n);
+    let (counts, mut blocked) = census(index, scan);
+    let (oracle_counts, oracle_blocked) = census(&oracle_index, &oracle);
+    for id in sticky {
+        assert!(
+            blocked.remove(*id) && !oracle_blocked.contains(*id),
+            "generation {n}: {id} sticky: {}",
+            counters(cache)
+        );
+    }
     assert_eq!(
-        census(index, scan),
-        census(&oracle_index, &oracle),
+        (counts, blocked),
+        (oracle_counts, oracle_blocked),
         "generation {n}: {}",
         counters(cache)
     );
@@ -3291,7 +3306,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true);
+    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
     // NC1: unchanged, the hold stays quiet: two exact-stamp hits, each
     // disclosing what a cold parse does.
     for n in 1..=2 {
@@ -3302,7 +3317,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
             "{}",
             counters(&cache)
         );
-        assert_oracle(&home, &cache, &next, &quiet, n, true);
+        assert_oracle(&home, &cache, &next, &quiet, n, true, &[]);
         index = next;
     }
     home.flush_from(3);
@@ -3319,7 +3334,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
         "admitted: {}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &cured, 3, true);
+    assert_oracle(&home, &cache, &index, &cured, 3, true, &[]);
     assert_admitted_once(&home, &cache, index, &cured, 4);
 }
 
@@ -3345,7 +3360,7 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true);
+    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
     home.project(home.bytes(3), 3);
     let (index, woken) = home.generation(index, &cache, 1);
     assert_eq!(
@@ -3370,7 +3385,7 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
         "cured, not re-held: {}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &woken, 1, true);
+    assert_oracle(&home, &cache, &index, &woken, 1, true, &[]);
 }
 
 /// B1 second symptom (N1c): a state-declared created thread whose sidecar
@@ -3398,12 +3413,12 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() 
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true);
+    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
     let entry = home.memo_entry(&cache).expect("recorded entry");
     assert_eq!(entry.parent_ref(), Some(SPAWN_PARENT));
     let (index, quiet) = home.generation(index, &cache, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    assert_oracle(&home, &cache, &index, &quiet, 1, true);
+    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
     // The turn context flushes past the projection: the bind no longer
     // matches the file.
     let mut file = OpenOptions::new().append(true).open(&home.path).unwrap();
@@ -3416,7 +3431,7 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() 
         counters(&cache)
     );
     assert!(created_usage(&grown).is_empty(), "{}", counters(&cache));
-    assert_oracle(&home, &cache, &index, &grown, 2, true);
+    assert_oracle(&home, &cache, &index, &grown, 2, true, &[]);
     assert_eq!(
         counter(&cache, |c| c.memo_records),
         2,
@@ -3428,7 +3443,7 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() 
     let (index, unchanged) = home.generation(index, &cache, 3);
     assert!(created_usage(&unchanged).is_empty());
     assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
-    assert_oracle(&home, &cache, &index, &unchanged, 3, true);
+    assert_oracle(&home, &cache, &index, &unchanged, 3, true, &[]);
 }
 
 const ORPHAN: &str = "01a0dead-49cf-7460-9fd7-f7dbfd2f05e4";
@@ -3479,12 +3494,12 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true);
+    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
     // Unchanged: the orphan hits; the admitted created thread is skipped,
     // which a cold scan republishes, so only the census is compared.
     let (index, quiet) = home.generation(index, &cache, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    assert_oracle(&home, &cache, &index, &quiet, 1, false);
+    assert_oracle(&home, &cache, &index, &quiet, 1, false, &[]);
     // The state census no longer holds any created thread.
     rusqlite::Connection::open(home.codex().join("state_5.sqlite"))
         .unwrap()
@@ -3500,10 +3515,14 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
         "no stale hit: {}",
         counters(&cache)
     );
-    assert!(
-        !index.codex_state_only_blocked_session_ids.contains(ORPHAN),
+    // Not held again: the miss re-read the orphan as an ordinary session.
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &cured, 2, true);
+    // Its usage-free cure publishes nothing, so the warm index keeps the
+    // block a cold parse never sets.
+    assert_oracle(&home, &cache, &index, &cured, 2, true, &[ORPHAN]);
 }
