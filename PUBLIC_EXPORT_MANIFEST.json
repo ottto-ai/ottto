@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 716,
-  "content_sha256": "1ded6669947fc57ee90e8f73847234069be74eab640176049a09c597636201d7",
+  "content_sha256": "fe00692266dfb4a15a98c70a31ecc1e46d3621661d8fc1cc14a6cf1699e93552",
   "files": [
     {
       "executable": false,
@@ -1287,8 +1287,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "dd18f048e311d1bfcbb3cb23d12b1c20a67effa572ec092d57b749dbe3209571",
-      "size_bytes": 2766294
+      "sha256": "b80a84717a44af6527652e57ba4f101192ecfc5b051efb70ff3abedcc2642e32",
+      "size_bytes": 2766333
     },
     {
       "executable": false,
@@ -1427,8 +1427,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join.rs",
-      "sha256": "833dd7c9f911118d7816893de704a644e74b4976af4862ee3e1b544871ca8e18",
-      "size_bytes": 159596
+      "sha256": "4bae4d8a486cae5b5959605aab50fb3f60c309a4f58e1b7de11a92cc83c6291e",
+      "size_bytes": 159732
     },
     {
       "executable": false,
@@ -1441,8 +1441,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join/group_job_tests.rs",
-      "sha256": "9bcc3f3513325ca8c6ad722c8f7a0cd04786f15c197957453fab9dc347b8b52a",
-      "size_bytes": 74160
+      "sha256": "2bbbbc1bc473c51142f1eec69e7782db91a89333055a91aad8909af7e2be22e5",
+      "size_bytes": 75431
     },
     {
       "executable": false,
@@ -1546,15 +1546,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "43811cc140be86f82020d4e787d58e49c06d232e4e1509886cd4e05eb5deca85",
-      "size_bytes": 142683
+      "sha256": "6a65e3578bb20398941878036fc583e1173df580d9bf7667ffd0f398f7f88a32",
+      "size_bytes": 144712
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "d0c8ffceabb9d32911c5a2c26ae634a936c37bfda30720b9993bf29020aed710",
-      "size_bytes": 104855
+      "sha256": "905c97531b757cd7dea338d0838684322f8ef9ff2e4eba7948e705548c595e3d",
+      "size_bytes": 122198
     },
     {
       "executable": false,

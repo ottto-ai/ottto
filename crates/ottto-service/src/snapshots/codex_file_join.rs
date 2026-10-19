@@ -1344,12 +1344,14 @@ pub(super) fn plan_group(
     keys: &[String],
 ) -> std::result::Result<GroupPlan, JoinRefusal> {
     let n = headers.len();
-    for i in 0..n {
-        for j in i + 1..n {
-            if headers[i].digest == headers[j].digest && headers[i].size == headers[j].size {
-                return Err(JoinRefusal::CandidateCopy);
-            }
-        }
+    // Two members with equal line-0 bytes (digest) and equal size are one
+    // copied candidate; one set lookup per member (O(n)).
+    let mut seen = std::collections::HashSet::with_capacity(n);
+    if !headers
+        .iter()
+        .all(|header| seen.insert((header.digest.as_str(), header.size)))
+    {
+        return Err(JoinRefusal::CandidateCopy);
     }
     let ordinal = headers.first().is_some_and(MemberHeader::ordinal);
     if headers.iter().any(|header| header.ordinal() != ordinal) {

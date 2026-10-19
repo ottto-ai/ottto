@@ -14160,13 +14160,14 @@ impl OwnedSourceScan {
                     // of its own (it pages through the cursor like any group).
                     // Round 3: so does a group whose probes outran a page's
                     // remaining singleton budget (`ProbeBudgetOrder`).
+                    let fence = sampled_scan::codex_cursor::census_token(index);
                     let own_page = |group: &codex_file_join::Group| {
                         group.members.len() > file_limit
                             || sampling.as_ref().is_some_and(|context| {
                                 context.cache.group_own_page(
                                     &context.namespace,
                                     &codex_file_join::job_key(group),
-                                    sampled_scan::codex_cursor::census_token(index).as_deref(),
+                                    fence.as_deref(),
                                 )
                             })
                     };
