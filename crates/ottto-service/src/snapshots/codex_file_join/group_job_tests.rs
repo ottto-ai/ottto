@@ -1,10 +1,10 @@
 //! P2 group StreamProof, ordinal domain and census fencing tests (§n P2).
 //! Every fixture is synthetic; no provider account content. Scaled budgets
 //! come from `codex_cursor::with_test_limits` only.
-use super::super::tests::{fixture, member, replay_group, scan, usage};
+use super::super::tests::{fixture, legacy_index, member, replay_group, scan, usage};
 use super::*;
 use crate::transcript_acquisition::Scope;
-use sampled_scan::codex_cursor::{with_test_limits, Counters};
+use sampled_scan::codex_cursor::{with_test_limits, with_test_state_budget, Counters};
 use sampled_scan::SharedCache;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -601,10 +601,11 @@ fn binding_requires_unique_logical_uuid_offset_and_chain() {
         plan(&[origin.clone(), base(OWNER, 3, 4)]),
         Err(JoinRefusal::HistoryBase)
     );
-    // A thread id no member's file carries, or two members carry.
+    // A thread id no member's file carries (a predecessor outside the
+    // inventory, e.g. an unscanned `.zst`), or two members carry.
     assert_eq!(
         plan(&[origin.clone(), base(UNKNOWN, 3, 3)]),
-        Err(JoinRefusal::AmbiguousPredecessor)
+        Err(JoinRefusal::MissingPredecessor)
     );
     let twin = (
         ordinals(vec![meta(OWNER, "2026-10-01T10:30:00Z", json!({}))], 0).remove(0),
@@ -693,6 +694,24 @@ fn fork_first_member_held_from_headers() {
     };
     assert_eq!(reason, JoinRefusal::ForkedFromOtherSession);
     fs::remove_dir_all(root).unwrap();
+    // A first member continuing a thread outside the inventory (typically a
+    // compressed predecessor) is a missing predecessor, never a fork (R1-M3).
+    let continued = meta(
+        OWNER,
+        "2026-10-01T10:00:00Z",
+        json!({"history_base": {"thread_id": UNKNOWN,
+            "end_ordinal_exclusive": 3, "end_byte_offset": 500}}),
+    );
+    assert_eq!(
+        plan(&[
+            (continued, "a.jsonl".into()),
+            (
+                meta(OWNER, "2026-10-01T10:30:00Z", json!({})),
+                "b.jsonl".into()
+            )
+        ]),
+        Err(JoinRefusal::MissingPredecessor)
+    );
 }
 
 #[test]
@@ -735,4 +754,554 @@ fn origins_with_different_ownership_classification_held() {
         (origin("2026-10-01T10:30:00Z", "cli"), "b.jsonl".into()),
     ])
     .is_ok());
+}
+
+fn append_rows(path: &Path, rows: &[Value]) {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    for row in rows {
+        file.write_all((serde_json::to_string(row).unwrap() + "\n").as_bytes())
+            .unwrap();
+    }
+}
+
+fn completions(cache: &SharedCache) -> u64 {
+    let counters = counters(cache);
+    counters.jobs_certified + counters.jobs_uncertified
+}
+
+fn fingerprints(scan: &SourceScanResult) -> BTreeSet<String> {
+    scan.snapshots
+        .iter()
+        .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+        .collect()
+}
+
+fn input_totals(scan: &SourceScanResult) -> BTreeSet<u64> {
+    scan.snapshots
+        .iter()
+        .map(|snapshot| snapshot.input_tokens)
+        .collect()
+}
+
+/// Two members of `OWNER`, each larger than the scaled singleton budget
+/// (`with_test_limits(2048, 1024, 64)`): a paged group job.
+fn paged_corpus(tag: &str) -> PathBuf {
+    let root = temp_root(tag);
+    write_rows(
+        &root.join("sessions/a.jsonl"),
+        &chain_rows(OWNER, "a", "2026-10-01T10:00:00Z", 0, 30),
+    );
+    write_rows(
+        &root.join("sessions/b.jsonl"),
+        &chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30),
+    );
+    root
+}
+
+/// Sampled pages until `done`; returns the last page and every page before.
+fn pages(
+    root: &Path,
+    mut index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    mut done: impl FnMut() -> bool,
+) -> (ScanIndex, SourceScanResult, Vec<SourceScanResult>) {
+    let mut earlier = Vec::new();
+    for _ in 0..256 {
+        let (next, result) = sampled(root, index, 10, cache);
+        index = next;
+        if done() {
+            return (index, result, earlier);
+        }
+        earlier.push(result);
+    }
+    panic!("pages did not reach the condition: {:?}", counters(cache));
+}
+
+#[test]
+fn line_loss_before_refusal_is_strict_and_not_memoized() {
+    let root = temp_root("loss");
+    write_rows(
+        &root.join("sessions/a.jsonl"),
+        &chain_rows(OWNER, "a", "2026-10-01T10:00:00Z", 0, 2),
+    );
+    // b's second native is missing: the chain gaps at its third.
+    let mut rows = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 20, 3);
+    rows.remove(3);
+    rows.remove(3);
+    write_rows(&root.join("sessions/b.jsonl"), &rows);
+    assert_eq!(
+        refused(replay_group(group_of(&root), None, &ScanIndex::default())),
+        Some((JoinRefusal::Gap, 1)),
+        "without loss the gap is terminal proof debt"
+    );
+    // The same gap after a skipped (malformed) line may be the loss's own
+    // effect: strict, never settleable or memoized (R1-B1).
+    let body = rows
+        .iter()
+        .enumerate()
+        .map(|(at, row)| {
+            let line = serde_json::to_string(row).unwrap() + "\n";
+            if at == 3 {
+                "{\"type\": \"token_usage_record\", \"payload\": \n".to_owned() + &line
+            } else {
+                line
+            }
+        })
+        .collect::<String>();
+    fs::write(root.join("sessions/b.jsonl"), body).unwrap();
+    assert!(matches!(
+        replay_group(group_of(&root), None, &ScanIndex::default()),
+        Err(GroupEnd::Strict)
+    ));
+    let cache = Arc::new(SharedCache::default());
+    let (index, result) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let after = counters(&cache);
+    assert_eq!(after.memo_records, 0, "{after:?}");
+    assert!(
+        after.join_terminal_debt.iter().all(|count| *count == 0),
+        "{after:?}"
+    );
+    assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
+    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
+    let root = refused_fixture();
+    let cache = Arc::new(SharedCache::default());
+    let overlap = JoinRefusal::Overlap.slot();
+    let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let first = counters(&cache);
+    assert_eq!(first.join_terminal_debt[overlap], 1, "{first:?}");
+    assert_eq!(first.memo_records, 1, "{first:?}");
+    // The live member grows; an append cannot cure an overlap before it.
+    append_rows(
+        &root.join("sessions/b.jsonl"),
+        &[turn("44444444-aaaa-4aaa-8aaa-444444444444")],
+    );
+    index.traversal = None;
+    let (index, again) = sampled(&root, index, 10, &cache);
+    let after = counters(&cache);
+    assert_eq!(after.group_memo_hits, 1, "{after:?}");
+    assert_eq!(
+        after.join_terminal_debt[overlap], 1,
+        "a memo hit replays no byte: {after:?}"
+    );
+    assert!(again.snapshots.is_empty());
+    assert!(again.census_complete, "re-disclosed as settleable residue");
+    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
+    let root = temp_root("curable");
+    let first = "11111111-aaaa-4aaa-8aaa-111111111111";
+    let second = "22222222-aaaa-4aaa-8aaa-222222222222";
+    write_rows(
+        &root.join("sessions/a.jsonl"),
+        &[
+            meta(OWNER, "2026-10-01T10:00:00Z", json!({})),
+            turn(first),
+            native(OWNER, "r-a", 100, 100),
+            ui(100, 100, "2026-10-01T10:00:30Z"),
+        ],
+    );
+    write_rows(
+        &root.join("sessions/b.jsonl"),
+        &[
+            meta(OWNER, "2026-10-01T10:01:00Z", json!({})),
+            turn(first),
+            native(OWNER, "r-b", 200, 300),
+            ui(200, 300, "2026-10-01T10:01:30Z"),
+            turn(second),
+            ui(50, 350, "2026-10-01T10:02:30Z"),
+        ],
+    );
+    let unmatched = JoinRefusal::UiUnmatched.slot();
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let refused = counters(&cache);
+    assert_eq!(refused.join_terminal_debt[unmatched], 1, "{refused:?}");
+    assert_eq!(refused.memo_records, 1, "recorded with an exact stamp");
+    // Unchanged: the next generation does not re-read the group (R2-M1).
+    index.traversal = None;
+    let (mut index, _) = sampled(&root, index, 10, &cache);
+    let unchanged = counters(&cache);
+    assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
+    assert_eq!(unchanged.join_terminal_debt[unmatched], 1, "{unchanged:?}");
+    // Any growth of the live member may cure it: one attempt.
+    append_rows(
+        &root.join("sessions/b.jsonl"),
+        &[turn("55555555-aaaa-4aaa-8aaa-555555555555")],
+    );
+    index.traversal = None;
+    let (_, _) = sampled(&root, index, 10, &cache);
+    let grown = counters(&cache);
+    assert_eq!(grown.group_memo_hits, 1, "{grown:?}");
+    assert_eq!(grown.join_terminal_debt[unmatched], 2, "{grown:?}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = paged_corpus("parked");
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        // The first pause (inside sealed member a) cannot fit the scaled
+        // state budget: strict `JoinStateBound`, parked.
+        let (mut index, first) =
+            with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache));
+        let bound = counters(&cache);
+        assert_eq!(bound.jobs_state_bound, 1, "{bound:?}");
+        assert_eq!(bound.groups_started, 1, "{bound:?}");
+        assert!(first.snapshots.is_empty());
+        assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+        // A new generation without a capacity or input change: no attempt.
+        index.traversal = None;
+        let (mut index, _) = sampled(&root, index, 10, &cache);
+        let parked = counters(&cache);
+        assert_eq!(parked.parked_hits, 1, "{parked:?}");
+        assert_eq!(
+            parked.groups_started, 1,
+            "never retried per generation (R2-H1)"
+        );
+        // Growth of the live member keeps it parked.
+        append_rows(
+            &root.join("sessions/b.jsonl"),
+            &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 2)[1..],
+        );
+        index.traversal = None;
+        let (mut index, _) = sampled(&root, index, 10, &cache);
+        let grown = counters(&cache);
+        assert_eq!(grown.parked_hits, 2, "{grown:?}");
+        assert_eq!(grown.groups_started, 1, "{grown:?}");
+        // A sealed member's change wakes it: one new attempt.
+        append_rows(
+            &root.join("sessions/a.jsonl"),
+            &[turn("66666666-aaaa-4aaa-8aaa-666666666666")],
+        );
+        index.traversal = None;
+        let _ = sampled(&root, index, 10, &cache);
+        let woken = counters(&cache);
+        assert_eq!(woken.parked_hits, 2, "{woken:?}");
+        assert_eq!(woken.groups_started, 2, "{woken:?}");
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_continuation_during_job_invalidates_and_never_emits_as_singleton() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = paged_corpus("rotation");
+    let cache = Arc::new(SharedCache::default());
+    let done = with_test_limits(2048, 1024, 64, || {
+        let (mut index, first, _) = pages(&root, ScanIndex::default(), &cache, || {
+            counters(&cache).jobs_paused > 0
+        });
+        assert!(
+            first.snapshots.is_empty(),
+            "a paused group publishes nothing"
+        );
+        // A continuation appears while the job is paused; the next walk's
+        // complete inventory sees it.
+        write_rows(
+            &root.join("sessions/c.jsonl"),
+            &chain_rows(OWNER, "c", "2026-10-01T11:00:00Z", 600, 30),
+        );
+        index.traversal = None;
+        let (_, done, earlier) = pages(&root, index, &cache, || completions(&cache) > 0);
+        assert!(
+            earlier.iter().all(|page| page.snapshots.is_empty()),
+            "no member (the new one included) is emitted before the group"
+        );
+        done
+    });
+    let after = counters(&cache);
+    assert!(
+        after.jobs_invalidated >= 1,
+        "invalidated at resume: {after:?}"
+    );
+    assert_eq!(
+        after.groups_started, 2,
+        "one restart with N+1 members: {after:?}"
+    );
+    let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
+    assert_eq!(unpaged.snapshots.len(), 3, "one alias per member");
+    assert_eq!(fingerprints(&done), fingerprints(&unpaged));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_member_growth_mid_job_publishes_frozen_prefix_then_replaces_it() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = paged_corpus("growth");
+    let (_, prefix) = scan(&root, ScanIndex::default(), 10);
+    let cache = Arc::new(SharedCache::default());
+    let (first, second) = with_test_limits(2048, 1024, 64, || {
+        // Page until the paused job reads the live (last) member.
+        let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+            cache.paused_group_position() == Some(1)
+        });
+        append_rows(
+            &root.join("sessions/b.jsonl"),
+            &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 5)[1..],
+        );
+        let (mut index, first, earlier) = pages(&root, index, &cache, || completions(&cache) > 0);
+        assert!(earlier.iter().all(|page| page.snapshots.is_empty()));
+        // The appended tail stays pending; the next generation replaces
+        // the body.
+        index.traversal = None;
+        let (_, second, _) = pages(&root, index, &cache, || completions(&cache) > 1);
+        (first, second)
+    });
+    assert!(!first.snapshots.is_empty());
+    assert_eq!(
+        input_totals(&first),
+        input_totals(&prefix),
+        "the first body covers exactly the frozen prefix"
+    );
+    let (_, full) = scan(&root, ScanIndex::default(), 10);
+    assert_ne!(input_totals(&full), input_totals(&prefix));
+    assert_eq!(
+        input_totals(&second),
+        input_totals(&full),
+        "the replacing body counts the prefix once"
+    );
+    assert_eq!(counters(&cache).groups_started, 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = paged_corpus("restart");
+    let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
+    with_test_limits(2048, 1024, 64, || {
+        let before = Arc::new(SharedCache::default());
+        let (mut index, first, _) = pages(&root, ScanIndex::default(), &before, || {
+            counters(&before).jobs_paused > 0
+        });
+        assert!(first.snapshots.is_empty());
+        assert!(
+            index.codex_state_only_blocked_session_ids.contains(OWNER),
+            "F8: no state-only body for the owner of a paused group"
+        );
+        // Restart: the RAM cache and its paused job are gone; the index is
+        // saved and loaded.
+        drop(before);
+        let path = root.join("index.json");
+        index.save(&path).unwrap();
+        let index = ScanIndex::load(&path).unwrap();
+        assert!(
+            index.codex_state_only_blocked_session_ids.contains(OWNER),
+            "F8 across a restart"
+        );
+        let after = Arc::new(SharedCache::default());
+        let (_, done, earlier) = pages(&root, index, &after, || completions(&after) > 0);
+        assert!(
+            earlier.iter().all(|page| page
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.source_session_id != OWNER)),
+            "no body for the in-progress owner before its group completes"
+        );
+        let counted = counters(&after);
+        assert_eq!(
+            counted.groups_started, 1,
+            "the group re-boots once: {counted:?}"
+        );
+        assert_eq!(completions(&after), 1);
+        assert_eq!(
+            fingerprints(&done),
+            fingerprints(&unpaged),
+            "exactly one body"
+        );
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
+    let root = refused_fixture();
+    let overlap = JoinRefusal::Overlap.slot();
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
+    assert!(first.census_complete, "{first:?}");
+    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+    let path = root.join("index.json");
+    index.save(&path).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.codex_state_only_blocked_session_ids.contains(OWNER));
+    assert_eq!(
+        loaded
+            .traversal
+            .as_ref()
+            .map(|traversal| &traversal.residue),
+        index.traversal.as_ref().map(|traversal| &traversal.residue),
+        "residue survives save and load"
+    );
+    // A new process: no memo, one bounded re-attempt, the same settleable
+    // debt and the same blocked owner.
+    loaded.traversal = None;
+    let restarted = Arc::new(SharedCache::default());
+    let (index, again) = sampled(&root, loaded, 10, &restarted);
+    assert!(again.snapshots.is_empty());
+    assert!(again.census_complete, "{again:?}");
+    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+    assert_eq!(counters(&restarted).join_terminal_debt[overlap], 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn upload_context_change_invalidates_paused_group() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = paged_corpus("scope");
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+            counters(&cache).jobs_paused > 0
+        });
+        // §p (R1-M1): receipts must not mix upload scopes.
+        index.active_upload_context_fingerprint = Some("other-upload-context".into());
+        let (_, done, _) = pages(&root, index, &cache, || completions(&cache) > 0);
+        assert!(!done.snapshots.is_empty());
+    });
+    let after = counters(&cache);
+    assert!(after.jobs_invalidated >= 1, "{after:?}");
+    assert_eq!(after.groups_started, 2, "{after:?}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unchanged_group_releases_persisted_blocked_owner() {
+    let (root, _) = fixture();
+    let previous = ScanIndex::default();
+    let (mut index, mut result) = scan(&root, previous.clone(), 2);
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+    result.finish_codex_capture_boundary(&mut index);
+    let accepted = result
+        .snapshots
+        .iter()
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+    let path = root.join("index.json");
+    settled.save(&path).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    // A block a previous process persisted (F8) without its RAM provenance.
+    loaded
+        .codex_state_only_blocked_session_ids
+        .insert(OWNER.to_owned());
+    let (index, restarted) = scan(&root, loaded, 2);
+    assert_eq!(
+        restarted.semantic_noop_count, 2,
+        "the group boots unchanged"
+    );
+    assert!(
+        !index.codex_state_only_blocked_session_ids.contains(OWNER),
+        "R1-L3: no job or debt holds the owner"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn group_with_legacy_tee_is_byte_charged() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (root, inventory) = fixture();
+    let previous = legacy_index(&inventory, None);
+    let mut boot = GroupBoot::new(inventory.groups().into_values().next().unwrap(), &previous);
+    loop {
+        match boot.step(None, &previous) {
+            Boot::Pending => {}
+            Boot::Ready => break,
+            _ => panic!("the legacy group boots"),
+        }
+    }
+    let metadata = CodexTitleMetadata::default();
+    let mut job = boot
+        .into_job(JobInputs {
+            metadata: &metadata,
+            traces: None,
+            ledgers: None,
+            artifacts: false,
+            context_curve: false,
+            index: &previous,
+        })
+        .unwrap();
+    assert!(job.group.as_ref().unwrap().tee.is_some());
+    let no_scope = |_: &CandidateFile| None;
+    let inputs = StepInputs {
+        metadata: &metadata,
+        attribution: None,
+        artifacts: false,
+        context_curve: false,
+        live_scope: &no_scope,
+    };
+    assert!(matches!(
+        step_group(&mut job, &inputs),
+        GroupStep::Read(Ok(false))
+    ));
+    let cache = Arc::new(SharedCache::default());
+    let mut owned = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        &[root.join("sessions")],
+        previous,
+        "2026-10-06T23:00:00Z",
+        7,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
+    *owned.active_file = Some(job);
+    // R2-M2: the group read without the cursor is charged by bytes
+    // (`completed_bound`, tee inputs taken out), never refused by the
+    // per-line visit walk, so retained singleton copies survive.
+    assert!(owned.sampled_copy_budget() > 0);
+    let walked = owned
+        .active_file
+        .as_ref()
+        .and_then(|active| active.group.as_ref())
+        .and_then(|group| group.walked);
+    assert!(
+        walked.is_some_and(|(charge, _, _)| charge != usize::MAX),
+        "{walked:?}"
+    );
+    assert!(owned.sampled_copy_budget() > 0, "the E3 estimate");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn proof_charge_uses_proven_btree_fill() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut proof = StreamProof::new(OWNER.into(), false, vec![MemberPlan::default()]);
+    proof.responses.extend(0..100_000u64);
+    proof.ui.extend(0..100_000u64);
+    let charged = crate::heap_layout_bound::completed_bound(&proof, usize::MAX).unwrap();
+    // R2-M4: every non-root std B-tree node holds at least 5 entries.
+    let node = 256 + 12 * size_of::<usize>() + 11 * size_of::<u64>();
+    let ceiling = 2 * (100_000 / 5 + 1) * node + 64 * 1024;
+    assert!(charged <= ceiling, "{charged} > {ceiling}");
+    assert!(charged >= 2 * 100_000 * size_of::<u64>(), "{charged}");
 }
