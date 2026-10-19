@@ -3354,6 +3354,17 @@ pub struct ClaudeUnresolvedAccountDescriptorV1 {
     pub unresolved_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
+    /// Present only for one exact Claude Desktop account/organization session
+    /// folder pair; such a row is a daemon-selectable connect target. Absent
+    /// for account-only evidence, which never names an organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// Display only, on an exact pair row: the labels that folder pair's own
+    /// Desktop metadata states. Never identity or authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default)]
@@ -6250,6 +6261,9 @@ mod tests {
         let descriptor = ClaudeUnresolvedAccountDescriptorV1 {
             unresolved_id: "claude_unresolved_0123456789abcdef".to_string(),
             account_identifier_hash: Some("display-safe-hash".to_string()),
+            organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
             observed_at: Some("2026-08-04T12:00:00Z".to_string()),
             evidence: vec![
                 ClaudeUnresolvedAccountEvidenceKind::CliIdentity,
