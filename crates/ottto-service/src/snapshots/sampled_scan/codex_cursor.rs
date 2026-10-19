@@ -3108,11 +3108,28 @@ pub(in crate::snapshots) fn held_monotone(accumulator: &SnapshotAccumulator) -> 
 /// may be cured by an append, when the sidecar's rollout extent is ahead of
 /// the flushed file and the file catches up. Its memo entry hits only on the
 /// exact recorded stamp, so any growth re-reads it.
+///
+/// #635: a state-declared created thread whose rollout extent does not match
+/// the file binds no projection and no creation time, so its header is held
+/// as `AmbiguousFork`, not `NativeCreatedThread`: the same growth-curable
+/// hold. Memo eligibility only; admission is unchanged.
 pub(in crate::snapshots) fn growth_may_cure(accumulator: &SnapshotAccumulator) -> bool {
-    matches!(
-        accumulator.codex_ownership_boundary,
-        CodexOwnershipBoundary::NativeCreatedThread
-    ) && accumulator.codex_parent_session_ref.is_none()
+    match accumulator.codex_ownership_boundary {
+        CodexOwnershipBoundary::NativeCreatedThread => {
+            accumulator.codex_parent_session_ref.is_none()
+                && accumulator.codex_sidecar_projected_next_ordinal.is_none()
+        }
+        CodexOwnershipBoundary::AmbiguousFork => unbound_created_thread(accumulator),
+        _ => false,
+    }
+}
+
+/// A state-declared created thread with no trusted parent and no bound
+/// projection (#635).
+fn unbound_created_thread(accumulator: &SnapshotAccumulator) -> bool {
+    accumulator.codex_sidecar_created_thread
+        && accumulator.codex_sidecar_parent.is_none()
+        && accumulator.codex_parent_session_ref.is_none()
         && accumulator.codex_sidecar_projected_next_ordinal.is_none()
 }
 
@@ -3123,12 +3140,14 @@ pub(in crate::snapshots) fn memo_key(namespace: &Scope, key: &str) -> String {
 
 /// Every hold except an ambiguous fork (cured by peer parent evidence, which
 /// the entry's parent ledger records) also wakes on sidecar change. When in
-/// doubt the sidecar is kept as a wake input (K3).
+/// doubt the sidecar is kept as a wake input (K3). An unbound created
+/// thread's `AmbiguousFork` is cured by its projection, so it wakes too
+/// (#635).
 pub(in crate::snapshots) fn sidecar_wakes(accumulator: &SnapshotAccumulator) -> bool {
     !matches!(
         accumulator.codex_ownership_boundary,
         CodexOwnershipBoundary::AmbiguousFork
-    )
+    ) || unbound_created_thread(accumulator)
 }
 
 /// The path's full sidecar facts (K3): the non-reduction sidecar
