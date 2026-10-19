@@ -4059,6 +4059,7 @@ fn prepare_sync_source(
                 counts: SyncCounts::for_policy(0),
                 state: CollectorState::PolicyTombstone,
             },
+            None,
         )?;
         return Ok(None);
     }
@@ -4112,6 +4113,7 @@ fn prepare_sync_source(
                 counts: SyncCounts::for_policy(receipt_window_days),
                 state: CollectorState::Disabled(Some("disabled_by_admin".to_string())),
             },
+            None,
         )?;
         return Ok(None);
     }
@@ -5248,6 +5250,7 @@ fn finish_sync_source(
                         message: "backend shed the snapshot upload; honouring backoff",
                     },
                 },
+                scan_result.codex_counting_v2.as_deref(),
             )?;
             return Ok(());
         }
@@ -5273,6 +5276,7 @@ fn finish_sync_source(
                         disabled_reason.or_else(|| Some("disabled_by_admin".to_string())),
                     ),
                 },
+                scan_result.codex_counting_v2.as_deref(),
             )?;
             return Ok(());
         }
@@ -5449,6 +5453,7 @@ fn finish_sync_source(
                     .with_snapshot_terminal_counts(&index),
                     state,
                 },
+                scan_result.codex_counting_v2.as_deref(),
             );
             return Err(error.context(context));
         }
@@ -5640,6 +5645,7 @@ fn finish_sync_source(
                     .with_snapshot_terminal_counts(&index),
                 state: deferred_entity_state(resolved_permanent_rejections),
             },
+            scan_result.codex_counting_v2.as_deref(),
         );
         // Fully accounted permanent refusals finish transport successfully.
         // Their terminal health remains incomplete and none are marked accepted.
@@ -5669,6 +5675,7 @@ fn finish_sync_source(
                 .with_snapshot_terminal_counts(&index),
             state: CollectorState::Success,
         },
+        scan_result.codex_counting_v2.as_deref(),
     )?;
     if let Some(mut lease) = native_comparison_lease {
         lease.stage_window_after_save(
@@ -7613,13 +7620,14 @@ fn terminal_status_journal_path(
 
 #[cfg(test)]
 fn save_terminal_status_journal(path: &Path, request: &SnapshotStatusRequest) -> Result<()> {
-    save_terminal_status_journal_with_diagnostics(path, request, None)
+    save_terminal_status_journal_with_diagnostics(path, request, None, None)
 }
 
 fn save_terminal_status_journal_with_diagnostics(
     path: &Path,
     request: &SnapshotStatusRequest,
     diagnostic: Option<&CodexScanDiagnostics>,
+    codex_counting_v2: Option<&codex_scan_diagnostics::CountingV2Receipts>,
 ) -> Result<()> {
     #[derive(Serialize)]
     struct LocalJournal<'a> {
@@ -7627,6 +7635,10 @@ fn save_terminal_status_journal_with_diagnostics(
         receipt: &'a SnapshotStatusRequest,
         #[serde(skip_serializing_if = "Option::is_none")]
         local_codex_diagnostics: Option<&'a CodexScanDiagnostics>,
+        /// Borrowed from the scan result; absent when no configured counting
+        /// parse finished, never written as zero.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_codex_counting_v2: Option<&'a codex_scan_diagnostics::CountingV2Receipts>,
     }
     // One latest receipt already has stricter retention than the four-record
     // ceiling. Enforce the extension's byte cap before touching its journal.
@@ -7637,6 +7649,7 @@ fn save_terminal_status_journal_with_diagnostics(
     let journal = LocalJournal {
         receipt: request,
         local_codex_diagnostics: diagnostic,
+        local_codex_counting_v2: codex_counting_v2,
     };
     if request.last_scan_finished_at.is_none() {
         return Err(anyhow!("terminal status journal requires a finished scan"));
@@ -7678,6 +7691,7 @@ fn load_terminal_status_journal(path: &Path) -> Result<Option<SnapshotStatusRequ
     Ok(Some(request))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
@@ -7686,6 +7700,7 @@ fn report_status_with_fresh_relay_token(
     source: SnapshotSource,
     manifest_source: TerminalManifestSource<'_>,
     mut status: CollectorStatus<'_>,
+    codex_counting_v2: Option<&codex_scan_diagnostics::CountingV2Receipts>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     // This is the single terminal report boundary. Every terminal outcome
@@ -7726,9 +7741,12 @@ fn report_status_with_fresh_relay_token(
     // full disk or an unwritable support dir must not suppress the terminal
     // report itself. Remote truth never waits on local disk; the failure is
     // disclosed on the daemon's error log instead.
-    if let Err(error) =
-        save_terminal_status_journal_with_diagnostics(&journal_path, &request, diagnostic.as_ref())
-    {
+    if let Err(error) = save_terminal_status_journal_with_diagnostics(
+        &journal_path,
+        &request,
+        diagnostic.as_ref(),
+        codex_counting_v2,
+    ) {
         eprintln!(
             "local snapshot terminal status journal write failed for {}: {}",
             source.api_slug(),
@@ -8585,6 +8603,7 @@ mod tests {
                 codex_captured_tier_receipt: None,
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
+                codex_counting_v2: false,
                 effective_upload_body_witness_revision: 0,
             },
         );
@@ -15140,6 +15159,7 @@ mod tests {
                 counts: SyncCounts::for_policy(30),
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("report status with fresh relay token");
 
@@ -15238,6 +15258,7 @@ mod tests {
                 counts,
                 state,
             },
+            None,
         )
         .expect("terminal receipt");
         let requests = captured.lock().expect("captured requests").clone();
@@ -15670,6 +15691,7 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("report parser liveness failure");
 
@@ -16436,12 +16458,14 @@ mod tests {
                 counts: SyncCounts::from_scan_result(&scan, 0, 30),
                 state: CollectorState::Success,
             },
+            scan.codex_counting_v2.as_deref(),
         )
         .unwrap();
         let requests = captured.lock().unwrap();
         let terminal = http_request_json(requests.last().unwrap());
         for private in [
             "local_codex_diagnostics",
+            "local_codex_counting_v2",
             "index",
             "scope",
             "producer_pid",
@@ -16487,6 +16511,11 @@ mod tests {
             &destination,
             SnapshotSource::Codex,
         );
+        // Only the first scan executed configured counting.
+        let receipts = codex_scan_diagnostics::CountingV2Receipts {
+            v2_sessions: 1,
+            ..Default::default()
+        };
         for generation in [1, 2] {
             let counts = SyncCounts {
                 local_codex_diagnostics: Some(CodexScanDiagnostics {
@@ -16510,14 +16539,24 @@ mod tests {
                     counts,
                     state: CollectorState::Success,
                 },
+                (generation == 1).then_some(&receipts),
             )
             .unwrap();
             let journal: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(journal["local_codex_diagnostics"]["generation"], generation);
+            if generation == 1 {
+                assert_eq!(journal["local_codex_counting_v2"]["v2_sessions"], 1);
+            } else {
+                assert!(
+                    journal.get("local_codex_counting_v2").is_none(),
+                    "a scan without executed counting is absent, not zero"
+                );
+            }
             let requests = captured.lock().unwrap();
             let terminal = http_request_json(requests.last().unwrap());
             assert!(terminal.get("local_codex_diagnostics").is_none());
+            assert!(terminal.get("local_codex_counting_v2").is_none());
             assert_eq!(
                 serde_json::to_value(load_terminal_status_journal(&path).unwrap().unwrap())
                     .unwrap(),
@@ -16606,6 +16645,7 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("report partial parser liveness failure");
 
@@ -16650,6 +16690,7 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("persist and emit terminal loss receipt");
         report_checkin_status_with_fresh_relay_token(
@@ -16756,6 +16797,7 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("a failed local journal write must not suppress the terminal report");
 
@@ -17005,6 +17047,7 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("report terminal status");
         let requests = captured.lock().expect("captured requests").clone();
@@ -17136,6 +17179,7 @@ mod tests {
                     counts,
                     state,
                 },
+                None,
             )
             .expect("report terminal manifest withdrawal");
             let request = captured.lock().expect("captured requests")[1].clone();
@@ -17383,6 +17427,7 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("report terminal with refreshed policy");
 
@@ -17445,6 +17490,7 @@ mod tests {
                 counts: SyncCounts::for_policy(183),
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("terminal receipt");
 
@@ -17498,6 +17544,7 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
+            None,
         )
         .expect("zero-width terminal tombstone");
         assert!(cached_source_manifest(&destination, SnapshotSource::Codex).is_none());
@@ -17614,6 +17661,7 @@ mod tests {
                             state
                         },
                     },
+                    None,
                 )
                 .unwrap_or_else(|error| panic!("{path}/{expected_width} report failed: {error}"));
 

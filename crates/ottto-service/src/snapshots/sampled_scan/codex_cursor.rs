@@ -407,21 +407,17 @@ crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
 /// recomputed from the current entries at every resume and at emission.
-/// Every Codex session counts under the legacy rule until the counting
-/// writer's version decision is on `main`; that change replaces this body
-/// with its `AckEvidence::of_view` view and `counting_reusable` with its
-/// `old.filter` predicate, so one predicate guards both restore paths.
-pub(in crate::snapshots) fn counting_view(
-    _candidate: &CandidateFile,
-    _index: &ScanIndex,
-) -> String {
-    "legacy".to_owned()
+/// `"legacy"` while the counting cutover is inactive.
+pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
+    crate::snapshots::codex_counting_version::singleton_view(candidate, index)
 }
 
-/// The one counting reuse predicate for a restored accumulator: the paused
-/// job (decided under `recorded`) may continue under `current`.
-fn counting_reusable(_accumulator: &SnapshotAccumulator, recorded: &str, current: &str) -> bool {
-    recorded == current
+/// The one counting reuse predicate for a restored accumulator, shared with
+/// the retained-reduction `old.filter`: the paused job continues only under
+/// the rule `current` would select. The paused accumulator carries the
+/// configuration it was decided under, so `recorded` adds nothing to it.
+fn counting_reusable(accumulator: &SnapshotAccumulator, _recorded: &str, current: &str) -> bool {
+    crate::snapshots::codex_counting_version::reusable_under_view(accumulator, current)
 }
 
 /// The strict census generation a cursor attempt belongs to (K7): the

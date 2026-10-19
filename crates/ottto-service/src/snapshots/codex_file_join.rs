@@ -777,6 +777,8 @@ pub(super) struct GroupReader {
     receipt_scope: String,
     legacy_expected: BTreeMap<String, String>,
     legacy_baselines: Vec<LegacyBaseline>,
+    /// Counting acknowledgement evidence of every member entry (COST rule 2).
+    counting_evidence: codex_counting_version::AckEvidence,
 }
 impl GroupReader {
     pub(super) fn new(members: Vec<CandidateFile>) -> Result<Self> {
@@ -811,6 +813,7 @@ impl GroupReader {
             receipt_scope: String::new(),
             legacy_expected: BTreeMap::new(),
             legacy_baselines: Vec::new(),
+            counting_evidence: codex_counting_version::AckEvidence::None,
         })
     }
     pub(super) fn configure_receipts(&mut self, index: &ScanIndex) {
@@ -818,6 +821,11 @@ impl GroupReader {
             .active_upload_context_fingerprint
             .clone()
             .unwrap_or_default();
+        self.counting_evidence = codex_counting_version::group_evidence(
+            self.members
+                .iter()
+                .filter_map(|member| index.files.get(&local_index_key(&member.path))),
+        );
         for member in &self.members {
             let key = local_index_key(&member.path);
             if let Some(entry) = index.files.get(&key) {
@@ -1093,7 +1101,7 @@ impl GroupReader {
                 parser.accumulator.latest_reasoning_effort = None;
                 parser.accumulator.latest_turn_id = None;
             } else {
-                self.parser = Some(OwnedJsonlParser::new(
+                let mut parser = OwnedJsonlParser::new(
                     file,
                     &member.path,
                     SnapshotSource::Codex,
@@ -1103,7 +1111,13 @@ impl GroupReader {
                     ledgers,
                     artifacts,
                     context_curve,
-                )?);
+                )?;
+                // One counting state for the whole group; later members keep it.
+                codex_counting_version::configure_group_once(
+                    &mut parser.accumulator,
+                    self.counting_evidence,
+                );
+                self.parser = Some(parser);
             }
             let previous = self
                 .previous_receipts
@@ -1222,7 +1236,7 @@ impl GroupReader {
         Ok((parser, last, self.members, self.applied_receipts))
     }
 }
-crate::heap_layout_bound::fields!(GroupReader; launch_owner, members, proofs, identified, proof_reader, proof, records, replay_order, canonical_order, proof_prefix_matched, replay_member, parser, replay_digest, report, applied_receipts, previous_receipts, receipt_scope, legacy_expected, legacy_baselines);
+crate::heap_layout_bound::fields!(GroupReader; launch_owner, members, proofs, identified, proof_reader, proof, records, replay_order, canonical_order, proof_prefix_matched, replay_member, parser, replay_digest, report, applied_receipts, previous_receipts, receipt_scope, legacy_expected, legacy_baselines, counting_evidence);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Tokens([u64; 6]);
@@ -1775,6 +1789,157 @@ pub(super) mod tests {
             "an acknowledged group needs no new upload"
         );
         assert_eq!(restarted.semantic_noop_count, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// The two-member fixture with creation times, so a cutover can select V2.
+    fn counting_v2_fixture() -> (PathBuf, [String; 2]) {
+        let (root, _) = fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        for (name, rows) in [
+            ("a", member(owner, "r-a", 100, 100)),
+            ("b", member(owner, "r-b", 200, 300)),
+        ] {
+            let body = rows
+                .into_iter()
+                .map(|mut row| {
+                    if row["type"] == "session_meta" {
+                        row["payload"]["timestamp"] = json!("2026-10-01T10:00:00Z");
+                    }
+                    serde_json::to_string(&row).unwrap() + "\n"
+                })
+                .collect::<String>();
+            fs::write(root.join("sessions").join(format!("{name}.jsonl")), body).unwrap();
+        }
+        let keys = ["a", "b"]
+            .map(|name| local_index_key(&root.join("sessions").join(format!("{name}.jsonl"))));
+        (root, keys)
+    }
+    /// The selected local ACK facts the counting mark must move with.
+    fn local_ack(
+        entry: &ScanIndexEntry,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        (
+            entry.last_snapshot_fingerprint.clone(),
+            entry.last_upload_body_witness.clone(),
+            entry.codex_joined_member_set.clone(),
+            entry.codex_protected_owner.clone(),
+        )
+    }
+    /// Finalizes one scan, saves its selected index over `file` (compare-and-
+    /// swap against the generation it was loaded at) and reloads it.
+    fn save_selected(
+        root: &Path,
+        file: &str,
+        mut working: ScanIndex,
+        mut result: SourceScanResult,
+        previous: &ScanIndex,
+        hold_owner: Option<&str>,
+    ) -> ScanIndex {
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        if let Some(owner) = hold_owner {
+            result.hold_codex_groups(
+                &mut working,
+                previous,
+                &BTreeSet::from([resolve_codex_identity(owner)]),
+                "synthetic counting hold",
+            );
+        }
+        result.finish_codex_capture_boundary(&mut working);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        let path = root.join(file);
+        working
+            .committable_subset(previous, &accepted, &BTreeMap::new())
+            .save(&path)
+            .unwrap();
+        ScanIndex::load(&path).unwrap()
+    }
+    #[test]
+    fn counting_v2_group_is_configured_once_and_folded_once() {
+        let (root, keys) = counting_v2_fixture();
+        let (legacy_index, legacy) = scan(&root, ScanIndex::default(), 2);
+        let _cutover = codex_counting_version::TestCutover::set(0);
+        let (index, counted) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
+        let receipts = counted
+            .codex_counting_v2
+            .as_deref()
+            .expect("an executed configured group parse owns receipts");
+        assert_eq!(receipts.v2_sessions, 1, "a joined group folds once");
+        // One carried accumulator saw both members' records.
+        assert_eq!(receipts.native_outside_open_turn, 2);
+        assert_eq!(receipts.ui_in_unbound_span, 2);
+        for key in &keys {
+            assert!(index.files[key].codex_counting_v2, "V2 marks every member");
+            assert!(!legacy_index.files[key].codex_counting_v2);
+        }
+        assert!(
+            legacy.codex_counting_v2.is_none(),
+            "an inactive scan reports no receipts, not a zero block"
+        );
+        for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
+            assert_eq!(counted.input_tokens, legacy.input_tokens);
+            assert_eq!(counted.input_tokens, 300);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn counting_v2_member_mark_moves_only_with_the_selected_saved_ack() {
+        let (root, keys) = counting_v2_fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let previous = {
+            let _cutover = codex_counting_version::TestCutover::set(0);
+            let (index, result) = scan(&root, ScanIndex::default(), 2);
+            save_selected(&root, "v2.json", index, result, &ScanIndex::default(), None)
+        };
+        for key in &keys {
+            assert!(previous.files[key].codex_counting_v2, "saved V2 ACK");
+            assert!(previous.files[key].last_snapshot_fingerprint.is_some());
+        }
+        // The held and settled outcomes are alternatives: each starts from its
+        // own copy of the saved index the cycle loaded.
+        for file in ["held.json", "settled.json"] {
+            fs::copy(root.join("v2.json"), root.join(file)).unwrap();
+        }
+        // New content, parsed by an inactive build: a Legacy group decision.
+        let path = root.join("sessions/b.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        for row in member(owner, "r-c", 200, 500).into_iter().skip(1) {
+            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
+        }
+        fs::write(&path, text).unwrap();
+        let legacy_scan = || {
+            let (working, result) = scan(&root, previous.clone(), 2);
+            for key in &keys {
+                assert!(!working.files[key].codex_counting_v2);
+            }
+            (working, result)
+        };
+        // A held group restores the old mark with the old ACK in saved state.
+        let (working, result) = legacy_scan();
+        let held = save_selected(&root, "held.json", working, result, &previous, Some(owner));
+        for key in &keys {
+            assert!(held.files[key].codex_counting_v2, "mark kept with its ACK");
+            assert_eq!(local_ack(&held.files[key]), local_ack(&previous.files[key]));
+        }
+        // Paired control: the selected save records false with the new facts.
+        let (working, result) = legacy_scan();
+        let settled = save_selected(&root, "settled.json", working, result, &previous, None);
+        for key in &keys {
+            assert!(!settled.files[key].codex_counting_v2, "false with new ACK");
+            assert_ne!(
+                settled.files[key].last_snapshot_fingerprint,
+                previous.files[key].last_snapshot_fingerprint
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

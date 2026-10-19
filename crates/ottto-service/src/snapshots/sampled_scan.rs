@@ -398,6 +398,7 @@ pub(super) fn new_source_parser(
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);
+        codex_counting_version::configure_singleton(&mut parser, candidate, index);
     }
     Ok(parser)
 }

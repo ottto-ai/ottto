@@ -757,9 +757,59 @@ pub(crate) struct CodexScanDiagnostics {
     pub lineage: [Option<RecoveryLineage>; LINEAGE_SAMPLES],
 }
 
+/// Content-free, fixed-size Codex usage-counting V2 receipts of one scan's
+/// finished parses (a singleton, or a joined group's single replay parse,
+/// each folded once), summed with saturation. Owned by the scan result and
+/// borrowed into the local terminal journal as `local_codex_counting_v2`;
+/// absent when no configured counting parse finished. Usage vectors are
+/// `input, cached_input, cache_write_input, output, reasoning_output, total`.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct CountingV2Receipts {
+    pub v2_sessions: u64,
+    pub native_counted: u64,
+    pub native_not_authority: u64,
+    pub native_restated: u64,
+    pub native_inside_holed_coverage: u64,
+    pub native_inside_holed_coverage_usage: [u64; 6],
+    pub native_chain_gap: u64,
+    pub native_chain_overlap: u64,
+    pub native_chain_overlap_covered: [u64; 6],
+    pub native_epoch_reset: u64,
+    pub native_conflict: u64,
+    pub native_outside_open_turn: u64,
+    pub native_outside_open_turn_usage: [u64; 6],
+    pub native_after_turn_closed: u64,
+    pub native_after_turn_closed_usage: [u64; 6],
+    pub native_after_ui_flush: u64,
+    pub native_after_ui_flush_usage: [u64; 6],
+    pub ui_equal_total_repeat: u64,
+    pub ui_equal_total_repeat_usage: [u64; 6],
+    pub ui_in_native_turn_not_counted: u64,
+    pub ui_in_native_turn_not_counted_usage: [u64; 6],
+    pub ui_in_unbound_span: u64,
+    pub v2_cumulative_base_uncounted: u64,
+    pub v2_cumulative_base_uncounted_usage: [u64; 6],
+    pub turn_closure_mismatch: u64,
+    pub turn_reopened: u64,
+    /// Closed-turn filter hits outside the exact recent ring: an older
+    /// closure or a false positive. Natives there count 0 (usage below).
+    pub closed_filter_hit_unconfirmed: u64,
+    pub closed_filter_hit_unconfirmed_native_usage: [u64; 6],
+    pub pending_overflow_flushes: u64,
+    /// Visible local debt, only for the scan that parsed it: sessions ending
+    /// this parse inside a still-open UI-only turn, their staged UI events and
+    /// staged usage. Not carried to later scans.
+    pub open_turn_ui_pending_sessions_this_scan: u64,
+    pub open_turn_ui_pending_events_this_scan: u64,
+    pub open_turn_ui_pending_usage_this_scan: [u64; 6],
+    /// Open turns whose staged usage sum overflowed; never folded as zero.
+    pub open_turn_ui_pending_unsummable_this_scan: u64,
+}
+
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
 crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, identity_conflict_taxonomy, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
@@ -913,7 +963,45 @@ mod tests {
         lineage.associated_file_count = u64::MAX;
         lineage.final_body_revision = u64::MAX;
         diagnostics.lineage = [Some(lineage); LINEAGE_SAMPLES];
-        let bytes = serde_json::to_vec_pretty(&diagnostics).unwrap();
+        let max = [u64::MAX; 6];
+        let receipts = CountingV2Receipts {
+            v2_sessions: u64::MAX,
+            native_counted: u64::MAX,
+            native_not_authority: u64::MAX,
+            native_restated: u64::MAX,
+            native_inside_holed_coverage: u64::MAX,
+            native_inside_holed_coverage_usage: max,
+            native_chain_gap: u64::MAX,
+            native_chain_overlap: u64::MAX,
+            native_chain_overlap_covered: max,
+            native_epoch_reset: u64::MAX,
+            native_conflict: u64::MAX,
+            native_outside_open_turn: u64::MAX,
+            native_outside_open_turn_usage: max,
+            native_after_turn_closed: u64::MAX,
+            native_after_turn_closed_usage: max,
+            native_after_ui_flush: u64::MAX,
+            native_after_ui_flush_usage: max,
+            ui_equal_total_repeat: u64::MAX,
+            ui_equal_total_repeat_usage: max,
+            ui_in_native_turn_not_counted: u64::MAX,
+            ui_in_native_turn_not_counted_usage: max,
+            ui_in_unbound_span: u64::MAX,
+            v2_cumulative_base_uncounted: u64::MAX,
+            v2_cumulative_base_uncounted_usage: max,
+            turn_closure_mismatch: u64::MAX,
+            turn_reopened: u64::MAX,
+            closed_filter_hit_unconfirmed: u64::MAX,
+            closed_filter_hit_unconfirmed_native_usage: max,
+            pending_overflow_flushes: u64::MAX,
+            open_turn_ui_pending_sessions_this_scan: u64::MAX,
+            open_turn_ui_pending_events_this_scan: u64::MAX,
+            open_turn_ui_pending_usage_this_scan: max,
+            open_turn_ui_pending_unsummable_this_scan: u64::MAX,
+        };
+        // The journal carries both blocks; together they keep the old cap.
+        let mut bytes = serde_json::to_vec_pretty(&diagnostics).unwrap();
+        bytes.extend(serde_json::to_vec_pretty(&receipts).unwrap());
         assert!(bytes.len() < MAX_LOCAL_DIAGNOSTIC_BYTES);
         let text = String::from_utf8(bytes).unwrap();
         for forbidden in ["/Users", "credential", "raw session id"] {
