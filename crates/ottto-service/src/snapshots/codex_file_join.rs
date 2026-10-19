@@ -1581,6 +1581,7 @@ pub(super) mod tests {
                         reason,
                         position: 0,
                         offset: 0,
+                        at_eof: false,
                     })
                 }
                 Boot::Strict | Boot::Unchanged => return Err(GroupEnd::Strict),
@@ -2024,6 +2025,7 @@ pub(super) mod tests {
         assert_eq!(receipts.v2_sessions, 1, "a joined group folds once");
         // One carried accumulator saw both members' records, each inside
         // its member's bound turn (#630 re-fixture: was 2 and 2 unbound).
+        assert_eq!(receipts.native_counted, 2, "both members' natives");
         assert_eq!(receipts.native_outside_open_turn, 0);
         assert_eq!(receipts.ui_in_unbound_span, 0);
         for key in &keys {

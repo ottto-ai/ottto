@@ -394,10 +394,11 @@ fn estimate_charge(
 
 /// A job charged by bytes like a cursor job (E3): any cursor job, and a
 /// group job read in one page (R2-M2). Its state is walked with
-/// `completed_bound` at most once per `CHARGE_REFRESH_BYTES` of input and
-/// at each member's new reader (`forget_job_charge`), never with the
-/// visit-limited `bound` per line, so a large group cannot refuse the copy
-/// budget by visits alone and clear every retained singleton copy.
+/// `completed_bound` at most once per `CHARGE_REFRESH_BYTES` of input, never
+/// with the visit-limited `bound` per line, so a large group cannot refuse
+/// the copy budget by visits alone and clear every retained singleton copy.
+/// A group's input position is cumulative over its members (round 3,
+/// R2-L3): a member swap needs no walk.
 pub(in crate::snapshots) fn byte_charged(job: &OwnedActiveFile) -> bool {
     job.cursor.is_some() || job.group.is_some()
 }
@@ -414,18 +415,15 @@ pub(in crate::snapshots) fn job_charge_estimate(
         (None, Some(group)) => group.walked,
         (None, None) => return None,
     };
-    estimate_charge(walked, consumed, buffer, feeds)
+    estimate_charge(walked, job_position(job, consumed), buffer, feeds)
 }
 
-/// A group job swapped its member reader (R2-N4): the new reader counts
-/// from zero, so the next copy-budget step walks the job again.
-pub(in crate::snapshots) fn forget_job_charge(job: &mut OwnedActiveFile) {
-    if let Some(meta) = job.cursor.as_mut() {
-        meta.charge = None;
-    }
-    if let Some(group) = job.group.as_mut() {
-        group.walked = None;
-    }
+/// The job's input position for E3: the reader's `consumed`, plus the bytes
+/// a group's completed member readers consumed (R2-N4, R2-L3).
+fn job_position(job: &OwnedActiveFile, consumed: u64) -> u64 {
+    job.group.as_ref().map_or(consumed, |group| {
+        consumed.saturating_add(group.consumed_before)
+    })
 }
 
 /// Record a byte-charged job's walk (`usize::MAX` when it refused).
@@ -435,6 +433,7 @@ pub(in crate::snapshots) fn record_job_charge(
     consumed: u64,
     buffer: usize,
 ) {
+    let consumed = job_position(job, consumed);
     if let Some(meta) = job.cursor.as_mut() {
         meta.record_charge(charge, consumed, buffer);
     } else if let Some(group) = job.group.as_mut() {
@@ -691,15 +690,18 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
 /// (`STATE_BYTES`) while reading a prefix that only grows, so an append
 /// cannot cure it: growth keeps it parked; replacement, shrink, an in-place
 /// edit or a dependency change wakes it. A capacity change is a new
-/// process, which starts with no parked record.
+/// process, which starts with no parked record. A `ProbeBudgetOrder` group
+/// (round 3) parks the same way; `exact` when its refusal is append-curable
+/// in the live member, so any change of that member's stamp wakes it.
 #[derive(Clone, Debug)]
 struct Parked {
     stamp: OpenStamp,
     dependencies: Option<String>,
     disclosure: Disclosure,
     used: u64,
+    exact: bool,
 }
-crate::heap_layout_bound::fields!(Parked; stamp, dependencies, disclosure, used);
+crate::heap_layout_bound::fields!(Parked; stamp, dependencies, disclosure, used, exact);
 
 /// Slot rotation and the census fence (K7, K10). Keys are
 /// `namespace NUL index key`, so concurrent namespaces share one fair queue.
@@ -715,8 +717,11 @@ struct Rotation {
     waiting: BTreeMap<String, (u64, u64)>,
     /// Census generation of each file's last completed attempt.
     attempted: BTreeMap<String, (String, u64)>,
+    /// Groups whose probes outran the page's remaining singleton budget
+    /// (`ProbeBudgetOrder`, round 3): each takes a page of its own next.
+    own_page: BTreeMap<String, u64>,
 }
-crate::heap_layout_bound::fields!(Rotation; page, sequence, served, waiting, attempted);
+crate::heap_layout_bound::fields!(Rotation; page, sequence, served, waiting, attempted, own_page);
 
 impl Rotation {
     fn rank(&self, key: &str) -> u64 {
@@ -1131,6 +1136,7 @@ impl CursorLease {
                             dependencies: meta.dependencies.clone(),
                             disclosure: disclosure.clone(),
                             used,
+                            exact: false,
                         },
                     );
                     cursor.rotation.complete(
@@ -2027,8 +2033,11 @@ impl SharedCache {
             let used = cursor.tick();
             let parked = cursor.parked.get_mut(key)?;
             if let Some(now) = now.filter(|now| {
-                parked.stamp.append_compatible(now)
-                    && parked.dependencies.as_deref() == dependencies
+                (if parked.exact {
+                    parked.stamp == *now
+                } else {
+                    parked.stamp.append_compatible(now)
+                }) && parked.dependencies.as_deref() == dependencies
             }) {
                 parked.stamp = now;
                 parked.used = used;
@@ -2040,6 +2049,82 @@ impl SharedCache {
             None
         })
         .flatten()
+    }
+
+    /// Park a `ProbeBudgetOrder` group under its live member's boot stamp
+    /// (round 3): strict debt disclosed again at zero replay bytes until a
+    /// member changes (`exact`: any live-member stamp change) or a
+    /// dependency does. Bounded like every parked record.
+    pub(in crate::snapshots) fn park_group(
+        &self,
+        key: &str,
+        stamp: OpenStamp,
+        dependencies: Option<String>,
+        disclosure: Disclosure,
+        exact: bool,
+    ) {
+        self.with_cursor(|cursor| {
+            let used = cursor.tick();
+            park(
+                cursor,
+                key.to_owned(),
+                Parked {
+                    stamp,
+                    dependencies,
+                    disclosure,
+                    used,
+                    exact,
+                },
+            );
+        });
+    }
+
+    /// A memo entry or parked record exists for the group: its boot reaches
+    /// that lookup before the cursor-slot check (round 3, R2-M1).
+    pub(in crate::snapshots) fn group_recorded(&self, namespace: &Scope, key: &str) -> bool {
+        let memo_key = memo_key(namespace, key);
+        self.with_cursor(|cursor| {
+            cursor.memo.entries.contains_key(&memo_key) || cursor.parked.contains_key(key)
+        })
+        .unwrap_or(false)
+    }
+
+    /// A group that read nothing for a job (unchanged, memo hit, parked)
+    /// stops waiting for the slot, with no fence and no served update
+    /// (round 3, R2-M1).
+    pub(in crate::snapshots) fn cursor_unwait(&self, namespace: &Scope, key: &str) {
+        let key = rotation_key(&namespace.0, key);
+        self.with_cursor(|cursor| cursor.rotation.waiting.remove(&key));
+    }
+
+    /// The group asked for a page of its own (round 3).
+    pub(in crate::snapshots) fn group_own_page(&self, namespace: &Scope, key: &str) -> bool {
+        let key = rotation_key(&namespace.0, key);
+        self.with_cursor(|cursor| cursor.rotation.own_page.contains_key(&key))
+            .unwrap_or(false)
+    }
+
+    /// The group's boot takes its own-page request: true when it was asked.
+    pub(in crate::snapshots) fn take_group_own_page(&self, namespace: &Scope, key: &str) -> bool {
+        let key = rotation_key(&namespace.0, key);
+        self.with_cursor(|cursor| cursor.rotation.own_page.remove(&key).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Its probes outran the page's remaining singleton budget: next time it
+    /// takes a page of its own (round 3).
+    pub(in crate::snapshots) fn request_group_own_page(&self, namespace: &Scope, key: &str) {
+        let key = rotation_key(&namespace.0, key);
+        self.with_cursor(|cursor| {
+            let page = cursor.rotation.page;
+            bounded_insert(&mut cursor.rotation.own_page, &key, page, |page| *page);
+        });
+    }
+
+    #[cfg(test)]
+    pub(in crate::snapshots) fn rotation_waiters_for_test(&self) -> usize {
+        self.with_cursor(|cursor| cursor.rotation.waiting.len())
+            .unwrap_or(0)
     }
 
     pub(in crate::snapshots) fn cursor_note_deferred(&self) {
@@ -3025,6 +3110,10 @@ pub(in crate::snapshots) enum DebtReason {
     /// and dependency changes a later generation can cure, so it is not
     /// clearly terminal and stays strict.
     MemberChanged,
+    /// A group whose chain broke in the chronological fallback order its
+    /// probe limit forced (round 3): the order may be our own artifact, so
+    /// it is strict; parked until a member changes.
+    ProbeBudgetOrder,
 }
 impl HeapLayoutBound for DebtReason {
     const INLINE_ONLY: bool = true;

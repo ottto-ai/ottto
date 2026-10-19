@@ -101,6 +101,7 @@ fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_
         dependencies: dependencies.map(str::to_owned),
         disclosure: strict(DebtReason::JoinStateBound),
         used: 0,
+        exact: false,
     };
     let cache = SharedCache::default();
     cache.with_cursor(|cursor| park(cursor, "key".into(), parked(Some("dependencies"))));
@@ -597,7 +598,11 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         );
         (census, residue, residue_blocked, blocked, pending, index)
     };
-    for reason in [DebtReason::JoinStateBound, DebtReason::MemberChanged] {
+    for reason in [
+        DebtReason::JoinStateBound,
+        DebtReason::MemberChanged,
+        DebtReason::ProbeBudgetOrder,
+    ] {
         assert!(!reason.settleable());
         let (census, residue, residue_blocked, blocked, pending, index) = disclose(&strict(reason));
         assert!(residue.is_empty() && residue_blocked.is_empty());

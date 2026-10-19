@@ -109,6 +109,19 @@ pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosur
     }
 }
 
+/// The strict debt a parked `ProbeBudgetOrder` group discloses again
+/// (round 3): never settleable, the owner held.
+fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
+    cursor::Disclosure {
+        reason: cursor::DebtReason::ProbeBudgetOrder,
+        ownership_incomplete_file_count: 0,
+        zero_snapshot_usage_evidence: false,
+        state_only_blocked_session_ids: vec![owner.to_owned()],
+        diagnostic_reason: FileReason::NotParsedThisCycle,
+        parsed_snapshot_count: 0,
+    }
+}
+
 /// Every member's prior body is kept by a terminal disclosure.
 fn previous_body(index: &ScanIndex, member: &CandidateFile) -> (Option<String>, Option<String>) {
     let keep = !index
@@ -182,7 +195,14 @@ pub(in crate::snapshots) struct GroupBoot {
     probes: Vec<Option<Tokens>>,
     probed: usize,
     ordered: bool,
+    /// The unchanged and receipt checks passed: the boot reads from here.
+    admitted: bool,
     pub(in crate::snapshots) probe_bound: bool,
+    /// A probe was cut by `PROBE_BYTES` itself, not by the allowance: the
+    /// fallback order is the same every generation (round 3).
+    probe_limit_bound: bool,
+    /// This boot runs on a page of its own (round 3, `ProbeBudgetOrder`).
+    pub(in crate::snapshots) own_page: bool,
     /// Probe bytes this boot may still read (R2-N2): the page's remaining
     /// singleton budget, set by the scanner before each step.
     probe_allowance: u64,
@@ -193,8 +213,8 @@ pub(in crate::snapshots) struct GroupBoot {
     evidence: codex_counting_version::AckEvidence,
 }
 crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, headers, plan,
-    probes, probed, ordered, probe_bound, probe_allowance, charge, previous_receipts,
-    receipt_scope, legacy_expected, evidence);
+    probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
+    charge, previous_receipts, receipt_scope, legacy_expected, evidence);
 
 impl GroupBoot {
     pub(in crate::snapshots) fn new(group: Group, index: &ScanIndex) -> Self {
@@ -235,7 +255,10 @@ impl GroupBoot {
             probes: Vec::new(),
             probed: 0,
             ordered: false,
+            admitted: false,
             probe_bound: false,
+            probe_limit_bound: false,
+            own_page: false,
             probe_allowance: u64::MAX,
             charge: 0,
             previous_receipts,
@@ -250,9 +273,11 @@ impl GroupBoot {
         std::mem::take(&mut self.charge)
     }
 
-    /// No member was opened yet: nothing of this boot was read.
-    pub(in crate::snapshots) fn fresh(&self) -> bool {
-        self.identified == 0
+    /// Every member is identified and the group is neither unchanged nor
+    /// receipt-strict, and no header was read yet: the boot's first read
+    /// (round 3, R2-M1: the cursor-slot check sits here).
+    pub(in crate::snapshots) fn awaits_read(&self) -> bool {
+        self.admitted && self.headers.is_empty()
     }
 
     /// Cap this boot's remaining probe reads (R2-N2). A probe cut by it ends
@@ -279,13 +304,15 @@ impl GroupBoot {
         if self.identified < n {
             return self.identify(attribution);
         }
-        if self.headers.is_empty() {
+        if !self.admitted {
             if self.unchanged_joined(index) {
                 return Boot::Unchanged;
             }
             if !self.receipts_valid() {
                 return Boot::Strict;
             }
+            self.admitted = true;
+            return Boot::Pending;
         }
         if self.headers.len() < n {
             let member = &self.group.members[self.headers.len()];
@@ -438,6 +465,7 @@ impl GroupBoot {
         let Ok((before, bound, read)) = result else {
             return Boot::Strict;
         };
+        self.probe_limit_bound |= bound && cap == PROBE_BYTES as u64;
         self.charge = self.charge.saturating_add(read);
         self.probe_allowance = self.probe_allowance.saturating_sub(read);
         self.probes[i] = before;
@@ -500,6 +528,7 @@ impl GroupBoot {
         inputs: JobInputs<'_>,
     ) -> std::result::Result<Box<OwnedActiveFile>, GroupEnd> {
         let memo_digest = self.memo_digest(inputs.index, inputs.metadata);
+        let dependencies = self.dependencies(inputs.metadata);
         let Self {
             group,
             key,
@@ -507,6 +536,8 @@ impl GroupBoot {
             headers,
             plan,
             probe_bound,
+            probe_limit_bound,
+            own_page,
             previous_receipts,
             receipt_scope,
             legacy_expected,
@@ -611,9 +642,13 @@ impl GroupBoot {
                 lines: (0, 0),
                 charge: 0,
                 probe_bound,
+                probe_limit_bound,
+                own_page,
+                dependencies,
                 memo_digest,
                 scope: cursor::group_scope(index),
                 walked: None,
+                consumed_before: 0,
             })),
         }))
     }
@@ -693,6 +728,11 @@ pub(in crate::snapshots) struct GroupJob {
     lines: (usize, usize),
     charge: u64,
     pub(in crate::snapshots) probe_bound: bool,
+    probe_limit_bound: bool,
+    own_page: bool,
+    /// `GroupBoot::dependencies`: a parked `ProbeBudgetOrder` record's wake
+    /// inputs (round 3).
+    dependencies: Option<String>,
     pub(in crate::snapshots) memo_digest: Option<String>,
     /// `cursor::group_scope` at job start (§p, R1-M1): every resume and the
     /// emission compare it with the current index.
@@ -700,10 +740,14 @@ pub(in crate::snapshots) struct GroupJob {
     /// The last walked copy-budget charge of a group read without the
     /// cursor (E3, R2-M2; a cursor job keeps it in its `JobMeta`).
     pub(in crate::snapshots) walked: Option<(usize, u64, usize)>,
+    /// Bytes the completed members' readers consumed: E3 measures a group's
+    /// input cumulatively, so a member swap needs no walk (R2-L3).
+    pub(in crate::snapshots) consumed_before: u64,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
-    charge, probe_bound, memo_digest, scope, walked);
+    charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
+    consumed_before);
 
 impl GroupJob {
     /// A legacy tee takes every consumed record too (E3, R2-N5).
@@ -759,10 +803,13 @@ pub(in crate::snapshots) fn take_charge(active: &mut OwnedActiveFile) -> u64 {
 pub(in crate::snapshots) enum GroupEnd {
     /// Terminal proof debt (outcome R) at canonical `position`; `offset` is
     /// the end of the last complete record read in that member.
+    /// `at_eof` marks a refusal raised by the member-end proof, where the
+    /// reader stopped at its read limit; a mid-stream refusal stops it early.
     Refused {
         reason: JoinRefusal,
         position: usize,
         offset: u64,
+        at_eof: bool,
     },
     /// Open/read failure, line loss, receipts, owner or creator conflict.
     Strict,
@@ -844,6 +891,7 @@ pub(in crate::snapshots) fn step_group(
             reason,
             position,
             offset: active.parser.reader.last_complete_line_end(),
+            at_eof: false,
         });
     }
     if !complete {
@@ -916,6 +964,7 @@ fn member_eof(
             reason,
             position,
             offset: active.parser.reader.last_complete_line_end(),
+            at_eof: true,
         });
     }
     let receipt = replay.finish().map_err(|_| GroupEnd::Strict)?;
@@ -1089,6 +1138,10 @@ fn open_member(
         .unwrap_or_default();
     let receipt_scope = group.receipt_scope.clone();
     group.tee = tee;
+    // E3 keeps counting across the swap (R2-N4, R2-L3): no walk per member.
+    group.consumed_before = group
+        .consumed_before
+        .saturating_add(active.parser.reader.consumed_bytes());
     let parser = &mut active.parser;
     parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file), MAX_JSONL_LINE_BYTES, true);
     // Context inferred in one physical file must not price an unrelated
@@ -1097,8 +1150,6 @@ fn open_member(
     parser.accumulator.latest_model = None;
     parser.accumulator.latest_reasoning_effort = None;
     parser.accumulator.latest_turn_id = None;
-    // The new reader counts from zero: walk the job again (E3, R2-N4).
-    cursor::forget_job_charge(active);
     if paged {
         let scope = if last {
             Some((inputs.live_scope)(&member).ok_or(GroupEnd::Unavailable)?)
@@ -1147,13 +1198,34 @@ pub(in crate::snapshots) fn end_group(
         // never settleable or memoized, named for S11. Per-member reasons
         // (UI balance, shape) do not depend on the order.
         GroupEnd::Refused {
-            reason: JoinRefusal::Gap | JoinRefusal::Overlap,
+            reason: reason @ (JoinRefusal::Gap | JoinRefusal::Overlap),
+            position,
             ..
         } if group.probe_bound => {
             if let Some(context) = sampling {
                 context
                     .cache
                     .note_join_refusal(JoinRefusal::ProbeBudgetOrder);
+                // Round 3 (R1-L1, R2-L2): converge under stable inputs. An
+                // order the page's remaining singleton budget forced gets a
+                // page of its own next; one `PROBE_BYTES` forced (or forced
+                // again on its own page) is the same every generation, so it
+                // parks like `JoinStateBound` until a member changes.
+                if group.probe_limit_bound || group.own_page {
+                    if let Some(stamp) = group.stamps.last() {
+                        context.cache.park_group(
+                            &group.key,
+                            stamp.clone(),
+                            group.dependencies.clone(),
+                            probe_order_disclosure(&group.owner),
+                            reason.append_curable() && position + 1 == group.members.len(),
+                        );
+                    }
+                } else {
+                    context
+                        .cache
+                        .request_group_own_page(&context.namespace, &group.key);
+                }
             }
             if let Some(lease) = lease {
                 lease.release();
@@ -1167,6 +1239,7 @@ pub(in crate::snapshots) fn end_group(
             reason,
             position,
             offset,
+            at_eof,
         } => {
             let disclosure = refusal_disclosure(&group.owner);
             let live_failed = position + 1 == group.members.len();
@@ -1181,8 +1254,12 @@ pub(in crate::snapshots) fn end_group(
                     // R1-H1: an exact-stamp entry never covers bytes the job
                     // did not read (growth past a paged cut): they may
                     // already cure it, so the next generation reads them.
+                    // Round-3 R1-M1: only a refusal raised at the read limit
+                    // can be cured by those bytes; a mid-stream refusal is
+                    // fixed by records already read, and any append still
+                    // misses the exact stamp.
                     OpenStamp::capture(held).ok().filter(|stamp| {
-                        !growth_may_cure || stamp.extent() == cursor::read_end(&active)
+                        !growth_may_cure || !at_eof || stamp.extent() == cursor::read_end(&active)
                     })
                 } else {
                     group.stamps.last().cloned()

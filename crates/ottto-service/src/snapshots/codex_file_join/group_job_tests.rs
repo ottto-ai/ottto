@@ -109,9 +109,17 @@ fn candidate(name: &str, size: u64) -> CandidateFile {
 
 /// `plan_group` over header rows and file names (distinct sizes).
 fn plan(members: &[(Value, String)]) -> std::result::Result<GroupPlan, JoinRefusal> {
+    plan_sized(members, 100u64..)
+}
+
+/// `plan_group` over header rows, file names and member sizes.
+fn plan_sized(
+    members: &[(Value, String)],
+    sizes: impl IntoIterator<Item = u64>,
+) -> std::result::Result<GroupPlan, JoinRefusal> {
     let headers = members
         .iter()
-        .zip(100u64..)
+        .zip(sizes)
         .map(|((row, name), size)| {
             MemberHeader::parse(
                 serde_json::to_string(row).unwrap().as_bytes(),
@@ -125,6 +133,28 @@ fn plan(members: &[(Value, String)]) -> std::result::Result<GroupPlan, JoinRefus
         .map(|(_, name)| format!("/fixture/sessions/{name}"))
         .collect::<Vec<_>>();
     plan_group(&headers, &keys)
+}
+
+/// R1-L2: byte-identical line 0 at an equal size is one copied candidate
+/// (`CandidateCopy`), never a chain; the same line 0 at another size is not.
+#[test]
+fn plan_refuses_an_equal_header_and_size_as_a_candidate_copy() {
+    let header = meta(OWNER, "2026-10-01T10:00:00Z", json!({}));
+    let members = [
+        (
+            header.clone(),
+            rollout("11111111-cccc-4ccc-8ccc-111111111111"),
+        ),
+        (header, rollout("22222222-cccc-4ccc-8ccc-222222222222")),
+    ];
+    assert_eq!(
+        plan_sized(&members, [100, 100]).err(),
+        Some(JoinRefusal::CandidateCopy)
+    );
+    assert_ne!(
+        plan_sized(&members, [100, 101]).err(),
+        Some(JoinRefusal::CandidateCopy)
+    );
 }
 
 /// Feed rows to `proof` with the parser's S10 tap after every UI record.
@@ -980,6 +1010,51 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// Round-3 R1-M1: a live-member `Gap` raised mid-stream stops the reader
+/// before the file's end; bytes after it cannot cure it, so the exact-stamp
+/// entry is recorded and an unchanged group is not re-read.
+#[test]
+fn mid_stream_live_gap_is_memoized_and_skipped_while_unchanged() {
+    let root = temp_root("midgap");
+    write_rows(
+        &root.join("sessions/a.jsonl"),
+        &[
+            meta(OWNER, "2026-10-01T10:00:00Z", json!({})),
+            native(OWNER, "r-a", 100, 100),
+            ui(100, 100, "2026-10-01T10:00:30Z"),
+        ],
+    );
+    write_rows(
+        &root.join("sessions/b.jsonl"),
+        &[
+            meta(OWNER, "2026-10-01T10:01:00Z", json!({})),
+            native(OWNER, "r-b", 200, 300),
+            ui(200, 300, "2026-10-01T10:01:30Z"),
+            // A counter reset inside the live member: `before` 350 != 300.
+            native(OWNER, "r-reset", 50, 400),
+            ui(50, 400, "2026-10-01T10:02:30Z"),
+            native(OWNER, "r-tail", 10, 410),
+            ui(10, 410, "2026-10-01T10:03:30Z"),
+        ],
+    );
+    let gap = JoinRefusal::Gap.slot();
+    let cache = Arc::new(SharedCache::default());
+    let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let refused = counters(&cache);
+    assert_eq!(refused.join_terminal_debt[gap], 1, "{refused:?}");
+    assert_eq!(refused.groups_started, 1, "{refused:?}");
+    assert_eq!(
+        refused.memo_records, 1,
+        "recorded although the reader stopped mid-stream: {refused:?}"
+    );
+    let _ = next_generation(&root, index, &cache, 1);
+    let unchanged = counters(&cache);
+    assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
+    assert_eq!(unchanged.groups_started, 1, "not re-read: {unchanged:?}");
+    assert_eq!(unchanged.join_terminal_debt[gap], 1, "{unchanged:?}");
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1476,6 +1551,162 @@ fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
     assert!(result.snapshots.is_empty());
     assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The `probe_budget_fallback…` fixture: legacy members whose header times
+/// disagree with their counter order, so only the probes order them; the
+/// chronological fallback order breaks the chain (a `Gap` at sealed `a`).
+fn probe_order_corpus(tag: &str, padding: usize) -> PathBuf {
+    let root = temp_root(tag);
+    let mut a = vec![meta(OWNER, "2026-10-01T10:00:00Z", json!({}))];
+    // Padding before `a`'s first native: past `PROBE_BYTES` when large.
+    a.extend((0..padding).map(|i| {
+        json!({"type": "event_msg", "timestamp": "2026-10-01T10:00:01Z", "payload": {
+            "type": "agent_message", "message": format!("{i}:{}", "p".repeat(4096))}})
+    }));
+    a.push(native(OWNER, "r-a", 200, 300));
+    a.push(ui(200, 300, "2026-10-01T10:05:01Z"));
+    write_rows(&root.join("sessions/a.jsonl"), &a);
+    write_rows(
+        &root.join("sessions/b.jsonl"),
+        &[
+            meta(OWNER, "2026-10-01T10:05:00Z", json!({})),
+            native(OWNER, "r-b", 100, 100),
+            ui(100, 100, "2026-10-01T10:00:01Z"),
+        ],
+    );
+    root
+}
+
+/// Round 3 (R1-L1, R2-L2 (a)): a `ProbeBudgetOrder` the page's remaining
+/// singleton budget forced takes a page of its own next; forced again there,
+/// it is parked like `JoinStateBound`: strict debt disclosed each generation
+/// with no attempt, until a member changes (growth of the live member does
+/// not cure a sealed member's `Gap`).
+#[test]
+fn allowance_bound_probe_order_takes_an_own_page_then_parks() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = probe_order_corpus("probe-own-page", 0);
+    let order = JoinRefusal::ProbeBudgetOrder.slot();
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1, 64, || {
+        let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+        assert_eq!(counters(&cache).join_terminal_debt[order], 1);
+        assert_eq!(counters(&cache).parked_hits, 0);
+        // On its own page the allowance is still short: parked.
+        let (index, _) = next_generation(&root, index, &cache, 1);
+        assert_eq!(counters(&cache).join_terminal_debt[order], 2);
+        let (index, parked) = next_generation(&root, index, &cache, 2);
+        let after = counters(&cache);
+        assert_eq!(
+            after.join_terminal_debt[order], 2,
+            "not replayed: {after:?}"
+        );
+        assert_eq!(after.parked_hits, 1, "{after:?}");
+        assert_eq!(after.memo_records, 0, "{after:?}");
+        assert!(parked.snapshots.is_empty());
+        assert!(parked.unreadable_path_count > 0, "disclosed as strict debt");
+        assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+        // Growth of the live member cannot cure the sealed member's `Gap`.
+        append_rows(
+            &root.join("sessions/b.jsonl"),
+            &[ui(1, 101, "2026-10-01T10:06:00Z")],
+        );
+        let (index, _) = next_generation(&root, index, &cache, 3);
+        let grown = counters(&cache);
+        assert_eq!(grown.parked_hits, 2, "{grown:?}");
+        assert_eq!(grown.join_terminal_debt[order], 2, "{grown:?}");
+        // A sealed member's change wakes it: one more attempt.
+        append_rows(
+            &root.join("sessions/a.jsonl"),
+            &[turn("66666666-aaaa-4aaa-8aaa-666666666666")],
+        );
+        let _ = next_generation(&root, index, &cache, 4);
+        assert_eq!(counters(&cache).join_terminal_debt[order], 3);
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Round 3 (R1-L1, R2-L2 (b)): a probe cut by `PROBE_BYTES` itself gives
+/// the same fallback order every generation: parked at once, not replayed.
+#[test]
+fn probe_limit_bound_order_parks_until_a_member_changes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = probe_order_corpus("probe-limit", PROBE_BYTES / 4096 + 16);
+    let order = JoinRefusal::ProbeBudgetOrder.slot();
+    let cache = Arc::new(SharedCache::default());
+    let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let first = counters(&cache);
+    assert!(first.probe_bound >= 1, "{first:?}");
+    assert_eq!(first.join_terminal_debt[order], 1, "{first:?}");
+    let (index, parked) = next_generation(&root, index, &cache, 1);
+    let after = counters(&cache);
+    assert_eq!(
+        after.join_terminal_debt[order], 1,
+        "not replayed: {after:?}"
+    );
+    assert_eq!(after.parked_hits, 1, "{after:?}");
+    assert!(parked.snapshots.is_empty());
+    assert!(parked.unreadable_path_count > 0, "disclosed as strict debt");
+    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Round 3 (R2-M1): a memoized group larger than the singleton budget
+/// reaches its memo hit without the cursor slot while a P1 singleton's job
+/// holds it: no deferral, no rotation waiter, no group job; the singleton
+/// completes.
+#[test]
+fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = paged_corpus("memo-slot");
+    // A duplicate response mid-way through live `b`: terminal `Overlap`.
+    let mut b = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30);
+    b[5]["payload"]["response_id"] = json!("a-3");
+    write_rows(&root.join("sessions/b.jsonl"), &b);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+            counters(&cache).memo_records == 1
+        });
+        let recorded = counters(&cache);
+        assert_eq!(
+            recorded.join_terminal_debt[JoinRefusal::Overlap.slot()],
+            1,
+            "{recorded:?}"
+        );
+        assert_eq!(recorded.groups_started, 1, "{recorded:?}");
+        // A large P1 singleton takes the slot and pauses in it.
+        write_rows(
+            &root.join("sessions/s.jsonl"),
+            &chain_rows(OTHER, "s", "2026-10-01T11:00:00Z", 0, 30),
+        );
+        let (mut index, _, _) = pages(&root, index, &cache, || {
+            counters(&cache).jobs_paused > recorded.jobs_paused
+        });
+        let paused = counters(&cache);
+        assert_eq!(completions(&cache), 0, "{paused:?}");
+        // The next generation: the group's lookup runs while `s` holds it.
+        index.traversal = None;
+        let _ = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+            counters(&cache).group_memo_hits == 1 && completions(&cache) == 1
+        });
+        let after = counters(&cache);
+        assert_eq!(after.deferred, paused.deferred, "{after:?}");
+        assert_eq!(
+            after.deferred_rotation, paused.deferred_rotation,
+            "{after:?}"
+        );
+        assert_eq!(after.groups_started, 1, "no group job: {after:?}");
+        assert_eq!(cache.rotation_waiters_for_test(), 0, "{after:?}");
+    });
     fs::remove_dir_all(root).unwrap();
 }
 
