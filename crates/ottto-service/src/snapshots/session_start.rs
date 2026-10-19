@@ -20,7 +20,7 @@
 //! HMAC and follows attribution consent. No text leaves the Mac.
 
 use super::UsageTotals;
-use crate::codex_prelude::{char_count as units, BlockKind, CodexPreludeParser};
+use crate::codex_prelude_footprint::{char_count as units, BlockKind, CodexPreludeParser};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -38,7 +38,7 @@ const MAX_HELD_BYTES: usize = 256 * 1024;
 const MAX_HELD_INSTRUCTION_BYTES: usize = MAX_HELD_BYTES / 2;
 const MAX_HELD_COLLECTION_BYTES: usize = MAX_HELD_BYTES - MAX_HELD_INSTRUCTION_BYTES - 1024;
 /// Codex keeps its AGENTS.md text inside the shared prelude parser, beside
-/// the parser's own small strings (`codex_prelude::MAX_SMALL_TEXT_BYTES` each).
+/// the parser's own small strings (`codex_prelude_footprint::MAX_SMALL_TEXT_BYTES` each).
 const MAX_CODEX_AGENTS_MD_BYTES: usize = MAX_HELD_INSTRUCTION_BYTES - 8 * 1024;
 const MAX_SHELL_PATH_TOKENS: usize = 16;
 const MAX_PATH_BYTES: usize = 512;
@@ -1695,7 +1695,7 @@ mod tests {
         ClaudeTitleMetadata, SnapshotItem, SnapshotSource,
     };
     use super::*;
-    use crate::codex_prelude;
+    use crate::codex_prelude_footprint;
     use crate::session_attribution::{
         SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION,
     };
@@ -2047,15 +2047,15 @@ mod tests {
                 codex_message(
                     "developer",
                     &[
-                        (codex_prelude::BASE_INSTRUCTIONS_KIND, "BASE instructions"),
+                        (codex_prelude_footprint::BASE_INSTRUCTIONS_KIND, "BASE instructions"),
                         ("permissions.instructions", "<permissions>p</permissions>"),
                     ],
                 ),
                 codex_message(
                     "user",
                     &[
-                        (codex_prelude::AGENTS_MD_KIND, "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nSee docs/guide.md\n</INSTRUCTIONS>"),
-                        (codex_prelude::HOST_SKILLS_KIND, "<skills>s</skills>"),
+                        (codex_prelude_footprint::AGENTS_MD_KIND, "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nSee docs/guide.md\n</INSTRUCTIONS>"),
+                        (codex_prelude_footprint::HOST_SKILLS_KIND, "<skills>s</skills>"),
                         ("user.text", "fix it"),
                     ],
                 ),
@@ -2138,7 +2138,7 @@ mod tests {
                 codex_message(
                     "user",
                     &[
-                        (codex_prelude::AGENTS_MD_KIND, "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nWRAPPED copy\n</INSTRUCTIONS>"),
+                        (codex_prelude_footprint::AGENTS_MD_KIND, "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nWRAPPED copy\n</INSTRUCTIONS>"),
                         ("environments.environment_context", "<env/>"),
                     ],
                 ),
@@ -2171,7 +2171,7 @@ mod tests {
                 .iter()
                 .map(|row| row.to_string() + "\n")
                 .collect::<String>();
-            codex_prelude::parse_prelude(std::io::Cursor::new(bytes)).expect("reader")
+            codex_prelude_footprint::parse_prelude(std::io::Cursor::new(bytes)).expect("reader")
         };
         let decoded = |rows: &[Value]| {
             let mut state = SessionStartState::default();
@@ -2186,11 +2186,14 @@ mod tests {
         };
         let read = reader(&rows(false));
         assert!(read.world_state_seen && read.input_closed && !read.blocks_incomplete);
+        // The footprint's prelude totals run to the first usage record;
+        // request-1 parts stop at the model's first output.
+        assert_eq!((read.hook_chars, read.chars(BlockKind::Hooks)), (8, 4));
         assert_eq!(read.skills_body.as_deref(), Some("SKILLS BODY"));
         // The snapshot keeps no skills body; everything else is identical.
         assert_eq!(
             decoded(&rows(false)),
-            codex_prelude::CodexPrelude {
+            codex_prelude_footprint::CodexPrelude {
                 skills_body: None,
                 ..read.clone()
             }
@@ -2494,7 +2497,7 @@ mod tests {
         // Codex: the shared parser holds the AGENTS.md text and its own small
         // strings beside the collections.
         let mut state = SessionStartState::default();
-        let long = "p".repeat(codex_prelude::MAX_SMALL_TEXT_BYTES);
+        let long = "p".repeat(codex_prelude_footprint::MAX_SMALL_TEXT_BYTES);
         state.note_codex_session_meta(&json!({"type": "session_meta", "payload": {
             "id": long, "cwd": long, "cli_version": "0.160.0"}}));
         state.observe_codex_line(

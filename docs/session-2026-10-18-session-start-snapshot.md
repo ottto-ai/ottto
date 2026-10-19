@@ -21,9 +21,16 @@ Fields:
 - Request-1 character counts per part. `cc_wire_v1` derives them from Claude
   Code's logged request shape and blobs. `codex_items_v1` derives them from
   Codex's labelled prelude items through the one Codex prelude parser
-  (`codex_prelude.rs`, shared with the Codex prelude footprint); it needs
-  `world_state` (Codex 0.159+), and the Codex tools part is present only when
-  `additional_tools` is logged.
+  (`CodexPreludeParser` in `codex_prelude_footprint.rs`, fed the lines the
+  snapshot pass already decoded); it needs `world_state` (Codex 0.159+), and
+  the Codex tools part is present only when `additional_tools` is logged.
+  Request-1 parts count blocks until the model's first output; the footprint's
+  own prelude totals keep their window (until the first usage record).
+- `instruction_load_cut`, Claude only: request 1 loaded part of MEMORY.md.
+  Codex leaves it absent. Its cut rule (`agents_md_cut`) needs
+  `project_doc_max_bytes` from the Codex home's `config.toml`, which the rollout
+  does not record and this pass does not read; the per-file cut comes from the
+  Codex prelude footprint.
 - A 16-hex configuration fingerprint.
 - `client_version`.
 

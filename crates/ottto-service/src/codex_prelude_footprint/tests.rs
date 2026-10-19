@@ -170,6 +170,72 @@ fn token_count_event_also_closes_the_prelude() {
     assert_eq!(prelude.context_window, Some(400_000));
 }
 
+#[test]
+fn zero_context_estimates_do_not_end_the_prelude() {
+    let estimate = |kind: &str| match kind {
+        "record" => usage(0),
+        _ => json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": 0}, "total_token_usage": {"input_tokens": 0}}}}),
+    };
+    for kind in ["record", "event"] {
+        let prelude = parse(&[
+            meta(json!({})),
+            estimate(kind),
+            message("user", Some(AGENTS_MD_KIND), "RULES"),
+            usage(5),
+        ]);
+        assert_eq!(prelude.first_input_tokens, Some(5), "{kind}");
+        assert_eq!(prelude.chars(BlockKind::AgentsMd), 5, "{kind}");
+    }
+}
+
+#[test]
+fn model_output_closes_request_one_blocks() {
+    let prelude = parse(&[
+        meta(json!({})),
+        message("developer", Some("permissions.instructions"), "PERMS"),
+        message("user", Some("user.text"), "go"),
+        json!({"type": "response_item", "payload": {"type": "reasoning"}}),
+        // Injected after the model answered: request 2's input.
+        message("developer", Some("hooks.additional_context"), "LATE"),
+        usage(10),
+    ]);
+    assert!(prelude.input_closed && !prelude.blocks_incomplete);
+    assert_eq!(prelude.chars(BlockKind::Environment), 5);
+    assert_eq!(prelude.chars(BlockKind::Prompt), 2);
+    assert_eq!(prelude.chars(BlockKind::Hooks), 0);
+    // The footprint's totals keep their window: up to the first usage record.
+    assert_eq!((prelude.hook_chars, prelude.other_harness_chars), (4, 5));
+}
+
+#[test]
+fn unlabeled_or_image_blocks_mark_request_one_incomplete() {
+    let mut malformed = message("user", None, "x");
+    malformed["payload"]["internal_chat_message_metadata_passthrough"] =
+        json!({"content_item_kinds": [7]});
+    let image = json!({"type": "response_item", "payload": {"type": "message", "role": "user",
+        "content": [{"type": "input_image", "image_url": "data:"}],
+        "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["user.image"]}}});
+    for row in [message("user", None, "unlabeled"), malformed, image] {
+        let prelude = parse(&[meta(json!({})), row, usage(1)]);
+        assert!(prelude.blocks_incomplete);
+        assert_eq!(prelude.block_chars, [0; BLOCK_KINDS]);
+    }
+}
+
+#[test]
+fn matching_only_caps_agents_md_and_skips_skills() {
+    let mut parser = CodexPreludeParser::matching_only(4);
+    parser.observe(&json!({"type": "world_state", "payload": {"state": {
+        "agents_md": {"text": "abc\u{e9}def"}, "host_skills": {"body": SKILLS_BODY}}}}));
+    let prelude = parser.prelude();
+    assert_eq!(prelude.agents_md.as_ref().unwrap().text, "abc");
+    assert!(prelude.agents_md_capped);
+    assert_eq!(prelude.skills_body, None);
+    parser.release_text();
+    assert_eq!(parser.prelude().agents_md, None);
+}
+
 fn chain(files: &[(&str, &str, u64)]) -> Vec<ChainFile> {
     files
         .iter()
