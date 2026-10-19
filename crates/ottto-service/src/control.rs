@@ -29025,7 +29025,7 @@ X-API-Key = "otel_redacted"
             action_type: "verify_source".into(),
             source: Some("codex".into()),
         };
-        let (status, _, payload) = run_verify_source_action(
+        let (status, _, payload, verification) = run_verify_source_action(
             &daemon,
             "http://127.0.0.1:1",
             &mut credentials,
@@ -29038,8 +29038,17 @@ X-API-Key = "otel_redacted"
         assert_eq!(payload["records_seen"], 0);
         assert_eq!(payload["live_telemetry_required"], false);
         assert!(payload["smoke_after"].is_null());
+        assert!(payload.get("check").is_none());
+        // The setup completion says configuration only, never usage or an account.
+        assert_eq!(
+            verification.and_then(|result| result.check),
+            Some(SourceVerificationCheck {
+                method: Some(SourceVerificationMethod::ConfigurationCheck),
+                scope: SourceVerificationScope::Configuration,
+            })
+        );
         let disconnected = self::daemon().with_connection(Some(credentials.connection.clone()));
-        let (status, _, payload) = run_verify_source_action(
+        let (status, _, payload, verification) = run_verify_source_action(
             &disconnected,
             "http://127.0.0.1:1",
             &mut credentials,
@@ -29050,9 +29059,15 @@ X-API-Key = "otel_redacted"
         assert_eq!(status, "failed");
         assert_eq!(payload["local_import_ready"], false);
         assert_eq!(payload["error_code"], "account_not_connected");
+        assert_eq!(
+            verification
+                .and_then(|result| result.check)
+                .map(|check| check.scope),
+            Some(SourceVerificationScope::NotEstablished)
+        );
         {
             let _disabled = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
-            let (status, _, payload) = run_verify_source_action(
+            let (status, _, payload, _) = run_verify_source_action(
                 &daemon,
                 "http://127.0.0.1:1",
                 &mut credentials,
