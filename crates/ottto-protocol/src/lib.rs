@@ -683,6 +683,11 @@ pub struct AuthResetResponse {
     pub setup_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected_at: Option<Rfc3339Timestamp>,
+    /// Whether Ottto released this Mac's server registration during a cloud
+    /// reset. Absent for local-only resets and from older daemons; `false`
+    /// means the registration may still be active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_released: Option<bool>,
     pub message: StableMessage,
 }
 
@@ -845,6 +850,15 @@ pub struct ActiveSession {
     pub subscription_product: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_attribution_source: Option<String>,
+    /// Content-free reason the daemon withheld this session's account, so an
+    /// app can say why instead of a bare "unknown". Closed values:
+    /// `multiple_accounts` (the session's own request evidence names more than
+    /// one account) and `incomplete_request_evidence` (one account, but not
+    /// every billed request has a request witness). Only ever set while
+    /// `account_identifier_hash` is absent, and never names an account. Apps
+    /// must treat an unknown value as no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_withheld_reason: Option<String>,
     /// Model the session was MOST RECENTLY seen running, not its lifetime
     /// primary. An active session's card answers "what is it running right
     /// now", so a long session that switched models must not keep showing the
@@ -2247,6 +2261,9 @@ pub struct SourceVerificationResult {
     pub message: StableMessage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_results: Vec<SourceRouteVerificationResult>,
+    /// What kind of check ran and what it established. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<SourceVerificationCheck>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2284,6 +2301,53 @@ pub struct SourceRouteVerificationResult {
     pub error_code: Option<String>,
     pub local_session_observed: Option<bool>,
     pub message: StableMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<SourceVerificationCheck>,
+}
+
+/// The kind of check a Verify used and what it established. `scope` never
+/// names an account: no verification result binds accepted usage to one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceVerificationCheck {
+    /// Absent when no route was evaluated, so the kind is not determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<SourceVerificationMethod>,
+    pub scope: SourceVerificationScope,
+}
+
+/// The kind of check. It does not say the check sent a prompt or finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationMethod {
+    /// Local configuration, source registration and CLI presence only.
+    ConfigurationCheck,
+    /// A small provider prompt, then a check for fresh usage.
+    LivePrompt,
+    /// No prompt: recent usage and local route evidence.
+    PassiveRecentUsage,
+    /// Routes used different methods; each route carries its own.
+    Mixed,
+    /// A value from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a completed check established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationScope {
+    NotEstablished,
+    /// Local configuration is ready; upload was not checked.
+    Configuration,
+    /// Local session or route evidence only; upload was not confirmed.
+    LocalEvidence,
+    /// Ottto received fresh matching usage.
+    UsageReceived,
+    /// Some routes established something and others did not, or they differ.
+    Partial,
+    /// A value from a newer daemon; never success.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7998,6 +8062,7 @@ mod tests {
                 organization_identifier_hash: Some("org-hash".to_string()),
                 subscription_product: Some("chatgpt_pro".to_string()),
                 account_attribution_source: Some("current_login_at_reconciliation".to_string()),
+                account_withheld_reason: None,
                 latest_model: Some("claude-opus-5".to_string()),
                 latest_reasoning_effort: Some("high".to_string()),
             }],
@@ -8021,9 +8086,28 @@ mod tests {
         // Snake-case keys the Swift Companion decodes for the session card.
         assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
         assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");
+        // Absent, not null, when the daemon has no withheld reason.
+        assert!(value["sessions"][0]
+            .as_object()
+            .is_some_and(|session| !session.contains_key("account_withheld_reason")));
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
+
+        let mut withheld = reconciliation.clone();
+        withheld.sessions[0].account_identifier_hash = None;
+        withheld.sessions[0].organization_identifier_hash = None;
+        withheld.sessions[0].subscription_product = None;
+        withheld.sessions[0].account_attribution_source = None;
+        withheld.sessions[0].account_withheld_reason = Some("multiple_accounts".to_string());
+        let value = serde_json::to_value(&withheld).expect("serialize withheld reconciliation");
+        assert_eq!(
+            value["sessions"][0]["account_withheld_reason"],
+            "multiple_accounts"
+        );
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize withheld reconciliation");
+        assert_eq!(round_tripped, withheld);
     }
 
     #[test]
@@ -8518,5 +8602,43 @@ mod tests {
         assert!(!is_credit_reason_code("Tenure"));
         assert!(!is_credit_reason_code(&"a".repeat(65)));
         assert!(!is_credit_reason_code("five hour"));
+    }
+
+    #[test]
+    fn verification_check_is_optional_and_unknown_values_stay_unknown() {
+        let old = serde_json::json!({
+            "source": "codex",
+            "config": {"discovered": true, "path_hint": null, "fingerprint": null, "drift": []},
+            "status": "warning",
+            "verified": false,
+            "records_seen": 0,
+            "last_record_id": null,
+            "last_received_at": null,
+            "smoke_after": null,
+            "message": {"code": "codex_local_import", "text": "checked"},
+        });
+        let decoded: SourceVerificationResult = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(decoded.check, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
+
+        let mut future = old;
+        future["check"] = serde_json::json!({"method": "quantum_probe", "scope": "future_scope"});
+        let decoded: SourceVerificationResult = serde_json::from_value(future).unwrap();
+        assert_eq!(
+            decoded.check,
+            Some(SourceVerificationCheck {
+                method: Some(SourceVerificationMethod::Unknown),
+                scope: SourceVerificationScope::Unknown,
+            })
+        );
+
+        let check = SourceVerificationCheck {
+            method: None,
+            scope: SourceVerificationScope::NotEstablished,
+        };
+        assert_eq!(
+            serde_json::to_value(&check).unwrap(),
+            serde_json::json!({"scope": "not_established"})
+        );
     }
 }

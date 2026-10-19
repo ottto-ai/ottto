@@ -1379,6 +1379,8 @@ fn native_comparison_interrupted_correction_is_terminal_base(upload: RearmUpload
 
 #[test]
 #[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
 fn native_comparison_shed_corrective_parse_partial_save_and_terminal_use_base() {
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::Shed);
 }
@@ -2016,6 +2018,8 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
 
 #[test]
 #[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
 fn native_comparison_copy_offer_shed_partial_save_recovers() {
     native_comparison_copy_offer_interruption(RearmUpload::Shed, false);
 }
@@ -2026,6 +2030,8 @@ fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
 }
 #[test]
 #[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
 fn native_comparison_copy_offer_shed_restart_recovers() {
     native_comparison_copy_offer_interruption(RearmUpload::Shed, true);
 }

@@ -301,6 +301,12 @@ impl SessionAttributionContext {
         facts
     }
 
+    /// Tenant-keyed opaque id for one kind of local material, the same scheme
+    /// as skill and template ids. Exists only while attribution is collected.
+    pub(crate) fn opaque_id(&self, domain: &str, material: &str) -> Option<String> {
+        opaque_hmac_id(&self.key, domain, material)
+    }
+
     pub fn grouping_facts(
         &self,
         input: SessionAttributionGroupingInput<'_>,

@@ -119,6 +119,44 @@ impl Samples {
     }
 }
 
+/// Parent ruling 2 (#606 round 3): the opened object's identity and the
+/// samples covering its sealed prefix, minted only by
+/// `ReadPlan::commit_sealed_prefix_or_lossy_identity` when the certificate
+/// refused as `Lossy` alone (every identity, sample, scope and audit check
+/// passed). It certifies nothing: no checkpoint, verification, retention or
+/// debt change. It lets `finish` accept a grown object for an UNCERTIFIED
+/// publication only while `holds` passes at finalization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LossyPrefixIdentity {
+    stamp: FileStamp,
+    samples: Samples,
+}
+
+impl LossyPrefixIdentity {
+    /// Revalidate against the held FD now: the same object, unchanged or
+    /// grown (never shrunk, never edited at the same size), and both covered
+    /// samples re-read from the held FD unchanged.
+    pub(crate) fn holds(&self, file: &mut File) -> bool {
+        let Ok(now) = file.metadata().and_then(FileStamp::capture) else {
+            return false;
+        };
+        let sealed = self.samples.sealed_offset;
+        if !self.stamp.same_object(&now)
+            || !(now == self.stamp || now.length > self.stamp.length)
+            || !self.samples.valid_for(self.stamp.length)
+        {
+            return false;
+        }
+        let mut guard = 0;
+        let boundary_start = sealed - self.samples.boundary.len() as u64;
+        matches!(sample_at(file, 0, &self.samples.head, &mut guard), Ok(true))
+            && matches!(
+                sample_at(file, boundary_start, &self.samples.boundary, &mut guard),
+                Ok(true)
+            )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Checkpoint {
     stamp: FileStamp,
@@ -147,6 +185,28 @@ impl Checkpoint {
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
     }
+    #[cfg(test)]
+    pub(crate) fn last_full_verified(&self) -> u64 {
+        self.last_full_verified_unix_seconds
+    }
+}
+
+/// Why a multi-page read's sealed prefix `[0, s)` was not certified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefixRefusal {
+    /// Replacement, shrink, same-size edit, a held-FD sample mismatch or an
+    /// unknown witness: the parsed result may mix old and new bytes. Nothing
+    /// from this read may be published or committed.
+    Invalidated(FullReason),
+    /// The interpretation scope or another dependency changed: invalidates.
+    Dependency,
+    /// A tail reached its audit deadline before commit. Like
+    /// `commit_after_native_completion`, a tail never certifies past it;
+    /// the next read is the full audit. Not an invalidation.
+    AuditDue,
+    /// Every object check holds but the native read was lossy. The result
+    /// publishes uncertified, exactly like a lossy full read.
+    Lossy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,7 +417,13 @@ impl ReadPlan {
     pub(crate) fn mode(&self) -> ReadMode {
         self.mode
     }
-    #[cfg(test)]
+    /// Length frozen when this acquisition opened. A multi-page reader never
+    /// consumes past it; later appends belong to the next tail.
+    pub(crate) fn frozen_length(&self) -> u64 {
+        self.stamp.length
+    }
+    /// Where this read starts: 0 for a full read, `s` for a tail. A reader
+    /// counts consumed bytes from here.
     pub(crate) fn start_offset(&self) -> u64 {
         self.start_offset
     }
@@ -488,6 +554,137 @@ impl ReadPlan {
     }
 }
 
+impl ReadPlan {
+    /// `commit_sealed_prefix`, plus ruling 2's typed identity exactly when it
+    /// refused as `Lossy`: that refusal is reached only after every other
+    /// identity, sample, scope and audit check passed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_sealed_prefix_or_lossy_identity(
+        self,
+        file: &mut File,
+        path_same_object: bool,
+        current_scope: &Scope,
+        started: u64,
+        now: u64,
+        lossy: bool,
+        consumed: u64,
+    ) -> (
+        Result<Checkpoint, PrefixRefusal>,
+        Option<LossyPrefixIdentity>,
+    ) {
+        let identity = LossyPrefixIdentity {
+            stamp: self.stamp.clone(),
+            samples: self.samples.clone(),
+        };
+        let result = self.commit_sealed_prefix(
+            file,
+            path_same_object,
+            current_scope,
+            started,
+            now,
+            lossy,
+            consumed,
+        );
+        let identity = matches!(result, Err(PrefixRefusal::Lossy)).then_some(identity);
+        (result, identity)
+    }
+
+    /// Certify the sealed prefix `[0, s)` of a read that spanned pages while
+    /// the source may have grown. `s` is the end of the last complete record
+    /// at or below the frozen length; an unfinished record after it is never
+    /// certified. The checkpoint records `length = s` and verification time
+    /// `started` (when this read opened, never completion), so appended
+    /// bytes stay unread and the deadline is never reset by a slow read.
+    ///
+    /// `path_same_object` is the caller's `stat(path)` dev/ino equality with
+    /// the held FD; no bytes are read from the reopened path. Samples are
+    /// re-read from the held FD only. This is append-only sampled-prefix
+    /// semantics, not an immutable snapshot: an interior edit that preserves
+    /// both samples is not detected until a later full read.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_sealed_prefix(
+        self,
+        file: &mut File,
+        path_same_object: bool,
+        current_scope: &Scope,
+        started: u64,
+        now: u64,
+        lossy: bool,
+        consumed: u64,
+    ) -> Result<Checkpoint, PrefixRefusal> {
+        use FullReason::*;
+        let invalid = |reason| Err(PrefixRefusal::Invalidated(reason));
+        if !cfg!(unix) {
+            return invalid(UnsupportedIdentity);
+        }
+        let Ok(current) = file.metadata().and_then(FileStamp::capture) else {
+            return invalid(Replaced);
+        };
+        let sealed = self.samples.sealed_offset;
+        if !path_same_object || !self.stamp.same_object(&current) {
+            return invalid(Replaced);
+        }
+        if current.length < self.stamp.length || current.length < consumed.max(sealed) {
+            return invalid(Shrunk);
+        }
+        if current.length == self.stamp.length && current != self.stamp {
+            return invalid(SameSizeEdit);
+        }
+        if self.mode == ReadMode::Unchanged
+            || !self.samples.valid_for(self.stamp.length)
+            || (sealed > 0 && self.samples.boundary.last() != Some(&b'\n'))
+        {
+            return invalid(InvalidCheckpoint);
+        }
+        let mut guard = 0;
+        let boundary_start = sealed - self.samples.boundary.len() as u64;
+        match sample_at(file, 0, &self.samples.head, &mut guard) {
+            Ok(true) => {}
+            _ => return invalid(HeadChanged),
+        }
+        match sample_at(file, boundary_start, &self.samples.boundary, &mut guard) {
+            Ok(true) => {}
+            _ => return invalid(BoundaryChanged),
+        }
+        if current_scope != &self.scope {
+            return Err(PrefixRefusal::Dependency);
+        }
+        if let (ReadMode::Tail, Some(debt)) = (self.mode, self.debt) {
+            if now >= debt.due_unix_seconds {
+                return Err(PrefixRefusal::AuditDue);
+            }
+        }
+        if lossy {
+            return Err(PrefixRefusal::Lossy);
+        }
+        let (verified, audit_debt) = match self.mode {
+            ReadMode::Full(_) => {
+                let due = started.saturating_add(AUDIT_INTERVAL_SECONDS);
+                // A read that outlived the interval completes already due:
+                // stage the debt instead of clearing it.
+                (
+                    started,
+                    (now >= due).then_some(AuditDebt {
+                        due_unix_seconds: due,
+                    }),
+                )
+            }
+            ReadMode::Tail | ReadMode::Unchanged => {
+                (self.last_full_verified_unix_seconds, self.debt)
+            }
+        };
+        let mut stamp = self.stamp;
+        stamp.length = sealed;
+        Ok(Checkpoint {
+            stamp,
+            scope: self.scope,
+            samples: self.samples,
+            last_full_verified_unix_seconds: verified,
+            audit_debt,
+        })
+    }
+}
+
 impl crate::heap_layout_bound::HeapLayoutBound for Scope {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self(value) = self;
@@ -498,6 +695,7 @@ crate::heap_layout_bound::fields!(AuditDebt; due_unix_seconds);
 crate::heap_layout_bound::fields!(FileStamp; length, #[cfg(unix)] device, #[cfg(unix)] inode,
     #[cfg(unix)] modified, #[cfg(unix)] changed);
 crate::heap_layout_bound::fields!(Samples; sealed_offset, head, boundary);
+crate::heap_layout_bound::fields!(LossyPrefixIdentity; stamp, samples);
 crate::heap_layout_bound::fields!(Checkpoint; stamp, scope, samples, last_full_verified_unix_seconds, audit_debt);
 crate::heap_layout_bound::fields!(ReadPlan; mode, stamp, scope, samples, start_offset,
     last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record);
@@ -934,5 +1132,220 @@ mod tests {
             100,
         );
         assert_eq!(mode, ReadMode::Full(FullReason::ClockChanged));
+    }
+
+    /// A cursor-style read: freeze at open, consume complete records up to the
+    /// frozen length, then let the caller mutate the file before commit.
+    fn sealed_read(f: &Fixture, started: u64) -> (File, ReadPlan, u64) {
+        let mut file = f.open();
+        let mut plan = ReadPlan::prepare(&mut file, None, &scope(), None, started).unwrap();
+        let frozen = plan.frozen_length();
+        let mut bytes = vec![0; frozen as usize];
+        file.read_exact(&mut bytes).unwrap();
+        if let Some(last) = bytes.iter().rposition(|b| *b == b'\n') {
+            plan.observe_complete_records(&bytes[..=last]).unwrap();
+        }
+        (file, plan, frozen)
+    }
+
+    #[test]
+    fn grown_source_certifies_sealed_prefix_at_read_start() {
+        let f = Fixture::new(b"one\ntwo\n");
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        f.append(b"three\n");
+        let cp = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, 900, false, frozen)
+            .unwrap();
+        assert_eq!(cp.sealed_offset(), frozen);
+        assert_eq!(cp.last_full_verified(), 100);
+        assert_eq!(cp.audit_debt(), None);
+        // Appended bytes were never marked read: the next read tails from s.
+        let (mode, next, _) = run(&f, Some(&cp), None, 1000);
+        assert_eq!(mode, ReadMode::Tail);
+        assert_eq!(next.sealed_offset(), frozen + 6);
+    }
+
+    #[test]
+    fn crash_truncated_last_line_not_certified_no_audit_loop() {
+        let f = Fixture::new(b"one\ntwo\npart");
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        let cp = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, 200, false, frozen)
+            .unwrap();
+        assert_eq!(cp.sealed_offset(), 8);
+        // Unchanged source: the index skips it by its open-time fingerprint;
+        // a completed fragment changes the length and tails from s.
+        f.append(b"ial\n");
+        let (mode, next, _) = run(&f, Some(&cp), None, 300);
+        assert_eq!(mode, ReadMode::Tail);
+        assert_eq!(next.sealed_offset(), 16);
+    }
+
+    #[test]
+    fn prefix_certificate_fails_on_same_size_edit_or_shrink_or_object_change() {
+        let refusal = |mutate: &dyn Fn(&Fixture), path_same_object: bool| {
+            let f = Fixture::new(b"one\ntwo\n");
+            let (mut file, plan, frozen) = sealed_read(&f, 100);
+            mutate(&f);
+            plan.commit_sealed_prefix(
+                &mut file,
+                path_same_object,
+                &scope(),
+                100,
+                200,
+                false,
+                frozen,
+            )
+            .unwrap_err()
+        };
+        use FullReason::*;
+        assert_eq!(
+            refusal(&|f| f.replace_bytes(b"one\ntwX\n"), true),
+            PrefixRefusal::Invalidated(SameSizeEdit)
+        );
+        assert_eq!(
+            refusal(&|f| f.replace_bytes(b"one\n"), true),
+            PrefixRefusal::Invalidated(Shrunk)
+        );
+        assert_eq!(
+            refusal(&|_| {}, false),
+            PrefixRefusal::Invalidated(Replaced)
+        );
+    }
+
+    #[test]
+    fn held_fd_sample_mismatch_invalidates_grown_source() {
+        // C1: an in-place edit of already-parsed bytes inside a sample is a
+        // necessary invalidation even when the file also grew.
+        for offset in [1, SAMPLE_BYTES + 100] {
+            let mut bytes = vec![b'a'; 2 * SAMPLE_BYTES];
+            bytes.push(b'\n');
+            let f = Fixture::new(&bytes);
+            let (mut file, plan, frozen) = sealed_read(&f, 100);
+            bytes[offset] = b'b';
+            bytes.extend_from_slice(b"new\n");
+            f.replace_bytes(&bytes);
+            assert_eq!(
+                plan.commit_sealed_prefix(&mut file, true, &scope(), 100, 200, false, frozen)
+                    .unwrap_err(),
+                PrefixRefusal::Invalidated(if offset < SAMPLE_BYTES {
+                    FullReason::HeadChanged
+                } else {
+                    FullReason::BoundaryChanged
+                })
+            );
+        }
+    }
+
+    /// M1: a multi-page tail that reaches its audit deadline before commit is
+    /// refused (the next read is the audit), exactly like a single-page tail.
+    #[test]
+    fn tail_prefix_reaching_its_audit_deadline_is_refused_for_the_audit() {
+        let f = Fixture::new(b"one\n");
+        let cp = initial(&f, 1000);
+        f.append(b"two\n");
+        let debt = Some(AuditDebt {
+            due_unix_seconds: 1500,
+        });
+        let tail = |commit_at: u64| {
+            let mut file = f.open();
+            let mut plan = ReadPlan::prepare(&mut file, Some(&cp), &scope(), debt, 1100).unwrap();
+            assert_eq!(plan.mode(), ReadMode::Tail);
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            plan.observe_complete_records(&bytes).unwrap();
+            let consumed = plan.frozen_length();
+            plan.commit_sealed_prefix(&mut file, true, &scope(), 1100, commit_at, false, consumed)
+        };
+        assert_eq!(tail(1500).unwrap_err(), PrefixRefusal::AuditDue);
+        let certified = tail(1499).unwrap();
+        assert_eq!(certified.sealed_offset(), 8);
+        assert_eq!(
+            certified.audit_debt().map(|debt| debt.due_unix_seconds),
+            Some(1500)
+        );
+    }
+
+    #[test]
+    fn lossy_or_rescoped_prefix_is_not_certified_and_slow_read_stays_due() {
+        let f = Fixture::new(b"one\ntwo\n");
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        assert_eq!(
+            plan.commit_sealed_prefix(&mut file, true, &scope(), 100, 200, true, frozen)
+                .unwrap_err(),
+            PrefixRefusal::Lossy
+        );
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        assert_eq!(
+            plan.commit_sealed_prefix(
+                &mut file,
+                true,
+                &Scope("other-interpretation".into()),
+                100,
+                200,
+                false,
+                frozen
+            )
+            .unwrap_err(),
+            PrefixRefusal::Dependency
+        );
+        // Ruling 2: only a `Lossy`-alone refusal leaves the typed identity. It
+        // revalidates against the held FD: growth holds; a covered-sample
+        // edit or a shrink does not. Any other refusal leaves none.
+        for edit in ["grow", "sample", "shrink"] {
+            let g = Fixture::new(b"one\ntwo\n");
+            let (mut file, plan, frozen) = sealed_read(&g, 100);
+            let (refusal, identity) = plan.commit_sealed_prefix_or_lossy_identity(
+                &mut file,
+                true,
+                &scope(),
+                100,
+                200,
+                true,
+                frozen,
+            );
+            assert_eq!(refusal.unwrap_err(), PrefixRefusal::Lossy);
+            let identity = identity.expect("a lossy-only refusal carries the identity");
+            assert!(identity.holds(&mut file), "{edit}: unchanged");
+            g.append(b"three\n");
+            match edit {
+                "grow" => assert!(identity.holds(&mut file), "growth holds"),
+                "sample" => {
+                    let mut writer = g.open();
+                    writer.seek(SeekFrom::Start(0)).unwrap();
+                    writer.write_all(b"O").unwrap();
+                    assert!(!identity.holds(&mut file), "covered sample changed");
+                }
+                _ => {
+                    g.open().set_len(2).unwrap();
+                    assert!(!identity.holds(&mut file), "shrunk");
+                }
+            }
+        }
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        let (refusal, identity) = plan.commit_sealed_prefix_or_lossy_identity(
+            &mut file,
+            true,
+            &Scope("other-interpretation".into()),
+            100,
+            200,
+            true,
+            frozen,
+        );
+        assert_eq!(refusal.unwrap_err(), PrefixRefusal::Dependency);
+        assert!(identity.is_none(), "not the sole refusal");
+        // A read that outlived the interval certifies at its start and stays due.
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        let late = 100 + AUDIT_INTERVAL_SECONDS;
+        let cp = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, late, false, frozen)
+            .unwrap();
+        assert_eq!(cp.last_full_verified(), 100);
+        assert_eq!(cp.audit_debt().unwrap().due_unix_seconds, late);
+        f.append(b"three\n");
+        assert_eq!(
+            run(&f, Some(&cp), cp.audit_debt(), late + 1).0,
+            ReadMode::Full(FullReason::AuditDue)
+        );
     }
 }

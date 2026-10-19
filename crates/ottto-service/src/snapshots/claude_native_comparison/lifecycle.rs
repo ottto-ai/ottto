@@ -65,6 +65,7 @@ pub(crate) struct Lease {
     window: Option<Box<WindowEligibility>>,
     policy: FamilyPolicyState,
     policy_hit: bool,
+    pub(crate) diagnostic: crate::local_resource_diagnostics::NativeDecision,
 }
 
 impl Lifecycle {
@@ -82,6 +83,7 @@ impl Lifecycle {
             window: None,
             policy: FamilyPolicyState::default(),
             policy_hit: false,
+            diagnostic: crate::local_resource_diagnostics::NativeDecision::new(),
         };
         if let Ok(mut state) = self.state.lock() {
             lease.previous_valid = state.valid;
@@ -96,6 +98,9 @@ impl Lifecycle {
                 lease.generation = Some(next);
             }
         }
+        lease
+            .diagnostic
+            .update(|d| d.lease_generation = lease.generation);
         lease
     }
 
@@ -184,6 +189,11 @@ impl Lease {
                     state.published_policy = state.policy.summary();
                     state.policy_in_flight = false;
                     self.finished = true;
+                    self.diagnostic.update(|d| {
+                        d.outcome =
+                            crate::local_resource_diagnostics::NativeDecisionOutcome::CadenceWait;
+                        d.retained_permit = Some(state.valid);
+                    });
                 }
             }
         }
@@ -227,6 +237,8 @@ impl Lease {
         if !self.allowed {
             self.window = None;
         }
+        self.diagnostic
+            .update(|d| d.allowed_at_bind = Some(self.allowed));
         self.publish_policy();
     }
 
@@ -238,6 +250,8 @@ impl Lease {
     }
 
     pub(crate) fn revoke(&mut self) {
+        self.diagnostic
+            .update(|d| d.revoke_calls = d.revoke_calls.saturating_add(1));
         self.allowed = false;
         self.selected_save = false;
         self.native_save = false;
@@ -248,6 +262,8 @@ impl Lease {
     /// target. Conservative BASE for this process lifecycle; no timer, retry
     /// grant or persisted suppression. Ordinary sources remain available.
     pub(crate) fn refuse_admission(&mut self) {
+        self.diagnostic
+            .update(|d| d.admission_refusal_calls = d.admission_refusal_calls.saturating_add(1));
         self.revoke();
         if let Ok(mut state) = self.owner.state.lock() {
             if self.generation == Some(state.generation) {
@@ -287,6 +303,16 @@ impl Lease {
         let decision = self
             .policy
             .decide_paid(root, oversized, counts, generation, credit)?;
+        self.diagnostic.update(|d| {
+            d.hit_policy_calls = d.hit_policy_calls.saturating_add(1);
+            if decision {
+                d.deferred_decisions = d.deferred_decisions.saturating_add(1);
+            } else if was_blocked {
+                d.latched_base_decisions = d.latched_base_decisions.saturating_add(1);
+            } else {
+                d.other_base_decisions = d.other_base_decisions.saturating_add(1);
+            }
+        });
         self.policy_hit |= !was_blocked;
         self.publish_policy();
         Ok(decision)
@@ -364,6 +390,7 @@ impl Lease {
     /// conjunction receipt. A known saved bounded page may retain an existing
     /// permit, but cannot mint one. Envelopes/possible hits never mint one.
     pub(crate) fn note_selected_save(&mut self, native_conjunction: bool) {
+        self.diagnostic.update(|d| d.selected_save = true);
         self.selected_save = true;
         self.native_save = native_conjunction;
         if let Some(generation) = self.generation {
@@ -373,6 +400,10 @@ impl Lease {
     }
 
     pub(crate) fn finish(mut self, clean: bool) {
+        self.diagnostic.update(|d| {
+            d.clean_at_finish = Some(clean);
+            d.outcome = crate::local_resource_diagnostics::NativeDecisionOutcome::Finished;
+        });
         if let Ok(mut state) = self.owner.state.lock() {
             if self.generation == Some(state.generation) && self.scope == state.scope {
                 state.valid = !state.admission_refused
@@ -380,6 +411,8 @@ impl Lease {
                     && self.scope.is_some()
                     && self.selected_save
                     && (self.native_save || self.allowed);
+                self.diagnostic
+                    .update(|d| d.retained_permit = Some(state.valid));
                 state.window = if state.valid {
                     self.window.take()
                 } else {
@@ -400,6 +433,7 @@ impl Drop for Lease {
             if let Ok(mut state) = self.owner.state.lock() {
                 if self.generation == Some(state.generation) {
                     state.valid = false;
+                    self.diagnostic.update(|d| d.retained_permit = Some(false));
                     state.window = None;
                     // Save/offer failure after C3 still requires the next page
                     // to be BASE. Other abandoned leases revoke all ephemeral
@@ -417,6 +451,10 @@ impl Drop for Lease {
                     state.policy_in_flight = false;
                 }
             }
+        }
+        // Emit after releasing lifecycle locks; sink failure cannot change state.
+        if !std::thread::panicking() {
+            self.diagnostic.emit();
         }
     }
 }
@@ -497,7 +535,7 @@ fn native_comparison_local_refusal_latches_base_across_pages_and_cache_clear() {
 
 crate::heap_layout_bound::fields!(Lifecycle; state);
 crate::heap_layout_bound::fields!(State; generation, scope, valid, window, admission_refused, policy, published_policy, policy_in_flight);
-crate::heap_layout_bound::fields!(Lease; owner, generation, previous_scope, previous_valid, scope, allowed, selected_save, native_save, finished, window, policy, policy_hit);
+crate::heap_layout_bound::fields!(Lease; owner, generation, previous_scope, previous_valid, scope, allowed, selected_save, native_save, finished, window, policy, policy_hit, diagnostic);
 
 /// The latch is process-local progress policy, never upload/ownership evidence.
 /// Retain the success counter after quiet clear so a proof refresh cannot renew

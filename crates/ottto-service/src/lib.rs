@@ -15,11 +15,13 @@ pub(crate) mod claude_status_coverage;
 pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;
+pub mod codex_prelude_footprint;
 mod codex_process_homes;
 mod codex_scan_diagnostics;
 pub mod codex_sign_in;
 pub(crate) mod command_env;
 pub mod context_composition;
+mod context_file_counts;
 pub mod context_footprint;
 pub mod context_posture;
 pub mod control;
@@ -980,6 +982,7 @@ impl LocalDaemon {
             cloud_disconnected: false,
             setup_run_id: None,
             disconnected_at: None,
+            device_released: None,
             message: StableMessage {
                 code: "disconnected".to_string(),
                 text: "This Mac is disconnected from Ottto.".to_string(),
@@ -5149,6 +5152,7 @@ mod tests {
                 text: "Codex verification passed.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -5254,6 +5258,7 @@ mod tests {
                 text: "Codex telemetry config does not match the active Ottto relay.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -5328,6 +5333,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -5399,6 +5405,7 @@ mod tests {
                     text: "Verification passed.".to_string(),
                 },
                 route_results: Vec::new(),
+                check: None,
             };
             daemon
                 .record_verification_result(&verified)
@@ -5425,6 +5432,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
         daemon
             .record_verification_result(&not_installed)
@@ -5485,6 +5493,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
         daemon
             .record_verification_result(&cli_unavailable)
@@ -5910,6 +5919,7 @@ mod tests {
                 text: "Codex smoke session failed before verification could complete.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -5956,6 +5966,7 @@ mod tests {
                 text: "No Pi model routes passed smoke verification.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
         daemon
             .record_verification_result(&result)
@@ -6045,6 +6056,7 @@ mod tests {
                 text: "Ottto did not receive a fresh Codex verification signal after the smoke prompt.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6111,6 +6123,7 @@ mod tests {
                 text: "Pi telemetry is turned off in this workspace. Turn telemetry on in Ottto, then retry Verify.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6218,6 +6231,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6284,6 +6298,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6417,6 +6432,7 @@ mod tests {
                 text: "Claude Code smoke session failed before verification could complete: You've hit your org's monthly spend limit · run [path] to raise it, or visit claude.ai/admin-settings/usage".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6603,6 +6619,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6667,6 +6684,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6728,6 +6746,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6785,6 +6804,7 @@ mod tests {
                 text: detail.to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6848,6 +6868,7 @@ mod tests {
                 text: "Use Sign in in the Ottto app to refresh it.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6896,6 +6917,7 @@ mod tests {
                 text: "Claude Code sign-in expired. Ottto itself is still connected.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6940,6 +6962,7 @@ mod tests {
                 text: "Use Sign in in the Ottto app, then try verifying again.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -8712,6 +8735,7 @@ mod tests {
                 text: "Codex verification passed.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         }
     }
 
@@ -8735,6 +8759,7 @@ mod tests {
                 text: "Use Sign in in the Ottto app to refresh it.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         }
     }
 

@@ -321,6 +321,74 @@ fn sampled_native_hidden_middle_edit_is_corrected_by_due_full_audit() {
     }
 }
 #[test]
+fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = Fixture::new(SnapshotSource::ClaudeCode);
+    fixture.append(&usage(
+        SnapshotSource::ClaudeCode,
+        100,
+        0,
+        "claude-opus-4-8",
+    ));
+    let ((old, mode, _, body), full) =
+        observe(|| acquire(&fixture, SnapshotSource::ClaudeCode, None, 100));
+    assert!(matches!(mode, ReadMode::Full(_)));
+    assert_eq!(body, oracle(&fixture, SnapshotSource::ClaudeCode));
+    assert_eq!(full.retention_produced, 1);
+    assert_eq!(full.retention_bound_refused, 0);
+    fixture.append(&usage(
+        SnapshotSource::ClaudeCode,
+        140,
+        1,
+        "claude-opus-4-8",
+    ));
+    let (mut parser, expected, scope) = native_parser(&fixture, SnapshotSource::ClaudeCode);
+    assert_eq!(
+        parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
+        ReadMode::Tail
+    );
+    while !parser.step().unwrap() {}
+    let (certificate, refused) =
+        observe(|| parser.retain_reduction(&scope, 101, 0).unwrap().unwrap());
+    assert!(certificate.reduction.is_none());
+    assert_eq!(
+        certificate
+            .checkpoint
+            .audit_debt()
+            .unwrap()
+            .due_unix_seconds,
+        3700
+    );
+    assert_eq!(refused.retention_bound_refused, 1);
+    assert_eq!(refused.retention_produced, 0);
+    let parsed = parser
+        .finish(
+            &expected,
+            &fixture.0,
+            NOW,
+            "native-fixture".into(),
+            Some(&CodexTitleMetadata::default()),
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+        )
+        .unwrap();
+    assert!(parsed.complete());
+    let mut items = parsed.snapshots;
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        &mut items,
+        SnapshotUploadPolicy::default(),
+    );
+    assert_eq!(
+        serde_json::to_value(items).unwrap(),
+        oracle(&fixture, SnapshotSource::ClaudeCode)
+    );
+}
+
+#[test]
 fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -648,6 +716,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
             if inputs != "parents" {
                 let traces = Arc::new(CodexTurnTraceMap {
                     priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
+                    incomplete: false,
                 });
                 assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
                 scan.codex_turn_traces = Some(traces);
@@ -1022,6 +1091,7 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
         priority_turns: BTreeSet::from(["unrelated-turn".into()]),
+        incomplete: false,
     }));
     assert_eq!(
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
@@ -1031,6 +1101,7 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
         priority_turns: BTreeSet::from(["this-turn".into()]),
+        incomplete: false,
     }));
     assert!(matches!(
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),

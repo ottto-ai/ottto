@@ -4,7 +4,19 @@ use serde::{ser::SerializeMap, Serialize};
 use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod cache_lifecycle;
+
 const SCHEMA_VERSION: u8 = 2;
+
+/// Cumulative shared-process totals, NOT events attributed to the finishing
+/// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
+pub(crate) fn cache_lifecycle_totals() {
+    traversal_point(
+        "process_retained_cache_lifecycle_totals",
+        "unknown",
+        &cache_lifecycle::snapshot(),
+    );
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,10 +199,13 @@ struct EmptyCounts {}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
+    traversal_point("bounded_traversal_transition", source, counts);
+}
+fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
-        stage: "bounded_traversal_transition",
+        stage,
         source: Source::from_slug(source),
         observation: Observation {
             observed_unix_ms: SystemTime::now()
@@ -204,6 +219,94 @@ pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
         },
         counts,
     });
+}
+
+/// One preparation/page observation, never a permit or authority input.
+/// None means that boundary was not reached, not a known false/zero result.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct NativeComparisonDecision {
+    pub(crate) layout_supported: bool,
+    pub(crate) lease_generation: Option<u64>,
+    pub(crate) fold_index_generation: Option<u64>,
+    pub(crate) allowed_at_bind: Option<bool>,
+    pub(crate) controller_created: bool,
+    pub(crate) controller_current_at_finish: Option<bool>,
+    pub(crate) bootstrap: Option<NativeBootstrap>,
+    pub(crate) selected_save: bool,
+    pub(crate) upload_fully_settled: Option<bool>,
+    pub(crate) clean_at_finish: Option<bool>,
+    pub(crate) retained_permit: Option<bool>,
+    pub(crate) revoke_calls: usize,
+    pub(crate) admission_refusal_calls: usize,
+    pub(crate) hit_policy_calls: usize,
+    pub(crate) deferred_decisions: usize,
+    pub(crate) latched_base_decisions: usize,
+    pub(crate) other_base_decisions: usize,
+    pub(crate) terminal_rearm: Option<NativeRearm>,
+    pub(crate) correction_mint: Option<NativeMint>,
+    pub(crate) outcome: NativeDecisionOutcome,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeDecisionOutcome {
+    #[default]
+    Abandoned,
+    CadenceWait,
+    Finished,
+    DisabledBeforeLease,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct NativeBootstrap {
+    pub(crate) native_census_complete: bool,
+    pub(crate) coverage_complete: bool,
+    pub(crate) census_valid: bool,
+    pub(crate) fence_open: bool,
+    pub(crate) pending_occurrences_present: bool,
+    pub(crate) transcript_ownership_complete: bool,
+    pub(crate) scan_census_complete: bool,
+    pub(crate) not_withheld: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct NativeRearm {
+    pub(crate) negative_keys: usize,
+    pub(crate) proof_candidates: usize,
+    /// Actual no-clear decisions: other rearm disjuncts must also be false.
+    pub(crate) suppressed: usize,
+    pub(crate) other_rearm_matches: usize,
+    pub(crate) clear_calls: usize,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct NativeMint {
+    pub(crate) window_available: bool,
+    pub(crate) candidates: usize,
+    pub(crate) insertions: usize,
+    /// This is before later window staging/retirement, not a retained grant.
+    pub(crate) receipts_after_mint: usize,
+}
+/// Inline Cell permits the final read-only negative view to report decisions.
+/// It owns no graph and is included in its lease's existing layout charge.
+pub(crate) struct NativeDecision(pub(crate) std::cell::Cell<NativeComparisonDecision>);
+impl NativeDecision {
+    pub(crate) fn new() -> Self {
+        Self(std::cell::Cell::new(NativeComparisonDecision {
+            layout_supported: crate::heap_layout_bound::layout_supported(),
+            ..Default::default()
+        }))
+    }
+    pub(crate) fn update(&self, update: impl FnOnce(&mut NativeComparisonDecision)) {
+        let mut value = self.0.get();
+        update(&mut value);
+        self.0.set(value);
+    }
+    pub(crate) fn emit(&self) {
+        traversal_point("native_comparison_decision", "claude_code", &self.0.get());
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
+    const INLINE_ONLY: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -225,6 +328,140 @@ pub(crate) struct ReadCounts {
     pub(crate) acquisition_admission: AcquisitionAdmission,
     pub(crate) page_events: PageEvents,
     pub(crate) index_state_at_page_end: IndexState,
+    /// Resumable large-file Codex read cursor (#606). `null` when its
+    /// snapshot could not be obtained (no Codex cursor page tick in this scan,
+    /// or the cursor state was busy at completion): unknown, never zero
+    /// activity.
+    pub(crate) codex_cursor: Option<Box<CodexCursorCounts>>,
+}
+
+/// Content-free, fixed width; each count saturates at `u32::MAX`. Like
+/// `FullReasons`, only nonzero keys are serialized (an absent key is zero);
+/// the block itself is `null` when unknown.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct CodexCursorCounts {
+    /// Process-global cursor counter deltas while this scan's window was
+    /// open (its first cursor page tick to its completion). The cursor is
+    /// shared by every namespace in the process and overlapping scans move
+    /// these counters too: NOT events caused by this scan.
+    pub(crate) during_scan_window: CodexCursorEvents,
+    /// Process-wide cursor gauges when this scan completed.
+    pub(crate) retained: CodexCursorRetained,
+}
+
+/// Process-global cursor events during a scan window (shared process scope,
+/// not attributed to one scan or namespace).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CodexCursorEvents {
+    pub(crate) jobs_started: u32,
+    pub(crate) jobs_paused: u32,
+    pub(crate) jobs_resumed: u32,
+    pub(crate) jobs_certified: u32,
+    pub(crate) jobs_uncertified: u32,
+    pub(crate) jobs_invalidated: u32,
+    pub(crate) jobs_member_changed: u32,
+    pub(crate) jobs_state_bound: u32,
+    pub(crate) jobs_lost: u32,
+    pub(crate) jobs_deferred_inputs: u32,
+    pub(crate) jobs_start_unstartable: u32,
+    pub(crate) jobs_audit_restarted: u32,
+    pub(crate) jobs_finish_failed: u32,
+    pub(crate) jobs_frame_returned: u32,
+    pub(crate) deferred: u32,
+    pub(crate) deferred_rotation: u32,
+    pub(crate) deferred_next_generation: u32,
+    pub(crate) namespace_busy: u32,
+    pub(crate) cursor_disabled_unsupported_layout: u32,
+    pub(crate) audit_overdue: u32,
+    pub(crate) sealed_fragment_withheld: u32,
+    /// A withheld final record applied at a genuine unchanged EOF.
+    pub(crate) eof_record_applied: u32,
+    /// A paused job ended: its path no longer named its object, or its
+    /// evidence stayed unavailable for 3 consecutive resume pages.
+    pub(crate) jobs_unavailable_ended: u32,
+    pub(crate) memo_hits: u32,
+    pub(crate) memo_records: u32,
+    pub(crate) parked_hits: u32,
+}
+
+/// Process-wide cursor state when the scan completed (gauges, not events).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CodexCursorRetained {
+    /// A paused job is waiting in the slot.
+    pub(crate) paused_job: bool,
+    /// Its charged bytes (requested layout, measured at pause).
+    pub(crate) paused_job_charged_bytes: u32,
+    pub(crate) memo_entries: u32,
+    pub(crate) parked_entries: u32,
+    pub(crate) invalidation_entries: u32,
+    pub(crate) rotation_waiters: u32,
+    /// Process-lifetime maximum `now - due` of an overdue certification.
+    pub(crate) lifetime_audit_overdue_max_age_seconds: u32,
+}
+impl Serialize for CodexCursorEvents {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, count) in [
+            ("jobs_started", self.jobs_started),
+            ("jobs_paused", self.jobs_paused),
+            ("jobs_resumed", self.jobs_resumed),
+            ("jobs_certified", self.jobs_certified),
+            ("jobs_uncertified", self.jobs_uncertified),
+            ("jobs_invalidated", self.jobs_invalidated),
+            ("jobs_member_changed", self.jobs_member_changed),
+            ("jobs_state_bound", self.jobs_state_bound),
+            ("jobs_lost", self.jobs_lost),
+            ("jobs_deferred_inputs", self.jobs_deferred_inputs),
+            ("jobs_start_unstartable", self.jobs_start_unstartable),
+            ("jobs_audit_restarted", self.jobs_audit_restarted),
+            ("jobs_finish_failed", self.jobs_finish_failed),
+            ("jobs_frame_returned", self.jobs_frame_returned),
+            ("deferred", self.deferred),
+            ("deferred_rotation", self.deferred_rotation),
+            ("deferred_next_generation", self.deferred_next_generation),
+            ("namespace_busy", self.namespace_busy),
+            (
+                "cursor_disabled_unsupported_layout",
+                self.cursor_disabled_unsupported_layout,
+            ),
+            ("audit_overdue", self.audit_overdue),
+            ("sealed_fragment_withheld", self.sealed_fragment_withheld),
+            ("eof_record_applied", self.eof_record_applied),
+            ("jobs_unavailable_ended", self.jobs_unavailable_ended),
+            ("memo_hits", self.memo_hits),
+            ("memo_records", self.memo_records),
+            ("parked_hits", self.parked_hits),
+        ] {
+            if count != 0 {
+                map.serialize_entry(key, &count)?;
+            }
+        }
+        map.end()
+    }
+}
+impl Serialize for CodexCursorRetained {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if self.paused_job {
+            map.serialize_entry("paused_job", &true)?;
+        }
+        for (key, count) in [
+            ("paused_job_charged_bytes", self.paused_job_charged_bytes),
+            ("memo_entries", self.memo_entries),
+            ("parked_entries", self.parked_entries),
+            ("invalidation_entries", self.invalidation_entries),
+            ("rotation_waiters", self.rotation_waiters),
+            (
+                "lifetime_audit_overdue_max_age_seconds",
+                self.lifetime_audit_overdue_max_age_seconds,
+            ),
+        ] {
+            if count != 0 {
+                map.serialize_entry(key, &count)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// Fixed page totals, not per-file history. Unassessed is attempts - assessed;
@@ -514,6 +751,50 @@ mod tests {
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,
             },
+            codex_cursor: Some(Box::new(max_codex_cursor_counts())),
+        }
+    }
+
+    fn max_codex_cursor_counts() -> CodexCursorCounts {
+        let m = u32::MAX;
+        CodexCursorCounts {
+            during_scan_window: CodexCursorEvents {
+                jobs_started: m,
+                jobs_paused: m,
+                jobs_resumed: m,
+                jobs_certified: m,
+                jobs_uncertified: m,
+                jobs_invalidated: m,
+                jobs_member_changed: m,
+                jobs_state_bound: m,
+                jobs_lost: m,
+                jobs_deferred_inputs: m,
+                jobs_start_unstartable: m,
+                jobs_audit_restarted: m,
+                jobs_finish_failed: m,
+                jobs_frame_returned: m,
+                deferred: m,
+                deferred_rotation: m,
+                deferred_next_generation: m,
+                namespace_busy: m,
+                cursor_disabled_unsupported_layout: m,
+                audit_overdue: m,
+                sealed_fragment_withheld: m,
+                eof_record_applied: m,
+                jobs_unavailable_ended: m,
+                memo_hits: m,
+                memo_records: m,
+                parked_hits: m,
+            },
+            retained: CodexCursorRetained {
+                paused_job: true,
+                paused_job_charged_bytes: m,
+                memo_entries: m,
+                parked_entries: m,
+                invalidation_entries: m,
+                rotation_waiters: m,
+                lifetime_audit_overdue_max_age_seconds: m,
+            },
         }
     }
 
@@ -524,6 +805,116 @@ mod tests {
         assert_eq!(record["counts"], serde_json::json!({}));
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
+    }
+
+    #[test]
+    fn native_comparison_decision_distinguishes_unreached_saved_and_retained() {
+        use crate::snapshots::claude_native_comparison::lifecycle::{Lifecycle, Scope};
+        let owner = std::sync::Arc::new(Lifecycle::default());
+        let (_, rows) = capture(|| {
+            let mut abandoned = owner.begin();
+            abandoned.bind_scope(Scope::from_arguments(format_args!(
+                "private-synthetic-scope"
+            )));
+            drop(abandoned);
+            // Logical lifecycle fixture: the native conjunction is supplied to
+            // the existing settlement seam, not a supported native-path claim.
+            let mut saved = owner.begin();
+            saved.bind_scope(Scope::from_arguments(format_args!(
+                "private-synthetic-scope"
+            )));
+            saved.note_selected_save(true);
+            saved.finish(true);
+            let mut retained = owner.begin();
+            retained.bind_scope(Scope::from_arguments(format_args!(
+                "private-synthetic-scope"
+            )));
+            assert!(retained.allowed());
+            retained.note_selected_save(false);
+            retained.finish(true);
+        });
+        assert_eq!(rows.len(), 3);
+        let a = &rows[0]["counts"];
+        assert_eq!(a["outcome"], "abandoned");
+        assert_eq!(a["allowed_at_bind"], false);
+        assert_eq!(a["selected_save"], false);
+        assert_eq!(a["retained_permit"], false);
+        for unknown in [
+            "bootstrap",
+            "terminal_rearm",
+            "correction_mint",
+            "controller_current_at_finish",
+            "upload_fully_settled",
+        ] {
+            assert!(a[unknown].is_null(), "unreached {unknown} is unknown");
+        }
+        let b = &rows[1]["counts"];
+        assert_eq!(b["allowed_at_bind"], false);
+        assert_eq!(b["selected_save"], true);
+        assert_eq!(b["retained_permit"], true);
+        assert_eq!(rows[2]["counts"]["allowed_at_bind"], true);
+        for row in rows {
+            assert_eq!(row["stage"], "native_comparison_decision");
+            assert_eq!(row["counts"]["deferred_decisions"], 0);
+            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            let text = serde_json::to_string(&row).unwrap();
+            assert!(!text.contains("private-synthetic-scope"));
+        }
+    }
+
+    #[test]
+    fn native_comparison_decision_maximum_width_is_bounded() {
+        let diagnostic = NativeDecision::new();
+        diagnostic.update(|d| {
+            *d = NativeComparisonDecision {
+                layout_supported: true,
+                lease_generation: Some(u64::MAX),
+                fold_index_generation: Some(u64::MAX),
+                allowed_at_bind: Some(false),
+                controller_created: false,
+                controller_current_at_finish: Some(false),
+                bootstrap: Some(NativeBootstrap {
+                    native_census_complete: false,
+                    coverage_complete: false,
+                    census_valid: false,
+                    fence_open: false,
+                    pending_occurrences_present: false,
+                    transcript_ownership_complete: false,
+                    scan_census_complete: false,
+                    not_withheld: false,
+                }),
+                selected_save: false,
+                upload_fully_settled: Some(false),
+                clean_at_finish: Some(false),
+                retained_permit: Some(false),
+                revoke_calls: usize::MAX,
+                admission_refusal_calls: usize::MAX,
+                hit_policy_calls: usize::MAX,
+                deferred_decisions: usize::MAX,
+                latched_base_decisions: usize::MAX,
+                other_base_decisions: usize::MAX,
+                terminal_rearm: Some(NativeRearm {
+                    negative_keys: usize::MAX,
+                    proof_candidates: usize::MAX,
+                    suppressed: usize::MAX,
+                    other_rearm_matches: usize::MAX,
+                    clear_calls: usize::MAX,
+                }),
+                correction_mint: Some(NativeMint {
+                    window_available: false,
+                    candidates: usize::MAX,
+                    insertions: usize::MAX,
+                    receipts_after_mint: usize::MAX,
+                }),
+                outcome: NativeDecisionOutcome::DisabledBeforeLease,
+            }
+        });
+        let (_, rows) = capture(|| diagnostic.emit());
+        assert_eq!(rows.len(), 1);
+        let text = serde_json::to_string(&rows[0]).unwrap();
+        assert!(text.len() < 4096);
+        println!("NATIVE_COMPARISON_DECISION_MAX_WIDTH bytes={} inline_bytes={} no_resource_samples=true", text.len(), std::mem::size_of::<NativeDecision>());
     }
 
     #[test]
@@ -708,6 +1099,28 @@ mod tests {
     }
 
     #[test]
+    fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_retained_cache_lifecycle_totals",
+                "unknown",
+                &cache_lifecycle::Counts::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
+        assert_eq!(record["source"], "unknown");
+        assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        assert!(serde_json::to_string(record).unwrap().len() < 2048);
+        let (_, actual) = capture(cache_lifecycle_totals);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+    }
+
+    #[test]
     fn resource_log_sink_failure_does_not_escape() {
         struct FailedSink;
         impl Write for FailedSink {
@@ -840,6 +1253,24 @@ mod tests {
         assert_eq!(records[3]["counts"]["attempted_encoded_body_bytes"], 1100);
         assert_eq!(records[3]["counts"]["attempted_decoded_body_bytes"], 2000);
         assert_eq!(records[3]["source"], "unknown");
+        // The cursor block: a window of shared process deltas plus gauges;
+        // an unobtainable snapshot is `null`, never zeros.
+        let cursor = &records[0]["counts"]["sampled_acquisition"]["codex_cursor"];
+        assert_eq!(cursor["during_scan_window"]["jobs_started"], u32::MAX);
+        assert_eq!(
+            cursor["retained"]["lifetime_audit_overdue_max_age_seconds"],
+            u32::MAX
+        );
+        let unavailable = ReadCounts {
+            codex_cursor: None,
+            ..max_read_counts()
+        };
+        assert!(serde_json::to_value(&unavailable).unwrap()["codex_cursor"].is_null());
+        let idle = serde_json::to_value(CodexCursorCounts::default()).unwrap();
+        assert_eq!(
+            idle,
+            serde_json::json!({"during_scan_window": {}, "retained": {}})
+        );
         for record in records {
             let text = serde_json::to_string(&record).unwrap();
             // Fixed page gate totals extend this local diagnostic record only;
