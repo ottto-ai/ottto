@@ -3326,7 +3326,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
 /// B1 (N1b): the same rollout-declared hold on an unchanged file, cured by
 /// the projection catching up with it. The entry wakes on its sidecar (a
 /// miss), and the re-read binds the spawn parent: the usage-free thread is
-/// no longer ownership-incomplete or blocked, exactly as a cold parse.
+/// no longer ownership-incomplete, exactly as a cold parse.
 #[test]
 fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
     let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
@@ -3354,16 +3354,20 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
         "no stale hit: {}",
         counters(&cache)
     );
-    // The cure, not only the wake.
+    // The cure, not only the wake: the re-read finds the thread complete
+    // (no longer ownership-incomplete) and records no new hold. It stays in
+    // the state-only blocked set, as a complete usage-free created thread
+    // (a fork) does on a cold parse too; `assert_oracle` compares that set.
     assert_eq!(
         woken.ownership_incomplete_file_count,
         0,
         "{}",
         counters(&cache)
     );
-    assert!(
-        !index.codex_state_only_blocked_session_ids.contains(CREATED),
-        "cured: {}",
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "cured, not re-held: {}",
         counters(&cache)
     );
     assert_oracle(&home, &cache, &index, &woken, 1, true);

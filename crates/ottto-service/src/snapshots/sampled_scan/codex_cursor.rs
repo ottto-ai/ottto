@@ -3153,9 +3153,15 @@ pub(in crate::snapshots) fn sidecar_fingerprint(codex: &CodexTitleMetadata, path
 
 /// The path's candidate ids that are identity conflicts, resolved, sorted
 /// and newline-joined. The set, not its size: a conflict moving from one
-/// candidate to another at an equal count also wakes (R1-L1).
+/// candidate to another at an equal count also wakes (R1-L1). A path with no
+/// rollout id is identity-ambiguous exactly while the state census holds
+/// any created thread (`seed_codex_sidecar_parent`), so that bit stands in.
 fn conflicted_identities(codex: &CodexTitleMetadata, path: &Path) -> String {
-    codex_session_id_candidates_from_path(path)
+    let candidates = codex_session_id_candidates_from_path(path);
+    if candidates.is_empty() {
+        return format!("no_candidates:{}", !codex.state_created_threads.is_empty());
+    }
+    candidates
         .iter()
         .map(|identity| resolve_codex_identity(identity.as_str()))
         .filter(|identity| codex.identity_conflicts.contains(identity.as_str()))
