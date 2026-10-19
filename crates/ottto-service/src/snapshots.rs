@@ -14426,6 +14426,10 @@ impl OwnedSourceScan {
                     }
                     Ok(true) => {}
                 }
+                if active.cursor.is_some() {
+                    // E1 before the protected-tier gate below (R1-H1).
+                    sampled_scan::codex_cursor::apply_eof_record(&mut active);
+                }
                 if let Some(context) = attribution_context {
                     let workers = launch_workers_for_parsed(
                         source,

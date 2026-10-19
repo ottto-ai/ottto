@@ -1823,6 +1823,7 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
     }
     const STEPS: usize = 10_000;
     let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
     let cache = Arc::new(SharedCache::default());
     let flipped = |scan: &mut OwnedSourceScan| {
         scan.sidecar_census_complete = false;
@@ -1877,6 +1878,9 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
             0,
             "not a member change"
         );
+        // R2-L4: the ended job freed the slot and its path left the queue.
+        assert!(cache.cursor_slot_free(), "{}", counters(&cache));
+        assert_eq!(pending_hint(&index, &path), None, "dequeued");
     });
 }
 
@@ -1941,31 +1945,42 @@ fn live_job_charge_is_estimated_between_bounded_walks() {
         pages: 0,
         unavailable_resumes: 0,
         charge: None,
+        eof_applied: false,
     };
-    assert_eq!(meta.charge_estimate(0), None, "the first step walks");
-    meta.record_charge(1_000, 10);
-    assert_eq!(meta.charge_estimate(10), Some(1_000));
+    assert_eq!(meta.charge_estimate(0, 64), None, "the first step walks");
+    meta.record_charge(1_000, 10, 64);
+    assert_eq!(meta.charge_estimate(10, 64), Some(1_000));
     assert_eq!(
-        meta.charge_estimate(510),
+        meta.charge_estimate(510, 64),
         Some(1_500),
         "consumed bytes charged"
     );
+    assert_eq!(
+        meta.charge_estimate(510, 4_160),
+        Some(5_596),
+        "reader buffer capacity growth charged (R2-M1)"
+    );
+    assert_eq!(
+        meta.charge_estimate(510, 32),
+        Some(1_500),
+        "a shrunk buffer never lowers the charge below the walk"
+    );
     assert!(meta
-        .charge_estimate(10 + CHARGE_REFRESH_BYTES - 1)
+        .charge_estimate(10 + CHARGE_REFRESH_BYTES - 1, 64)
         .is_some());
     assert_eq!(
-        meta.charge_estimate(10 + CHARGE_REFRESH_BYTES),
+        meta.charge_estimate(10 + CHARGE_REFRESH_BYTES, 64),
         None,
         "walk again"
     );
     assert_eq!(
-        meta.charge_estimate(5),
+        meta.charge_estimate(5, 64),
         None,
         "a restarted reader walks again"
     );
-    meta.record_charge(usize::MAX, 10);
+    meta.record_charge(usize::MAX, 10, 64);
     assert_eq!(
-        meta.charge_estimate(20),
+        meta.charge_estimate(20, 64),
         Some(usize::MAX),
         "a refused walk stays refused"
     );
@@ -2060,6 +2075,92 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
             assert_eq!(counter(&cache, |c| c.jobs_started), 1, "{case}: no re-read");
         });
     }
+}
+
+/// R1-H1 (#606 final review): a tail-mode cursor job whose genuine-EOF
+/// record (E1) introduces the file's first priority tier goes through the
+/// protected-tier full replay before anything publishes, as main's trailing
+/// line does: a sampled prefix never mints the receipt.
+#[test]
+fn tail_eof_record_adding_first_priority_tier_replays_before_publishing() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let path = fixture.file(SESSION);
+        let key = local_index_key(&path);
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "a retained prefix makes the next read a tail: {}",
+            counters(&cache)
+        );
+        // A tail larger than the singleton budget (a cursor job) whose last,
+        // unterminated record is the file's first priority usage.
+        for n in 41..=80 {
+            fixture.append(SESSION, &token_line(n));
+        }
+        let mut priority = codex_line(
+            json!({"timestamp": "2026-10-07T10:30:00Z", "type": "event_msg",
+            "payload": {"type": "token_count", "service_tier": "priority",
+            "info": {"model": "fixture-model",
+            "total_token_usage": {"input_tokens": 8_100, "cached_input_tokens": 4_050,
+                "output_tokens": 810},
+            "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 50,
+                "output_tokens": 10}}}}),
+        );
+        priority.pop();
+        fixture.append(SESSION, &priority);
+        let mut tail_started = false;
+        let mut replayed = false;
+        let mut published = None;
+        // Later census generations: the K7 fence held this file for the
+        // generation of its certified read.
+        for page_number in 1..=64 {
+            let (next, scan, modes) = page_at(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(page_number),
+            );
+            index = next;
+            tail_started |= modes.1 > 0;
+            replayed |= tail_started && modes.0 > 0;
+            if !scan.snapshots.is_empty() {
+                assert!(
+                    replayed,
+                    "the EOF record's protected tier forced the full replay first"
+                );
+                // Main's unpaged read of the same object, same collection.
+                let (_, unpaged, _) = page_at(
+                    &fixture,
+                    ScanIndex::default(),
+                    None,
+                    "cursor-fixture",
+                    &collected_at(page_number),
+                );
+                published = Some((scan, unpaged));
+                break;
+            }
+        }
+        let (published, unpaged) = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert!(tail_started, "the read began as a sampled tail");
+        assert_eq!(counter(&cache, |c| c.eof_record_applied), 1);
+        assert!(index.files[&key].codex_applied_tier_receipt_required);
+        assert_eq!(fingerprints(&published), fingerprints(&unpaged));
+    });
 }
 
 /// E1: a file that grew during the job keeps its unterminated record

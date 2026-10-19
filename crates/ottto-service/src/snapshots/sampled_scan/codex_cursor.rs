@@ -290,26 +290,41 @@ impl JobMeta {
     }
 
     /// The live job's copy-budget charge without a walk (E3): the last
-    /// `completed_bound` plus every byte the reader consumed since, so it
-    /// never undercounts what a line can add. None when no charge is
+    /// `completed_bound` plus every byte the reader consumed since plus the
+    /// reader buffer's capacity growth since (`buffer` is its capacity now).
+    /// Not a strict upper bound: an accumulator collection that regrows can
+    /// add more than the bytes that caused it. That slack lasts at most
+    /// `CHARGE_REFRESH_BYTES` of input and is corrected by the next walk;
+    /// the pause and completion walks are exact. None when no charge is
     /// recorded, the reader restarted, or `CHARGE_REFRESH_BYTES` were
     /// consumed since (the caller walks again: at most one walk per that
     /// many bytes, never one per line).
-    pub(in crate::snapshots) fn charge_estimate(&self, consumed: u64) -> Option<usize> {
-        let (charge, at) = self.charge?;
+    pub(in crate::snapshots) fn charge_estimate(
+        &self,
+        consumed: u64,
+        buffer: usize,
+    ) -> Option<usize> {
+        let (charge, at, buffer_at) = self.charge?;
         let since = consumed.checked_sub(at)?;
         if since >= CHARGE_REFRESH_BYTES {
             return None;
         }
-        usize::try_from(since)
-            .ok()
-            .map(|since| charge.saturating_add(since))
+        usize::try_from(since).ok().map(|since| {
+            charge
+                .saturating_add(since)
+                .saturating_add(buffer.saturating_sub(buffer_at))
+        })
     }
 
     /// Record a walked charge (`usize::MAX` when the walk refused) taken at
-    /// reader position `consumed`.
-    pub(in crate::snapshots) fn record_charge(&mut self, charge: usize, consumed: u64) {
-        self.charge = Some((charge, consumed));
+    /// reader position `consumed` with reader buffer capacity `buffer`.
+    pub(in crate::snapshots) fn record_charge(
+        &mut self,
+        charge: usize,
+        consumed: u64,
+        buffer: usize,
+    ) {
+        self.charge = Some((charge, consumed, buffer));
     }
 }
 
@@ -379,12 +394,15 @@ pub(in crate::snapshots) struct JobMeta {
     pages: u32,
     /// Consecutive resume pages whose evidence was unavailable (E2).
     unavailable_resumes: u32,
-    /// The last walked copy-budget charge and the reader position it was
-    /// taken at (E3; see `charge_estimate`).
-    charge: Option<(usize, u64)>,
+    /// The last walked copy-budget charge, the reader position and the
+    /// reader buffer capacity it was taken at (E3; see `charge_estimate`).
+    charge: Option<(usize, u64, usize)>,
+    /// E1: this read's withheld final record was applied at a genuine
+    /// unchanged EOF on its completion step (`apply_eof_record`).
+    eof_applied: bool,
 }
 crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, dependencies,
-    owner, counting, fence, census_trusted, pages, unavailable_resumes, charge);
+    owner, counting, fence, census_trusted, pages, unavailable_resumes, charge, eof_applied);
 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
@@ -439,7 +457,9 @@ pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) jobs_resumed: u64,
     /// Published with a sealed-prefix certificate (after `finish`).
     pub(in crate::snapshots) jobs_certified: u64,
-    /// Lossy with intact samples: published uncertified (after `finish`).
+    /// Lossy with intact samples, finished uncertified (after `finish`).
+    /// Publication then follows main's completeness rule: retryable loss
+    /// (a malformed or invalid line) publishes nothing and is not indexed.
     pub(in crate::snapshots) jobs_uncertified: u64,
     /// Restarted after a necessary invalidation; nothing committed.
     pub(in crate::snapshots) jobs_invalidated: u64,
@@ -479,6 +499,7 @@ pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) sealed_fragment_withheld: u64,
     /// E1: a completion at genuine unchanged EOF applied its withheld final
     /// record with main's trailing-line rule (strict finish identity).
+    /// Counted only once its `finish` succeeded.
     pub(in crate::snapshots) eof_record_applied: u64,
     /// E2: a paused job ended because its path no longer named the held
     /// object or its evidence stayed unavailable for `UNAVAILABLE_RESUMES`.
@@ -790,6 +811,8 @@ pub(in crate::snapshots) struct Publication {
     certified: bool,
     /// `now - due` when it certified at or after its audit deadline.
     overdue_age: Option<u64>,
+    /// E1 applied this read's withheld final record.
+    eof_applied: bool,
 }
 
 /// A completed attempt on a file that did not grow withheld an unterminated
@@ -853,8 +876,9 @@ pub(in crate::snapshots) fn paused_charge(job: &OwnedActiveFile) -> Option<usize
 /// both exclude the live source-wide inputs.
 fn record_paused_charge(job: &mut OwnedActiveFile, charge: usize) {
     let consumed = job.parser.reader.consumed_bytes();
+    let buffer = job.parser.reader.buf.capacity();
     if let Some(meta) = job.cursor.as_mut() {
-        meta.record_charge(charge, consumed);
+        meta.record_charge(charge, consumed, buffer);
     }
 }
 
@@ -1055,24 +1079,9 @@ pub(in crate::snapshots) fn finish_job(
     let grown = held
         .as_ref()
         .is_some_and(|held| held.extent > meta.stamp_open.extent);
-    // E1 (K4 amendment, parent ACK): at a genuine unchanged physical EOF (the
-    // held FD is exactly the opened object: dev, ino, length, mtime, ctime;
-    // and this read reached that length), the withheld final record is
-    // applied from the bytes already buffered, with main's trailing-line
-    // rule. No byte is read. Such a job gets no S12 grant below: strict
-    // finish identity covers the trailing bytes, so an append or replacement
-    // before publication refuses as on main. A grown file keeps it withheld.
-    let read_end = job
-        .parser
-        .reader
-        .acquisition
-        .as_ref()
-        .map_or(0, crate::transcript_acquisition::ReadPlan::start_offset)
-        .saturating_add(job.parser.reader.consumed_bytes());
-    let eof_applied = job.parser.reader.sealed_fragment()
-        && held.as_ref() == Some(&meta.stamp_open)
-        && read_end == meta.stamp_open.extent
-        && job.parser.apply_sealed_fragment();
+    // E1: applied on the completion step, before the protected-tier gate
+    // (`apply_eof_record`). Such a job gets no S12 grant below.
+    let eof_applied = meta.eof_applied;
     let parser = &mut job.parser;
     let lossy = parser.reader.lossy_prefix()
         || parser.reader.failure.is_some()
@@ -1146,9 +1155,6 @@ pub(in crate::snapshots) fn finish_job(
             if fragment.is_some() {
                 cursor.counters.sealed_fragment_withheld += 1;
             }
-            if eof_applied {
-                cursor.counters.eof_record_applied += 1;
-            }
         }
         Err(Some(PrefixRefusal::AuditDue)) => cursor.counters.jobs_audit_restarted += 1,
         Err(None) => cursor.counters.jobs_deferred_inputs += 1,
@@ -1204,6 +1210,7 @@ pub(in crate::snapshots) fn finish_job(
                 publication: Publication {
                     certified: true,
                     overdue_age,
+                    eof_applied,
                 },
                 fragment,
             }
@@ -1213,6 +1220,7 @@ pub(in crate::snapshots) fn finish_job(
             publication: Publication {
                 certified: false,
                 overdue_age: None,
+                eof_applied,
             },
             fragment,
         },
@@ -1268,7 +1276,49 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
         .set_extent_limit(frozen.min(stamp_open.extent).saturating_sub(start));
     meta.stamp_open = stamp_open;
     meta.started = super::now_seconds();
+    // The replay's own completion step decides E1 again.
+    meta.eof_applied = false;
     true
+}
+
+/// E1 (K4 amendment, parent ACK), on the cursor job's completion step and
+/// before the protected-tier replay gate (R1-H1), as main applies its
+/// trailing line inside the read: at a genuine unchanged physical EOF (the
+/// held FD is exactly the opened object: dev, ino, length, mtime, ctime;
+/// and this read reached that length), the withheld final record is applied
+/// from the bytes already buffered, with main's trailing-line rule. No byte
+/// is read. A record that adds the file's first protected tier therefore
+/// sends a sampled read through the full replay. Such a job gets no S12
+/// grant (`finish_job`): strict finish identity covers the trailing bytes,
+/// so an append or replacement before publication refuses as on main. A
+/// grown file keeps the record withheld. Idempotent across re-entered
+/// completion steps.
+pub(in crate::snapshots) fn apply_eof_record(job: &mut OwnedActiveFile) {
+    let Some(stamp_open) = job
+        .cursor
+        .as_ref()
+        .filter(|meta| !meta.eof_applied)
+        .map(|meta| meta.stamp_open.clone())
+    else {
+        return;
+    };
+    if !job.parser.reader.sealed_fragment() {
+        return;
+    }
+    let read_end = job
+        .parser
+        .reader
+        .acquisition
+        .as_ref()
+        .map_or(0, crate::transcript_acquisition::ReadPlan::start_offset)
+        .saturating_add(job.parser.reader.consumed_bytes());
+    let held = OpenStamp::capture(job.parser.reader.reader.get_ref()).ok();
+    let applied = held.as_ref() == Some(&stamp_open)
+        && read_end == stamp_open.extent
+        && job.parser.apply_sealed_fragment();
+    if let Some(meta) = job.cursor.as_mut() {
+        meta.eof_applied = applied;
+    }
 }
 
 impl SharedCache {
@@ -1484,6 +1534,9 @@ impl SharedCache {
             } else {
                 counters.jobs_uncertified += 1;
             }
+            if finished && publication.eof_applied {
+                counters.eof_record_applied += 1;
+            }
             if let Some(age) = publication.overdue_age.filter(|_| finished) {
                 counters.audit_overdue += 1;
                 counters.audit_overdue_max_age_seconds =
@@ -1582,6 +1635,7 @@ impl SharedCache {
             pages: 1,
             unavailable_resumes: 0,
             charge: None,
+            eof_applied: false,
         });
         Ok(CursorLease {
             cache: Arc::clone(self),
@@ -1971,8 +2025,9 @@ fn end_unavailable(
     let rotation = meta.map(|meta| rotation_key(&meta.namespace, &meta.key));
     lease.end(|cursor| {
         cursor.counters.jobs_unavailable_ended += 1;
+        // Missing evidence is not evidence of stability: the file's count
+        // of real invalidations is kept (R2-L1).
         if let (Some(meta), Some(rotation)) = (meta, rotation.as_ref()) {
-            cursor.invalidations.remove(&meta.key);
             cursor.rotation.complete(rotation, meta.fence.as_deref());
         }
     });

@@ -283,9 +283,11 @@ pub(super) fn completion_copy_budget(
 /// The copy budget left beside the active file. A cursor job's state grows
 /// past the ordinary walk's visit limit (usage hours, witnesses), so it is
 /// charged by bytes like its pause (N3), but never walked per line (E3):
-/// mid-job it uses the last walk plus the bytes consumed since
-/// (`JobMeta::charge_estimate`); `completing` walks exactly, once, on the
-/// step that consumes the budget.
+/// mid-job it uses the last walk plus the bytes consumed and the reader
+/// buffer growth since (`JobMeta::charge_estimate`, bounded slack corrected
+/// at the next walk, at most every `CHARGE_REFRESH_BYTES`); `completing`
+/// walks exactly, once, on the step that consumes the budget.
+/// This accounting is amortized across the job, not completion-only.
 pub(super) fn copy_budget_beside(
     sampling: Option<&Context>,
     active: Option<&mut OwnedActiveFile>,
@@ -302,11 +304,12 @@ pub(super) fn copy_budget_beside(
     };
     let active = active.map_or(Some(0), |active| {
         let consumed = active.parser.reader.consumed_bytes();
+        let buffer = active.parser.reader.buf.capacity();
         let estimate = active
             .cursor
             .as_ref()
             .filter(|_| !completing)
-            .and_then(|meta| meta.charge_estimate(consumed));
+            .and_then(|meta| meta.charge_estimate(consumed, buffer));
         if let Some(estimate) = estimate {
             return Some(estimate);
         }
@@ -323,7 +326,7 @@ pub(super) fn copy_budget_beside(
         };
         active.parser.restore_live_reduction_inputs(inputs);
         if let Some(meta) = active.cursor.as_mut() {
-            meta.record_charge(bound.unwrap_or(usize::MAX), consumed);
+            meta.record_charge(bound.unwrap_or(usize::MAX), consumed, buffer);
         }
         bound
     });
