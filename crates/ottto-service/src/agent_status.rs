@@ -12250,14 +12250,18 @@ fn claude_oauth_usage_slot_seconds(
 }
 
 /// How old a stored reading may be and still be labelled fresh: the
-/// unused-account gate. The shorter in-use slot never labels a reading stale
-/// sooner.
+/// unused-account gate plus one collection interval. A read becomes due at
+/// the gate, but the next scheduled collection can be up to five minutes
+/// later. Keep that bounded scheduling gap from making healthy idle accounts
+/// flash stale. This does not defer a provider read or move its observation.
+/// The shorter in-use slot never labels a reading stale sooner.
 fn claude_oauth_usage_serve_gate_seconds(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     _now: u64,
 ) -> u64 {
     claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash)
+        .saturating_add(CLAUDE_OAUTH_USAGE_REFRESH_SECONDS)
 }
 
 /// Whether Claude Code's local statusLine wrote a reading for exactly this
@@ -29653,7 +29657,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_oauth_usage_cache_marks_old_windows_stale() {
+    fn claude_oauth_usage_cache_covers_collection_gap_then_marks_old_windows_stale() {
         let cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: "account-a".to_string(),
@@ -29684,10 +29688,51 @@ for line in sys.stdin:
             account_weekly_not_offered: false,
         };
 
-        // Past the account's own jittered gate, not the bare base constant.
+        let read_gate = claude_oauth_usage_fresh_age_seconds("account-a", "organization-a");
+        // Idle accounts remain readable while the next scheduled collection
+        // catches up. Cache and retained-slot presentation use the same bound.
+        for age in [
+            read_gate + 1,
+            read_gate + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+        ] {
+            let now = 100 + age;
+            let usage = claude_oauth_usage_from_cache(cache.clone(), now);
+            assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
+            assert_eq!(usage.windows[0].used_percent, Some(72));
+            assert_eq!(
+                usage.windows[0].observed_at.as_deref(),
+                Some("1970-01-01T00:01:40Z")
+            );
+            assert_eq!(
+                usage.credit_balances[0].freshness,
+                AgentQuotaWindowFreshness::Fresh
+            );
+            let snapshot = local_claude_quota_snapshot(
+                "1970-01-01T00:01:40Z",
+                &usage.windows,
+                &usage.credit_balances,
+                true,
+                true,
+            );
+            assert!(local_claude_quota_snapshot_is_fresh_for_account(
+                &snapshot,
+                "account-a",
+                "organization-a",
+                OffsetDateTime::from_unix_timestamp(now as i64).unwrap(),
+            ));
+            // Display tolerance never defers the collection that is due.
+            assert!(claude_credit_pools::claude_reading_due(
+                Some(100),
+                400,
+                read_gate,
+                now,
+            ));
+        }
+
+        // Past the account's display deadline, including the collection gap.
         let usage = claude_oauth_usage_from_cache(
             cache,
-            100 + claude_oauth_usage_fresh_age_seconds("account-a", "organization-a") + 1,
+            100 + claude_oauth_usage_serve_gate_seconds("account-a", "organization-a", 100) + 1,
         );
 
         assert_eq!(usage.windows.len(), 1);
