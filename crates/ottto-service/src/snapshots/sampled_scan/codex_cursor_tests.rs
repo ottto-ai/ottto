@@ -2648,8 +2648,9 @@ fn created_thread_holds_are_exact_and_sidecar_woken() {
 
 /// R1-L1 / class 7 (NC4, NC5): the sidecar fingerprint and the memo digest
 /// carry the set of the path's conflicted candidate ids, not their count. A
-/// conflict moving between two candidates at an equal count, or appearing on
-/// an ordinary fork's id (whose entry has no sidecar wake), changes them.
+/// conflict moving between two candidates at an equal count changes both
+/// (NC4); a conflict appearing changes the digest too, so an ordinary fork's
+/// entry, which has no sidecar wake, misses (NC5).
 #[test]
 fn memo_wakes_on_the_conflicted_identity_set() {
     // A timestamp-shaped name has two candidate ids: the whole raw stem
@@ -2660,13 +2661,29 @@ fn memo_wakes_on_the_conflicted_identity_set() {
     let candidates = codex_session_id_candidates_from_path(&path);
     assert_eq!(candidates.len(), 2, "{candidates:?}");
     let (a, b) = (candidates[0].as_str(), candidates[1].as_str());
-    let with_conflict = |id: &str| {
+    // Both candidates carry identity evidence, so the path resolves to
+    // neither and the sidecar facts are the same for {a} and {b}: only the
+    // conflicted set tells them apart.
+    let evidenced = || {
         let mut codex = CodexTitleMetadata::default();
+        for id in [a, b] {
+            codex.rollout_extents.insert(
+                id.into(),
+                CodexRolloutExtent {
+                    next_byte_offset: 8,
+                    next_ordinal: 1,
+                },
+            );
+        }
+        codex
+    };
+    let with_conflict = |id: &str| {
+        let mut codex = evidenced();
         codex.identity_conflicts.insert(id.into());
         codex
     };
     let (on_a, on_b) = (with_conflict(a), with_conflict(b));
-    let none = CodexTitleMetadata::default();
+    let none = evidenced();
     assert_ne!(
         sidecar_fingerprint(&on_a, &path),
         sidecar_fingerprint(&on_b, &path)

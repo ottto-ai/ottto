@@ -1553,8 +1553,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "ac4382a62e99d9a5aa461511b33e8f975b02590d631c4f5f54fc493d2ea531d1",
-      "size_bytes": 132788
+      "sha256": "d5c2eea12a75c373e8b96808aa6a628ebc4cdb704b29635e508e89618de90469",
+      "size_bytes": 133347
     },
     {
       "executable": false,
