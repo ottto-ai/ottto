@@ -480,6 +480,7 @@ mod tests {
             request_evidence: Vec::new(),
             request_identity_refusals: 0,
             claude_org_markers: None,
+            claude_account_withheld_reason: None,
             source_session_id: session_id.to_string(),
             snapshot_fingerprint: format!("fp-{session_id}"),
             status: "final".to_string(),

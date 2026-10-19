@@ -3054,6 +3054,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         request_evidence: Vec::new(),
         request_identity_refusals: 0,
         claude_org_markers: None,
+        claude_account_withheld_reason: None,
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
