@@ -316,6 +316,140 @@ pub(crate) struct ReadCounts {
     pub(crate) acquisition_admission: AcquisitionAdmission,
     pub(crate) page_events: PageEvents,
     pub(crate) index_state_at_page_end: IndexState,
+    /// Resumable large-file Codex read cursor (#606). `null` when its
+    /// snapshot could not be obtained (no Codex cursor page tick in this scan,
+    /// or the cursor state was busy at completion): unknown, never zero
+    /// activity.
+    pub(crate) codex_cursor: Option<Box<CodexCursorCounts>>,
+}
+
+/// Content-free, fixed width; each count saturates at `u32::MAX`. Like
+/// `FullReasons`, only nonzero keys are serialized (an absent key is zero);
+/// the block itself is `null` when unknown.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct CodexCursorCounts {
+    /// Process-global cursor counter deltas while this scan's window was
+    /// open (its first cursor page tick to its completion). The cursor is
+    /// shared by every namespace in the process and overlapping scans move
+    /// these counters too: NOT events caused by this scan.
+    pub(crate) during_scan_window: CodexCursorEvents,
+    /// Process-wide cursor gauges when this scan completed.
+    pub(crate) retained: CodexCursorRetained,
+}
+
+/// Process-global cursor events during a scan window (shared process scope,
+/// not attributed to one scan or namespace).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CodexCursorEvents {
+    pub(crate) jobs_started: u32,
+    pub(crate) jobs_paused: u32,
+    pub(crate) jobs_resumed: u32,
+    pub(crate) jobs_certified: u32,
+    pub(crate) jobs_uncertified: u32,
+    pub(crate) jobs_invalidated: u32,
+    pub(crate) jobs_member_changed: u32,
+    pub(crate) jobs_state_bound: u32,
+    pub(crate) jobs_lost: u32,
+    pub(crate) jobs_deferred_inputs: u32,
+    pub(crate) jobs_start_unstartable: u32,
+    pub(crate) jobs_audit_restarted: u32,
+    pub(crate) jobs_finish_failed: u32,
+    pub(crate) jobs_frame_returned: u32,
+    pub(crate) deferred: u32,
+    pub(crate) deferred_rotation: u32,
+    pub(crate) deferred_next_generation: u32,
+    pub(crate) namespace_busy: u32,
+    pub(crate) cursor_disabled_unsupported_layout: u32,
+    pub(crate) audit_overdue: u32,
+    pub(crate) sealed_fragment_withheld: u32,
+    /// A withheld final record applied at a genuine unchanged EOF.
+    pub(crate) eof_record_applied: u32,
+    /// A paused job ended: its path no longer named its object, or its
+    /// evidence stayed unavailable for 3 consecutive resume pages.
+    pub(crate) jobs_unavailable_ended: u32,
+    pub(crate) memo_hits: u32,
+    pub(crate) memo_records: u32,
+    pub(crate) parked_hits: u32,
+}
+
+/// Process-wide cursor state when the scan completed (gauges, not events).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CodexCursorRetained {
+    /// A paused job is waiting in the slot.
+    pub(crate) paused_job: bool,
+    /// Its charged bytes (requested layout, measured at pause).
+    pub(crate) paused_job_charged_bytes: u32,
+    pub(crate) memo_entries: u32,
+    pub(crate) parked_entries: u32,
+    pub(crate) invalidation_entries: u32,
+    pub(crate) rotation_waiters: u32,
+    /// Process-lifetime maximum `now - due` of an overdue certification.
+    pub(crate) lifetime_audit_overdue_max_age_seconds: u32,
+}
+impl Serialize for CodexCursorEvents {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, count) in [
+            ("jobs_started", self.jobs_started),
+            ("jobs_paused", self.jobs_paused),
+            ("jobs_resumed", self.jobs_resumed),
+            ("jobs_certified", self.jobs_certified),
+            ("jobs_uncertified", self.jobs_uncertified),
+            ("jobs_invalidated", self.jobs_invalidated),
+            ("jobs_member_changed", self.jobs_member_changed),
+            ("jobs_state_bound", self.jobs_state_bound),
+            ("jobs_lost", self.jobs_lost),
+            ("jobs_deferred_inputs", self.jobs_deferred_inputs),
+            ("jobs_start_unstartable", self.jobs_start_unstartable),
+            ("jobs_audit_restarted", self.jobs_audit_restarted),
+            ("jobs_finish_failed", self.jobs_finish_failed),
+            ("jobs_frame_returned", self.jobs_frame_returned),
+            ("deferred", self.deferred),
+            ("deferred_rotation", self.deferred_rotation),
+            ("deferred_next_generation", self.deferred_next_generation),
+            ("namespace_busy", self.namespace_busy),
+            (
+                "cursor_disabled_unsupported_layout",
+                self.cursor_disabled_unsupported_layout,
+            ),
+            ("audit_overdue", self.audit_overdue),
+            ("sealed_fragment_withheld", self.sealed_fragment_withheld),
+            ("eof_record_applied", self.eof_record_applied),
+            ("jobs_unavailable_ended", self.jobs_unavailable_ended),
+            ("memo_hits", self.memo_hits),
+            ("memo_records", self.memo_records),
+            ("parked_hits", self.parked_hits),
+        ] {
+            if count != 0 {
+                map.serialize_entry(key, &count)?;
+            }
+        }
+        map.end()
+    }
+}
+impl Serialize for CodexCursorRetained {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if self.paused_job {
+            map.serialize_entry("paused_job", &true)?;
+        }
+        for (key, count) in [
+            ("paused_job_charged_bytes", self.paused_job_charged_bytes),
+            ("memo_entries", self.memo_entries),
+            ("parked_entries", self.parked_entries),
+            ("invalidation_entries", self.invalidation_entries),
+            ("rotation_waiters", self.rotation_waiters),
+            (
+                "lifetime_audit_overdue_max_age_seconds",
+                self.lifetime_audit_overdue_max_age_seconds,
+            ),
+        ] {
+            if count != 0 {
+                map.serialize_entry(key, &count)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// Fixed page totals, not per-file history. Unassessed is attempts - assessed;
@@ -604,6 +738,50 @@ mod tests {
                 pending_audits: usize::MAX,
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,
+            },
+            codex_cursor: Some(Box::new(max_codex_cursor_counts())),
+        }
+    }
+
+    fn max_codex_cursor_counts() -> CodexCursorCounts {
+        let m = u32::MAX;
+        CodexCursorCounts {
+            during_scan_window: CodexCursorEvents {
+                jobs_started: m,
+                jobs_paused: m,
+                jobs_resumed: m,
+                jobs_certified: m,
+                jobs_uncertified: m,
+                jobs_invalidated: m,
+                jobs_member_changed: m,
+                jobs_state_bound: m,
+                jobs_lost: m,
+                jobs_deferred_inputs: m,
+                jobs_start_unstartable: m,
+                jobs_audit_restarted: m,
+                jobs_finish_failed: m,
+                jobs_frame_returned: m,
+                deferred: m,
+                deferred_rotation: m,
+                deferred_next_generation: m,
+                namespace_busy: m,
+                cursor_disabled_unsupported_layout: m,
+                audit_overdue: m,
+                sealed_fragment_withheld: m,
+                eof_record_applied: m,
+                jobs_unavailable_ended: m,
+                memo_hits: m,
+                memo_records: m,
+                parked_hits: m,
+            },
+            retained: CodexCursorRetained {
+                paused_job: true,
+                paused_job_charged_bytes: m,
+                memo_entries: m,
+                parked_entries: m,
+                invalidation_entries: m,
+                rotation_waiters: m,
+                lifetime_audit_overdue_max_age_seconds: m,
             },
         }
     }
@@ -1041,6 +1219,24 @@ mod tests {
         assert_eq!(records[3]["counts"]["attempted_encoded_body_bytes"], 1100);
         assert_eq!(records[3]["counts"]["attempted_decoded_body_bytes"], 2000);
         assert_eq!(records[3]["source"], "unknown");
+        // The cursor block: a window of shared process deltas plus gauges;
+        // an unobtainable snapshot is `null`, never zeros.
+        let cursor = &records[0]["counts"]["sampled_acquisition"]["codex_cursor"];
+        assert_eq!(cursor["during_scan_window"]["jobs_started"], u32::MAX);
+        assert_eq!(
+            cursor["retained"]["lifetime_audit_overdue_max_age_seconds"],
+            u32::MAX
+        );
+        let unavailable = ReadCounts {
+            codex_cursor: None,
+            ..max_read_counts()
+        };
+        assert!(serde_json::to_value(&unavailable).unwrap()["codex_cursor"].is_null());
+        let idle = serde_json::to_value(CodexCursorCounts::default()).unwrap();
+        assert_eq!(
+            idle,
+            serde_json::json!({"during_scan_window": {}, "retained": {}})
+        );
         for record in records {
             let text = serde_json::to_string(&record).unwrap();
             // Fixed page gate totals extend this local diagnostic record only;

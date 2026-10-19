@@ -9585,11 +9585,19 @@ fn load_claude_desktop_session_title(
 #[derive(Debug, Clone, Default)]
 struct CodexTurnTraceMap {
     priority_turns: BTreeSet<String>,
+    /// A present trace DB failed to load, or its row cap was reached: absent
+    /// turns are unknown, not standard (R2-H1). A paged job treats a flipped
+    /// decision under such a map as unavailable evidence, never a change.
+    incomplete: bool,
 }
 
 impl CodexTurnTraceMap {
     fn is_priority_turn(&self, turn_id: &str) -> bool {
         self.priority_turns.contains(turn_id)
+    }
+
+    fn is_incomplete(&self) -> bool {
+        self.incomplete
     }
 }
 
@@ -9805,6 +9813,9 @@ struct SnapshotAccumulator {
     // read-only across every session file in the cycle via `Arc`.
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
+    /// A paged cursor job keeps every turn witness, charged by bytes in its
+    /// slot; every other reader keeps the cache-only witness caps.
+    codex_priority_witnesses_uncapped: bool,
     codex_tier_replay: Option<codex_file_join::TierReplay>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
@@ -10018,6 +10029,7 @@ impl SnapshotAccumulator {
             latest_turn_id: None,
             codex_turn_traces: None,
             codex_observed_priority_turns: None,
+            codex_priority_witnesses_uncapped: false,
             codex_tier_replay: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
@@ -11508,9 +11520,10 @@ impl SnapshotAccumulator {
             .as_ref()
             .is_some_and(|traces| traces.is_priority_turn(turn_id));
         if let Some(observed) = self.codex_observed_priority_turns.as_mut() {
-            if turn_id.len() > sampled_jsonl::MAX_PRIORITY_WITNESS_ID_BYTES
-                || (observed.len() >= sampled_jsonl::MAX_PRIORITY_WITNESSES
-                    && !observed.contains_key(turn_id))
+            if !self.codex_priority_witnesses_uncapped
+                && (turn_id.len() > sampled_jsonl::MAX_PRIORITY_WITNESS_ID_BYTES
+                    || (observed.len() >= sampled_jsonl::MAX_PRIORITY_WITNESSES
+                        && !observed.contains_key(turn_id)))
             {
                 // Dropping a dependency witness disables future retention,
                 // never the native usage decision or durable audit obligation.
@@ -12910,13 +12923,21 @@ pub(crate) struct OwnedSourceScan {
     claude_authority_preflight: bool,
     forced_claude_family_reparses: BTreeSet<String>,
     identified_candidates: VecDeque<CandidateFile>,
-    active_file: Option<OwnedActiveFile>,
+    /// The active file and, while it is a paged cursor job, its slot lease.
+    /// A dropped frame returns an intact job to the slot.
+    active_file: sampled_scan::codex_cursor::ActiveFrame,
     codex_join_inventory: Option<codex_file_join::HeaderInventory>,
     codex_join_prepared: bool,
     codex_join_groups: VecDeque<codex_file_join::Group>,
     codex_join_active: Option<(codex_file_join::Group, codex_file_join::GroupReader)>,
     codex_join_completed: Vec<codex_file_join::Group>,
     codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
+    /// Decoded bytes this page consumed; the cursor job and ordinary Codex
+    /// singleton reads have separate budgets.
+    codex_page: sampled_scan::codex_cursor::PageBudget,
+    /// Selection flags of this page's Codex candidates, so a budget deferral
+    /// returns a file to `pending_candidates` with its original priority.
+    codex_selected_flags: BTreeMap<String, (bool, bool)>,
 }
 struct OwnedActiveFile {
     comparison_target: bool,
@@ -12930,6 +12951,12 @@ struct OwnedActiveFile {
     parser: OwnedJsonlParser,
     aliases: Vec<CandidateFile>,
     applied_receipts: BTreeMap<String, Option<codex_file_join::AppliedTierReceipt>>,
+    /// Present while this file is read as a paged cursor job.
+    cursor: Option<sampled_scan::codex_cursor::JobMeta>,
+    /// Reader bytes already charged to this page's budgets.
+    charged_bytes: u64,
+    /// End of the record after which a hold no append can cure first held.
+    hold_offset: Option<u64>,
 }
 #[allow(clippy::large_enum_variant)] // One active context moves between native collection steps.
 pub(crate) enum OwnedSourceScanStep {
@@ -13540,6 +13567,19 @@ impl OwnedSourceScan {
         index.resume_census_window_end = Some(census_window_end.clone());
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let mut census = ScanCensus::default();
+        let codex_selected_flags = if source == SnapshotSource::Codex {
+            pending_paths
+                .iter()
+                .map(|pending| {
+                    (
+                        local_index_key(&pending.path),
+                        (pending.census_member, pending.watcher_hint),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
@@ -13772,13 +13812,15 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             identified_candidates: identified_candidates.into(),
-            active_file: None,
+            active_file: Default::default(),
             codex_join_inventory,
             codex_join_prepared: false,
             codex_join_groups: VecDeque::new(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),
             codex_legacy_join_baselines: Vec::new(),
+            codex_page: Default::default(),
+            codex_selected_flags,
         }
     }
     pub(crate) fn step(
@@ -13899,14 +13941,18 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             mut forced_claude_family_reparses,
             mut identified_candidates,
-            mut active_file,
+            active_file: active_frame,
             mut codex_join_inventory,
             mut codex_join_prepared,
             mut codex_join_groups,
             mut codex_join_active,
             mut codex_join_completed,
             mut codex_legacy_join_baselines,
+            mut codex_page,
+            codex_selected_flags,
         } = self;
+        // Held while this scan object runs the shared cursor job.
+        let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
         let index = &mut index_storage;
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
         // Construct the large continuation once. Repeating it in every yield
@@ -14159,7 +14205,7 @@ impl OwnedSourceScan {
                                 // at capture/send/checkpoint, after all page replays.
                                 let source_file_fingerprint =
                                     candidate.source_file_fingerprint.clone();
-                                active_file = Some(OwnedActiveFile {
+                                active_file = Some(Box::new(OwnedActiveFile {
                                     comparison_target: false,
                                     sampling: None,
                                     previous_snapshot_fingerprint: index
@@ -14176,7 +14222,10 @@ impl OwnedSourceScan {
                                     parser,
                                     aliases: members,
                                     applied_receipts,
-                                });
+                                    cursor: None,
+                                    charged_bytes: 0,
+                                    hold_offset: None,
+                                }));
                                 codex_legacy_join_baselines.extend(baselines);
                                 pending!();
                             }
@@ -14210,6 +14259,63 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            if source == SnapshotSource::Codex
+                && active_file.is_none()
+                && codex_join_active.is_none()
+            {
+                // A lease without an active file means this scan lost its job
+                // on an error path; dropping the lease frees the slot.
+                codex_cursor_lease = None;
+                if let Some(context) = sampling.as_ref() {
+                    codex_page.note_page(&context.cache);
+                }
+                // E2: at most one resume attempt per page, and none on a page
+                // that selected no candidates (no header inventory: no
+                // evidence for the job this page). A deferred job therefore
+                // never spins within a page.
+                if let Some(context) = sampling.as_ref().filter(|_| {
+                    !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
+                        && codex_join_inventory.is_some()
+                        && codex_page.claim_resume()
+                }) {
+                    // Continuing the paused job is the highest scheduling class.
+                    match sampled_scan::codex_cursor::resume_paused_job(
+                        sampled_scan::codex_cursor::ResumeContext {
+                            source,
+                            sampling: context,
+                            codex: &codex_title_metadata,
+                            claude: &claude_title_metadata,
+                            support: claude_effort_support_dir_ref,
+                            context_curve_enabled,
+                            traces: codex_turn_traces.clone(),
+                            parents: codex_parent_ownership_ledgers.clone(),
+                            inventory: codex_join_inventory.as_ref(),
+                            flags: &codex_selected_flags,
+                            census_complete: state_census_complete && sidecar_census_complete,
+                        },
+                        index,
+                        &mut identified_candidates,
+                        sampled_scan::codex_cursor::DisclosureTargets {
+                            census: &mut census,
+                            residue_index_keys: &mut residue_index_keys,
+                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                            codex_state_only_blocked_session_ids:
+                                &mut codex_state_only_blocked_session_ids,
+                            pending_finalization: &mut pending_finalization,
+                        },
+                    ) {
+                        sampled_scan::codex_cursor::Resumed::Active(job, lease) => {
+                            codex_cursor_lease = Some(lease);
+                            active_file = Some(job);
+                            pending!();
+                        }
+                        // Deferred, invalidated or ended as strict debt: this
+                        // page is spent; a pending path resumes or restarts.
+                        sampled_scan::codex_cursor::Resumed::Spent => pending!(),
+                        sampled_scan::codex_cursor::Resumed::Idle => {}
+                    }
+                }
+            }
             if active_file.is_none() {
                 if let Some(group) = codex_join_groups.pop_front() {
                     scanned_file_count += group.members.len();
@@ -14235,8 +14341,68 @@ impl OwnedSourceScan {
                 }
             }
             if let Some(mut active) = active_file.take() {
-                match active.parser.step() {
+                let stepped = active.parser.step();
+                if source == SnapshotSource::Codex {
+                    let consumed = active.parser.reader.consumed_bytes();
+                    codex_page.charge(
+                        active.cursor.is_some(),
+                        consumed.saturating_sub(active.charged_bytes),
+                    );
+                    active.charged_bytes = consumed;
+                    if active.hold_offset.is_none()
+                        && sampled_scan::codex_cursor::held_monotone(&active.parser.accumulator)
+                    {
+                        // File offset: a tail's reader counts from its start.
+                        let start = active
+                            .parser
+                            .reader
+                            .acquisition
+                            .as_ref()
+                            .map_or(0, crate::transcript_acquisition::ReadPlan::start_offset);
+                        active.hold_offset =
+                            Some(start + active.parser.reader.last_complete_line_end());
+                    }
+                }
+                match stepped {
                     Ok(false) => {
+                        if active.cursor.is_some()
+                            && codex_page
+                                .cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
+                        {
+                            if let Some(lease) = codex_cursor_lease.take() {
+                                if let sampled_scan::codex_cursor::PauseEnd::StateBound(
+                                    job,
+                                    disclosure,
+                                ) = lease.pause(active)
+                                {
+                                    // No unbounded fallback: `JoinStateBound`
+                                    // debt, prior body kept, file parked.
+                                    sampled_scan::codex_cursor::disclose_job_debt(
+                                        &job,
+                                        &disclosure,
+                                        index,
+                                        sampled_scan::codex_cursor::DisclosureTargets {
+                                            census: &mut census,
+                                            residue_index_keys: &mut residue_index_keys,
+                                            residue_blocked_session_ids:
+                                                &mut residue_blocked_session_ids,
+                                            codex_state_only_blocked_session_ids:
+                                                &mut codex_state_only_blocked_session_ids,
+                                            pending_finalization: &mut pending_finalization,
+                                        },
+                                    );
+                                    sampled_scan::codex_cursor::dequeue(index, &job.candidate);
+                                }
+                                pending!();
+                            }
+                            // A job without its lease is dropped, never
+                            // continued in-page past the budget; its pending
+                            // path restarts it (L2).
+                            if let Some(context) = sampling.as_ref() {
+                                context.cache.cursor_note_lost();
+                            }
+                            pending!();
+                        }
                         active_file = Some(active);
                         pending!();
                     }
@@ -14249,10 +14415,20 @@ impl OwnedSourceScan {
                             "local snapshot scan: {} transcript read failed: {error}",
                             source.api_slug()
                         );
+                        if let Some(lease) = codex_cursor_lease.take() {
+                            lease.release();
+                        }
+                        if active.cursor.is_some() {
+                            sampled_scan::codex_cursor::dequeue(index, &active.candidate);
+                        }
                         census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
                     }
                     Ok(true) => {}
+                }
+                if active.cursor.is_some() {
+                    // E1 before the protected-tier gate below (R1-H1).
+                    sampled_scan::codex_cursor::apply_eof_record(&mut active);
                 }
                 if let Some(context) = attribution_context {
                     let workers = launch_workers_for_parsed(
@@ -14330,9 +14506,189 @@ impl OwnedSourceScan {
                         context.record_mode(mode, acquisition.audit_due);
                     }
                     active.parser = parser;
+                    active.charged_bytes = 0;
+                    active.hold_offset = None;
+                    if active.cursor.is_some()
+                        && !sampled_scan::codex_cursor::restart_in_place(&mut active)
+                    {
+                        // The full replay cannot be frozen: end this attempt
+                        // (a retryable failure), never an unpaged read.
+                        active.cursor = None;
+                        if let Some(lease) = codex_cursor_lease.take() {
+                            lease.release();
+                        }
+                        sampled_scan::codex_cursor::dequeue(index, &active.candidate);
+                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        pending!();
+                    }
                     active_file = Some(active);
                     pending!();
                 }
+                // E3: the completion step walks the finished job exactly,
+                // once, for the budget its retention consumes below.
+                let copy_budget = if active.cursor.is_some() {
+                    sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active)
+                } else {
+                    copy_budget
+                };
+                // S6: a cursor job commits only through its sealed-prefix
+                // certificate; an invalidated attempt publishes nothing.
+                let mut cursor_certificate = None;
+                let mut cursor_publication = None;
+                let mut cursor_fragment = None;
+                if let Some(context) = sampling.as_ref().filter(|_| active.cursor.is_some()) {
+                    let current_scope = sampled_scan::reduction_dependencies(
+                        source,
+                        &active.candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    )
+                    .map(|dependency| {
+                        context.file_scope(
+                            source,
+                            &active.candidate,
+                            &dependency,
+                            true,
+                            context_curve_enabled,
+                            index,
+                        )
+                    });
+                    let counting_now =
+                        sampled_scan::codex_cursor::counting_view(&active.candidate, index);
+                    let census_trusted = state_census_complete
+                        && sidecar_census_complete
+                        && active
+                            .cursor
+                            .as_ref()
+                            .is_some_and(sampled_scan::codex_cursor::JobMeta::census_trusted);
+                    // The certificate re-reads two samples from the held FD (M3).
+                    codex_page.charge(true, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                    match sampled_scan::codex_cursor::finish_job(
+                        &context.cache,
+                        codex_cursor_lease.take(),
+                        &mut active,
+                        current_scope.as_ref(),
+                        &counting_now,
+                        census_trusted,
+                    ) {
+                        sampled_scan::codex_cursor::JobEnd::Certified {
+                            checkpoint,
+                            grown,
+                            publication,
+                            fragment,
+                        } => {
+                            // N2: a withheld record keeps the path pending, so
+                            // the next page tails it from `s`.
+                            sampled_scan::codex_cursor::release_path(
+                                index,
+                                &active.candidate,
+                                grown || fragment.is_some(),
+                            );
+                            // N1: a cursor-only job (census incomplete at start
+                            // or now) publishes like main's unsampled read: the
+                            // certificate fenced the object, but no checkpoint,
+                            // copy or verification is kept.
+                            cursor_certificate = Some(Some(checkpoint).filter(|_| census_trusted));
+                            cursor_publication = Some(publication);
+                            cursor_fragment = fragment;
+                        }
+                        sampled_scan::codex_cursor::JobEnd::Uncertified {
+                            grown,
+                            publication,
+                            fragment,
+                        } => {
+                            // N2: a withheld record keeps the path pending, so
+                            // the next page tails it from `s`.
+                            sampled_scan::codex_cursor::release_path(
+                                index,
+                                &active.candidate,
+                                grown || fragment.is_some(),
+                            );
+                            cursor_certificate = Some(None);
+                            cursor_publication = Some(publication);
+                            cursor_fragment = fragment;
+                        }
+                        // Its path is still pending: the next page re-bootstraps.
+                        sampled_scan::codex_cursor::JobEnd::Restart => pending!(),
+                        sampled_scan::codex_cursor::JobEnd::MemberChanged(disclosure) => {
+                            sampled_scan::codex_cursor::disclose_job_debt(
+                                &active,
+                                &disclosure,
+                                index,
+                                sampled_scan::codex_cursor::DisclosureTargets {
+                                    census: &mut census,
+                                    residue_index_keys: &mut residue_index_keys,
+                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                    codex_state_only_blocked_session_ids:
+                                        &mut codex_state_only_blocked_session_ids,
+                                    pending_finalization: &mut pending_finalization,
+                                },
+                            );
+                            sampled_scan::codex_cursor::dequeue(index, &active.candidate);
+                            pending!();
+                        }
+                    }
+                }
+                let memo_offset = active.hold_offset.filter(|_| {
+                    source == SnapshotSource::Codex
+                        && active.aliases.is_empty()
+                        && sampling.is_some()
+                });
+                if memo_offset.is_some() {
+                    // The live witness reads two samples of the held file (M3).
+                    codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                }
+                let memo_candidate = memo_offset.and_then(|offset| {
+                    let file = active.parser.reader.reader.get_ref();
+                    let live = sampled_scan::codex_cursor::LiveWitness::read(file, offset)?;
+                    let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
+                    let dependencies = sampled_scan::reduction_dependencies(
+                        source,
+                        &active.candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    )?;
+                    let digest = sampled_scan::codex_cursor::memo_digest(
+                        index,
+                        &active.candidate,
+                        file,
+                        &dependencies,
+                        &codex_title_metadata,
+                        sampled_scan::codex_cursor::owner_members(
+                            codex_join_inventory.as_ref(),
+                            &active.candidate.path,
+                        ),
+                        &sampled_scan::codex_cursor::counting_view(&active.candidate, index),
+                    )?;
+                    let sidecar = sampled_scan::codex_cursor::sidecar_wakes(
+                        &active.parser.accumulator,
+                    )
+                    .then(|| {
+                        sampled_scan::codex_cursor::sidecar_fingerprint(
+                            &codex_title_metadata,
+                            &active.candidate.path,
+                        )
+                    });
+                    let parent = active
+                        .parser
+                        .accumulator
+                        .codex_parent_session_ref
+                        .clone()
+                        .map(|parent| {
+                            let ledger = index
+                                .codex_parent_ownership_ledgers
+                                .get(resolve_codex_identity(&parent).as_str())
+                                .map(|ledger| ledger.opened_object_identity.clone());
+                            (parent, ledger)
+                        });
+                    // Completing a withheld record also cures (N2).
+                    let growth_may_cure =
+                        sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator)
+                            || active.parser.reader.sealed_fragment();
+                    Some((digest, live, stamp, parent, sidecar, growth_may_cure))
+                });
                 let OwnedActiveFile {
                     comparison_target,
                     sampling: file_sampling,
@@ -14345,7 +14701,10 @@ impl OwnedSourceScan {
                     parser,
                     aliases,
                     mut applied_receipts,
-                } = active;
+                    cursor: _,
+                    charged_bytes: _,
+                    hold_offset: _,
+                } = *active;
                 let mut parser = parser;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
                     match replay.finish() {
@@ -14353,6 +14712,11 @@ impl OwnedSourceScan {
                             applied_receipts.insert(local_index_key(&candidate.path), receipt);
                         }
                         Err(_) => {
+                            if let Some((context, publication)) =
+                                sampling.as_ref().zip(cursor_publication.take())
+                            {
+                                context.cache.cursor_published(publication, false);
+                            }
                             census.ownership_incomplete_file_count += 1;
                             census.record_unreadable(UnreadableCause::AliasParser, 1);
                             residue_index_keys.insert(local_index_key(&candidate.path));
@@ -14380,6 +14744,11 @@ impl OwnedSourceScan {
                 if retained_bytes.saturating_add(incoming_bytes)
                     > codex_file_join::MAX_RECEIPT_BYTES
                 {
+                    if let Some((context, publication)) =
+                        sampling.as_ref().zip(cursor_publication.take())
+                    {
+                        context.cache.cursor_published(publication, false);
+                    }
                     census.ownership_incomplete_file_count += aliases.len().max(1);
                     census.record_unreadable(UnreadableCause::AliasParser, 1);
                     residue_index_keys.insert(local_index_key(&candidate.path));
@@ -14399,7 +14768,23 @@ impl OwnedSourceScan {
                 let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
                     && aliases.is_empty()
                     && applied_receipts.values().all(Option::is_none);
-                let mut completed_acquisition = if let Some(acquisition) = file_sampling.as_ref() {
+                let mut completed_acquisition = if let Some(certificate) = cursor_certificate {
+                    // Retain the reduction only when every applied byte is in
+                    // the certified prefix `[0, s)`; a lossy job publishes
+                    // uncertified with its prepared debt, like a lossy full read.
+                    let sealed_only = parser.reader.sealed_fragment()
+                        || parser.reader.consumed_bytes() == parser.reader.last_complete_line_end();
+                    certificate.map(|checkpoint| {
+                        parser.retain_sealed_prefix(
+                            checkpoint,
+                            if cache_compatible && sealed_only {
+                                copy_budget
+                            } else {
+                                0
+                            },
+                        )
+                    })
+                } else if let Some(acquisition) = file_sampling.as_ref() {
                     // Known dependencies and the current path are separate from the
                     // sampled prefix promise. Neither may be stale at completion.
                     let current_scope = sampled_scan::reduction_dependencies(
@@ -14455,7 +14840,7 @@ impl OwnedSourceScan {
                         .as_deref()
                         .map(resolve_codex_identity)
                 };
-                let mut parsed_file = match parser.finish(
+                let parsed_file = parser.finish(
                     &candidate.opened_object_identity,
                     &candidate.path,
                     collected_at.as_str(),
@@ -14463,7 +14848,16 @@ impl OwnedSourceScan {
                     (source == SnapshotSource::Codex).then_some(&codex_title_metadata),
                     (source == SnapshotSource::ClaudeCode).then_some(&claude_title_metadata),
                     attribution_context,
-                ) {
+                );
+                // A committed cursor attempt counts as published only now (M4).
+                if let Some((context, publication)) =
+                    sampling.as_ref().zip(cursor_publication.take())
+                {
+                    context
+                        .cache
+                        .cursor_published(publication, parsed_file.is_ok());
+                }
+                let mut parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
                     Err(_) => {
                         census.record_unreadable(UnreadableCause::Reduction, 1);
@@ -14648,9 +15042,61 @@ impl OwnedSourceScan {
                 let ownership_incomplete_file_count = parsed_file.ownership_incomplete_file_count;
                 let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
                 let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
-                let source_verified = completed_acquisition
+                if let Some(context) = sampling
                     .as_ref()
-                    .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
+                    .filter(|_| source == SnapshotSource::Codex && aliases.is_empty())
+                {
+                    // Memoize only a loss-free terminal hold; anything else
+                    // (completion included) clears a stale entry.
+                    let held = !parse_complete
+                        && non_progressing_residue
+                        && ownership_incomplete_file_count > 0
+                        && report.complete()
+                        && recognized_usage_drop_count == 0
+                        && dropped_usage_record_count == 0;
+                    match memo_candidate.filter(|_| held) {
+                        Some((digest, live, stamp, parent, sidecar, growth_may_cure)) => {
+                            context.cache.memo_record(
+                                sampled_scan::codex_cursor::memo_key(
+                                    &context.namespace,
+                                    &index_key,
+                                ),
+                                sampled_scan::codex_cursor::MemoEntry::new(
+                                    digest,
+                                    live,
+                                    stamp,
+                                    parent,
+                                    sidecar,
+                                    sampled_scan::codex_cursor::Disclosure {
+                                        reason:
+                                            sampled_scan::codex_cursor::DebtReason::HeldTerminal,
+                                        ownership_incomplete_file_count,
+                                        zero_snapshot_usage_evidence,
+                                        state_only_blocked_session_ids: parsed_file
+                                            .state_only_blocked_session_ids
+                                            .iter()
+                                            .cloned()
+                                            .collect(),
+                                        diagnostic_reason,
+                                        parsed_snapshot_count: parsed_file.snapshots.len(),
+                                    },
+                                )
+                                .growth_may_cure(growth_may_cure),
+                            )
+                        }
+                        None => context
+                            .cache
+                            .memo_forget(&sampled_scan::codex_cursor::memo_key(
+                                &context.namespace,
+                                &index_key,
+                            )),
+                    }
+                }
+                // N2: a withheld final record is owed, never verified.
+                let source_verified = cursor_fragment.is_none()
+                    && completed_acquisition
+                        .as_ref()
+                        .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
                     || (file_sampling.is_none()
                         && state_census_complete
                         && sidecar_census_complete
@@ -14754,6 +15200,7 @@ impl OwnedSourceScan {
                     .map(|snapshot| snapshot.snapshot_fingerprint.clone());
                 let parsed_snapshot_count = parsed.len();
                 let sampled_audit_verified = parse_complete
+                    && cursor_fragment.is_none()
                     && completed_acquisition
                         .as_ref()
                         .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
@@ -14826,7 +15273,20 @@ impl OwnedSourceScan {
                     } else {
                         ScanParseOutcome::ConfirmedEmpty
                     };
-                    index.record(candidate, last_snapshot_fingerprint, outcome);
+                    // N2: with the certified prefix copy retained, the entry
+                    // records only `[0, s)` as read, so the next page tails
+                    // the withheld record with main's EOF behavior. Without a
+                    // copy it records the length read and the staged debt
+                    // re-selects it at the audit cadence.
+                    let mut recorded = candidate;
+                    if let Some(fragment) = cursor_fragment.filter(|_| {
+                        completed_acquisition
+                            .as_ref()
+                            .is_some_and(|completed| completed.reduction.is_some())
+                    }) {
+                        recorded.size_bytes = fragment.offset;
+                    }
+                    index.record(recorded, last_snapshot_fingerprint, outcome);
                     // Native settlement accepts disclosed terminal row loss, even
                     // though that acquisition cannot certify a verified prefix.
                     // Its sampled publication still owes the prepared deadline;
@@ -14856,6 +15316,13 @@ impl OwnedSourceScan {
                         }
                     } else if source_verified {
                         index.complete_full_audit(&index_key, &source_file_fingerprint);
+                    }
+                    if let Some(fragment) = cursor_fragment {
+                        index.stage_sampled_audit(
+                            &index_key,
+                            &source_file_fingerprint,
+                            fragment.debt,
+                        );
                     }
                     if let Some(completed) = completed_acquisition {
                         if let Some(context) = sampling.as_ref() {
@@ -15392,6 +15859,7 @@ impl OwnedSourceScan {
                             overdue_audits: overdue,
                             oldest_due_age_seconds: oldest_due_age,
                         },
+                        codex_cursor: context.cache.cursor_diagnostics(&codex_page),
                     }
                 });
                 resource_probe.collection(
@@ -15408,6 +15876,19 @@ impl OwnedSourceScan {
                     terminal_native_traversal,
                 });
             };
+            if let Some(context) = sampling
+                .as_ref()
+                .filter(|_| source == SnapshotSource::Codex)
+            {
+                if context.cache.cursor_job_key().as_deref()
+                    == Some(local_index_key(&candidate.path).as_str())
+                {
+                    // The paused or active cursor job owns this file; it stays
+                    // pending (holding the census) until that job's attempt ends.
+                    sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
+                    pending!();
+                }
+            }
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
             if let Some(context) = attribution_context {
@@ -15571,6 +16052,160 @@ impl OwnedSourceScan {
                 }
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
+            if let Some(context) = sampling
+                .as_ref()
+                .filter(|_| source == SnapshotSource::Codex)
+            {
+                let key = local_index_key(&candidate.path);
+                // Keyed per namespace (R1-M1): the digest carries the upload
+                // context, so concurrent namespaces must not evict each other.
+                let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
+                if let Some(entry) = context.cache.memo_lookup(&memo_key) {
+                    // The match re-reads two samples of the held file (M3).
+                    codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                    let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
+                        &codex_title_metadata,
+                        &candidate.path,
+                    );
+                    let parent_ledger = entry.parent_ref().and_then(|parent| {
+                        index
+                            .codex_parent_ownership_ledgers
+                            .get(resolve_codex_identity(parent).as_str())
+                            .map(|ledger| ledger.opened_object_identity.clone())
+                    });
+                    let hit = sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    )
+                    .and_then(|dependencies| {
+                        sampled_scan::codex_cursor::memo_digest(
+                            index,
+                            &candidate,
+                            &opened_file,
+                            &dependencies,
+                            &codex_title_metadata,
+                            sampled_scan::codex_cursor::owner_members(
+                                codex_join_inventory.as_ref(),
+                                &candidate.path,
+                            ),
+                            &sampled_scan::codex_cursor::counting_view(&candidate, index),
+                        )
+                    })
+                    .and_then(|digest| {
+                        entry.matches(&digest, &opened_file, parent_ledger, &sidecar_now)
+                    });
+                    if let Some(stamp) = hit {
+                        // An append cannot cure this hold and no wake
+                        // dependency changed: disclose the same terminal
+                        // debt again at zero transcript bytes.
+                        context.cache.memo_hit(&memo_key, stamp);
+                        let keep_previous = decision != CandidateDecision::ReconcileLegacy
+                            && !index
+                                .effective_upload_body_witness_revision_requires_adoption(&key);
+                        let previous = (
+                            keep_previous
+                                .then(|| index.last_snapshot_fingerprint(&candidate))
+                                .flatten(),
+                            keep_previous
+                                .then(|| index.last_upload_body_witness(&candidate))
+                                .flatten(),
+                        );
+                        sampled_scan::codex_cursor::disclose_terminal_codex_debt(
+                            entry.disclosure(),
+                            &candidate,
+                            previous,
+                            index,
+                            sampled_scan::codex_cursor::DisclosureTargets {
+                                census: &mut census,
+                                residue_index_keys: &mut residue_index_keys,
+                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                codex_state_only_blocked_session_ids:
+                                    &mut codex_state_only_blocked_session_ids,
+                                pending_finalization: &mut pending_finalization,
+                            },
+                        );
+                        pending!();
+                    }
+                    context.cache.memo_forget(&memo_key);
+                }
+                // A parked `JoinStateBound` file is not read again until it
+                // is replaced, shrunk or edited, or its reduction dependencies
+                // change; growth cannot cure it (§c.2, M-2).
+                let parked = context.cache.cursor_parked(
+                    &key,
+                    &opened_file,
+                    sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    )
+                    .as_deref(),
+                );
+                if let Some(disclosure) = parked {
+                    let keep_previous = decision != CandidateDecision::ReconcileLegacy
+                        && !index.effective_upload_body_witness_revision_requires_adoption(&key);
+                    let previous = (
+                        keep_previous
+                            .then(|| index.last_snapshot_fingerprint(&candidate))
+                            .flatten(),
+                        keep_previous
+                            .then(|| index.last_upload_body_witness(&candidate))
+                            .flatten(),
+                    );
+                    sampled_scan::codex_cursor::disclose_terminal_codex_debt(
+                        &disclosure,
+                        &candidate,
+                        previous,
+                        index,
+                        sampled_scan::codex_cursor::DisclosureTargets {
+                            census: &mut census,
+                            residue_index_keys: &mut residue_index_keys,
+                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                            codex_state_only_blocked_session_ids:
+                                &mut codex_state_only_blocked_session_ids,
+                            pending_finalization: &mut pending_finalization,
+                        },
+                    );
+                    pending!();
+                }
+                // Fresh-first page budget, decided before any retained state is
+                // consumed: the optimistic read is the tail extent when a
+                // retained entry exists, the whole file otherwise.
+                let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
+                let expected =
+                    extent.saturating_sub(context.cache.retained_sealed_offset(&key).unwrap_or(0));
+                match context.cache.cursor_plan(
+                    &mut codex_page,
+                    sampled_scan::codex_cursor::Limits::current(),
+                    expected,
+                    codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
+                    crate::heap_layout_bound::layout_supported(),
+                    &context.namespace,
+                    &key,
+                    sampled_scan::codex_cursor::census_token(index).as_deref(),
+                ) {
+                    sampled_scan::codex_cursor::StartPlan::Defer => {
+                        context.cache.cursor_note_deferred();
+                        sampled_scan::codex_cursor::requeue(
+                            index,
+                            &codex_selected_flags,
+                            &candidate,
+                        );
+                        pending!();
+                    }
+                    // Processed for this generation (K7 fence): not requeued,
+                    // so the census can complete; the next generation reads it.
+                    sampled_scan::codex_cursor::StartPlan::Fenced => pending!(),
+                    sampled_scan::codex_cursor::StartPlan::Singleton
+                    | sampled_scan::codex_cursor::StartPlan::Cursor
+                    | sampled_scan::codex_cursor::StartPlan::Unpaged => {}
+                }
+            }
             if let Some(phase) = native_comparison.as_mut() {
                 // This is an actual native acquisition attempt, before parser
                 // construction can fail or complete with no emitted entity.
@@ -15633,6 +16268,10 @@ impl OwnedSourceScan {
                 }
             };
             let mut file_sampling = None;
+            let mut retained_offset = None;
+            // Counted once the page actually reads the file (R2-M3): a fence
+            // or deferral below does not inflate the read diagnostics.
+            let mut planned_mode = None;
             if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
                 let retained = context.cache.take(&key);
@@ -15647,6 +16286,9 @@ impl OwnedSourceScan {
                         .cache_lookup_miss_unknown_origin
                         .saturating_add(1);
                 }
+                retained_offset = retained
+                    .as_ref()
+                    .map(|retained| retained.checkpoint.sealed_offset());
                 let owning_header_is_current = source != SnapshotSource::Codex
                     || codex_join_inventory.as_ref().is_some_and(|inventory| {
                         inventory.complete
@@ -15770,7 +16412,7 @@ impl OwnedSourceScan {
                             .acquisition
                             .as_ref()
                             .and_then(|plan| plan.metrics().audit_due);
-                        context.record_mode(mode, audit_due);
+                        planned_mode = Some((mode, audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             key,
                             scope,
@@ -15778,9 +16420,75 @@ impl OwnedSourceScan {
                             audit_due,
                         });
                     }
+                } else if source == SnapshotSource::Codex
+                    && owning_header_is_current
+                    && crate::heap_layout_bound::layout_supported()
+                    && parser
+                        .reader
+                        .reader
+                        .get_ref()
+                        .metadata()
+                        .is_ok_and(|metadata| {
+                            metadata.len()
+                                > sampled_scan::codex_cursor::Limits::current().singleton()
+                        })
+                {
+                    // N1 (K9): the state or sidecar census is incomplete, so
+                    // main's trust rule refuses verification and retention,
+                    // yet main still reads and publishes this file. A file
+                    // larger than the singleton budget therefore pages as a
+                    // cursor-only job: a fresh `Full` acquisition with no
+                    // retained state and no debt input, used only for the
+                    // job's object certificate. Its completion keeps no
+                    // checkpoint and no copy, so it is never source-verified.
+                    let reduction_sidecar = sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    );
+                    context
+                        .admission
+                        .reduction_dependencies_available
+                        .observe(reduction_sidecar.is_some());
+                    if let Some(reduction_sidecar) = reduction_sidecar {
+                        let scope = context.file_scope(
+                            source,
+                            &candidate,
+                            &reduction_sidecar,
+                            true,
+                            context_curve_enabled,
+                            index,
+                        );
+                        context.admission.prepare_started =
+                            context.admission.prepare_started.saturating_add(1);
+                        let mode = match parser.prepare_acquisition(
+                            None,
+                            &scope,
+                            None,
+                            sampled_scan::now_seconds(),
+                        ) {
+                            Ok(mode) => mode,
+                            Err(_) => {
+                                context.admission.prepare_failed =
+                                    context.admission.prepare_failed.saturating_add(1);
+                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                pending!();
+                            }
+                        };
+                        sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
+                        planned_mode = Some((mode, None));
+                        file_sampling = Some(sampled_scan::Active {
+                            key,
+                            scope,
+                            mode,
+                            audit_due: None,
+                        });
+                    }
                 }
             }
-            active_file = Some(OwnedActiveFile {
+            let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
                 sampling: file_sampling,
                 candidate,
@@ -15792,7 +16500,120 @@ impl OwnedSourceScan {
                 parser,
                 aliases: Vec::new(),
                 applied_receipts: BTreeMap::new(),
+                cursor: None,
+                charged_bytes: 0,
+                hold_offset: None,
             });
+            if let Some(context) = sampling
+                .as_ref()
+                .filter(|_| source == SnapshotSource::Codex)
+            {
+                let extent = active
+                    .parser
+                    .reader
+                    .reader
+                    .get_ref()
+                    .metadata()
+                    .map_or(0, |metadata| metadata.len());
+                let expected = match active.sampling.as_ref().map(|acquisition| acquisition.mode) {
+                    Some(crate::transcript_acquisition::ReadMode::Unchanged) => 0,
+                    Some(crate::transcript_acquisition::ReadMode::Tail) => {
+                        extent.saturating_sub(retained_offset.unwrap_or(0))
+                    }
+                    _ => extent,
+                };
+                let defer = match context.cache.cursor_plan(
+                    &mut codex_page,
+                    sampled_scan::codex_cursor::Limits::current(),
+                    expected,
+                    codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
+                    crate::heap_layout_bound::layout_supported(),
+                    &context.namespace,
+                    &local_index_key(&active.candidate.path),
+                    sampled_scan::codex_cursor::census_token(index).as_deref(),
+                ) {
+                    sampled_scan::codex_cursor::StartPlan::Singleton => false,
+                    sampled_scan::codex_cursor::StartPlan::Unpaged => {
+                        // Layout-unsupported build: the cursor is off as a
+                        // whole and this file reads in its page, as before.
+                        codex_page.disclose_disabled(&context.cache);
+                        false
+                    }
+                    sampled_scan::codex_cursor::StartPlan::Cursor => {
+                        let dependencies = sampled_scan::reduction_dependencies(
+                            source,
+                            &active.candidate,
+                            &codex_title_metadata,
+                            &claude_title_metadata,
+                            claude_effort_support_dir_ref,
+                        );
+                        let owner = codex_join_inventory
+                            .as_ref()
+                            .and_then(|inventory| inventory.owner_for_path(&active.candidate.path))
+                            .map(str::to_owned);
+                        match context.cache.cursor_start(
+                            &mut active,
+                            &context.namespace,
+                            dependencies,
+                            owner,
+                            state_census_complete && sidecar_census_complete,
+                            index,
+                        ) {
+                            Ok(lease) => {
+                                // The job's path holds the strict census until
+                                // its attempt ends (accepted or debt).
+                                sampled_scan::codex_cursor::requeue(
+                                    index,
+                                    &codex_selected_flags,
+                                    &active.candidate,
+                                );
+                                codex_cursor_lease = Some(lease);
+                                false
+                            }
+                            // The slot frees when its job ends: wait in turn.
+                            Err(sampled_scan::codex_cursor::StartRefusal::Busy) => true,
+                            // N1: no acquisition even cursor-only (no current
+                            // owning header or no reduction dependencies, where
+                            // main holds the file too). Never requeued: the
+                            // path is processed for this generation with a
+                            // retryable cause, so discovery finishes and the
+                            // bounded unhealthy retry starts the next one.
+                            Err(sampled_scan::codex_cursor::StartRefusal::InputsUnavailable) => {
+                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                pending!();
+                            }
+                            Err(sampled_scan::codex_cursor::StartRefusal::Unstartable) => {
+                                // Never an unbounded in-page read of a file
+                                // larger than the singleton budget.
+                                census.record_unreadable(UnreadableCause::OpenRead, 1);
+                                pending!();
+                            }
+                        }
+                    }
+                    sampled_scan::codex_cursor::StartPlan::Defer => true,
+                    // Processed for this generation (K7 fence).
+                    sampled_scan::codex_cursor::StartPlan::Fenced => {
+                        scanned_file_count = scanned_file_count.saturating_sub(1);
+                        pending!();
+                    }
+                };
+                if defer {
+                    // Only a full read reaches here (a tail was planned
+                    // before its retained state was consumed).
+                    context.cache.cursor_note_deferred();
+                    scanned_file_count = scanned_file_count.saturating_sub(1);
+                    sampled_scan::codex_cursor::requeue(
+                        index,
+                        &codex_selected_flags,
+                        &active.candidate,
+                    );
+                    pending!();
+                }
+            }
+            if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
+                context.record_mode(mode, audit_due);
+            }
+            active_file = Some(active);
             pending!();
         }
         Ok(OwnedSourceScanStep::Pending(Self {
@@ -15833,13 +16654,18 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             identified_candidates,
-            active_file,
+            active_file: sampled_scan::codex_cursor::ActiveFrame::new(
+                active_file,
+                codex_cursor_lease,
+            ),
             codex_join_inventory,
             codex_join_prepared,
             codex_join_groups,
             codex_join_active,
             codex_join_completed,
             codex_legacy_join_baselines,
+            codex_page,
+            codex_selected_flags,
         }))
     }
 }
@@ -16509,6 +17335,11 @@ impl ParsedJsonlFile {
 
 // The native file parser owns all state needed between physical-line steps.
 // Finalization is separate: a line step is never file or upload authority.
+/// The reader `OwnedJsonlParser` owns (named once for `with_line_sink`).
+type ParserReader = BoundedJsonlReader<OpenedInput>;
+/// The parser's one per-line sink, as `with_line_sink` lends it.
+type LineSink<'a> = &'a mut dyn FnMut(&Value);
+
 struct OwnedJsonlParser {
     reader: BoundedJsonlReader<OpenedInput>,
     accumulator: SnapshotAccumulator,
@@ -16598,14 +17429,31 @@ impl OwnedJsonlParser {
     fn step(&mut self) -> Result<bool> {
         self.step_with_observer(|_| {})
     }
-    fn step_with_observer(&mut self, mut observe: impl FnMut(&Value)) -> Result<bool> {
+    fn step_with_observer(&mut self, observe: impl FnMut(&Value)) -> Result<bool> {
+        let step = self.with_line_sink(observe, |reader, sink| reader.step(sink))?;
+        Ok(matches!(step, JsonlReaderStep::Complete(_)))
+    }
+
+    /// E1: at a genuine unchanged EOF (proved by the cursor caller), apply a
+    /// withheld final record through the same line sink as every other line.
+    fn apply_sealed_fragment(&mut self) -> bool {
+        self.with_line_sink(|_| {}, |reader, sink| reader.apply_sealed_fragment(sink))
+    }
+
+    /// Run `drive` with the parser's one line sink (observer, tier replay,
+    /// usage-shape counters, `apply_line`).
+    fn with_line_sink<T>(
+        &mut self,
+        mut observe: impl FnMut(&Value),
+        drive: impl FnOnce(&mut ParserReader, LineSink<'_>) -> T,
+    ) -> T {
         let source = self.source;
         let accumulator = &mut self.accumulator;
         let recognized_usage_drop_count = &mut self.recognized_usage_drop_count;
         let positive_recognized_usage_count = &mut self.positive_recognized_usage_count;
         let positive_usage_evidence = &mut self.positive_usage_evidence;
         let apply_line = self.apply_line;
-        let step = self.reader.step(|value| {
+        let mut sink = |value: &Value| {
             observe(value);
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.observe(value);
@@ -16622,8 +17470,8 @@ impl OwnedJsonlParser {
                 *positive_usage_evidence |= json_has_positive_usage_evidence(value);
             }
             apply_line(value, accumulator);
-        })?;
-        Ok(matches!(step, JsonlReaderStep::Complete(_)))
+        };
+        drive(&mut self.reader, &mut sink)
     }
     #[allow(clippy::too_many_arguments)]
     fn finish(
@@ -16662,6 +17510,11 @@ impl OwnedJsonlParser {
         } = self;
         let mut reader = bounded.reader;
         let report = bounded.report;
+        // Present only for a cursor job whose prefix certificate passed (S12)
+        // or whose lossy job holds ruling 2's same-object identity proof.
+        let sealed_prefix = bounded.sealed_prefix;
+        // A cursor read withheld an unterminated final record (N2).
+        let sealed_fragment = bounded.sealed_fragment.is_some();
         let mut ownership_incomplete_file_count = 0;
         // The bounded reader cannot prove that a skipped physical line contained
         // no usage. Account one potential recognized usage record per line while
@@ -16671,7 +17524,19 @@ impl OwnedJsonlParser {
             recognized_usage_drop_count.saturating_add(report.over_line_cap_count);
         let observed_after_read = opened_object_identity(source, reader.get_mut())
             .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
-        if observed_after_read != expected_opened_object_identity {
+        // A cursor job read only up to its frozen extent; appended bytes
+        // belong to the next tail, so its object may have grown. Only a job
+        // whose prefix certificate passed against the held FD carries
+        // `Certified` (same dev/ino, no shrink, no same-size edit, held-FD
+        // samples, scope), and the held FD must still be that dev/ino and at
+        // least the frozen extent long. A lossy job (ruling 2) carries only
+        // its same-object proof, revalidated here against the held FD (no
+        // shrink, same covered samples) and the selected path; it publishes
+        // uncertified. Every other read keeps exact equality.
+        let grown_identity_holds = sealed_prefix
+            .as_ref()
+            .is_some_and(|grant| grant.holds(reader.get_mut(), path));
+        if observed_after_read != expected_opened_object_identity && !grown_identity_holds {
             return Err(anyhow::anyhow!(
                 "opened snapshot candidate changed while it was parsed"
             ));
@@ -16711,8 +17576,9 @@ impl OwnedJsonlParser {
         // A parentless created thread is proven only by its complete physical
         // stream. Record an unread line before the ownership decision so the file
         // is held as ownership-incomplete (the generic marking below is too late).
+        // A withheld final record is unread too: the prefix is not that stream.
         if source == SnapshotSource::Codex
-            && !report.complete()
+            && (!report.complete() || sealed_fragment)
             && accumulator.codex_parentless_created_thread()
         {
             accumulator.codex_creator_evidence_conflicted = true;
@@ -17182,6 +18048,9 @@ fn read_bounded_jsonl_lines(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonlReaderStep {
     Line,
+    /// A chunked overlong skip paused at a chunk boundary (cursor reads only).
+    /// No record was delivered or counted; the next step resumes the skip.
+    Partial,
     Complete(JsonlReadReport),
 }
 
@@ -17197,6 +18066,31 @@ struct BoundedJsonlReader<R> {
     finished: bool,
     failure: Option<std::io::ErrorKind>,
     acquisition: Option<crate::transcript_acquisition::ReadPlan>,
+    /// Resumable reads only: an overlong line's skip pauses after this many
+    /// skipped bytes per step instead of consuming to its newline at once.
+    chunked_skip: Option<usize>,
+    /// An overlong line is being skipped across steps. Its salvage was
+    /// taken from the capped prefix when the skip first paused and `buf`
+    /// was cleared then (E4), so a pause never holds the 16 MiB prefix.
+    skipping: Option<EarlySalvage>,
+    /// Resumable reads only: never consume past this frozen extent.
+    extent_limit: Option<u64>,
+    /// Physical bytes consumed from `reader`, including skipped bytes.
+    consumed: u64,
+    last_line_end: u64,
+    /// A frozen-extent read ended on an unterminated record:
+    /// `Some((overflowed, early salvage))`. Those bytes were neither
+    /// delivered nor counted as a line, even when nothing past the extent was
+    /// visible yet. `buf` keeps them (bounded by `max_line_bytes`, the
+    /// salvage prefix when overflowed, unless E4 already took it) so a
+    /// genuine unchanged EOF can apply them with main's trailing-line rule
+    /// (E1).
+    sealed_fragment: Option<(bool, Option<EarlySalvage>)>,
+    /// Set only by a cursor job's `finish_job`: the identity `finish` may
+    /// accept for a grown object. `Certified` after its prefix certificate
+    /// passed (S12); `LossySameObject` (ruling 2) is not a sealed-prefix
+    /// certificate and permits only an uncertified publication.
+    sealed_prefix: Option<sampled_scan::codex_cursor::FinishGrant>,
 }
 
 impl<R: BufRead> BoundedJsonlReader<R> {
@@ -17210,7 +18104,66 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             finished: false,
             failure: None,
             acquisition: None,
+            chunked_skip: None,
+            skipping: None,
+            extent_limit: None,
+            consumed: 0,
+            last_line_end: 0,
+            sealed_fragment: None,
+            sealed_prefix: None,
         }
+    }
+
+    /// Chunked, pausable overlong skip for resumable reads. Non-cursor
+    /// callers never set it and keep consuming an overlong line in one step.
+    fn set_chunked_skip(&mut self, chunk: usize) {
+        self.chunked_skip = Some(chunk.max(1));
+    }
+
+    /// Freeze the readable extent (sealed-live mode). Bytes appended after
+    /// the extent belong to a later read; an unterminated record at the
+    /// extent is withheld, never parsed or counted, whether or not bytes past
+    /// the extent are visible yet.
+    fn set_extent_limit(&mut self, limit: u64) {
+        self.extent_limit = Some(limit.max(self.consumed));
+    }
+
+    fn consumed_bytes(&self) -> u64 {
+        self.consumed
+    }
+
+    /// End offset of the last newline-terminated record consumed.
+    fn last_complete_line_end(&self) -> u64 {
+        self.last_line_end
+    }
+
+    /// Any skipped, salvaged, malformed or invalid line so far.
+    fn lossy_prefix(&self) -> bool {
+        self.report.over_line_cap_count > 0 || !self.report.complete_except_over_line_cap()
+    }
+
+    fn sealed_fragment(&self) -> bool {
+        self.sealed_fragment.is_some()
+    }
+
+    /// E1, genuine unchanged EOF only (the caller proves it): apply the
+    /// withheld final record from the bytes already buffered, exactly as a
+    /// read without an extent applies its trailing line. No byte is read.
+    fn apply_sealed_fragment(&mut self, mut on_value: impl FnMut(&Value)) -> bool {
+        let Some((overflowed, early)) = self.sealed_fragment.take() else {
+            return false;
+        };
+        apply_physical_line(
+            &mut self.buf,
+            &mut self.report,
+            overflowed,
+            early,
+            self.max_line_bytes,
+            self.salvage_codex_envelope,
+            &mut on_value,
+        );
+        self.buf.clear();
+        true
     }
 
     fn step(&mut self, on_value: impl FnMut(&Value)) -> std::io::Result<JsonlReaderStep> {
@@ -17223,11 +18176,17 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         if self.finished {
             return Ok(JsonlReaderStep::Complete(self.report));
         }
-        self.buf.clear();
+        if self.skipping.is_none() {
+            self.buf.clear();
+        }
         let result = self.read_step(on_value);
         // Values have been consumed synchronously and dropped. Retain only the
         // existing buffer capacity; no logical raw row survives this return.
-        self.buf.clear();
+        // A paused overlong skip keeps no bytes (E4); a withheld final
+        // record keeps its bounded bytes (E1).
+        if self.skipping.is_none() && self.sealed_fragment.is_none() {
+            self.buf.clear();
+        }
         if let Err(error) = &result {
             // A partial physical line may already have been consumed. Resuming
             // after an I/O error would reinterpret its suffix or lose the row.
@@ -17246,12 +18205,20 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         // tracks whether we reached a newline (vs. EOF) so we can stop the
         // outer loop on a trailing partial line.
         let mut line_complete = false;
-        let mut overflowed = false;
+        let mut early = self.skipping.take();
+        let mut overflowed = early.is_some();
+        let mut skipped_this_step = 0_usize;
         let reached_eof = loop {
-            let available = reader.fill_buf()?;
-            if available.is_empty() {
+            let raw = reader.fill_buf()?;
+            let allowed = self.extent_limit.map_or(raw.len(), |limit| {
+                usize::try_from(limit.saturating_sub(self.consumed))
+                    .unwrap_or(usize::MAX)
+                    .min(raw.len())
+            });
+            if allowed == 0 {
                 break true;
             }
+            let available = &raw[..allowed];
             match available.iter().position(|&byte| byte == b'\n') {
                 Some(offset) => {
                     if !overflowed {
@@ -17268,6 +18235,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(&available[..offset + 1], true)?;
                     }
                     reader.consume(offset + 1);
+                    self.consumed += (offset + 1) as u64;
+                    self.last_line_end = self.consumed;
                     line_complete = true;
                     break false;
                 }
@@ -17284,52 +18253,109 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(available, false)?;
                     }
                     reader.consume(len);
+                    self.consumed += len as u64;
+                    if overflowed {
+                        skipped_this_step = skipped_this_step.saturating_add(len);
+                        if self
+                            .chunked_skip
+                            .is_some_and(|chunk| skipped_this_step >= chunk)
+                        {
+                            // Pause the skip at a chunk boundary. The line is
+                            // neither delivered nor counted until its newline.
+                            // The capped prefix is final once overflowed, so
+                            // its salvage is taken now and the bytes dropped
+                            // (E4): the same envelope the newline would give.
+                            self.skipping = Some(early.take().unwrap_or_else(|| {
+                                EarlySalvage::take(buf, salvage_codex_envelope)
+                            }));
+                            return Ok(JsonlReaderStep::Partial);
+                        }
+                    }
                 }
             }
         };
+        if reached_eof
+            && self.extent_limit.is_some()
+            && (overflowed || !buf.is_empty())
+            && !line_complete
+        {
+            // Sealed cursor completion (S5): a record without its newline at
+            // or before the frozen extent is unfinished for this read, even if
+            // no byte beyond the extent is visible yet. It is never parsed,
+            // counted or certified. Reads without an extent keep the normal
+            // trailing-line behavior below, byte-identical to before.
+            self.sealed_fragment = Some((overflowed, early));
+            self.finished = true;
+            return Ok(JsonlReaderStep::Complete(*report));
+        }
         if !line_complete && buf.is_empty() && !overflowed {
             // Clean EOF with no pending bytes.
             self.finished = true;
             return Ok(JsonlReaderStep::Complete(*report));
         }
-        report.physical_line_count += 1;
-        if overflowed {
-            report.over_line_cap_count += 1;
-            // Codex created-thread ownership requires a gap-free ordinal and
-            // timestamp stream. Image-bearing response/compaction rows carry
-            // that structural envelope before their huge payload. Preserve
-            // only those two content-free scalars; the payload stays skipped
-            // and is still disclosed as one dropped potential usage record.
-            if salvage_codex_envelope {
-                if let Some(value) = oversized_codex_envelope(buf) {
-                    on_value(&value);
-                }
-            }
-            // Drop the oversized line; its retained-capacity buffer is reset to
-            // the cap so one huge line does not pin a large allocation.
-            buf.clear();
-            buf.shrink_to(max_line_bytes);
-            self.finished = reached_eof;
-            return Ok(JsonlReaderStep::Line);
-        }
-        // Trim a trailing CR so a CRLF transcript parses identically to LF.
-        let mut bytes = buf.as_slice();
-        if bytes.last() == Some(&b'\r') {
-            bytes = &bytes[..bytes.len() - 1];
-        }
-        match std::str::from_utf8(bytes) {
-            Ok(line) if line.trim().is_empty() => {}
-            Ok(line) => match serde_json::from_str::<Value>(line) {
-                Ok(value) => {
-                    report.parsed_json_line_count += 1;
-                    on_value(&value);
-                }
-                Err(_) => report.malformed_json_line_count += 1,
-            },
-            Err(_) => report.invalid_utf8_line_count += 1,
-        }
+        apply_physical_line(
+            buf,
+            report,
+            overflowed,
+            early,
+            max_line_bytes,
+            salvage_codex_envelope,
+            &mut on_value,
+        );
         self.finished = reached_eof;
         Ok(JsonlReaderStep::Line)
+    }
+}
+
+/// Count and apply one physical line held in `buf` (newline-terminated, or a
+/// trailing line at EOF). Shared by every read path.
+fn apply_physical_line(
+    buf: &mut Vec<u8>,
+    report: &mut JsonlReadReport,
+    overflowed: bool,
+    early: Option<EarlySalvage>,
+    max_line_bytes: usize,
+    salvage_codex_envelope: bool,
+    on_value: &mut impl FnMut(&Value),
+) {
+    report.physical_line_count += 1;
+    if overflowed {
+        report.over_line_cap_count += 1;
+        // Codex created-thread ownership requires a gap-free ordinal and
+        // timestamp stream. Image-bearing response/compaction rows carry
+        // that structural envelope before their huge payload. Preserve
+        // only those two content-free scalars; the payload stays skipped
+        // and is still disclosed as one dropped potential usage record.
+        if salvage_codex_envelope {
+            let value = match early {
+                Some(early) => early.envelope.map(SalvagedEnvelope::value),
+                None => oversized_codex_envelope(buf),
+            };
+            if let Some(value) = value {
+                on_value(&value);
+            }
+        }
+        // Drop the oversized line; its retained-capacity buffer is reset to
+        // the cap so one huge line does not pin a large allocation.
+        buf.clear();
+        buf.shrink_to(max_line_bytes);
+        return;
+    }
+    // Trim a trailing CR so a CRLF transcript parses identically to LF.
+    let mut bytes = buf.as_slice();
+    if bytes.last() == Some(&b'\r') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(line) if line.trim().is_empty() => {}
+        Ok(line) => match serde_json::from_str::<Value>(line) {
+            Ok(value) => {
+                report.parsed_json_line_count += 1;
+                on_value(&value);
+            }
+            Err(_) => report.malformed_json_line_count += 1,
+        },
+        Err(_) => report.invalid_utf8_line_count += 1,
     }
 }
 
@@ -17342,13 +18368,57 @@ fn read_bounded_jsonl_lines_impl(
     let mut state = BoundedJsonlReader::new(reader, max_line_bytes, salvage_codex_envelope);
     loop {
         match state.step(&mut on_value)? {
-            JsonlReaderStep::Line => {}
+            JsonlReaderStep::Line | JsonlReaderStep::Partial => {}
             JsonlReaderStep::Complete(report) => return Ok(report),
         }
     }
 }
 
+/// An overlong cursor record's salvage, taken from its capped prefix when
+/// its skip first paused (E4). `envelope` is exactly what
+/// `oversized_codex_envelope` derives from that prefix at the newline: the
+/// prefix no longer changes once the line overflowed.
+#[derive(Debug)]
+struct EarlySalvage {
+    envelope: Option<SalvagedEnvelope>,
+}
+crate::heap_layout_bound::fields!(EarlySalvage; envelope);
+
+impl EarlySalvage {
+    fn take(prefix: &mut Vec<u8>, salvage_codex_envelope: bool) -> Self {
+        let envelope = if salvage_codex_envelope {
+            oversized_codex_envelope_parts(prefix)
+        } else {
+            None
+        };
+        prefix.clear();
+        Self { envelope }
+    }
+}
+
+/// The two content-free scalars an oversized Codex row keeps.
+#[derive(Debug)]
+struct SalvagedEnvelope {
+    timestamp: String,
+    ordinal: u64,
+}
+crate::heap_layout_bound::fields!(SalvagedEnvelope; timestamp, ordinal);
+
+impl SalvagedEnvelope {
+    fn value(self) -> Value {
+        json!({
+            "timestamp": self.timestamp,
+            "type": "oversized_payload_skipped",
+            "ordinal": self.ordinal,
+        })
+    }
+}
+
 fn oversized_codex_envelope(prefix: &[u8]) -> Option<Value> {
+    oversized_codex_envelope_parts(prefix).map(SalvagedEnvelope::value)
+}
+
+fn oversized_codex_envelope_parts(prefix: &[u8]) -> Option<SalvagedEnvelope> {
     let mut depth = 0_u32;
     let mut index = 0_usize;
     let mut ordinal = None;
@@ -17408,11 +18478,10 @@ fn oversized_codex_envelope(prefix: &[u8]) -> Option<Value> {
             _ => index += 1,
         }
     }
-    Some(json!({
-        "timestamp": timestamp?,
-        "type": "oversized_payload_skipped",
-        "ordinal": ordinal?,
-    }))
+    Some(SalvagedEnvelope {
+        timestamp: timestamp?,
+        ordinal: ordinal?,
+    })
 }
 
 fn json_string_token_end(bytes: &[u8], start: usize) -> Option<usize> {
@@ -21125,7 +22194,11 @@ impl CodexTurnTraceMap {
                 codex_dir.join("logs_2.sqlite"),
                 codex_dir.join("sqlite").join("logs_2.sqlite"),
             ] {
-                load_codex_logs2_priority_turns(&db_path, since_epoch, &mut map.priority_turns);
+                map.incomplete |= !load_codex_logs2_priority_turns(
+                    &db_path,
+                    since_epoch,
+                    &mut map.priority_turns,
+                );
             }
         }
         map
@@ -21141,13 +22214,15 @@ fn codex_logs2_since_epoch(backfill_window_days: u64) -> i64 {
     now.saturating_sub(span) as i64
 }
 
+/// False when a present DB could not be read completely (open, prepare,
+/// query or row error, or the row cap reached); a missing DB is complete.
 fn load_codex_logs2_priority_turns(
     path: &Path,
     since_epoch: i64,
     priority_turns: &mut BTreeSet<String>,
-) {
+) -> bool {
     if !path.exists() {
-        return;
+        return true;
     }
     // URI `mode=ro` so a WAL database with a concurrent writer is safe to read.
     let uri = format!("file:{}?mode=ro", path.to_string_lossy());
@@ -21155,7 +22230,7 @@ fn load_codex_logs2_priority_turns(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     ) else {
-        return;
+        return false;
     };
     let _ = connection.busy_timeout(std::time::Duration::from_millis(
         CODEX_LOGS2_BUSY_TIMEOUT_MS,
@@ -21168,19 +22243,27 @@ fn load_codex_logs2_priority_turns(
          WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
          ORDER BY ts DESC LIMIT ?2",
     ) else {
-        return;
+        return false;
     };
     let Ok(rows) = statement.query_map(
         rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
         |row| row.get::<_, String>(0),
     ) else {
-        return;
+        return false;
     };
-    for body in rows.flatten() {
+    let mut complete = true;
+    let mut read = 0_u64;
+    for body in rows {
+        let Ok(body) = body else {
+            complete = false;
+            continue;
+        };
+        read += 1;
         if let Some(turn_id) = codex_logs2_priority_turn_from_body(&body) {
             priority_turns.insert(turn_id);
         }
     }
+    complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
 
 /// Parse one `feedback_log_body` row. Returns the `turn_id` when the row is a
@@ -60694,14 +61777,14 @@ crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ord
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
-crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns);
+crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count,
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
@@ -60718,7 +61801,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
@@ -60751,6 +61834,13 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
             finished,
             failure,
             acquisition,
+            chunked_skip,
+            skipping,
+            extent_limit,
+            consumed,
+            last_line_end,
+            sealed_fragment,
+            sealed_prefix,
         } = self;
         c.add(reader.capacity())?;
         buf.heap_bound(c)?;
@@ -60760,6 +61850,13 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
         finished.heap_bound(c)?;
         // ErrorKind is inline; File holds the existing OS handle, no new Rust buffer.
         let _ = failure;
+        chunked_skip.heap_bound(c)?;
+        skipping.heap_bound(c)?;
+        extent_limit.heap_bound(c)?;
+        consumed.heap_bound(c)?;
+        last_line_end.heap_bound(c)?;
+        sealed_fragment.heap_bound(c)?;
+        sealed_prefix.heap_bound(c)?;
         acquisition.heap_bound(c)
     }
 }

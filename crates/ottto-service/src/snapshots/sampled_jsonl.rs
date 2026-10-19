@@ -236,4 +236,73 @@ impl OwnedJsonlParser {
             reduction,
         }))
     }
+
+    /// Pair a cursor job's prefix certificate (`ReadPlan::commit_sealed_prefix`)
+    /// with a copy of its reduction. The caller passes a zero budget unless
+    /// every applied byte is inside the certified prefix `[0, s)`; the
+    /// certificate alone then still publishes without retention.
+    pub(super) fn retain_sealed_prefix(
+        &mut self,
+        checkpoint: Checkpoint,
+        remaining_copy_budget: usize,
+    ) -> CompletedNativeAcquisition {
+        let budget = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
+        // The job kept every turn witness (K1); a retained copy keeps the
+        // cache-only caps that govern every other retained reduction.
+        let witnesses_retainable = self
+            .accumulator
+            .codex_observed_priority_turns
+            .as_ref()
+            .map_or(true, |observed| {
+                observed.len() <= MAX_PRIORITY_WITNESSES
+                    && observed
+                        .keys()
+                        .all(|turn| turn.len() <= MAX_PRIORITY_WITNESS_ID_BYTES)
+            });
+        if budget == 0
+            || !witnesses_retainable
+            || !sampled_scan::compatible_reduction(&self.accumulator)
+        {
+            return CompletedNativeAcquisition {
+                checkpoint,
+                reduction: None,
+            };
+        }
+        // The certificate consumed the acquisition plan, so charge the
+        // certificate itself where `retention_bound` charges the plan.
+        let inputs = self.take_live_reduction_inputs();
+        let admitted = (|| {
+            let state = crate::heap_layout_bound::bound(&self.accumulator, budget)?;
+            let certificate =
+                crate::heap_layout_bound::bound(&checkpoint, budget.checked_sub(state)?)?;
+            let inline = std::mem::size_of::<CachedJsonlReduction>()
+                .checked_sub(std::mem::size_of::<SnapshotAccumulator>())?;
+            let total = state.checked_add(certificate)?.checked_add(inline)?;
+            (total <= budget).then_some(())
+        })();
+        let accumulator = admitted.map(|()| {
+            let mut copy = self.accumulator.clone();
+            copy.codex_priority_witnesses_uncapped = false;
+            copy
+        });
+        self.restore_live_reduction_inputs(inputs);
+        let Some(accumulator) = accumulator else {
+            return CompletedNativeAcquisition {
+                checkpoint,
+                reduction: None,
+            };
+        };
+        let reduction = CachedJsonlReduction {
+            accumulator,
+            report: self.reader.report,
+            recognized_usage_drop_count: self.recognized_usage_drop_count,
+            positive_recognized_usage_count: self.positive_recognized_usage_count,
+            positive_usage_evidence: self.positive_usage_evidence,
+        };
+        let reduction = crate::heap_layout_bound::bound(&reduction, budget).map(|_| reduction);
+        CompletedNativeAcquisition {
+            checkpoint,
+            reduction,
+        }
+    }
 }

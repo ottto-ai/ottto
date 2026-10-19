@@ -111,6 +111,38 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
     }
+    /// Evict in admission victim order (oldest source, then least recently
+    /// used) until the resident state fits `limit`. False when even an empty
+    /// cache does not fit. The cursor makes room for a paused job this way.
+    pub(crate) fn release_until(&mut self, limit: usize) -> bool {
+        loop {
+            if heap_layout_bound::bound(self, limit).is_some() {
+                return true;
+            }
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| (entry.modified_hint, entry.used))
+                .map(|(key, _)| key.clone())
+            else {
+                return false;
+            };
+            self.entries.remove(&victim);
+        }
+    }
+    /// Sealed offset of a retained entry without taking it, so a page budget
+    /// can plan a tail read before the frame consumes retained state.
+    pub(crate) fn sealed_offset(&self, key: &str) -> Option<u64> {
+        self.entries
+            .get(key)
+            .map(|entry| entry.retained.checkpoint.sealed_offset())
+    }
+    #[cfg(test)]
+    pub(crate) fn checkpoint(&self, key: &str) -> Option<Checkpoint> {
+        self.entries
+            .get(key)
+            .map(|entry| entry.retained.checkpoint.clone())
+    }
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) {
         self.entries.remove(key);
