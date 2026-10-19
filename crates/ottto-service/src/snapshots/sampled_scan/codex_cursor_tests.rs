@@ -2564,7 +2564,7 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
             if grow {
                 fixture.append(SESSION, &token_line(41));
             }
-            let _ = finish_job(&cache, None, &mut job, None, "legacy", true);
+            let _ = finish_job(&cache, None, &mut job, None, "legacy", "", true);
             job.hold_offset
         });
         assert_eq!(hold.is_some(), !grow, "grow: {grow}");

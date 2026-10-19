@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 714,
-  "content_sha256": "56ca00dc94e11c94921010827cee9e49306d112555a69d931d50ad6444f9f096",
+  "content_sha256": "a009b9532cc8b0b059e1e44d6699ce6897723ac8751f1a6150fa4b87c56c448c",
   "files": [
     {
       "executable": false,
@@ -1546,8 +1546,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "9bd7a1382ff5206be2c2aa667ff90fd97b259d7b4d27d27911a6791dfd8ea0bd",
-      "size_bytes": 104479
+      "sha256": "78bf81a3e99da7d07a0a40fb3cf568f16976c61dbb6af73d8ffadcc0f7b86070",
+      "size_bytes": 104483
     },
     {
       "executable": false,
