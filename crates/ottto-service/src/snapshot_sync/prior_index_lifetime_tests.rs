@@ -107,7 +107,7 @@ fn large_prior_index(occurrences: usize) -> ScanIndex {
 
 struct Finished {
     index: Vec<u8>,
-    progress: Vec<u8>,
+    progress: Option<Vec<u8>>,
     offered: Vec<serde_json::Value>,
     observation: Observation,
     allocation: crate::retry_allocation_probe::Stats,
@@ -263,9 +263,16 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
                 .quarantined_snapshot_fingerprints
                 .contains_key(fingerprint));
         }
+        // Successful cycles may retire this disposable ledger. Preserve that
+        // absence as a distinct durable outcome; all other I/O errors fail.
+        let progress = match std::fs::read(progress_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read final upload progress: {error}"),
+        };
         output.push(Finished {
             index: serde_json::to_vec(&saved).unwrap(),
-            progress: std::fs::read(progress_path).unwrap(),
+            progress,
             offered,
             observation: observations[0],
             allocation,
