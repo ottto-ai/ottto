@@ -7547,8 +7547,11 @@ fn multi_page_traversal_folds_parent_causes_and_matches_once() {
 /// replaced by a `DeferredRestart` wait record on G (and unwitnessed in the
 /// step map) before P resolves. With P and C both before G, C is never
 /// counted `ParentHeld` after G appears. With C first (`chain_fixture(true)`)
-/// C is classified before P's re-read on the first such generation, so it
-/// may count `ParentHeld` then, never later. Both settle as a cold scan.
+/// C may keep the conservative `ParentHeld` label until P's actual
+/// dependency-triggered re-read (the general bound; not one traversal by
+/// wall clock). In this fixture that re-read runs on the first such
+/// generation, so C may count `ParentHeld` then, never later. Both settle as
+/// a cold scan.
 #[test]
 fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
     for c_first in [false, true] {
