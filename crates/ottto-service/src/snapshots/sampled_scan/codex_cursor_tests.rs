@@ -4275,7 +4275,13 @@ fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
         index = home.generation(index, &cache, n).0;
         n += 1;
     }
-    assert!(home.memo_entry(&cache).is_some(), "{}", counters(&cache));
+    let entry = home.memo_entry(&cache).expect("memoized hold");
+    let dep = entry.parent.as_ref().expect("spawn parent dependency");
+    // The hold used no ledger; the index now has one for the same parent.
+    assert_eq!(
+        (dep.id.as_str(), dep.ledger.as_deref()),
+        (SPAWN_PARENT, None)
+    );
     // At most one miss on the arrival; then the unchanged hold is quiet.
     let (index, _) = home.generation(index, &cache, n);
     let hits = counter(&cache, |c| c.memo_hits);
@@ -4663,19 +4669,17 @@ fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
     assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
 }
 
-/// T3: non-monotone holds, `Undetermined` (usage before any session header)
-/// and `AwaitingLegacyTrigger` (a subagent fork with copied usage and no
-/// trigger turn), are memoized at their read end: unchanged, both hit
-/// exactly; a grown one is an exact-stamp miss and is read again.
+/// T3: a non-monotone hold (`AwaitingLegacyTrigger`: a subagent fork with
+/// copied usage and no trigger turn) is memoized at its read end: unchanged
+/// it hits exactly; grown, it is an exact-stamp miss and is read again. Its
+/// parent is not on disk, so no parent ledger ever arrives (T15c covers
+/// that). (An `Undetermined` file, usage before any header, never reaches
+/// the memo: its first record is not an owning header, so the header
+/// inventory holds the page, as on main.)
 #[test]
-fn non_monotone_holds_hit_exactly_and_miss_on_growth() {
+fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let fixture = ScanRoot::with_sessions(&[]);
-    fs::write(
-        fixture.file(SESSION),
-        [token_line(1), token_line(2)].concat(),
-    )
-    .unwrap();
     let mut fork = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
         "type": "session_meta", "payload": {"id": SESSION_B, "forked_from_id": SESSION,
         "thread_source": "subagent"}}));
@@ -4696,16 +4700,31 @@ fn non_monotone_holds_hit_exactly_and_miss_on_growth() {
         (index, scan)
     };
     let (index, held) = generation(ScanIndex::default(), 0);
-    assert!(held.snapshots.is_empty(), "{}", counters(&cache));
+    assert!(
+        session_usage(&held, SESSION_B).is_empty(),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(
+        held.ownership_incomplete_file_count,
+        1,
+        "{}",
+        counters(&cache)
+    );
     assert_eq!(
         counter(&cache, |c| c.memo_records),
-        2,
+        1,
         "{}",
         counters(&cache)
     );
     let (index, quiet) = generation(index, 1);
-    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
-    assert_eq!(replayed_census(&quiet), replayed_census(&held));
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(
+        census(&index, &quiet).0,
+        census(&index, &held).0,
+        "{}",
+        counters(&cache)
+    );
     fixture.append(SESSION_B, &token_line(3));
     let ((index, grown), counts) = codex_memo_lifecycle::observe(|| generation(index, 2));
     assert_eq!(
@@ -4718,10 +4737,46 @@ fn non_monotone_holds_hit_exactly_and_miss_on_growth() {
         "{}",
         counters(&cache)
     );
-    assert_eq!(counter(&cache, |c| c.memo_hits), 3, "{}", counters(&cache));
-    assert!(grown.snapshots.is_empty(), "{}", counters(&cache));
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert!(session_usage(&grown, SESSION_B).is_empty());
     let _ = generation(index, 3);
-    assert_eq!(counter(&cache, |c| c.memo_hits), 5, "{}", counters(&cache));
+    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
+}
+
+/// T3 (second shape): a fork that matches every signature of its parent's
+/// ledger and ends there stays `AwaitingParentPrefix` (non-monotone, not
+/// parent-pending): memoized, hit while unchanged; growth is an exact-stamp
+/// miss and the re-read settles exactly as a cold scan.
+#[test]
+fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::parent()[1..]);
+    let cache = Arc::new(SharedCache::default());
+    let (index, settled, n) = home.settle(ScanIndex::default(), &cache, 0);
+    assert!(session_usage(&settled, CHILD).is_empty());
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    let hits = counter(&cache, |c| c.memo_hits);
+    let (index, _) = home.generation(index, &cache, n);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 1,
+        "{}",
+        counters(&cache)
+    );
+    home.fixture.append(
+        CHILD,
+        &jsonl(&[turn_record("2026-10-07T08:40:01Z", "child-turn-1")]),
+    );
+    let ((index, _), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n + 1));
+    assert_eq!(
+        (counts.memo_miss_exact_stamp, counts.memo_miss_other),
+        (1, 0),
+        "{counts:?}"
+    );
+    let (index, settled, n) = home.settle(index, &cache, n + 2);
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
 /// T6 and T18 (second half): growth together with a sidecar change is not
@@ -5008,10 +5063,10 @@ fn state_only(scan: &SourceScanResult) -> BTreeMap<String, u64> {
 
 /// C-T1/C-T2 after generation `n`, against a cold oracle of the same files:
 /// - SB-T18: every attributed id is blocked;
-/// - warm ⊇ cold on the blocked set outside `legacy ∪ unattributed` and the
-///   ids a published body covers (cold's set there depends on page order
-///   around an acceptance); the excess is only ids attributed to a key no
-///   longer on disk (class (e));
+/// - warm ⊇ cold on the blocked set outside the ids a published body covers
+///   (cold's set there depends on page order around an acceptance); the
+///   excess outside `legacy ∪ unattributed` is only ids attributed to a key
+///   no longer on disk (class (e));
 /// - warm publishes no state-only total cold does not, and withholds only
 ///   ids in that excess, `legacy` or `unattributed`.
 ///
@@ -5053,12 +5108,7 @@ fn assert_warm_covers_cold(
         .collect::<BTreeSet<_>>();
     let warm = index
         .codex_state_only_blocked_session_ids
-        .iter()
-        .filter(|id| {
-            !covered.contains(*id)
-                && !index.codex_state_only_blocked_legacy.contains(*id)
-                && !index.codex_state_only_blocked_unattributed.contains(*id)
-        })
+        .difference(&covered)
         .cloned()
         .collect::<BTreeSet<_>>();
     assert!(
@@ -5066,7 +5116,14 @@ fn assert_warm_covers_cold(
         "generation {n}: warm {warm:?} does not cover cold {cold:?}: {}",
         counters(cache)
     );
-    let excess = warm.difference(&cold).cloned().collect::<BTreeSet<_>>();
+    let excess = warm
+        .difference(&cold)
+        .filter(|id| {
+            !index.codex_state_only_blocked_legacy.contains(*id)
+                && !index.codex_state_only_blocked_unattributed.contains(*id)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
     for id in &excess {
         assert!(
             index
@@ -5162,11 +5219,10 @@ fn warm_state_only_blocks_cover_cold_across_a_generation_sweep() {
     // (8) the held fork is deleted: no retirement, so warm keeps its block
     // (class (e)) while cold publishes the state total.
     fs::remove_file(&home.path).unwrap();
-    let (index, scan, excess, cold_state) = run(index, 7);
+    let (index, scan, _, cold_state) = run(index, 7);
     assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert!(!state_only(&scan).contains_key(CREATED));
     assert_eq!(cold_state.get(CREATED), Some(&50), "{}", counters(&cache));
-    assert_eq!(excess, BTreeSet::from([CREATED.to_owned()]));
     // (9) unchanged: still blocked, still never published.
     let (index, scan, _, _) = run(index, 8);
     assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
