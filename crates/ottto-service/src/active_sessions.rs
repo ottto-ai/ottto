@@ -783,6 +783,9 @@ fn lineage_account_attribution(
     snapshot: &SnapshotItem,
     status: &AgentStatusSnapshot,
 ) -> EvidenceResolution<AccountAttribution> {
+    // A launched session is a separate run that may sign in to a different
+    // account, so its starter's account is never borrowed. Other lineage facts
+    // on the same session still count.
     let session_refs = snapshot
         .attribution_facts
         .iter()
@@ -791,6 +794,7 @@ fn lineage_account_attribution(
                 fact.field.as_str(),
                 "parent_session_ref" | "root_session_ref"
             ) && fact.evidence.strength == "direct"
+                && !fact.evidence.states_independent_launch()
                 && non_empty(&fact.value)
         })
         .map(|fact| fact.value.as_str())
@@ -2225,6 +2229,76 @@ mod tests {
 
         assert_eq!(active.account_identifier_hash, None);
         assert_eq!(active.account_attribution_source, None);
+    }
+
+    #[test]
+    fn launched_session_never_borrows_its_starters_account() {
+        let attribution = |facts: &[(&str, &str)], own_hash: Option<&str>| {
+            let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
+            for (field, source_version) in facts {
+                let mut fact = direct_fact(field, "parent");
+                fact.evidence.source_version = source_version.to_string();
+                snapshot.attribution_facts.push(fact);
+            }
+            let mut status = test_status();
+            status.plan_observations.push(test_plan_observation(
+                "parent",
+                "parent_hash",
+                AgentStatusConfidence::High,
+            ));
+            if let Some(own_hash) = own_hash {
+                status.plan_observations.push(test_plan_observation(
+                    "child",
+                    own_hash,
+                    AgentStatusConfidence::High,
+                ));
+            }
+            let active =
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+            (
+                active.account_identifier_hash,
+                active.account_attribution_source,
+            )
+        };
+        let borrowed = (
+            Some("parent_hash".to_string()),
+            Some("lineage_plan_observation".to_string()),
+        );
+
+        // Launched by a launcher or by the desktop app, on either lineage field:
+        // the starter's account stays the starter's.
+        let launched: [&[(&str, &str)]; 3] = [
+            &[("parent_session_ref", "launcher_event:v1")],
+            &[("parent_session_ref", "claude_desktop_spawn:v1")],
+            &[("root_session_ref", "claude_desktop_spawn:v1")],
+        ];
+        for facts in launched {
+            assert_eq!(attribution(facts, None), (None, None), "{facts:?}");
+            assert_eq!(
+                attribution(facts, Some("child_hash")),
+                (
+                    Some("child_hash".to_string()),
+                    Some("session_plan_observation".to_string())
+                ),
+                "{facts:?}"
+            );
+        }
+        // Nested work, unknown or look-alike parsers, and a non-launched fact
+        // beside a launched one keep the lineage fallback.
+        let not_launched: [&[(&str, &str)]; 6] = [
+            &[("parent_session_ref", "claude_code_jsonl:v40")],
+            &[("parent_session_ref", "test:v1")],
+            &[("root_session_ref", "")],
+            &[("parent_session_ref", "launcher_events:v1")],
+            &[("parent_session_ref", "claude_desktop_spawner:v1")],
+            &[
+                ("parent_session_ref", "launcher_event:v1"),
+                ("root_session_ref", "claude_code_jsonl:v40"),
+            ],
+        ];
+        for facts in not_launched {
+            assert_eq!(attribution(facts, None), borrowed, "{facts:?}");
+        }
     }
 
     #[test]
