@@ -6644,6 +6644,10 @@ fn strict_claude_account_hash(
     (hashes.len() == 1).then(|| *hashes.first().expect("one account hash"))
 }
 
+/// Account-family membership. A session another session launched as a separate
+/// run is not in its starter's account family: its requests are logged under
+/// its own id, and counting it would void the starter's family proof. Only the
+/// launched fact is skipped; any other lineage fact naming the root still counts.
 fn claude_snapshot_belongs_to_family(item: &SnapshotItem, root_session_id: &str) -> bool {
     item.source_session_id == root_session_id
         || item.attribution_facts.iter().any(|fact| {
@@ -6651,6 +6655,7 @@ fn claude_snapshot_belongs_to_family(item: &SnapshotItem, root_session_id: &str)
                 fact.field.as_str(),
                 "parent_session_ref" | "root_session_ref"
             ) && fact.value == root_session_id
+                && !fact.evidence.states_independent_launch()
         })
 }
 
@@ -44805,6 +44810,130 @@ mod tests {
             .iter()
             .all(|row| row.account_identifier_hash.is_none()));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launched_session_stays_out_of_its_starters_account_family() {
+        let parent_hash = "a".repeat(64);
+        let launched_hash = "b".repeat(64);
+        let launched = "5b0d8f3e-2a71-4c55-9e0b-7d1f4c2a9e61";
+        let hashes = |item: &SnapshotItem| {
+            item.model_usage
+                .iter()
+                .chain(
+                    item.usage_buckets
+                        .iter()
+                        .flat_map(|bucket| bucket.model_usage.iter()),
+                )
+                .map(|row| row.account_identifier_hash.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        // Each case is the lineage the separately started session C carries
+        // naming the starter P, and whether P's Task family still proves.
+        let cases: [(&[Option<&str>], bool); 5] = [
+            (&[Some("launcher_event:v1")], true),
+            (&[Some("claude_desktop_spawn:v1")], true),
+            // `None` keeps the nested subagent's own parser: genuine sub-work.
+            (&[None], false),
+            (&[Some("claude_desktop_spawner:v1")], false),
+            (&[Some("claude_desktop_spawn:v1"), None], false),
+        ];
+        for (source_versions, family_proves) in cases {
+            let (root, parent, mut items) = claude_account_family_fixture();
+            let nested_fact = items[1]
+                .attribution_facts
+                .iter()
+                .find(|fact| fact.field == "parent_session_ref")
+                .cloned()
+                .expect("subagent names its parent");
+            let launched_path = root.join(format!("{launched}.jsonl"));
+            fs::write(
+                &launched_path,
+                format!(
+                    "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"assistant\",\"sessionId\":\"{launched}\",\"requestId\":\"req_c1\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n"
+                ),
+            )
+            .expect("write launched fixture");
+            let mut child = parse_claude_code_jsonl_file(
+                &launched_path,
+                "2026-08-02T07:01:00Z",
+                "launched-fp".to_string(),
+            )
+            .expect("parse launched")
+            .remove(0);
+            for source_version in source_versions {
+                let mut fact = nested_fact.clone();
+                if let Some(source_version) = source_version {
+                    fact.evidence.source_version = source_version.to_string();
+                }
+                child.attribution_facts.push(fact);
+            }
+            items.push(child);
+            let mut evidence =
+                claude_account_family_evidence(&parent, &vec![parent_hash.clone(); 5]);
+            evidence.insert(
+                launched.to_string(),
+                vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                    fingerprint: "launched-0".to_string(),
+                    session_id: launched.to_string(),
+                    request_id: "req_c1".to_string(),
+                    observed_at: "2026-08-02T07:00:05Z".to_string(),
+                    model: "claude-haiku-4-5".to_string(),
+                    output_tokens: 11,
+                    request_count: 1,
+                    account_identity_checked: true,
+                    account_identifier_hash: Some(launched_hash.clone()),
+                    ..Default::default()
+                }],
+            );
+            let mut index = ScanIndex::default();
+            for path in [
+                root.join(format!("{parent}.jsonl")),
+                root.join(&parent)
+                    .join("subagents")
+                    .join("agent-a4d1585d310070d0f.jsonl"),
+                launched_path,
+            ] {
+                index
+                    .files
+                    .insert(local_index_key(&path), manifest_index_entry(None));
+            }
+
+            apply_claude_effort_evidence_with_index(
+                &mut items,
+                &evidence,
+                &mut index,
+                true,
+                "2026-08-02T07:01:00Z",
+            );
+
+            let case = format!("{source_versions:?}");
+            // P is always proven by its own exact request ids, and C only ever
+            // carries its own account, never P's.
+            assert_eq!(
+                hashes(&items[0]),
+                BTreeSet::from([Some(parent_hash.clone())]),
+                "{case}"
+            );
+            assert_eq!(
+                hashes(&items[2]),
+                BTreeSet::from([Some(launched_hash.clone())]),
+                "{case}"
+            );
+            // P's subagent keeps family stamping unless C is family to P.
+            let subagent = if family_proves {
+                Some(parent_hash.clone())
+            } else {
+                None
+            };
+            assert_eq!(hashes(&items[1]), BTreeSet::from([subagent]), "{case}");
+            assert_eq!(
+                index.claude_account_family_witnesses.contains_key(&parent),
+                family_proves,
+                "{case}"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

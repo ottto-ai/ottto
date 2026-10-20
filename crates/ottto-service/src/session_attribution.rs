@@ -76,6 +76,32 @@ pub struct SessionFieldEvidence {
     pub evidence_ref: String,
 }
 
+/// Parser ids whose lineage facts state a controller starting an independent
+/// run: an instrumented launcher, or the Claude desktop app's `start_session`.
+/// Mirrors `_LAUNCHED_CAPTURE_SOURCES` in the backend's session-family facts,
+/// which serves an edge from these parsers as `launched` rather than as nested
+/// work inside one job. The two sets must stay equal.
+const LAUNCHED_CAPTURE_SOURCES: [&str; 2] = ["launcher_event", "claude_desktop_spawn"];
+
+impl SessionFieldEvidence {
+    /// Whether this evidence comes from a launched capture source: the exact
+    /// parser id before the first `:` of `source_version`, matched the way the
+    /// backend matches it. No prefix or substring match, so a look-alike parser
+    /// keeps its current meaning.
+    ///
+    /// A launched session is its own run and its account is its own question.
+    /// Account consumers therefore never read a launched lineage fact as
+    /// account-family membership or as an account to borrow. The fact itself
+    /// still uploads and still draws the backend's `launched` edge.
+    pub(crate) fn states_independent_launch(&self) -> bool {
+        let parser = self
+            .source_version
+            .split_once(':')
+            .map_or(self.source_version.as_str(), |(parser, _)| parser);
+        LAUNCHED_CAPTURE_SOURCES.contains(&parser)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SessionAttributionFact {
     pub field: String,
@@ -1881,6 +1907,37 @@ mod tests {
         assert!(launch_context(Vec::new())
             .launch_event_facts(&launch_event().worker_session_ref, "2026-08-09T15:20:00Z")
             .is_empty());
+    }
+
+    #[test]
+    fn only_exact_launched_parsers_state_an_independent_launch() {
+        let launcher_fact = launch_context(vec![launch_event()])
+            .launch_event_facts(&launch_event().worker_session_ref, "2026-08-09T15:20:00Z")
+            .remove(0);
+        assert!(launcher_fact.evidence.states_independent_launch());
+        for (source_version, launched) in [
+            ("launcher_event:v1", true),
+            ("claude_desktop_spawn:v1", true),
+            ("launcher_event", true),
+            ("launcher_events:v1", false),
+            ("claude_desktop_spawner:v1", false),
+            ("xlauncher_event:v1", false),
+            ("launcher_event_v1", false),
+            ("Launcher_event:v1", false),
+            ("", false),
+            (
+                crate::snapshots::SnapshotSource::ClaudeCode.parser_version(),
+                false,
+            ),
+        ] {
+            let mut evidence = launcher_fact.evidence.clone();
+            evidence.source_version = source_version.to_string();
+            assert_eq!(
+                evidence.states_independent_launch(),
+                launched,
+                "{source_version:?}"
+            );
+        }
     }
 
     #[test]
