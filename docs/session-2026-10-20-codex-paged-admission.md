@@ -86,26 +86,33 @@ keys CI printed. Only then were the keys written to
 
 O7 needs no flag: a build that contains this change behaves this way.
 
-**It recurs on every change.** O7 fires on every tail that carries any
-priority-tier usage, not only the first (`has_protected_tiers` is true for
-any priority record the tail parsed). An active priority-tier session over
-64 MiB used to publish each change within one page. Now each such change
-waits for a cursor read of the whole file, `ceil(L / 64 MiB)` pages:
+**Once per file, at its first priority tail.** O7 fires on every tail that
+parses priority-tier usage. But the first priority publication leaves a tier
+receipt on the file's index entry, so its history is protected
+(`codex_history_is_protected`), and protected files are never sampled again
+(`allow_sample` requires `!protected`, unchanged from main). Every later
+change is therefore a Full read, and a Full read of a file over 64 MiB was
+already a cursor read on main. So for an existing file of 65 MiB to 2 GiB,
+FC1 moves one read, the first priority tail's in-page replay, to the cursor:
+`ceil(L / 64 MiB)` pages once. Later changes cost what they cost on main.
+A test pins this: the second change is a Full cursor read, not an O7 tail.
 
-| File length L | Pages per change | 5-minute cadence | Idle cadence (10 min) |
+| File length L | Pages | 5-minute cadence | Idle cadence (10 min) |
 |---|---|---|---|
-| 65 MiB – 2 GiB (existing) | 2 – 32 | 10 min – 2.7 h | 20 min – 5.3 h |
-| 4 GiB (newly admitted) | 64 | 5.3 h | 10.7 h |
-| over 2 GiB in general | `ceil(L / 64 MiB)` | no upper bound: linear in L | no upper bound |
+| 65 MiB – 2 GiB (existing), first priority tail | 2 – 32, once | 10 min – 2.7 h | 20 min – 5.3 h |
+| 4 GiB (newly admitted), every protected change | 64 per change | 5.3 h | 10.7 h |
+| over 2 GiB in general | `ceil(L / 64 MiB)` per change | no upper bound: linear in L | no upper bound |
 
-Files over 2 GiB are new coverage (they were excluded before), but each
-priority change on them costs this much.
+Files over 2 GiB are new coverage (they were excluded before). Once
+protected, each of their changes is a Full cursor read of the whole file.
 
 **Plus the slot wait.** There is one cursor slot, rotated by whole attempts.
-Each such change holds the slot for a whole attempt, so every other paged
-read (first reads over 64 MiB, every file over 2 GiB, other O7 requeues)
-waits behind it, and it waits behind them. This is the standing load behind
-the cursor-slot-starvation residual below.
+On main, every change of a protected file over 64 MiB already takes a whole
+attempt. FC1 adds the first priority tail of 65 MiB – 2 GiB files and every
+change of protected files over 2 GiB to that load. Every other paged read
+(first reads over 64 MiB, other O7 requeues) waits behind those attempts,
+and they wait behind it. This is the standing load behind the
+cursor-slot-starvation residual below.
 
 **Plus the generation fence (K7).** A file whose cursor attempt already
 completed in the current census generation is `Fenced`: its next large read
@@ -119,9 +126,10 @@ the file's own `ceil(L / 64 MiB)` pages in the next generation. With no
 other large read pending, the traversal ends with the file's own attempt and
 there is no fence.
 
-The bytes read per change are the same as before; they are spread over pages
-instead of one page of up to 2 GiB. This is a material publication-latency
-cost for priority-tier sessions over 64 MiB, not a counter shift. It is the
+The bytes read are the same as before; they are spread over pages instead of
+one page of up to 2 GiB. This is a material publication-latency cost for a
+priority-tier session's first priority change over 64 MiB, and for every
+change of protected sessions over 2 GiB. It is not a counter shift. It is the
 price of never reading more than the singleton budget in one page.
 
 ## Residuals (unchanged by this change)
@@ -133,7 +141,7 @@ price of never reading more than the singleton budget in one page.
 - Restart, memory pressure and unsupported layouts. A scan with an
   unsupported layout still refuses Codex files over 2 GiB, counted and
   disclosed.
-- Cursor slot starvation, which O7 makes a standing load (see above).
+- Cursor slot starvation. FC1 adds to its standing load (see the latency section).
 - A non-paged group member that grows past the unpaged limit after identify
   ends the job as strict debt; it is not counted in `oversized_file_count`.
 - `ta::sample_at` above 2^32 (the audit sample a `Full(AuditDue)` read takes

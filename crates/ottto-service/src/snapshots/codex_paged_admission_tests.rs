@@ -325,6 +325,13 @@ fn reset_counters() {
     take_test_identity_bytes_read();
 }
 
+fn index_is_protected(index: &ScanIndex, key: &str) -> bool {
+    index
+        .files
+        .get(key)
+        .is_some_and(ScanIndexEntry::codex_history_is_protected)
+}
+
 /// The page's running `OpenRead` unreadable count.
 fn open_read_unreadable(scan: &SourceScanResult) -> u64 {
     let causes = scan
@@ -1078,10 +1085,21 @@ fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
         );
         let c = counters(&row.cache);
         assert_eq!(c.jobs_started, 1, "one cursor read, no requeue loop: {c:?}");
-        // R2-M2: the cost is per change. A second priority tail on the
-        // certified file requeues again and costs a second whole cursor read.
-        // The file is read again on the first page that selects it.
+        // R2-M2, the second change. The first priority publication left a
+        // tier receipt, so the entry has protected history and is never
+        // sampled again (`allow_sample` requires `!protected`, as on main):
+        // the next change is a Full read, not a second O7 tail. On a file
+        // over the singleton budget that is a whole cursor read, which main
+        // already paid for protected files; only the first priority tail's
+        // in-page replay moved to the cursor.
+        let key = local_index_key(&path);
+        assert!(
+            index_is_protected(&certified.index, &key),
+            "retained: {}",
+            row.cache.retained_checkpoint(&key).is_some()
+        );
         row.fixture.append(SESSION, &priority_line(26));
+        // The file is read again on the first page that selects it.
         let mut number = 1 + certified.pages;
         let mut index = certified.index;
         let mut seen = Vec::new();
@@ -1096,10 +1114,15 @@ fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
                 assert!(seen.len() < 4, "never selected again: {seen:?}");
                 continue;
             }
-            assert_eq!(stats.tail, 1, "{seen:?}");
+            assert_eq!((stats.full, stats.tail), (1, 0), "{seen:?}");
             assert_eq!(stats.priority_replays, 0, "no in-page full replay");
             assert!(again.snapshots.is_empty());
-            assert_eq!(counters(&row.cache).deferred, before.deferred + 1);
+            let after = counters(&row.cache);
+            assert_eq!(
+                after.deferred, before.deferred,
+                "a cursor start, not an O7 requeue"
+            );
+            assert_eq!(after.jobs_started, before.jobs_started + 1);
             break;
         }
         let recertified = page_until_certified(&row.fixture, index, &row.cache, number);
@@ -1109,6 +1132,7 @@ fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
         );
         let c = counters(&row.cache);
         assert_eq!(c.jobs_started, 2, "a second whole cursor read: {c:?}");
+        assert!(index_is_protected(&recertified.index, &key));
     });
 }
 
