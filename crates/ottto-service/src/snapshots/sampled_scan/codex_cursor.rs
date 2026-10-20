@@ -1992,12 +1992,9 @@ fn evict_oldest_join_owner(cursor: &mut CursorState) -> bool {
     let Some(oldest) = cursor.join_owners.values().map(|(used, _)| *used).min() else {
         return false;
     };
-    // Ticks are unique (`tick`), so this extracts exactly one entry.
-    cursor
-        .join_owners
-        .extract_if(.., |_, (used, _)| *used == oldest)
-        .next()
-        .is_some()
+    // Ticks are unique (`tick`), so this drops exactly one entry, in place.
+    cursor.join_owners.retain(|_, (used, _)| *used != oldest);
+    true
 }
 
 /// K6 admission of `charge` more cursor bytes, under both locks (retained,
@@ -2314,7 +2311,7 @@ impl SharedCache {
             let built = crate::heap_layout_bound::tree_node_bytes::<String, JoinProvenance>()
                 .and_then(|node| node.checked_add(if replacing { 0 } else { owner.len() }))
                 .and_then(|bytes| bytes.checked_add(keys.capacity()));
-            if keys.len() != keys_len || built.is_none_or(|built| built > charge) {
+            if keys.len() != keys_len || !built.is_some_and(|built| built <= charge) {
                 // Outside the accounting contract: refuse, freed here.
                 cursor.join_owners.remove(owner);
                 return;
@@ -2349,13 +2346,16 @@ impl SharedCache {
         mut release: impl FnMut(&str, std::str::Split<'_, char>),
     ) {
         self.with_cursor(|cursor| {
-            for (owner, (_, members)) in cursor.join_owners.extract_if(.., |owner, (_, members)| {
-                join_members_well_formed(members)
+            // In place: `release` reads the entry, which `retain` then drops.
+            cursor.join_owners.retain(|owner, (_, members)| {
+                let departed = join_members_well_formed(members)
                     && !keep(owner.as_str())
-                    && members.split('\0').all(|member| !census.contains(member))
-            }) {
-                release(owner.as_str(), members.split('\0'));
-            }
+                    && members.split('\0').all(|member| !census.contains(member));
+                if departed {
+                    release(owner.as_str(), members.split('\0'));
+                }
+                !departed
+            });
         });
     }
 

@@ -2057,11 +2057,11 @@ fn join_release_keeps_a_non_member_claim_on_the_same_owner() {
         .codex_state_only_blocked_by_file
         .insert(n.clone(), BTreeSet::from([OWNER.to_owned()]));
     let index = walk_without_members(&root, index, &cache, |index| {
-        claims(index, &a).is_none_or(|owners| !owners.contains(OWNER))
+        !claims(index, &a).is_some_and(|owners| owners.contains(OWNER))
     });
     for key in [&a, &b] {
         assert!(
-            claims(&index, key).is_none_or(|owners| !owners.contains(OWNER)),
+            !claims(&index, key).is_some_and(|owners| owners.contains(OWNER)),
             "the member's own claim is released"
         );
     }
