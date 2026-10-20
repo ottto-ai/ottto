@@ -12770,6 +12770,9 @@ static NO_CODEX_CENSUS: BTreeSet<String> = BTreeSet::new();
 pub(in crate::snapshots) struct CodexParentCensus<'a> {
     scan_roots: &'a [PathBuf],
     paths: &'a BTreeSet<String>,
+    /// False for the empty view of an invalid or missing census: every
+    /// lookup is the baseline `Absent` refusal and never touches the slot.
+    available: bool,
 }
 
 impl<'a> CodexParentCensus<'a> {
@@ -12778,7 +12781,11 @@ impl<'a> CodexParentCensus<'a> {
         scan_roots: &'a [PathBuf],
         paths: &'a BTreeSet<String>,
     ) -> Self {
-        Self { scan_roots, paths }
+        Self {
+            scan_roots,
+            paths,
+            available: true,
+        }
     }
 }
 
@@ -12789,7 +12796,10 @@ impl<'a> CodexParentCensus<'a> {
 pub(in crate::snapshots) struct CodexParentIdentities {
     /// `codex_frozen_census_valid` at page start, evaluated once.
     census_valid: bool,
-    /// The last probe of this step call; `begin_step` clears it.
+    /// The last probe of this step call; `begin_step` clears it. Only a
+    /// UUID-shaped id (36 bytes, `codex_identity_is_uuid_shaped`) is kept,
+    /// with an opened identity (a 64-byte SHA-256 hex digest,
+    /// `opened_object_identity`) or a cause: at most 100 heap bytes.
     last: Option<CodexParentProbeSlot>,
 }
 
@@ -12821,10 +12831,12 @@ impl CodexParentIdentities {
             Some(traversal) => CodexParentCensus {
                 scan_roots: &traversal.scan_roots,
                 paths: &traversal.codex_rollout_paths,
+                available: true,
             },
             None => CodexParentCensus {
                 scan_roots: &[],
                 paths: &NO_CODEX_CENSUS,
+                available: false,
             },
         }
     }
@@ -12843,7 +12855,12 @@ impl CodexParentIdentities {
         census: CodexParentCensus<'_>,
         session_id: &str,
     ) -> (Result<String, CodexParentUnresolvable>, bool) {
-        let session_id = resolve_codex_identity(session_id);
+        if !census.available || !codex_identity_is_uuid_shaped(session_id) {
+            return (self.reprobe(census, session_id), true);
+        }
+        // `resolve_codex_identity` of a UUID-shaped id, without its copy of
+        // any other id.
+        let session_id = session_id.to_ascii_lowercase();
         if let Some(slot) = self
             .last
             .as_ref()
@@ -12856,12 +12873,18 @@ impl CodexParentIdentities {
 
     /// Never served from the slot: a fresh open (both after-parse fences).
     /// It overwrites the slot, so a later probe in this step call sees it.
+    /// An unavailable census is the baseline `Absent` refusal, and any id
+    /// that is not UUID-shaped is never kept; both empty the slot.
     pub(in crate::snapshots) fn reprobe(
         &mut self,
         census: CodexParentCensus<'_>,
         session_id: &str,
     ) -> Result<String, CodexParentUnresolvable> {
-        self.reprobe_resolved(census, resolve_codex_identity(session_id))
+        if !census.available || !codex_identity_is_uuid_shaped(session_id) {
+            self.last = None;
+            return codex_parent_open(census, session_id).map(|(identity, _file)| identity);
+        }
+        self.reprobe_resolved(census, session_id.to_ascii_lowercase())
     }
 
     fn reprobe_resolved(
@@ -59251,6 +59274,90 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(child_path);
+    }
+
+    #[test]
+    fn codex_parent_slot_is_bounded_and_unavailable_census_refuses() {
+        let root = temp_dir("codex-parent-slot-bound");
+        let parent_id = "019fc428-0000-7000-8000-0000000000aa";
+        let legacy_id = "legacy-parent";
+        let header = |id: &str| {
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":id,"thread_source":"user"}})
+                .to_string()
+                + "\n"
+        };
+        let parent_path = root.join(format!("rollout-2026-08-02T08-00-00-{parent_id}.jsonl"));
+        let legacy_path = root.join(format!("rollout-{legacy_id}.jsonl"));
+        fs::write(&parent_path, header(parent_id)).expect("write parent rollout");
+        fs::write(&legacy_path, header(legacy_id)).expect("write legacy parent rollout");
+        let paths = BTreeSet::from([local_index_key(&parent_path), local_index_key(&legacy_path)]);
+        let roots = std::slice::from_ref(&root);
+        let census = CodexParentCensus::new(roots, &paths);
+        let mut ids = CodexParentIdentities {
+            census_valid: true,
+            last: None,
+        };
+
+        // A UUID-shaped parent is kept: a 36-byte id and a 64-byte identity.
+        let (identity, fresh) = ids.probe(census, parent_id);
+        assert!(fresh);
+        let identity = identity.expect("parent opens");
+        assert!(identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let slot = ids.last.as_ref().expect("slot");
+        let kept = match &slot.probe {
+            CodexParentProbe::Identity(kept) => kept.capacity(),
+            CodexParentProbe::Unresolvable(_) => 0,
+        };
+        assert!(slot.session_id.capacity() + kept <= 100);
+        // The slot keys on the resolved id, as the uncached lookup does.
+        assert_eq!(
+            ids.probe(census, &parent_id.to_ascii_uppercase()),
+            (Ok(identity.clone()), false)
+        );
+
+        // An unavailable census never serves the slot: the baseline `Absent`
+        // refusal, and the slot is emptied, so the next lookup re-opens.
+        let no_traversal = ScanIndex::default();
+        let unavailable = ids.census(&no_traversal);
+        assert_eq!(
+            ids.probe(unavailable, parent_id),
+            (Err(CodexParentUnresolvable::Absent), true)
+        );
+        assert!(ids.last.is_none());
+        assert_eq!(ids.probe(census, parent_id), (Ok(identity.clone()), true));
+        assert_eq!(
+            ids.reprobe(unavailable, parent_id),
+            Err(CodexParentUnresolvable::Absent)
+        );
+        assert!(ids.last.is_none());
+        // An invalid page-start census is the same unavailable view, even
+        // over an index that has a traversal.
+        let mut with_traversal = ScanIndex::default();
+        with_traversal.install_terminal_unhealthy_traversal_for_retry_test(
+            SnapshotSource::Codex,
+            roots,
+            30,
+            0,
+        );
+        assert!(ids.census(&with_traversal).available);
+        let invalid = CodexParentIdentities::new(SnapshotSource::Codex, None);
+        assert!(!invalid.census(&with_traversal).available);
+
+        // Any other id resolves exactly as before but is never kept, so the
+        // slot stays bounded whatever a header names.
+        let _ = ids.probe(census, parent_id);
+        assert!(ids.last.is_some());
+        let (legacy, fresh) = ids.probe(census, legacy_id);
+        assert!(fresh && legacy.is_ok());
+        assert!(ids.last.is_none());
+        assert!(ids.probe(census, legacy_id).1);
+        let long = "x".repeat(64 * 1024);
+        assert_eq!(
+            ids.probe(census, &long),
+            (Err(CodexParentUnresolvable::Absent), true)
+        );
+        assert!(ids.last.is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn sb_ids(ids: &[&str]) -> BTreeSet<String> {
