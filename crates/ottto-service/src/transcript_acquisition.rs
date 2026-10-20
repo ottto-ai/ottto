@@ -9,6 +9,8 @@
 //! generation can enter persistent no-op suppression. RAM eviction cannot clear
 //! it. The native scanner commits this obligation through its existing index/CAS.
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(unix)]
@@ -23,12 +25,12 @@ pub(crate) const AUDIT_INTERVAL_SECONDS: u64 = 3600;
 pub(crate) struct Scope(pub(crate) String);
 
 /// Minimal obligation, separately owned by the existing durable file index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditDebt {
     pub(crate) due_unix_seconds: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FileStamp {
     length: u64,
     #[cfg(unix)]
@@ -42,7 +44,7 @@ pub(crate) struct FileStamp {
 }
 
 impl FileStamp {
-    fn capture(metadata: Metadata) -> io::Result<Self> {
+    pub(crate) fn capture(metadata: Metadata) -> io::Result<Self> {
         if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -62,7 +64,7 @@ impl FileStamp {
         })
     }
 
-    fn same_object(&self, other: &Self) -> bool {
+    pub(crate) fn same_object(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {
             self.device == other.device && self.inode == other.inode
@@ -73,6 +75,28 @@ impl FileStamp {
             false
         }
     }
+}
+
+/// An opened object's identity and length, as one held-FD stamp sees it.
+pub(crate) trait StampIdentity: PartialEq {
+    fn same_object(&self, other: &Self) -> bool;
+    fn length(&self) -> u64;
+}
+
+impl StampIdentity for FileStamp {
+    fn same_object(&self, other: &Self) -> bool {
+        FileStamp::same_object(self, other)
+    }
+    fn length(&self) -> u64 {
+        self.length
+    }
+}
+
+/// The one append-compatibility rule: the same object, and either grown or
+/// unchanged. A shrink, an equal-length edit or a replacement is refused.
+/// Appended bytes are outside the old frozen length.
+pub(crate) fn append_compatible<S: StampIdentity>(old: &S, now: &S) -> bool {
+    old.same_object(now) && (now.length() > old.length() || now == old)
 }
 
 /// Only bounded private byte samples are retained, never the entire source.
@@ -141,10 +165,7 @@ impl LossyPrefixIdentity {
             return false;
         };
         let sealed = self.samples.sealed_offset;
-        if !self.stamp.same_object(&now)
-            || !(now == self.stamp || now.length > self.stamp.length)
-            || !self.samples.valid_for(self.stamp.length)
-        {
+        if !append_compatible(&self.stamp, &now) || !self.samples.valid_for(self.stamp.length) {
             return false;
         }
         let mut guard = 0;
@@ -189,6 +210,141 @@ impl Checkpoint {
     pub(crate) fn last_full_verified(&self) -> u64 {
         self.last_full_verified_unix_seconds
     }
+
+    /// The parts of this certificate `select_mode` reads.
+    fn view(&self) -> CertificateView<'_> {
+        CertificateView {
+            stamp: &self.stamp,
+            scope: &self.scope.0,
+            sealed_offset: self.samples.sealed_offset,
+            samples_valid: self.samples.valid_for(self.stamp.length),
+            verified: self.last_full_verified_unix_seconds,
+        }
+    }
+
+    /// `seal_as` under this checkpoint's own scope.
+    #[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-2.
+    pub(crate) fn seal(&self, now: u64) -> PrefixSeal {
+        self.seal_as(now, &self.scope)
+    }
+
+    /// This certificate in content-free persistable form, under `scope`.
+    /// The stamp's length is normalized to the sealed offset, so a completed
+    /// read with an unsealed EOF fragment never claims bytes it did not seal.
+    /// Both samples are kept only as SHA-256 digests.
+    #[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-2.
+    pub(crate) fn seal_as(&self, now: u64, scope: &Scope) -> PrefixSeal {
+        let mut stamp = self.stamp.clone();
+        stamp.length = self.samples.sealed_offset;
+        // Unequal windows can never be valid: `admits` then refuses the seal
+        // as `InvalidCheckpoint`, exactly as `prepare` refuses the checkpoint.
+        let sample_len = if self.samples.head.len() == self.samples.boundary.len() {
+            u32::try_from(self.samples.head.len()).unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        };
+        PrefixSeal {
+            stamp,
+            scope: scope.0.clone(),
+            sample_len,
+            head_sha256: sha256_hex(&self.samples.head),
+            boundary_sha256: sha256_hex(&self.samples.boundary),
+            verified_unix_seconds: self.last_full_verified_unix_seconds,
+            sealed_unix_seconds: now,
+            audit_debt_unix_seconds: self.audit_debt.map(|debt| debt.due_unix_seconds),
+        }
+    }
+}
+
+/// A `Checkpoint`'s certificate in persistable form for a file another
+/// file's decision depends on: the stamp (length = sealed `s`), scope and
+/// verification time, with both samples kept only as SHA-256. Minted only by
+/// `Checkpoint::seal_as`, so only from a committed checkpoint.
+#[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-2.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PrefixSeal {
+    stamp: FileStamp,
+    scope: String,
+    /// `min(s, SAMPLE_BYTES)`, the length of both sample windows.
+    sample_len: u32,
+    head_sha256: String,
+    boundary_sha256: String,
+    verified_unix_seconds: u64,
+    /// When the seal was minted.
+    sealed_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit_debt_unix_seconds: Option<u64>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-2.
+impl PrefixSeal {
+    pub(crate) fn sealed_offset(&self) -> u64 {
+        self.stamp.length
+    }
+    pub(crate) fn has_debt(&self) -> bool {
+        self.audit_debt_unix_seconds.is_some()
+    }
+    pub(crate) fn scope_is(&self, scope: &Scope) -> bool {
+        self.scope == scope.0
+    }
+
+    /// `prepare`'s decision (`select_mode`) with this seal as the checkpoint,
+    /// on the held FD, followed by `prepare`'s stamp re-capture. `Ok(sample
+    /// bytes read)` iff the decision is `Tail` or `Unchanged`. `publication`
+    /// is an outlived seal's one use: no debt yet, horizon from minting.
+    ///
+    /// Two differences from `prepare`, both refusal-only: a short or failed
+    /// sample read refuses as `HeadChanged`/`BoundaryChanged` (`prepare`
+    /// returns `Err`), and a failed stamp capture or a change during the
+    /// guards refuses as `Replaced`.
+    pub(crate) fn admits(
+        &self,
+        file: &mut File,
+        scope: &Scope,
+        now: u64,
+        publication: bool,
+    ) -> Result<usize, FullReason> {
+        let stamp = file
+            .metadata()
+            .and_then(FileStamp::capture)
+            .map_err(|_| FullReason::Replaced)?;
+        let sealed = self.stamp.length;
+        let len = self.sample_len as usize;
+        let view = CertificateView {
+            stamp: &self.stamp,
+            scope: &self.scope,
+            sealed_offset: sealed,
+            samples_valid: u64::from(self.sample_len) == sealed.min(SAMPLE_BYTES as u64)
+                && self.head_sha256.len() == 64
+                && self.boundary_sha256.len() == 64,
+            verified: if publication {
+                self.sealed_unix_seconds
+            } else {
+                self.verified_unix_seconds
+            },
+        };
+        let debt = (!publication)
+            .then_some(self.audit_debt_unix_seconds)
+            .flatten()
+            .map(|due_unix_seconds| AuditDebt { due_unix_seconds });
+        let mut guard = 0;
+        let mode = select_mode(Some(view), debt, &stamp, scope, now, |at| {
+            let (offset, expected) = match at {
+                SampleAt::Head => (0, &self.head_sha256),
+                SampleAt::Boundary => (sealed - len as u64, &self.boundary_sha256),
+            };
+            Ok(read_sample(file, offset, len, &mut guard)
+                .is_ok_and(|bytes| sha256_hex(&bytes) == *expected))
+        })
+        .map_err(|_| FullReason::Replaced)?;
+        if file.metadata().and_then(FileStamp::capture).ok().as_ref() != Some(&stamp) {
+            return Err(FullReason::Replaced);
+        }
+        match mode {
+            ReadMode::Tail | ReadMode::Unchanged => Ok(guard),
+            ReadMode::Full(reason) => Err(reason),
+        }
+    }
 }
 
 /// Why a multi-page read's sealed prefix `[0, s)` was not certified.
@@ -209,7 +365,7 @@ pub(crate) enum PrefixRefusal {
     Lossy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum FullReason {
     StateMissing,
     AuditDue,
@@ -224,7 +380,7 @@ pub(crate) enum FullReason {
     UnsupportedIdentity,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ReadMode {
     Full(FullReason),
     Tail,
@@ -283,9 +439,9 @@ fn earlier_debt(a: Option<AuditDebt>, b: Option<AuditDebt>) -> Option<AuditDebt>
     }
 }
 
-fn sample_at(file: &mut File, offset: u64, expected: &[u8], count: &mut usize) -> io::Result<bool> {
+fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0; expected.len()];
+    let mut bytes = vec![0; len];
     let mut read = 0;
     while read < bytes.len() {
         let n = file.read(&mut bytes[read..])?;
@@ -298,7 +454,91 @@ fn sample_at(file: &mut File, offset: u64, expected: &[u8], count: &mut usize) -
         }
         read += n;
     }
-    Ok(bytes == expected)
+    Ok(bytes)
+}
+
+fn sample_at(file: &mut File, offset: u64, expected: &[u8], count: &mut usize) -> io::Result<bool> {
+    Ok(read_sample(file, offset, expected.len(), count)? == expected)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The parts of a prior certificate `prepare`'s decision reads, borrowed from
+/// a `Checkpoint` or a `PrefixSeal`.
+struct CertificateView<'a> {
+    stamp: &'a FileStamp,
+    scope: &'a str,
+    sealed_offset: u64,
+    samples_valid: bool,
+    verified: u64,
+}
+
+#[derive(Clone, Copy)]
+enum SampleAt {
+    Head,
+    Boundary,
+}
+
+/// `prepare`'s mode decision. `sample_eq` compares one sample window of the
+/// held FD with the certificate's; it is called only when the decision needs
+/// that window, in the order head then boundary.
+fn select_mode(
+    old: Option<CertificateView<'_>>,
+    debt: Option<AuditDebt>,
+    stamp: &FileStamp,
+    scope: &Scope,
+    now: u64,
+    mut sample_eq: impl FnMut(SampleAt) -> io::Result<bool>,
+) -> io::Result<ReadMode> {
+    let clock_changed = old.as_ref().is_some_and(|old| now < old.verified)
+        || debt.is_some_and(|d| {
+            now.checked_add(AUDIT_INTERVAL_SECONDS)
+                .is_some_and(|latest| d.due_unix_seconds > latest)
+        });
+    Ok(if clock_changed {
+        ReadMode::Full(FullReason::ClockChanged)
+    } else if debt.is_some_and(|d| now >= d.due_unix_seconds) {
+        ReadMode::Full(FullReason::AuditDue)
+    } else if let Some(old) = old {
+        if !old.samples_valid {
+            ReadMode::Full(FullReason::InvalidCheckpoint)
+        } else if old.scope != scope.0 {
+            ReadMode::Full(FullReason::ScopeChanged)
+        } else if !cfg!(unix) {
+            ReadMode::Full(FullReason::UnsupportedIdentity)
+        } else if !old.stamp.same_object(stamp) {
+            ReadMode::Full(FullReason::Replaced)
+        } else if stamp.length < old.stamp.length {
+            ReadMode::Full(FullReason::Shrunk)
+        } else if stamp.length == old.stamp.length && stamp != old.stamp {
+            ReadMode::Full(FullReason::SameSizeEdit)
+        } else if stamp == old.stamp && old.sealed_offset == stamp.length {
+            ReadMode::Unchanged
+        } else if !sample_eq(SampleAt::Head)? {
+            ReadMode::Full(FullReason::HeadChanged)
+        } else if !sample_eq(SampleAt::Boundary)? {
+            ReadMode::Full(FullReason::BoundaryChanged)
+        } else {
+            let due = old
+                .verified
+                .checked_add(AUDIT_INTERVAL_SECONDS)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "audit deadline overflow")
+                })?;
+            if now >= due {
+                ReadMode::Full(FullReason::AuditDue)
+            } else {
+                ReadMode::Tail
+            }
+        }
+    } else {
+        ReadMode::Full(FullReason::StateMissing)
+    })
 }
 
 impl ReadPlan {
@@ -314,55 +554,25 @@ impl ReadPlan {
         let stamp = FileStamp::capture(file.metadata()?)?;
         let debt = earlier_debt(durable_debt, checkpoint.and_then(Checkpoint::audit_debt));
         let mut guard_bytes_read = 0;
-        let clock_changed = checkpoint.is_some_and(|old| now < old.last_full_verified_unix_seconds)
-            || debt.is_some_and(|d| {
-                now.checked_add(AUDIT_INTERVAL_SECONDS)
-                    .is_some_and(|latest| d.due_unix_seconds > latest)
-            });
-        let mode = if clock_changed {
-            ReadMode::Full(FullReason::ClockChanged)
-        } else if debt.is_some_and(|d| now >= d.due_unix_seconds) {
-            ReadMode::Full(FullReason::AuditDue)
-        } else if let Some(old) = checkpoint {
-            if !old.samples.valid_for(old.stamp.length) {
-                ReadMode::Full(FullReason::InvalidCheckpoint)
-            } else if old.scope != *scope {
-                ReadMode::Full(FullReason::ScopeChanged)
-            } else if !cfg!(unix) {
-                ReadMode::Full(FullReason::UnsupportedIdentity)
-            } else if !old.stamp.same_object(&stamp) {
-                ReadMode::Full(FullReason::Replaced)
-            } else if stamp.length < old.stamp.length {
-                ReadMode::Full(FullReason::Shrunk)
-            } else if stamp.length == old.stamp.length && stamp != old.stamp {
-                ReadMode::Full(FullReason::SameSizeEdit)
-            } else if stamp == old.stamp && old.samples.sealed_offset == stamp.length {
-                ReadMode::Unchanged
-            } else if !sample_at(file, 0, &old.samples.head, &mut guard_bytes_read)? {
-                ReadMode::Full(FullReason::HeadChanged)
-            } else if !sample_at(
-                file,
-                old.samples.sealed_offset - old.samples.boundary.len() as u64,
-                &old.samples.boundary,
-                &mut guard_bytes_read,
-            )? {
-                ReadMode::Full(FullReason::BoundaryChanged)
-            } else {
-                let due = old
-                    .last_full_verified_unix_seconds
-                    .checked_add(AUDIT_INTERVAL_SECONDS)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "audit deadline overflow")
-                    })?;
-                if now >= due {
-                    ReadMode::Full(FullReason::AuditDue)
-                } else {
-                    ReadMode::Tail
+        let mode = select_mode(
+            checkpoint.map(Checkpoint::view),
+            debt,
+            &stamp,
+            scope,
+            now,
+            |at| {
+                let old = checkpoint.expect("samples are compared only with a checkpoint");
+                match at {
+                    SampleAt::Head => sample_at(file, 0, &old.samples.head, &mut guard_bytes_read),
+                    SampleAt::Boundary => sample_at(
+                        file,
+                        old.samples.sealed_offset - old.samples.boundary.len() as u64,
+                        &old.samples.boundary,
+                        &mut guard_bytes_read,
+                    ),
                 }
-            }
-        } else {
-            ReadMode::Full(FullReason::StateMissing)
-        };
+            },
+        )?;
         if FileStamp::capture(file.metadata()?)? != stamp {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -685,6 +895,140 @@ impl ReadPlan {
     }
 }
 
+/// One `Samples` in content-free form: its sealed offset and both windows'
+/// lengths and SHA-256 digests.
+#[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-3.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ParkedSamples {
+    sealed_offset: u64,
+    head_len: u32,
+    head_sha256: String,
+    boundary_len: u32,
+    boundary_sha256: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-3.
+impl ParkedSamples {
+    fn of(samples: &Samples) -> Self {
+        Self {
+            sealed_offset: samples.sealed_offset,
+            head_len: u32::try_from(samples.head.len()).unwrap_or(u32::MAX),
+            head_sha256: sha256_hex(&samples.head),
+            boundary_len: u32::try_from(samples.boundary.len()).unwrap_or(u32::MAX),
+            boundary_sha256: sha256_hex(&samples.boundary),
+        }
+    }
+
+    /// Re-read both windows from the held FD and rebuild `Samples` only if
+    /// their digests match. The windows must have the lengths every valid
+    /// `Samples` has, within `length`.
+    fn restore(&self, file: &mut File, length: u64) -> Result<Samples, FullReason> {
+        let expected = self.sealed_offset.min(SAMPLE_BYTES as u64);
+        if self.sealed_offset > length
+            || u64::from(self.head_len) != expected
+            || u64::from(self.boundary_len) != expected
+        {
+            return Err(FullReason::InvalidCheckpoint);
+        }
+        let mut guard = 0;
+        let head = read_sample(file, 0, self.head_len as usize, &mut guard)
+            .ok()
+            .filter(|bytes| sha256_hex(bytes) == self.head_sha256)
+            .ok_or(FullReason::HeadChanged)?;
+        let boundary_start = self.sealed_offset - u64::from(self.boundary_len);
+        let boundary = read_sample(file, boundary_start, self.boundary_len as usize, &mut guard)
+            .ok()
+            .filter(|bytes| sha256_hex(bytes) == self.boundary_sha256)
+            .ok_or(FullReason::BoundaryChanged)?;
+        Ok(Samples {
+            sealed_offset: self.sealed_offset,
+            head,
+            boundary,
+        })
+    }
+}
+
+/// A `ReadPlan` in content-free persistable form: every field the plan's
+/// later decisions read, with sample bytes kept only as SHA-256. `unpark`
+/// restores the plan exactly or refuses.
+#[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-3.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ParkedPlan {
+    mode: ReadMode,
+    stamp: FileStamp,
+    scope: String,
+    samples: ParkedSamples,
+    start_offset: u64,
+    last_full_verified_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    debt: Option<AuditDebt>,
+    guard_bytes_read: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_record: Option<ParkedSamples>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-3.
+impl ReadPlan {
+    /// This plan in persistable form. Reads nothing and changes nothing.
+    pub(crate) fn park(&self) -> ParkedPlan {
+        ParkedPlan {
+            mode: self.mode,
+            stamp: self.stamp.clone(),
+            scope: self.scope.0.clone(),
+            samples: ParkedSamples::of(&self.samples),
+            start_offset: self.start_offset,
+            last_full_verified_unix_seconds: self.last_full_verified_unix_seconds,
+            debt: self.debt,
+            guard_bytes_read: self.guard_bytes_read,
+            pending_record: self.pending_record.as_ref().map(ParkedSamples::of),
+        }
+    }
+
+    /// Rebuild a parked plan on `file`, the held FD of the same object. The
+    /// object checks are `commit_sealed_prefix`'s: a replacement, a shrink
+    /// below the frozen length or an equal-length edit refuses. Then every
+    /// parked window is re-read from the held FD and must match its digest.
+    /// Every other field is restored exactly. The FD position is left
+    /// unspecified: the caller seeks to its own resume offset.
+    pub(crate) fn unpark(file: &mut File, parked: &ParkedPlan) -> Result<Self, FullReason> {
+        if !cfg!(unix) {
+            return Err(FullReason::UnsupportedIdentity);
+        }
+        let current = file
+            .metadata()
+            .and_then(FileStamp::capture)
+            .map_err(|_| FullReason::Replaced)?;
+        if !parked.stamp.same_object(&current) {
+            return Err(FullReason::Replaced);
+        }
+        if current.length < parked.stamp.length {
+            return Err(FullReason::Shrunk);
+        }
+        if current.length == parked.stamp.length && current != parked.stamp {
+            return Err(FullReason::SameSizeEdit);
+        }
+        let samples = parked.samples.restore(file, parked.stamp.length)?;
+        let pending_record = match &parked.pending_record {
+            Some(pending) if pending.sealed_offset < samples.sealed_offset => {
+                return Err(FullReason::InvalidCheckpoint);
+            }
+            Some(pending) => Some(pending.restore(file, parked.stamp.length)?),
+            None => None,
+        };
+        Ok(Self {
+            mode: parked.mode,
+            stamp: parked.stamp.clone(),
+            scope: Scope(parked.scope.clone()),
+            samples,
+            start_offset: parked.start_offset,
+            last_full_verified_unix_seconds: parked.last_full_verified_unix_seconds,
+            debt: parked.debt,
+            guard_bytes_read: parked.guard_bytes_read,
+            pending_record,
+        })
+    }
+}
+
 impl crate::heap_layout_bound::HeapLayoutBound for Scope {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self(value) = self;
@@ -698,6 +1042,12 @@ crate::heap_layout_bound::fields!(Samples; sealed_offset, head, boundary);
 crate::heap_layout_bound::fields!(LossyPrefixIdentity; stamp, samples);
 crate::heap_layout_bound::fields!(Checkpoint; stamp, scope, samples, last_full_verified_unix_seconds, audit_debt);
 crate::heap_layout_bound::fields!(ReadPlan; mode, stamp, scope, samples, start_offset,
+    last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record);
+crate::heap_layout_bound::fields!(PrefixSeal; stamp, scope, sample_len, head_sha256, boundary_sha256,
+    verified_unix_seconds, sealed_unix_seconds, audit_debt_unix_seconds);
+crate::heap_layout_bound::fields!(ParkedSamples; sealed_offset, head_len, head_sha256, boundary_len,
+    boundary_sha256);
+crate::heap_layout_bound::fields!(ParkedPlan; mode, stamp, scope, samples, start_offset,
     last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record);
 impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -1346,6 +1696,442 @@ mod tests {
         assert_eq!(
             run(&f, Some(&cp), cp.audit_debt(), late + 1).0,
             ReadMode::Full(FullReason::AuditDue)
+        );
+    }
+    /// Rows large enough that the head and boundary windows are disjoint.
+    fn wide_rows(tag: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for row in 0..3 {
+            bytes.extend_from_slice(
+                format!("{{\"row\":{row},\"tag\":\"{tag}\",\"pad\":\"").as_bytes(),
+            );
+            bytes.extend(std::iter::repeat_n(b'a', SAMPLE_BYTES));
+            bytes.extend_from_slice(b"\"}\n");
+        }
+        bytes
+    }
+
+    fn mode_as_admission(mode: io::Result<ReadMode>) -> Result<(), FullReason> {
+        match mode.unwrap() {
+            ReadMode::Tail | ReadMode::Unchanged => Ok(()),
+            ReadMode::Full(reason) => Err(reason),
+        }
+    }
+
+    /// U-T30: `PrefixSeal::admits` and `prepare` share `select_mode`, so a
+    /// seal admits exactly when `prepare` would reuse the checkpoint, with the
+    /// same refusal reason, on every identity, sample, scope and clock case.
+    #[test]
+    fn prefix_seal_admits_exactly_when_prepare_reuses_the_checkpoint() {
+        type Mutate = fn(&Fixture, &[u8]) -> Option<Fixture>;
+        type Case = (&'static str, Mutate, u64, bool, Result<(), FullReason>);
+        let cases: [Case; 11] = [
+            ("unchanged", |_, _| None, 200, false, Ok(())),
+            (
+                "grown",
+                |f, _| {
+                    f.append(b"next\n");
+                    None
+                },
+                200,
+                false,
+                Ok(()),
+            ),
+            (
+                "equal-length edit",
+                |f, bytes| {
+                    let mut edited = bytes.to_vec();
+                    edited[SAMPLE_BYTES + 50] = b'b';
+                    f.replace_bytes(&edited);
+                    f.open()
+                        .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+                        .unwrap();
+                    None
+                },
+                200,
+                false,
+                Err(FullReason::SameSizeEdit),
+            ),
+            (
+                "shrink",
+                |f, bytes| {
+                    f.replace_bytes(&bytes[..10]);
+                    None
+                },
+                200,
+                false,
+                Err(FullReason::Shrunk),
+            ),
+            (
+                "replaced",
+                |_, bytes| Some(Fixture::new(bytes)),
+                200,
+                false,
+                Err(FullReason::Replaced),
+            ),
+            (
+                "head edit and growth",
+                |f, bytes| {
+                    let mut edited = bytes.to_vec();
+                    edited[1] = b'X';
+                    edited.extend_from_slice(b"next\n");
+                    f.replace_bytes(&edited);
+                    None
+                },
+                200,
+                false,
+                Err(FullReason::HeadChanged),
+            ),
+            (
+                "boundary edit and growth",
+                |f, bytes| {
+                    let mut edited = bytes.to_vec();
+                    let at = edited.len() - 10;
+                    edited[at] = b'X';
+                    edited.extend_from_slice(b"next\n");
+                    f.replace_bytes(&edited);
+                    None
+                },
+                200,
+                false,
+                Err(FullReason::BoundaryChanged),
+            ),
+            (
+                "scope change",
+                |f, _| {
+                    f.append(b"next\n");
+                    None
+                },
+                200,
+                true,
+                Err(FullReason::ScopeChanged),
+            ),
+            (
+                "clock moved back",
+                |f, _| {
+                    f.append(b"next\n");
+                    None
+                },
+                50,
+                false,
+                Err(FullReason::ClockChanged),
+            ),
+            (
+                "audit horizon",
+                |f, _| {
+                    f.append(b"next\n");
+                    None
+                },
+                100 + AUDIT_INTERVAL_SECONDS,
+                false,
+                Err(FullReason::AuditDue),
+            ),
+            (
+                "unchanged past the horizon",
+                |_, _| None,
+                100 + AUDIT_INTERVAL_SECONDS,
+                false,
+                Ok(()),
+            ),
+        ];
+        for (case, mutate, now, rescope, expected) in cases {
+            let bytes = wide_rows(case);
+            let f = Fixture::new(&bytes);
+            let cp = initial(&f, 100);
+            let seal = cp.seal(100);
+            let other = mutate(&f, &bytes);
+            let target = other.as_ref().unwrap_or(&f);
+            let current = if rescope {
+                Scope("changed-parent-policy".into())
+            } else {
+                scope()
+            };
+            let prepared = ReadPlan::prepare(&mut target.open(), Some(&cp), &current, None, now)
+                .map(|plan| plan.mode());
+            let prepared = mode_as_admission(prepared);
+            let admitted = seal
+                .admits(&mut target.open(), &current, now, false)
+                .map(|_| ());
+            assert_eq!(prepared, expected, "{case}: prepare");
+            assert_eq!(admitted, expected, "{case}: admits");
+        }
+    }
+
+    /// U-T30: staged debt. A tail checkpoint's debt is carried by its seal;
+    /// an outlived seal's one publication use has no debt yet and measures
+    /// the horizon from minting, and every later use refuses as `prepare` does.
+    #[test]
+    fn prefix_seal_carries_debt_and_publication_uses_the_minting_horizon() {
+        let f = Fixture::new(b"one\ntwo\n");
+        let cp = initial(&f, 1000);
+        f.append(b"three\n");
+        let (_, tail, _) = run(&f, Some(&cp), None, 1100);
+        let due = tail.audit_debt().unwrap().due_unix_seconds;
+        let seal = tail.seal(1100);
+        assert!(seal.has_debt());
+        for now in [due - 1, due] {
+            let prepared = mode_as_admission(
+                ReadPlan::prepare(&mut f.open(), Some(&tail), &scope(), None, now)
+                    .map(|plan| plan.mode()),
+            );
+            assert_eq!(
+                seal.admits(&mut f.open(), &scope(), now, false).map(|_| ()),
+                prepared,
+                "now {now}"
+            );
+        }
+        // An outlived full read stages its debt at commit.
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        let late = 100 + AUDIT_INTERVAL_SECONDS;
+        let outlived = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, late, false, frozen)
+            .unwrap();
+        let seal = outlived.seal(late);
+        f.append(b"four\n");
+        assert_eq!(
+            seal.admits(&mut f.open(), &scope(), late + 1, false),
+            Err(FullReason::AuditDue)
+        );
+        assert!(seal.admits(&mut f.open(), &scope(), late + 1, true).is_ok());
+        assert_eq!(
+            seal.admits(&mut f.open(), &scope(), late + AUDIT_INTERVAL_SECONDS, true),
+            Err(FullReason::AuditDue)
+        );
+    }
+
+    /// `seal_as` normalizes the length to the sealed offset, takes the given
+    /// scope, and serializes without any sample byte.
+    #[test]
+    fn seal_as_normalizes_the_sealed_length_and_keeps_no_sample_bytes() {
+        let f = Fixture::new(b"{\"secret\":\"U1A1-SENTINEL\"}\npartial");
+        let cp = initial(&f, 100);
+        assert_eq!(cp.sealed_offset(), 27);
+        let side = Scope("side-scope".into());
+        let seal = cp.seal_as(100, &side);
+        assert_eq!(seal.sealed_offset(), 27);
+        assert!(seal.scope_is(&side) && !seal.scope_is(&scope()));
+        assert!(!seal.has_debt());
+        assert!(seal.admits(&mut f.open(), &side, 200, false).is_ok());
+        assert_eq!(
+            seal.admits(&mut f.open(), &scope(), 200, false),
+            Err(FullReason::ScopeChanged)
+        );
+        let json = serde_json::to_string(&seal).unwrap();
+        assert!(!json.contains("U1A1-SENTINEL"), "{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["stamp"]["length"], 27);
+        assert_eq!(value["stamp"]["modified"].as_array().unwrap().len(), 2);
+        assert!(value.get("audit_debt_unix_seconds").is_none());
+        assert_eq!(serde_json::from_str::<PrefixSeal>(&json).unwrap(), seal);
+    }
+
+    /// U-T56 (ta): the one `append_compatible` rule on `FileStamp`, against
+    /// `LossyPrefixIdentity::holds`'s replaced inline predicate.
+    #[test]
+    fn append_compatible_truth_table_matches_the_replaced_inline_predicate() {
+        let base = FileStamp {
+            length: 100,
+            device: 7,
+            inode: 11,
+            modified: (1, 2),
+            changed: (3, 4),
+        };
+        let cases = [
+            ("identical", base.clone(), true),
+            (
+                "grown",
+                FileStamp {
+                    length: 150,
+                    modified: (5, 6),
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                "equal-length edit",
+                FileStamp {
+                    modified: (5, 6),
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                "shrink",
+                FileStamp {
+                    length: 50,
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                "replaced",
+                FileStamp {
+                    inode: 12,
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                "replaced and grown",
+                FileStamp {
+                    device: 8,
+                    length: 150,
+                    ..base.clone()
+                },
+                false,
+            ),
+        ];
+        for (case, now, expected) in cases {
+            let inline = base.same_object(&now) && (now == base || now.length > base.length);
+            assert_eq!(append_compatible(&base, &now), expected, "{case}");
+            assert_eq!(inline, expected, "{case}: replaced inline predicate");
+        }
+        // `holds` keeps its behaviour on an equal-length in-place edit.
+        let g = Fixture::new(b"one\ntwo\n");
+        let (mut file, plan, frozen) = sealed_read(&g, 100);
+        let (_, identity) = plan.commit_sealed_prefix_or_lossy_identity(
+            &mut file,
+            true,
+            &scope(),
+            100,
+            200,
+            true,
+            frozen,
+        );
+        let identity = identity.unwrap();
+        assert!(identity.holds(&mut file));
+        let mut writer = g.open();
+        writer.seek(SeekFrom::Start(5)).unwrap();
+        writer.write_all(b"W").unwrap();
+        writer
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        assert!(!identity.holds(&mut file), "equal-length edit");
+    }
+
+    /// A multi-page read: consume `rows` complete rows and one partial row.
+    fn partial_read(f: &Fixture, rows: usize, partial: usize) -> (ReadPlan, u64) {
+        let mut file = f.open();
+        let mut plan = ReadPlan::prepare(&mut file, None, &scope(), None, 100).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        let mut offset = 0;
+        for _ in 0..rows {
+            let end = offset + bytes[offset..].iter().position(|b| *b == b'\n').unwrap() + 1;
+            plan.observe_record_fragment(&bytes[offset..end], true)
+                .unwrap();
+            offset = end;
+        }
+        plan.observe_record_fragment(&bytes[offset..offset + partial], false)
+            .unwrap();
+        (plan, (offset + partial) as u64)
+    }
+
+    fn finish_read(f: &Fixture, mut plan: ReadPlan, from: u64) -> PrefixSeal {
+        let mut file = f.open();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        let frozen = plan.frozen_length() as usize;
+        let rest = &bytes[from as usize..frozen];
+        let last = rest.iter().rposition(|b| *b == b'\n').unwrap();
+        plan.observe_record_fragment(&rest[..=last], true).unwrap();
+        plan.commit_sealed_prefix(&mut file, true, &scope(), 100, 200, false, frozen as u64)
+            .unwrap()
+            .seal(200)
+    }
+
+    /// Park/unpark round trip: a parked plan (with a pending partial row)
+    /// survives serde, unparks to the identical plan and finishes with the
+    /// same certificate as an uninterrupted read. A prefix change while
+    /// parked refuses with `commit_sealed_prefix`'s reasons; growth does not.
+    #[test]
+    fn parked_plan_round_trips_and_unpark_refuses_prefix_changes() {
+        let bytes = wide_rows("park");
+        let f = Fixture::new(&bytes);
+        let (plan, consumed) = partial_read(&f, 2, 7);
+        let uninterrupted = {
+            let (control, _) = partial_read(&f, 2, 7);
+            finish_read(&f, control, consumed)
+        };
+        let parked = plan.park();
+        assert!(parked.pending_record.is_some());
+        let json = serde_json::to_string(&parked).unwrap();
+        assert!(!json.contains("\"pad\""), "no sample bytes");
+        let decoded: ParkedPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, parked);
+        drop(plan);
+        f.append(b"appended\n");
+        let unparked = ReadPlan::unpark(&mut f.open(), &decoded).unwrap();
+        assert_eq!(unparked.park(), parked);
+        assert_eq!(unparked.guard_bytes_read(), parked.guard_bytes_read);
+        assert_eq!(finish_read(&f, unparked, consumed), uninterrupted);
+
+        type Mutate = fn(&Fixture, &[u8]) -> Option<Fixture>;
+        type Refusal = (&'static str, Mutate, FullReason);
+        let refusals: [Refusal; 4] = [
+            (
+                "head edit",
+                |f, bytes| {
+                    let mut edited = bytes.to_vec();
+                    edited[1] = b'X';
+                    f.replace_bytes(&edited);
+                    f.open()
+                        .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+                        .unwrap();
+                    None
+                },
+                FullReason::SameSizeEdit,
+            ),
+            (
+                "boundary edit and growth",
+                |f, bytes| {
+                    let mut edited = bytes.to_vec();
+                    edited[2 * SAMPLE_BYTES] = b'X';
+                    edited.extend_from_slice(b"next\n");
+                    f.replace_bytes(&edited);
+                    None
+                },
+                FullReason::BoundaryChanged,
+            ),
+            (
+                "shrink",
+                |f, bytes| {
+                    f.replace_bytes(&bytes[..bytes.len() - 1]);
+                    None
+                },
+                FullReason::Shrunk,
+            ),
+            (
+                "replaced",
+                |_, bytes| Some(Fixture::new(bytes)),
+                FullReason::Replaced,
+            ),
+        ];
+        for (case, mutate, expected) in refusals {
+            let bytes = wide_rows(case);
+            let f = Fixture::new(&bytes);
+            let (plan, _) = partial_read(&f, 2, 7);
+            let parked = plan.park();
+            let other = mutate(&f, &bytes);
+            let target = other.as_ref().unwrap_or(&f);
+            assert_eq!(
+                ReadPlan::unpark(&mut target.open(), &parked).err(),
+                Some(expected),
+                "{case}"
+            );
+        }
+        // A head edit with growth is caught by the head digest.
+        let bytes = wide_rows("head");
+        let f = Fixture::new(&bytes);
+        let (plan, _) = partial_read(&f, 2, 7);
+        let parked = plan.park();
+        let mut edited = bytes.clone();
+        edited[1] = b'X';
+        edited.extend_from_slice(b"next\n");
+        f.replace_bytes(&edited);
+        assert_eq!(
+            ReadPlan::unpark(&mut f.open(), &parked).err(),
+            Some(FullReason::HeadChanged)
         );
     }
 }
