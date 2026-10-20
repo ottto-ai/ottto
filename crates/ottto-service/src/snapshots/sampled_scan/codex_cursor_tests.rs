@@ -6886,16 +6886,32 @@ fn held_then_quiet(
     let cache = Arc::new(SharedCache::default());
     let mut index = ScanIndex::default();
     let mut held_at = None;
+    let mut history = Vec::new();
     for n in 0..=limit {
-        let (next, scan) = fixture_generation(fixture, &cache, index, n);
+        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, &cache, index, n));
         index = next;
-        assert_eq!(parent_causes(&scan)[never.index()], 0, "generation {n}");
+        history.push(format!(
+            "{n}: causes {:?} restarts {:?} parsed {parsed:?} scanned {} incomplete {} \
+             census {} refs {} ledger {:?}",
+            parent_causes(&scan),
+            restarts_in_scope(&scan),
+            scan.scanned_file_count,
+            scan.ownership_incomplete_file_count,
+            scan.census_complete,
+            index.codex_parent_ownership_refs.contains(PARENT),
+            index
+                .codex_parent_ownership_ledgers
+                .get(PARENT)
+                .map(|ledger| ledger.scan_complete),
+        ));
+        assert_eq!(parent_causes(&scan)[never.index()], 0, "{history:#?}");
         if parent_causes(&scan) == expected {
             held_at = Some(n);
             break;
         }
     }
-    let held_at = held_at.unwrap_or_else(|| panic!("never held: {}", counters(&cache)));
+    let held_at =
+        held_at.unwrap_or_else(|| panic!("never held: {history:#?}\n{}", counters(&cache)));
     for n in held_at + 1..held_at + 3 {
         let ((next, scan), parsed) = parses(|| fixture_generation(fixture, &cache, index, n));
         assert!(parsed.is_empty(), "generation {n}: {parsed:?}");
