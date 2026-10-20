@@ -3479,8 +3479,9 @@ const ORPHAN: &str = "01a0dead-49cf-7460-9fd7-f7dbfd2f05e4";
 /// and the ordinary session is admitted, exactly as a cold parse.
 #[test]
 fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
-    // The created thread itself is complete and admitted; it records no
-    // memo entry, so every memo counter below is the orphan's.
+    // The created thread itself is complete and admitted; until the state
+    // census drops it, it records no memo entry, so every memo counter
+    // before that is the orphan's.
     let home = CreatedThreadHome::new(10, false);
     let at = |offset: i64| bounded_rfc3339_millis(home.base_ms + offset).unwrap();
     let orphan = [
@@ -3538,10 +3539,25 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
         "no stale hit: {}",
         counters(&cache)
     );
-    // Not held again: the miss re-read the orphan as an ordinary session.
+    // Not held again: the miss re-read the orphan as an ordinary session,
+    // and its entry is gone. PR-1: the created thread, no longer declared by
+    // the state census, is held with usage, which the wider gate memoizes:
+    // the one new record is its entry.
+    let scope = Scope("cursor-fixture".into());
+    let orphan = home.fixture.root.join("orphan.jsonl");
+    assert!(
+        [orphan.clone(), fs::canonicalize(&orphan).unwrap()]
+            .iter()
+            .all(|path| cache
+                .memo_lookup(&memo_key(&scope, &local_index_key(path)))
+                .is_none()),
+        "{}",
+        counters(&cache)
+    );
+    assert!(home.memo_entry(&cache).is_some(), "{}", counters(&cache));
     assert_eq!(
         counter(&cache, |c| c.memo_records),
-        1,
+        2,
         "{}",
         counters(&cache)
     );
