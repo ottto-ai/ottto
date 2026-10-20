@@ -1176,7 +1176,7 @@ fn upstream_http_agent() -> ureq::Agent {
 // transition, when its pooled sockets are exactly the ones presumed dead.
 // New connections still get the fallback resolver below.
 fn build_upstream_http_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+    crate::retry_tls::agent_builder()
         .timeout_connect(RELAY_UPSTREAM_CONNECT_TIMEOUT)
         .timeout_read(RELAY_UPSTREAM_READ_TIMEOUT)
         .timeout_write(RELAY_UPSTREAM_WRITE_TIMEOUT)

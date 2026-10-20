@@ -1387,7 +1387,8 @@ impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
         let url = format!(
             "{PROVIDER_ENDPOINT}?start_date={start_date}&end_date={end_date}&group_by=day&workspace_user=true"
         );
-        let mut request = ureq::get(&url)
+        let mut request = crate::retry_tls::agent()
+            .get(&url)
             .timeout(PROVIDER_TIMEOUT)
             .set("Accept", "application/json")
             // Be trivially identifiable and trivially benign. Never a

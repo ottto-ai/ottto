@@ -1,32 +1,77 @@
-//! Absolute TLS I/O deadline for optional snapshot turns. No thread or socket
-//! clone: pinned ureq performs its normal handshake over this bounded stream.
+//! The one rustls connector behind every ureq agent, and the absolute TLS I/O
+//! deadline for optional snapshot turns. ureq's own `tls` feature stays off so
+//! its webpki-roots 0.26 shim (RUSTSEC-2026-0381) never enters the build; the
+//! connector below keeps ureq 2.12.1's built-in ring/TLS1.2+1.3/WebPKI client.
+//! No thread or socket clone: pinned ureq performs its normal handshake over
+//! the bounded deadline stream.
 use std::io::{self, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use ureq::{ReadWrite, TlsConnector};
 
+/// ureq 2.12.1's built-in client policy (src/rtls.rs `default_tls_config`):
+/// ring, TLS 1.2 and 1.3, the patched WebPKI roots, no client auth, no ALPN.
+fn webpki_client_config() -> Arc<rustls::ClientConfig> {
+    client_config(rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    })
+}
+/// The policy above over `roots`. Only tests pass synthetic roots.
+fn client_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+        .expect("ring supports TLS 1.2 and TLS 1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    )
+}
+
+/// The connector ureq's `tls` feature installed on every agent. One
+/// process-wide config, like ureq's lazy default, keeps session resumption
+/// in its previous scope.
+struct WebPkiTls {
+    config: Arc<rustls::ClientConfig>,
+}
+fn default_connector() -> Arc<WebPkiTls> {
+    static DEFAULT: OnceLock<Arc<WebPkiTls>> = OnceLock::new();
+    DEFAULT
+        .get_or_init(|| {
+            Arc::new(WebPkiTls {
+                config: webpki_client_config(),
+            })
+        })
+        .clone()
+}
+/// Every ureq agent starts here: without ureq's `tls` feature a bare
+/// `ureq::get` or `AgentBuilder::new()` refuses HTTPS. The inventory test
+/// below keeps production code off those.
+pub(crate) fn agent_builder() -> ureq::AgentBuilder {
+    ureq::AgentBuilder::new().tls_connector(default_connector())
+}
+/// A fresh agent per call, like the `ureq::get` shortcuts it replaces.
+pub(crate) fn agent() -> ureq::Agent {
+    agent_builder().build()
+}
+impl TlsConnector for WebPkiTls {
+    fn connect(
+        &self,
+        dns_name: &str,
+        io: Box<dyn ReadWrite>,
+    ) -> Result<Box<dyn ReadWrite>, ureq::Error> {
+        rustls_connect(&self.config, dns_name, io)
+    }
+}
+
 pub(crate) struct DeadlineTls {
-    config: Arc<ureq::rustls::ClientConfig>,
+    config: Arc<rustls::ClientConfig>,
     deadline: Instant,
 }
 pub(crate) fn connector(deadline: Instant) -> Arc<DeadlineTls> {
-    static CONFIG: OnceLock<Arc<ureq::rustls::ClientConfig>> = OnceLock::new();
-    let config = CONFIG.get_or_init(|| {
-        // Match pinned ureq's default ring/TLS1.2+1.3/WebPKI trust policy.
-        // Use its rustls re-export so connector types stay version compatible.
-        let roots = ureq::rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        Arc::new(
-            ureq::rustls::ClientConfig::builder_with_provider(
-                ureq::rustls::crypto::ring::default_provider().into(),
-            )
-            .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
-            .expect("ring supports TLS 1.2 and TLS 1.3")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
-    });
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    let config = CONFIG.get_or_init(webpki_client_config);
     #[cfg(test)]
     let config = TEST_CONFIG
         .with(|c| c.borrow().clone())
@@ -53,7 +98,7 @@ impl TlsConnector for DeadlineTls {
             inner: io,
             deadline: self.deadline,
         };
-        let tls = TlsConnector::connect(&self.config, dns_name, Box::new(io))?;
+        let tls = rustls_connect(&self.config, dns_name, Box::new(io))?;
         Ok(Box::new(ResponseHeaders {
             inner: tls,
             bytes: 0,
@@ -63,6 +108,139 @@ impl TlsConnector for DeadlineTls {
             complete: false,
         }))
     }
+}
+
+// The connect step and stream below are adapted from ureq 2.12.1 src/rtls.rs
+// (https://github.com/algesten/ureq), Copyright (c) 2019 Martin Algesten,
+// licensed MIT OR Apache-2.0; see NOTICE. Only error construction differs:
+// ureq's `ErrorKind::msg` and `Error::src` are crate-private, so each failure
+// is an `io::Error` that keeps the underlying I/O kind and carries a typed
+// `TlsSetupError` naming the step.
+#[allow(clippy::result_large_err)] // ureq's own `TlsConnector::connect` result
+fn rustls_connect(
+    config: &Arc<rustls::ClientConfig>,
+    dns_name: &str,
+    mut io: Box<dyn ReadWrite>,
+) -> Result<Box<dyn ReadWrite>, ureq::Error> {
+    #[cfg(test)]
+    CONNECTS.with(|count| count.set(count.get() + 1));
+    // rustls doesn't like ipv6 addresses with brackets
+    let dns_name = dns_name
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(dns_name);
+    let sni = rustls::pki_types::ServerName::try_from(dns_name)
+        .map_err(|e| {
+            TlsSetupError::io(
+                TlsSetupStep::ServerName(dns_name.to_string()),
+                io::ErrorKind::InvalidInput,
+                e,
+            )
+        })?
+        .to_owned();
+    let mut sess = rustls::ClientConnection::new(config.clone(), sni)
+        .map_err(|e| TlsSetupError::io(TlsSetupStep::Session, io::ErrorKind::Other, e))?;
+    sess.complete_io(&mut io)
+        .map_err(|e| TlsSetupError::io(TlsSetupStep::Handshake, e.kind(), e))?;
+    Ok(Box::new(RustlsStream(rustls::StreamOwned::new(sess, io))))
+}
+
+#[allow(deprecated)]
+fn is_close_notify(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::ConnectionAborted
+        && e.get_ref()
+            .is_some_and(|msg| msg.description().contains("CloseNotify"))
+}
+
+struct RustlsStream(rustls::StreamOwned<rustls::ClientConnection, Box<dyn ReadWrite>>);
+impl ReadWrite for RustlsStream {
+    // ureq applies its connect/read/write deadlines through this socket.
+    fn socket(&self) -> Option<&std::net::TcpStream> {
+        self.0.get_ref().socket()
+    }
+}
+impl Read for RustlsStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.0.read(buf) {
+            Ok(size) => Ok(size),
+            Err(ref e) if is_close_notify(e) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
+impl Write for RustlsStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+impl std::fmt::Debug for RustlsStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RustlsStream").finish()
+    }
+}
+
+/// The connect step that failed, with ureq's former messages.
+#[derive(Debug)]
+enum TlsSetupStep {
+    ServerName(String),
+    Session,
+    Handshake,
+}
+/// A typed connector failure, so diagnostics keep the DNS / connect / I/O
+/// categories ureq's built-in connector reported for each step.
+#[derive(Debug)]
+struct TlsSetupError {
+    step: TlsSetupStep,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+impl TlsSetupError {
+    fn io(
+        step: TlsSetupStep,
+        kind: io::ErrorKind,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> io::Error {
+        io::Error::new(
+            kind,
+            Self {
+                step,
+                source: Box::new(source),
+            },
+        )
+    }
+    fn transport_kind(&self) -> ureq::ErrorKind {
+        match self.step {
+            TlsSetupStep::ServerName(_) => ureq::ErrorKind::Dns,
+            TlsSetupStep::Session => ureq::ErrorKind::Io,
+            TlsSetupStep::Handshake => ureq::ErrorKind::ConnectionFailed,
+        }
+    }
+}
+impl std::fmt::Display for TlsSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.step {
+            TlsSetupStep::ServerName(name) => write!(f, "parsing '{name}'")?,
+            TlsSetupStep::Session => f.write_str("tls connection creation failed")?,
+            TlsSetupStep::Handshake => f.write_str("tls connection init failed")?,
+        }
+        write!(f, ": {}", self.source)
+    }
+}
+impl std::error::Error for TlsSetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+/// A transport failure's ureq category. A failure from `rustls_connect`
+/// reports the category ureq's built-in connector gave the same step.
+pub(crate) fn transport_kind(transport: &ureq::Transport) -> ureq::ErrorKind {
+    std::error::Error::source(transport)
+        .and_then(|source| source.downcast_ref::<io::Error>())
+        .and_then(io::Error::get_ref)
+        .and_then(|inner| inner.downcast_ref::<TlsSetupError>())
+        .map_or_else(|| transport.kind(), TlsSetupError::transport_kind)
 }
 
 /// ureq bounds individual header lines, not their aggregate. Limit plaintext
@@ -143,16 +321,15 @@ impl ReadWrite for ResponseHeaders {
 // Production still uses the unchanged pinned WebPKI/ring policy above.
 #[cfg(test)]
 thread_local! {
-    static TEST_CONFIG: std::cell::RefCell<Option<Arc<ureq::rustls::ClientConfig>>> = const {
+    static TEST_CONFIG: std::cell::RefCell<Option<Arc<rustls::ClientConfig>>> = const {
         std::cell::RefCell::new(None)
     };
+    // Connector handshakes started on this thread, for path coverage tests.
+    static CONNECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
-pub(crate) fn with_test_config<T>(
-    config: Arc<ureq::rustls::ClientConfig>,
-    f: impl FnOnce() -> T,
-) -> T {
-    struct Restore(Option<Arc<ureq::rustls::ClientConfig>>);
+pub(crate) fn with_test_config<T>(config: Arc<rustls::ClientConfig>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Arc<rustls::ClientConfig>>);
     impl Drop for Restore {
         fn drop(&mut self) {
             TEST_CONFIG.with(|c| {
@@ -313,5 +490,550 @@ mod tests {
             stream.read_to_end(&mut Vec::new()).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    // Synthetic trust only: each fixture mints throwaway loopback certificates.
+    // No test contacts a live host or trusts anything outside its own fixture.
+    struct Certificates(std::path::PathBuf);
+    impl Certificates {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ottto-retry-tls-{label}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn mint(
+            &self,
+            name: &str,
+            subject_alt_names: &str,
+        ) -> (
+            rustls::pki_types::CertificateDer<'static>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        ) {
+            use rustls::pki_types::pem::PemObject;
+            std::fs::write(
+                self.0.join(format!("{name}.cnf")),
+                format!(
+                    "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=ext\n[dn]\nCN={name}\n[ext]\nsubjectAltName={subject_alt_names}\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n"
+                ),
+            )
+            .unwrap();
+            let output = std::process::Command::new("/usr/bin/openssl")
+                .args([
+                    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                ])
+                .arg("-config")
+                .arg(format!("{name}.cnf"))
+                .arg("-keyout")
+                .arg(format!("{name}.key"))
+                .arg("-out")
+                .arg(format!("{name}.pem"))
+                .current_dir(&self.0)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "synthetic certificate generation failed"
+            );
+            let certificate = rustls::pki_types::CertificateDer::from_pem_slice(
+                &std::fs::read(self.0.join(format!("{name}.pem"))).unwrap(),
+            )
+            .unwrap();
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+                &std::fs::read(self.0.join(format!("{name}.key"))).unwrap(),
+            )
+            .unwrap();
+            (certificate, key)
+        }
+    }
+    impl Drop for Certificates {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn trusting(
+        certificate: &rustls::pki_types::CertificateDer<'static>,
+    ) -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.clone()).unwrap();
+        client_config(roots)
+    }
+    /// Serve `connections` loopback TLS connections with one tiny response
+    /// each; report whether each connection completed a request.
+    fn serve(
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+        connections: usize,
+    ) -> (u16, std::thread::JoinHandle<Vec<bool>>) {
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into(),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], key)
+            .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut served = Vec::new();
+            for _ in 0..connections {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let connection = rustls::ServerConnection::new(config.clone()).unwrap();
+                let mut stream = rustls::StreamOwned::new(connection, socket);
+                let mut request = Vec::new();
+                let mut bytes = [0; 1024];
+                let complete = loop {
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break true;
+                    }
+                    match stream.read(&mut bytes) {
+                        Ok(0) | Err(_) => break false,
+                        Ok(count) => request.extend_from_slice(&bytes[..count]),
+                    }
+                };
+                if complete {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                    let _ = stream.flush();
+                }
+                served.push(complete);
+            }
+            served
+        });
+        (port, server)
+    }
+    fn connects() -> usize {
+        CONNECTS.with(|count| count.get())
+    }
+    /// The rustls error behind a connector failure, through the typed chain.
+    fn rustls_cause(error: &ureq::Error) -> Option<&rustls::Error> {
+        let ureq::Error::Transport(transport) = error else {
+            return None;
+        };
+        let setup = std::error::Error::source(transport)?
+            .downcast_ref::<io::Error>()?
+            .get_ref()?
+            .downcast_ref::<TlsSetupError>()?;
+        setup
+            .source
+            .downcast_ref::<io::Error>()?
+            .get_ref()?
+            .downcast_ref::<rustls::Error>()
+    }
+    fn kind_of(error: &ureq::Error) -> Option<ureq::ErrorKind> {
+        match error {
+            ureq::Error::Transport(transport) => Some(transport_kind(transport)),
+            ureq::Error::Status(..) => None,
+        }
+    }
+    fn result_class(error: ureq::Error) -> crate::provider_calls::CallResult {
+        crate::provider_calls::http_result(&Err::<(), _>(error))
+    }
+
+    #[test]
+    fn default_agent_uses_the_shared_webpki_connector() {
+        assert!(Arc::ptr_eq(&default_connector(), &default_connector()));
+        let certificates = Certificates::new("default");
+        let (certificate, key) = certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1");
+        let (port, server) = serve(certificate, key, 1);
+        let before = connects();
+        // Production trust is the patched WebPKI root set: a synthetic
+        // loopback certificate is an unknown issuer, never a missing backend.
+        let error = agent()
+            .get(&format!("https://localhost:{port}/"))
+            .call()
+            .unwrap_err();
+        assert_eq!(connects(), before + 1);
+        assert!(
+            matches!(
+                rustls_cause(&error),
+                Some(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer
+                ))
+            ),
+            "{error}"
+        );
+        assert_eq!(kind_of(&error), Some(ureq::ErrorKind::ConnectionFailed));
+        assert!(error.to_string().contains("tls connection init failed"));
+        assert_eq!(
+            result_class(error),
+            crate::provider_calls::CallResult::Error("connect_error")
+        );
+        assert_eq!(server.join().unwrap(), vec![false]);
+    }
+
+    #[test]
+    fn trusted_host_is_accepted_by_name_and_by_ip() {
+        let certificates = Certificates::new("trusted");
+        let (certificate, key) = certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1");
+        let tls = Arc::new(WebPkiTls {
+            config: trusting(&certificate),
+        });
+        let agent = ureq::AgentBuilder::new().tls_connector(tls).build();
+        let (port, server) = serve(certificate, key, 2);
+        for host in ["localhost", "127.0.0.1"] {
+            let response = agent
+                .get(&format!("https://{host}:{port}/"))
+                .call()
+                .unwrap();
+            assert_eq!(response.into_string().unwrap(), "ok", "{host}");
+        }
+        assert_eq!(server.join().unwrap(), vec![true, true]);
+    }
+
+    #[test]
+    fn wrong_host_and_untrusted_certificates_are_refused() {
+        let certificates = Certificates::new("refused");
+        let (other_host, other_host_key) = certificates.mint("wrong", "DNS:wrong.example");
+        let (trusted, _) = certificates.mint("trusted", "DNS:localhost,IP:127.0.0.1");
+        let (untrusted, untrusted_key) =
+            certificates.mint("untrusted", "DNS:localhost,IP:127.0.0.1");
+        let cases = [
+            (other_host.clone(), other_host, other_host_key, "wrong host"),
+            (trusted, untrusted, untrusted_key, "untrusted"),
+        ];
+        for (trust, served, key, case) in cases {
+            let tls = Arc::new(WebPkiTls {
+                config: trusting(&trust),
+            });
+            let agent = ureq::AgentBuilder::new().tls_connector(tls).build();
+            let (port, server) = serve(served, key, 1);
+            let error = agent
+                .get(&format!("https://localhost:{port}/"))
+                .call()
+                .unwrap_err();
+            let refused = match rustls_cause(&error) {
+                Some(rustls::Error::InvalidCertificate(reason)) => reason.clone(),
+                _ => panic!("{case}: {error}"),
+            };
+            if case == "wrong host" {
+                assert!(
+                    matches!(
+                        refused,
+                        rustls::CertificateError::NotValidForName
+                            | rustls::CertificateError::NotValidForNameContext { .. }
+                    ),
+                    "{refused:?}"
+                );
+            } else {
+                assert_eq!(refused, rustls::CertificateError::UnknownIssuer);
+            }
+            assert_eq!(kind_of(&error), Some(ureq::ErrorKind::ConnectionFailed));
+            assert_eq!(server.join().unwrap(), vec![false], "{case}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn deadline_agent_shares_the_connector_and_bounds_a_stalled_handshake() {
+        let certificates = Certificates::new("deadline");
+        let (certificate, key) = certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1");
+        let config = trusting(&certificate);
+        let (port, server) = serve(certificate, key, 1);
+        let before = connects();
+        let response = with_test_config(config.clone(), || {
+            ureq::AgentBuilder::new()
+                .tls_connector(connector(Instant::now() + Duration::from_secs(10)))
+                .build()
+                .get(&format!("https://localhost:{port}/"))
+                .call()
+        })
+        .unwrap();
+        assert_eq!(connects(), before + 1);
+        assert_eq!(response.into_string().unwrap(), "ok");
+        assert_eq!(server.join().unwrap(), vec![true]);
+
+        // A peer that accepts TCP and never answers the ClientHello.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(10));
+        });
+        let started = Instant::now();
+        let error = with_test_config(config, || {
+            ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(30))
+                .tls_connector(connector(Instant::now() + Duration::from_millis(300)))
+                .build()
+                .get(&format!("https://127.0.0.1:{port}/"))
+                .call()
+        })
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(connects(), before + 2);
+        // The underlying I/O timeout survives the typed connector cause.
+        assert_eq!(
+            result_class(error),
+            crate::provider_calls::CallResult::Timeout
+        );
+    }
+
+    #[test]
+    fn connector_failures_keep_ureq_transport_categories() {
+        let cases = [
+            (
+                TlsSetupStep::ServerName("bad name".into()),
+                io::ErrorKind::InvalidInput,
+                ureq::ErrorKind::Dns,
+                "dns_error",
+            ),
+            (
+                TlsSetupStep::Session,
+                io::ErrorKind::Other,
+                ureq::ErrorKind::Io,
+                "io_error",
+            ),
+            (
+                TlsSetupStep::Handshake,
+                io::ErrorKind::InvalidData,
+                ureq::ErrorKind::ConnectionFailed,
+                "connect_error",
+            ),
+        ];
+        for (step, io_kind, kind, class) in cases {
+            let error = ureq::Error::from(TlsSetupError::io(
+                step,
+                io_kind,
+                rustls::Error::HandshakeNotComplete,
+            ));
+            assert_eq!(kind_of(&error), Some(kind));
+            assert_eq!(
+                result_class(error),
+                crate::provider_calls::CallResult::Error(class)
+            );
+        }
+        let timed_out = ureq::Error::from(TlsSetupError::io(
+            TlsSetupStep::Handshake,
+            io::ErrorKind::TimedOut,
+            io::Error::from(io::ErrorKind::TimedOut),
+        ));
+        assert_eq!(
+            result_class(timed_out),
+            crate::provider_calls::CallResult::Timeout
+        );
+        // Other transport failures keep ureq's own category.
+        let reset = ureq::Error::from(io::Error::from(io::ErrorKind::ConnectionReset));
+        assert_eq!(kind_of(&reset), Some(ureq::ErrorKind::Io));
+        // A real server-name refusal from the connector is a DNS failure.
+        let error = match rustls_connect(
+            &webpki_client_config(),
+            "not a host name",
+            Box::new(Bytes(Default::default())),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an invalid server name must be refused"),
+        };
+        assert_eq!(kind_of(&error), Some(ureq::ErrorKind::Dns));
+        assert!(error.to_string().contains("parsing 'not a host name'"));
+    }
+
+    #[test]
+    fn every_production_ureq_agent_uses_the_configured_connector() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Plain-HTTP agents inside test modules, by file and exact line.
+        // `{u}` keeps this list from matching itself.
+        const TEST_ONLY: &[(&str, &str)] = &[
+            (
+                "src/net_resilience.rs",
+                "let agent = {u}AgentBuilder::new().resolver(resolver).build();",
+            ),
+            ("src/net_resilience.rs", "let error = {u}agent()"),
+            (
+                "src/snapshot_client.rs",
+                "let agent = {u}AgentBuilder::new().resolver(resolver).build();",
+            ),
+            (
+                "src/provider_calls.rs",
+                "let refused = {u}get(\"http://127.0.0.1:9/\")",
+            ),
+        ];
+        // Constructors and shortcuts that install ureq's own default TLS.
+        const BYPASSES: &[&str] = &[
+            "get(",
+            "post(",
+            "put(",
+            "patch(",
+            "delete(",
+            "head(",
+            "request(",
+            "request_url(",
+            "agent(",
+            "builder(",
+            "Agent::new(",
+            "Agent::default(",
+            "AgentBuilder::default(",
+            "AgentBuilder::new(",
+        ];
+        let mut files = vec![root.join("build.rs")];
+        let mut pending = vec![root.join("src"), root.join("tests")];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(files.len() > 50, "source inventory looks truncated");
+        let mut seen = vec![0; TEST_ONLY.len()];
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let file = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let tests_start = text.find("\n#[cfg(test)]\nmod tests {");
+            let mut offset = 0;
+            for (index, line) in text.split_inclusive('\n').enumerate() {
+                let start = offset;
+                offset += line.len();
+                let trimmed = line.trim();
+                if trimmed.starts_with("use ureq")
+                    && !(file == "src/retry_tls.rs"
+                        && trimmed == "use ureq::{ReadWrite, TlsConnector};")
+                {
+                    panic!("{file}:{}: import ureq items by path: {trimmed}", index + 1);
+                }
+                for bypass in BYPASSES {
+                    let bypass = format!("ureq::{bypass}");
+                    if !line.contains(&bypass) {
+                        continue;
+                    }
+                    // A builder may stay when the same chain installs a connector.
+                    if bypass.ends_with("AgentBuilder::new(")
+                        && configures_connector(&text[start..])
+                    {
+                        continue;
+                    }
+                    let exception = TEST_ONLY.iter().position(|(owner, exact)| {
+                        *owner == file && exact.replace("{u}", "ureq::") == trimmed
+                    });
+                    match exception {
+                        Some(exception) if tests_start.is_some_and(|tests| start > tests) => {
+                            seen[exception] += 1;
+                        }
+                        _ => panic!(
+                            "{file}:{}: ureq agent bypasses retry_tls's connector: {trimmed}",
+                            index + 1
+                        ),
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, vec![1; TEST_ONLY.len()], "stale test-only exception");
+    }
+    fn configures_connector(chain: &str) -> bool {
+        let end = [chain.find(".build()"), chain.find("\n}")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(chain.len());
+        chain[..end].contains(".tls_connector(")
+    }
+
+    #[test]
+    fn locked_graph_carries_only_patched_tls_roots() {
+        // CI builds with --locked, so this lockfile is the resolved graph.
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        let packages: Vec<(String, String, Vec<String>)> = lock
+            .split("[[package]]")
+            .skip(1)
+            .map(|block| {
+                let field = |key: &str| {
+                    block
+                        .lines()
+                        .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
+                        .and_then(|rest| rest.strip_suffix('"'))
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let dependencies = block
+                    .lines()
+                    .skip_while(|line| *line != "dependencies = [")
+                    .skip(1)
+                    .take_while(|line| *line != "]")
+                    .map(|line| {
+                        line.trim()
+                            .trim_end_matches(',')
+                            .trim_matches('"')
+                            .to_string()
+                    })
+                    .collect();
+                (field("name"), field("version"), dependencies)
+            })
+            .collect();
+        let versions = |name: &str| -> Vec<Vec<u64>> {
+            packages
+                .iter()
+                .filter(|(package, _, _)| package == name)
+                .map(|(_, version, _)| {
+                    version
+                        .split('.')
+                        .map(|part| part.parse().unwrap())
+                        .collect()
+                })
+                .collect()
+        };
+        let roots = versions("webpki-roots");
+        assert_eq!(roots.len(), 1, "one webpki-roots, never the 0.26 shim");
+        assert!(roots[0] >= vec![1, 0, 10], "{roots:?}");
+        let webpki = versions("rustls-webpki");
+        assert_eq!(webpki.len(), 1);
+        assert!(
+            webpki[0] >= vec![0, 103, 16] && webpki[0] < vec![0, 104],
+            "{webpki:?}"
+        );
+        assert_eq!(versions("rustls").len(), 1);
+        for absent in [
+            "aws-lc-rs",
+            "aws-lc-sys",
+            "native-tls",
+            "rustls-native-certs",
+            "webpki-root-certs",
+        ] {
+            assert!(versions(absent).is_empty(), "{absent} entered the graph");
+        }
+        let ureq = packages.iter().find(|(name, _, _)| name == "ureq").unwrap();
+        assert!(
+            ureq.2
+                .iter()
+                .all(|dependency| !dependency.starts_with("rustls")
+                    && !dependency.starts_with("webpki")),
+            "ureq's own TLS stack is enabled: {:?}",
+            ureq.2
+        );
+        let dependents: Vec<&str> = packages
+            .iter()
+            .filter(|(_, _, dependencies)| dependencies.iter().any(|d| d == "ureq"))
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(dependents, ["ottto-service"]);
     }
 }
