@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 734,
-  "content_sha256": "78883cb98d956fd48a0d7fa51bffdbfa169f7f438ca701e871a8a5ef693efb5a",
+  "content_sha256": "7b25283b9e968151b1a178a9d56a1bc07a3a401f0ec364ee98cbadb7efd3d3f7",
   "files": [
     {
       "executable": false,
@@ -1476,8 +1476,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_paged_admission_tests.rs",
-      "sha256": "fda4d4223950be2b2fbb2a8175ae544be482c7134a3a7b34d61802a6eed34914",
-      "size_bytes": 70583
+      "sha256": "de4640aef6e6d75ad2f05f8b5c2e98d876fb75b5fe03f6a287b483b64ae40a1f",
+      "size_bytes": 71266
     },
     {
       "executable": false,
@@ -3331,8 +3331,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-20-codex-paged-admission.md",
-      "sha256": "27767d0bb33a1c17d2e0f9aa03903f39051e0d16d5309dd388c71d449ccf55b1",
-      "size_bytes": 4826
+      "sha256": "651454bc8af7888a98dbff148b10789569f4fb23a7aea8afe6bf0e447e7f94c9",
+      "size_bytes": 5312
     },
     {
       "executable": false,

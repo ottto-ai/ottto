@@ -23,6 +23,10 @@ refusal excluded files that the cursor could read.
   matches, and revalidation.
 - **Parent `Oversize`.** A parent is an `Oversize` witness only where the
   scan cannot page it. This is decided from the opened descriptor's length.
+  Parent witnesses come only from the sampled parent pass, as before: on an
+  unsampled scan an over-limit parent is refused at its unpaged open, and
+  its child stays held with no recorded cause unless a valid persisted
+  ledger resolves it.
 - **One runtime refusal** (`refuse_unpaged_overrun`), at every point where a
   non-cursor read starts:
   - R-a: the main-loop read;
@@ -57,10 +61,13 @@ A consumer must treat an unknown or missing completeness field,
 audit leg. This is a producer change only. The private validator's v5
 support is separate work, and no audit was run or collected for this change.
 
-The v5 golden keys were recomputed from their unblinded fixture inputs,
-which CI printed on a deliberate first-pass mismatch. Before the keys were
-written, those inputs were checked by reproducing the v4 golden under the v4
-domain.
+The v5 golden keys come from supported CI, not a local build. A first CI
+pass with placeholder keys failed on purpose and printed the actual keys and
+their unblinded fixture inputs: the payload and rescanned fingerprints, the
+six component hashes and the revision hash. Under the v4 domain those inputs
+reproduce every v4 golden key. Under the v5 domain they give exactly the
+keys CI printed. Only then were the keys written to
+`fixtures/snapshot-audit/v5-golden-keys.json`.
 
 ## Latency trade-off (O7)
 

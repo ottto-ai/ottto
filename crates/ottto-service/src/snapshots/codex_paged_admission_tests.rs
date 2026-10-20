@@ -1572,16 +1572,13 @@ fn child_usage(scan: &SourceScanResult) -> bool {
         .any(|snapshot| snapshot.source_session_id == CHILD)
 }
 
-/// Generations until the child is held under an `Oversize` parent witness.
-/// The child's first read records the parent ref; the witness lands with
-/// the parent prepass, so it shows from a later generation on.
-fn held_by_oversize(
-    home: &ForkHome,
-    mut index: ScanIndex,
-    cache: Option<&Arc<SharedCache>>,
-) -> ScanIndex {
+/// Sampled generations until the child is held under an `Oversize` parent
+/// witness. The child's first read records the parent ref; the witness
+/// lands with the next page's parent pass, so it shows from a later
+/// generation on.
+fn held_by_oversize(home: &ForkHome, mut index: ScanIndex, cache: &Arc<SharedCache>) -> ScanIndex {
     for n in 0..6 {
-        let (next, scan) = home.generation(index, cache, n);
+        let (next, scan) = home.generation(index, Some(cache), n);
         index = next;
         assert!(!child_usage(&scan), "the child stays held");
         if parent_causes(&scan)[CodexParentUnresolvable::Oversize.index()] > 0 {
@@ -1627,16 +1624,30 @@ fn paged_scan_reads_an_over_limit_parent_and_resolves_its_child() {
     });
 }
 
-// F-T10: unsampled, with no ledger, the over-limit parent is `Oversize` as
-// today; with a valid persisted ledger, the ledger wins and the child
-// resolves while the parent itself is refused at its unpaged open.
+// F-T10: unsampled, with no ledger, the over-limit parent is refused at its
+// unpaged open and its child stays held. Parent witnesses (and so the
+// `Oversize` cause) come only from the sampled parent pass
+// (`codex_parent_step_start`), as on main, so no cause is recorded here.
+// With a valid persisted ledger, the ledger wins and the child resolves
+// while the parent itself is still refused at its unpaged open.
 #[test]
-fn unsampled_parent_over_the_limit_is_oversize_unless_its_ledger_is_valid() {
+fn unsampled_parent_over_the_limit_holds_its_child_unless_its_ledger_is_valid() {
     let home = ForkHome::new();
     let parent_len = home.fixture.len(PARENT);
     assert!(home.fixture.len(CHILD) < parent_len - 1);
     with_test_unpaged_limit(parent_len - 1, || {
-        held_by_oversize(&home, ScanIndex::default(), None)
+        let mut index = ScanIndex::default();
+        for n in 0..4 {
+            let (next, scan) = home.generation(index, None, n);
+            index = next;
+            assert!(!child_usage(&scan), "the child stays held");
+            assert_eq!(scan.oversized_file_count, 1, "the parent is not read");
+            assert_eq!(
+                parent_causes(&scan),
+                [0; crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES]
+            );
+            assert!(ForkHome::parent_ledger(&index).is_none());
+        }
     });
     // Settle the ledger with no limit, then change the child.
     let mut index = ScanIndex::default();
@@ -1699,7 +1710,7 @@ fn shrunk_parent_drops_its_oversize_witness() {
     let cache = Arc::new(SharedCache::default());
     with_test_unpaged_limit(short, || {
         with_test_forced_routing(None, Some(ReadAdmission::Unpaged), || {
-            let index = held_by_oversize(&home, ScanIndex::default(), Some(&cache));
+            let index = held_by_oversize(&home, ScanIndex::default(), &cache);
             fs::write(home.fixture.file(PARENT), jsonl(&ForkHome::parent())).unwrap();
             let mut index = index;
             for n in 10..16 {
