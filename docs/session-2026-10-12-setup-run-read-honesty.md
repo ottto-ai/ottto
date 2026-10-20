@@ -42,6 +42,14 @@ change only adds the status writer and the refresh commit.
   clear) closes it. A late outcome from a replaced binding, or one that
   finishes after logout, is dropped. The state is in memory and resets on
   daemon restart until the next read.
+- Reads of one binding also run concurrently, so a success clears only the
+  rejection that was already current when that read started. Each read
+  captures, together with its binding and under the same state lock, the
+  sequence of the latest rejection/recovery event. Event sequences are
+  unique and only grow while the daemon runs, so a slow read that succeeded
+  before the run ended cannot clear a rejection recorded after it started,
+  even if an earlier rejection of the same kind was cleared in between. A
+  read that starts after the rejection and succeeds clears it.
 
 ## Refresh persistence
 
@@ -85,7 +93,11 @@ CI runs the tests. Focused tests cover:
 - A concurrency regression drives `ottto costs` on worker threads against a
   backend whose responses the test releases, so ordering comes from messages,
   not timing. A late rejection or success of a replaced run cannot mark or
-  clear the new run, and logout mid-read records nothing.
+  clear the new run, and logout mid-read records nothing. On one binding, a
+  slow read whose success arrives after a later read's rejection leaves the
+  run rejected, and a read that starts afterwards and succeeds clears it. A
+  daemon-level test also covers a stale success after a cleared and repeated
+  rejection of the same kind, and after a change of rejection kind.
 - Refresh persistence: a refresh of run A that finishes after a reconnect to
   run B leaves B untouched and makes no retry; one that finishes after logout
   restores nothing; a same-binding refresh persists the new pair and retries

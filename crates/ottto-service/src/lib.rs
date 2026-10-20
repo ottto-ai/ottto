@@ -1025,11 +1025,7 @@ impl LocalDaemon {
     pub fn connection_for_authorized_client(
         &self,
     ) -> Result<Option<LocalConnectionBinding>, LocalApiError> {
-        self.connection_for_authorized_client_with(|| {
-            FileConnectionStore::default()
-                .load()
-                .map_err(|_| LocalApiError::StatePoisoned)
-        })
+        self.connection_for_authorized_client_with(load_persisted_connection)
     }
 
     fn connection_for_authorized_client_with<F>(
@@ -1040,12 +1036,22 @@ impl LocalDaemon {
         F: FnOnce() -> Result<Option<LocalConnectionBinding>, LocalApiError>,
     {
         let mut state = self.state()?;
-        if state.connection.is_none() {
-            if let Some(connection) = load_connection()? {
-                state.connection = Some(connection);
-            }
-        }
-        Ok(state.connection.clone())
+        load_connection_into(&mut state, load_connection)
+    }
+
+    /// The setup-run binding an agent read starts with, together with the
+    /// read-rejection revision it starts from. Both are captured under one
+    /// state lock, so the revision describes exactly what this binding's
+    /// reads had recorded when this read began.
+    pub(crate) fn setup_run_read_start(&self) -> Result<Option<SetupRunReadStart>, LocalApiError> {
+        let mut state = self.state()?;
+        let Some(binding) = load_connection_into(&mut state, load_persisted_connection)? else {
+            return Ok(None);
+        };
+        Ok(Some(SetupRunReadStart {
+            binding,
+            revision: setup_run_read_revision(&state.local_health_events),
+        }))
     }
 
     pub fn bind_setup_run_for_authorized_client(
@@ -1520,14 +1526,20 @@ impl LocalDaemon {
     }
 
     /// Clear a recorded setup-run read rejection after a successful read
-    /// that started with the current `binding`.
+    /// that started with the current binding. Only the rejection that was
+    /// already current when the read started is cleared: reads of one
+    /// binding run concurrently, so a slow read that succeeded before the
+    /// run ended can finish after a later read recorded the rejection, and
+    /// its success says nothing about that newer answer.
     pub(crate) fn record_setup_run_read_accepted(
         &self,
-        binding: &LocalConnectionBinding,
+        start: &SetupRunReadStart,
     ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
-        if !state.binds_setup_run(binding)
-            || latest_setup_run_read_rejection(&state.local_health_events).is_none()
+        if !state.binds_setup_run(&start.binding)
+            || latest_setup_run_read_rejection(&state.local_health_events)
+                .map(|current| current.sequence)
+                != Some(start.revision)
         {
             return Ok(());
         }
@@ -2458,6 +2470,27 @@ fn latest_snapshot_sync_stall(status: &DaemonStatus) -> Option<String> {
         .map(|event| event.observed_at.clone())
 }
 
+fn load_persisted_connection() -> Result<Option<LocalConnectionBinding>, LocalApiError> {
+    FileConnectionStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn load_connection_into<F>(
+    state: &mut DaemonState,
+    load_connection: F,
+) -> Result<Option<LocalConnectionBinding>, LocalApiError>
+where
+    F: FnOnce() -> Result<Option<LocalConnectionBinding>, LocalApiError>,
+{
+    if state.connection.is_none() {
+        if let Some(connection) = load_connection()? {
+            state.connection = Some(connection);
+        }
+    }
+    Ok(state.connection.clone())
+}
+
 fn setup_run_binding_matches(
     current: &LocalConnectionBinding,
     replacement: &LocalConnectionBinding,
@@ -2491,20 +2524,39 @@ const DEVICE_REJECTED_READ_REJECTION: &str = "device_rejected";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SetupRunReadRejection {
+    sequence: u64,
     observed_at: String,
     rejection: TerminalRefreshRejection,
 }
 
-/// The latest setup-run read rejection, if the most recent
-/// rejection/recovery event says it is still current.
-fn latest_setup_run_read_rejection(events: &[LocalHealthEventV1]) -> Option<SetupRunReadRejection> {
-    let event = events
+/// What an agent read started from: the binding it reads with and the
+/// sequence of the latest setup-run read rejection/recovery event at that
+/// moment (0 when none). Event sequences are unique and only grow while the
+/// daemon runs, so an equal revision names the same recorded observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetupRunReadStart {
+    pub(crate) binding: LocalConnectionBinding,
+    revision: u64,
+}
+
+fn latest_setup_run_read_event(events: &[LocalHealthEventV1]) -> Option<&LocalHealthEventV1> {
+    events
         .iter()
         .filter(|event| {
             event.event_type == "SetupRunReadRejected"
                 || event.event_type == "SetupRunReadRecovered"
         })
         .max_by_key(|event| event.sequence)
+}
+
+fn setup_run_read_revision(events: &[LocalHealthEventV1]) -> u64 {
+    latest_setup_run_read_event(events).map_or(0, |event| event.sequence)
+}
+
+/// The latest setup-run read rejection, if the most recent
+/// rejection/recovery event says it is still current.
+fn latest_setup_run_read_rejection(events: &[LocalHealthEventV1]) -> Option<SetupRunReadRejection> {
+    let event = latest_setup_run_read_event(events)
         .filter(|event| event.event_type == "SetupRunReadRejected")?;
     let rejection = match event.payload.get("rejection")?.as_str()? {
         SETUP_RUN_ENDED_READ_REJECTION => TerminalRefreshRejection::SetupRunEnded,
@@ -2512,6 +2564,7 @@ fn latest_setup_run_read_rejection(events: &[LocalHealthEventV1]) -> Option<Setu
         _ => return None,
     };
     Some(SetupRunReadRejection {
+        sequence: event.sequence,
         observed_at: event.observed_at.clone(),
         rejection,
     })
@@ -5928,6 +5981,13 @@ mod tests {
         assert_eq!(health.sources[0].next_action.as_deref(), Some("sign_in"));
     }
 
+    fn read_start(daemon: &LocalDaemon) -> SetupRunReadStart {
+        daemon
+            .setup_run_read_start()
+            .expect("read start")
+            .expect("bound setup run")
+    }
+
     fn read_binding(setup_run_id: &str) -> LocalConnectionBinding {
         LocalConnectionBinding {
             setup_run_id: setup_run_id.to_string(),
@@ -5948,7 +6008,7 @@ mod tests {
             .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
             .expect("record successful verification");
         daemon
-            .record_setup_run_read_accepted(&run)
+            .record_setup_run_read_accepted(&read_start(&daemon))
             .expect("accepted read without a prior rejection");
         assert!(latest_setup_run_read_rejection(
             &daemon.status(TOKEN).expect("status").local_health_events
@@ -5992,7 +6052,7 @@ mod tests {
         );
 
         daemon
-            .record_setup_run_read_accepted(&run)
+            .record_setup_run_read_accepted(&read_start(&daemon))
             .expect("record recovered read");
         let recovered = daemon
             .status(TOKEN)
@@ -6072,6 +6132,99 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.code == "device_credential_rejected"));
+    }
+
+    #[test]
+    fn older_successful_read_cannot_clear_a_newer_same_run_rejection() {
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run.clone()));
+        let setup_run_state = |daemon: &LocalDaemon| {
+            daemon
+                .status(TOKEN)
+                .expect("status")
+                .canonical_health
+                .expect("canonical health")
+                .account
+                .setup_run_state
+        };
+        let recoveries = |daemon: &LocalDaemon| {
+            daemon
+                .status(TOKEN)
+                .expect("status")
+                .local_health_events
+                .iter()
+                .filter(|event| event.event_type == "SetupRunReadRecovered")
+                .count()
+        };
+
+        // A slow read starts while Ottto still accepts the run. A later read
+        // of the same binding is told the run ended, then the slow read's
+        // success arrives: it predates that answer and must not clear it.
+        let slow_read = read_start(&daemon);
+        let rejected_read = read_start(&daemon);
+        daemon
+            .record_setup_run_read_rejected(
+                &rejected_read.binding,
+                TerminalRefreshRejection::SetupRunEnded,
+            )
+            .expect("record rejected read");
+        daemon
+            .record_setup_run_read_accepted(&slow_read)
+            .expect("late success of the older read");
+        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Rejected);
+        assert_eq!(recoveries(&daemon), 0);
+
+        // A read that started after the rejection and succeeds recovers it.
+        let started_while_rejected = read_start(&daemon);
+        let recovering_read = read_start(&daemon);
+        daemon
+            .record_setup_run_read_accepted(&recovering_read)
+            .expect("subsequent successful read");
+        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Complete);
+        assert_eq!(recoveries(&daemon), 1);
+
+        // The run is rejected again with the same kind. A read that started
+        // during the earlier rejection describes that one, not this one.
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record second rejection");
+        daemon
+            .record_setup_run_read_accepted(&started_while_rejected)
+            .expect("late success from the earlier rejection");
+        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Rejected);
+        assert_eq!(recoveries(&daemon), 1);
+
+        // A different terminal answer recorded after a read started is also
+        // newer than that read.
+        let before_device_rejection = read_start(&daemon);
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::DeviceRejected)
+            .expect("record device rejection");
+        daemon
+            .record_setup_run_read_accepted(&before_device_rejection)
+            .expect("late success before the device rejection");
+        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Unknown);
+        assert_eq!(recoveries(&daemon), 1);
+
+        daemon
+            .record_setup_run_read_accepted(&read_start(&daemon))
+            .expect("subsequent successful read");
+        let recovered = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            recovered.account.setup_run_state,
+            LocalSetupRunState::Complete
+        );
+        assert_eq!(recovered.account.device_state, LocalDeviceState::Active);
+        assert!(!recovered.blockers.iter().any(|blocker| {
+            blocker.code == "setup_run_rejected" || blocker.code == "device_credential_rejected"
+        }));
+        assert_eq!(recoveries(&daemon), 2);
     }
 
     #[test]

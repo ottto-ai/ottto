@@ -9,7 +9,7 @@ use crate::{
     keychain::TelemetryKeyStore,
     snapshot_client::relay_token_request_payload,
     BackendErrorDetails, BackendErrorKind, LocalApiError, LocalDaemon, PendingAuthClaim,
-    StagedAccountSwitch,
+    SetupRunReadStart, StagedAccountSwitch,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::{
@@ -3190,28 +3190,31 @@ fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError>
 /// and leave the recorded state unchanged. A successful read clears it.
 /// Reads run concurrently with setup and sign-in, so the outcome is recorded
 /// against exactly the binding this read used, and dropped by the daemon if
-/// that binding has since been replaced.
+/// that binding has since been replaced. Reads of one binding also run
+/// concurrently with each other, so a success clears only the rejection that
+/// was already recorded when this read started, never a newer one.
 fn observe_setup_run_read<T>(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     command: &str,
     read: impl FnOnce(&str, &LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
 ) -> Result<T, LocalApiError> {
-    let (api_base_url, binding) = setup_run_agent_read_binding(daemon, authorization, command)?;
-    let result = setup_run_token_for_connection(&api_base_url, &binding).and_then(|credentials| {
-        read(
-            &api_base_url,
-            &credentials.connection,
-            &credentials.setup_run_token,
-        )
-    });
+    let (api_base_url, start) = setup_run_agent_read_binding(daemon, authorization, command)?;
+    let result =
+        setup_run_token_for_connection(&api_base_url, &start.binding).and_then(|credentials| {
+            read(
+                &api_base_url,
+                &credentials.connection,
+                &credentials.setup_run_token,
+            )
+        });
     match &result {
         Ok(_) => {
-            let _ = daemon.record_setup_run_read_accepted(&binding);
+            let _ = daemon.record_setup_run_read_accepted(&start);
         }
         Err(error) => {
             if let Some(rejection) = terminal_refresh_rejection(error) {
-                let _ = daemon.record_setup_run_read_rejected(&binding, rejection);
+                let _ = daemon.record_setup_run_read_rejected(&start.binding, rejection);
             }
         }
     }
@@ -3482,18 +3485,18 @@ fn setup_run_agent_read_binding(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     command: &str,
-) -> Result<(String, LocalConnectionBinding), LocalApiError> {
+) -> Result<(String, SetupRunReadStart), LocalApiError> {
     let status = status_for(daemon, authorization)?;
     if status.account.state != LocalAccountState::Connected {
         return Err(LocalApiError::InvalidRequest(format!(
             "{command} requires this Mac to be connected to Ottto"
         )));
     }
-    let connection = daemon
-        .connection_for_authorized_client()?
+    let start = daemon
+        .setup_run_read_start()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
-    Ok((api_base_url, connection))
+    let api_base_url = validated_api_base_url(Some(start.binding.api_base_url.as_str()))?;
+    Ok((api_base_url, start))
 }
 
 fn require_authorized_local_client(
@@ -31457,6 +31460,35 @@ X-API-Key = "otel_redacted"
             );
 
             // Same binding: a successful read of B clears B's rejection.
+            let b_read = scope.spawn(read);
+            held("run_b", "costs").answer(200, COSTS);
+            b_read.join().expect("read thread").expect("run B answered");
+            no_more_requests();
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Complete);
+
+            // Same binding, out of order: a slow read of B is in flight when a
+            // later read of B is told the run ended. The slow read's success
+            // arrives last but predates that answer, so it cannot clear it.
+            let slow_read = scope.spawn(read);
+            let slow_costs = held("run_b", "costs");
+            let later_read = scope.spawn(read);
+            held("run_b", "costs").answer(401, EXPIRED);
+            held("run_b", "refresh").answer(401, EXPIRED);
+            assert!(later_read.join().expect("read thread").is_err());
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Rejected);
+            slow_costs.answer(200, COSTS);
+            slow_read
+                .join()
+                .expect("read thread")
+                .expect("run B answered");
+            no_more_requests();
+            assert_eq!(
+                run_state(),
+                ottto_protocol::LocalSetupRunState::Rejected,
+                "an older success of run B must not clear its newer rejection"
+            );
+
+            // A read of B that starts after the rejection and succeeds clears it.
             let b_read = scope.spawn(read);
             held("run_b", "costs").answer(200, COSTS);
             b_read.join().expect("read thread").expect("run B answered");
