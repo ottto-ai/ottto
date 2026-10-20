@@ -748,7 +748,10 @@ fn over_limit_file_pages_through_the_cursor_and_matches_one_parser() {
     let cache = Arc::new(SharedCache::default());
     with_test_unpaged_limit(4096, || {
         with_test_limits(2048, 1024, 64, || {
-            assert!(len > 3 * 2048 && len > 4096);
+            assert!(
+                len > 3 * 2048,
+                "over the unpaged limit, three pages or more"
+            );
             let certified = page_until_certified(&fixture, ScanIndex::default(), &cache, 0);
             assert!(certified.pages >= 3, "{} pages", certified.pages);
             let published = certified.scan;
@@ -1351,7 +1354,6 @@ fn outlived_grown_cursor_read_stages_the_audit_debt() {
         with_test_limits(2048, 1024, 64, || {
             let mut now = 1_900_000_000_u64;
             let mut index = ScanIndex::default();
-            let mut next_line = 81;
             for number in 0..64 {
                 clock.set(now);
                 let (next, _, _) = page(&fixture, index, Some(&cache), &collected_at(number));
@@ -1359,8 +1361,7 @@ fn outlived_grown_cursor_read_stages_the_audit_debt() {
                 if counters(&cache).jobs_certified == 1 {
                     break;
                 }
-                fixture.append(SESSION, &token_line(next_line));
-                next_line += 1;
+                fixture.append(SESSION, &token_line(81 + number));
                 now += interval;
             }
             let c = counters(&cache);
