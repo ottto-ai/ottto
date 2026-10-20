@@ -27804,8 +27804,6 @@ fn resolve_configured_scan_root(
 /// symlink, capture its stable object identity and a bounded content witness,
 /// then rewind it for the parser. Discovery metadata is never trusted as the
 /// parse identity: a replacement between enumeration and open is reparsed.
-/// Production opens name their admission (`open_candidate_file_admitted`).
-#[cfg(test)]
 fn open_candidate_file(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
@@ -62067,6 +62065,7 @@ mod tests {
             parents_applied: false,
             restart_budget_spent: false,
             parent_restarts: None,
+            paged: false,
         };
         let (old_identity, fresh) = ids.probe(census, parent_id);
         assert!(fresh && old_identity.is_ok());
@@ -62203,6 +62202,7 @@ mod tests {
             parents_applied: false,
             restart_budget_spent: false,
             parent_restarts: None,
+            paged: false,
         };
 
         // A UUID-shaped parent is kept: a 36-byte id and a 64-byte identity.

@@ -12,7 +12,6 @@ use sampled_scan::codex_cursor::{
 };
 use sampled_scan::SharedCache;
 use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
