@@ -2636,16 +2636,6 @@ impl SharedCache {
         .unwrap_or(false)
     }
 
-    /// §d.1.3: B blocked `owner` for a queued group of `members`. The exact
-    /// member keys are the L-1 release's deletion authority. Admission,
-    /// construction and commit run in one critical section (retained lock,
-    /// then cursor lock): the entry's accounted size is admitted before any
-    /// byte of it is allocated (optional: it never forgets other provenance or
-    /// a paused job's room for it), so nothing built is ever uncharged and no
-    /// other admission can spend the same room. Refused provenance (malformed
-    /// keys, unsupported accounting, overflow, no room, a poisoned lock) is
-    /// forgotten, which keeps the owner blocked; it never releases one, and
-    /// nothing partial is stored.
     /// PR-P: the namespace's parent state for one page, under the cursor lock.
     /// Touches the (namespace, scope) restart slot and the witness entry; an
     /// entry of another scope is dropped (its witnesses are lost and
@@ -2881,6 +2871,16 @@ impl SharedCache {
         .unwrap_or(PARENT_RESTART_BUDGET)
     }
 
+    /// §d.1.3: B blocked `owner` for a queued group of `members`. The exact
+    /// member keys are the L-1 release's deletion authority. Admission,
+    /// construction and commit run in one critical section (retained lock,
+    /// then cursor lock): the entry's accounted size is admitted before any
+    /// byte of it is allocated (optional: it never forgets other provenance or
+    /// a paused job's room for it), so nothing built is ever uncharged and no
+    /// other admission can spend the same room. Refused provenance (malformed
+    /// keys, unsupported accounting, overflow, no room, a poisoned lock) is
+    /// forgotten, which keeps the owner blocked; it never releases one, and
+    /// nothing partial is stored.
     pub(in crate::snapshots) fn record_join_owner(&self, owner: &str, members: &[CandidateFile]) {
         // Encoding is checked before anything is reserved or allocated.
         let charge = join_keys_len(members)

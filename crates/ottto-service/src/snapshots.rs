@@ -38170,9 +38170,12 @@ mod tests {
             vec![(3, 3), (0, 0), (0, 0), (0, 0)],
             "the oversized parent must be read exactly once, not once per cycle"
         );
+        // PR-P §2.4: ordinal subagent children never consult a parent
+        // ledger, so they request no parent ref (P-T34 keeps the referenced
+        // parent's coverage).
         assert!(
-            index.codex_parent_ownership_refs.contains(parent_id),
-            "children still resolve their parent reference"
+            !index.codex_parent_ownership_refs.contains(parent_id),
+            "ordinal children request no parent reference"
         );
         assert!(
             !index.codex_parent_ownership_ledgers.contains_key(parent_id),
@@ -60630,6 +60633,119 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// P-T38 (PR-P): batched page-start validation makes ONE census pass for
+    /// every eligible ledger and equals PR-1's per-ledger fold: two current
+    /// ledgers kept, a replaced and an absent one dropped, and a conflict (the
+    /// uppercase spelling of an eligible id, same identity, different
+    /// signatures) drops both spellings. The one-id open agrees with the
+    /// batched match for every id (P-T14's control). No eligible ledger: no
+    /// pass, empty map.
+    #[test]
+    fn batched_parent_validation_matches_the_per_ledger_fold() {
+        let root = temp_dir("codex-parent-ledger-batched");
+        let current = [
+            "019fc428-0000-7000-8000-0000000000ab",
+            "019fc428-0000-7000-8000-0000000000cd",
+            "019fc428-0000-7000-8000-0000000000ef",
+        ];
+        let absent = "019fc428-0000-7000-8000-0000000000aa";
+        let mut ledgers = BTreeMap::new();
+        let mut census_paths = BTreeSet::new();
+        for id in current {
+            let path = root.join(format!("rollout-2026-08-02T08-00-00-{id}.jsonl"));
+            let values = [
+                json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":id,"thread_source":"user"}}),
+                json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":format!("turn-{id}"),"model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:00:02Z",
+                    None,
+                    (100, 80, 10, 2),
+                    Some((100, 80, 10, 2)),
+                ),
+            ];
+            fs::write(
+                &path,
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .expect("write parent rollout");
+            let (_, ledger) = parse_codex_test_with_ledgers(&path, BTreeMap::new())
+                .codex_parent_ownership_ledger
+                .expect("parent ledger");
+            assert!(ledger.scan_complete && !ledger.opened_object_identity.is_empty());
+            census_paths.insert(local_index_key(&path));
+            ledgers.insert(id.to_string(), ledger);
+        }
+        let template = ledgers[current[0]].clone();
+        let mut replaced = ledgers[current[2]].clone();
+        replaced.opened_object_identity = "replaced-object".to_string();
+        ledgers.insert(current[2].to_string(), replaced);
+        ledgers.insert(absent.to_string(), template.clone());
+        let mut conflict = template;
+        conflict.signatures.truncate(1);
+        assert!(!conflict.signatures.is_empty());
+        ledgers.insert(current[0].to_ascii_uppercase(), conflict);
+        let index = ScanIndex {
+            codex_parent_ownership_ledgers: ledgers,
+            ..ScanIndex::default()
+        };
+        let roots = std::slice::from_ref(&root);
+        let census = CodexParentCensus::new(roots, &census_paths);
+
+        // PR-1's fold, one census pass and one open per ledger.
+        let mut fold = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        for (session_id, ledger) in &index.codex_parent_ownership_ledgers {
+            let resolved = resolve_codex_identity(session_id);
+            if conflicts.contains(&resolved) {
+                continue;
+            }
+            let opened = codex_parent_open(census, session_id)
+                .ok()
+                .map(|(identity, _file)| identity);
+            if opened.as_deref() == Some(ledger.opened_object_identity.as_str()) {
+                if fold
+                    .get(&resolved)
+                    .is_some_and(|existing: &CodexParentOwnershipLedger| existing != ledger)
+                {
+                    fold.remove(&resolved);
+                    conflicts.insert(resolved);
+                } else {
+                    fold.insert(resolved, ledger.clone());
+                }
+            }
+        }
+        let passes = codex_parent_census_passes_for_test();
+        let validated = validated_codex_parent_ownership_ledgers(&index, census);
+        assert_eq!(codex_parent_census_passes_for_test() - passes, 1);
+        assert_eq!(validated, fold);
+        assert_eq!(
+            validated.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![current[1]]
+        );
+
+        // The one-id open equals the batched match for every id.
+        let ids = [current[0], current[1], current[2], absent, "not-a-uuid"];
+        let mut wanted = ids.to_vec();
+        wanted.sort_unstable();
+        let batched = codex_parent_census_matches(census, &wanted);
+        for (at, id) in wanted.iter().enumerate() {
+            let one = codex_parent_open(census, id).map(|(identity, _file)| identity);
+            let many = codex_parent_open_match(census, batched[at])
+                .map(|(_path, identity, _file)| identity);
+            assert_eq!(one, many, "{id}");
+        }
+
+        let passes = codex_parent_census_passes_for_test();
+        assert!(validated_codex_parent_ownership_ledgers(&ScanIndex::default(), census).is_empty());
+        assert_eq!(codex_parent_census_passes_for_test(), passes);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn codex_changed_parent_invalidates_stale_prefix_before_child_parse() {
         let root = temp_dir("codex-parent-ledger-stale");
@@ -65631,6 +65747,39 @@ mod census_unreadable_tests {
         let roundtrip: ScanTraversalCounts =
             serde_json::from_slice(&serde_json::to_vec(&retained).unwrap()).unwrap();
         assert_eq!(projection(&roundtrip), projection(&retained));
+    }
+
+    /// PR-P: the held-parent counts persist inside the traversal counts
+    /// additively. A pre-PR-P checkpoint loads them as zero, a roundtrip keeps
+    /// them, and a pre-PR-P binary reads the new checkpoint (it ignores the
+    /// unknown field). They are counts only, never proof.
+    #[test]
+    fn parent_unresolvable_counts_persist_additively_and_downgrade() {
+        use crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES;
+        let old: ScanTraversalCounts =
+            serde_json::from_value(json!({"unreadable_path_count": 2})).unwrap();
+        assert_eq!(old.parent_unresolvable, ParentUnresolvableCauses::default());
+        let mut counts = old;
+        let mut page = ScanCensus::default();
+        page.parent_unresolvable
+            .record(CodexParentUnresolvable::Absent.index(), 1);
+        page.parent_unresolvable
+            .record(CodexParentUnresolvable::DeferredRestart.index(), 2);
+        counts.parent_unresolvable.merge(page.parent_unresolvable);
+        let bytes = serde_json::to_vec(&counts).unwrap();
+        let back: ScanTraversalCounts = serde_json::from_slice(&bytes).unwrap();
+        let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
+        expected[CodexParentUnresolvable::Absent.index()] = 1;
+        expected[CodexParentUnresolvable::DeferredRestart.index()] = 2;
+        assert_eq!(back.parent_unresolvable.counts(), expected);
+        assert_eq!(back.unreadable_path_count, 2);
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct PrePrP {
+            unreadable_path_count: usize,
+        }
+        let older: PrePrP = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(older.unreadable_path_count, 2);
     }
 
     #[test]

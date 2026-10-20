@@ -941,6 +941,39 @@ mod tests {
         assert_eq!(evidence.completed_roots, 1);
         assert!(!serde_json::to_string(&evidence).unwrap().contains("secret"));
     }
+    /// PR-P: both parent fields are additive. `parent_restarts_in_scope` is
+    /// omitted when unknown (never a fabricated 0) and present when
+    /// established, 0 included; cause counts saturate, ignore an
+    /// out-of-range cause, and a pre-PR-P value loads as zero.
+    #[test]
+    fn parent_fields_are_additive_and_unknown_restarts_are_omitted() {
+        let mut diagnostics = CodexScanDiagnostics::default();
+        let value = serde_json::to_value(diagnostics).unwrap();
+        assert!(value.get("parent_restarts_in_scope").is_none());
+        assert_eq!(
+            value["parent_unresolvable"]["counts"],
+            serde_json::to_value([0_u64; PARENT_UNRESOLVABLE_CAUSES]).unwrap()
+        );
+        diagnostics.parent_restarts_in_scope = Some(0);
+        diagnostics.parent_unresolvable.record(3, 2);
+        diagnostics
+            .parent_unresolvable
+            .record(PARENT_UNRESOLVABLE_CAUSES, 1);
+        let value = serde_json::to_value(diagnostics).unwrap();
+        assert_eq!(value["parent_restarts_in_scope"], 0);
+        let mut expected = [0_u64; PARENT_UNRESOLVABLE_CAUSES];
+        expected[3] = 2;
+        assert_eq!(diagnostics.parent_unresolvable.counts(), expected);
+        let old: ParentUnresolvableCauses = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, ParentUnresolvableCauses::default());
+        let back: ParentUnresolvableCauses =
+            serde_json::from_value(serde_json::to_value(diagnostics.parent_unresolvable).unwrap())
+                .unwrap();
+        assert_eq!(back, diagnostics.parent_unresolvable);
+        let mut merged = ParentUnresolvableCauses::saturated();
+        merged.merge(diagnostics.parent_unresolvable);
+        assert_eq!(merged, ParentUnresolvableCauses::saturated());
+    }
     #[test]
     fn fully_populated_schema_stays_bounded_and_content_free() {
         let mut diagnostics = CodexScanDiagnostics {
