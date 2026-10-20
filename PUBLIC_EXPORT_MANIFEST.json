@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 717,
-  "content_sha256": "32aeebc928a21592a9c40e6d49615999031a4dc237e66c1024c3f2468ebb52a8",
+  "content_sha256": "f5a3da6d3348b14c817ed7ba500a331255fadd1b3ad51a87bd5a236ebbb60e07",
   "files": [
     {
       "executable": false,
@@ -125,8 +125,8 @@
       "executable": false,
       "mode": "0644",
       "path": "agent-adapters/autoreview/SKILL.md",
-      "sha256": "ecadcb1bcc6866217861a03fa8003666b396f46df2b08012942d659ecb2fddb8",
-      "size_bytes": 5703
+      "sha256": "76fd5ea134d7d30ad7d559c926910f7735a7fcb997b116ada726a4baaa6f5aac",
+      "size_bytes": 5862
     },
     {
       "executable": false,
@@ -4605,8 +4605,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/autoreview",
-      "sha256": "46485c97f8d927f737798cff033b2f5a7ae5024365c96725517279b29faed59b",
-      "size_bytes": 26834
+      "sha256": "b5ecf90065c3d960302116dac0090238cf9384e65093db258aad0222d9b15786",
+      "size_bytes": 28238
     },
     {
       "executable": true,
@@ -4822,8 +4822,8 @@
       "executable": false,
       "mode": "0644",
       "path": "scripts/test_autoreview.py",
-      "sha256": "e5d5bc1ef724a8f1f14ed286c27d481a71a9cc01cc81bb4225142d7b94cba6fc",
-      "size_bytes": 14220
+      "sha256": "4f6a6068ceb60d0eee42f45fe6ddbbb6c552f437ea13a9d71218f6e1644a360e",
+      "size_bytes": 18003
     },
     {
       "executable": true,
@@ -5022,7 +5022,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T01:55:23+00:00",
+  "generated_at": "2026-10-20T08:22:52+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 718,
   "public_roots": [
@@ -5061,5 +5061,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "39fc5d256438bf332e770fb0f57e071a9873327d"
+  "source_commit": "8ef5d0be57c115fb749bc37615699f8fe618ecc5"
 }
