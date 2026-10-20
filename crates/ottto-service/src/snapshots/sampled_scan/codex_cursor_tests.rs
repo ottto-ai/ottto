@@ -1747,8 +1747,9 @@ fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
     });
 }
 
-/// L-A1: an active cursor job owns resumable state, so even a measured copy
-/// refusal keeps the conservative release.
+/// L-A1: a live cursor job reads a fresh `Full` acquisition, so the unchanged
+/// #641 `Full` branch decides its refusal. The cursor conjunct alone still
+/// keeps an otherwise unsampled shape on the conservative release.
 #[test]
 fn cursor_job_copy_refusal_keeps_conservative_release() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1778,18 +1779,41 @@ fn cursor_job_copy_refusal_keeps_conservative_release() {
                 .is_some_and(|active| active.cursor.is_some()),
             "precondition: a live cursor job"
         );
-        let measured =
-            crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), STATE_BYTES);
-        assert!(measured.is_some(), "precondition: residents measured");
-        let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-            crate::snapshots::sampled_scan::release_cache_for_copy_refusal(
-                scan.sampling.as_ref(),
-                scan.active_file.as_deref(),
-                measured,
-            )
-        });
-        assert_eq!(lifecycle.clear_other_active, 1);
+        let release = |scan: &OwnedSourceScan| {
+            let measured =
+                crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), STATE_BYTES);
+            assert!(measured.is_some(), "precondition: residents measured");
+            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+                crate::snapshots::sampled_scan::release_cache_for_copy_refusal(
+                    scan.sampling.as_ref(),
+                    scan.active_file.as_deref(),
+                    measured,
+                )
+            })
+            .1
+        };
+        let active = scan.active_file.as_deref().unwrap();
+        assert!(
+            matches!(
+                active.sampling.as_ref().map(|sampling| sampling.mode),
+                Some(crate::transcript_acquisition::ReadMode::Full(_))
+            ),
+            "precondition: a cursor job reads a fresh Full acquisition"
+        );
+        let lifecycle = release(&scan);
+        assert_eq!(lifecycle.clear_other_active, 0, "the #641 Full branch");
         assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+        // Isolate the cursor conjunct, then restore the job before its frame
+        // returns it to the slot.
+        let active = scan.active_file.as_deref_mut().unwrap();
+        let sampling = active.sampling.take();
+        let acquisition = active.parser.reader.acquisition.take();
+        let lifecycle = release(&scan);
+        assert_eq!(lifecycle.clear_other_active, 1, "the cursor conjunct");
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.sampling = sampling;
+        active.parser.reader.acquisition = acquisition;
     });
 }
 
