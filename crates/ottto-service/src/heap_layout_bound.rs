@@ -194,13 +194,17 @@ impl<T: HeapLayoutBound> HeapLayoutBound for VecDeque<T> {
         Some(())
     }
 }
+/// The bytes `tree_nodes` charges per entry: one full node (see there).
+pub(crate) fn tree_node_bytes<K, V>() -> Option<usize> {
+    256usize
+        .checked_add(12 * size_of::<usize>())?
+        .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)
+}
 pub(crate) fn tree_nodes<K, V>(len: usize, c: &mut Counter) -> Option<()> {
     // Rust1.88/1.95 B=6:11 key/value slots and12 edges. Charging one full node per
     // entry plus one root overcounts unused slots and internal/leaf grouping.
     // A zero-length map may retain its empty allocated root after removal.
-    let node = 256usize
-        .checked_add(12 * size_of::<usize>())?
-        .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)?;
+    let node = tree_node_bytes::<K, V>()?;
     c.add(len.checked_add(1)?.checked_mul(node)?)
 }
 impl<K: HeapLayoutBound, V: HeapLayoutBound> HeapLayoutBound for BTreeMap<K, V> {

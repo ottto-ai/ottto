@@ -2099,6 +2099,21 @@ pub struct ScanIndex {
     /// `state_5.sqlite.tokens_used` as session-local usage.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     codex_state_only_blocked_session_ids: BTreeSet<String>,
+    /// L-SB: what each local index key's latest settleable disclosure blocked
+    /// (strict disclosures add). A re-parse or memo replay that no longer
+    /// blocks an id releases it unless another holder remains. Never pruned by
+    /// census absence. Never a settling rule.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    codex_state_only_blocked_by_file: BTreeMap<String, BTreeSet<String>>,
+    /// Ids the group paths block with no file attribution: queued or paused
+    /// join owners and capture-boundary held owners.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    codex_state_only_blocked_unattributed: BTreeSet<String>,
+    /// Ids blocked before L-SB existed: never released by attribution.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    codex_state_only_blocked_legacy: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    codex_state_only_blocked_attributed: bool,
     /// Parent ids requested by unresolved legacy ordinary forks. This bounded
     /// set forces an unchanged parent through one structural prepass instead
     /// of retaining every Codex transcript signature in the index.
@@ -2302,6 +2317,10 @@ impl Default for ScanIndex {
             legacy_unresolved_root_file_witnesses: BTreeSet::new(),
             codex_state_only_snapshot_fingerprints: BTreeMap::new(),
             codex_state_only_blocked_session_ids: BTreeSet::new(),
+            codex_state_only_blocked_by_file: BTreeMap::new(),
+            codex_state_only_blocked_unattributed: BTreeSet::new(),
+            codex_state_only_blocked_legacy: BTreeSet::new(),
+            codex_state_only_blocked_attributed: false,
             codex_parent_ownership_refs: BTreeSet::new(),
             codex_parent_ownership_ledgers: BTreeMap::new(),
             claude_desktop_title_files: BTreeMap::new(),
@@ -3281,6 +3300,7 @@ impl SourceScanResult {
             if previous.confirmed_empty_files.contains(key) {
                 index.confirmed_empty_files.insert(key.clone());
             }
+            index.revert_codex_blocked_attribution(previous, key);
         }
         self.pending_finalization
             .retain(|pending| !keys.contains(&pending.index_key));
@@ -3308,6 +3328,9 @@ impl SourceScanResult {
         }
         index
             .codex_state_only_blocked_session_ids
+            .extend(held.iter().cloned());
+        index
+            .codex_state_only_blocked_unattributed
             .extend(held.iter().cloned());
         if let Some(validation) = &mut self.codex_join_validation {
             validation
@@ -10108,6 +10131,9 @@ struct SnapshotAccumulator {
     // Provider state-row creation time for the trusted child edge. Fresh-file
     // timestamps must not precede this physical spawn witness.
     codex_sidecar_child_created_at_nanos: Option<i128>,
+    /// L-6: the file length the sidecar bind saw (`seed_codex_sidecar_parent`).
+    /// A curable hold is memoized only at exactly this length.
+    codex_bind_seed_len: Option<u64>,
     // Codex's independently projected EOF ordinal, when thread_history_1 is
     // available. The native stream must end at the same ordinal boundary.
     codex_sidecar_projected_next_ordinal: Option<u64>,
@@ -10312,6 +10338,7 @@ impl SnapshotAccumulator {
             codex_sidecar_identity_ambiguous: false,
             codex_sidecar_parent: None,
             codex_sidecar_child_created_at_nanos: None,
+            codex_bind_seed_len: None,
             codex_sidecar_projected_next_ordinal: None,
             codex_parent_session_ref: None,
             codex_parent_signatures: None,
@@ -10403,6 +10430,7 @@ impl SnapshotAccumulator {
         file_metadata: &fs::Metadata,
         metadata: &CodexTitleMetadata,
     ) {
+        self.codex_bind_seed_len = Some(file_metadata.len());
         let identities = codex_session_id_candidates_from_path(path);
         if identities.is_empty() {
             // A provider rollout whose identity cannot be resolved while the
@@ -12869,79 +12897,238 @@ fn scan_source_roots_with_limit(
     )
 }
 
-/// Return only persisted parent-prefix ledgers whose exact rollout object is
-/// still current. Parent files are sampled through the same no-follow,
-/// opened-object identity path as normal parsing. A missing, duplicated,
-/// replaced, or appended parent is deliberately omitted: the child remains
-/// retryable until a normal parent parse publishes fresh structural evidence.
-fn validated_codex_parent_ownership_ledgers(
-    index: &ScanIndex,
-    scan_roots: &[PathBuf],
-    frozen_census_paths: &BTreeSet<String>,
-) -> BTreeMap<String, CodexParentOwnershipLedger> {
-    let mut validated = BTreeMap::new();
-    let mut conflicts = BTreeSet::new();
-    for (session_id, ledger) in &index.codex_parent_ownership_ledgers {
-        let session_id = resolve_codex_identity(session_id.as_str());
-        if !ledger.scan_complete
-            || ledger.signatures.is_empty()
-            || ledger.opened_object_identity.is_empty()
-            || conflicts.contains(session_id.as_str())
-        {
-            continue;
-        }
-        if current_codex_parent_opened_identity(
-            scan_roots,
-            frozen_census_paths,
-            session_id.as_str(),
-        )
-        .as_deref()
-            == Some(ledger.opened_object_identity.as_str())
-        {
-            if validated
-                .get(session_id.as_str())
-                .is_some_and(|existing| existing != ledger)
-            {
-                validated.remove(session_id.as_str());
-                conflicts.insert(session_id);
-            } else {
-                validated.insert(session_id, ledger.clone());
-            }
-        }
+/// L-5: why a parent has no usable current identity. PR-1 constructs the
+/// identity causes; PR-P adds the ledger, parent-debt and deferral causes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum CodexParentUnresolvable {
+    Absent,
+    Duplicated,
+    NotRegular,
+    Oversize,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CodexParentUnresolvable {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
     }
-    validated
 }
 
-fn current_codex_parent_opened_identity(
-    scan_roots: &[PathBuf],
-    frozen_census_paths: &BTreeSet<String>,
+/// L-5 probe value; `hlb` has no `Result` impl.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CodexParentProbe {
+    Identity(String),
+    Unresolvable(CodexParentUnresolvable),
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CodexParentProbe {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Identity(identity) => identity.heap_bound(c),
+            Self::Unresolvable(_) => c.add(0),
+        }
+    }
+}
+impl CodexParentProbe {
+    fn result(&self) -> Result<String, CodexParentUnresolvable> {
+        match self {
+            Self::Identity(identity) => Ok(identity.clone()),
+            Self::Unresolvable(cause) => Err(*cause),
+        }
+    }
+}
+impl From<&Result<String, CodexParentUnresolvable>> for CodexParentProbe {
+    fn from(probed: &Result<String, CodexParentUnresolvable>) -> Self {
+        match probed {
+            Ok(identity) => Self::Identity(identity.clone()),
+            Err(cause) => Self::Unresolvable(*cause),
+        }
+    }
+}
+
+/// The frozen-census validity filter: every directory visited, nothing
+/// capped, rejected, unreadable or vanished.
+fn codex_frozen_census_valid(traversal: &ScanTraversalCheckpoint) -> bool {
+    traversal.pending_directories.is_empty()
+        && traversal.counts.directory_entry_cap_exceeded_count == 0
+        && traversal.counts.symlink_rejected_count == 0
+        && traversal.counts.unreadable_path_count == 0
+        && traversal.counts.disappeared_file_count == 0
+}
+
+static NO_CODEX_CENSUS: BTreeSet<String> = BTreeSet::new();
+
+/// L-5: a borrowed view of the rollout census the index already owns. It
+/// holds no copy: a page writes the census only before its scan object is
+/// built (roster refresh, directory walk) and after it finishes.
+#[derive(Clone, Copy)]
+pub(in crate::snapshots) struct CodexParentCensus<'a> {
+    scan_roots: &'a [PathBuf],
+    paths: &'a BTreeSet<String>,
+    /// False for the empty view of an invalid or missing census: every
+    /// lookup is the baseline `Absent` refusal and never touches the slot.
+    available: bool,
+}
+
+impl<'a> CodexParentCensus<'a> {
+    #[cfg(test)]
+    pub(in crate::snapshots) fn new(
+        scan_roots: &'a [PathBuf],
+        paths: &'a BTreeSet<String>,
+    ) -> Self {
+        Self {
+            scan_roots,
+            paths,
+            available: true,
+        }
+    }
+}
+
+/// L-5: parent identities for one scan object (page). It holds only the
+/// page-start validity bit and a one-slot probe memo; the census is
+/// borrowed per call from the index. An uncached lookup costs one census
+/// pass and one open.
+pub(in crate::snapshots) struct CodexParentIdentities {
+    /// `codex_frozen_census_valid` at page start, evaluated once.
+    census_valid: bool,
+    /// The last probe of this step call; `begin_step` clears it. Only a
+    /// UUID-shaped id (36 bytes, `codex_identity_is_uuid_shaped`) is kept,
+    /// with an opened identity (a 64-byte SHA-256 hex digest,
+    /// `opened_object_identity`) or a cause: at most 100 heap bytes.
+    last: Option<CodexParentProbeSlot>,
+}
+
+struct CodexParentProbeSlot {
+    session_id: String,
+    probe: CodexParentProbe,
+}
+crate::heap_layout_bound::fields!(CodexParentProbeSlot; session_id, probe);
+crate::heap_layout_bound::fields!(CodexParentIdentities; census_valid, last);
+
+impl CodexParentIdentities {
+    pub(in crate::snapshots) fn new(
+        source: SnapshotSource,
+        traversal: Option<&ScanTraversalCheckpoint>,
+    ) -> Self {
+        Self {
+            census_valid: source == SnapshotSource::Codex
+                && traversal.is_some_and(codex_frozen_census_valid),
+            last: None,
+        }
+    }
+
+    /// Parent identity is not unique until the frozen directory census has
+    /// visited every directory. Keep ordinary fork ownership red on earlier
+    /// pages; once discovery completes, the rollout census is the
+    /// authoritative current population, including unparsed candidates.
+    pub(in crate::snapshots) fn census<'a>(&self, index: &'a ScanIndex) -> CodexParentCensus<'a> {
+        match index.traversal.as_ref().filter(|_| self.census_valid) {
+            Some(traversal) => CodexParentCensus {
+                scan_roots: &traversal.scan_roots,
+                paths: &traversal.codex_rollout_paths,
+                available: true,
+            },
+            None => CodexParentCensus {
+                scan_roots: &[],
+                paths: &NO_CODEX_CENSUS,
+                available: false,
+            },
+        }
+    }
+
+    /// Every step call after the first resumes a `Pending` step, and a parent
+    /// may have changed in between: nothing probed earlier survives it.
+    pub(in crate::snapshots) fn begin_step(&mut self) {
+        self.last = None;
+    }
+
+    /// Served from the one slot when it holds this parent: the memo lookup
+    /// and the record-site wake input. `true` when it opened; the caller
+    /// charges the two content samples.
+    pub(in crate::snapshots) fn probe(
+        &mut self,
+        census: CodexParentCensus<'_>,
+        session_id: &str,
+    ) -> (Result<String, CodexParentUnresolvable>, bool) {
+        if !census.available || !codex_identity_is_uuid_shaped(session_id) {
+            return (self.reprobe(census, session_id), true);
+        }
+        // `resolve_codex_identity` of a UUID-shaped id, without its copy of
+        // any other id.
+        let session_id = session_id.to_ascii_lowercase();
+        if let Some(slot) = self
+            .last
+            .as_ref()
+            .filter(|slot| slot.session_id == session_id)
+        {
+            return (slot.probe.result(), false);
+        }
+        (self.reprobe_resolved(census, session_id), true)
+    }
+
+    /// Never served from the slot: a fresh open (both after-parse fences).
+    /// It overwrites the slot, so a later probe in this step call sees it.
+    /// An unavailable census is the baseline `Absent` refusal, and any id
+    /// that is not UUID-shaped is never kept; both empty the slot.
+    pub(in crate::snapshots) fn reprobe(
+        &mut self,
+        census: CodexParentCensus<'_>,
+        session_id: &str,
+    ) -> Result<String, CodexParentUnresolvable> {
+        if !census.available || !codex_identity_is_uuid_shaped(session_id) {
+            self.last = None;
+            return codex_parent_open(census, session_id).map(|(identity, _file)| identity);
+        }
+        self.reprobe_resolved(census, session_id.to_ascii_lowercase())
+    }
+
+    fn reprobe_resolved(
+        &mut self,
+        census: CodexParentCensus<'_>,
+        session_id: String,
+    ) -> Result<String, CodexParentUnresolvable> {
+        let probed = codex_parent_open(census, &session_id).map(|(identity, _file)| identity);
+        self.last = Some(CodexParentProbeSlot {
+            session_id,
+            probe: CodexParentProbe::from(&probed),
+        });
+        probed
+    }
+}
+
+/// Uncached: one census pass and one no-follow open of the parent's single
+/// rollout. The `File` is for PR-P; PR-1 callers drop it.
+fn codex_parent_open(
+    census: CodexParentCensus<'_>,
     session_id: &str,
-) -> Option<String> {
+) -> Result<(String, File), CodexParentUnresolvable> {
+    use CodexParentUnresolvable::*;
     let session_id = resolve_codex_identity(session_id);
-    let mut matching_paths = frozen_census_paths.iter().filter_map(|key| {
+    let mut matching_paths = census.paths.iter().filter_map(|key| {
         let path = PathBuf::from(key);
         codex_session_id_candidates_from_path(&path)
             .iter()
             .any(|candidate| candidate == &session_id)
             .then_some(path)
     });
-    let path = matching_paths.next()?;
+    let path = matching_paths.next().ok_or(Absent)?;
     // More than one physical rollout claiming the same source session id is
     // ambiguous evidence, even if one happens to match the old witness.
     if matching_paths.next().is_some() {
-        return None;
+        return Err(Duplicated);
     }
-    let scan_root = scan_roots
+    let scan_root = census
+        .scan_roots
         .iter()
         .filter(|root| path.starts_with(root))
         .max_by_key(|root| root.components().count())
-        .cloned()?;
-    let metadata = fs::symlink_metadata(&path).ok()?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > max_jsonl_file_bytes(SnapshotSource::Codex)
-    {
-        return None;
+        .cloned()
+        .ok_or(Absent)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| Absent)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(NotRegular);
+    }
+    if metadata.len() > max_jsonl_file_bytes(SnapshotSource::Codex) {
+        return Err(Oversize);
     }
     let modified_unix_seconds = metadata
         .modified()
@@ -12964,24 +13151,125 @@ fn current_codex_parent_opened_identity(
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
     };
-    let _file = open_candidate_file(SnapshotSource::Codex, &mut candidate).ok()?;
-    Some(candidate.opened_object_identity)
+    let file = open_candidate_file(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
+    Ok((candidate.opened_object_identity, file))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// B2-T1 seam: runs after a Codex candidate's memo lookup (which probes
+    /// its parent) and before its parse begins, so a test can change that
+    /// parent between the two.
+    static CODEX_BEFORE_PARSE: std::cell::RefCell<Option<CodexBeforeParseHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+type CodexBeforeParseHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+pub(in crate::snapshots) fn with_codex_before_parse<T>(
+    hook: impl FnMut(&Path) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    CODEX_BEFORE_PARSE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let value = run();
+    CODEX_BEFORE_PARSE.with(|slot| *slot.borrow_mut() = None);
+    value
+}
+
+/// Return only persisted parent-prefix ledgers whose exact rollout object is
+/// still current. Parent files are sampled through the same no-follow,
+/// opened-object identity path as normal parsing. A missing, duplicated,
+/// replaced, or appended parent is deliberately omitted: the child remains
+/// retryable until a normal parent parse publishes fresh structural evidence.
+fn validated_codex_parent_ownership_ledgers(
+    index: &ScanIndex,
+    census: CodexParentCensus<'_>,
+) -> BTreeMap<String, CodexParentOwnershipLedger> {
+    let mut validated = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
+    for (session_id, ledger) in &index.codex_parent_ownership_ledgers {
+        let session_id = resolve_codex_identity(session_id.as_str());
+        if !ledger.scan_complete
+            || ledger.signatures.is_empty()
+            || ledger.opened_object_identity.is_empty()
+            || conflicts.contains(session_id.as_str())
+        {
+            continue;
+        }
+        if codex_parent_open(census, session_id.as_str())
+            .ok()
+            .map(|(identity, _file)| identity)
+            .as_deref()
+            == Some(ledger.opened_object_identity.as_str())
+        {
+            if validated
+                .get(session_id.as_str())
+                .is_some_and(|existing| existing != ledger)
+            {
+                validated.remove(session_id.as_str());
+                conflicts.insert(session_id);
+            } else {
+                validated.insert(session_id, ledger.clone());
+            }
+        }
+    }
+    validated
+}
+
+/// L-1 release (§d.1.3) of every owner whose recorded members all left the
+/// clean walk's census. Exact authority: only those member keys' claims on
+/// that owner go (`accept_codex_block`); any other key still blocking it, and
+/// every other owner, stay. A missing traversal skips the release: it is
+/// never read as an empty census.
+fn release_departed_join_owners(
+    index: &mut ScanIndex,
+    cache: &sampled_scan::SharedCache,
+    keep: impl Fn(&str) -> bool,
+) {
+    /// Puts the taken traversal back on every exit, an unwind included.
+    struct Restore<'a> {
+        index: &'a mut ScanIndex,
+        traversal: Option<ScanTraversalCheckpoint>,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            self.index.traversal = self.traversal.take();
+        }
+    }
+    // Moved out (no copy) so the census is borrowed beside `&mut index`;
+    // `accept_codex_block` never reads `traversal`.
+    let Some(traversal) = index.traversal.take() else {
+        return;
+    };
+    let mut restore = Restore {
+        index,
+        traversal: Some(traversal),
+    };
+    let Restore { index, traversal } = &mut restore;
+    let Some(traversal) = traversal.as_ref() else {
+        return;
+    };
+    cache.release_join_owners(&traversal.codex_rollout_paths, keep, |owner, members| {
+        index.accept_codex_block(members, owner);
+    });
 }
 
 fn invalidate_stale_codex_parent_resolution(
     parsed: &mut ParsedJsonlFile,
-    scan_roots: &[PathBuf],
-    frozen_census_paths: &BTreeSet<String>,
+    identities: &mut CodexParentIdentities,
+    census: CodexParentCensus<'_>,
 ) -> bool {
     let Some(used_identity) = parsed.codex_parent_ledger_identity_used.as_deref() else {
         return false;
     };
+    // L-5: always a fresh open. This fence exists because the parent can
+    // change after the page-start pre-validation.
     let parent_is_still_current = parsed
         .codex_parent_session_ref
         .as_deref()
-        .and_then(|parent_id| {
-            current_codex_parent_opened_identity(scan_roots, frozen_census_paths, parent_id)
-        })
+        .and_then(|parent_id| identities.reprobe(census, parent_id).ok())
         .as_deref()
         == Some(used_identity);
     if parent_is_still_current {
@@ -13224,8 +13512,7 @@ pub(crate) struct OwnedSourceScan {
     state_census_complete: bool,
     sidecar_census_complete: bool,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
-    codex_parent_validation_roots: Vec<PathBuf>,
-    codex_parent_frozen_census_paths: BTreeSet<String>,
+    codex_parent_identities: CodexParentIdentities,
     codex_parent_ownership_ledgers:
         Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     census_window_end: String,
@@ -13741,40 +14028,18 @@ impl OwnedSourceScan {
             );
             release_codex_inventory_hold(source, traversal);
         }
-        let codex_parent_validation_roots = if source == SnapshotSource::Codex {
-            index
-                .traversal
-                .as_ref()
-                .map(|traversal| traversal.scan_roots.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        // Parent identity is not unique until the frozen directory census has
-        // visited every directory. Keep ordinary fork ownership red on earlier
-        // pages; once discovery completes, observed_index_keys is the authoritative
-        // current population, including candidates not yet parsed in this page.
-        let codex_parent_frozen_census_paths = if source == SnapshotSource::Codex {
-            index
-                .traversal
-                .as_ref()
-                .filter(|traversal| {
-                    traversal.pending_directories.is_empty()
-                        && traversal.counts.directory_entry_cap_exceeded_count == 0
-                        && traversal.counts.symlink_rejected_count == 0
-                        && traversal.counts.unreadable_path_count == 0
-                        && traversal.counts.disappeared_file_count == 0
-                })
-                .map(|traversal| traversal.codex_rollout_paths.clone())
-                .unwrap_or_default()
-        } else {
-            BTreeSet::new()
-        };
+        if source == SnapshotSource::Codex {
+            // L-SB: an index from before blocked-set attribution moves its
+            // whole blocked set to `legacy` once.
+            index.migrate_codex_blocked_attribution();
+        }
+        // L-5: no census copy; parent lookups borrow the index's own census,
+        // which this page no longer writes until it finishes.
+        let codex_parent_identities = CodexParentIdentities::new(source, index.traversal.as_ref());
         let codex_parent_ownership_ledgers = (source == SnapshotSource::Codex).then(|| {
             Arc::new(Mutex::new(validated_codex_parent_ownership_ledgers(
                 index,
-                &codex_parent_validation_roots,
-                &codex_parent_frozen_census_paths,
+                codex_parent_identities.census(index),
             )))
         });
         let traversal = index.traversal.as_mut().expect("traversal initialized");
@@ -14118,8 +14383,7 @@ impl OwnedSourceScan {
             state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
-            codex_parent_validation_roots,
-            codex_parent_frozen_census_paths,
+            codex_parent_identities,
             codex_parent_ownership_ledgers,
             census_window_end,
             discovered_file_count,
@@ -14247,8 +14511,7 @@ impl OwnedSourceScan {
             state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
-            codex_parent_validation_roots,
-            codex_parent_frozen_census_paths,
+            mut codex_parent_identities,
             codex_parent_ownership_ledgers,
             census_window_end,
             discovered_file_count,
@@ -14280,6 +14543,8 @@ impl OwnedSourceScan {
         // Held while this scan object runs the shared cursor job.
         let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
         let index = &mut index_storage;
+        // L-5: a resumed step re-probes everything it needs.
+        codex_parent_identities.begin_step();
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
         // Construct the large continuation once. Repeating it in every yield
         // branch multiplies debug-build stack slots and can overflow native
@@ -14511,6 +14776,9 @@ impl OwnedSourceScan {
                         index
                             .codex_state_only_blocked_session_ids
                             .insert(group.owner.clone());
+                        index
+                            .codex_state_only_blocked_unattributed
+                            .insert(group.owner.clone());
                         if let Some(context) = sampling.as_ref() {
                             context
                                 .cache
@@ -14524,6 +14792,9 @@ impl OwnedSourceScan {
                         .and_then(|context| context.cache.cursor_group_owner())
                     {
                         codex_state_only_blocked_session_ids.insert(owner.clone());
+                        index
+                            .codex_state_only_blocked_unattributed
+                            .insert(owner.clone());
                         index.codex_state_only_blocked_session_ids.insert(owner);
                     }
                     identified_candidates.retain(|candidate| {
@@ -14634,9 +14905,16 @@ impl OwnedSourceScan {
                         // body releases it, unless this scan holds the owner
                         // as residue.
                         if !residue_blocked_session_ids.contains(&boot.group.owner) {
-                            index
-                                .codex_state_only_blocked_session_ids
-                                .remove(&boot.group.owner);
+                            // L-SB: the accepted joined body supersedes the
+                            // members' own block on the owner; any other key
+                            // still blocking it keeps it.
+                            index.accept_codex_block(
+                                boot.group
+                                    .members
+                                    .iter()
+                                    .map(|member| local_index_key(&member.path)),
+                                &boot.group.owner,
+                            );
                         }
                         // R2-M1: nothing read for a job; it does not wait.
                         if let Some(context) = sampling.as_ref() {
@@ -15359,11 +15637,24 @@ impl OwnedSourceScan {
                     .as_ref()
                     .and_then(|_| sampled_scan::codex_cursor::certified_prefix(&active))
                     .map(|prefix| (local_index_key(&active.candidate.path), prefix));
-                let memo_offset = active.hold_offset.filter(|_| {
-                    source == SnapshotSource::Codex
-                        && active.aliases.is_empty()
-                        && sampling.is_some()
-                });
+                // PR-1 class 3: a non-monotone held file is memoized too, at the
+                // read end; the record gate decides. Only a file the accumulator
+                // already holds, and that is not parent-pending (the gate refuses
+                // those), pays the two samples.
+                let accumulator = &active.parser.accumulator;
+                let memo_offset = active
+                    .hold_offset
+                    .or_else(|| {
+                        (!accumulator.codex_usage_accounting_complete()
+                            && !accumulator.codex_parent_resolution_pending()
+                            && !sampled_scan::codex_cursor::held_monotone(accumulator))
+                        .then_some(attempt_read_end)
+                    })
+                    .filter(|_| {
+                        source == SnapshotSource::Codex
+                            && active.aliases.is_empty()
+                            && sampling.is_some()
+                    });
                 if memo_offset.is_some() {
                     // The live witness reads two samples of the held file (M3).
                     codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
@@ -15372,6 +15663,19 @@ impl OwnedSourceScan {
                     let file = active.parser.reader.reader.get_ref();
                     let live = sampled_scan::codex_cursor::LiveWitness::read(file, offset)?;
                     let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
+                    // PR-1: every singleton entry is exact until a counted tail
+                    // makes growth replayable, so the stamp must cover exactly
+                    // the bytes read (#631 review M1: captured after
+                    // `finish_job`'s check).
+                    if stamp.extent() != attempt_read_end {
+                        return None;
+                    }
+                    // L-6: a curable hold is stamped only at the length its bind saw.
+                    if sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator)
+                        && active.parser.accumulator.codex_bind_seed_len != Some(attempt_read_end)
+                    {
+                        return None;
+                    }
                     let dependencies = sampled_scan::reduction_dependencies(
                         source,
                         &active.candidate,
@@ -15400,29 +15704,7 @@ impl OwnedSourceScan {
                             &active.candidate.path,
                         )
                     });
-                    let parent = active
-                        .parser
-                        .accumulator
-                        .codex_parent_session_ref
-                        .clone()
-                        .map(|parent| {
-                            let ledger = index
-                                .codex_parent_ownership_ledgers
-                                .get(resolve_codex_identity(&parent).as_str())
-                                .map(|ledger| ledger.opened_object_identity.clone());
-                            (parent, ledger)
-                        });
-                    // Completing a withheld record also cures (N2).
-                    let growth_may_cure =
-                        sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator)
-                            || active.parser.reader.sealed_fragment();
-                    // #631 review M1: the exact stamp is captured here, after
-                    // `finish_job`'s check; an append in between must not be
-                    // anchored as read.
-                    if growth_may_cure && stamp.extent() != attempt_read_end {
-                        return None;
-                    }
-                    Some((digest, live, stamp, parent, sidecar, growth_may_cure))
+                    Some((digest, live, stamp, sidecar))
                 });
                 let OwnedActiveFile {
                     comparison_target,
@@ -15698,10 +15980,11 @@ impl OwnedSourceScan {
                         completed.reduction = None;
                     }
                 }
+                let codex_parent_census = codex_parent_identities.census(index);
                 invalidate_stale_codex_parent_resolution(
                     &mut parsed_file,
-                    &codex_parent_validation_roots,
-                    &codex_parent_frozen_census_paths,
+                    &mut codex_parent_identities,
+                    codex_parent_census,
                 );
                 codex_parent_resolution_retry_required |=
                     parsed_file.codex_parent_resolution_pending;
@@ -15746,31 +16029,23 @@ impl OwnedSourceScan {
                 };
                 let terminal_loss = parsed_file.terminal_loss();
                 if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
-                    let parent_session_ref = resolve_codex_identity(parent_session_ref.as_str());
-                    if index.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
-                        || index
-                            .codex_parent_ownership_refs
-                            .contains(parent_session_ref.as_str())
-                    {
-                        index.codex_parent_ownership_refs.insert(parent_session_ref);
-                    }
+                    index.record_codex_parent_ref(parent_session_ref);
                 }
                 if let Some((session_id, ledger)) =
                     parsed_file.codex_parent_ownership_ledger.as_ref()
                 {
                     let session_id = resolve_codex_identity(session_id.as_str());
-                    let ledger_is_unique_current_parent = ledger.scan_complete
-                        && current_codex_parent_opened_identity(
-                            &codex_parent_validation_roots,
-                            &codex_parent_frozen_census_paths,
-                            session_id.as_str(),
-                        )
-                        .as_deref()
-                            == Some(ledger.opened_object_identity.as_str());
+                    // L-5: a fresh open after the parent's own parse, only for a
+                    // referenced parent (the only kind whose ledger is kept).
                     if index
                         .codex_parent_ownership_refs
                         .contains(session_id.as_str())
-                        && ledger_is_unique_current_parent
+                        && ledger.scan_complete
+                        && codex_parent_identities
+                            .reprobe(codex_parent_identities.census(index), &session_id)
+                            .ok()
+                            .as_deref()
+                            == Some(ledger.opened_object_identity.as_str())
                     {
                         index
                             .codex_parent_ownership_ledgers
@@ -15789,15 +16064,29 @@ impl OwnedSourceScan {
                 } else {
                     settled_residue_index_keys.insert(index_key.clone());
                 }
-                for session_id in &parsed_file.state_only_blocked_session_ids {
-                    let session_id = resolve_codex_identity(session_id.as_str());
+                let blocked = parsed_file
+                    .state_only_blocked_session_ids
+                    .iter()
+                    .map(|session_id| resolve_codex_identity(session_id.as_str()))
+                    .collect::<BTreeSet<_>>();
+                for session_id in &blocked {
                     if non_progressing_residue {
                         residue_blocked_session_ids.insert(session_id.clone());
                     }
                     codex_state_only_blocked_session_ids.insert(session_id.clone());
                     index
                         .codex_state_only_blocked_session_ids
-                        .insert(session_id);
+                        .insert(session_id.clone());
+                }
+                if source == SnapshotSource::Codex {
+                    // L-SB: this (settleable) parse is each member's whole
+                    // contribution. `aliases` includes the candidate itself, so
+                    // `index_key` repeats: intentional and idempotent.
+                    for key in std::iter::once(index_key.clone())
+                        .chain(aliases.iter().map(|member| local_index_key(&member.path)))
+                    {
+                        index.attribute_codex_blocked(&key, blocked.clone());
+                    }
                 }
                 let report = parsed_file.report;
                 let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
@@ -15808,16 +16097,66 @@ impl OwnedSourceScan {
                     .as_ref()
                     .filter(|_| source == SnapshotSource::Codex && aliases.is_empty())
                 {
-                    // Memoize only a loss-free terminal hold; anything else
-                    // (completion included) clears a stale entry.
+                    // PR-1: every settleable held singleton (usage-bearing and
+                    // terminal over-line-cap included; `non_progressing_residue`
+                    // already requires `complete_except_over_line_cap` and excludes
+                    // parent-pending). Anything else, completion included, clears
+                    // a stale entry.
                     let held = !parse_complete
                         && non_progressing_residue
-                        && ownership_incomplete_file_count > 0
-                        && report.complete()
-                        && recognized_usage_drop_count == 0
-                        && dropped_usage_record_count == 0;
+                        && ownership_incomplete_file_count > 0;
                     match memo_candidate.filter(|_| held) {
-                        Some((digest, live, stamp, parent, sidecar, growth_may_cure)) => {
+                        Some((digest, live, stamp, sidecar)) => {
+                            // L4: the ledger identity the classification used, and
+                            // the parent's opened identity. When a ledger was used,
+                            // the after-parse fence just proved the parent is at
+                            // it, so no second open. Otherwise the probe is a wake
+                            // input only, charged when it opens.
+                            let used = parsed_file.codex_parent_ledger_identity_used.clone();
+                            let parent =
+                                parsed_file
+                                    .codex_parent_session_ref
+                                    .as_deref()
+                                    .map(|parent| {
+                                        let current = match used.clone() {
+                                            Some(used) => Some(used),
+                                            None => {
+                                                let (current, fresh) = codex_parent_identities
+                                                    .probe(
+                                                        codex_parent_identities.census(index),
+                                                        parent,
+                                                    );
+                                                if fresh {
+                                                    codex_page.charge(
+                                                    false,
+                                                    sampled_scan::codex_cursor::SAMPLE_READ_BYTES,
+                                                );
+                                                }
+                                                current.ok()
+                                            }
+                                        };
+                                        sampled_scan::codex_cursor::ParentDep {
+                                            id: parent.to_owned(),
+                                            // An invalidation dependency only, never
+                                            // proof of use: the ledger the parse used
+                                            // takes precedence; with none, the indexed
+                                            // identity (main's term), so its arrival,
+                                            // change or removal misses once.
+                                            ledger: used.clone().or_else(|| {
+                                                index
+                                                    .codex_parent_ownership_ledgers
+                                                    .get(resolve_codex_identity(parent).as_str())
+                                                    .map(|ledger| {
+                                                        ledger.opened_object_identity.clone()
+                                                    })
+                                            }),
+                                            current,
+                                        }
+                                    });
+                            let own_ledger = parsed_file
+                                .codex_parent_ownership_ledger
+                                .as_ref()
+                                .is_some_and(|(_, ledger)| ledger.scan_complete);
                             context.cache.memo_record(
                                 sampled_scan::codex_cursor::memo_key(
                                     &context.namespace,
@@ -15841,9 +16180,19 @@ impl OwnedSourceScan {
                                             .collect(),
                                         diagnostic_reason,
                                         parsed_snapshot_count: parsed_file.snapshots.len(),
+                                        held: sampled_scan::codex_cursor::HeldCounts {
+                                            over_line_cap: report.over_line_cap_count,
+                                            recognized_usage_drop: recognized_usage_drop_count,
+                                            dropped_usage_record: dropped_usage_record_count,
+                                            terminal_line_loss: parsed_file
+                                                .terminal_line_loss_count,
+                                        },
+                                        parent_ref: parsed_file.codex_parent_session_ref.clone(),
                                     },
                                 )
-                                .growth_may_cure(growth_may_cure),
+                                // Every singleton entry is exact (PR-1).
+                                .growth_may_cure(true)
+                                .own_ledger(own_ledger),
                             )
                         }
                         None => context
@@ -15905,7 +16254,15 @@ impl OwnedSourceScan {
                         if snapshot.usage_accounting_contract.as_deref()
                             == Some("session_exclusive_reported_usage:v1")
                         {
-                            index.codex_state_only_blocked_session_ids.remove(
+                            // L-SB: the accepted exclusive body supersedes this
+                            // file's (and its aliases') own block; any other key
+                            // still blocking the id keeps it. `aliases` includes
+                            // the candidate, so `index_key` repeats: intentional,
+                            // the second is a no-op.
+                            index.accept_codex_block(
+                                std::iter::once(index_key.clone()).chain(
+                                    aliases.iter().map(|member| local_index_key(&member.path)),
+                                ),
                                 resolve_codex_identity(snapshot.source_session_id.as_str())
                                     .as_str(),
                             );
@@ -16337,19 +16694,10 @@ impl OwnedSourceScan {
                     if let (SnapshotSource::Codex, true, Some(context), Some(inventory)) =
                         (source, clean, sampling.as_ref(), inventory)
                     {
-                        let present = index
-                            .traversal
-                            .as_ref()
-                            .map(|traversal| {
-                                traversal
-                                    .codex_rollout_paths
-                                    .iter()
-                                    .map(|key| sampled_scan::codex_cursor::compact_key(key))
-                                    .collect::<BTreeSet<_>>()
-                            })
-                            .unwrap_or_default();
+                        // Read before the release: `keep` runs under the cursor
+                        // lock and must not take it again.
                         let paused = context.cache.cursor_group_owner();
-                        let released = context.cache.release_join_owners(&present, |owner| {
+                        release_departed_join_owners(index, &context.cache, |owner| {
                             inventory.headers.iter().any(|header| header.owner == owner)
                                 || paused.as_deref() == Some(owner)
                                 || codex_join_groups.iter().any(|group| group.owner == owner)
@@ -16357,9 +16705,6 @@ impl OwnedSourceScan {
                                     .as_ref()
                                     .is_some_and(|boot| boot.group.owner == owner)
                         });
-                        for owner in released {
-                            index.codex_state_only_blocked_session_ids.remove(&owner);
-                        }
                     }
                 }
                 let traversal_snapshot = index
@@ -16675,6 +17020,9 @@ impl OwnedSourceScan {
                 });
                 if sampled_acquisition.is_some() {
                     crate::local_resource_diagnostics::cache_lifecycle_totals();
+                    crate::local_resource_diagnostics::codex_memo_lifecycle_totals(
+                        source.api_slug(),
+                    );
                 }
                 resource_probe.collection(
                     source.api_slug(),
@@ -16877,20 +17225,49 @@ impl OwnedSourceScan {
                 // Keyed per namespace (R1-M1): the digest carries the upload
                 // context, so concurrent namespaces must not evict each other.
                 let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
-                if let Some(entry) = context.cache.memo_lookup(&memo_key) {
+                use crate::local_resource_diagnostics::codex_memo_lifecycle;
+                // R1-M1: an owed parent whose held parse yields its own ledger
+                // must be re-read so the ledger is inserted.
+                let owed_parent = codex_session_id_candidates_from_path(&candidate.path)
+                    .iter()
+                    .any(|id| {
+                        let id = resolve_codex_identity(id);
+                        index.codex_parent_ownership_refs.contains(&id)
+                            && !index
+                                .codex_parent_ownership_ledgers
+                                .get(&id)
+                                .is_some_and(|ledger| ledger.scan_complete)
+                    });
+                let entry = context.cache.memo_lookup(&memo_key);
+                let bypass =
+                    owed_parent && entry.as_ref().is_some_and(|entry| entry.has_own_ledger());
+                if bypass {
+                    codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther);
+                }
+                if let Some(entry) = entry.filter(|_| !bypass) {
                     // The match re-reads two samples of the held file (M3).
                     codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                     let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
                         &codex_title_metadata,
                         &candidate.path,
                     );
-                    let parent_ledger = entry.parent_ref().and_then(|parent| {
-                        index
-                            .codex_parent_ownership_ledgers
-                            .get(resolve_codex_identity(parent).as_str())
-                            .map(|ledger| ledger.opened_object_identity.clone())
+                    // L4 (PR-1): the parent's index ledger identity, and its
+                    // current opened identity (L-5 probe; charged when it opens).
+                    let parent_now = entry.parent_ref().map(|parent| {
+                        let (current, fresh) = codex_parent_identities
+                            .probe(codex_parent_identities.census(index), parent);
+                        if fresh {
+                            codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                        }
+                        sampled_scan::codex_cursor::ParentNow {
+                            ledger: index
+                                .codex_parent_ownership_ledgers
+                                .get(resolve_codex_identity(parent).as_str())
+                                .map(|ledger| ledger.opened_object_identity.clone()),
+                            current: current.ok(),
+                        }
                     });
-                    let hit = sampled_scan::reduction_dependencies(
+                    let digest = sampled_scan::reduction_dependencies(
                         source,
                         &candidate,
                         &codex_title_metadata,
@@ -16910,14 +17287,18 @@ impl OwnedSourceScan {
                             ),
                             &sampled_scan::codex_cursor::counting_view(&candidate, index),
                         )
-                    })
-                    .and_then(|digest| {
-                        entry.matches(&digest, &opened_file, parent_ledger, &sidecar_now)
+                    });
+                    let hit = digest.as_deref().and_then(|digest| {
+                        entry.matches(digest, &opened_file, parent_now.as_ref(), &sidecar_now)
                     });
                     if let Some(stamp) = hit {
                         // An append cannot cure this hold and no wake
                         // dependency changed: disclose the same terminal
                         // debt again at zero transcript bytes.
+                        codex_memo_lifecycle::add(
+                            codex_memo_lifecycle::Event::HitEstimatedAvoidedParserBytes,
+                            stamp.extent(),
+                        );
                         context.cache.memo_hit(&memo_key, stamp);
                         let keep_previous = decision != CandidateDecision::ReconcileLegacy
                             && !index
@@ -16944,7 +17325,30 @@ impl OwnedSourceScan {
                                 pending_finalization: &mut pending_finalization,
                             },
                         );
+                        // R1-L6: the fresh path's session count, replayed.
+                        scanned_session_count += entry.disclosure().parsed_snapshot_count;
                         pending!();
+                    }
+                    match digest.as_deref().and_then(|digest| {
+                        entry.grew_past_exact(
+                            digest,
+                            &opened_file,
+                            parent_now.as_ref(),
+                            &sidecar_now,
+                        )
+                    }) {
+                        Some(extent) => {
+                            codex_memo_lifecycle::record(
+                                codex_memo_lifecycle::Event::MissExactStamp,
+                            );
+                            codex_memo_lifecycle::add(
+                                codex_memo_lifecycle::Event::MissExactStampBytes,
+                                extent,
+                            );
+                        }
+                        None => {
+                            codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther)
+                        }
                     }
                     context.cache.memo_forget(&memo_key);
                 }
@@ -16990,6 +17394,12 @@ impl OwnedSourceScan {
                     );
                     pending!();
                 }
+                #[cfg(test)]
+                CODEX_BEFORE_PARSE.with(|slot| {
+                    if let Some(hook) = slot.borrow_mut().as_mut() {
+                        hook(&candidate.path);
+                    }
+                });
                 // Fresh-first page budget, decided before any retained state is
                 // consumed: the optimistic read is the tail extent when a
                 // retained entry exists, the whole file otherwise.
@@ -17452,8 +17862,7 @@ impl OwnedSourceScan {
             state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
-            codex_parent_validation_roots,
-            codex_parent_frozen_census_paths,
+            codex_parent_identities,
             codex_parent_ownership_ledgers,
             census_window_end,
             discovered_file_count,
@@ -26243,6 +26652,11 @@ impl ScanIndex {
     /// once, and reject conflicting values that collapse to one UUID key.
     fn canonicalize_codex_identity_keys(&mut self) -> bool {
         canonicalize_codex_identity_set(&mut self.codex_state_only_blocked_session_ids);
+        canonicalize_codex_identity_set(&mut self.codex_state_only_blocked_unattributed);
+        canonicalize_codex_identity_set(&mut self.codex_state_only_blocked_legacy);
+        for blocked in self.codex_state_only_blocked_by_file.values_mut() {
+            canonicalize_codex_identity_set(blocked);
+        }
         canonicalize_codex_identity_set(&mut self.codex_parent_ownership_refs);
         canonicalize_codex_identity_map(&mut self.codex_state_only_snapshot_fingerprints)
             && canonicalize_codex_identity_map(&mut self.codex_parent_ownership_ledgers)
@@ -27759,6 +28173,7 @@ impl ScanIndex {
             } else {
                 result.confirmed_empty_files.remove(key);
             }
+            result.revert_codex_blocked_attribution(previous, key);
             match previous.terminal_jsonl_dispositions.get(key) {
                 Some(disposition) => {
                     result
@@ -27872,6 +28287,7 @@ impl ScanIndex {
             } else {
                 self.confirmed_empty_files.remove(key);
             }
+            self.revert_codex_blocked_attribution(previous, key);
             match previous.terminal_jsonl_dispositions.get(key) {
                 Some(disposition) => {
                     self.terminal_jsonl_dispositions
@@ -28080,6 +28496,12 @@ impl ScanIndex {
                 .clone(),
             codex_state_only_snapshot_fingerprints,
             codex_state_only_blocked_session_ids: self.codex_state_only_blocked_session_ids.clone(),
+            codex_state_only_blocked_by_file: self.codex_state_only_blocked_by_file.clone(),
+            codex_state_only_blocked_unattributed: self
+                .codex_state_only_blocked_unattributed
+                .clone(),
+            codex_state_only_blocked_legacy: self.codex_state_only_blocked_legacy.clone(),
+            codex_state_only_blocked_attributed: self.codex_state_only_blocked_attributed,
             codex_parent_ownership_refs: self.codex_parent_ownership_refs.clone(),
             codex_parent_ownership_ledgers: self.codex_parent_ownership_ledgers.clone(),
             claude_desktop_title_files: self.claude_desktop_title_files.clone(),
@@ -28275,6 +28697,138 @@ impl ScanIndex {
         let files = &self.files;
         self.terminal_jsonl_dispositions
             .retain(|key, _| files.contains_key(key));
+    }
+
+    /// L-SB upgrade. Idempotent; the Codex page start calls it first.
+    fn migrate_codex_blocked_attribution(&mut self) {
+        if !self.codex_state_only_blocked_attributed {
+            self.codex_state_only_blocked_legacy
+                .extend(self.codex_state_only_blocked_session_ids.iter().cloned());
+            self.codex_state_only_blocked_attributed = true;
+        }
+    }
+
+    /// L-SB: `key`'s latest settleable disclosure blocks exactly `blocked`;
+    /// release every id it blocked before and no longer does.
+    pub(in crate::snapshots) fn attribute_codex_blocked(
+        &mut self,
+        key: &str,
+        blocked: BTreeSet<String>,
+    ) {
+        let previous = if blocked.is_empty() {
+            self.codex_state_only_blocked_by_file.remove(key)
+        } else {
+            self.codex_state_only_blocked_by_file
+                .insert(key.to_owned(), blocked.clone())
+        }
+        .unwrap_or_default();
+        for session_id in previous.difference(&blocked) {
+            self.release_codex_block(session_id);
+        }
+    }
+
+    /// L-SB: a strict or parked disclosure keeps the prior body, so it keeps
+    /// the prior attribution and adds its own ids. Releases nothing.
+    pub(in crate::snapshots) fn extend_codex_blocked_attribution(
+        &mut self,
+        key: &str,
+        blocked: BTreeSet<String>,
+    ) {
+        if !blocked.is_empty() {
+            self.codex_state_only_blocked_by_file
+                .entry(key.to_owned())
+                .or_default()
+                .extend(blocked);
+        }
+    }
+
+    /// Releases a block no persistent holder keeps (the page set is not a
+    /// holder). O(map) per released id; releases follow shrinking settleable
+    /// disclosures, join-owner releases and acceptances
+    /// (`accept_codex_block`) only.
+    pub(in crate::snapshots) fn release_codex_block(&mut self, session_id: &str) {
+        if self
+            .codex_state_only_blocked_unattributed
+            .contains(session_id)
+            || self.codex_state_only_blocked_legacy.contains(session_id)
+            || self
+                .codex_state_only_blocked_by_file
+                .values()
+                .any(|blocked| blocked.contains(session_id))
+        {
+            return;
+        }
+        self.codex_state_only_blocked_session_ids.remove(session_id);
+    }
+
+    /// L-SB: an accepted exclusive body (publication) or joined body
+    /// (`Boot::Unchanged`) supersedes the accepting keys' own block on
+    /// `session_id`. Any other key whose latest disclosure still blocks it
+    /// keeps it blocked; the accepted body covers it meanwhile. A legacy-only
+    /// claim is cleared here, as on main (class (h), disclosed).
+    pub(in crate::snapshots) fn accept_codex_block<K: AsRef<str>>(
+        &mut self,
+        accepting_keys: impl IntoIterator<Item = K>,
+        session_id: &str,
+    ) {
+        for key in accepting_keys {
+            let key = key.as_ref();
+            let emptied = self
+                .codex_state_only_blocked_by_file
+                .get_mut(key)
+                .is_some_and(|blocked| {
+                    blocked.remove(session_id);
+                    blocked.is_empty()
+                });
+            if emptied {
+                self.codex_state_only_blocked_by_file.remove(key);
+            }
+        }
+        self.codex_state_only_blocked_unattributed
+            .remove(session_id);
+        self.codex_state_only_blocked_legacy.remove(session_id);
+        self.release_codex_block(session_id);
+    }
+
+    /// L-SB revert: the reverted parse's attribution stays beside the
+    /// committed one, so the key's next parse releases what it no longer
+    /// blocks. Re-block only committed ids that were still blocked then, and
+    /// keep attribution only for ids blocked after the revert.
+    pub(in crate::snapshots) fn revert_codex_blocked_attribution(
+        &mut self,
+        previous: &ScanIndex,
+        key: &str,
+    ) {
+        let committed = previous.codex_state_only_blocked_by_file.get(key);
+        if let Some(committed) = committed {
+            self.codex_state_only_blocked_session_ids.extend(
+                committed
+                    .intersection(&previous.codex_state_only_blocked_session_ids)
+                    .cloned(),
+            );
+        }
+        let current = self.codex_state_only_blocked_by_file.remove(key);
+        let mut blocked = committed.cloned().unwrap_or_default();
+        blocked.extend(current.unwrap_or_default());
+        blocked.retain(|session_id| {
+            self.codex_state_only_blocked_session_ids
+                .contains(session_id)
+        });
+        if !blocked.is_empty() {
+            self.codex_state_only_blocked_by_file
+                .insert(key.to_owned(), blocked);
+        }
+    }
+
+    /// The bounded parent-ref set (`MAX_CODEX_PARENT_LEDGER_REFS`): a fresh
+    /// parse and a memo replay request the same way.
+    pub(in crate::snapshots) fn record_codex_parent_ref(&mut self, parent: &str) {
+        let parent = resolve_codex_identity(parent);
+        if self.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
+            || self.codex_parent_ownership_refs.contains(parent.as_str())
+        {
+            self.codex_parent_ownership_refs.insert(parent);
+        }
     }
 
     fn effective_upload_body_witness_revision_requires_adoption(&self, key: &str) -> bool {
@@ -59232,12 +59786,20 @@ mod tests {
             },
         );
         let frozen_census_paths = BTreeSet::from([local_index_key(&parent_path)]);
-        let validated_before_parent_change = validated_codex_parent_ownership_ledgers(
-            &index,
-            std::slice::from_ref(&root),
-            &frozen_census_paths,
-        );
+        let roots = std::slice::from_ref(&root);
+        let census = CodexParentCensus::new(roots, &frozen_census_paths);
+        let validated_before_parent_change =
+            validated_codex_parent_ownership_ledgers(&index, census);
         assert!(validated_before_parent_change.contains_key(parent_id));
+        // L-5: one identities object for the whole test; its slot now holds
+        // the parent's old identity.
+        let mut ids = CodexParentIdentities {
+            census_valid: true,
+            last: None,
+        };
+        let (old_identity, fresh) = ids.probe(census, parent_id);
+        assert!(fresh && old_identity.is_ok());
+        assert_eq!(ids.probe(census, parent_id), (old_identity.clone(), false));
         let duplicate_parent_path =
             root.join(format!("rollout-2026-08-02T08-05-00-{parent_id}.jsonl"));
         fs::copy(&parent_path, &duplicate_parent_path).expect("write duplicate parent rollout");
@@ -59245,18 +59807,12 @@ mod tests {
             local_index_key(&parent_path),
             local_index_key(&duplicate_parent_path),
         ]);
-        assert!(validated_codex_parent_ownership_ledgers(
-            &index,
-            std::slice::from_ref(&root),
-            &duplicate_census_paths,
-        )
-        .is_empty());
-        assert!(current_codex_parent_opened_identity(
-            std::slice::from_ref(&root),
-            &duplicate_census_paths,
-            parent_id,
-        )
-        .is_none());
+        let duplicate_census = CodexParentCensus::new(roots, &duplicate_census_paths);
+        assert!(validated_codex_parent_ownership_ledgers(&index, duplicate_census).is_empty());
+        assert!(matches!(
+            codex_parent_open(duplicate_census, parent_id),
+            Err(CodexParentUnresolvable::Duplicated)
+        ));
         fs::remove_file(&duplicate_parent_path).expect("remove duplicate parent rollout");
 
         let appended_turn = json!({"timestamp":"2026-08-02T08:10:01Z","type":"turn_context","payload":{"turn_id":"new-parent-turn","model":"gpt-5.6-sol"}});
@@ -59280,11 +59836,7 @@ mod tests {
                 + "\n",
         )
         .expect("append parent rollout");
-        let validated = validated_codex_parent_ownership_ledgers(
-            &index,
-            std::slice::from_ref(&root),
-            &frozen_census_paths,
-        );
+        let validated = validated_codex_parent_ownership_ledgers(&index, census);
         assert!(
             validated.is_empty(),
             "changed parent must invalidate old ledger"
@@ -59320,13 +59872,25 @@ mod tests {
         let mut stale_child =
             parse_codex_test_with_ledgers(&child_path, validated_before_parent_change);
         assert!(!stale_child.snapshots.is_empty());
+        // The slot still holds the old identity: a cached fence would pass
+        // here. The fence re-opens, so it refuses.
+        assert_eq!(ids.probe(census, parent_id), (old_identity.clone(), false));
         assert!(invalidate_stale_codex_parent_resolution(
             &mut stale_child,
-            std::slice::from_ref(&root),
-            &frozen_census_paths,
+            &mut ids,
+            census,
         ));
         assert!(stale_child.snapshots.is_empty());
         assert!(!stale_child.complete());
+        // The fence's open overwrote the slot with the new identity.
+        let (new_identity, fresh) = ids.probe(census, parent_id);
+        assert!(!fresh && new_identity.is_ok() && new_identity != old_identity);
+        // Before discovery completes every lookup is `Absent` (main's empty
+        // census), and a new step re-opens.
+        let invalid = CodexParentIdentities::new(SnapshotSource::Codex, None);
+        assert!(!invalid.census_valid);
+        ids.begin_step();
+        assert!(ids.probe(census, parent_id).1);
         let refreshed_parent = parse_codex_test_with_ledgers(&parent_path, BTreeMap::new());
         let (_, fresh_ledger) = refreshed_parent
             .codex_parent_ownership_ledger
@@ -59343,6 +59907,524 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(child_path);
+    }
+
+    #[test]
+    fn codex_parent_slot_is_bounded_and_unavailable_census_refuses() {
+        let root = temp_dir("codex-parent-slot-bound");
+        let parent_id = "019fc428-0000-7000-8000-0000000000aa";
+        let legacy_id = "legacy-parent";
+        let header = |id: &str| {
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":id,"thread_source":"user"}})
+                .to_string()
+                + "\n"
+        };
+        let parent_path = root.join(format!("rollout-2026-08-02T08-00-00-{parent_id}.jsonl"));
+        let legacy_path = root.join(format!("rollout-{legacy_id}.jsonl"));
+        fs::write(&parent_path, header(parent_id)).expect("write parent rollout");
+        fs::write(&legacy_path, header(legacy_id)).expect("write legacy parent rollout");
+        let paths = BTreeSet::from([local_index_key(&parent_path), local_index_key(&legacy_path)]);
+        let roots = std::slice::from_ref(&root);
+        let census = CodexParentCensus::new(roots, &paths);
+        let mut ids = CodexParentIdentities {
+            census_valid: true,
+            last: None,
+        };
+
+        // A UUID-shaped parent is kept: a 36-byte id and a 64-byte identity.
+        let (identity, fresh) = ids.probe(census, parent_id);
+        assert!(fresh);
+        let identity = identity.expect("parent opens");
+        assert!(identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let slot = ids.last.as_ref().expect("slot");
+        let kept = match &slot.probe {
+            CodexParentProbe::Identity(kept) => kept.capacity(),
+            CodexParentProbe::Unresolvable(_) => 0,
+        };
+        assert!(slot.session_id.capacity() + kept <= 100);
+        // The slot keys on the resolved id, as the uncached lookup does.
+        assert_eq!(
+            ids.probe(census, &parent_id.to_ascii_uppercase()),
+            (Ok(identity.clone()), false)
+        );
+
+        // An unavailable census never serves the slot: the baseline `Absent`
+        // refusal, and the slot is emptied, so the next lookup re-opens.
+        let no_traversal = ScanIndex::default();
+        let unavailable = ids.census(&no_traversal);
+        assert_eq!(
+            ids.probe(unavailable, parent_id),
+            (Err(CodexParentUnresolvable::Absent), true)
+        );
+        assert!(ids.last.is_none());
+        assert_eq!(ids.probe(census, parent_id), (Ok(identity.clone()), true));
+        assert_eq!(
+            ids.reprobe(unavailable, parent_id),
+            Err(CodexParentUnresolvable::Absent)
+        );
+        assert!(ids.last.is_none());
+        // An invalid page-start census is the same unavailable view, even
+        // over an index that has a traversal.
+        let mut with_traversal = ScanIndex::default();
+        with_traversal.install_terminal_unhealthy_traversal_for_retry_test(
+            SnapshotSource::Codex,
+            roots,
+            30,
+            0,
+        );
+        assert!(ids.census(&with_traversal).available);
+        let invalid = CodexParentIdentities::new(SnapshotSource::Codex, None);
+        assert!(!invalid.census(&with_traversal).available);
+
+        // Any other id resolves exactly as before but is never kept, so the
+        // slot stays bounded whatever a header names.
+        let _ = ids.probe(census, parent_id);
+        assert!(ids.last.is_some());
+        let (legacy, fresh) = ids.probe(census, legacy_id);
+        assert!(fresh && legacy.is_ok());
+        assert!(ids.last.is_none());
+        assert!(ids.probe(census, legacy_id).1);
+        let long = "x".repeat(64 * 1024);
+        assert_eq!(
+            ids.probe(census, &long),
+            (Err(CodexParentUnresolvable::Absent), true)
+        );
+        assert!(ids.last.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn sb_ids(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    /// SB-T18: every attributed id is blocked, and no attribution is empty.
+    fn assert_attribution_blocked(index: &ScanIndex) {
+        for (key, ids) in &index.codex_state_only_blocked_by_file {
+            assert!(!ids.is_empty(), "{key}: empty attribution");
+            for id in ids {
+                assert!(
+                    index.codex_state_only_blocked_session_ids.contains(id),
+                    "{key}: {id} attributed but not blocked"
+                );
+            }
+        }
+    }
+
+    /// The fresh finish (site 2) or a settleable replay (site 3) of `key`:
+    /// the page inserts every blocked id, then attributes them.
+    fn sb_disclose(index: &mut ScanIndex, key: &str, blocked: &[&str]) {
+        let blocked = sb_ids(blocked);
+        index
+            .codex_state_only_blocked_session_ids
+            .extend(blocked.iter().cloned());
+        index.attribute_codex_blocked(key, blocked);
+        assert_attribution_blocked(index);
+    }
+
+    /// Publication of `id`'s exclusive body by `key` (site 2, then the
+    /// holder-checked acceptance).
+    fn sb_publish(index: &mut ScanIndex, key: &str, id: &str) {
+        sb_disclose(index, key, &[]);
+        index.accept_codex_block([key.to_owned()], id);
+        assert_attribution_blocked(index);
+    }
+
+    fn sb_blocked(index: &ScanIndex, id: &str) -> bool {
+        index.codex_state_only_blocked_session_ids.contains(id)
+    }
+
+    /// A cold index: every listed key's latest disclosure (space-separated
+    /// ids), from scratch.
+    fn sb_cold(latest: &[(&str, &str)]) -> ScanIndex {
+        let mut index = ScanIndex::default();
+        index.migrate_codex_blocked_attribution();
+        for (key, blocked) in latest {
+            sb_disclose(
+                &mut index,
+                key,
+                &blocked.split_whitespace().collect::<Vec<_>>(),
+            );
+        }
+        index
+    }
+
+    /// L-SB upgrade (C-1, SB-T4): an index from before attribution moves its
+    /// whole blocked set to `legacy` once; attribution never releases a
+    /// legacy id, and only an acceptance, a holder-less join release or a
+    /// fresh index does.
+    #[test]
+    fn l_sb_upgrade_moves_the_blocked_set_to_legacy_once_and_attribution_never_releases_it() {
+        let mut index = ScanIndex::default();
+        index
+            .codex_state_only_blocked_session_ids
+            .extend(sb_ids(&["old-x", "old-y", "old-z"]));
+        index.migrate_codex_blocked_attribution();
+        assert!(index.codex_state_only_blocked_attributed);
+        assert_eq!(
+            index.codex_state_only_blocked_legacy,
+            sb_ids(&["old-x", "old-y", "old-z"])
+        );
+        // Idempotent: a later page start adds nothing.
+        sb_disclose(&mut index, "k1", &["new"]);
+        index.migrate_codex_blocked_attribution();
+        assert!(!index.codex_state_only_blocked_legacy.contains("new"));
+        // A key that blocked a legacy id re-parses, shrinks, is deleted (no
+        // retirement): the legacy id stays blocked.
+        sb_disclose(&mut index, "k1", &["old-x"]);
+        sb_disclose(&mut index, "k1", &[]);
+        assert!(sb_blocked(&index, "old-x") && !sb_blocked(&index, "new"));
+        // Released only by an acceptance or a holder-less join release.
+        index.accept_codex_block(["k9".to_owned()], "old-y");
+        assert!(!sb_blocked(&index, "old-y"));
+        index.codex_state_only_blocked_unattributed.remove("old-z");
+        index.codex_state_only_blocked_legacy.remove("old-z");
+        index.release_codex_block("old-z");
+        assert!(!sb_blocked(&index, "old-z"));
+        assert!(sb_blocked(&index, "old-x"));
+        assert_attribution_blocked(&index);
+    }
+
+    /// C-1 downgrade and re-upgrade: the four fields are additive and
+    /// skipped when empty, so an old binary loads the index, drops them on
+    /// its next save and keeps the blocked set. Re-upgrading moves the whole
+    /// set to `legacy` again (one jump), and nothing is released.
+    #[test]
+    fn l_sb_downgrade_and_reupgrade_preserve_every_block() {
+        let fresh = serde_json::to_value(ScanIndex::default()).unwrap();
+        for field in [
+            "codex_state_only_blocked_by_file",
+            "codex_state_only_blocked_unattributed",
+            "codex_state_only_blocked_legacy",
+            "codex_state_only_blocked_attributed",
+        ] {
+            assert!(fresh.get(field).is_none(), "{field} serialized when empty");
+        }
+        let mut index = ScanIndex::default();
+        index
+            .codex_state_only_blocked_session_ids
+            .insert("legacy-id".to_owned());
+        index.migrate_codex_blocked_attribution();
+        sb_disclose(&mut index, "held-key", &["held-id", "shared-id"]);
+        sb_disclose(&mut index, "other-key", &["shared-id"]);
+        index
+            .codex_state_only_blocked_session_ids
+            .insert("queued-owner".to_owned());
+        index
+            .codex_state_only_blocked_unattributed
+            .insert("queued-owner".to_owned());
+        let blocked = index.codex_state_only_blocked_session_ids.clone();
+        // Round trip through this binary keeps everything.
+        let saved = serde_json::to_value(&index).unwrap();
+        let reloaded: ScanIndex = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(
+            reloaded.codex_state_only_blocked_by_file,
+            index.codex_state_only_blocked_by_file
+        );
+        assert!(reloaded.codex_state_only_blocked_attributed);
+        // The old binary: unknown fields are ignored and gone on its save.
+        let mut old = saved;
+        for field in [
+            "codex_state_only_blocked_by_file",
+            "codex_state_only_blocked_unattributed",
+            "codex_state_only_blocked_legacy",
+            "codex_state_only_blocked_attributed",
+        ] {
+            assert!(old.as_object_mut().unwrap().remove(field).is_some());
+        }
+        let mut reupgraded: ScanIndex = serde_json::from_value(old).unwrap();
+        assert_eq!(reupgraded.codex_state_only_blocked_session_ids, blocked);
+        assert!(!reupgraded.codex_state_only_blocked_attributed);
+        reupgraded.migrate_codex_blocked_attribution();
+        assert_eq!(reupgraded.codex_state_only_blocked_legacy, blocked);
+        // Nothing is released by attribution after the jump.
+        sb_disclose(&mut reupgraded, "held-key", &[]);
+        sb_disclose(&mut reupgraded, "other-key", &[]);
+        assert_eq!(reupgraded.codex_state_only_blocked_session_ids, blocked);
+    }
+
+    /// SB-T5: two keys block X; one shrinks, X stays; the other shrinks, X
+    /// is released, equal to cold.
+    #[test]
+    fn l_sb_shared_id_is_released_only_when_its_last_holder_shrinks() {
+        let mut index = sb_cold(&[]);
+        sb_disclose(&mut index, "a", &["x"]);
+        sb_disclose(&mut index, "b", &["x"]);
+        sb_disclose(&mut index, "a", &[]);
+        assert!(sb_blocked(&index, "x"));
+        assert_eq!(
+            index.codex_state_only_blocked_session_ids,
+            sb_cold(&[("a", ""), ("b", "x")]).codex_state_only_blocked_session_ids
+        );
+        sb_disclose(&mut index, "b", &[]);
+        assert!(!sb_blocked(&index, "x"));
+        assert!(index.codex_state_only_blocked_by_file.is_empty());
+        assert_eq!(
+            index.codex_state_only_blocked_session_ids,
+            sb_cold(&[("a", ""), ("b", "")]).codex_state_only_blocked_session_ids
+        );
+    }
+
+    /// SB-T5b (zero-usage cure), both legs, each with a variant where another
+    /// stored key still names the id. (a) A held fork with ambiguous
+    /// candidates {X, Y} re-parses complete resolved to X: Y is released and
+    /// X, its own id, stays (a complete fork still blocks it). (b) A held
+    /// non-fork session re-parses complete with zero usage: it blocks
+    /// nothing, and its own id is released.
+    #[test]
+    fn l_sb_zero_usage_cure_legs_release_only_holderless_ids() {
+        for other_names_it in [false, true] {
+            let mut index = sb_cold(&[]);
+            if other_names_it {
+                sb_disclose(&mut index, "other", &["y"]);
+            }
+            sb_disclose(&mut index, "fork", &["x", "y"]);
+            sb_disclose(&mut index, "fork", &["x"]);
+            assert!(sb_blocked(&index, "x"));
+            assert_eq!(sb_blocked(&index, "y"), other_names_it);
+            let mut latest = vec![("fork", "x")];
+            if other_names_it {
+                latest.push(("other", "y"));
+            }
+            assert_eq!(
+                index.codex_state_only_blocked_session_ids,
+                sb_cold(&latest).codex_state_only_blocked_session_ids,
+                "leg (a), other={other_names_it}"
+            );
+
+            let mut index = sb_cold(&[]);
+            if other_names_it {
+                sb_disclose(&mut index, "other", &["s"]);
+            }
+            sb_disclose(&mut index, "session", &["s"]);
+            sb_disclose(&mut index, "session", &[]);
+            assert_eq!(sb_blocked(&index, "s"), other_names_it);
+            assert!(!index
+                .codex_state_only_blocked_by_file
+                .contains_key("session"));
+            let mut latest = vec![("session", "")];
+            if other_names_it {
+                latest.push(("other", "s"));
+            }
+            assert_eq!(
+                index.codex_state_only_blocked_session_ids,
+                sb_cold(&latest).codex_state_only_blocked_session_ids,
+                "leg (b), other={other_names_it}"
+            );
+        }
+    }
+
+    /// SB-T10: `Boot::Unchanged` (an acceptance by the group's members)
+    /// releases an owner only the members or `unattributed` hold, and keeps
+    /// one a non-member key still blocks: the members' attribution is
+    /// dropped, the other key's kept.
+    #[test]
+    fn l_sb_boot_unchanged_acceptance_is_holder_checked() {
+        let mut index = sb_cold(&[]);
+        sb_disclose(&mut index, "m1", &["owner"]);
+        sb_disclose(&mut index, "m2", &["owner"]);
+        index
+            .codex_state_only_blocked_unattributed
+            .insert("owner".to_owned());
+        index.accept_codex_block(["m1".to_owned(), "m2".to_owned()], "owner");
+        assert!(!sb_blocked(&index, "owner"));
+        assert!(index.codex_state_only_blocked_by_file.is_empty());
+        assert!(index.codex_state_only_blocked_unattributed.is_empty());
+
+        sb_disclose(&mut index, "m1", &["owner", "kept"]);
+        sb_disclose(&mut index, "outsider", &["owner"]);
+        index.accept_codex_block(["m1".to_owned()], "owner");
+        assert!(sb_blocked(&index, "owner") && sb_blocked(&index, "kept"));
+        assert_eq!(
+            index.codex_state_only_blocked_by_file["m1"],
+            sb_ids(&["kept"])
+        );
+        assert_eq!(
+            index.codex_state_only_blocked_by_file["outsider"],
+            sb_ids(&["owner"])
+        );
+        assert_attribution_blocked(&index);
+    }
+
+    /// SB-T19 (DB2, multi-holder control). K is a complete, unchanged fork
+    /// whose ambiguous candidates are {X, Z}; F (X's own rollout) publishes
+    /// X; H (held) blocks X again; F is deleted; H resolves away from X. X
+    /// stays blocked at every step, equal to cold. The 2-file form, and the
+    /// positive control: a single rollout with usage publishes, and X leaves
+    /// the set as on main (this also covers main's older hole: F publishes,
+    /// F is deleted, K still claims X).
+    #[test]
+    fn l_sb_acceptance_keeps_ids_another_key_still_claims() {
+        let mut index = sb_cold(&[]);
+        sb_disclose(&mut index, "k", &["x", "z"]);
+        sb_publish(&mut index, "f", "x");
+        assert!(sb_blocked(&index, "x"), "K still claims X");
+        sb_disclose(&mut index, "h", &["x"]);
+        assert!(sb_blocked(&index, "x"));
+        // F is deleted: nothing runs for it (no retirement).
+        sb_disclose(&mut index, "h", &[]);
+        assert!(sb_blocked(&index, "x"));
+        let cold = sb_cold(&[("k", "x z"), ("h", "")]);
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .is_superset(&cold.codex_state_only_blocked_session_ids));
+        assert_eq!(
+            index.codex_state_only_blocked_session_ids,
+            cold.codex_state_only_blocked_session_ids
+        );
+
+        // The 2-file form: F publishes X, goes held (re-blocks X), is
+        // rewritten complete with zero usage while K still claims X.
+        let mut index = sb_cold(&[]);
+        sb_disclose(&mut index, "k", &["x"]);
+        sb_publish(&mut index, "f", "x");
+        sb_disclose(&mut index, "f", &["x"]);
+        sb_disclose(&mut index, "f", &[]);
+        assert!(sb_blocked(&index, "x"));
+        assert_eq!(
+            index.codex_state_only_blocked_session_ids,
+            sb_cold(&[("k", "x"), ("f", "")]).codex_state_only_blocked_session_ids
+        );
+
+        // Positive control: a single rollout, held, then complete with usage.
+        let mut index = sb_cold(&[]);
+        sb_disclose(&mut index, "f", &["x"]);
+        sb_publish(&mut index, "f", "x");
+        assert!(!sb_blocked(&index, "x"));
+        assert!(index.codex_state_only_blocked_by_file.is_empty());
+    }
+
+    /// Class (h) (DL10), retained explicitly: a legacy-only claim (a
+    /// pre-upgrade claimant never re-parsed) is cleared by an acceptance,
+    /// exactly as main's publication drops the id. If the accepting file's
+    /// coverage is later lost, warm no longer blocks the id while a cold
+    /// re-parse of the claimant would: an under-block identical to main,
+    /// permitted by D1 and disclosed. A post-upgrade claimant is kept.
+    #[test]
+    fn l_sb_class_h_legacy_only_claim_is_cleared_by_acceptance_as_on_main() {
+        let mut index = ScanIndex::default();
+        index
+            .codex_state_only_blocked_session_ids
+            .insert("x".to_owned());
+        index.migrate_codex_blocked_attribution();
+        sb_publish(&mut index, "f", "x");
+        assert!(!sb_blocked(&index, "x"), "class (h): as on main");
+        assert!(sb_blocked(&sb_cold(&[("k", "x")]), "x"));
+        // Attributed after the upgrade, the same claimant keeps X blocked.
+        let mut index = ScanIndex::default();
+        index
+            .codex_state_only_blocked_session_ids
+            .insert("x".to_owned());
+        index.migrate_codex_blocked_attribution();
+        sb_disclose(&mut index, "k", &["x"]);
+        sb_publish(&mut index, "f", "x");
+        assert!(sb_blocked(&index, "x"));
+    }
+
+    /// SB-T15: a join-owner release keeps an owner a held key (including a
+    /// deleted one, never retired) still attributes. SB-T6/SB-T6b: a revert
+    /// restores the committed attribution and block, and keeps a reverted
+    /// parse's still-blocked addition attributed so the next clean parse
+    /// releases it.
+    #[test]
+    fn l_sb_join_release_and_revert_keep_holders() {
+        let mut index = sb_cold(&[]);
+        index
+            .codex_state_only_blocked_session_ids
+            .insert("owner".to_owned());
+        index
+            .codex_state_only_blocked_unattributed
+            .insert("owner".to_owned());
+        sb_disclose(&mut index, "deleted-held", &["owner"]);
+        index.codex_state_only_blocked_unattributed.remove("owner");
+        index.codex_state_only_blocked_legacy.remove("owner");
+        index.release_codex_block("owner");
+        assert!(sb_blocked(&index, "owner"));
+        sb_disclose(&mut index, "deleted-held", &[]);
+        assert!(!sb_blocked(&index, "owner"));
+
+        // SB-T6: a shrinking parse of K is reverted.
+        let mut previous = sb_cold(&[]);
+        sb_disclose(&mut previous, "k", &["x"]);
+        let mut index = previous.clone();
+        sb_disclose(&mut index, "k", &[]);
+        assert!(!sb_blocked(&index, "x"));
+        index.revert_codex_blocked_attribution(&previous, "k");
+        assert!(sb_blocked(&index, "x"));
+        assert_eq!(index.codex_state_only_blocked_by_file["k"], sb_ids(&["x"]));
+        // SB-T6b: a growing parse adds Y, then is reverted; the next clean
+        // parse releases Y.
+        let mut index = previous.clone();
+        sb_disclose(&mut index, "k", &["x", "y"]);
+        index.revert_codex_blocked_attribution(&previous, "k");
+        assert_eq!(
+            index.codex_state_only_blocked_by_file["k"],
+            sb_ids(&["x", "y"])
+        );
+        sb_disclose(&mut index, "k", &["x"]);
+        assert!(sb_blocked(&index, "x") && !sb_blocked(&index, "y"));
+        assert_attribution_blocked(&index);
+    }
+
+    /// SB-T16 (fixture check, not a universal heap bound): the attribution
+    /// of 50 complete zero-usage forks and 50 held forks beside 1,000
+    /// published forks (no entry) costs at most 256 serialized bytes per
+    /// `by_file` entry. Prints the measured serialized cost, the accounted
+    /// heap cost (`heap_layout_bound`, the bytes `fields!(ScanIndex)` charges;
+    /// `None` on an unsupported layout) and the projections of both for the
+    /// C-1 counts. Only the serialized figure is asserted.
+    #[test]
+    fn l_sb_by_file_entry_cost_fixture() {
+        let key = |n: usize| {
+            format!(
+                "/Users/synthetic-user/.codex/sessions/2026/10/20/rollout-2026-10-20T10-00-00-019fa111-2222-7333-8444-{n:012}.jsonl"
+            )
+        };
+        let id = |n: usize| format!("019fa111-2222-7333-8444-{n:012}");
+        let mut index = sb_cold(&[]);
+        for n in 0..1_000 {
+            sb_publish(&mut index, &key(n), &id(n));
+        }
+        for n in 1_000..1_050 {
+            sb_disclose(&mut index, &key(n), &[id(n).as_str()]);
+        }
+        for n in 1_050..1_100 {
+            // A held fork blocks its own id and one ambiguous candidate.
+            let candidate = id(n + 10_000);
+            sb_disclose(&mut index, &key(n), &[id(n).as_str(), candidate.as_str()]);
+        }
+        // Nothing is deleted. A deleted held fork is never pruned, so its
+        // entry costs what a present one does.
+        let entries = index.codex_state_only_blocked_by_file.len();
+        assert_eq!(entries, 100);
+        assert!(index
+            .codex_state_only_blocked_by_file
+            .keys()
+            .all(|stored| (1_000..1_100).any(|n| *stored == key(n))));
+        let by_file = serde_json::to_string(&index.codex_state_only_blocked_by_file)
+            .unwrap()
+            .len();
+        let fields = serde_json::to_string(&serde_json::json!({
+            "codex_state_only_blocked_by_file": index.codex_state_only_blocked_by_file,
+            "codex_state_only_blocked_unattributed": index.codex_state_only_blocked_unattributed,
+            "codex_state_only_blocked_legacy": index.codex_state_only_blocked_legacy,
+            "codex_state_only_blocked_attributed": index.codex_state_only_blocked_attributed,
+        }))
+        .unwrap()
+        .len();
+        let per_entry = by_file / entries;
+        let accounted =
+            crate::heap_layout_bound::bound(&index.codex_state_only_blocked_by_file, usize::MAX);
+        let accounted_per_entry = accounted.map(|bytes| bytes / entries);
+        println!(
+            "SB_T16 by_file_entries={entries} by_file_bytes={by_file} four_fields_bytes={fields} \
+             per_entry_bytes={per_entry} projected_bytes_49_entries={} projected_bytes_4189_entries={} \
+             accounted_heap_bytes={accounted:?} accounted_per_entry_bytes={accounted_per_entry:?} \
+             accounted_projected_bytes_4189_entries={:?}",
+            per_entry * 49,
+            per_entry * 4_189,
+            accounted_per_entry.map(|bytes| bytes * 4_189)
+        );
+        assert!(per_entry <= 256, "{per_entry} B per entry");
     }
 
     #[test]
@@ -63466,12 +64548,12 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
@@ -63483,7 +64565,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
