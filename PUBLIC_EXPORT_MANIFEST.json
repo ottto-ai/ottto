@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 718,
-  "content_sha256": "aa3da315cbae38367dd6a33e1e75884914cc66c0f722661f6005fca94978318e",
+  "candidate_file_count": 720,
+  "content_sha256": "9fd375c464d2cdd030660601014ad71e3dd8a7886ddab9333b3f6d171eb5227e",
   "files": [
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "5c57cd02ff76d6bb16ae0b2cb3b6595e2822c0f2b82709fc27d362441ff45f4c",
-      "size_bytes": 841452
+      "sha256": "83dd714a622b1e9a601c544dbfc6d6c540f5fc17c3e1834fce6ae8d127b5f719",
+      "size_bytes": 842213
     },
     {
       "executable": false,
@@ -1268,6 +1268,13 @@
       "path": "crates/ottto-service/src/snapshot_sync/packing_count_tests.rs",
       "sha256": "ad70d9abd24292fb2ded745da990bc781fc741c8dba9f26ea164d59f06a8978f",
       "size_bytes": 10576
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync/permanent_finish_pipeline_tests.rs",
+      "sha256": "9abcd63c02f38431731b14d60150f80b5d15f92b1b83afb81e1697832c84f8cf",
+      "size_bytes": 15155
     },
     {
       "executable": false,
@@ -3274,6 +3281,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-20-permanent-source-finish.md",
+      "sha256": "574cd6b52d2dc5f61cacbd7c4c0ea8fb07627e4872029f812f20e7300fd539eb",
+      "size_bytes": 3377
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -5029,9 +5043,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T09:53:48+00:00",
+  "generated_at": "2026-10-20T13:45:09+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 719,
+  "output_file_count": 721,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5068,5 +5082,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "4810101daf492be4222b85aac201f6fbae471df2"
+  "source_commit": "d73631ebb1798ee18a6875e6d27f61d585bc40c8"
 }

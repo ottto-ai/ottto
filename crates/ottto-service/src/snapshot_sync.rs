@@ -5788,7 +5788,7 @@ fn finish_sync_source(
         // facts are durable: returning earlier would recreate the per-source
         // starvation wedge, while reporting success would hide the backend's
         // capacity condition from source-level isolation and cadence handling.
-        let _ = report_status_with_fresh_relay_token(
+        let status_result = report_status_with_fresh_relay_token(
             client,
             device,
             device_secret,
@@ -5809,36 +5809,48 @@ fn finish_sync_source(
             },
             scan_result.codex_counting_v2.as_deref(),
         );
-        // Fully accounted permanent refusals finish transport successfully.
-        // Their terminal health remains incomplete and none are marked accepted.
-        return if resolved_permanent_rejections {
-            Ok(())
-        } else {
-            Err(snapshot_entity_deferred(count))
-        };
-    }
-
-    report_status_with_fresh_relay_token(
-        client,
-        device,
-        device_secret,
-        support_dir,
-        source,
-        if scan_result.census_complete {
-            TerminalManifestSource::CompleteCensus(&index)
-        } else {
-            TerminalManifestSource::Withdraw
-        },
-        CollectorStatus {
+        if !resolved_permanent_rejections {
+            return Err(snapshot_entity_deferred(count));
+        }
+        // Permanent refusals still finish transport successfully and remain
+        // disclosed as errors. Only an otherwise earned, clean selected save
+        // may reach the common finalizer; every ineligible exit keeps Drop.
+        if status_result.is_err()
+            || !upload_fully_settled
+            || !crate::snapshots::claude_native_comparison::selected_page_is_clean(
+                &scan_result,
+                &index,
+                &claude_authority_disposition,
+            )
+            || !native_comparison_lease.as_ref().is_some_and(|lease| {
+                lease.allowed() || (actual_native_conjunction && scan_result.census_complete)
+            })
+        {
+            return Ok(());
+        }
+    } else {
+        report_status_with_fresh_relay_token(
+            client,
+            device,
+            device_secret,
+            support_dir,
             source,
-            machine_id,
-            scan_started_at: terminal_scan_started_at,
-            counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
-                .with_snapshot_terminal_counts(&index),
-            state: CollectorState::Success,
-        },
-        scan_result.codex_counting_v2.as_deref(),
-    )?;
+            if scan_result.census_complete {
+                TerminalManifestSource::CompleteCensus(&index)
+            } else {
+                TerminalManifestSource::Withdraw
+            },
+            CollectorStatus {
+                source,
+                machine_id,
+                scan_started_at: terminal_scan_started_at,
+                counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
+                    .with_snapshot_terminal_counts(&index),
+                state: CollectorState::Success,
+            },
+            scan_result.codex_counting_v2.as_deref(),
+        )?;
+    }
     if let Some(mut lease) = native_comparison_lease {
         lease.stage_window_after_save(
             comparison_completion.and_then(|comparison| comparison.window),
@@ -18594,6 +18606,9 @@ mod tests {
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    mod permanent_finish_pipeline_tests {
+        include!("snapshot_sync/permanent_finish_pipeline_tests.rs");
+    }
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
     }
