@@ -2803,6 +2803,29 @@ pub(super) mod tests {
         assert!(!scan.census_complete);
     }
 
+    fn assert_dependency_settlement(index: &ScanIndex, path: &Path, fingerprint: &str) {
+        let key = local_index_key(path);
+        let expected = BTreeSet::from([fingerprint.to_string()]);
+        assert_eq!(
+            index.file_snapshot_fingerprints.get(&key),
+            Some(&expected),
+            "common settlement preserves the exact entity set"
+        );
+        // The finalizer's file-set fold is inline, so mirror its domain and
+        // sorted-set iteration here while reusing its actual framing helper.
+        let mut digest = Sha256::new();
+        update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
+        for entity in &expected {
+            update_length_prefixed(&mut digest, entity.as_bytes());
+        }
+        let aggregate = format!("{:x}", digest.finalize());
+        assert_eq!(
+            index.files[&key].last_snapshot_fingerprint.as_deref(),
+            Some(aggregate.as_str()),
+            "common settlement preserves the canonical file aggregate"
+        );
+    }
+
     fn retained_dependency_fixture() -> (crate::test_scratch::ScratchDir, ScanIndex) {
         let root = crate::test_scratch::ScratchDir::new("codex-retained-dependency");
         fs::create_dir(root.join("sessions")).unwrap();
@@ -2818,13 +2841,7 @@ pub(super) mod tests {
         let (index, scan) = settle_dependency_page(&previous, index, scan);
         let fingerprint = scan.snapshots[0].snapshot_fingerprint.clone();
         assert_retained_dependency_shape(&index, &scan);
-        assert_eq!(
-            index.files[&local_index_key(&root.join("sessions/a.jsonl"))]
-                .last_snapshot_fingerprint
-                .as_ref(),
-            Some(&fingerprint),
-            "common settlement preserves the initial exact body"
-        );
+        assert_dependency_settlement(&index, &root.join("sessions/a.jsonl"), &fingerprint);
         (root, index)
     }
 
@@ -2878,12 +2895,7 @@ pub(super) mod tests {
             .unwrap()
             .snapshot_fingerprint
             .clone();
-        assert_eq!(
-            index.files[&local_index_key(&root.join("sessions/new.jsonl"))]
-                .last_snapshot_fingerprint
-                .as_ref(),
-            Some(&sibling)
-        );
+        assert_dependency_settlement(&index, &root.join("sessions/new.jsonl"), &sibling);
         if !known_updated {
             assert_eq!(
                 serde_json::to_vec(&index.files[&known_key]).unwrap(),
@@ -2920,12 +2932,7 @@ pub(super) mod tests {
             .unwrap()
             .snapshot_fingerprint
             .clone();
-        assert_eq!(
-            index.files[&local_index_key(&path)]
-                .last_snapshot_fingerprint
-                .as_ref(),
-            Some(&fingerprint)
-        );
+        assert_dependency_settlement(&index, &path, &fingerprint);
         println!("RETAINED_DEPENDENCY_CONTROL actual_hint=true offered=250 common_settled=true server_ack_proved=false");
     }
 
