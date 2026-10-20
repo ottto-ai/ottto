@@ -791,9 +791,13 @@ pub(crate) struct CodexScanDiagnostics {
     /// PR-P: held fork children per parent cause. Traversal-cumulative, as
     /// `unreadable_causes`: every page reports the running traversal total.
     pub parent_unresolvable: ParentUnresolvableCauses,
-    /// PR-P: the scope's parent-resolution restart count, only when this page
-    /// established it (its step-start pass or a restart ran). Omitted, never
-    /// a fabricated 0, on discovery pages or without a shared cache.
+    /// PR-P: the scope's parent-resolution restart budget consumed, only when
+    /// this page established it (its step-start pass or a restart ran).
+    /// Omitted, never a fabricated 0, on discovery pages or without a shared
+    /// cache. A budget counter, not a count of actual restarts: an evicted
+    /// slot re-enters spent and a poisoned cursor reports the budget
+    /// (`Some(2)`), so it may read 2 (or exceed it after re-entry) with fewer
+    /// restarts run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_restarts_in_scope: Option<u64>,
     pub quarantine_count: u64,

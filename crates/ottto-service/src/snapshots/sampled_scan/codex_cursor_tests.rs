@@ -5977,6 +5977,49 @@ fn witness_keys(cache: &SharedCache, namespace: &str) -> Vec<String> {
         .unwrap()
 }
 
+/// A namespace's whole parent entry: scope, match mark and every witness
+/// with its stored charge.
+type WitnessEntry = (
+    String,
+    Option<(String, u64)>,
+    Vec<(String, ParentWitness, usize)>,
+);
+
+/// `namespace`'s whole parent entry, read without touching anything.
+fn witness_entry(cache: &SharedCache, namespace: &str) -> Option<WitnessEntry> {
+    cache
+        .with_cursor(|cursor| {
+            cursor.parents.get(namespace).map(|entry| {
+                (
+                    entry.scope.clone(),
+                    entry.matched.clone(),
+                    entry
+                        .witnesses
+                        .entries
+                        .iter()
+                        .map(|(parent, (witness, charge))| {
+                            (parent.clone(), witness.clone(), *charge)
+                        })
+                        .collect(),
+                )
+            })
+        })
+        .unwrap()
+}
+
+/// `namespace`'s RAM witness of `parent`, read without touching anything.
+fn witness_of(cache: &SharedCache, namespace: &str, parent: &str) -> Option<ParentWitness> {
+    cache
+        .with_cursor(|cursor| {
+            cursor
+                .parents
+                .get(namespace)
+                .and_then(|entry| entry.witnesses.entries.get(parent))
+                .map(|(witness, _)| witness.clone())
+        })
+        .unwrap()
+}
+
 /// P-T26 (L1): a restart slot is keyed by (namespace, scope). A new scope is
 /// a new slot; the old scope's spent budget is never reset; two pairs whose
 /// keys collide share one budget (spent sooner, never refilled).
@@ -6251,6 +6294,10 @@ fn hopeless_admission_keeps_every_witness() {
     with_test_limits(2048, 8192, 64, || {
         let setup = witness_admission();
         let cache = &setup.cache;
+        // R2-L4: every witness value, charge, scope and match mark, not
+        // only the keys.
+        let entries = WITNESS_NAMESPACES.map(|namespace| witness_entry(cache, namespace));
+        assert!(entries.iter().all(Option::is_some));
         let intact = || {
             assert!(
                 cache.retained_checkpoint(&setup.key).is_some(),
@@ -6266,6 +6313,10 @@ fn hopeless_admission_keeps_every_witness() {
             for namespace in WITNESS_NAMESPACES {
                 assert_eq!(witness_keys(cache, namespace), WITNESS_KEYS, "{namespace}");
             }
+            assert_eq!(
+                WITNESS_NAMESPACES.map(|namespace| witness_entry(cache, namespace)),
+                entries
+            );
             assert_eq!(counter(cache, |c| c.parent_witness_evicted), 0);
             assert_eq!(cache.cursor_reserved(), 0);
         };
@@ -6884,11 +6935,32 @@ fn held_then_quiet(
     never: CodexParentUnresolvable,
 ) {
     let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
+    held_then_quiet_from(
+        fixture,
+        &cache,
+        ScanIndex::default(),
+        0,
+        expected,
+        limit,
+        never,
+    );
+}
+
+/// `held_then_quiet` continuing `cache` and `index` from generation `from`.
+fn held_then_quiet_from(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    from: u64,
+    expected: [u64; PARENT_UNRESOLVABLE_CAUSES],
+    limit: u64,
+    never: CodexParentUnresolvable,
+) {
+    let mut index = index;
     let mut held_at = None;
     let mut history = Vec::new();
-    for n in 0..=limit {
-        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, &cache, index, n));
+    for n in from..=from + limit {
+        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, cache, index, n));
         index = next;
         history.push(format!(
             "{n}: causes {:?} restarts {:?} parsed {parsed:?} scanned {} incomplete {} \
@@ -6911,9 +6983,9 @@ fn held_then_quiet(
         }
     }
     let held_at =
-        held_at.unwrap_or_else(|| panic!("never held: {history:#?}\n{}", counters(&cache)));
+        held_at.unwrap_or_else(|| panic!("never held: {history:#?}\n{}", counters(cache)));
     for n in held_at + 1..held_at + 3 {
-        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, &cache, index, n));
+        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, cache, index, n));
         assert!(parsed.is_empty(), "generation {n}: {parsed:?}");
         assert_eq!(parent_causes(&scan), expected, "generation {n}");
         index = next;
@@ -6937,6 +7009,543 @@ fn duplicated_parent_holds_its_fork_duplicated() {
         &home.fixture,
         only(CodexParentUnresolvable::Duplicated, 1),
         3,
+        CodexParentUnresolvable::ParentLossy,
+    );
+}
+
+// PR-P fix round 1: event (c), deferral chains, multi-page folds and the
+// wait-record transition.
+
+/// `id`'s rollout at `hour` on 2026-10-07 (`ScanRoot::file` is hour 10).
+fn rollout_at(fixture: &ScanRoot, id: &str, hour: &str) -> PathBuf {
+    fixture
+        .root
+        .join(format!("rollout-2026-10-07T{hour}-00-00-{id}.jsonl"))
+}
+
+/// The name `parses` records for `path`.
+fn file_name(path: &Path) -> String {
+    path.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// `scan`'s held children under a `parent_debt()` cause.
+fn parent_debt(scan: &SourceScanResult) -> u64 {
+    let causes = parent_causes(scan);
+    causes[CodexParentUnresolvable::ParentHeld.index()]
+        + causes[CodexParentUnresolvable::ParentLossy.index()]
+}
+
+/// One line past `MAX_JSONL_LINE_BYTES` (an image row) appended to `path`:
+/// a terminal over-line-cap loss, so a complete parse of the file records a
+/// terminal disposition and publishes no ledger.
+fn append_oversized_line(path: &Path) {
+    let mut row = b"{\"timestamp\":\"2026-10-07T08:40:01Z\",\"type\":\"response_item\",\
+        \"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\
+        \"image_url\":\""
+        .to_vec();
+    row.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+    row.extend_from_slice(b"\"}]}}\n");
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(&row)
+        .unwrap();
+}
+
+/// P-T34 (R1-M1, R2-M1): event (c). P's only rollout ends in a terminal
+/// over-line-cap line, so its one complete parse records a terminal
+/// disposition and no ledger. When C requests P, the unchanged P is skipped
+/// and witnessed `ParentLossy` at its probed identity instead of being read
+/// again: P is parsed exactly once, C is held `ParentLossy`, and from then on
+/// nothing is read.
+#[test]
+fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    append_oversized_line(&home.fixture.file(PARENT));
+    let parent = file_name(&home.fixture.file(PARENT));
+    let lossy = only(CodexParentUnresolvable::ParentLossy, 1);
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut parent_parses = 0;
+    let mut held_at = None;
+    let mut history = Vec::new();
+    for n in 0..6 {
+        let ((next, scan), parsed) = parses(|| home.generation(index, &cache, n));
+        index = next;
+        parent_parses += parsed.iter().filter(|name| **name == parent).count();
+        history.push(format!(
+            "{n}: causes {:?} restarts {:?} parsed {parsed:?}",
+            parent_causes(&scan),
+            restarts_in_scope(&scan)
+        ));
+        assert!(session_usage(&scan, CHILD).is_empty(), "{history:#?}");
+        if held_at.is_some() {
+            assert!(parsed.is_empty(), "{history:#?}");
+            assert_eq!(parent_causes(&scan), lossy, "{history:#?}");
+        } else if parent_causes(&scan) == lossy {
+            held_at = Some(n);
+        }
+    }
+    let held_at =
+        held_at.unwrap_or_else(|| panic!("never held: {history:#?}\n{}", counters(&cache)));
+    assert!(held_at <= 2, "{history:#?}");
+    assert_eq!(parent_parses, 1, "{history:#?}");
+    assert!(index
+        .terminal_jsonl_dispositions
+        .contains_key(&local_index_key(&home.fixture.file(PARENT))));
+    assert!(index.codex_parent_ownership_refs.contains(PARENT));
+    assert!(!index
+        .codex_parent_ownership_ledgers
+        .get(PARENT)
+        .is_some_and(|ledger| ledger.scan_complete));
+    let witness = witness_of(&cache, "cursor-fixture", PARENT);
+    assert!(
+        witness.as_ref().is_some_and(|witness| witness.cause
+            == CodexParentUnresolvable::ParentLossy
+            && witness.identity.is_some()
+            && witness.waits_on.is_none()),
+        "{witness:?}"
+    );
+}
+
+/// P-T34's duplicate-copy leg: two copies of a lossy P are both read and
+/// recorded with terminal dispositions before C exists. C sorts first, so it
+/// requests P before either copy is skipped; event (c)'s probe of each copy
+/// is `Duplicated`, so neither copy is witnessed `ParentLossy` (in RAM or
+/// in any count). The next match witnesses P `Duplicated`, C is held under
+/// it, and nothing is read again.
+#[test]
+fn duplicated_lossy_parent_is_never_witnessed_parent_lossy() {
+    let fixture = ScanRoot::with_sessions(&[]);
+    fs::write(fixture.file(PARENT), jsonl(&ForkHome::parent())).unwrap();
+    append_oversized_line(&fixture.file(PARENT));
+    fs::copy(fixture.file(PARENT), rollout_at(&fixture, PARENT, "11")).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    for n in 0..2 {
+        index = fixture_generation(&fixture, &cache, index, n).0;
+    }
+    assert_eq!(
+        index.terminal_jsonl_dispositions.len(),
+        2,
+        "{}",
+        counters(&cache)
+    );
+    let mut records = vec![json!({"timestamp": "2026-10-07T08:20:00Z",
+        "type": "session_meta",
+        "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}})];
+    records.extend(ForkHome::diverging_child(3));
+    fs::write(rollout_at(&fixture, CHILD, "05"), jsonl(&records)).unwrap();
+    let duplicated = only(CodexParentUnresolvable::Duplicated, 1);
+    let mut held_at = None;
+    let mut history = Vec::new();
+    for n in 2..8 {
+        let ((next, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, n));
+        index = next;
+        let witness = witness_of(&cache, "cursor-fixture", PARENT);
+        history.push(format!(
+            "{n}: causes {:?} restarts {:?} parsed {parsed:?} witness {witness:?}",
+            parent_causes(&scan),
+            restarts_in_scope(&scan)
+        ));
+        assert_eq!(
+            parent_causes(&scan)[CodexParentUnresolvable::ParentLossy.index()],
+            0,
+            "{history:#?}"
+        );
+        assert!(
+            !matches!(
+                witness,
+                Some(ParentWitness {
+                    cause: CodexParentUnresolvable::ParentLossy,
+                    ..
+                })
+            ),
+            "{history:#?}"
+        );
+        if held_at.is_some() {
+            assert!(parsed.is_empty(), "{history:#?}");
+            assert_eq!(parent_causes(&scan), duplicated, "{history:#?}");
+        } else if parent_causes(&scan) == duplicated {
+            held_at = Some(n);
+        }
+    }
+    assert!(
+        held_at.is_some_and(|n| n <= 4),
+        "{history:#?}\n{}",
+        counters(&cache)
+    );
+}
+
+const ABSENT_GRANDPARENT: &str = "019fa111-2222-7333-8444-333333333333";
+
+/// P-T5b (R2-B1): C -> P -> X with X's ref the 257th, so it never fits. P is
+/// held `DeferredRef` and witnessed `DeferredRef` (settling), and C is held
+/// `DeferredRef` under it: never a `parent_debt()` cause. P is not re-read
+/// every generation: from generation 2 nothing is parsed. P before C (P's
+/// ref already held from an earlier traversal) runs no restart; C before P
+/// runs at most one (C is pending before P's step-map entry exists).
+#[test]
+fn deferred_intermediate_parent_is_not_reread_every_generation() {
+    for c_first in [false, true] {
+        let fixture = ScanRoot::with_sessions(&[]);
+        write_rollout(
+            &fixture,
+            PARENT,
+            Some(ABSENT_GRANDPARENT),
+            &ForkHome::parent()[1..],
+        );
+        write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
+        let mut index = ScanIndex::default();
+        for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS - 1 {
+            index
+                .codex_parent_ownership_refs
+                .insert(format!("prefilled-{n:03}"));
+        }
+        if c_first {
+            fs::rename(fixture.file(CHILD), rollout_at(&fixture, CHILD, "09")).unwrap();
+        } else {
+            index.codex_parent_ownership_refs.insert(PARENT.to_owned());
+        }
+        let parent = file_name(&fixture.file(PARENT));
+        let cache = Arc::new(SharedCache::default());
+        let mut parent_parses = 0;
+        let mut history = Vec::new();
+        for n in 0..6 {
+            let ((next, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, n));
+            index = next;
+            parent_parses += parsed.iter().filter(|name| **name == parent).count();
+            history.push(format!(
+                "{n}: causes {:?} restarts {:?} parsed {parsed:?}",
+                parent_causes(&scan),
+                restarts_in_scope(&scan)
+            ));
+            assert_eq!(parent_debt(&scan), 0, "c_first {c_first}: {history:#?}");
+            assert!(!index
+                .codex_parent_ownership_refs
+                .contains(ABSENT_GRANDPARENT));
+            let restarts = restarts_in_scope(&scan);
+            if c_first {
+                assert!(
+                    restarts.is_some_and(|restarts| restarts <= 1),
+                    "{history:#?}"
+                );
+            } else {
+                assert_eq!(restarts, Some(0), "{history:#?}");
+            }
+            if n >= 2 {
+                assert!(parsed.is_empty(), "c_first {c_first}: {history:#?}");
+                assert_eq!(
+                    parent_causes(&scan),
+                    only(CodexParentUnresolvable::DeferredRef, 2),
+                    "c_first {c_first}: {history:#?}"
+                );
+            }
+        }
+        if c_first {
+            assert!(parent_parses <= 2, "{history:#?}");
+        } else {
+            assert_eq!(parent_parses, 1, "{history:#?}");
+        }
+        let witness = witness_of(&cache, "cursor-fixture", PARENT);
+        assert!(
+            witness
+                .as_ref()
+                .is_some_and(|witness| witness.cause == CodexParentUnresolvable::DeferredRef),
+            "c_first {c_first}: {witness:?}"
+        );
+    }
+}
+
+const GREAT_GRANDPARENT: &str = "019fa111-2222-7333-8444-222222222222";
+
+/// The settled census of `fixture` from generation `n` on a fresh index and
+/// cache (unspent budget): the cold oracle of a chain.
+fn cold_census(fixture: &ScanRoot, n: u64) -> (Vec<(&'static str, u64)>, BTreeSet<String>) {
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut last = None;
+    for m in n..n + 8 {
+        let (next, scan) = fixture_generation(fixture, &cache, index, m);
+        last = Some(census(&next, &scan));
+        index = next;
+    }
+    last.unwrap()
+}
+
+/// P-T10c (R2-M1, covers P-T10): C -> P -> G -> H in the worst page order (C
+/// first, H last) with the scope's restart budget already spent. No restart
+/// runs; links wait as `DeferredRestart` while the chain converges, never a
+/// `parent_debt()` cause; the chain then settles as a cold scan does.
+#[test]
+fn spent_budget_chain_never_counts_parent_debt_and_converges() {
+    let fixture = ScanRoot::with_sessions(&[]);
+    let root = ForkHome::parent();
+    let grandparent = [
+        root[1].clone(),
+        root[2].clone(),
+        turn_record("2026-10-07T08:20:01Z", "grandparent-own-turn"),
+        usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
+        turn_record("2026-10-07T08:40:01Z", "grandparent-own-turn-2"),
+        usage_record("2026-10-07T08:40:02Z", (150, 115, 17, 4), (20, 15, 3, 1)),
+    ];
+    let mut parent = grandparent[..4].to_vec();
+    parent.push(turn_record("2026-10-07T08:30:01Z", "parent-own-turn"));
+    parent.push(usage_record(
+        "2026-10-07T08:30:02Z",
+        (145, 110, 16, 3),
+        (15, 10, 2, 0),
+    ));
+    write_rollout(&fixture, GREAT_GRANDPARENT, None, &root[1..]);
+    write_rollout(&fixture, GRANDPARENT, Some(GREAT_GRANDPARENT), &grandparent);
+    write_rollout(&fixture, PARENT, Some(GRANDPARENT), &parent);
+    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
+    for (id, hour) in [
+        (CHILD, "05"),
+        (PARENT, "06"),
+        (GRANDPARENT, "07"),
+        (GREAT_GRANDPARENT, "08"),
+    ] {
+        fs::rename(fixture.file(id), rollout_at(&fixture, id, hour)).unwrap();
+    }
+    let cache = Arc::new(SharedCache::default());
+    let namespace = Scope("cursor-fixture".into());
+    let scope = group_scope(&ScanIndex::default());
+    for _ in 0..PARENT_RESTART_BUDGET {
+        cache.note_parent_restart(&namespace, &scope);
+    }
+    let mut index = ScanIndex::default();
+    let mut history = Vec::new();
+    let mut previous = None;
+    let mut settled = None;
+    for n in 0..10 {
+        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
+        index = next;
+        history.push(format!(
+            "{n}: causes {:?} restarts {:?}",
+            parent_causes(&scan),
+            restarts_in_scope(&scan)
+        ));
+        assert_eq!(parent_debt(&scan), 0, "{history:#?}");
+        assert_eq!(
+            restarts_in_scope(&scan),
+            Some(PARENT_RESTART_BUDGET),
+            "{history:#?}"
+        );
+        let now = census(&index, &scan);
+        let quiet = parent_causes(&scan) == [0; PARENT_UNRESOLVABLE_CAUSES];
+        if quiet && previous.as_ref() == Some(&now) {
+            settled = Some((n, now));
+            break;
+        }
+        previous = quiet.then_some(now);
+    }
+    let (n, warm) =
+        settled.unwrap_or_else(|| panic!("never settled: {history:#?}\n{}", counters(&cache)));
+    assert_eq!(warm, cold_census(&fixture, n + 1), "{history:#?}");
+}
+
+/// P-T16 (R2-M1): a traversal spanning pages. Twelve changed sessions and C
+/// (a fork of absent P, sorted first) are 13 candidates over 10-file pages.
+/// On each steady traversal the step-start match runs once, C's `Absent`
+/// count appears on its page and every later page of the traversal reports
+/// it again (the page-to-traversal fold, traversal-cumulative per page),
+/// P's witness survives every page, and restarts stay within budget.
+#[test]
+fn multi_page_traversal_folds_parent_causes_and_matches_once() {
+    let fillers = (0..12)
+        .map(|n| format!("019fa111-2222-7333-8444-9000000000{n:02}"))
+        .collect::<Vec<_>>();
+    let sessions = fillers
+        .iter()
+        .map(|id| (id.as_str(), 2))
+        .collect::<Vec<_>>();
+    let fixture = ScanRoot::with_sessions(&sessions);
+    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
+    fs::rename(fixture.file(CHILD), rollout_at(&fixture, CHILD, "05")).unwrap();
+    let absent = only(CodexParentUnresolvable::Absent, 1);
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut page = 0;
+    for traversal in 0..5 {
+        for id in &fillers {
+            fixture.append(id, &token_line(3 + traversal));
+        }
+        let before = crate::snapshots::codex_parent_step_start_matches_for_test();
+        let mut pages = Vec::new();
+        loop {
+            let (next, scan, _) = page_with(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(page),
+                |_| {},
+            );
+            index = next;
+            page += 1;
+            pages.push((
+                parent_causes(&scan),
+                restarts_in_scope(&scan),
+                witness_of(&cache, "cursor-fixture", PARENT).map(|witness| witness.cause),
+            ));
+            if index.traversal.is_none() {
+                break;
+            }
+            assert!(pages.len() < 10, "traversal {traversal}: {pages:?}");
+        }
+        let matches = crate::snapshots::codex_parent_step_start_matches_for_test() - before;
+        for (_, restarts, _) in &pages {
+            assert!(
+                !restarts.is_some_and(|restarts| restarts > PARENT_RESTART_BUDGET),
+                "traversal {traversal}: {pages:?}"
+            );
+        }
+        if traversal < 2 {
+            continue;
+        }
+        assert!(pages.len() >= 2, "traversal {traversal}: {pages:?}");
+        assert_eq!(matches, 1, "traversal {traversal}: {pages:?}");
+        let at = pages
+            .iter()
+            .position(|(causes, ..)| *causes == absent)
+            .unwrap_or_else(|| panic!("traversal {traversal}: {pages:?}"));
+        assert!(at + 1 < pages.len(), "traversal {traversal}: {pages:?}");
+        for (causes, ..) in &pages[..at] {
+            assert_eq!(
+                *causes, [0; PARENT_UNRESOLVABLE_CAUSES],
+                "traversal {traversal}: {pages:?}"
+            );
+        }
+        for (causes, _, witness) in &pages[at..] {
+            assert_eq!(*causes, absent, "traversal {traversal}: {pages:?}");
+            assert_eq!(
+                *witness,
+                Some(CodexParentUnresolvable::Absent),
+                "traversal {traversal}: {pages:?}"
+            );
+        }
+    }
+}
+
+/// P-T18b (R1-M2): P-T18 with P before G on the page. G absent: P is held
+/// `Absent` and witnessed `ParentHeld`, C is held `ParentHeld`. When G
+/// appears, P's re-read finds G not yet read, so P's settling witness is
+/// replaced by a `DeferredRestart` wait record on G (and unwitnessed in the
+/// step map) before P resolves. With P and C both before G, C is never
+/// counted `ParentHeld` after G appears. With C first (`chain_fixture(true)`)
+/// C is classified before P's re-read on the first such generation, so it
+/// may count `ParentHeld` then, never later. Both settle as a cold scan.
+#[test]
+fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
+    for c_first in [false, true] {
+        let fixture = chain_fixture(c_first);
+        let grandparent = if c_first {
+            rollout_at(&fixture, GRANDPARENT, "09")
+        } else {
+            for (id, hour) in [(PARENT, "06"), (CHILD, "07")] {
+                fs::rename(fixture.file(id), rollout_at(&fixture, id, hour)).unwrap();
+            }
+            fixture.file(GRANDPARENT)
+        };
+        let away = fixture.root.parent().unwrap().join("grandparent-away");
+        fs::rename(&grandparent, &away).unwrap();
+        let mut held = [0; PARENT_UNRESOLVABLE_CAUSES];
+        held[CodexParentUnresolvable::Absent.index()] = 1;
+        held[CodexParentUnresolvable::ParentHeld.index()] = 1;
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        let mut history = Vec::new();
+        let mut n = 0;
+        loop {
+            let (next, scan) = fixture_generation(&fixture, &cache, index, n);
+            index = next;
+            history.push(format!("{n}: causes {:?}", parent_causes(&scan)));
+            n += 1;
+            if parent_causes(&scan) == held {
+                break;
+            }
+            assert!(n < 6, "c_first {c_first}: {history:#?}");
+        }
+        let witness = witness_of(&cache, "cursor-fixture", PARENT);
+        assert!(
+            witness
+                .as_ref()
+                .is_some_and(|witness| witness.cause == CodexParentUnresolvable::ParentHeld),
+            "c_first {c_first}: {witness:?}"
+        );
+        fs::rename(&away, &grandparent).unwrap();
+        let mut published = Vec::new();
+        let mut censuses = Vec::new();
+        for m in n..n + 6 {
+            let (next, scan) = fixture_generation(&fixture, &cache, index, m);
+            index = next;
+            let witness = witness_of(&cache, "cursor-fixture", PARENT);
+            history.push(format!(
+                "{m}: causes {:?} restarts {:?} witness {witness:?}",
+                parent_causes(&scan),
+                restarts_in_scope(&scan)
+            ));
+            let parent_held = parent_causes(&scan)[CodexParentUnresolvable::ParentHeld.index()];
+            assert!(
+                parent_held == 0 || (c_first && m == n),
+                "c_first {c_first}: {history:#?}"
+            );
+            if m == n {
+                assert!(
+                    witness.as_ref().is_some_and(|witness| witness.cause
+                        == CodexParentUnresolvable::DeferredRestart
+                        && witness.waits_on.as_deref() == Some(GRANDPARENT)),
+                    "c_first {c_first}: {history:#?}\n{}",
+                    counters(&cache)
+                );
+            }
+            published.extend(session_usage(&scan, PARENT));
+            censuses.push(census(&index, &scan));
+        }
+        assert_eq!(
+            witness_of(&cache, "cursor-fixture", PARENT),
+            None,
+            "c_first {c_first}: {history:#?}"
+        );
+        assert_eq!(published, vec![(30, 1)], "c_first {c_first}: {history:#?}");
+        let warm = censuses.pop().unwrap();
+        assert_eq!(Some(&warm), censuses.last(), "c_first {c_first}");
+        assert_eq!(warm, cold_census(&fixture, n + 6), "c_first {c_first}");
+    }
+}
+
+/// P-T23 (R1-M1, R2-M1): P's index ledger is admitted and the fork settled;
+/// then a copy of P appears and C changes once. The admitted ledger no
+/// longer validates and does not hide P: C is held `Duplicated` (never
+/// `ParentLossy`) and then nothing, neither copy of P nor C, is read again.
+#[test]
+fn duplicate_after_an_admitted_ledger_holds_the_fork_duplicated() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    assert!(ForkHome::parent_ledger(&index).is_some());
+    fs::copy(
+        home.fixture.file(PARENT),
+        rollout_at(&home.fixture, PARENT, "11"),
+    )
+    .unwrap();
+    home.fixture.append(
+        CHILD,
+        &jsonl(&[usage_record(
+            "2026-10-07T08:20:03Z",
+            (40, 20, 4, 0),
+            (10, 5, 1, 0),
+        )]),
+    );
+    held_then_quiet_from(
+        &home.fixture,
+        &cache,
+        index,
+        n,
+        only(CodexParentUnresolvable::Duplicated, 1),
+        4,
         CodexParentUnresolvable::ParentLossy,
     );
 }

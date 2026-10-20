@@ -12946,6 +12946,12 @@ fn scan_source_roots_with_limit(
 /// L-5: why a parent has no usable current identity. PR-1 constructs the
 /// identity causes; PR-P adds the ledger, parent-debt, policy and deferral
 /// causes.
+///
+/// Ordinals belong to the persisted `parent_unresolvable` counts array
+/// (`ScanTraversalCounts`, the diagnostics projection): `index` is the slot
+/// and `COUNT` its length. Never reorder, insert, append or remove a variant
+/// without a schema change and a migration (see the asserts below); a
+/// reorder would silently misattribute persisted counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum CodexParentUnresolvable {
     // Identity evidence (L-5, PR-1).
@@ -13036,6 +13042,10 @@ impl CodexParentUnresolvable {
         }
     }
 }
+// Ordinals belong to the persisted counts array: never reorder without a
+// schema change. `COUNT` is a serde fixed-array length, so even an appended
+// cause fails to load older checkpoints' `ScanTraversalCounts` without a
+// migration or a versioned field.
 const _: () = assert!(
     CodexParentUnresolvable::DeferredRestart as usize + 1 == CodexParentUnresolvable::COUNT
 );

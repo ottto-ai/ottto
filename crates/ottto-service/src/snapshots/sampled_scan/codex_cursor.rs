@@ -2687,12 +2687,16 @@ impl SharedCache {
     }
 
     /// PR-P: admits one witness, optionally (it never forgets provenance or
-    /// witnesses and never takes a claim's room), in one critical section
-    /// under the retained lock, then the cursor lock. The charge is computed
-    /// from lengths before any key is copied: the witness node, the key and
-    /// the moved-in strings' capacities, plus a new entry's node, key, scope
-    /// and empty-map root. Construction is checked against it. Unsupported
+    /// witnesses to make room and never takes a claim's room), in one
+    /// critical section under the retained lock, then the cursor lock. The
+    /// charge is computed from lengths before any key is copied: the witness
+    /// node, the key and the moved-in strings' capacities, plus a new entry's
+    /// node, key, scope and empty-map root. Construction is checked against it. Unsupported
     /// layout or no room: refused (`parent_witness_refused`), nothing kept.
+    /// The count bound is separate: a witness for a new namespace past
+    /// `ROTATION_KEYS` (the 65th) drops the least recently touched
+    /// namespace's entry with all its witnesses (`parent_namespace_evicted`);
+    /// those parents are revalidated fail-closed on their next match.
     pub(in crate::snapshots) fn witness_parent(
         &self,
         namespace: &Scope,
