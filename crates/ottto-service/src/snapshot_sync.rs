@@ -18594,6 +18594,9 @@ mod tests {
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    mod permanent_finish_pipeline_tests {
+        include!("snapshot_sync/permanent_finish_pipeline_tests.rs");
+    }
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
     }
