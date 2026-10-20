@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 722,
-  "content_sha256": "afc92ba33a354ec9fdb8e935ffdf83a904b8ca01ec81fbd86b77697bf769a1d6",
+  "candidate_file_count": 724,
+  "content_sha256": "e7cad9d3021ef3f1be33127b89e9de7d94ed2fe78884d449faaf2327e9844c02",
   "files": [
     {
       "executable": false,
@@ -1231,8 +1231,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/authority_proof_correction_pipeline_tests.rs",
-      "sha256": "bbbb902db32cd58f49634ee2debb27bbf239c77eb47c125aa391ebeb3567b1ac",
-      "size_bytes": 105144
+      "sha256": "89e9d6c1febe1df78f83d7f40bad0fefd2241a4dc2a572725d32868315984678",
+      "size_bytes": 107838
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync/authority_retry_binding_baseline_test.rs",
+      "sha256": "b8d7be179d1fd9fc8f9aa915328780097e9844763e29459f2836199268354be8",
+      "size_bytes": 6750
     },
     {
       "executable": false,
@@ -3295,6 +3302,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-20-native-terminal-retry-binding-baseline.md",
+      "sha256": "3e782bfe68077897d214f87f642ec7fecbd290e340a64c1e7871ca708c134ad6",
+      "size_bytes": 1549
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-20-permanent-source-finish.md",
       "sha256": "574cd6b52d2dc5f61cacbd7c4c0ea8fb07627e4872029f812f20e7300fd539eb",
       "size_bytes": 3377
@@ -5059,7 +5073,7 @@
   ],
   "generated_at": "2026-10-20T15:11:36+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 723,
+  "output_file_count": 725,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
