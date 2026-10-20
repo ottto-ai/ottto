@@ -9,7 +9,7 @@ use crate::{
     keychain::TelemetryKeyStore,
     snapshot_client::relay_token_request_payload,
     BackendErrorDetails, BackendErrorKind, LocalApiError, LocalDaemon, PendingAuthClaim,
-    StagedAccountSwitch,
+    SetupRunReadStart, StagedAccountSwitch,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::{
@@ -3083,9 +3083,14 @@ fn agent_context(
     query: AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto context")?;
-    get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto context",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_context_with_refresh(api_base_url, connection, setup_run_token, &query)
+        },
+    )
 }
 
 fn agent_costs(
@@ -3094,9 +3099,14 @@ fn agent_costs(
     query: AgentCostsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto costs")?;
-    get_agent_costs_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto costs",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_costs_with_refresh(api_base_url, connection, setup_run_token, &query)
+        },
+    )
 }
 
 fn agent_sessions(
@@ -3105,9 +3115,14 @@ fn agent_sessions(
     query: AgentSessionsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto sessions")?;
-    get_agent_sessions_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto sessions",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_sessions_with_refresh(api_base_url, connection, setup_run_token, &query)
+        },
+    )
 }
 
 fn agent_recommendations(
@@ -3115,9 +3130,19 @@ fn agent_recommendations(
     authorization: &RequestAuthorization,
     query: AgentRecommendationsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto recommendations")?;
-    get_agent_recommendations_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto recommendations",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_recommendations_with_refresh(
+                api_base_url,
+                connection,
+                setup_run_token,
+                &query,
+            )
+        },
+    )
 }
 
 fn agent_provider_impact(
@@ -3125,9 +3150,19 @@ fn agent_provider_impact(
     authorization: &RequestAuthorization,
     query: AgentProviderImpactQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto provider-impact")?;
-    get_agent_provider_impact_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto provider-impact",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_provider_impact_with_refresh(
+                api_base_url,
+                connection,
+                setup_run_token,
+                &query,
+            )
+        },
+    )
 }
 
 const TIMEZONE_OVERRIDE_UNSUPPORTED: &str =
@@ -3143,6 +3178,47 @@ fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError>
         ));
     }
     Ok(())
+}
+
+/// Run one setup-run agent read and record whether Ottto still accepts this
+/// Mac's setup run, so local status stops reporting a rejected run as
+/// complete. Only an authoritative terminal answer from the device-secret
+/// refresh counts (`terminal_refresh_rejection`): every read path propagates
+/// that refresh error unchanged, so it is the read's final error. A read 401,
+/// a 401 retried after a successful refresh, an unrecognized refresh detail,
+/// and network, timeout or other backend failures say nothing about the run
+/// and leave the recorded state unchanged. A successful read clears it.
+/// Reads run concurrently with setup and sign-in, so the outcome is recorded
+/// against exactly the binding this read used, and dropped by the daemon if
+/// that binding has since been replaced. Reads of one binding also run
+/// concurrently with each other, so a success clears only the rejection that
+/// was already recorded when this read started, never a newer one.
+fn observe_setup_run_read<T>(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    command: &str,
+    read: impl FnOnce(&str, &LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
+) -> Result<T, LocalApiError> {
+    let (api_base_url, start) = setup_run_agent_read_binding(daemon, authorization, command)?;
+    let result =
+        setup_run_token_for_connection(&api_base_url, &start.binding).and_then(|credentials| {
+            read(
+                &api_base_url,
+                &credentials.connection,
+                &credentials.setup_run_token,
+            )
+        });
+    match &result {
+        Ok(_) => {
+            let _ = daemon.record_setup_run_read_accepted(&start);
+        }
+        Err(error) => {
+            if let Some(rejection) = terminal_refresh_rejection(error) {
+                let _ = daemon.record_setup_run_read_rejected(&start.binding, rejection);
+            }
+        }
+    }
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -3179,21 +3255,30 @@ fn cloud_command(
     operation: CloudOperation,
 ) -> Result<serde_json::Value, LocalApiError> {
     validate_cloud_operation(&operation)?;
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto cloud")?;
-    match cloud_request_with_base(&api_base_url, &connection, &setup_run_token, &operation) {
-        Ok(value) => Ok(value),
-        Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
-            let refreshed = refresh_setup_run_token_via_device_secret(&api_base_url, &connection)?;
-            cloud_request_with_base(
-                &api_base_url,
-                &refreshed.connection,
-                &refreshed.setup_run_token,
-                &operation,
-            )
-        }
-        Err(error) => Err(error),
-    }
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto cloud",
+        |api_base_url, connection, setup_run_token| match cloud_request_with_base(
+            api_base_url,
+            connection,
+            setup_run_token,
+            &operation,
+        ) {
+            Ok(value) => Ok(value),
+            Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
+                let refreshed =
+                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+                cloud_request_with_base(
+                    api_base_url,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
+                    &operation,
+                )
+            }
+            Err(error) => Err(error),
+        },
+    )
 }
 
 fn validate_cloud_operation(operation: &CloudOperation) -> Result<(), LocalApiError> {
@@ -3396,27 +3481,22 @@ fn cloud_request_with_base(
     }
 }
 
-fn setup_run_agent_read_context(
+fn setup_run_agent_read_binding(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     command: &str,
-) -> Result<(String, LocalConnectionBinding, String), LocalApiError> {
+) -> Result<(String, SetupRunReadStart), LocalApiError> {
     let status = status_for(daemon, authorization)?;
     if status.account.state != LocalAccountState::Connected {
         return Err(LocalApiError::InvalidRequest(format!(
             "{command} requires this Mac to be connected to Ottto"
         )));
     }
-    let connection = daemon
-        .connection_for_authorized_client()?
+    let start = daemon
+        .setup_run_read_start()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
-    let credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
-    Ok((
-        api_base_url,
-        credentials.connection,
-        credentials.setup_run_token,
-    ))
+    let api_base_url = validated_api_base_url(Some(start.binding.api_base_url.as_str()))?;
+    Ok((api_base_url, start))
 }
 
 fn require_authorized_local_client(
@@ -8633,10 +8713,6 @@ fn refresh_setup_run_token_via_device_secret(
         "device_secret": device_secret,
     });
     let response: SetupRunRefreshResponse = backend_post_json(&url, &body, &[])?;
-    let _binding_lock = lock_setup_run_binding();
-    KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-        .save(&response.setup_run_token)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
     let mut refreshed = connection.clone();
     if let Some(setup_run_id) = response
         .setup_run_id
@@ -8647,13 +8723,90 @@ fn refresh_setup_run_token_via_device_secret(
         refreshed.setup_run_id = setup_run_id.to_string();
     }
     refreshed.setup_run_token_expires_at = response.expires_at.clone();
-    FileConnectionStore::default()
-        .save(&refreshed)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let committed = {
+        let _binding_lock = lock_setup_run_binding();
+        commit_refreshed_setup_run_binding_locked(
+            connection,
+            &refreshed,
+            &response.setup_run_token,
+            &FileConnectionStore::default(),
+            &KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT),
+        )?
+    };
     Ok(RefreshedSetupRunToken {
         setup_run_token: response.setup_run_token,
-        connection: refreshed,
+        connection: committed,
     })
+}
+
+/// The connection half of a refresh commit; a seam so storage failures can be
+/// exercised without touching the real support directory.
+trait SetupRunConnectionStore {
+    fn load_connection(&self) -> anyhow::Result<Option<LocalConnectionBinding>>;
+    fn save_connection(&self, connection: &LocalConnectionBinding) -> anyhow::Result<()>;
+}
+
+impl SetupRunConnectionStore for FileConnectionStore {
+    fn load_connection(&self) -> anyhow::Result<Option<LocalConnectionBinding>> {
+        self.load()
+    }
+
+    fn save_connection(&self, connection: &LocalConnectionBinding) -> anyhow::Result<()> {
+        self.save(connection)
+    }
+}
+
+/// Persist a refreshed setup-run token and connection only if the persisted
+/// binding is still the one this refresh belongs to, and return the binding
+/// written. The caller holds the setup-run binding lock, which every writer
+/// of these two stores (claim, switch, setup attach, terminal clear, logout
+/// reset) also holds, so this compare-and-swap cannot interleave with a
+/// reconnect or logout.
+///
+/// The persisted binding may name the refresh's own run, or the run the
+/// backend just minted for (an earlier refresh rebinding to the latest run
+/// persists that run while the in-memory binding keeps the old id). Only the
+/// run id and token expiry change; the persisted record's other fields are
+/// kept. Anything else means the binding was replaced or removed while the
+/// refresh was in flight; the minted token is dropped and nothing is written.
+/// If the connection write fails after the token write, the prior token is
+/// put back (or the new one removed when none could be read), so the stores
+/// keep the prior binding. The two stores are not written atomically: if that
+/// rollback also fails, the new token stays beside the prior connection until
+/// the next refresh.
+fn commit_refreshed_setup_run_binding_locked(
+    expected: &LocalConnectionBinding,
+    refreshed: &LocalConnectionBinding,
+    setup_run_token: &str,
+    connections: &impl SetupRunConnectionStore,
+    tokens: &impl ControlTokenStore,
+) -> Result<LocalConnectionBinding, LocalApiError> {
+    let persisted = connections
+        .load_connection()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+    if !setup_run_binding_matches(&persisted, expected)
+        && !setup_run_binding_matches(&persisted, refreshed)
+    {
+        return Err(LocalApiError::SetupRunConnectionMismatch);
+    }
+    let committed = LocalConnectionBinding {
+        setup_run_id: refreshed.setup_run_id.clone(),
+        setup_run_token_expires_at: refreshed.setup_run_token_expires_at.clone(),
+        ..persisted
+    };
+    let prior_token = tokens.load().ok();
+    tokens
+        .save(setup_run_token)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if connections.save_connection(&committed).is_err() {
+        let _ = match prior_token {
+            Some(token) => tokens.save(&token),
+            None => tokens.delete(),
+        };
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(committed)
 }
 
 pub(crate) fn refresh_setup_run_token_for_persisted_connection() -> Result<(), LocalApiError> {
@@ -31077,6 +31230,867 @@ X-API-Key = "otel_redacted"
         assert_eq!(error.code.exit_code(), 61);
         assert!(error.retryable);
         assert!(error.message.contains("Timed out waiting for setup"));
+    }
+
+    /// What the scripted setup-run backend answers: `read` for every agent
+    /// read, `refresh` for the device-secret refresh. Status 0 closes the
+    /// connection without an answer (a transport failure).
+    #[derive(Clone, Copy)]
+    struct SetupRunReadScript {
+        read: (u16, &'static str),
+        refresh: (u16, &'static str),
+    }
+
+    fn expired_setup_run_read_server(
+        calls: Arc<Mutex<Vec<String>>>,
+        script: Arc<Mutex<SetupRunReadScript>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind expired run backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let request = read_complete_http_request(&mut stream);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                calls.lock().expect("calls lock").push(path.clone());
+                let script = *script.lock().expect("script lock");
+                let (status, body) = if path.contains("/local-client/refresh") {
+                    script.refresh
+                } else {
+                    script.read
+                };
+                match status {
+                    0 => drop(stream),
+                    200 => write_json_response(&mut stream, 200, "OK", body),
+                    401 => write_json_response(&mut stream, 401, "Unauthorized", body),
+                    _ => write_json_response(&mut stream, status, "Error", body),
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// One backend request held open until the test thread answers it.
+    struct HeldSetupRunRequest {
+        path: String,
+        request: String,
+        respond: mpsc::Sender<(u16, &'static str)>,
+    }
+
+    impl HeldSetupRunRequest {
+        fn answer(self, status: u16, body: &'static str) {
+            self.respond
+                .send((status, body))
+                .expect("backend connection waits for its answer");
+        }
+    }
+
+    /// A backend whose every response is released by the test thread, so read
+    /// and rebind interleavings are fixed by message order rather than timing.
+    fn held_setup_run_backend() -> (String, mpsc::Receiver<HeldSetupRunRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind held backend");
+        let address = listener.local_addr().expect("local address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let requests_tx = requests_tx.clone();
+                thread::spawn(move || {
+                    let request = read_complete_http_request(&mut stream);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or_default()
+                        .to_string();
+                    let (respond, answer) = mpsc::channel();
+                    if requests_tx
+                        .send(HeldSetupRunRequest {
+                            path,
+                            request,
+                            respond,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Ok((status, body)) = answer.recv() {
+                        let reason = if status == 200 { "OK" } else { "Unauthorized" };
+                        write_json_response(&mut stream, status, reason, body);
+                    }
+                });
+            }
+        });
+        (format!("http://{address}"), requests_rx)
+    }
+
+    #[test]
+    #[serial]
+    fn setup_run_read_outcome_never_crosses_a_concurrent_rebind() {
+        const EXPIRED: &str = r#"{"detail":"Setup run expired"}"#;
+        const COSTS: &str = r#"{"results_state":"current"}"#;
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("setup-run-read-concurrent-rebind");
+        let secret_root = telemetry_key_store_root("setup-run-read-concurrent-rebind-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_current")
+            .expect("persist setup token");
+        let (api_base_url, requests) = held_setup_run_backend();
+        let binding = |setup_run_id: &str| LocalConnectionBinding {
+            setup_run_id: setup_run_id.to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let (run_a, run_b) = (binding("run_a"), binding("run_b"));
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(run_a.clone()));
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let next = || {
+            requests
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the read reaches the backend")
+        };
+        let held = |run: &str, endpoint: &str| {
+            let request = next();
+            assert!(
+                request
+                    .path
+                    .starts_with(&format!("/api/v1/setup-runs/{run}/local-client/{endpoint}")),
+                "expected {run} {endpoint}, got {}",
+                request.path
+            );
+            request
+        };
+        let no_more_requests = || {
+            assert!(
+                matches!(requests.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "one read makes one request and at most one refresh"
+            );
+        };
+        let run_state = || {
+            daemon
+                .status("token")
+                .expect("status")
+                .canonical_health
+                .expect("canonical health")
+                .account
+                .setup_run_state
+        };
+        let read = || agent_costs(&daemon, &authorization, AgentCostsQuery::default());
+
+        thread::scope(|scope| {
+            // A read of run A is in flight when this Mac reconnects to run B.
+            // Its refresh still targets A: the read keeps the binding the
+            // observer captured instead of looking it up again.
+            let stale_read = scope.spawn(read);
+            let stale_costs = held("run_a", "costs");
+            daemon
+                .bind_setup_run_for_authorized_client(run_b.clone())
+                .expect("reconnect to run B");
+            stale_costs.answer(401, EXPIRED);
+            held("run_a", "refresh").answer(401, EXPIRED);
+            assert!(stale_read.join().expect("read thread").is_err());
+            no_more_requests();
+            assert_eq!(
+                run_state(),
+                ottto_protocol::LocalSetupRunState::Complete,
+                "a rejection of replaced run A must not mark run B rejected"
+            );
+
+            // Same binding: a rejected read of B (one refresh) marks B rejected.
+            let b_read = scope.spawn(read);
+            held("run_b", "costs").answer(401, EXPIRED);
+            held("run_b", "refresh").answer(401, EXPIRED);
+            assert!(b_read.join().expect("read thread").is_err());
+            no_more_requests();
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Rejected);
+
+            // A read of run A is in flight when this Mac reconnects to run B
+            // and a read of B is rejected; A's late success cannot clear it.
+            daemon
+                .bind_setup_run_for_authorized_client(run_a.clone())
+                .expect("bind run A for the stale read");
+            let stale_read = scope.spawn(read);
+            let stale_costs = held("run_a", "costs");
+            daemon
+                .bind_setup_run_for_authorized_client(run_b.clone())
+                .expect("reconnect to run B");
+            let b_read = scope.spawn(read);
+            held("run_b", "costs").answer(401, EXPIRED);
+            held("run_b", "refresh").answer(401, EXPIRED);
+            assert!(b_read.join().expect("read thread").is_err());
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Rejected);
+            stale_costs.answer(200, COSTS);
+            stale_read
+                .join()
+                .expect("read thread")
+                .expect("run A answered");
+            no_more_requests();
+            assert_eq!(
+                run_state(),
+                ottto_protocol::LocalSetupRunState::Rejected,
+                "a success of replaced run A must not clear run B's rejection"
+            );
+
+            // Same binding: a successful read of B clears B's rejection.
+            let b_read = scope.spawn(read);
+            held("run_b", "costs").answer(200, COSTS);
+            b_read.join().expect("read thread").expect("run B answered");
+            no_more_requests();
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Complete);
+
+            // Same binding, out of order: a slow read of B is in flight when a
+            // later read of B is told the run ended. The slow read's success
+            // arrives last but predates that answer, so it cannot clear it.
+            let slow_read = scope.spawn(read);
+            let slow_costs = held("run_b", "costs");
+            let later_read = scope.spawn(read);
+            held("run_b", "costs").answer(401, EXPIRED);
+            held("run_b", "refresh").answer(401, EXPIRED);
+            assert!(later_read.join().expect("read thread").is_err());
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Rejected);
+            slow_costs.answer(200, COSTS);
+            slow_read
+                .join()
+                .expect("read thread")
+                .expect("run B answered");
+            no_more_requests();
+            assert_eq!(
+                run_state(),
+                ottto_protocol::LocalSetupRunState::Rejected,
+                "an older success of run B must not clear its newer rejection"
+            );
+
+            // A read of B that starts after the rejection and succeeds clears it.
+            let b_read = scope.spawn(read);
+            held("run_b", "costs").answer(200, COSTS);
+            b_read.join().expect("read thread").expect("run B answered");
+            no_more_requests();
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Complete);
+
+            // Logout while a rejected read is in flight records nothing.
+            let stale_read = scope.spawn(read);
+            let stale_costs = held("run_b", "costs");
+            daemon
+                .reset_account_for_authorized_client()
+                .expect("logout");
+            stale_costs.answer(401, EXPIRED);
+            held("run_b", "refresh").answer(401, EXPIRED);
+            assert!(stale_read.join().expect("read thread").is_err());
+            no_more_requests();
+            let status = daemon.status("token").expect("status");
+            assert_ne!(
+                status
+                    .local_health_events
+                    .iter()
+                    .rfind(|event| event.event_type.starts_with("SetupRunRead"))
+                    .map(|event| event.event_type.as_str()),
+                Some("SetupRunReadRejected"),
+                "a rejection that finishes after logout must not be recorded"
+            );
+        });
+    }
+
+    #[derive(Default)]
+    struct FakeSetupRunConnectionStore {
+        value: std::cell::RefCell<Option<LocalConnectionBinding>>,
+        fail_save: bool,
+    }
+
+    impl SetupRunConnectionStore for FakeSetupRunConnectionStore {
+        fn load_connection(&self) -> anyhow::Result<Option<LocalConnectionBinding>> {
+            Ok(self.value.borrow().clone())
+        }
+
+        fn save_connection(&self, connection: &LocalConnectionBinding) -> anyhow::Result<()> {
+            if self.fail_save {
+                return Err(anyhow::anyhow!("synthetic connection write failure"));
+            }
+            *self.value.borrow_mut() = Some(connection.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeSetupRunTokenStore {
+        value: std::cell::RefCell<Option<String>>,
+        fail_save: bool,
+    }
+
+    impl ControlTokenStore for FakeSetupRunTokenStore {
+        fn load(&self) -> Result<String, TokenStoreError> {
+            self.value.borrow().clone().ok_or(TokenStoreError::Missing)
+        }
+
+        fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+            if self.fail_save {
+                return Err(TokenStoreError::Store(
+                    "synthetic token write failure".to_string(),
+                ));
+            }
+            *self.value.borrow_mut() = Some(token.to_string());
+            Ok(())
+        }
+
+        fn delete(&self) -> Result<(), TokenStoreError> {
+            *self.value.borrow_mut() = None;
+            Ok(())
+        }
+    }
+
+    fn refresh_binding(setup_run_id: &str, expires_at: &str) -> LocalConnectionBinding {
+        LocalConnectionBinding {
+            setup_run_id: setup_run_id.to_string(),
+            setup_run_token_expires_at: expires_at.to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: "https://api.ottto.net".to_string(),
+        }
+    }
+
+    #[test]
+    fn refresh_commit_writes_only_for_the_binding_it_belongs_to() {
+        let commit = |persisted: Option<LocalConnectionBinding>,
+                      token: Option<&str>,
+                      expected: &LocalConnectionBinding,
+                      refreshed: &LocalConnectionBinding| {
+            let connections = FakeSetupRunConnectionStore {
+                value: std::cell::RefCell::new(persisted),
+                ..Default::default()
+            };
+            let tokens = FakeSetupRunTokenStore {
+                value: std::cell::RefCell::new(token.map(str::to_string)),
+                ..Default::default()
+            };
+            let result = commit_refreshed_setup_run_binding_locked(
+                expected,
+                refreshed,
+                "otsr_minted",
+                &connections,
+                &tokens,
+            );
+            (result, connections.value.take(), tokens.value.take())
+        };
+        let run_a = refresh_binding("run_a", "2026-05-05T10:00:00Z");
+        let run_a_refreshed = refresh_binding("run_a", "2026-05-05T10:15:00Z");
+        let run_b = refresh_binding("run_b", "2026-05-05T10:05:00Z");
+        let run_c_refreshed = refresh_binding("run_c", "2026-05-05T10:15:00Z");
+
+        // Same binding: the new pair is written.
+        let (result, connection, token) = commit(
+            Some(run_a.clone()),
+            Some("otsr_a"),
+            &run_a,
+            &run_a_refreshed,
+        );
+        assert!(result.is_ok());
+        assert_eq!(connection, Some(run_a_refreshed.clone()));
+        assert_eq!(token.as_deref(), Some("otsr_minted"));
+
+        // The backend rebound to its latest run C; the persisted binding
+        // already names C while the in-memory binding still says A. Only the
+        // run id and expiry come from the refresh; the persisted record keeps
+        // its own other fields.
+        let persisted_c = LocalConnectionBinding {
+            claim_code: Some("claim_c".to_string()),
+            ..refresh_binding("run_c", "2026-05-05T10:00:00Z")
+        };
+        let committed_c = LocalConnectionBinding {
+            claim_code: Some("claim_c".to_string()),
+            ..run_c_refreshed.clone()
+        };
+        let (result, connection, token) =
+            commit(Some(persisted_c), Some("otsr_c"), &run_a, &run_c_refreshed);
+        assert_eq!(result.ok(), Some(committed_c.clone()));
+        assert_eq!(connection, Some(committed_c));
+        assert_eq!(token.as_deref(), Some("otsr_minted"));
+
+        // Replaced by a reconnect: nothing is written.
+        let (result, connection, token) = commit(
+            Some(run_b.clone()),
+            Some("otsr_b"),
+            &run_a,
+            &run_a_refreshed,
+        );
+        assert!(matches!(
+            result,
+            Err(LocalApiError::SetupRunConnectionMismatch)
+        ));
+        assert_eq!(connection, Some(run_b.clone()));
+        assert_eq!(token.as_deref(), Some("otsr_b"));
+
+        // Same run id against another API base is a different binding.
+        let other_base = LocalConnectionBinding {
+            api_base_url: "https://staging.ottto.net".to_string(),
+            ..run_a.clone()
+        };
+        let (result, connection, token) = commit(
+            Some(other_base.clone()),
+            Some("otsr_other"),
+            &run_a,
+            &run_a_refreshed,
+        );
+        assert!(matches!(
+            result,
+            Err(LocalApiError::SetupRunConnectionMismatch)
+        ));
+        assert_eq!(connection, Some(other_base));
+        assert_eq!(token.as_deref(), Some("otsr_other"));
+
+        // Removed by logout: nothing is written.
+        let (result, connection, token) = commit(None, None, &run_a, &run_a_refreshed);
+        assert!(matches!(
+            result,
+            Err(LocalApiError::SetupRunConnectionMissing)
+        ));
+        assert_eq!(connection, None);
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn refresh_commit_storage_failure_never_leaves_a_mixed_pair() {
+        let run_a = refresh_binding("run_a", "2026-05-05T10:00:00Z");
+        let run_c_refreshed = refresh_binding("run_c", "2026-05-05T10:15:00Z");
+
+        // Token write fails: both stores keep the prior pair.
+        let connections = FakeSetupRunConnectionStore {
+            value: std::cell::RefCell::new(Some(run_a.clone())),
+            ..Default::default()
+        };
+        let tokens = FakeSetupRunTokenStore {
+            value: std::cell::RefCell::new(Some("otsr_a".to_string())),
+            fail_save: true,
+        };
+        let result = commit_refreshed_setup_run_binding_locked(
+            &run_a,
+            &run_c_refreshed,
+            "otsr_minted",
+            &connections,
+            &tokens,
+        );
+        assert!(matches!(result, Err(LocalApiError::StatePoisoned)));
+        assert_eq!(connections.value.take(), Some(run_a.clone()));
+        assert_eq!(tokens.value.take().as_deref(), Some("otsr_a"));
+
+        // Connection write fails after the token write: the prior token is
+        // put back, so the stores keep the prior binding rather than the new
+        // token beside the old connection.
+        let connections = FakeSetupRunConnectionStore {
+            value: std::cell::RefCell::new(Some(run_a.clone())),
+            fail_save: true,
+        };
+        let tokens = FakeSetupRunTokenStore {
+            value: std::cell::RefCell::new(Some("otsr_a".to_string())),
+            ..Default::default()
+        };
+        let result = commit_refreshed_setup_run_binding_locked(
+            &run_a,
+            &run_c_refreshed,
+            "otsr_minted",
+            &connections,
+            &tokens,
+        );
+        assert!(matches!(result, Err(LocalApiError::StatePoisoned)));
+        assert_eq!(connections.value.take(), Some(run_a.clone()));
+        assert_eq!(tokens.value.take().as_deref(), Some("otsr_a"));
+
+        // No prior token: the new one is removed, and the next read refreshes
+        // again with the device credential.
+        let connections = FakeSetupRunConnectionStore {
+            value: std::cell::RefCell::new(Some(run_a.clone())),
+            fail_save: true,
+        };
+        let tokens = FakeSetupRunTokenStore::default();
+        let result = commit_refreshed_setup_run_binding_locked(
+            &run_a,
+            &run_c_refreshed,
+            "otsr_minted",
+            &connections,
+            &tokens,
+        );
+        assert!(matches!(result, Err(LocalApiError::StatePoisoned)));
+        assert_eq!(connections.value.take(), Some(run_a));
+        assert_eq!(tokens.value.take(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn stale_refresh_never_overwrites_a_reconnected_or_logged_out_binding() {
+        const INVALID: &str = r#"{"detail":"Setup run companion token is invalid"}"#;
+        const COSTS: &str = r#"{"results_state":"current"}"#;
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("stale-refresh-binding-cas");
+        let secret_root = telemetry_key_store_root("stale-refresh-binding-cas-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        let (api_base_url, requests) = held_setup_run_backend();
+        let binding = |setup_run_id: &str, expires_at: &str| LocalConnectionBinding {
+            setup_run_id: setup_run_id.to_string(),
+            setup_run_token_expires_at: expires_at.to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let run_a = binding("run_a", "2026-05-05T10:00:00Z");
+        let run_b = binding("run_b", "2026-05-05T10:05:00Z");
+        let tokens = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT);
+        // Model a binding writer (claim, switch, setup attach): it replaces
+        // both stores under the same lock the refresh commit takes.
+        let install = |connection: &LocalConnectionBinding, token: &str| {
+            let _binding_lock = lock_setup_run_binding();
+            tokens.save(token).expect("persist setup token");
+            FileConnectionStore::default()
+                .save(connection)
+                .expect("persist connection binding");
+        };
+        let persisted = || {
+            (
+                FileConnectionStore::default()
+                    .load()
+                    .expect("load connection binding"),
+                tokens.load().ok(),
+            )
+        };
+        install(&run_a, "otsr_a");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(run_a.clone()));
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let held = |run: &str, endpoint: &str| {
+            let request = requests
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the read reaches the backend");
+            assert!(
+                request
+                    .path
+                    .starts_with(&format!("/api/v1/setup-runs/{run}/local-client/{endpoint}")),
+                "expected {run} {endpoint}, got {}",
+                request.path
+            );
+            request
+        };
+        let no_more_requests = || {
+            assert!(
+                matches!(requests.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "one read makes one request, at most one refresh and one retry"
+            );
+        };
+        let read = || agent_costs(&daemon, &authorization, AgentCostsQuery::default());
+
+        thread::scope(|scope| {
+            // Same binding: a successful refresh persists the new pair and
+            // the retry uses the new token.
+            let a_read = scope.spawn(read);
+            held("run_a", "costs").answer(401, INVALID);
+            held("run_a", "refresh").answer(
+                200,
+                r#"{"setup_run_id":"run_a","setup_run_token":"otsr_a_refreshed","expires_at":"2026-05-05T10:30:00Z"}"#,
+            );
+            let retry = held("run_a", "costs");
+            assert!(retry
+                .request
+                .contains("X-Ottto-Setup-Run-Token: otsr_a_refreshed"));
+            retry.answer(200, COSTS);
+            a_read.join().expect("read thread").expect("run A answered");
+            no_more_requests();
+            assert_eq!(
+                persisted(),
+                (
+                    Some(binding("run_a", "2026-05-05T10:30:00Z")),
+                    Some("otsr_a_refreshed".to_string())
+                )
+            );
+
+            // A successful refresh of run A finishes after this Mac
+            // reconnected to run B: B's connection and token stay intact and
+            // the stale read does not retry with A's new token.
+            let stale_read = scope.spawn(read);
+            held("run_a", "costs").answer(401, INVALID);
+            let stale_refresh = held("run_a", "refresh");
+            install(&run_b, "otsr_b");
+            daemon
+                .bind_setup_run_for_authorized_client(run_b.clone())
+                .expect("reconnect to run B");
+            stale_refresh.answer(
+                200,
+                r#"{"setup_run_id":"run_a","setup_run_token":"otsr_stale_a","expires_at":"2026-05-05T10:45:00Z"}"#,
+            );
+            assert!(matches!(
+                stale_read.join().expect("read thread"),
+                Err(LocalApiError::SetupRunConnectionMismatch)
+            ));
+            no_more_requests();
+            assert_eq!(
+                persisted(),
+                (Some(run_b.clone()), Some("otsr_b".to_string()))
+            );
+
+            // A successful refresh of run B finishes after logout: nothing
+            // is restored.
+            let stale_read = scope.spawn(read);
+            held("run_b", "costs").answer(401, INVALID);
+            let stale_refresh = held("run_b", "refresh");
+            {
+                let _binding_lock = lock_setup_run_binding();
+                FileConnectionStore::default()
+                    .reset()
+                    .expect("logout removes the connection binding");
+            }
+            let _ = tokens.delete();
+            daemon
+                .reset_account_for_authorized_client()
+                .expect("logout");
+            stale_refresh.answer(
+                200,
+                r#"{"setup_run_id":"run_b","setup_run_token":"otsr_stale_b","expires_at":"2026-05-05T10:45:00Z"}"#,
+            );
+            assert!(matches!(
+                stale_read.join().expect("read thread"),
+                Err(LocalApiError::SetupRunConnectionMissing)
+            ));
+            no_more_requests();
+            assert_eq!(persisted(), (None, None));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn expired_setup_run_read_refreshes_once_and_reports_reconnect_required() {
+        const EXPIRED: &str = r#"{"detail":"Setup run expired"}"#;
+        const INVALID: &str = r#"{"detail":"Setup run companion token is invalid"}"#;
+        const DEVICE_INACTIVE: &str = r#"{"detail":"Telemetry device is not active"}"#;
+        const REFRESHED: &str =
+            r#"{"setup_run_token":"otsr_recovered","expires_at":"2026-05-05T10:45:00Z"}"#;
+        const COSTS: &str = r#"{"results_state":"current"}"#;
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("expired-setup-run-read");
+        let secret_root = telemetry_key_store_root("expired-setup-run-read-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_expired_run")
+            .expect("persist setup token");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(SetupRunReadScript {
+            read: (401, INVALID),
+            refresh: (401, INVALID),
+        }));
+        let api_base_url = expired_setup_run_read_server(calls.clone(), script.clone());
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_expired".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url,
+        };
+        FileConnectionStore::default()
+            .save(&connection)
+            .expect("persist connection binding");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let answer = |read: (u16, &'static str), refresh: (u16, &'static str)| {
+            *script.lock().expect("script lock") = SetupRunReadScript { read, refresh };
+        };
+        // Runs one read; returns its result and how many reads and refreshes
+        // it sent.
+        let read = || {
+            let result = agent_costs(&daemon, &authorization, AgentCostsQuery::default());
+            let paths = std::mem::take(&mut *calls.lock().expect("calls lock"));
+            let count =
+                |endpoint: &str| paths.iter().filter(|path| path.contains(endpoint)).count();
+            (
+                result,
+                count("/local-client/costs"),
+                count("/local-client/refresh"),
+            )
+        };
+        let account = || {
+            daemon
+                .status("token")
+                .expect("status")
+                .canonical_health
+                .expect("canonical health")
+                .account
+        };
+        let assert_no_terminal_proof = |row: &str| {
+            let account = account();
+            assert_eq!(
+                (account.setup_run_state, account.setup_token_state),
+                (
+                    ottto_protocol::LocalSetupRunState::Complete,
+                    ottto_protocol::LocalSetupTokenState::Valid
+                ),
+                "{row} is not terminal proof"
+            );
+            assert!(
+                !daemon
+                    .status("token")
+                    .expect("status")
+                    .local_health_events
+                    .iter()
+                    .any(|event| event.event_type == "SetupRunReadRejected"),
+                "{row} records nothing"
+            );
+        };
+
+        // A generic 401 from the refresh (a detail Ottto does not list as
+        // terminal) proves nothing about the run.
+        answer((401, EXPIRED), (401, INVALID));
+        let (result, reads, refreshes) = read();
+        assert!(result.is_err());
+        assert_eq!((reads, refreshes), (1, 1));
+        assert_no_terminal_proof("an unrecognized refresh 401");
+
+        // The refresh succeeds but the retried read is refused again: the
+        // final 401 is the read's, not an authoritative refresh answer.
+        answer((401, EXPIRED), (200, REFRESHED));
+        let (result, reads, refreshes) = read();
+        assert!(result.is_err());
+        assert_eq!((reads, refreshes), (2, 1));
+        assert_no_terminal_proof("a 401 retried after a successful refresh");
+
+        // The refresh never reaches Ottto.
+        answer((401, INVALID), (0, ""));
+        let (result, reads, refreshes) = read();
+        assert!(result.is_err());
+        assert_eq!((reads, refreshes), (1, 1));
+        assert_no_terminal_proof("a refresh transport failure");
+
+        // Ottto ended the run: one read and one refresh per command.
+        answer((401, EXPIRED), (401, EXPIRED));
+        for _ in 1..=2 {
+            let (result, reads, refreshes) = read();
+            let error = cli_error(result.expect_err("an expired setup run cannot serve reads"));
+            assert!(
+                error.message.contains("Run `ottto login`"),
+                "{}",
+                error.message
+            );
+            assert!(!error.retryable);
+            assert_eq!((reads, refreshes), (1, 1), "one read and one refresh");
+        }
+        let health = daemon
+            .status("token")
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            health.account.setup_run_state,
+            ottto_protocol::LocalSetupRunState::Rejected
+        );
+        assert_eq!(
+            health.account.setup_token_state,
+            ottto_protocol::LocalSetupTokenState::Expired
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "setup_run_rejected"));
+
+        // A later transport failure proves nothing either way.
+        answer((401, INVALID), (0, ""));
+        assert!(read().0.is_err());
+        assert_eq!(
+            account().setup_run_state,
+            ottto_protocol::LocalSetupRunState::Rejected
+        );
+
+        // Ottto refuses the device credential: not an ended run.
+        answer((401, INVALID), (401, DEVICE_INACTIVE));
+        let (result, reads, refreshes) = read();
+        assert!(result.is_err());
+        assert_eq!((reads, refreshes), (1, 1));
+        let health = daemon
+            .status("token")
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            health.account.setup_token_state,
+            ottto_protocol::LocalSetupTokenState::RefreshRequired
+        );
+        assert_eq!(
+            health.account.device_state,
+            ottto_protocol::LocalDeviceState::Inactive
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "device_credential_rejected"));
+        assert!(!health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "setup_run_rejected"));
+
+        // A successful read clears the current binding's rejection.
+        answer((200, COSTS), (200, REFRESHED));
+        let (result, reads, refreshes) = read();
+        result.expect("an accepted read restores reads");
+        assert_eq!((reads, refreshes), (1, 0));
+        let recovered = account();
+        assert_eq!(
+            recovered.setup_run_state,
+            ottto_protocol::LocalSetupRunState::Complete
+        );
+        assert_eq!(
+            recovered.setup_token_state,
+            ottto_protocol::LocalSetupTokenState::Valid
+        );
     }
 
     #[test]

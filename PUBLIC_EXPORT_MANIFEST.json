@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 719,
-  "content_sha256": "059b42570f92121fecf975688903bdf78f29fcbb466814ef02939f8faaa57647",
+  "candidate_file_count": 720,
+  "content_sha256": "3105ea3736509044626e4b87fe22782499437a7edaaf688496c2d4bfaf19ed05",
   "files": [
     {
       "executable": false,
@@ -937,8 +937,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "b6d96aa1a2f255093e253ea3a9e91e5426c471462d39b26d623643ccaf149f0e",
-      "size_bytes": 1319027
+      "sha256": "1faec7201424fc363880e71f548ec0841caed35f6c67acc5df3789e8e3ebc42f",
+      "size_bytes": 1360800
     },
     {
       "executable": false,
@@ -1014,8 +1014,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "34eadfc56009218e67486c9944498765a460dffc8dc7107dd222e157f495af76",
-      "size_bytes": 350064
+      "sha256": "9d5f4ed4797b0fecff97f1e6175b9b942f5152ae9ab54996852a66f24006fdbd",
+      "size_bytes": 372399
     },
     {
       "executable": false,
@@ -2976,6 +2976,13 @@
       "path": "docs/session-2026-10-12-partial-snapshot-ack-settlement.md",
       "sha256": "86f89c80d74d2ebdb24a35e85fde5b04ac4fc6a40a0456e17766d45adf220d22",
       "size_bytes": 4302
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-12-setup-run-read-honesty.md",
+      "sha256": "b93978e055039347637b7a0d1d1d1ff81b8e926ee21372612c57dabbabcc5634",
+      "size_bytes": 6138
     },
     {
       "executable": false,
@@ -5036,9 +5043,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T10:34:07+00:00",
+  "generated_at": "2026-10-20T10:35:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 720,
+  "output_file_count": 721,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
