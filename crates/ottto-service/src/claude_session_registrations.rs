@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 const MAX_ENTRIES: usize = 256;
 const MAX_FILES: usize = 16;
+/// Live-owner checks for scheduled jobs need every running session, not a
+/// display census, so they accept more registrations.
+#[cfg(any(target_os = "macos", test))]
+const MAX_OWNER_FILES: usize = 128;
 const MAX_FILE_BYTES: u64 = 8 * 1024;
 #[cfg(any(target_os = "macos", test))]
 const MAX_PROCESS_BYTES: usize = 4096;
@@ -45,6 +49,27 @@ struct Record {
     entrypoint: Option<String>,
 }
 
+/// A running session's registration claim: pid, session id and the process
+/// start witness. The caller confirms the pid still runs with that start.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct SessionProcess {
+    pub pid: u32,
+    pub session_id: String,
+    pub proc_start: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn session_processes(root: &Path) -> Vec<SessionProcess> {
+    read_records(root, MAX_OWNER_FILES)
+        .into_iter()
+        .map(|record| SessionProcess {
+            pid: record.pid,
+            session_id: record.session_id,
+            proc_start: record.proc_start,
+        })
+        .collect()
+}
+
 #[cfg(not(test))]
 pub(crate) fn collect(root: &Path) -> Registrations {
     collect_with_processes(root, process_starts)
@@ -54,7 +79,7 @@ fn collect_with_processes(
     root: &Path,
     processes: impl FnOnce(&[u32]) -> BTreeMap<u32, String>,
 ) -> Registrations {
-    let records = read_records(root);
+    let records = read_records(root, MAX_FILES);
     if records.is_empty() {
         return Registrations::new();
     }
@@ -94,7 +119,7 @@ fn collect_with_processes(
         .collect()
 }
 
-fn read_records(root: &Path) -> Vec<Record> {
+fn read_records(root: &Path, max_files: usize) -> Vec<Record> {
     #[cfg(unix)]
     {
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -137,7 +162,7 @@ fn read_records(root: &Path) -> Vec<Record> {
                 names.push((name, pid));
             }
         }
-        if names.len() > MAX_FILES {
+        if names.len() > max_files {
             return Vec::new();
         }
         names.sort_by(|a, b| a.0.cmp(&b.0));
@@ -209,7 +234,7 @@ fn read_records(root: &Path) -> Vec<Record> {
     }
     #[cfg(not(unix))]
     {
-        let _ = root;
+        let _ = (root, max_files);
         Vec::new()
     }
 }

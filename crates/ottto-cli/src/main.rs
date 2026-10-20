@@ -60,6 +60,8 @@ enum Command {
     Status(StatusArgs),
     #[command(about = "Show recent snapshot upload acknowledgements")]
     Receipts(ReceiptsArgs),
+    #[command(about = "Count this Mac's logged calls to OpenAI and Anthropic per day")]
+    ProviderRequests(ProviderRequestsArgs),
     #[command(about = "List apps or refresh app setup status")]
     Apps(AppsArgs),
     #[command(about = "Refresh one source status using the lower-level source noun")]
@@ -311,6 +313,44 @@ struct ReceiptsArgs {
 }
 
 #[derive(Debug, Args)]
+struct ProviderRequestsArgs {
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = parse_recent_window,
+        help = "Count only calls in this recent window, such as 90m, 24h or 7d"
+    )]
+    since: Option<Duration>,
+}
+
+/// `<number><s|m|h|d>`, at most the log's retention.
+fn parse_recent_window(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    let invalid = || format!("expected a duration such as 90m, 24h or 7d, got {value:?}");
+    let unit_at = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .ok_or_else(invalid)?;
+    let (number, unit) = value.split_at(unit_at);
+    let number: u64 = number.parse().map_err(|_| invalid())?;
+    let seconds = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err(invalid()),
+    };
+    let window = number.checked_mul(seconds).ok_or_else(invalid)?;
+    if window == 0 {
+        return Err(invalid());
+    }
+    Ok(Duration::from_secs(window.min(
+        ottto_core::provider_call_log::RETENTION_DAYS * 86_400,
+    )))
+}
+
+#[derive(Debug, Args)]
 struct AppsArgs {
     #[arg(long, help = "Print one final JSON object and no human summary text")]
     json: bool,
@@ -427,7 +467,7 @@ struct CostsArgs {
     #[arg(
         long,
         value_name = "MACHINE_ID",
-        help = "Override the local machine filter"
+        help = "Filter to one machine (refused while Ottto can't answer it; use by_machine rows)"
     )]
     machine_id: Option<String>,
     #[arg(
@@ -444,8 +484,19 @@ struct CostsArgs {
         help = "Breakdown mode such as full or overview"
     )]
     mode: Option<String>,
-    #[arg(long, help = "Request account-wide costs instead of this Mac")]
+    #[arg(
+        long,
+        help = "Accepted for compatibility; costs are account-wide by default"
+    )]
     all_machines: bool,
+    #[arg(
+        long,
+        value_name = "LIST",
+        help = "Comma-separated groups such as machine,model, or all"
+    )]
+    dimensions: Option<String>,
+    #[arg(long, help = "Include daily series for the selected groups")]
+    daily: bool,
 }
 
 impl CostsArgs {
@@ -462,6 +513,8 @@ impl CostsArgs {
             bucket: non_empty_option(self.bucket.as_deref()),
             mode: non_empty_option(self.mode.as_deref()),
             all_machines: self.all_machines,
+            dimensions: non_empty_option(self.dimensions.as_deref()),
+            daily: self.daily,
         }
     }
 }
@@ -524,7 +577,7 @@ struct SessionsArgs {
     #[arg(
         long,
         value_name = "MACHINE_ID",
-        help = "Override the local machine filter"
+        help = "Filter to one machine's sessions"
     )]
     machine_id: Option<String>,
     #[arg(
@@ -543,7 +596,10 @@ struct SessionsArgs {
     sort_dir: Option<String>,
     #[arg(long, value_name = "TEXT", help = "Search text")]
     search: Option<String>,
-    #[arg(long, help = "Request account-wide sessions instead of this Mac")]
+    #[arg(
+        long,
+        help = "Accepted for compatibility; sessions are account-wide by default"
+    )]
     all_machines: bool,
 }
 
@@ -684,7 +740,7 @@ struct LogoutArgs {
     local_only: bool,
     #[arg(
         long,
-        help = "Forget installation identity, account scope, credentials, and local sync receipts"
+        help = "Forget installation identity, credentials, and local sync receipts; without --local-only, first release this Mac in Ottto"
     )]
     forget_installation: bool,
     #[arg(
@@ -848,6 +904,10 @@ fn main() {
         let code = run_uninstall(output_mode, args);
         std::process::exit(code);
     }
+    if let Command::ProviderRequests(args) = &cli.command {
+        let code = run_provider_requests(output_mode, args);
+        std::process::exit(code);
+    }
     let invocation = build_invocation(cli, output_mode);
     let code = if let Some(setup_args) = setup_args {
         run_setup(invocation, setup_args)
@@ -938,6 +998,31 @@ fn validate_cli(cli: &Cli) -> Result<(), CliError> {
         });
     }
     Ok(())
+}
+
+/// Summarize the local provider-call log. Reads the log files directly: no
+/// daemon request, so it also works while the daemon is stopped.
+fn run_provider_requests(output_mode: OutputMode, args: &ProviderRequestsArgs) -> i32 {
+    let summary = ottto_core::provider_call_log::summarize_provider_calls(
+        &ottto_core::default_support_dir(),
+        args.since,
+        SystemTime::now(),
+    );
+    match output_mode {
+        OutputMode::Human => print!(
+            "{}",
+            ottto_core::provider_call_log::render_provider_call_summary(&summary)
+        ),
+        OutputMode::Json => println!("{}", pretty_json(&summary)),
+        OutputMode::Ndjson => {
+            let payload = serde_json::to_value(&summary).expect("payload should serialize");
+            println!(
+                "{}",
+                compact_json(&final_payload_event(&request_id(), 0, payload))
+            );
+        }
+    }
+    0
 }
 
 fn run_claude_code_statusline(json: bool) -> i32 {
@@ -2083,10 +2168,12 @@ fn local_command(command: Command) -> LocalControlCommand {
             },
             Some(AppsCommand::Status(args)) => LocalControlCommand::AgentStatusRefresh {
                 source: Some(args.app.into()),
+                quota_refresh: false,
             },
         },
         Command::AgentStatus(args) => LocalControlCommand::AgentStatusRefresh {
             source: Some(args.selected_source()),
+            quota_refresh: false,
         },
         Command::Context(args) => LocalControlCommand::AgentContext {
             query: args.query(),
@@ -2130,6 +2217,7 @@ fn local_command(command: Command) -> LocalControlCommand {
             query: args.query(),
         },
         Command::ClaudeCodeStatusline(_) => unreachable!("statusLine helper is handled directly"),
+        Command::ProviderRequests(_) => unreachable!("provider-requests is handled directly"),
         Command::Setup(args) | Command::Login(args) => LocalControlCommand::Setup {
             sources: Vec::new(),
             claim_code: args.claim_code,
@@ -2183,6 +2271,7 @@ fn command_json(command: &Command) -> bool {
     match command {
         Command::Status(args) => args.json,
         Command::Receipts(args) => args.json,
+        Command::ProviderRequests(args) => args.json,
         Command::Apps(args) => match &args.command {
             None => args.json,
             Some(AppsCommand::Detect(args)) => args.json,
@@ -2340,6 +2429,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::CodexAccountReconnect { .. } => "codex_account_reconnect",
         LocalControlCommand::CodexAccountCheck { .. } => "codex_account_check",
         LocalControlCommand::CodexAccountStopWaiting { .. } => "codex_account_stop_waiting",
+        LocalControlCommand::CodexAccountStartSignIn { .. } => "codex_account_start_sign_in",
         LocalControlCommand::CodexAccountRemove { .. } => "codex_account_remove",
         LocalControlCommand::Detect { .. } => "detect",
         LocalControlCommand::Setup { .. } => "setup",
@@ -2609,7 +2699,10 @@ mod tests {
             LocalControlCommand::Status {
                 refresh_agent_status: true,
             },
-            LocalControlCommand::AgentStatusRefresh { source: None },
+            LocalControlCommand::AgentStatusRefresh {
+                source: None,
+                quota_refresh: false,
+            },
             LocalControlCommand::AgentContext {
                 query: AgentContextQuery::default(),
             },
@@ -2711,10 +2804,14 @@ mod tests {
     }
 
     fn cli_help_snapshot() -> String {
-        let commands: [(&str, &[&str]); 31] = [
+        let commands: [(&str, &[&str]); 32] = [
             ("ottto --help", &["ottto", "--help"]),
             ("ottto status --help", &["ottto", "status", "--help"]),
             ("ottto receipts --help", &["ottto", "receipts", "--help"]),
+            (
+                "ottto provider-requests --help",
+                &["ottto", "provider-requests", "--help"],
+            ),
             ("ottto apps --help", &["ottto", "apps", "--help"]),
             (
                 "ottto apps detect --help",
@@ -2801,6 +2898,155 @@ mod tests {
             cli_help_snapshot(),
             include_str!("../../../fixtures/cli/help-contract.txt")
         );
+    }
+
+    #[test]
+    fn provider_requests_takes_a_recent_window() {
+        let cli = Cli::parse_from(["ottto", "provider-requests", "--json", "--since", "24h"]);
+        let Command::ProviderRequests(args) = cli.command else {
+            panic!("provider-requests parses");
+        };
+        assert!(args.json);
+        assert_eq!(args.since, Some(Duration::from_secs(86_400)));
+        assert_eq!(parse_recent_window("90m"), Ok(Duration::from_secs(5_400)));
+        assert_eq!(parse_recent_window("45s"), Ok(Duration::from_secs(45)));
+        // Capped at the log's retention.
+        assert_eq!(
+            parse_recent_window("30d"),
+            Ok(Duration::from_secs(7 * 86_400))
+        );
+        for invalid in ["", "24", "h", "0h", "1w", "-1h", "1.5h"] {
+            assert!(parse_recent_window(invalid).is_err(), "{invalid}");
+        }
+        assert!(Cli::try_parse_from(["ottto", "provider-requests", "--since", "soon"]).is_err());
+    }
+
+    #[test]
+    fn provider_requests_summary_json_counts_per_day() {
+        use ottto_core::provider_call_log::{
+            record_provider_call, summarize_provider_calls, CallKind, CallResult, Provider,
+            ProviderCall, Trigger,
+        };
+        let support = std::env::temp_dir().join(format!(
+            "ottto-cli-provider-requests-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        // 2026-10-15T12:00:00Z
+        let noon = UNIX_EPOCH + Duration::from_secs(1_792_065_600);
+        let account = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let codex = |trigger, result| {
+            ProviderCall::subprocess(
+                Provider::Openai,
+                CallKind::CodexAppServerQuota,
+                trigger,
+                Some(account),
+                result,
+                Duration::from_millis(900),
+                2,
+            )
+        };
+        record_provider_call(&support, &codex(Trigger::Schedule, CallResult::Ok), noon);
+        record_provider_call(
+            &support,
+            &codex(Trigger::ExplicitRefresh, CallResult::Timeout),
+            noon + Duration::from_secs(60),
+        );
+        record_provider_call(
+            &support,
+            &ProviderCall::observed(
+                Provider::Anthropic,
+                CallKind::ClaudeOauthUsage,
+                Trigger::Schedule,
+                Some(account),
+                CallResult::Http(429),
+                Duration::from_millis(120),
+            ),
+            noon + Duration::from_secs(120),
+        );
+        // Pi's default route: a model request with an unknown provider.
+        record_provider_call(
+            &support,
+            &ProviderCall::subprocess(
+                Provider::Unknown,
+                CallKind::PiDefaultSmokePrompt,
+                Trigger::Setup,
+                None,
+                CallResult::Ok,
+                Duration::from_millis(3_000),
+                1,
+            ),
+            noon + Duration::from_secs(180),
+        );
+        // Two days earlier: outside a 24 h window.
+        record_provider_call(
+            &support,
+            &codex(Trigger::Schedule, CallResult::Ok),
+            noon - Duration::from_secs(2 * 86_400),
+        );
+
+        let summary = summarize_provider_calls(
+            &support,
+            Some(Duration::from_secs(86_400)),
+            noon + Duration::from_secs(600),
+        );
+        let actual = serde_json::to_value(&summary).expect("summary serializes");
+        let count = |calls: u64, requests: u64| serde_json::json!({"calls": calls, "requests_at_least": requests});
+        assert_eq!(
+            actual,
+            serde_json::json!({
+                "schema_version": 1,
+                "generated_at": "2026-10-15T12:10:00Z",
+                "since": "2026-10-14T12:10:00Z",
+                "retention_days": 7,
+                "calls": 4,
+                "requests_at_least": 6,
+                "by_provider": {
+                    "anthropic": count(1, 1),
+                    "openai": count(2, 4),
+                    "unknown": count(1, 1)
+                },
+                "days": [{
+                    "day": "2026-10-15",
+                    "calls": 4,
+                    "requests_at_least": 6,
+                    "observed_requests": 1,
+                    "subprocess_runs": 3,
+                    "log_full": false,
+                    "by_provider": {
+                        "anthropic": count(1, 1),
+                        "openai": count(2, 4),
+                        "unknown": count(1, 1)
+                    },
+                    "by_kind": {
+                        "claude_oauth_usage": count(1, 1),
+                        "codex_app_server_quota": count(2, 4),
+                        "pi_default_smoke_prompt": count(1, 1)
+                    },
+                    "by_trigger": {
+                        "explicit_refresh": count(1, 2),
+                        "schedule": count(2, 3),
+                        "setup": count(1, 1)
+                    },
+                    "by_result": {"http_429": count(1, 1), "ok": count(2, 3), "timeout": count(1, 2)},
+                    "by_provider_kind_trigger": {
+                        "anthropic/claude_oauth_usage/schedule": count(1, 1),
+                        "openai/codex_app_server_quota/explicit_refresh": count(1, 2),
+                        "openai/codex_app_server_quota/schedule": count(1, 2),
+                        "unknown/pi_default_smoke_prompt/setup": count(1, 1)
+                    }
+                }],
+                "skipped_lines": 0
+            })
+        );
+        let text = ottto_core::provider_call_log::render_provider_call_summary(&summary);
+        assert!(
+            text.contains("2026-10-15: 4 calls, >= 6 requests (anthropic 1 calls, >= 1 requests; openai 2 calls, >= 4 requests; unknown 1 calls, >= 1 requests)"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(support);
     }
 
     #[test]
@@ -3716,6 +3962,34 @@ mod tests {
     }
 
     #[test]
+    fn cloud_forget_installation_is_accepted_without_local_only() {
+        let unconfirmed = Cli::parse_from(["ottto", "logout", "--forget-installation"]);
+        let error = validate_cli(&unconfirmed).expect_err("confirmation required");
+        assert!(error.message.contains("--confirm"));
+
+        let confirmed = Cli::parse_from([
+            "ottto",
+            "logout",
+            "--forget-installation",
+            "--confirm",
+            "--json",
+        ]);
+        assert!(validate_cli(&confirmed).is_ok());
+        let invocation = invocation_from_cli(confirmed);
+        assert_eq!(
+            invocation.request.protocol_version,
+            ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AuthReset {
+                local_only: false,
+                forget_installation: true,
+            }
+        );
+    }
+
+    #[test]
     fn logout_local_request_matches_baseline_fixture() {
         let mut invocation = build_invocation(
             Cli {
@@ -3950,7 +4224,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::AgentStatusRefresh {
-                source: Some(SourceKind::Codex)
+                source: Some(SourceKind::Codex),
+                quota_refresh: false,
             }
         );
     }
@@ -4099,6 +4374,9 @@ mod tests {
             "day",
             "--mode",
             "full",
+            "--dimensions",
+            "machine,model",
+            "--daily",
         ]);
         validate_cli(&cli).expect("costs json valid");
         let invocation = invocation_from_cli(cli);
@@ -4121,6 +4399,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: Some("machine,model".to_string()),
+                    daily: true,
                 }
             }
         );
@@ -4148,6 +4428,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: Some("all".to_string()),
+                    daily: true,
                 }),
             },
             OutputMode::Json,
@@ -4496,7 +4778,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::AgentStatusRefresh {
-                source: Some(SourceKind::Pi)
+                source: Some(SourceKind::Pi),
+                quota_refresh: false,
             }
         );
     }

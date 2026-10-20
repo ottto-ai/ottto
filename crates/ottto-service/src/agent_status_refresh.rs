@@ -1,7 +1,8 @@
 //! One collection/upload owner per source, independent of transcript scans.
 //! Provider adapters still own acquisition budgets and observation timestamps.
 use crate::agent_status::{
-    collect_agent_status_collection, AgentStatusCollection, CodexHomeBinding,
+    claude_next_reset_read_at, collect_agent_status_collection, AgentStatusCollection,
+    CodexHomeBinding,
 };
 use crate::{LocalApiError, LocalDaemon};
 use ottto_protocol::SourceKind;
@@ -14,6 +15,9 @@ const INTERVAL: Duration = Duration::from_secs(300);
 const RETRY_DELAY: Duration = Duration::from_secs(60);
 const EVENT_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MANUAL_COALESCE: Duration = Duration::from_secs(1);
+/// A reset-read pass starts this long after the read falls due, so the
+/// binding's own due check (wall clock) has passed by then.
+const RESET_READ_MARGIN: Duration = Duration::from_secs(5);
 static OWNER: Mutex<Option<Arc<Owner>>> = Mutex::new(None);
 
 struct Owner {
@@ -67,12 +71,22 @@ struct LaneState {
     collecting: bool,
     collection_failed: bool,
     manual: bool,
+    /// Start of the last saved-only pass an app's request ran
+    /// ([`StatusLane::app_passes_saved_only`]); the schedule ignores it.
+    last_app_pass: Option<Duration>,
+    /// The lane ran its first provider-reading pass since daemon start.
+    /// Unlike `schedule.last_started`, a wake never clears it.
+    startup_pass_ran: bool,
     stopped: bool,
     generation: u64,
     collection: Option<Arc<AgentStatusCollection>>,
 }
 struct StatusLane {
     origin: Instant,
+    /// Claude: a pass an app's request starts serves stored provider readings,
+    /// leaves the timer alone and uploads nothing. Provider reads come from
+    /// the lane's own passes, which also run without an upload grant.
+    app_passes_saved_only: bool,
     state: Mutex<LaneState>,
     changed: Condvar,
 }
@@ -80,8 +94,15 @@ impl StatusLane {
     fn new() -> Self {
         Self {
             origin: Instant::now(),
+            app_passes_saved_only: false,
             state: Mutex::new(LaneState::default()),
             changed: Condvar::new(),
+        }
+    }
+    fn for_source(source: &SourceKind) -> Self {
+        Self {
+            app_passes_saved_only: *source == SourceKind::ClaudeCode,
+            ..Self::new()
         }
     }
     // Workers cannot acquire or publish until every source has spawned.
@@ -132,6 +153,20 @@ impl StatusLane {
             self.changed.notify_all();
         }
     }
+    /// Bring the next pass forward to a Claude reset read due `due_in` from
+    /// `now`, when that is sooner than the regular interval. Callers pass only
+    /// a read still ahead, so an unread reset never turns into back-to-back
+    /// passes; failure delays still apply through `deadline`.
+    fn run_by(&self, now: Duration, due_in: Duration) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = now + due_in + RESET_READ_MARGIN;
+        if at < state.schedule.next_due {
+            state.schedule.next_due = at;
+        }
+    }
     fn stop(&self) {
         let mut state = self
             .state
@@ -169,7 +204,11 @@ impl StatusLane {
                 "agent status acquisition failed".into(),
             ));
         }
-        let age = state.schedule.last_started.map(|at| now.saturating_sub(at));
+        let age = state
+            .schedule
+            .last_started
+            .max(state.last_app_pass)
+            .map(|at| now.saturating_sub(at));
         if !state.collecting
             && !state.collection_failed
             && (state.running && !manual
@@ -214,17 +253,18 @@ impl StatusLane {
         publish: impl FnOnce(&AgentStatusCollection) -> bool,
         finished_at: impl FnOnce() -> Duration,
     ) -> bool {
-        let reused = {
+        let (reused, app_only, first_pass) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.stopped
-                || state.running
-                || !(state.manual || automatic_enabled && state.schedule.deadline() <= now)
-            {
+            let due = automatic_enabled && state.schedule.deadline() <= now;
+            if state.stopped || state.running || !(state.manual || due) {
                 return false;
             }
+            // Only an app's request: saved readings, and the timer keeps its
+            // time. A request that meets a due pass is that pass.
+            let app_only = self.app_passes_saved_only && !due;
             // Transport retries reuse the exact collected body until the next
             // normal acquisition. A lost response cannot multiply provider
             // reads or change observed_at/captured_at on the retried body.
@@ -244,17 +284,36 @@ impl StatusLane {
             state.manual = false;
             state.running = true;
             state.collecting = reused.is_none();
-            if reused.is_none() {
+            let first_pass = !app_only && !state.startup_pass_ran;
+            state.startup_pass_ran |= first_pass;
+            if app_only {
+                state.last_app_pass = Some(now);
+            } else if reused.is_none() {
                 state.schedule.start(now);
             } else {
                 state.schedule.next_due = state.schedule.last_started.unwrap() + INTERVAL;
                 state.schedule.retry_not_before = Duration::ZERO;
             }
-            reused
+            (reused, app_only, first_pass)
         };
         let collection = if let Some(collection) = reused {
             collection
         } else {
+            let started_at = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+            let collect = || {
+                let collect =
+                    || crate::agent_status::with_claude_pass(app_only, started_at, collect);
+                // The provider calls of the first pass after daemon start
+                // are its startup burst, not its steady cadence.
+                if first_pass {
+                    crate::provider_calls::with_trigger(
+                        crate::provider_calls::Trigger::Startup,
+                        collect,
+                    )
+                } else {
+                    collect()
+                }
+            };
             let collection = match catch_unwind(AssertUnwindSafe(collect)) {
                 Ok(collection) => Arc::new(collection),
                 Err(_) => {
@@ -269,7 +328,9 @@ impl StatusLane {
                     // re-dating the last good collection. The existing worker
                     // reacquires after the ordinary failure delay.
                     state.generation += 1;
-                    state.schedule.finish(finished_at(), false);
+                    if !app_only {
+                        state.schedule.finish(finished_at(), false);
+                    }
                     self.changed.notify_all();
                     eprintln!("agent status acquisition panicked; retry deferred");
                     return true;
@@ -283,6 +344,12 @@ impl StatusLane {
             state.collection_failed = false;
             state.generation += 1;
             state.collecting = false;
+            if app_only {
+                // Served to the app; the lane's own passes upload.
+                state.running = false;
+                self.changed.notify_all();
+                return true;
+            }
             self.changed.notify_all();
             collection
         };
@@ -334,7 +401,8 @@ fn start_with(
         return Ok(());
     }
     let owner = Arc::new(Owner {
-        lanes: std::array::from_fn(|_| Arc::new(StatusLane::new())),
+        lanes: [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi]
+            .map(|source| Arc::new(StatusLane::for_source(&source))),
     });
     let mut workers = Vec::new();
     for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
@@ -379,9 +447,13 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
     loop {
         // Re-read ordinary device grants each pass; a disabled source is not
         // polled automatically. Manual diagnostics retain their old behavior.
+        // Claude's own passes are its quota schedule (app requests read no
+        // provider), so they run without the grant too and only skip the
+        // upload.
         let enabled = crate::snapshot_sync::agent_status_source_enabled(&source);
+        let automatic = enabled || lane.app_passes_saved_only;
         let began = Instant::now();
-        lane.pass(lane.origin.elapsed(), enabled,
+        lane.pass(lane.origin.elapsed(), automatic,
             || {
                 let captured = OffsetDateTime::now_utc();
                 let collection = collect_agent_status_collection(&source,
@@ -391,6 +463,9 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
                 collection
             },
             |collection| {
+                if !enabled {
+                    return true;
+                }
                 let result = crate::snapshot_sync::upload_agent_status_snapshots(&collection.snapshots);
                 eprintln!("agent status refresh: source={source:?} outcome={} duration_ms={} snapshots={}",
                     if result.is_ok() { "ok" } else { "error" }, began.elapsed().as_millis(), collection.snapshots.len());
@@ -399,6 +474,20 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
                 }
                 result.is_ok()
             }, || lane.origin.elapsed());
+        if source == SourceKind::ClaudeCode {
+            let collection = lane
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .collection
+                .clone();
+            if let Some(due_in) = collection.as_deref().and_then(|collection| {
+                let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).ok()?;
+                Some(claude_next_reset_read_at(collection, now)? - now)
+            }) {
+                lane.run_by(lane.origin.elapsed(), Duration::from_secs(due_in));
+            }
+        }
         let mut state = lane
             .state
             .lock()
@@ -417,6 +506,12 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
                     .schedule
                     .deadline()
                     .saturating_sub(lane.origin.elapsed())
+            } else if automatic {
+                state
+                    .schedule
+                    .deadline()
+                    .saturating_sub(lane.origin.elapsed())
+                    .min(RETRY_DELAY)
             } else {
                 RETRY_DELAY
             };
@@ -443,6 +538,10 @@ pub(crate) fn collection(
     expires_at: String,
     manual: bool,
 ) -> Result<Arc<AgentStatusCollection>, LocalApiError> {
+    #[cfg(test)]
+    if let Some(collection) = TEST_COLLECTION.with(|slot| slot.borrow().clone()) {
+        return Ok(collection);
+    }
     match owner() {
         Some(owner) => owner.lanes[index(source)].collection(manual),
         None => Ok(Arc::new(collect_agent_status_collection(
@@ -500,6 +599,30 @@ pub(crate) fn status_for_reconciliation(
 
 pub(crate) fn active() -> bool {
     owner().is_some()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COLLECTION: std::cell::RefCell<Option<Arc<AgentStatusCollection>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `run` with `collection` as this thread's status collection, so a test
+/// that drives a sync cycle reads no provider or credential state.
+#[cfg(test)]
+pub(crate) fn with_test_collection<T>(
+    collection: AgentStatusCollection,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_COLLECTION.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    TEST_COLLECTION.with(|slot| *slot.borrow_mut() = Some(Arc::new(collection)));
+    let _reset = Reset;
+    run()
 }
 pub fn request(source: &SourceKind) {
     if let Some(owner) = owner() {
@@ -578,6 +701,105 @@ mod tests {
         assert_eq!(starts, vec![0, 300, 600, 900, 1200]);
         assert_eq!(lane.state.lock().unwrap().generation, 5);
         assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(1500));
+    }
+    /// Claude: a pass only an app's request starts serves stored readings
+    /// (no provider call), uploads nothing and leaves the timer alone, so
+    /// the daemon's own 5-min passes, which may read the provider, keep
+    /// their time however often the app asks.
+    #[test]
+    fn claude_app_passes_serve_stored_readings_and_keep_the_timer() {
+        let lane = StatusLane::for_source(&SourceKind::ClaudeCode);
+        let uploads = std::cell::Cell::new(0);
+        let run = |at: u64, saved_only: bool| {
+            lane.pass(
+                seconds(at),
+                true,
+                || {
+                    assert_eq!(
+                        crate::agent_status::claude_pass_saved_only(),
+                        saved_only,
+                        "pass at {at}"
+                    );
+                    specimen(SourceKind::ClaudeCode)
+                },
+                |_| {
+                    uploads.set(uploads.get() + 1);
+                    true
+                },
+                || seconds(at + 2),
+            )
+        };
+        assert!(run(0, false));
+        assert_eq!(uploads.get(), 1);
+        for at in [120, 250, 299] {
+            lane.state.lock().unwrap().manual = true;
+            assert!(run(at, true));
+        }
+        assert_eq!(uploads.get(), 1, "app passes upload nothing");
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
+        assert_eq!(lane.state.lock().unwrap().generation, 4);
+        assert!(!crate::agent_status::claude_pass_saved_only());
+        // The timer pass reads; an app request that meets it is that pass.
+        lane.state.lock().unwrap().manual = true;
+        assert!(run(300, false));
+        assert_eq!(uploads.get(), 2);
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(600));
+        // An app request right after a pass shares it.
+        let shared = lane.collection_at(seconds(300), true).unwrap();
+        assert_eq!(lane.state.lock().unwrap().generation, 5);
+        drop(shared);
+        // Other sources keep their old manual passes.
+        let codex = StatusLane::for_source(&SourceKind::Codex);
+        assert!(pass(&codex, 0, 2, true));
+        codex.state.lock().unwrap().manual = true;
+        assert!(pass(&codex, 120, 122, true));
+        assert_eq!(codex.state.lock().unwrap().schedule.next_due, seconds(420));
+    }
+    /// The provider calls of a lane's first pass after daemon start are
+    /// labelled `startup`; an app-only pass before it does not count, and
+    /// later passes, including the first one after a wake, keep their
+    /// callers' labels.
+    #[test]
+    fn first_lane_pass_is_the_startup_trigger() {
+        use crate::provider_calls::{current_trigger, Trigger};
+        let lane = StatusLane::for_source(&SourceKind::ClaudeCode);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let run = |at: u64| {
+            lane.pass(
+                seconds(at),
+                true,
+                || {
+                    seen.borrow_mut().push(current_trigger());
+                    specimen(SourceKind::ClaudeCode)
+                },
+                |_| true,
+                || seconds(at + 2),
+            )
+        };
+        lane.state.lock().unwrap().schedule.next_due = seconds(60);
+        lane.state.lock().unwrap().manual = true;
+        assert!(run(10));
+        assert!(run(60));
+        assert!(run(360));
+        // A wake with a stale collection restarts the schedule, not the daemon.
+        let wall = OffsetDateTime::parse("2026-10-05T01:00:00Z", &Rfc3339).unwrap();
+        lane.wake_if_stale(seconds(370), wall);
+        assert!(lane.state.lock().unwrap().schedule.last_started.is_none());
+        assert!(run(370));
+        assert_eq!(*seen.borrow(), [None, Some(Trigger::Startup), None, None]);
+    }
+    #[test]
+    fn claude_reset_read_brings_the_next_pass_forward_only() {
+        let lane = StatusLane::new();
+        assert!(pass(&lane, 0, 7, true));
+        lane.run_by(seconds(7), seconds(60));
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(72));
+        // A later reset read never pushes the regular pass back.
+        lane.run_by(seconds(8), seconds(600));
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(72));
+        assert!(!pass(&lane, 71, 71, true));
+        assert!(pass(&lane, 72, 79, true));
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(372));
     }
     #[test]
     fn late_tick_and_overrun_skip_catchup_without_busy_loop() {

@@ -151,6 +151,11 @@ ottto logout --local-only --json
 Use local-only cleanup only after the user accepts that cloud disconnect did not
 complete.
 
+Cloud logout also releases this Mac's server registration when the response
+reports `device_released: true`. Local-only cleanup never does: the Mac stays
+registered to the old Ottto account until that account removes it on its Apps
+page (Disconnect), and only then can a different account connect it.
+
 ## Support Bundle
 
 ```bash

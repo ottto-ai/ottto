@@ -1,9 +1,12 @@
 //! Machine-local "active now" session status.
 //!
-//! A session qualifies only when its transcript's source activity advanced
-//! since the previous successful incremental scan and that activity is recent.
-//! This avoids treating a title-sidecar refresh or a historical backfill as
-//! live work. The persisted payload contains only content-free snapshot fields.
+//! A session enters the list only when its transcript's source activity
+//! advanced since the previous successful incremental scan and that activity is
+//! recent. This avoids treating a title-sidecar refresh or a historical backfill
+//! as live work. Once listed, a session stays listed by later scans until its
+//! last observed activity leaves the recent window, so a scan that saw no new
+//! activity does not empty the list. The persisted payload contains only
+//! content-free snapshot fields.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -20,6 +23,7 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::snapshots::{
     bounded_compaction_timestamps, SnapshotItem, SnapshotModelUsage, SnapshotSource,
+    SnapshotUploadPolicy, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
 };
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
@@ -37,6 +41,10 @@ struct ActiveSessionCache {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registration_evidence:
         BTreeMap<String, crate::claude_session_registrations::RegistrationEvidence>,
+    /// Upload privacy policy the listed rows were derived under. A row is
+    /// carried without re-reading its transcript only under the same policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    listed_under_policy: Option<String>,
 }
 
 pub fn active_session_cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
@@ -57,14 +65,35 @@ pub fn reconcile_active_sessions(
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
+    upload_policy: SnapshotUploadPolicy,
     reconciled_at: &str,
 ) -> Result<ActiveSessionReconciliation> {
+    let policy = serde_json::to_string(&upload_policy)?;
     reconcile_with_registrations(
         support_dir,
         source,
         snapshots,
         agent_status,
         reconciled_at,
+        Some(&policy),
+        crate::agent_status::claude_session_registrations,
+    )
+}
+
+/// Empties the list when the source stops collecting (policy tombstone or
+/// admin-disabled reconciliation). Recently listed sessions are not carried.
+pub fn clear_active_sessions(
+    support_dir: &Path,
+    source: SnapshotSource,
+    reconciled_at: &str,
+) -> Result<ActiveSessionReconciliation> {
+    reconcile_with_registrations(
+        support_dir,
+        source,
+        &[],
+        None,
+        reconciled_at,
+        None,
         crate::agent_status::claude_session_registrations,
     )
 }
@@ -75,6 +104,7 @@ fn reconcile_with_registrations(
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
     reconciled_at: &str,
+    carry_policy: Option<&str>,
     registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
 ) -> Result<ActiveSessionReconciliation> {
     let path = active_session_cache_path(support_dir, source);
@@ -82,10 +112,14 @@ fn reconcile_with_registrations(
     let now = OffsetDateTime::parse(reconciled_at, &Rfc3339)
         .unwrap_or_else(|_| OffsetDateTime::now_utc());
     let activity_cutoff = now - Duration::minutes(ACTIVE_ACTIVITY_WINDOW_MINUTES);
+    let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
     let mut changed = BTreeMap::<String, ActiveSession>::new();
     let mut selected_snapshots = BTreeMap::new();
+    // Recent snapshots this scan re-read without advanced activity. A listed
+    // session among them is rebuilt under the current policy and evidence.
+    let mut observed = BTreeMap::<&str, &SnapshotItem>::new();
     for snapshot in snapshots {
         let Some(last_activity) = snapshot.source_last_activity_at.as_deref() else {
             continue;
@@ -99,15 +133,21 @@ fn reconcile_with_registrations(
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
             .map_or(true, |value| last_activity_at > value);
 
-        if advanced
-            && last_activity_at >= activity_cutoff
-            && last_activity_at <= now + Duration::minutes(5)
-        {
+        if advanced && last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
             changed.insert(
                 snapshot.source_session_id.clone(),
                 active_session_from_snapshot(source, snapshot, agent_status),
             );
             selected_snapshots.insert(snapshot.source_session_id.clone(), snapshot);
+        } else if last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
+            let newer = observed
+                .get(snapshot.source_session_id.as_str())
+                .map_or(true, |seen| {
+                    seen.source_last_activity_at < snapshot.source_last_activity_at
+                });
+            if newer {
+                observed.insert(snapshot.source_session_id.as_str(), snapshot);
+            }
         }
         if advanced {
             cache.watermarks.insert(
@@ -141,14 +181,44 @@ fn reconcile_with_registrations(
 
     let changed_session_count = changed.len() as u64;
     let mut sessions = changed.into_values().collect::<Vec<_>>();
-    sessions.sort_by(|left, right| {
-        right
-            .source_last_activity_at
-            .cmp(&left.source_last_activity_at)
-            .then_with(|| left.source_session_id.cmp(&right.source_session_id))
-    });
-    sessions.truncate(MAX_ACTIVE_SESSIONS);
-    cache.registration_evidence.clear();
+    let previous_evidence = std::mem::take(&mut cache.registration_evidence);
+    // Keep still-recent sessions this scan did not select: an incremental scan
+    // omits unchanged transcripts, and a quiet minute is not an ended session.
+    let previous = cache
+        .reconciliation
+        .take()
+        .map(|reconciliation| reconciliation.sessions)
+        .unwrap_or_default();
+    let carry_unobserved =
+        carry_policy.is_some_and(|policy| cache.listed_under_policy.as_deref() == Some(policy));
+    let mut carried = Vec::new();
+    if carry_policy.is_some() {
+        for mut session in previous {
+            if selected_snapshots.contains_key(&session.source_session_id) {
+                continue;
+            }
+            if let Some(snapshot) = observed.get(session.source_session_id.as_str()) {
+                sessions.push(active_session_from_snapshot(source, snapshot, agent_status));
+                selected_snapshots.insert(session.source_session_id.clone(), snapshot);
+                continue;
+            }
+            let recent = OffsetDateTime::parse(&session.source_last_activity_at, &Rfc3339)
+                .is_ok_and(|at| at >= activity_cutoff && at <= activity_ceiling);
+            if !carry_unobserved || !recent {
+                continue;
+            }
+            if let Some(status) = agent_status {
+                withhold_contradicted_attribution(&mut session, status);
+            }
+            if let Some(evidence) = previous_evidence.get(&session.source_session_id) {
+                cache
+                    .registration_evidence
+                    .insert(session.source_session_id.clone(), evidence.clone());
+            }
+            carried.push(session);
+        }
+    }
+    cache.listed_under_policy = carry_policy.map(str::to_string);
     if source == SnapshotSource::ClaudeCode && !sessions.is_empty() {
         let registrations = registrations();
         for session in &mut sessions {
@@ -213,6 +283,21 @@ fn reconcile_with_registrations(
             }
         }
     }
+    sessions.extend(carried);
+    sessions.sort_by(|left, right| {
+        right
+            .source_last_activity_at
+            .cmp(&left.source_last_activity_at)
+            .then_with(|| left.source_session_id.cmp(&right.source_session_id))
+    });
+    sessions.truncate(MAX_ACTIVE_SESSIONS);
+    let listed = sessions
+        .iter()
+        .map(|session| session.source_session_id.as_str())
+        .collect::<BTreeSet<_>>();
+    cache
+        .registration_evidence
+        .retain(|session_id, _| listed.contains(session_id.as_str()));
     let reconciliation = ActiveSessionReconciliation {
         reconciled_at: reconciled_at.to_string(),
         changed_session_count,
@@ -221,6 +306,46 @@ fn reconcile_with_registrations(
     cache.reconciliation = Some(reconciliation.clone());
     write_cache(&path, &cache)?;
     Ok(reconciliation)
+}
+
+/// A carried row keeps the attribution proven when it was selected, unless the
+/// current status now contradicts it: an exact session observation naming a
+/// different account or workspace, or a current-login fallback whose login
+/// (account or workspace) has changed.
+fn withhold_contradicted_attribution(session: &mut ActiveSession, status: &AgentStatusSnapshot) {
+    let Some(account_hash) = session.account_identifier_hash.as_deref() else {
+        return;
+    };
+    let workspace_hash = session.organization_identifier_hash.as_deref();
+    let observation_contradicts = status
+        .plan_observations
+        .iter()
+        .filter(|observation| {
+            observation.source_session_id.as_deref() == Some(session.source_session_id.as_str())
+                && observation
+                    .account_identifier_hash
+                    .as_deref()
+                    .is_some_and(non_empty)
+        })
+        .any(|observation| {
+            observation.account_identifier_hash.as_deref() != Some(account_hash)
+                || observation
+                    .organization_identifier_hash
+                    .as_deref()
+                    .is_some_and(|workspace| Some(workspace) != workspace_hash)
+        });
+    let login_changed = session.account_attribution_source.as_deref()
+        == Some("current_login_at_reconciliation")
+        && status.account.as_ref().map_or(true, |account| {
+            account.account_identifier_hash.as_deref() != Some(account_hash)
+                || account.organization_identifier_hash.as_deref() != workspace_hash
+        });
+    if observation_contradicts || login_changed {
+        session.account_identifier_hash = None;
+        session.organization_identifier_hash = None;
+        session.subscription_product = None;
+        session.account_attribution_source = None;
+    }
 }
 
 fn active_session_from_snapshot(
@@ -283,6 +408,9 @@ fn active_session_from_snapshot(
         subscription_product: attribution
             .as_ref()
             .and_then(|value| value.subscription_product.clone()),
+        account_withheld_reason: account_withheld_reason(snapshot)
+            .filter(|_| attribution.is_none())
+            .map(str::to_string),
         account_attribution_source: attribution.map(|value| value.source),
         latest_model,
         latest_reasoning_effort,
@@ -442,11 +570,25 @@ fn account_attribution(
         EvidenceResolution::Resolved(account_hash) => Some(account_hash),
         EvidenceResolution::Conflict => return None,
     };
+    // One own login beside untagged usage names nothing by itself, but any
+    // other account contradicts the session's own requests.
+    let own_login = match snapshot_account_hash {
+        Some(_) => None,
+        None => match own_request_logins(snapshot) {
+            OwnRequestLogins::One(login) => Some(login),
+            OwnRequestLogins::Absent | OwnRequestLogins::Several => None,
+        },
+    };
+    let contradicts_own_login =
+        |account_hash: Option<&str>| own_login.is_some_and(|login| account_hash != Some(login));
 
     if exact_observation
         .and_then(|observation| observation.account_identifier_hash.as_deref())
         .zip(snapshot_account_hash.as_deref())
         .is_some_and(|(observation, snapshot)| observation != snapshot)
+        || exact_observation.is_some_and(|observation| {
+            contradicts_own_login(observation.account_identifier_hash.as_deref())
+        })
     {
         return None;
     }
@@ -463,8 +605,16 @@ fn account_attribution(
             "snapshot_account_identity",
         ));
     }
+    // The session's own requests already name several accounts: a parent's or
+    // the current login's single account must never stand in for them.
+    if account_withheld_reason(snapshot) == Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS) {
+        return None;
+    }
     match lineage_account_attribution(snapshot, status) {
-        EvidenceResolution::Resolved(lineage) => return Some(lineage),
+        EvidenceResolution::Resolved(lineage) => {
+            return (!contradicts_own_login(lineage.account_identifier_hash.as_deref()))
+                .then_some(lineage)
+        }
         EvidenceResolution::Conflict => return None,
         EvidenceResolution::Missing => {}
     }
@@ -480,6 +630,7 @@ fn account_attribution(
             .as_deref()
             .is_some_and(non_empty)
         || !snapshot_matches_current_account(snapshot, status)
+        || contradicts_own_login(account.account_identifier_hash.as_deref())
     {
         return None;
     }
@@ -489,6 +640,51 @@ fn account_attribution(
         subscription_product: account.subscription_product.clone(),
         source: "current_login_at_reconciliation".to_string(),
     })
+}
+
+/// The request-evidence pass's withheld reason, while it still describes the
+/// snapshot: every usage row is still unattributed, as that pass left it.
+/// Contract-5 rows that disagree explain themselves: their own per-request
+/// telemetry logins name two or more accounts. One account beside untagged
+/// usage, or a login from any other basis, explains nothing.
+fn account_withheld_reason(snapshot: &SnapshotItem) -> Option<&'static str> {
+    use crate::snapshots::claude_request_identity::{COLLECTOR, TELEMETRY, TELEMETRY_LOGIN};
+    let request_identity_rows = snapshot.provenance.collector == COLLECTOR;
+    if snapshot.claude_account_withheld_reason.is_none() && !request_identity_rows {
+        return None;
+    }
+    match exact_snapshot_account_hash(snapshot) {
+        EvidenceResolution::Missing => snapshot.claude_account_withheld_reason,
+        EvidenceResolution::Resolved(_) => None,
+        EvidenceResolution::Conflict if request_identity_rows => {
+            // Stops at the second account; nothing is collected.
+            let mut first = None;
+            snapshot
+                .model_usage
+                .iter()
+                .chain(
+                    snapshot
+                        .usage_buckets
+                        .iter()
+                        .flat_map(|bucket| bucket.model_usage.iter()),
+                )
+                .flat_map(|row| {
+                    std::iter::once((row.account_identifier_hash.as_deref(), row.evidence_ref))
+                        .chain(row.identity_parts.iter().flatten().map(|part| {
+                            (part.account_identifier_hash.as_deref(), part.evidence_ref)
+                        }))
+                })
+                .filter_map(|(hash, evidence_ref)| {
+                    let entry = snapshot.request_evidence.get(usize::from(evidence_ref?))?;
+                    matches!(entry.identity_basis.as_str(), TELEMETRY | TELEMETRY_LOGIN)
+                        .then_some(hash?)
+                        .filter(|hash| non_empty(hash))
+                })
+                .any(|hash| *first.get_or_insert(hash) != hash)
+                .then_some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS)
+        }
+        EvidenceResolution::Conflict => None,
+    }
 }
 
 enum EvidenceResolution<T> {
@@ -517,7 +713,12 @@ fn exact_snapshot_account_hash(snapshot: &SnapshotItem) -> EvidenceResolution<St
         })
         .collect::<BTreeSet<_>>();
     if hashes.is_empty() {
-        return EvidenceResolution::Missing;
+        // Rows split by request carry no row hash, but their parts still name
+        // the session's own logins: two of them conflict like two row hashes.
+        return match own_request_logins(snapshot) {
+            OwnRequestLogins::Several => EvidenceResolution::Conflict,
+            OwnRequestLogins::Absent | OwnRequestLogins::One(_) => EvidenceResolution::Missing,
+        };
     }
     if hashes.len() > 1
         || rows.iter().any(|row| {
@@ -531,10 +732,60 @@ fn exact_snapshot_account_hash(snapshot: &SnapshotItem) -> EvidenceResolution<St
     EvidenceResolution::Resolved(hashes.into_iter().next().expect("one hash").to_string())
 }
 
+enum OwnRequestLogins<'s> {
+    Absent,
+    One(&'s str),
+    Several,
+}
+
+/// The logins contract 5 tagged on the session's own requests from their own
+/// telemetry, read until a second one appears. Auxiliary and foreign requests
+/// are never tagged; org-only, census and untagged usage name no own login.
+fn own_request_logins(snapshot: &SnapshotItem) -> OwnRequestLogins<'_> {
+    use crate::snapshots::claude_request_identity::{COLLECTOR, TELEMETRY, TELEMETRY_LOGIN};
+    if snapshot.provenance.collector != COLLECTOR {
+        return OwnRequestLogins::Absent;
+    }
+    let mut logins = snapshot
+        .model_usage
+        .iter()
+        .chain(
+            snapshot
+                .usage_buckets
+                .iter()
+                .flat_map(|bucket| bucket.model_usage.iter()),
+        )
+        .flat_map(|row| {
+            std::iter::once((row.account_identifier_hash.as_deref(), row.evidence_ref)).chain(
+                row.identity_parts
+                    .iter()
+                    .flatten()
+                    .map(|part| (part.account_identifier_hash.as_deref(), part.evidence_ref)),
+            )
+        })
+        .filter_map(|(hash, evidence_ref)| {
+            let entry = snapshot.request_evidence.get(usize::from(evidence_ref?))?;
+            matches!(entry.identity_basis.as_str(), TELEMETRY | TELEMETRY_LOGIN)
+                .then_some(hash?)
+                .filter(|hash| non_empty(hash))
+        });
+    let Some(first) = logins.next() else {
+        return OwnRequestLogins::Absent;
+    };
+    if logins.any(|login| login != first) {
+        OwnRequestLogins::Several
+    } else {
+        OwnRequestLogins::One(first)
+    }
+}
+
 fn lineage_account_attribution(
     snapshot: &SnapshotItem,
     status: &AgentStatusSnapshot,
 ) -> EvidenceResolution<AccountAttribution> {
+    // A launched session is a separate run that may sign in to a different
+    // account, so its starter's account is never borrowed. Other lineage facts
+    // on the same session still count.
     let session_refs = snapshot
         .attribution_facts
         .iter()
@@ -543,6 +794,7 @@ fn lineage_account_attribution(
                 fact.field.as_str(),
                 "parent_session_ref" | "root_session_ref"
             ) && fact.evidence.strength == "direct"
+                && !fact.evidence.states_independent_launch()
                 && non_empty(&fact.value)
         })
         .map(|fact| fact.value.as_str())
@@ -731,6 +983,8 @@ mod tests {
 
     fn usage_row(model: &str, effort: Option<&str>, tokens: u64) -> SnapshotModelUsage {
         SnapshotModelUsage {
+            evidence_ref: None,
+            identity_parts: None,
             model: model.to_string(),
             input_tokens: 0,
             output_tokens: tokens,
@@ -886,6 +1140,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
+            test_policy(),
             "2026-07-19T10:05:00Z",
         )
         .expect("reconciliation");
@@ -942,6 +1197,7 @@ mod tests {
             &snapshots,
             None,
             "2026-07-19T10:05:00Z",
+            Some("policy"),
             registrations,
         )
         .unwrap();
@@ -999,6 +1255,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
+            Some("policy"),
             registrations,
         )
         .unwrap();
@@ -1026,16 +1283,42 @@ mod tests {
             .unwrap()
             .get("registration_evidence")
             .is_none());
+        // An incremental scan omits the unchanged transcript entirely.
         let unchanged = reconcile_with_registrations(
             &dir,
             SnapshotSource::ClaudeCode,
-            &[snapshot],
+            &[],
             None,
             "2026-07-19T10:10:00Z",
+            Some("policy"),
             || panic!("no registration acquisition without new activity"),
         )
         .unwrap();
         assert_eq!(unchanged.changed_session_count, 0);
+        assert_eq!(
+            unchanged.sessions[0].session_display_name.as_deref(),
+            Some("Repair process registration"),
+            "a carried row keeps its proven registration name"
+        );
+        assert_eq!(
+            read_cache(&active_session_cache_path(&dir, SnapshotSource::ClaudeCode))
+                .registration_evidence["registered-session"]
+                .name_source
+                .as_deref(),
+            Some("user"),
+            "and the provenance of that name"
+        );
+        let expired = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[],
+            None,
+            "2026-07-19T10:30:00Z",
+            Some("policy"),
+            || panic!("no registration acquisition without new activity"),
+        )
+        .unwrap();
+        assert!(expired.sessions.is_empty());
         assert!(
             read_cache(&active_session_cache_path(&dir, SnapshotSource::ClaudeCode))
                 .registration_evidence
@@ -1058,6 +1341,7 @@ mod tests {
             &[older, newer],
             None,
             "2026-07-19T10:05:00Z",
+            Some("policy"),
             registrations,
         )
         .unwrap();
@@ -1092,6 +1376,7 @@ mod tests {
                 std::slice::from_ref(&snapshot),
                 None,
                 "2026-07-19T10:05:00Z",
+                Some("policy"),
                 registrations,
             )
             .unwrap();
@@ -1114,6 +1399,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
+            Some("policy"),
             registrations,
         )
         .unwrap();
@@ -1134,6 +1420,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
+            Some("policy"),
             BTreeMap::new,
         )
         .unwrap();
@@ -1146,12 +1433,23 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &[],
             None,
-            "2026-07-19T10:10:00Z",
+            "2026-07-19T10:30:00Z",
+            Some("policy"),
             || panic!("no registry scan for empty source"),
         )
         .unwrap();
         assert!(empty.sessions.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_policy() -> SnapshotUploadPolicy {
+        SnapshotUploadPolicy {
+            session_titles_enabled: true,
+            workspace_labels_enabled: true,
+            session_artifacts_enabled: true,
+            session_attribution_enabled: true,
+            session_attribution_labels_enabled: true,
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1167,6 +1465,7 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
+            test_policy(),
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1181,10 +1480,265 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
+            test_policy(),
             "2026-07-19T10:10:00Z",
         )
         .expect("unchanged reconciliation");
         assert_eq!(unchanged.changed_session_count, 0);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keeps_recent_sessions_listed_until_their_activity_leaves_the_window() {
+        let dir = temp_dir("carried");
+        let busy = test_snapshot("busy", "2026-07-19T10:04:00Z");
+        let first = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&busy),
+            None,
+            test_policy(),
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+        assert_eq!(first.sessions.len(), 1);
+
+        // An incremental scan that re-selected nothing still lists the session.
+        let quiet = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            test_policy(),
+            "2026-07-19T10:15:00Z",
+        )
+        .expect("quiet reconciliation");
+        assert_eq!(quiet.changed_session_count, 0);
+        assert_eq!(quiet.sessions, first.sessions);
+
+        // A newly advanced session joins; the carried one stays, newest first.
+        let other = test_snapshot("other", "2026-07-19T10:16:00Z");
+        let mixed = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[busy.clone(), other],
+            None,
+            test_policy(),
+            "2026-07-19T10:17:00Z",
+        )
+        .expect("mixed reconciliation");
+        assert_eq!(mixed.changed_session_count, 1);
+        let ids = mixed
+            .sessions
+            .iter()
+            .map(|session| session.source_session_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["other", "busy"]);
+
+        // Fifteen minutes after its last activity the carried session expires.
+        let later = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            test_policy(),
+            "2026-07-19T10:20:00Z",
+        )
+        .expect("later reconciliation");
+        let ids = later
+            .sessions
+            .iter()
+            .map(|session| session.source_session_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["other"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebuilds_a_listed_session_re_read_without_new_activity() {
+        let dir = temp_dir("rebuilt");
+        let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        let first = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&snapshot),
+            None,
+            test_policy(),
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+        assert!(first.sessions[0].session_display_name.is_some());
+
+        // The workspace disabled titles; the re-read snapshot carries none.
+        let mut stripped = snapshot.clone();
+        stripped.session_display_name = None;
+        let policy = SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            ..test_policy()
+        };
+        let rebuilt = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[stripped],
+            None,
+            policy,
+            "2026-07-19T10:08:00Z",
+        )
+        .expect("rebuilt reconciliation");
+        assert_eq!(rebuilt.changed_session_count, 0);
+        assert_eq!(rebuilt.sessions.len(), 1);
+        assert!(rebuilt.sessions[0].session_display_name.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn does_not_carry_unread_sessions_across_an_upload_policy_change() {
+        let dir = temp_dir("policy-change");
+        let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&snapshot),
+            None,
+            test_policy(),
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+        let policy = SnapshotUploadPolicy {
+            workspace_labels_enabled: false,
+            ..test_policy()
+        };
+        let changed = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            policy,
+            "2026-07-19T10:08:00Z",
+        )
+        .expect("policy-change reconciliation");
+        assert!(changed.sessions.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn withholds_carried_attribution_that_current_evidence_contradicts() {
+        let dir = temp_dir("carried-attribution");
+        let mut snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        snapshot.model_usage[0].account_identifier_hash = Some("account-a".into());
+        snapshot.usage_buckets[0].model_usage[0].account_identifier_hash = Some("account-a".into());
+        let status = test_status();
+        let first = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&snapshot),
+            Some(&status),
+            test_policy(),
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+        assert_eq!(
+            first.sessions[0].account_identifier_hash.as_deref(),
+            Some("account-a")
+        );
+
+        let agreeing = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            Some(&status),
+            test_policy(),
+            "2026-07-19T10:06:00Z",
+        )
+        .expect("agreeing reconciliation");
+        assert_eq!(
+            agreeing.sessions[0].account_identifier_hash.as_deref(),
+            Some("account-a")
+        );
+
+        let mut conflicting = test_status();
+        conflicting.plan_observations.push(test_plan_observation(
+            "s1",
+            "account-b",
+            AgentStatusConfidence::High,
+        ));
+        let withheld = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            Some(&conflicting),
+            test_policy(),
+            "2026-07-19T10:07:00Z",
+        )
+        .expect("conflicting reconciliation");
+        assert_eq!(withheld.sessions.len(), 1);
+        assert!(withheld.sessions[0].account_identifier_hash.is_none());
+        assert!(withheld.sessions[0].organization_identifier_hash.is_none());
+        assert!(withheld.sessions[0].account_attribution_source.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn withholds_carried_login_fallback_after_a_workspace_switch() {
+        let mut session = active_session_from_snapshot(
+            SnapshotSource::Codex,
+            &test_snapshot("s1", "2026-07-19T10:04:00Z"),
+            None,
+        );
+        session.account_identifier_hash = Some("account-a".into());
+        session.organization_identifier_hash = Some("workspace-x".into());
+        session.account_attribution_source = Some("current_login_at_reconciliation".into());
+        let mut status = test_status();
+        let mut account = test_current_account("account-a");
+        account.organization_identifier_hash = Some("workspace-x".into());
+        status.account = Some(account.clone());
+
+        let mut same = session.clone();
+        withhold_contradicted_attribution(&mut same, &status);
+        assert_eq!(
+            same.organization_identifier_hash.as_deref(),
+            Some("workspace-x")
+        );
+
+        account.organization_identifier_hash = Some("workspace-y".into());
+        status.account = Some(account);
+        withhold_contradicted_attribution(&mut session, &status);
+        assert!(session.account_identifier_hash.is_none());
+        assert!(session.organization_identifier_hash.is_none());
+    }
+
+    #[test]
+    fn clearing_a_withdrawn_source_does_not_carry_recent_sessions() {
+        let dir = temp_dir("cleared");
+        let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&snapshot),
+            None,
+            test_policy(),
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+
+        let cleared = clear_active_sessions(&dir, SnapshotSource::Codex, "2026-07-19T10:06:00Z")
+            .expect("cleared reconciliation");
+        assert!(cleared.sessions.is_empty());
+        let after = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            test_policy(),
+            "2026-07-19T10:07:00Z",
+        )
+        .expect("next reconciliation");
+        assert!(after.sessions.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1254,6 +1808,162 @@ mod tests {
             active.input_token_scope.as_deref(),
             Some("inclusive_cached")
         );
+    }
+
+    #[test]
+    fn explains_withheld_accounts_without_widening_attribution() {
+        let mut status = test_status();
+        status.account = Some(test_current_account("current_login_hash"));
+        status.plan_observations.push(test_plan_observation(
+            "parent",
+            "parent_hash",
+            AgentStatusConfidence::High,
+        ));
+
+        // Several accounts on the session's own requests: neither the parent's
+        // nor the current login's single account may stand in for them.
+        let mut mixed = test_snapshot("mixed", "2026-07-19T10:04:00Z");
+        mixed
+            .attribution_facts
+            .push(direct_fact("parent_session_ref", "parent"));
+        mixed.claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &mixed, Some(&status));
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+        assert_eq!(
+            active.account_withheld_reason.as_deref(),
+            Some("multiple_accounts")
+        );
+
+        // Incomplete evidence only explains; the existing fallbacks are
+        // unchanged, and an attributed card never carries a reason.
+        let mut incomplete = test_snapshot("incomplete", "2026-07-19T10:04:00Z");
+        incomplete.claude_account_withheld_reason =
+            Some(crate::snapshots::CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE);
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &incomplete, Some(&status));
+        assert_eq!(
+            active.account_attribution_source.as_deref(),
+            Some("current_login_at_reconciliation")
+        );
+        assert_eq!(active.account_withheld_reason, None);
+        let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &incomplete, None);
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(
+            active.account_withheld_reason.as_deref(),
+            Some("incomplete_request_evidence")
+        );
+
+        // A reason no longer describes rows a later pass attributed.
+        let mut attributed = mixed.clone();
+        for row in &mut attributed.model_usage {
+            row.account_identifier_hash = Some("family_hash".to_string());
+        }
+        for bucket in &mut attributed.usage_buckets {
+            for row in &mut bucket.model_usage {
+                row.account_identifier_hash = Some("family_hash".to_string());
+            }
+        }
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &attributed, Some(&status));
+        assert_eq!(
+            active.account_identifier_hash.as_deref(),
+            Some("family_hash")
+        );
+        assert_eq!(active.account_withheld_reason, None);
+
+        // Contract-5 rows: each bucket row carries its own request login and the
+        // lifetime row splits into exact parts. Two accounts explain themselves
+        // with no stored reason, and still name nothing.
+        let part = |hash: &str| crate::snapshots::SnapshotIdentityPart {
+            account_identifier_hash: Some(hash.to_string()),
+            evidence_ref: Some(0),
+            input_tokens: 50,
+            output_tokens: 10,
+            cache_read_tokens: 40,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 0,
+            unattributed_total_tokens: 0,
+            request_count: 1,
+            cost_usd: None,
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
+        };
+        let mut tagged = test_snapshot("tagged", "2026-07-19T10:04:00Z");
+        tagged.provenance.collector =
+            crate::snapshots::claude_request_identity::COLLECTOR.to_string();
+        tagged
+            .attribution_facts
+            .push(direct_fact("parent_session_ref", "parent"));
+        tagged.request_evidence = vec![crate::snapshots::SnapshotRequestEvidence {
+            identity_basis: "telemetry".to_string(),
+            provider_workspace_hash: Some("organization_hash".to_string()),
+        }];
+        let mut later = tagged.usage_buckets[0].clone();
+        later.bucket_start = "2026-07-19T11:00:00Z".to_string();
+        tagged.usage_buckets.push(later);
+        tagged.model_usage[0].identity_parts = Some(vec![part("login_a"), part("login_b")]);
+        for (bucket, login) in tagged.usage_buckets.iter_mut().zip(["login_a", "login_b"]) {
+            bucket.model_usage[0].account_identifier_hash = Some(login.to_string());
+            bucket.model_usage[0].evidence_ref = Some(0);
+        }
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &tagged, Some(&status));
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+        assert_eq!(
+            active.account_withheld_reason.as_deref(),
+            Some("multiple_accounts")
+        );
+
+        // A login from a census basis is not the request's own telemetry.
+        let mut census = tagged.clone();
+        census.request_evidence[0].identity_basis = "transcript_sole_login".to_string();
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &census, Some(&status));
+        assert_eq!(active.account_attribution_source, None);
+        assert_eq!(active.account_withheld_reason, None);
+
+        // One account beside untagged usage is not several accounts.
+        let mut one_and_untagged = tagged.clone();
+        one_and_untagged.model_usage[0].identity_parts = Some(vec![
+            part("login_a"),
+            crate::snapshots::SnapshotIdentityPart {
+                account_identifier_hash: None,
+                evidence_ref: None,
+                ..part("login_a")
+            },
+        ]);
+        let untagged = &mut one_and_untagged.usage_buckets[1].model_usage[0];
+        untagged.account_identifier_hash = None;
+        untagged.evidence_ref = None;
+        let active = active_session_from_snapshot(
+            SnapshotSource::ClaudeCode,
+            &one_and_untagged,
+            Some(&status),
+        );
+        assert_eq!(active.account_attribution_source, None);
+        assert_eq!(active.account_withheld_reason, None);
+
+        // Every request on one account stays named, as today.
+        let mut single = tagged.clone();
+        single.model_usage[0].identity_parts = None;
+        single.model_usage[0].account_identifier_hash = Some("login_a".to_string());
+        single.model_usage[0].evidence_ref = Some(0);
+        single.usage_buckets[1].model_usage[0].account_identifier_hash =
+            Some("login_a".to_string());
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &single, Some(&status));
+        assert_eq!(active.account_identifier_hash.as_deref(), Some("login_a"));
+        assert_eq!(
+            active.account_attribution_source.as_deref(),
+            Some("snapshot_account_identity")
+        );
+        assert_eq!(active.account_withheld_reason, None);
     }
 
     #[test]
@@ -1522,6 +2232,76 @@ mod tests {
     }
 
     #[test]
+    fn launched_session_never_borrows_its_starters_account() {
+        let attribution = |facts: &[(&str, &str)], own_hash: Option<&str>| {
+            let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
+            for (field, source_version) in facts {
+                let mut fact = direct_fact(field, "parent");
+                fact.evidence.source_version = source_version.to_string();
+                snapshot.attribution_facts.push(fact);
+            }
+            let mut status = test_status();
+            status.plan_observations.push(test_plan_observation(
+                "parent",
+                "parent_hash",
+                AgentStatusConfidence::High,
+            ));
+            if let Some(own_hash) = own_hash {
+                status.plan_observations.push(test_plan_observation(
+                    "child",
+                    own_hash,
+                    AgentStatusConfidence::High,
+                ));
+            }
+            let active =
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+            (
+                active.account_identifier_hash,
+                active.account_attribution_source,
+            )
+        };
+        let borrowed = (
+            Some("parent_hash".to_string()),
+            Some("lineage_plan_observation".to_string()),
+        );
+
+        // Launched by a launcher or by the desktop app, on either lineage field:
+        // the starter's account stays the starter's.
+        let launched: [&[(&str, &str)]; 3] = [
+            &[("parent_session_ref", "launcher_event:v1")],
+            &[("parent_session_ref", "claude_desktop_spawn:v1")],
+            &[("root_session_ref", "claude_desktop_spawn:v1")],
+        ];
+        for facts in launched {
+            assert_eq!(attribution(facts, None), (None, None), "{facts:?}");
+            assert_eq!(
+                attribution(facts, Some("child_hash")),
+                (
+                    Some("child_hash".to_string()),
+                    Some("session_plan_observation".to_string())
+                ),
+                "{facts:?}"
+            );
+        }
+        // Nested work, unknown or look-alike parsers, and a non-launched fact
+        // beside a launched one keep the lineage fallback.
+        let not_launched: [&[(&str, &str)]; 6] = [
+            &[("parent_session_ref", "claude_code_jsonl:v40")],
+            &[("parent_session_ref", "test:v1")],
+            &[("root_session_ref", "")],
+            &[("parent_session_ref", "launcher_events:v1")],
+            &[("parent_session_ref", "claude_desktop_spawner:v1")],
+            &[
+                ("parent_session_ref", "launcher_event:v1"),
+                ("root_session_ref", "claude_code_jsonl:v40"),
+            ],
+        ];
+        for facts in not_launched {
+            assert_eq!(attribution(facts, None), borrowed, "{facts:?}");
+        }
+    }
+
+    #[test]
     fn refuses_conflict_between_exact_observation_and_snapshot_identity() {
         let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
         snapshot.model_usage[0].account_identifier_hash = Some("snapshot_hash".to_string());
@@ -1593,6 +2373,204 @@ mod tests {
 
         assert_eq!(active.account_identifier_hash, None);
         assert_eq!(active.account_attribution_source, None);
+    }
+
+    #[test]
+    fn own_request_parts_gate_account_fallbacks() {
+        use crate::claude_local_otel::{
+            ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence,
+            ClaudeTraceOwnershipLoadReport,
+        };
+        use crate::snapshots::claude_request_identity as identity;
+        use sha2::{Digest, Sha256};
+
+        // A subagent's two requests in one hour on one model, read by the
+        // parser and tagged by contract 5 from each request's own telemetry.
+        let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let agent = "a4d1585d310070d0f";
+        let dir = temp_dir("own-request-parts");
+        let transcript = dir
+            .join(parent)
+            .join("subagents")
+            .join(format!("agent-{agent}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let line = |n: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-08-02T07:00:0{n}Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"req_{n}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
+            )
+        };
+        std::fs::write(&transcript, line(1) + &line(2)).unwrap();
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        // `None` leaves that request without telemetry, so it stays untagged.
+        let tagged = |logins: [Option<&str>; 2]| {
+            let mut api = ClaudeLocalOtelLoadReport::default();
+            let mut trace = ClaudeTraceOwnershipLoadReport::default();
+            for (n, login) in (1_u64..).zip(logins) {
+                let Some(login) = login else { continue };
+                let mut row = ClaudeLocalOtelEvidence {
+                    capture_revision: "claude_api_request:v2".to_string(),
+                    session_id: parent.to_string(),
+                    request_id: format!("req_{n}"),
+                    client_request_id: format!("client-req_{n}"),
+                    observed_at: format!("2026-08-02T07:00:0{n}Z"),
+                    model: "claude-haiku-4-5".to_string(),
+                    effort: "high".to_string(),
+                    query_source: "user".to_string(),
+                    speed: "fast".to_string(),
+                    cost_usd_micros: Some(100),
+                    event_sequence: Some(n),
+                    app_version: "2.1.226".to_string(),
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    request_count: 1,
+                    account_identity_checked: true,
+                    account_identifier_hash: Some(login.to_string()),
+                    ..Default::default()
+                };
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&row).unwrap())
+                );
+                let mut owner = ClaudeTraceOwnershipEvidence {
+                    capture_revision: "claude_llm_request_ownership:v1".to_string(),
+                    session_id: parent.to_string(),
+                    request_id: format!("req_{n}"),
+                    client_request_id: format!("client-req_{n}"),
+                    agent_id: agent.to_string(),
+                    observed_at: "2026-08-02T07:00:30Z".to_string(),
+                    ..Default::default()
+                };
+                owner.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&owner).unwrap())
+                );
+                api.evidence
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(row);
+                trace
+                    .evidence
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(owner);
+            }
+            let mut items = crate::snapshots::parse_claude_code_jsonl_file(
+                &transcript,
+                "2026-08-02T07:01:00Z",
+                "child-fp".to_string(),
+            )
+            .unwrap();
+            let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+            assert_eq!(
+                identity::apply_scan(&mut items, &evidence, BTreeMap::new()).sent,
+                1
+            );
+            let item = items.remove(0);
+            assert_eq!(item.source_session_id, format!("{parent}_agent-{agent}"));
+            // Every row splits into parts: no row carries a hash.
+            assert!(item
+                .model_usage
+                .iter()
+                .chain(
+                    item.usage_buckets
+                        .iter()
+                        .flat_map(|bucket| &bucket.model_usage)
+                )
+                .all(|row| row.account_identifier_hash.is_none()
+                    && row
+                        .identity_parts
+                        .as_ref()
+                        .is_some_and(|parts| parts.len() == 2)));
+            item
+        };
+        let lineage = |account_hash: &str| {
+            let mut status = test_status();
+            status.plan_observations.push(test_plan_observation(
+                parent,
+                account_hash,
+                AgentStatusConfidence::High,
+            ));
+            status
+        };
+        let attribution = |item: &SnapshotItem, status: &AgentStatusSnapshot| {
+            let active =
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, item, Some(status));
+            (
+                active.account_identifier_hash,
+                active.account_attribution_source,
+            )
+        };
+
+        // Two own logins: neither the parent's account nor an observation of
+        // either login stands in for them.
+        let mixed = tagged([Some(a.as_str()), Some(b.as_str())]);
+        assert_eq!(attribution(&mixed, &lineage(c.as_str())), (None, None));
+        assert_eq!(attribution(&mixed, &lineage(a.as_str())), (None, None));
+        // A stored mixed-account reason still explains the withheld account.
+        let mut mixed = mixed;
+        mixed.claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
+        for status in [lineage(c.as_str()), lineage(a.as_str())] {
+            let active =
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, &mixed, Some(&status));
+            assert_eq!(active.account_identifier_hash, None);
+            assert_eq!(active.account_attribution_source, None);
+            assert_eq!(
+                active.account_withheld_reason.as_deref(),
+                Some("multiple_accounts")
+            );
+        }
+
+        // One own login beside an untagged request: lineage, an exact
+        // observation or the current login naming another account is refused;
+        // the same account keeps its source.
+        let one = tagged([Some(a.as_str()), None]);
+        assert_eq!(attribution(&one, &lineage(b.as_str())), (None, None));
+        assert_eq!(
+            attribution(&one, &lineage(a.as_str())),
+            (
+                Some(a.clone()),
+                Some("lineage_plan_observation".to_string())
+            )
+        );
+        let session = one.source_session_id.clone();
+        let exact = |account_hash: &str| {
+            let mut status = test_status();
+            status.plan_observations.push(test_plan_observation(
+                &session,
+                account_hash,
+                AgentStatusConfidence::High,
+            ));
+            status
+        };
+        assert_eq!(attribution(&one, &exact(b.as_str())), (None, None));
+        assert_eq!(
+            attribution(&one, &exact(a.as_str())),
+            (
+                Some(a.clone()),
+                Some("session_plan_observation".to_string())
+            )
+        );
+        let mut one = one;
+        one.model_usage[0].model_provider = Some("anthropic".to_string());
+        one.model_usage[0].subscription_product = Some("claude_max".to_string());
+        let login = |account_hash: &str| {
+            let mut status = test_status();
+            let mut account = test_current_account(account_hash);
+            account.provider = Some("anthropic".to_string());
+            account.plan_type = None;
+            account.subscription_product = Some("claude_max".to_string());
+            status.account = Some(account);
+            status
+        };
+        assert_eq!(attribution(&one, &login(b.as_str())), (None, None));
+        assert_eq!(
+            attribution(&one, &login(a.as_str())),
+            (
+                Some(a.clone()),
+                Some("current_login_at_reconciliation".to_string())
+            )
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1714,6 +2692,8 @@ mod tests {
 
     fn test_snapshot(session_id: &str, last_activity: &str) -> SnapshotItem {
         let model_usage = SnapshotModelUsage {
+            evidence_ref: None,
+            identity_parts: None,
             model: "gpt-5.6-codex".to_string(),
             input_tokens: 100,
             output_tokens: 20,
@@ -1743,6 +2723,10 @@ mod tests {
             cache_creation_cost_usd: None,
         };
         SnapshotItem {
+            request_evidence: Vec::new(),
+            request_identity_refusals: 0,
+            claude_org_markers: None,
+            claude_account_withheld_reason: None,
             source_session_id: session_id.to_string(),
             snapshot_fingerprint: format!("fp-{session_id}"),
             status: "active".to_string(),
@@ -1784,6 +2768,7 @@ mod tests {
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
+            session_start: None,
             model_usage: vec![model_usage.clone()],
             usage_buckets: vec![crate::snapshots::SnapshotUsageBucket {
                 bucket_start: "2026-07-19T10:00:00Z".to_string(),

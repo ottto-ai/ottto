@@ -680,6 +680,8 @@ mod tests {
         let model_usage = model
             .map(|model| {
                 vec![crate::snapshots::SnapshotModelUsage {
+                    evidence_ref: None,
+                    identity_parts: None,
                     model: model.to_string(),
                     input_tokens: 0,
                     output_tokens: 0,
@@ -708,6 +710,10 @@ mod tests {
             })
             .unwrap_or_default();
         SnapshotItem {
+            request_evidence: Vec::new(),
+            request_identity_refusals: 0,
+            claude_org_markers: None,
+            claude_account_withheld_reason: None,
             source_session_id: session_id.to_string(),
             snapshot_fingerprint: String::new(),
             status: "final".to_string(),
@@ -749,6 +755,7 @@ mod tests {
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
+            session_start: None,
             model_usage,
             usage_buckets: Vec::new(),
             cost: None,

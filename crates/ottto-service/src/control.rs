@@ -42,9 +42,10 @@ use ottto_protocol::{
     ProviderDailyReferenceControlAction, RedactedValue, RelayRuntimeState, RelayState,
     ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
     RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
-    SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
-    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
-    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
+    SourceRouteVerificationResult, SourceVerificationCheck, SourceVerificationMethod,
+    SourceVerificationResult, SourceVerificationScope, SourceVerificationStatus, StableMessage,
+    TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
+    DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -94,7 +95,6 @@ const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_MARKER_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-const PI_IMPORT_RUN_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -102,10 +102,6 @@ const PI_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const PI_SESSION_MAX_DEPTH: usize = 32;
 const PI_SESSION_MAX_ENTRIES: usize = 20_000;
 const PI_SESSION_MAX_FILES: usize = 10_000;
-const PI_SESSION_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const PI_SESSION_MAX_AGGREGATE_BYTES: u64 = 128 * 1024 * 1024;
-const PI_MULTIPART_MAX_FIELD_BYTES: usize = 4 * 1024;
-const PI_MULTIPART_MAX_BODY_BYTES: usize = 132 * 1024 * 1024;
 const PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON: &str =
     "race-safe rooted session access is unavailable on this platform";
 const PI_SESSION_CENSUS_FAILED_CODE: &str = "pi_session_census_failed";
@@ -219,6 +215,14 @@ fn reserve_identity_mutation(
     pause_enabled_on_cleanup_required: bool,
 ) -> Result<IdentityMutationReservation, LocalApiError> {
     let _identity_lifecycle_lock = lock_setup_run_binding();
+    reserve_identity_mutation_locked(pause_enabled_on_cleanup_required)
+}
+
+/// [`reserve_identity_mutation`] for a caller already holding the identity
+/// lifecycle lock.
+fn reserve_identity_mutation_locked(
+    pause_enabled_on_cleanup_required: bool,
+) -> Result<IdentityMutationReservation, LocalApiError> {
     require_identity_mutation_reservation(None)?;
     let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
     if pause_enabled_on_cleanup_required {
@@ -354,7 +358,15 @@ pub fn handle_request_with_peer(
     let client_install_owner = request
         .client_install_owner
         .unwrap_or(InstallOwner::Unknown);
-    match handle_command(daemon, authorization, request.command, client_install_owner) {
+    let status_refresh_quota_source =
+        status_refresh_quota_source(request.client_kind, request.protocol_version);
+    match handle_command(
+        daemon,
+        authorization,
+        request.command,
+        client_install_owner,
+        status_refresh_quota_source,
+    ) {
         Ok(payload) => LocalControlResponse {
             request_id,
             ok: true,
@@ -807,17 +819,51 @@ fn daemon_is_release_signed() -> bool {
     })
 }
 
+/// Companion apps up to this protocol version have no `quota_refresh`: their
+/// Refresh button sends `status` with `refresh_agent_status`, the same request
+/// as their 5-minute scan. Those requests stand in for an explicit refresh of
+/// every Codex home, at most once per
+/// [`LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS`] per home. Claude is left out:
+/// its Refresh never forced a provider read, and its accounts are served the
+/// stored reading the daemon's schedule keeps current.
+const LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION: u16 = 15;
+const LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS: u64 = 5 * 60;
+
+/// The source whose quota a `status` refresh from this client refreshes
+/// explicitly, if any.
+fn status_refresh_quota_source(
+    client_kind: Option<LocalClientKind>,
+    protocol_version: u16,
+) -> Option<SourceKind> {
+    (client_kind == Some(LocalClientKind::CompanionApp)
+        && protocol_version <= LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION)
+        .then_some(SourceKind::Codex)
+}
+
 fn handle_command(
     daemon: &LocalDaemon,
     authorization: RequestAuthorization,
     command: LocalControlCommand,
     client_install_owner: InstallOwner,
+    status_refresh_quota_source: Option<SourceKind>,
 ) -> Result<serde_json::Value, LocalApiError> {
     match command {
         LocalControlCommand::Status {
             refresh_agent_status,
         } => {
             if refresh_agent_status {
+                if let Some(source) = status_refresh_quota_source.as_ref() {
+                    require_authorized_local_client(daemon, &authorization)?;
+                    crate::provider_calls::with_trigger(
+                        crate::provider_calls::Trigger::OlderAppCompat,
+                        || {
+                            request_explicit_quota_refresh(
+                                Some(source),
+                                LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS,
+                            )
+                        },
+                    );
+                }
                 refresh_agent_status_for(daemon, &authorization, None)?;
             }
             let mut status = status_for(daemon, &authorization)?;
@@ -865,7 +911,17 @@ fn handle_command(
             )
         }
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
-        LocalControlCommand::AgentStatusRefresh { source } => {
+        LocalControlCommand::AgentStatusRefresh {
+            source,
+            quota_refresh,
+        } => {
+            if quota_refresh {
+                require_authorized_local_client(daemon, &authorization)?;
+                crate::provider_calls::with_trigger(
+                    crate::provider_calls::Trigger::ExplicitRefresh,
+                    || request_explicit_quota_refresh(source.as_ref(), 0),
+                );
+            }
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
         LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
@@ -946,6 +1002,7 @@ fn handle_command(
             &authorization,
             local_only,
             forget_installation,
+            None,
         )?),
         LocalControlCommand::Account => to_value(account_for(daemon, &authorization)?),
         LocalControlCommand::ClaudeAccountsStatus => {
@@ -1089,7 +1146,10 @@ fn handle_command(
         }
         LocalControlCommand::CodexAccountsStatus => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(load_codex_account_settings_for_status_read()?)
+            crate::codex_sign_in::end_stale_run();
+            to_value(crate::codex_sign_in::present(
+                load_codex_account_settings_for_status_read()?,
+            ))
         }
         LocalControlCommand::CodexAccountPrepare {
             schema_version,
@@ -1098,19 +1158,22 @@ fn handle_command(
             expected_workspace_identifier_hash,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(prepare_codex_account(
+            to_value(crate::codex_sign_in::present(prepare_codex_account(
                 schema_version,
                 operation_id,
                 expected_account_identifier_hash,
                 expected_workspace_identifier_hash,
-            )?)
+            )?))
         }
         LocalControlCommand::CodexAccountPrepareOpen {
             schema_version,
             operation_id,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(prepare_open_codex_account(schema_version, operation_id)?)
+            to_value(crate::codex_sign_in::present(prepare_open_codex_account(
+                schema_version,
+                operation_id,
+            )?))
         }
         LocalControlCommand::CodexAccountPrepareTarget {
             schema_version,
@@ -1118,11 +1181,11 @@ fn handle_command(
             target_id,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(prepare_codex_account_target(
+            to_value(crate::codex_sign_in::present(prepare_codex_account_target(
                 schema_version,
                 operation_id,
                 target_id,
-            )?)
+            )?))
         }
         LocalControlCommand::CodexAccountReconnect {
             schema_version,
@@ -1132,37 +1195,54 @@ fn handle_command(
             expected_workspace_identifier_hash,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(reconnect_codex_account(
+            to_value(crate::codex_sign_in::present(reconnect_codex_account(
                 schema_version,
                 operation_id,
                 &slot_id,
                 expected_account_identifier_hash,
                 expected_workspace_identifier_hash,
-            )?)
+            )?))
         }
         LocalControlCommand::CodexAccountCheck {
             schema_version,
             operation_id,
+            explicit,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(check_codex_account(schema_version, &operation_id)?)
+            to_value(crate::codex_sign_in::present(check_codex_account(
+                schema_version,
+                &operation_id,
+                explicit,
+            )?))
+        }
+        LocalControlCommand::CodexAccountStartSignIn {
+            schema_version,
+            operation_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(crate::codex_sign_in::present(start_codex_sign_in(
+                schema_version,
+                &operation_id,
+            )?))
         }
         LocalControlCommand::CodexAccountStopWaiting {
             schema_version,
             operation_id,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(stop_waiting_for_codex_account(
-                schema_version,
-                &operation_id,
-            )?)
+            to_value(crate::codex_sign_in::present(
+                stop_waiting_for_codex_account(schema_version, &operation_id)?,
+            ))
         }
         LocalControlCommand::CodexAccountRemove {
             schema_version,
             slot_id,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(remove_codex_account(schema_version, &slot_id)?)
+            to_value(crate::codex_sign_in::present(remove_codex_account(
+                schema_version,
+                &slot_id,
+            )?))
         }
         LocalControlCommand::Detect { source } => {
             require_authorized_local_client(daemon, &authorization)?;
@@ -1221,7 +1301,11 @@ fn handle_command(
             }
         }
         LocalControlCommand::Verify { source, repair } => {
-            let result = verify_source(daemon, &authorization, source, repair)?;
+            // A person's Verify (the app or `ottto verify`) is a setup check.
+            let result =
+                crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Setup, || {
+                    verify_source(daemon, &authorization, source, repair)
+                })?;
             if verification_result_should_refresh_agent_status(&result) {
                 if let Err(error) =
                     refresh_agent_status_for(daemon, &authorization, Some(result.source.clone()))
@@ -2557,22 +2641,24 @@ fn load_codex_account_settings() -> Result<ottto_protocol::CodexAccountsStatusV1
 }
 
 /// How long a status read may reuse the last annotated Codex accounts status.
-/// Annotation starts one `codex app-server` per connected Codex home, and each
-/// of those asks the provider for rate limits. The companion polls this read
-/// every few seconds while an accounts surface is visible, so without reuse a
-/// Mac with four homes ran four app-servers several times a minute.
+/// Annotation serves each home's saved quota (it never starts `codex
+/// app-server`), but it still runs the local `codex login status` and model
+/// listing per home. The companion polls this read every few seconds while an
+/// accounts surface is visible, so the reuse bounds those local runs.
 const CODEX_ACCOUNTS_STATUS_READ_REUSE: Duration = Duration::from_secs(30);
 
 struct CachedCodexAccountsStatus {
     settings: ottto_protocol::CodexAccountsStatusV1,
+    /// [`crate::agent_status::saved_codex_quota_generation`] when annotated.
+    saved_quota_generation: u64,
     annotated: ottto_protocol::CodexAccountsStatusV1,
     annotated_at: Instant,
 }
 
-/// The polled read. Reuses a recent annotation while the stored settings are
-/// unchanged; any settings change (connect, remove, prepare) misses the cache.
-/// Holding the lock across annotation also collapses concurrent polls into one
-/// set of app-server runs.
+/// The polled read. Reuses a recent annotation while the stored settings and
+/// the saved quota readings are unchanged; any settings change (connect,
+/// remove, prepare) or newly saved reading misses the cache. Holding the lock
+/// across annotation also collapses concurrent polls into one annotation.
 fn load_codex_account_settings_for_status_read(
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
     static CACHE: Mutex<Option<CachedCodexAccountsStatus>> = Mutex::new(None);
@@ -2582,11 +2668,12 @@ fn load_codex_account_settings_for_status_read(
     let mut cache = CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let saved_quota_generation = crate::agent_status::saved_codex_quota_generation();
     if let Some(cached) = cache.as_ref() {
         if status_read_reusable(
-            &cached.settings,
+            &(&cached.settings, cached.saved_quota_generation),
             cached.annotated_at,
-            &settings,
+            &(&settings, saved_quota_generation),
             Instant::now(),
         ) {
             return Ok(cached.annotated.clone());
@@ -2595,6 +2682,7 @@ fn load_codex_account_settings_for_status_read(
     let annotated = crate::agent_status::annotate_codex_accounts_status(settings.clone());
     *cache = Some(CachedCodexAccountsStatus {
         settings,
+        saved_quota_generation,
         annotated: annotated.clone(),
         annotated_at: Instant::now(),
     });
@@ -2703,12 +2791,18 @@ fn reconnect_codex_account(
 fn check_codex_account(
     schema_version: u16,
     operation_id: &str,
+    explicit: bool,
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
     let store = FileCodexAccountSlotSettingsStore::default();
     let current_operation = store
         .setup_operation(operation_id)
         .map_err(codex_account_slot_settings_error)?;
-    if current_operation.state == CodexAccountSetupOperationStateV1::Complete {
+    // A daemon-run sign-in reads the account itself when `codex login` ends,
+    // so a check while it runs (an older client polling, or a second app)
+    // only reports where it is.
+    if current_operation.state == CodexAccountSetupOperationStateV1::Complete
+        || crate::codex_sign_in::is_running(&current_operation)
+    {
         return store
             .load()
             .map_err(codex_account_slot_settings_error)
@@ -2718,7 +2812,8 @@ fn check_codex_account(
     // to poll while the provider-owned browser flow is open, but an incomplete
     // login is progress, not a failed durable connection. Probe before moving
     // the persisted operation to `validating`; only a complete exact identity
-    // and fresh quota snapshot crosses that state boundary.
+    // and fresh quota snapshot crosses that state boundary. Clients poll this
+    // every few seconds, so the probe's provider reads are spaced per home.
     let pending_collection = if current_operation.state
         == CodexAccountSetupOperationStateV1::WaitingForUserLogin
     {
@@ -2727,7 +2822,13 @@ fn check_codex_account(
                 "Codex setup operation has no durable connection slot".to_string(),
             )
         })?;
-        match crate::agent_status::collect_registered_codex_slot_for_setup(slot_id) {
+        match crate::agent_status::collect_registered_codex_slot_for_setup(
+            slot_id,
+            crate::agent_status::CodexSetupRead::WaitingForLogin {
+                operation_id,
+                explicit,
+            },
+        ) {
             Ok(result) => Some(Ok(result)),
             Err(crate::agent_status::CodexSlotSetupCollectionError::ProviderLoginPending(_)) => {
                 return store
@@ -2743,77 +2844,152 @@ fn check_codex_account(
     store
         .begin_validation(schema_version, operation_id)
         .map_err(codex_account_slot_settings_error)?;
-    let operation = store
-        .setup_operation(operation_id)
-        .map_err(codex_account_slot_settings_error)?;
-    let slot_id = operation.slot_id.ok_or_else(|| {
-        LocalApiError::InvalidRequest(
-            "Codex setup operation has no durable connection slot".to_string(),
-        )
-    })?;
+    let slot_id = codex_setup_slot_id(&store, operation_id)?;
     if store
         .is_verifying_pinned_workspace(operation_id)
         .map_err(codex_account_slot_settings_error)?
     {
-        let account_hash = operation
-            .account_identifier_hash
-            .as_deref()
-            .ok_or_else(|| {
-                LocalApiError::InvalidRequest(
-                    "Pinned Codex verification has no account identity.".to_string(),
-                )
-            })?;
-        let workspace_hash = operation
-            .workspace_identifier_hash
-            .as_deref()
-            .ok_or_else(|| {
-                LocalApiError::InvalidRequest(
-                    "Pinned Codex verification has no workspace identity.".to_string(),
-                )
-            })?;
-        return match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id) {
-            Ok((pinned, _))
-                if pinned.account_identifier_hash == account_hash
-                    && pinned.workspace_identifier_hash == workspace_hash =>
-            {
-                store
-                    .complete_pinned_verification(
-                        schema_version,
-                        operation_id,
-                        account_hash,
-                        workspace_hash,
-                    )
-                    .map_err(codex_account_slot_settings_error)
-                    .map(crate::agent_status::annotate_codex_accounts_status)
-            }
-            _ => store
-                .fail_validation(
-                    schema_version,
-                    operation_id,
-                    "Codex workspace restriction did not survive a fresh provider restart.",
-                )
-                .map_err(codex_account_slot_settings_error)
-                .map(crate::agent_status::annotate_codex_accounts_status),
-        };
+        return verify_pinned_codex_setup(&store, schema_version, operation_id, &slot_id)
+            .map(|(status, _)| crate::agent_status::annotate_codex_accounts_status(status));
     }
     let collection = match pending_collection {
         Some(result) => result,
-        None => crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id),
+        None => crate::agent_status::collect_registered_codex_slot_for_setup(
+            &slot_id,
+            crate::agent_status::CodexSetupRead::Validation,
+        ),
     };
+    finish_codex_setup_validation(&store, schema_version, operation_id, &slot_id, collection)
+        .map(|(status, _)| crate::agent_status::annotate_codex_accounts_status(status))
+}
+
+/// How the validation of a Codex setup ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexSetupValidationEnd {
+    /// The exact account and workspace is connected.
+    Accepted,
+    IdentityMismatch,
+    DuplicateAccount,
+    /// The workspace restriction did not hold in a fresh provider session.
+    WorkspaceNotKept,
+    /// The account read failed; the setup failed with its message.
+    ReadFailed,
+}
+
+/// The managed slot of the setup operation.
+pub(crate) fn codex_setup_slot_id(
+    store: &FileCodexAccountSlotSettingsStore,
+    operation_id: &str,
+) -> Result<String, LocalApiError> {
+    store
+        .setup_operation(operation_id)
+        .map_err(codex_account_slot_settings_error)?
+        .slot_id
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Codex setup operation has no durable connection slot".to_string(),
+            )
+        })
+}
+
+/// The fresh restricted read that accepts a pinned workspace, for a setup
+/// whose restriction is already durable.
+pub(crate) fn verify_pinned_codex_setup(
+    store: &FileCodexAccountSlotSettingsStore,
+    schema_version: u16,
+    operation_id: &str,
+    slot_id: &str,
+) -> Result<
+    (
+        ottto_protocol::CodexAccountsStatusV1,
+        CodexSetupValidationEnd,
+    ),
+    LocalApiError,
+> {
+    let operation = store
+        .setup_operation(operation_id)
+        .map_err(codex_account_slot_settings_error)?;
+    let account_hash = operation
+        .account_identifier_hash
+        .as_deref()
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Pinned Codex verification has no account identity.".to_string(),
+            )
+        })?;
+    let workspace_hash = operation
+        .workspace_identifier_hash
+        .as_deref()
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Pinned Codex verification has no workspace identity.".to_string(),
+            )
+        })?;
+    match crate::agent_status::collect_registered_codex_slot_for_setup(
+        slot_id,
+        crate::agent_status::CodexSetupRead::Validation,
+    ) {
+        Ok((pinned, _))
+            if pinned.account_identifier_hash == account_hash
+                && pinned.workspace_identifier_hash == workspace_hash =>
+        {
+            store
+                .complete_pinned_verification(
+                    schema_version,
+                    operation_id,
+                    account_hash,
+                    workspace_hash,
+                )
+                .map_err(codex_account_slot_settings_error)
+                .map(|status| (status, CodexSetupValidationEnd::Accepted))
+        }
+        _ => store
+            .fail_validation(
+                schema_version,
+                operation_id,
+                "Codex workspace restriction did not survive a fresh provider restart.",
+            )
+            .map_err(codex_account_slot_settings_error)
+            .map(|status| (status, CodexSetupValidationEnd::WorkspaceNotKept)),
+    }
+}
+
+/// Validate a setup from one account read of its home: accept the exact
+/// identity (pinning its workspace and verifying the pin in a fresh read),
+/// or record a mismatch, a duplicate, or the read's failure.
+pub(crate) fn finish_codex_setup_validation(
+    store: &FileCodexAccountSlotSettingsStore,
+    schema_version: u16,
+    operation_id: &str,
+    slot_id: &str,
+    collection: Result<
+        (
+            crate::agent_status::CodexStrongIdentity,
+            ottto_protocol::CodexAccountSlotCollectionStatusV1,
+        ),
+        crate::agent_status::CodexSlotSetupCollectionError,
+    >,
+) -> Result<
+    (
+        ottto_protocol::CodexAccountsStatusV1,
+        CodexSetupValidationEnd,
+    ),
+    LocalApiError,
+> {
     let (identity, _) = match collection {
         Ok(result) => result,
         Err(error) => {
             return store
                 .fail_validation(schema_version, operation_id, error.message())
                 .map_err(codex_account_slot_settings_error)
-                .map(crate::agent_status::annotate_codex_accounts_status);
+                .map(|status| (status, CodexSetupValidationEnd::ReadFailed));
         }
     };
     let duplicate = store
         .has_registered_binding(
             &identity.account_identifier_hash,
             &identity.workspace_identifier_hash,
-            Some(&slot_id),
+            Some(slot_id),
         )
         .map_err(codex_account_slot_settings_error)?;
     let status = store
@@ -2830,40 +3006,37 @@ fn check_codex_account(
         .is_verifying_pinned_workspace(operation_id)
         .map_err(codex_account_slot_settings_error)?
     {
-        match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id) {
-            Ok((pinned, _))
-                if pinned.account_identifier_hash == identity.account_identifier_hash
-                    && pinned.workspace_identifier_hash == identity.workspace_identifier_hash =>
-            {
-                return store
-                    .complete_pinned_verification(
-                        schema_version,
-                        operation_id,
-                        &identity.account_identifier_hash,
-                        &identity.workspace_identifier_hash,
-                    )
-                    .map_err(codex_account_slot_settings_error)
-                    .map(crate::agent_status::annotate_codex_accounts_status);
-            }
-            _ => {
-                return store
-                    .fail_validation(
-                        schema_version,
-                        operation_id,
-                        "Codex workspace restriction did not survive a fresh provider restart.",
-                    )
-                    .map_err(codex_account_slot_settings_error)
-                    .map(crate::agent_status::annotate_codex_accounts_status);
-            }
-        }
+        return verify_pinned_codex_setup(store, schema_version, operation_id, slot_id);
     }
-    Ok(crate::agent_status::annotate_codex_accounts_status(status))
+    let end = match status.setup_operation.state {
+        CodexAccountSetupOperationStateV1::DuplicateAccount => {
+            CodexSetupValidationEnd::DuplicateAccount
+        }
+        CodexAccountSetupOperationStateV1::Complete => CodexSetupValidationEnd::Accepted,
+        _ => CodexSetupValidationEnd::IdentityMismatch,
+    };
+    Ok((status, end))
+}
+
+/// v26: start the daemon-run sign-in of a setup operation.
+fn start_codex_sign_in(
+    schema_version: u16,
+    operation_id: &str,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    crate::codex_sign_in::start(schema_version, operation_id)
+        .map_err(codex_account_slot_settings_error)?;
+    load_codex_account_settings()
 }
 
 fn stop_waiting_for_codex_account(
     schema_version: u16,
     operation_id: &str,
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    // A running `codex login` ends first, so it cannot write into a home that
+    // stopping is about to remove; the sign-in then stops the setup itself.
+    if crate::codex_sign_in::cancel(operation_id) {
+        return load_codex_account_settings();
+    }
     FileCodexAccountSlotSettingsStore::default()
         .stop_waiting(schema_version, operation_id)
         .map_err(codex_account_slot_settings_error)
@@ -2874,7 +3047,24 @@ fn remove_codex_account(
     schema_version: u16,
     slot_id: &str,
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
-    FileCodexAccountSlotSettingsStore::default()
+    let store = FileCodexAccountSlotSettingsStore::default();
+    // A sign-in into the home being removed ends first, so `codex login`
+    // never writes into a removed home.
+    if let Ok(status) = store.load() {
+        let operation = &status.setup_operation;
+        if operation.slot_id.as_deref() == Some(slot_id)
+            && crate::codex_sign_in::is_running(operation)
+            && status
+                .managed_slots
+                .iter()
+                .any(|slot| slot.slot_id == slot_id)
+        {
+            if let Some(operation_id) = operation.operation_id.as_deref() {
+                stop_waiting_for_codex_account(schema_version, operation_id)?;
+            }
+        }
+    }
+    store
         .remove(schema_version, slot_id)
         .map_err(codex_account_slot_settings_error)
         .map(crate::agent_status::annotate_codex_accounts_status)
@@ -2893,14 +3083,9 @@ fn agent_context(
     query: AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
-        daemon,
-        authorization,
-        "ottto context",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_context_with_refresh(api_base_url, connection, setup_run_token, &query)
-        },
-    )
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto context")?;
+    get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
 }
 
 fn agent_costs(
@@ -2909,14 +3094,9 @@ fn agent_costs(
     query: AgentCostsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
-        daemon,
-        authorization,
-        "ottto costs",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_costs_with_refresh(api_base_url, connection, setup_run_token, &query)
-        },
-    )
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto costs")?;
+    get_agent_costs_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
 }
 
 fn agent_sessions(
@@ -2925,14 +3105,9 @@ fn agent_sessions(
     query: AgentSessionsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
-        daemon,
-        authorization,
-        "ottto sessions",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_sessions_with_refresh(api_base_url, connection, setup_run_token, &query)
-        },
-    )
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto sessions")?;
+    get_agent_sessions_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
 }
 
 fn agent_recommendations(
@@ -2940,19 +3115,9 @@ fn agent_recommendations(
     authorization: &RequestAuthorization,
     query: AgentRecommendationsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    observe_setup_run_read(
-        daemon,
-        authorization,
-        "ottto recommendations",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_recommendations_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                &query,
-            )
-        },
-    )
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto recommendations")?;
+    get_agent_recommendations_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
 }
 
 fn agent_provider_impact(
@@ -2960,19 +3125,9 @@ fn agent_provider_impact(
     authorization: &RequestAuthorization,
     query: AgentProviderImpactQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    observe_setup_run_read(
-        daemon,
-        authorization,
-        "ottto provider-impact",
-        |api_base_url, connection, setup_run_token| {
-            get_agent_provider_impact_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                &query,
-            )
-        },
-    )
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto provider-impact")?;
+    get_agent_provider_impact_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
 }
 
 const TIMEZONE_OVERRIDE_UNSUPPORTED: &str =
@@ -2988,48 +3143,6 @@ fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError>
         ));
     }
     Ok(())
-}
-
-/// Run one setup-run agent read and record whether Ottto still accepts this
-/// Mac's setup run, so local status stops reporting a rejected run as
-/// complete. Only an authentication rejection from a local-client endpoint
-/// counts; network, timeout, and other backend failures say nothing about
-/// the run and leave the recorded state unchanged.
-/// Reads run concurrently with setup and sign-in, so the outcome is recorded
-/// against exactly the binding this read used, and dropped by the daemon if
-/// that binding has since been replaced.
-fn observe_setup_run_read<T>(
-    daemon: &LocalDaemon,
-    authorization: &RequestAuthorization,
-    command: &str,
-    read: impl FnOnce(&str, &LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
-) -> Result<T, LocalApiError> {
-    let (api_base_url, binding) = setup_run_agent_read_binding(daemon, authorization, command)?;
-    let result = setup_run_token_for_connection(&api_base_url, &binding).and_then(|credentials| {
-        read(
-            &api_base_url,
-            &credentials.connection,
-            &credentials.setup_run_token,
-        )
-    });
-    match &result {
-        Ok(_) => {
-            let _ = daemon.record_setup_run_read_accepted(&binding);
-        }
-        Err(error) if is_setup_run_read_rejection(error) => {
-            let _ = daemon.record_setup_run_read_rejected(&binding);
-        }
-        Err(_) => {}
-    }
-    result
-}
-
-fn is_setup_run_read_rejection(error: &LocalApiError) -> bool {
-    matches!(
-        error,
-        LocalApiError::Backend(details)
-            if details.status == Some(401) && details.endpoint.contains("/local-client/")
-    )
 }
 
 #[derive(Debug, Clone)]
@@ -3066,30 +3179,21 @@ fn cloud_command(
     operation: CloudOperation,
 ) -> Result<serde_json::Value, LocalApiError> {
     validate_cloud_operation(&operation)?;
-    observe_setup_run_read(
-        daemon,
-        authorization,
-        "ottto cloud",
-        |api_base_url, connection, setup_run_token| match cloud_request_with_base(
-            api_base_url,
-            connection,
-            setup_run_token,
-            &operation,
-        ) {
-            Ok(value) => Ok(value),
-            Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
-                let refreshed =
-                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-                cloud_request_with_base(
-                    api_base_url,
-                    &refreshed.connection,
-                    &refreshed.setup_run_token,
-                    &operation,
-                )
-            }
-            Err(error) => Err(error),
-        },
-    )
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto cloud")?;
+    match cloud_request_with_base(&api_base_url, &connection, &setup_run_token, &operation) {
+        Ok(value) => Ok(value),
+        Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
+            let refreshed = refresh_setup_run_token_via_device_secret(&api_base_url, &connection)?;
+            cloud_request_with_base(
+                &api_base_url,
+                &refreshed.connection,
+                &refreshed.setup_run_token,
+                &operation,
+            )
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_cloud_operation(operation: &CloudOperation) -> Result<(), LocalApiError> {
@@ -3292,11 +3396,11 @@ fn cloud_request_with_base(
     }
 }
 
-fn setup_run_agent_read_binding(
+fn setup_run_agent_read_context(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     command: &str,
-) -> Result<(String, LocalConnectionBinding), LocalApiError> {
+) -> Result<(String, LocalConnectionBinding, String), LocalApiError> {
     let status = status_for(daemon, authorization)?;
     if status.account.state != LocalAccountState::Connected {
         return Err(LocalApiError::InvalidRequest(format!(
@@ -3307,7 +3411,12 @@ fn setup_run_agent_read_binding(
         .connection_for_authorized_client()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
     let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
-    Ok((api_base_url, connection))
+    let credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
+    Ok((
+        api_base_url,
+        credentials.connection,
+        credentials.setup_run_token,
+    ))
 }
 
 fn require_authorized_local_client(
@@ -4830,6 +4939,27 @@ fn refresh_agent_status_for(
     Ok(snapshots)
 }
 
+/// Explicit quota refresh (a user's Refresh action) of every account of the
+/// source(s). Codex homes are read here, each at most once a minute or
+/// `min_gap_seconds` if longer (one `codex app-server` run per home, up to its
+/// timeout, before the reply). Claude accounts are marked for the collection
+/// that follows, whose usage gate reads them at most once a minute and keeps
+/// every hold, breaker and Retry-After; the lane's next own pass answers a
+/// mark that collection missed (one already in flight).
+fn request_explicit_quota_refresh(source: Option<&SourceKind>, min_gap_seconds: u64) {
+    if source.map_or(true, |source| source == &SourceKind::ClaudeCode) {
+        crate::agent_status::request_claude_explicit_refresh();
+        crate::agent_status_refresh::request(&SourceKind::ClaudeCode);
+    }
+    if source.map_or(true, |source| source == &SourceKind::Codex) {
+        let outcome = crate::agent_status::refresh_codex_quota_now(min_gap_seconds);
+        eprintln!(
+            "explicit Codex quota refresh: read={} rate_limited={}",
+            outcome.read, outcome.rate_limited
+        );
+    }
+}
+
 fn reconcile_agent_status_config_for_refresh(
     daemon: &LocalDaemon,
     source: Option<&SourceKind>,
@@ -5288,7 +5418,13 @@ fn auth_switch_account(
     let identity_reservation = reserve_identity_mutation(true)?;
     let staged = daemon.take_staged_account_switch(claim_code)?;
     if staged.relay_device_credential_preparation_id.is_none() {
-        disconnect_previous_binding_best_effort(daemon);
+        disconnect_previous_binding_best_effort(
+            daemon,
+            staged
+                .relay_device
+                .as_ref()
+                .map(|device| device.device_id.as_str()),
+        );
     }
     match install_staged_account_switch(daemon, &staged, &identity_reservation) {
         Ok(response) => Ok(response),
@@ -5307,7 +5443,11 @@ fn auth_switch_account(
 /// (401/404), the token may be unrefreshable, or the network may be down. The
 /// switch proceeds either way; the backend reconciles a dangling setup run on
 /// its side.
-fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon) {
+///
+/// The request also asks the server to release the previous device
+/// registration, unless the incoming binding reuses the same device id: a
+/// release must never revoke the credential the switch is about to install.
+fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon, incoming_device_id: Option<&str>) {
     let connection = match daemon.connection_for_authorized_client() {
         Ok(Some(connection)) => connection,
         Ok(None) | Err(_) => return,
@@ -5318,13 +5458,22 @@ fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon) {
     let Ok(api_base_url) = validated_api_base_url(Some(connection.api_base_url.as_str())) else {
         return;
     };
-    if let Err(error) =
-        disconnect_setup_run_with_refresh(&api_base_url, &connection, &setup_run_token)
-    {
+    let release =
+        load_device_release_proof().filter(|proof| releasable_on_switch(proof, incoming_device_id));
+    if let Err(error) = disconnect_setup_run_with_refresh(
+        &api_base_url,
+        &connection,
+        &setup_run_token,
+        release.as_ref(),
+    ) {
         eprintln!(
             "ottto-service: account switch: cloud disconnect of previous binding skipped: {error}"
         );
     }
+}
+
+fn releasable_on_switch(proof: &DeviceReleaseProof, incoming_device_id: Option<&str>) -> bool {
+    incoming_device_id.map_or(true, |incoming| incoming != proof.device_id)
 }
 
 fn install_staged_account_switch(
@@ -5372,7 +5521,10 @@ fn install_staged_account_switch(
         };
         // Only now may the old local/cloud binding be disconnected: every
         // earlier failure cut retained usable old authority.
-        disconnect_previous_binding_best_effort(daemon);
+        disconnect_previous_binding_best_effort(
+            daemon,
+            Some(confirmed_pending.device.device_id.as_str()),
+        );
         Some((confirmed_pending, candidate_secret))
     } else {
         None
@@ -6410,46 +6562,74 @@ fn claim_completion_response_unexpected(detail: &str) -> LocalApiError {
         endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
         status: None,
         body_excerpt: Some(detail.to_string()),
+        reason_code: None,
     })
 }
 
+/// `only_if_bound`: reset only while this setup run is still the bound one
+/// (the automatic reset after a terminal refresh answer about it).
 fn auth_reset(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     local_only: bool,
     forget_installation: bool,
+    only_if_bound: Option<&LocalConnectionBinding>,
 ) -> Result<AuthResetResponse, LocalApiError> {
-    if forget_installation && !local_only {
-        return Err(LocalApiError::InvalidRequest(
-            "--forget-installation requires --local-only; this reset does not mutate cloud state"
-                .to_string(),
-        ));
-    }
     require_authorized_local_client(daemon, authorization)?;
     // Both ordinary and explicit local-only logout clear the account/device
     // authority needed for exact backend cleanup, so neither may strand an
     // unconfirmed cloud-session grant.
-    let identity_reservation = reserve_identity_mutation(true)?;
+    let identity_reservation = {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        require_setup_run_still_bound(daemon, only_if_bound)?;
+        reserve_identity_mutation_locked(true)?
+    };
     let mut cloud_disconnect: Option<SetupRunDisconnectResponse> = None;
+    let mut setup_run_already_ended = false;
 
     if !local_only {
         let connection = daemon
             .connection_for_authorized_client()?
-            .ok_or_else(cloud_logout_requires_connection_error)?;
+            .ok_or_else(|| cloud_logout_requires_connection_error(forget_installation))?;
         let setup_run_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
             .load()
-            .map_err(|_| cloud_logout_requires_connection_error())?;
+            .map_err(|_| cloud_logout_requires_connection_error(forget_installation))?;
         let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
-        cloud_disconnect = Some(disconnect_setup_run_with_refresh(
+        // Read the release proof before any local deletion below; the server
+        // revokes this Mac's registration only when both halves authenticate.
+        let release = load_device_release_proof();
+        match disconnect_setup_run_with_refresh(
             &api_base_url,
             &connection,
             &setup_run_token,
-        )?);
+            release.as_ref(),
+        ) {
+            Ok(disconnect) => cloud_disconnect = Some(disconnect),
+            // Ottto already ended this run, so there is nothing left to
+            // disconnect or release. Fall through to the local-only cleanup
+            // (prior device proof kept for reconnecting) and report that Ottto
+            // was not changed. Forgetting the installation still needs the
+            // release, and every other failure still aborts with local state
+            // intact.
+            Err(error)
+                if !forget_installation
+                    && terminal_refresh_rejection(&error)
+                        == Some(TerminalRefreshRejection::SetupRunEnded) =>
+            {
+                setup_run_already_ended = true;
+            }
+            Err(error) => return Err(error),
+        }
     }
+    let local_only = local_only || setup_run_already_ended;
 
-    {
+    // Every local deletion, Keychain included, happens under the identity
+    // lifecycle lock after the binding is rechecked, so a setup run attached
+    // meanwhile (which takes the same lock) is never cleared by this reset.
+    let mut reset = {
         let _identity_lifecycle_lock = lock_setup_run_binding();
         identity_reservation.validate_locked()?;
+        require_setup_run_still_bound(daemon, only_if_bound)?;
         require_cloud_session_cleanup_before_identity_change_without_pause(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
         )?;
@@ -6471,13 +6651,13 @@ fn auth_reset(
         if forget_installation {
             forget_installation_state_locked()?;
         }
-    }
-    let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
-    let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
-    if !local_only || forget_installation {
-        let _ = KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT).delete();
-    }
-    let mut reset = daemon.reset_account_for_authorized_client()?;
+        let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
+        let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+        if !local_only || forget_installation {
+            let _ = KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+        }
+        daemon.reset_account_for_authorized_client()?
+    };
     reset.local_only = local_only;
     reset.cloud_disconnected = cloud_disconnect.is_some();
     reset.setup_run_id = cloud_disconnect
@@ -6486,25 +6666,61 @@ fn auth_reset(
     reset.disconnected_at = cloud_disconnect
         .as_ref()
         .map(|disconnect| disconnect.disconnected_at.clone());
-    reset.message = StableMessage {
-        code: if forget_installation {
-            "installation_forgotten".to_string()
-        } else if local_only {
-            "local_disconnect_complete".to_string()
-        } else {
-            "cloud_disconnect_complete".to_string()
-        },
-        text: if forget_installation {
-            "Installation identity, account scope, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing."
-                .to_string()
-        } else if local_only {
-            "Active local credentials were cleared without changing cloud state; prior device proof was retained securely for reconnection."
-                .to_string()
-        } else {
-            "This Mac was disconnected from Ottto.".to_string()
-        },
+    reset.device_released = cloud_disconnect
+        .as_ref()
+        .map(|disconnect| disconnect.device_released);
+    reset.message = if setup_run_already_ended {
+        StableMessage {
+            code: "setup_run_already_ended".to_string(),
+            text: "Ottto had already ended this Mac's setup run, so nothing changed in Ottto and this Mac's server registration was not released. Active local credentials were cleared; prior device proof was retained securely for reconnection."
+                .to_string(),
+        }
+    } else {
+        auth_reset_message(forget_installation, reset.device_released)
     };
     Ok(reset)
+}
+
+/// `device_released` is `None` for a local-only reset, which never contacts
+/// Ottto, and the server's answer for a cloud reset.
+fn auth_reset_message(forget_installation: bool, device_released: Option<bool>) -> StableMessage {
+    const NOT_RELEASED: &str = "Ottto did not confirm releasing this Mac's server registration, so it may still be active; the account that owns it can disconnect this Mac on its Apps page (Disconnect).";
+    const STILL_REGISTERED: &str = "This Mac is still registered to the previous Ottto account on the server, so a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
+    const FORGOTTEN: &str = "Installation identity, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing.";
+    let (code, text) = match (forget_installation, device_released) {
+        (true, None) => (
+            "installation_forgotten",
+            format!("Ottto was not contacted. {FORGOTTEN} {STILL_REGISTERED}"),
+        ),
+        (true, Some(true)) => (
+            "installation_forgotten",
+            format!(
+                "This Mac was disconnected from Ottto and its server registration was released. {FORGOTTEN}"
+            ),
+        ),
+        (true, Some(false)) => (
+            "installation_forgotten",
+            format!("This Mac was disconnected from Ottto. {NOT_RELEASED} {FORGOTTEN}"),
+        ),
+        (false, None) => (
+            "local_disconnect_complete",
+            "Active local credentials were cleared without changing cloud state; prior device proof was retained securely for reconnection."
+                .to_string(),
+        ),
+        (false, Some(true)) => (
+            "cloud_disconnect_complete",
+            "This Mac was disconnected from Ottto and its server registration was released."
+                .to_string(),
+        ),
+        (false, Some(false)) => (
+            "cloud_disconnect_complete",
+            format!("This Mac was disconnected from Ottto. {NOT_RELEASED}"),
+        ),
+    };
+    StableMessage {
+        code: code.to_string(),
+        text,
+    }
 }
 
 fn forget_installation_state_locked() -> Result<(), LocalApiError> {
@@ -6600,11 +6816,14 @@ fn cloud_session_cleanup_is_confirmed(grant: &crate::cloud_sessions::CloudSessio
         }
 }
 
-fn cloud_logout_requires_connection_error() -> LocalApiError {
-    LocalApiError::InvalidRequest(
+fn cloud_logout_requires_connection_error(forget_installation: bool) -> LocalApiError {
+    LocalApiError::InvalidRequest(if forget_installation {
+        "logout --forget-installation requires an active Ottto cloud connection to release this Mac's server registration; use --local-only --forget-installation only to clear local state without updating Ottto"
+            .to_string()
+    } else {
         "logout requires an active Ottto cloud connection; use --local-only only to clear local state without updating Ottto"
-            .to_string(),
-    )
+            .to_string()
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -7497,6 +7716,12 @@ fn cli_error(error: LocalApiError) -> CliError {
                     RedactedValue::String(body_excerpt.clone()),
                 );
             }
+            if let Some(reason_code) = &backend.reason_code {
+                details.insert(
+                    "reason_code".to_string(),
+                    RedactedValue::String(reason_code.clone()),
+                );
+            }
             match backend.kind {
                 BackendErrorKind::Unreachable => CliErrorCode::BackendUnreachable,
                 BackendErrorKind::Rejected => CliErrorCode::BackendRejected,
@@ -7521,8 +7746,6 @@ fn cli_error(error: LocalApiError) -> CliError {
         details,
     }
 }
-
-const SETUP_RUN_REJECTED_MESSAGE: &str = "Ottto no longer accepts this Mac's setup run. Uploads continue, but agent reads such as `ottto costs` stop until you reconnect. Reconnect this Mac from the Ottto Apps page (Open the Ottto app), or run `ottto setup --claim-code <code>` with the code shown there.";
 
 fn cli_error_message(error: &LocalApiError) -> String {
     match error {
@@ -7560,11 +7783,39 @@ fn cli_error_message(error: &LocalApiError) -> String {
             if body.contains("more than one active authority") {
                 return "This Mac has multiple active registrations. Choose Replace it on the browser claim page to revoke them and create one fresh device, then retry `ottto login` or `ottto setup`.".to_string();
             }
-            if body.contains("setup run expired") || body.contains("setup run cancelled") {
-                return SETUP_RUN_REJECTED_MESSAGE.to_string();
+            match backend.reason_code.as_deref() {
+                Some("timezone_query_unsupported") => {
+                    return TIMEZONE_OVERRIDE_UNSUPPORTED.to_string();
+                }
+                Some("machine_filter_unsupported") => {
+                    return "Ottto can't filter costs to one Mac yet. Remove --machine-id: the default answer is account-wide and its by_machine rows show each Mac.".to_string();
+                }
+                Some("no_committed_answer") => {
+                    return "Ottto has no numbers for this window yet. They are unavailable, not zero; try again later.".to_string();
+                }
+                Some("results_not_served") => {
+                    return "Ottto could not read these numbers from its current calculation. They are unavailable, not zero; try again later.".to_string();
+                }
+                // Typed Results refusals: a settled answer, not a setup failure.
+                Some(_) if backend.status == Some(422) => {
+                    return "Ottto can't answer this read yet.".to_string();
+                }
+                _ => {}
             }
-            if body.contains("expired") {
-                return "Setup run expired. Open the Ottto app from Ottto to attach an active setup run.".to_string();
+            // Exact backend detail for a run Ottto no longer accepts. Other
+            // text that merely mentions expiry (a short-lived companion token
+            // the daemon refreshes, for example) is not a dead setup run.
+            if backend.status == Some(401)
+                && backend.endpoint.contains("/local-client/")
+                && matches!(
+                    backend_error_detail(backend).as_deref(),
+                    Some(SETUP_RUN_EXPIRED_DETAIL | SETUP_RUN_CANCELLED_DETAIL)
+                )
+            {
+                return "Setup run expired. Run `ottto login` to reconnect this Mac.".to_string();
+            }
+            if terminal_refresh_rejection(error) == Some(TerminalRefreshRejection::DeviceRejected) {
+                return "Ottto no longer accepts this Mac's device credential. Run `ottto login` to reconnect this Mac.".to_string();
             }
             if backend.status == Some(401) || backend.status == Some(403) {
                 if diagnostics_upload {
@@ -7603,6 +7854,54 @@ fn cli_error_message(error: &LocalApiError) -> String {
             }
         }
         _ => error.to_string(),
+    }
+}
+
+/// The string `detail` of a JSON error body excerpt, if it has one.
+fn backend_error_detail(backend: &BackendErrorDetails) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(backend.body_excerpt.as_deref()?).ok()?;
+    value
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+const SETUP_RUN_EXPIRED_DETAIL: &str = "Setup run expired";
+const SETUP_RUN_CANCELLED_DETAIL: &str = "Setup run cancelled";
+
+/// Why a device-secret refresh can never succeed for the current binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalRefreshRejection {
+    /// Ottto ended the setup run (expired or cancelled); it is never revived.
+    SetupRunEnded,
+    /// Ottto no longer accepts this Mac's device credential.
+    DeviceRejected,
+}
+
+/// An authoritative terminal answer from `/local-client/refresh`. The backend
+/// does not type these yet, so this matches its exact JSON `detail` on that
+/// endpoint only (a compatibility path, never a substring). Any other 401,
+/// including an unrecognized detail, and every transport failure is not proof.
+pub(crate) fn terminal_refresh_rejection(
+    error: &LocalApiError,
+) -> Option<TerminalRefreshRejection> {
+    let LocalApiError::Backend(details) = error else {
+        return None;
+    };
+    if details.status != Some(401)
+        || !details.endpoint.contains("/api/v1/setup-runs/")
+        || !details.endpoint.ends_with("/local-client/refresh")
+    {
+        return None;
+    }
+    match backend_error_detail(details).as_deref()? {
+        SETUP_RUN_EXPIRED_DETAIL | SETUP_RUN_CANCELLED_DETAIL => {
+            Some(TerminalRefreshRejection::SetupRunEnded)
+        }
+        "Telemetry device is not active"
+        | "Telemetry device secret is invalid"
+        | "Telemetry device not found" => Some(TerminalRefreshRejection::DeviceRejected),
+        _ => None,
     }
 }
 
@@ -7758,10 +8057,32 @@ fn setup_run(
         && !claim_code_provided
         && requested_setup_run_id.is_none()
     {
+        let mut setup_run_id = connection
+            .as_ref()
+            .map(|binding| binding.setup_run_id.clone());
+        if let Some(binding) = connection.as_ref() {
+            // An explicit sign-in on a Mac that looks connected confirms the
+            // binding once with the device credential. Only an authoritative
+            // terminal refresh answer ends it: the existing local-only reset
+            // keeps the prior device proof, and `NeedsUserAction` sends the
+            // caller to a fresh browser claim. The ended run is never revived;
+            // any other failure keeps the binding and the no-op answer.
+            match refresh_setup_run_token_via_device_secret(&binding.api_base_url, binding) {
+                Ok(refreshed) => setup_run_id = Some(refreshed.connection.setup_run_id),
+                Err(error) if terminal_refresh_rejection(&error).is_some() => {
+                    // Only the binding Ottto just answered for is cleared:
+                    // `auth_reset` rechecks it under the identity lifecycle
+                    // lock, so a binding attached meanwhile is left alone.
+                    auth_reset(daemon, authorization, true, false, Some(binding))?;
+                    return Err(LocalApiError::SetupRunConnectionMissing);
+                }
+                Err(_) => {}
+            }
+        }
         return Ok(json!({
             "status": "completed",
             "already_connected": true,
-            "setup_run_id": connection.as_ref().map(|binding| binding.setup_run_id.clone()),
+            "setup_run_id": setup_run_id,
             "claim_code_provided": false,
             "source_count": 0,
             "detected_sources": [],
@@ -7880,6 +8201,31 @@ fn setup_run_binding_matches(
     current.setup_run_id == expected.setup_run_id && current.api_base_url == expected.api_base_url
 }
 
+/// Under the identity lifecycle lock: `expected`, when given, must still be
+/// the persisted and the daemon's bound setup run. Otherwise a reattach or a
+/// completed sign-in replaced it and nothing of the replacement is touched.
+fn require_setup_run_still_bound(
+    daemon: &LocalDaemon,
+    expected: Option<&LocalConnectionBinding>,
+) -> Result<(), LocalApiError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let persisted = FileConnectionStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let bound = daemon.connection_for_authorized_client()?;
+    if [persisted, bound].iter().all(|binding| {
+        binding
+            .as_ref()
+            .is_some_and(|binding| setup_run_binding_matches(binding, expected))
+    }) {
+        Ok(())
+    } else {
+        Err(LocalApiError::SetupRunConnectionMissing)
+    }
+}
+
 fn is_terminal_setup_run_scan_error(error: &LocalApiError) -> bool {
     let LocalApiError::Backend(details) = error else {
         return false;
@@ -7955,7 +8301,7 @@ fn setup_action(
             ))
         }
     };
-    queue_setup_action(&api_base_url, &mut credentials, &source, &action_type)?;
+    let queued = queue_setup_action(&api_base_url, &mut credentials, &source, &action_type)?;
     let action_results =
         process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
     request_snapshot_sync_after_setup_actions(daemon, &action_results);
@@ -7967,7 +8313,11 @@ fn setup_action(
                 "queued setup action did not return a setup-run detail".to_string(),
             )
         })?;
-    setup_result_from_detail(&credentials.connection, detail, false, action_results)
+    let mut result =
+        setup_result_from_detail(&credentials.connection, detail, false, action_results)?;
+    // Lets the client bind a completion to the action this request queued.
+    result["queued_action_id"] = json!(queued.id);
+    Ok(result)
 }
 
 #[derive(Debug, Deserialize)]
@@ -8060,6 +8410,10 @@ struct SetupActionResult {
     source: Option<String>,
     status: String,
     detail: Option<SetupRunDetailApiResponse>,
+    /// The result a verify_source action computed; it appears only in the
+    /// response of the call that ran the action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<SourceVerificationResult>,
 }
 
 fn request_snapshot_sync_after_setup_actions(
@@ -8186,6 +8540,58 @@ struct SetupRunDisconnectResponse {
     #[allow(dead_code)]
     client_disconnected: bool,
     disconnected_at: String,
+    /// True only when the server authenticated the release proof and revoked
+    /// this Mac's device registration. Older servers omit the field.
+    #[serde(default)]
+    device_released: bool,
+}
+
+/// This Mac's active relay-device id and secret, presented on a cloud
+/// disconnect so the server can release the device registration. Read before
+/// any local deletion. Secret; redacted from `Debug` and never logged.
+struct DeviceReleaseProof {
+    device_id: String,
+    device_secret: String,
+}
+
+impl std::fmt::Debug for DeviceReleaseProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceReleaseProof")
+            .field("device_id", &self.device_id)
+            .field("device_secret", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Load the active device id and secret together. The server rejects one
+/// without the other, so a missing or unreadable half yields no proof.
+fn load_device_release_proof() -> Option<DeviceReleaseProof> {
+    let device = FileDeviceStore::default().load().ok().flatten()?;
+    let device_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+        .load()
+        .ok()?;
+    device_release_proof(device.device_id, device_secret)
+}
+
+fn device_release_proof(device_id: String, device_secret: String) -> Option<DeviceReleaseProof> {
+    if device_id.trim().is_empty() || device_secret.is_empty() {
+        return None;
+    }
+    Some(DeviceReleaseProof {
+        device_id,
+        device_secret,
+    })
+}
+
+fn setup_run_disconnect_body(release: Option<&DeviceReleaseProof>) -> serde_json::Value {
+    match release {
+        Some(release) => json!({
+            "reason": "logout",
+            "release_device_id": release.device_id,
+            "release_device_secret": release.device_secret,
+        }),
+        None => json!({ "reason": "logout" }),
+    }
 }
 
 /// Mint a fresh `setup_run_token` for the current run using the daemon's
@@ -8227,6 +8633,10 @@ fn refresh_setup_run_token_via_device_secret(
         "device_secret": device_secret,
     });
     let response: SetupRunRefreshResponse = backend_post_json(&url, &body, &[])?;
+    let _binding_lock = lock_setup_run_binding();
+    KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+        .save(&response.setup_run_token)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
     let mut refreshed = connection.clone();
     if let Some(setup_run_id) = response
         .setup_run_id
@@ -8237,78 +8647,13 @@ fn refresh_setup_run_token_via_device_secret(
         refreshed.setup_run_id = setup_run_id.to_string();
     }
     refreshed.setup_run_token_expires_at = response.expires_at.clone();
-    {
-        let _binding_lock = lock_setup_run_binding();
-        commit_refreshed_setup_run_binding_locked(
-            connection,
-            &refreshed,
-            &response.setup_run_token,
-            &FileConnectionStore::default(),
-            &KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT),
-        )?;
-    }
+    FileConnectionStore::default()
+        .save(&refreshed)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(RefreshedSetupRunToken {
         setup_run_token: response.setup_run_token,
         connection: refreshed,
     })
-}
-
-/// The connection half of a refresh commit; a seam so storage failures can be
-/// exercised without touching the real support directory.
-trait SetupRunConnectionStore {
-    fn load_connection(&self) -> anyhow::Result<Option<LocalConnectionBinding>>;
-    fn save_connection(&self, connection: &LocalConnectionBinding) -> anyhow::Result<()>;
-}
-
-impl SetupRunConnectionStore for FileConnectionStore {
-    fn load_connection(&self) -> anyhow::Result<Option<LocalConnectionBinding>> {
-        self.load()
-    }
-
-    fn save_connection(&self, connection: &LocalConnectionBinding) -> anyhow::Result<()> {
-        self.save(connection)
-    }
-}
-
-/// Persist a refreshed setup-run token and connection only if the persisted
-/// binding is still the one this refresh belongs to. The caller holds the
-/// setup-run binding lock, which every writer of these two stores (claim,
-/// switch, setup attach, terminal clear, logout reset) also holds, so this
-/// compare-and-swap cannot interleave with a reconnect or logout.
-///
-/// The persisted binding may name the refresh's own run, or the run the
-/// backend just minted for (an earlier refresh rebinding to the latest run
-/// persists that run while the in-memory binding keeps the old id). Anything
-/// else means the binding was replaced or removed while the refresh was in
-/// flight; the minted token is dropped and nothing is written. If the
-/// connection write fails after the token write, the new token is deleted
-/// (best effort) and the next read refreshes again with the device credential.
-/// The two stores are not written atomically: if that delete also fails, the
-/// new token stays beside the old connection until the next refresh.
-fn commit_refreshed_setup_run_binding_locked(
-    expected: &LocalConnectionBinding,
-    refreshed: &LocalConnectionBinding,
-    setup_run_token: &str,
-    connections: &impl SetupRunConnectionStore,
-    tokens: &impl ControlTokenStore,
-) -> Result<(), LocalApiError> {
-    let persisted = connections
-        .load_connection()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-        .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    if !setup_run_binding_matches(&persisted, expected)
-        && !setup_run_binding_matches(&persisted, refreshed)
-    {
-        return Err(LocalApiError::SetupRunConnectionMismatch);
-    }
-    tokens
-        .save(setup_run_token)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    if connections.save_connection(refreshed).is_err() {
-        let _ = tokens.delete();
-        return Err(LocalApiError::StatePoisoned);
-    }
-    Ok(())
 }
 
 pub(crate) fn refresh_setup_run_token_for_persisted_connection() -> Result<(), LocalApiError> {
@@ -8504,8 +8849,9 @@ fn disconnect_setup_run_with_refresh(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
+    release: Option<&DeviceReleaseProof>,
 ) -> Result<SetupRunDisconnectResponse, LocalApiError> {
-    match disconnect_setup_run_local_client(api_base_url, connection, setup_run_token) {
+    match disconnect_setup_run_local_client(api_base_url, connection, setup_run_token, release) {
         Ok(response) => Ok(response),
         Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
             let refreshed = refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
@@ -8513,6 +8859,7 @@ fn disconnect_setup_run_with_refresh(
                 api_base_url,
                 &refreshed.connection,
                 &refreshed.setup_run_token,
+                release,
             )
         }
         Err(other) => Err(other),
@@ -8523,15 +8870,20 @@ fn disconnect_setup_run_local_client(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
+    release: Option<&DeviceReleaseProof>,
 ) -> Result<SetupRunDisconnectResponse, LocalApiError> {
+    // SECURITY: a release proof carries the long-lived device secret. Gate the
+    // base through the trusted-base validator here as well, so no caller can
+    // send the secret to a base read from tampered on-disk state.
+    let api_base_url = validated_api_base_url(Some(api_base_url))?;
     let url = api_url_with_base(
-        api_base_url,
+        &api_base_url,
         &format!(
             "/api/v1/setup-runs/{}/local-client/disconnect",
             connection.setup_run_id
         ),
     );
-    let body = json!({ "reason": "logout" });
+    let body = setup_run_disconnect_body(release);
     backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
@@ -8741,16 +9093,29 @@ fn process_setup_actions(
                 source: source_slug,
                 status,
                 detail: Some(detail),
+                verification: None,
             });
             continue;
         }
         let action_outcome = match action.action_type.as_str() {
             "install_source" => {
                 run_install_source_action(daemon, api_base_url, credentials, &action, machine)
+                    .map(|(status, message, result)| (status, message, result, None))
             }
             "verify_source" => {
                 if let Some(source) = source.clone() {
-                    run_verify_source_action(daemon, api_base_url, credentials, &action, source)
+                    crate::provider_calls::with_trigger(
+                        crate::provider_calls::Trigger::Setup,
+                        || {
+                            run_verify_source_action(
+                                daemon,
+                                api_base_url,
+                                credentials,
+                                &action,
+                                source,
+                            )
+                        },
+                    )
                 } else {
                     Ok((
                         "failed".to_string(),
@@ -8760,6 +9125,7 @@ fn process_setup_actions(
                             "error_code": "source_missing",
                             "error_message": "Setup action source was missing",
                         }),
+                        None,
                     ))
                 }
             }
@@ -8770,11 +9136,16 @@ fn process_setup_actions(
                     "error_code": "unsupported_action",
                     "error_message": format!("Unsupported setup action {}", action.action_type),
                 }),
+                None,
             )),
         };
-        let (status, message, result) = match action_outcome {
+        let (status, message, result, verification) = match action_outcome {
             Ok(outcome) => outcome,
-            Err(error) => setup_action_execution_error_result(&action, source.as_ref(), &error),
+            Err(error) => {
+                let (status, message, result) =
+                    setup_action_execution_error_result(&action, source.as_ref(), &error);
+                (status, message, result, None)
+            }
         };
         let detail = complete_setup_action(
             api_base_url,
@@ -8790,6 +9161,7 @@ fn process_setup_actions(
             source: source_slug,
             status,
             detail: Some(detail),
+            verification,
         });
     }
     Ok(results)
@@ -11297,13 +11669,22 @@ fn claude_code_relay_env_for_machine_id(
     ]
 }
 
+/// Status, message and backend result of a setup action, plus the
+/// verification result a verify_source action computed.
+type SetupVerifyActionOutcome = (
+    String,
+    String,
+    serde_json::Value,
+    Option<SourceVerificationResult>,
+);
+
 fn run_verify_source_action(
     daemon: &LocalDaemon,
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
     source: SourceKind,
-) -> Result<(String, String, serde_json::Value), LocalApiError> {
+) -> Result<SetupVerifyActionOutcome, LocalApiError> {
     if source == SourceKind::Pi {
         return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
     }
@@ -11327,13 +11708,15 @@ fn run_verify_source_action(
                 "error_code": if ready { serde_json::Value::Null } else { json!(result.message.code) },
                 "error_message": if ready { serde_json::Value::Null } else { json!(result.message.text) }
             }),
+            Some(result),
         ));
     }
 
     if !source_binary_present(&source) {
-        let result =
+        let mut result =
             not_installed_verification_result(source.clone(), empty_source_config(&source));
         daemon.record_verification_result(&result)?;
+        attach_verification_check(&mut result);
         let message = result.message.text.clone();
         return Ok((
             "succeeded".to_string(),
@@ -11348,6 +11731,7 @@ fn run_verify_source_action(
                 "error_code": SOURCE_NOT_INSTALLED_CODE,
                 "error_message": message,
             }),
+            Some(result),
         ));
     }
     let smoke_after = current_rfc3339();
@@ -11374,8 +11758,10 @@ fn run_verify_source_action(
         },
     )?;
     if !smoke.succeeded {
-        let result = smoke_failure_verification_result(source.clone(), &smoke, Some(smoke_after));
+        let mut result =
+            smoke_failure_verification_result(source.clone(), &smoke, Some(smoke_after));
         daemon.record_verification_result(&result)?;
+        attach_verification_check(&mut result);
         let message = result.message.text.clone();
         let action_status = match result.status {
             SourceVerificationStatus::Verified | SourceVerificationStatus::Warning => "succeeded",
@@ -11395,6 +11781,7 @@ fn run_verify_source_action(
                 "error_code": smoke.error_code.as_deref().unwrap_or("smoke_command_failed"),
                 "error_message": message,
             }),
+            Some(result),
         ));
     }
     let _ = emit_setup_run_fast_verification_marker_with_refresh_mut(
@@ -11416,7 +11803,7 @@ fn run_verify_source_action(
             verification.clear_condition.as_deref(),
         )
     };
-    let result = verification_result(
+    let mut result = verification_result(
         source.clone(),
         if verification.verified {
             SourceVerificationStatus::Verified
@@ -11436,6 +11823,7 @@ fn run_verify_source_action(
         &verification_message,
     );
     daemon.record_verification_result(&result)?;
+    attach_verification_check(&mut result);
     let status = if verification.verified {
         "succeeded"
     } else {
@@ -11455,6 +11843,7 @@ fn run_verify_source_action(
             "error_code": if verification.verified { serde_json::Value::Null } else { json!(failure_code) },
             "error_message": if verification.verified { serde_json::Value::Null } else { json!(result.message.text) },
         }),
+        Some(result),
     ))
 }
 
@@ -11463,8 +11852,8 @@ fn run_pi_verify_source_action(
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
-) -> Result<(String, String, serde_json::Value), LocalApiError> {
-    let result = run_pi_route_verification_with_credentials(api_base_url, credentials)?;
+) -> Result<SetupVerifyActionOutcome, LocalApiError> {
+    let mut result = run_pi_route_verification_with_credentials(api_base_url, credentials)?;
     record_setup_action_event(
         api_base_url,
         credentials,
@@ -11499,23 +11888,27 @@ fn run_pi_verify_source_action(
         SourceVerificationStatus::Verified | SourceVerificationStatus::Warning => "succeeded",
         _ => "failed",
     };
+    let backend_result = json!({
+        "status": verification_status_slug(&result.status),
+        "verified": result.verified,
+        "records_seen": result.records_seen,
+        "last_record_id": result.last_record_id,
+        "last_received_at": result.last_received_at,
+        "smoke_after": result.smoke_after,
+        "route_results": result.route_results,
+        "routes_total": routes_total,
+        "routes_verified": routes_verified,
+        "routes_failed": routes_failed,
+        "error_code": if result.status == SourceVerificationStatus::Verified { serde_json::Value::Null } else { json!(result.message.code) },
+        "error_message": if result.status == SourceVerificationStatus::Verified { serde_json::Value::Null } else { json!(message) },
+    });
+    // Classify after building the backend payload so its bytes are unchanged.
+    attach_verification_check(&mut result);
     Ok((
         action_status.to_string(),
-        message.clone(),
-        json!({
-            "status": verification_status_slug(&result.status),
-            "verified": result.verified,
-            "records_seen": result.records_seen,
-            "last_record_id": result.last_record_id,
-            "last_received_at": result.last_received_at,
-            "smoke_after": result.smoke_after,
-            "route_results": result.route_results,
-            "routes_total": routes_total,
-            "routes_verified": routes_verified,
-            "routes_failed": routes_failed,
-            "error_code": if result.status == SourceVerificationStatus::Verified { serde_json::Value::Null } else { json!(result.message.code) },
-            "error_message": if result.status == SourceVerificationStatus::Verified { serde_json::Value::Null } else { json!(message) },
-        }),
+        message,
+        backend_result,
+        Some(result),
     ))
 }
 
@@ -11568,8 +11961,64 @@ fn run_smoke_prompt(source: &SourceKind) -> SmokeResult {
         source_display_name(source),
         before_session_count,
     );
+    match source {
+        SourceKind::Codex => record_smoke_prompt(
+            crate::provider_calls::Provider::Openai,
+            crate::provider_calls::CallKind::CodexSmokePrompt,
+            crate::agent_status::codex_cli_home_claimed_account_hash(),
+            &result,
+        ),
+        SourceKind::ClaudeCode => record_smoke_prompt(
+            crate::provider_calls::Provider::Anthropic,
+            crate::provider_calls::CallKind::ClaudeSmokePrompt,
+            crate::provider_calls::claude_slot_account_hash(
+                &ottto_core::ClaudeConfigDirSlot::Default,
+            ),
+            &result,
+        ),
+        // Pi's default route names no provider, but it is a real model
+        // request.
+        SourceKind::Pi => record_smoke_prompt(
+            crate::provider_calls::Provider::Unknown,
+            crate::provider_calls::CallKind::PiDefaultSmokePrompt,
+            None,
+            &result,
+        ),
+    }
     classify_source_smoke_failure(source, &mut result);
     result
+}
+
+/// One provider-call log line per smoke prompt that started: at least one
+/// request carrying the prompt.
+fn record_smoke_prompt(
+    provider: crate::provider_calls::Provider,
+    kind: crate::provider_calls::CallKind,
+    account_identifier_hash: Option<String>,
+    result: &SmokeResult,
+) {
+    use crate::provider_calls::{CallResult, ProviderCall, Trigger};
+    if !result.command_found {
+        return;
+    }
+    let outcome = if result.succeeded {
+        CallResult::Ok
+    } else if result.error_code.as_deref() == Some("smoke_timeout") {
+        CallResult::Timeout
+    } else {
+        result
+            .exit_status
+            .map_or(CallResult::Error("not_observed"), CallResult::Exit)
+    };
+    crate::provider_calls::record(ProviderCall::subprocess(
+        provider,
+        kind,
+        crate::provider_calls::trigger_or(Trigger::Other),
+        account_identifier_hash.as_deref(),
+        outcome,
+        Duration::from_millis(u64::try_from(result.duration_ms).unwrap_or(u64::MAX)),
+        1,
+    ));
 }
 
 struct SmokeCommand {
@@ -11823,20 +12272,12 @@ struct PiSessionSafetyLimits {
     max_depth: usize,
     max_entries: usize,
     max_files: usize,
-    max_file_bytes: u64,
-    max_aggregate_bytes: u64,
-    max_multipart_field_bytes: usize,
-    max_multipart_body_bytes: usize,
 }
 
 const PI_SESSION_SAFETY_LIMITS: PiSessionSafetyLimits = PiSessionSafetyLimits {
     max_depth: PI_SESSION_MAX_DEPTH,
     max_entries: PI_SESSION_MAX_ENTRIES,
     max_files: PI_SESSION_MAX_FILES,
-    max_file_bytes: PI_SESSION_MAX_FILE_BYTES,
-    max_aggregate_bytes: PI_SESSION_MAX_AGGREGATE_BYTES,
-    max_multipart_field_bytes: PI_MULTIPART_MAX_FIELD_BYTES,
-    max_multipart_body_bytes: PI_MULTIPART_MAX_BODY_BYTES,
 };
 
 fn pi_session_files() -> Result<BTreeSet<PathBuf>, LocalApiError> {
@@ -11981,29 +12422,6 @@ fn collect_pi_session_files(
     Ok(())
 }
 
-fn import_new_pi_route_sessions(
-    api_base_url: &str,
-    route: &PiModelRoute,
-    before: &PiSessionCensus,
-) -> Result<Option<serde_json::Value>, LocalApiError> {
-    // Keep the pre-smoke descriptor as the authority across the whole live
-    // verification. Reopening the pathname here would let an entirely different
-    // real directory generation reclassify its pre-existing transcripts as new.
-    let session_files = new_pi_route_session_files(before)?;
-    if session_files.is_empty() {
-        return Ok(None);
-    }
-    let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(
-        api_base_url,
-        &relay_token,
-        route,
-        &before.root,
-        &session_files,
-    )
-    .map(Some)
-}
-
 fn new_pi_route_session_files(before: &PiSessionCensus) -> Result<Vec<PathBuf>, LocalApiError> {
     Ok(
         pi_session_files_for_root(&before.root, PI_SESSION_SAFETY_LIMITS)?
@@ -12013,50 +12431,23 @@ fn new_pi_route_session_files(before: &PiSessionCensus) -> Result<Vec<PathBuf>, 
     )
 }
 
-/// Upload local Pi session files modified at or after `since` for `route`. Used
-/// by the passive (no-live-smoke) subscription-OAuth verify path so a fresh user
-/// `pi` run is imported and counts as observed usage. This only UPLOADS existing
-/// local session transcripts (via `upload_pi_import_run`) — it never runs `pi`,
-/// so it can't burn the rotating OAuth token. The `since` mtime bound keeps each
-/// verify from re-uploading the user's entire session history.
-struct PiSessionSelection {
-    root: OpenPiSessionRoot,
-    files: Vec<PathBuf>,
-}
-
-fn recent_pi_session_files(since: SystemTime) -> Result<Option<PiSessionSelection>, LocalApiError> {
+/// Local Pi session files modified at or after `since`. The passive
+/// (no-live-smoke) subscription-OAuth verify path uses only their presence as
+/// local evidence; it never runs `pi` and never uploads or reads transcript
+/// contents (the direct Pi import endpoint is retired).
+fn recent_pi_session_files(since: SystemTime) -> Result<Option<Vec<PathBuf>>, LocalApiError> {
     let Some(root) = open_pi_session_root()? else {
         return Ok(None);
     };
     let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
-    let files = pi_session_files_modified_since(&root, files, since)?;
-    Ok(Some(PiSessionSelection { root, files }))
-}
-
-fn import_pi_route_session_files(
-    api_base_url: &str,
-    route: &PiModelRoute,
-    selection: &PiSessionSelection,
-) -> Result<Option<serde_json::Value>, LocalApiError> {
-    if selection.files.is_empty() {
-        return Ok(None);
-    }
-    let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(
-        api_base_url,
-        &relay_token,
-        route,
-        &selection.root,
-        &selection.files,
-    )
-    .map(Some)
+    pi_session_files_modified_since(&root, files, since).map(Some)
 }
 
 /// Keep only session files whose on-disk mtime is at or after `since`. Files
 /// whose metadata can't be read are dropped (treated as not-recent), matching
-/// the conservative behavior of the live-import path. Pure helper so the mtime
+/// the conservative behavior of the live census. Pure helper so the mtime
 /// bound used by the passive Pi route verifier is unit-testable without the
-/// relay-token / upload network calls.
+/// network calls.
 fn pi_session_files_modified_since(
     root: &OpenPiSessionRoot,
     files: impl IntoIterator<Item = PathBuf>,
@@ -12344,10 +12735,6 @@ struct RelayTokenApiResponse {
     token: String,
 }
 
-fn issue_pi_relay_token(api_base_url: &str) -> Result<String, LocalApiError> {
-    issue_source_relay_token(api_base_url, &SourceKind::Pi)
-}
-
 fn issue_source_relay_token(
     api_base_url: &str,
     source: &SourceKind,
@@ -12519,254 +12906,6 @@ fn has_loopback_http_origin(value: &str, host: &str) -> bool {
         return false;
     };
     rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
-}
-
-fn upload_pi_import_run(
-    api_base_url: &str,
-    relay_token: &str,
-    route: &PiModelRoute,
-    session_root: &OpenPiSessionRoot,
-    session_files: &[PathBuf],
-) -> Result<serde_json::Value, LocalApiError> {
-    let boundary = format!("ottto-pi-route-{}", current_millis());
-    let body = build_pi_import_multipart(
-        route,
-        session_root,
-        session_files,
-        &boundary,
-        PI_SESSION_SAFETY_LIMITS,
-    )?;
-    let url = api_url_with_base(api_base_url, "/api/v1/pi/import-runs");
-    let response = ureq::post(&url)
-        .set("Accept", "application/json")
-        .set("Authorization", &format!("Bearer {relay_token}"))
-        .set(
-            "Content-Type",
-            &format!("multipart/form-data; boundary={boundary}"),
-        )
-        .timeout(PI_IMPORT_RUN_HTTP_TIMEOUT)
-        .send_bytes(&body)
-        .map_err(|error| backend_error_from_ureq(&url, error))?;
-    response
-        .into_json()
-        .map_err(|error| backend_response_unexpected(&url, error.to_string()))
-}
-
-struct OpenPiSessionUpload {
-    file: fs::File,
-    file_name: String,
-    metadata_len: u64,
-}
-
-fn build_pi_import_multipart(
-    route: &PiModelRoute,
-    session_root: &OpenPiSessionRoot,
-    session_files: &[PathBuf],
-    boundary: &str,
-    limits: PiSessionSafetyLimits,
-) -> Result<Vec<u8>, LocalApiError> {
-    if session_files.len() > limits.max_files {
-        return Err(pi_session_import_refused(
-            "upload exceeded the maximum file count",
-        ));
-    }
-    let mut body = Vec::new();
-    for (field, value) in pi_route_import_defaults(route) {
-        append_multipart_text_field(&mut body, boundary, field, value, limits)?;
-    }
-    let mut aggregate_metadata_bytes = 0_u64;
-    let mut aggregate_session_bytes = 0_u64;
-    for path in session_files {
-        let mut upload = open_pi_session_upload(session_root, path, limits)?;
-        aggregate_metadata_bytes = aggregate_metadata_bytes
-            .checked_add(upload.metadata_len)
-            .ok_or_else(|| pi_session_import_refused("aggregate byte count overflowed"))?;
-        if aggregate_metadata_bytes > limits.max_aggregate_bytes {
-            return Err(pi_session_import_refused(
-                "session files exceeded the maximum aggregate byte size",
-            ));
-        }
-        append_multipart_file_field(
-            &mut body,
-            boundary,
-            "files",
-            &upload.file_name,
-            &mut upload.file,
-            &mut aggregate_session_bytes,
-            limits,
-        )?;
-    }
-    append_pi_multipart_bytes(&mut body, format!("--{boundary}--\r\n").as_bytes(), limits)?;
-    Ok(body)
-}
-
-fn open_pi_session_upload(
-    session_root: &OpenPiSessionRoot,
-    path: &Path,
-    limits: PiSessionSafetyLimits,
-) -> Result<OpenPiSessionUpload, LocalApiError> {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-        return Err(pi_session_import_refused(
-            "upload contained a non-jsonl session file",
-        ));
-    }
-    let file = open_pi_session_file_beneath_root(session_root, path)
-        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-    if !metadata.is_file() {
-        return Err(pi_session_import_refused(
-            "upload target was not a regular file",
-        ));
-    }
-    if metadata.len() > limits.max_file_bytes {
-        return Err(pi_session_import_refused(
-            "session file exceeded the maximum byte size",
-        ));
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("session.jsonl")
-        .to_string();
-    Ok(OpenPiSessionUpload {
-        file,
-        file_name,
-        metadata_len: metadata.len(),
-    })
-}
-
-fn pi_route_import_defaults(route: &PiModelRoute) -> Vec<(&'static str, &str)> {
-    let mut defaults = Vec::new();
-    if let Some(value) = route.classification.billing_provider.as_deref() {
-        defaults.push(("billing_provider", value));
-    }
-    if let Some(value) = route.classification.model_provider.as_deref() {
-        defaults.push(("model_provider", value));
-    }
-    if let Some(value) = route.classification.billing_channel.as_deref() {
-        defaults.push(("billing_channel", value));
-    }
-    if let Some(value) = route.classification.auth_mode.as_deref() {
-        defaults.push(("auth_mode", value));
-    }
-    if let Some(value) = route.classification.gateway_provider.as_deref() {
-        defaults.push(("gateway_provider", value));
-    }
-    if let Some(value) = route.classification.subscription_product.as_deref() {
-        defaults.push(("subscription_product", value));
-    }
-    defaults
-}
-
-fn append_multipart_text_field(
-    body: &mut Vec<u8>,
-    boundary: &str,
-    name: &str,
-    value: &str,
-    limits: PiSessionSafetyLimits,
-) -> Result<(), LocalApiError> {
-    if value.len() > limits.max_multipart_field_bytes {
-        return Err(pi_session_import_refused(
-            "route metadata exceeded the multipart field byte cap",
-        ));
-    }
-    append_pi_multipart_bytes(body, format!("--{boundary}\r\n").as_bytes(), limits)?;
-    append_pi_multipart_bytes(
-        body,
-        format!(
-            "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
-            multipart_token(name)
-        )
-        .as_bytes(),
-        limits,
-    )?;
-    append_pi_multipart_bytes(body, value.as_bytes(), limits)?;
-    append_pi_multipart_bytes(body, b"\r\n", limits)
-}
-
-fn append_multipart_file_field(
-    body: &mut Vec<u8>,
-    boundary: &str,
-    name: &str,
-    file_name: &str,
-    file: &mut fs::File,
-    aggregate_session_bytes: &mut u64,
-    limits: PiSessionSafetyLimits,
-) -> Result<(), LocalApiError> {
-    append_pi_multipart_bytes(body, format!("--{boundary}\r\n").as_bytes(), limits)?;
-    append_pi_multipart_bytes(
-        body,
-        format!(
-            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-            multipart_token(name),
-            multipart_token(file_name),
-        )
-        .as_bytes(),
-        limits,
-    )?;
-    append_pi_multipart_bytes(body, b"Content-Type: application/x-ndjson\r\n\r\n", limits)?;
-
-    let mut file_bytes = 0_u64;
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-        if read == 0 {
-            break;
-        }
-        let read = read as u64;
-        file_bytes = file_bytes
-            .checked_add(read)
-            .ok_or_else(|| pi_session_import_refused("session file byte count overflowed"))?;
-        if file_bytes > limits.max_file_bytes {
-            return Err(pi_session_import_refused(
-                "session file exceeded the maximum byte size while reading",
-            ));
-        }
-        *aggregate_session_bytes = (*aggregate_session_bytes)
-            .checked_add(read)
-            .ok_or_else(|| pi_session_import_refused("aggregate byte count overflowed"))?;
-        if *aggregate_session_bytes > limits.max_aggregate_bytes {
-            return Err(pi_session_import_refused(
-                "session files exceeded the maximum aggregate byte size while reading",
-            ));
-        }
-        append_pi_multipart_bytes(body, &buffer[..read as usize], limits)?;
-    }
-    append_pi_multipart_bytes(body, b"\r\n", limits)
-}
-
-fn append_pi_multipart_bytes(
-    body: &mut Vec<u8>,
-    bytes: &[u8],
-    limits: PiSessionSafetyLimits,
-) -> Result<(), LocalApiError> {
-    let next_len = body
-        .len()
-        .checked_add(bytes.len())
-        .ok_or_else(|| pi_session_import_refused("multipart byte count overflowed"))?;
-    if next_len > limits.max_multipart_body_bytes {
-        return Err(pi_session_import_refused(
-            "multipart body exceeded the maximum byte size",
-        ));
-    }
-    body.try_reserve(bytes.len())
-        .map_err(|_| pi_session_import_refused("multipart allocation failed"))?;
-    body.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn multipart_token(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '"' | '\r' | '\n' => '_',
-            _ => ch,
-        })
-        .collect()
 }
 
 fn no_fresh_telemetry_code(source: &SourceKind, smoke: &SmokeResult) -> &'static str {
@@ -13839,6 +13978,17 @@ fn verify_source(
     source: SourceKind,
     repair: bool,
 ) -> Result<SourceVerificationResult, LocalApiError> {
+    let mut result = verify_source_unchecked(daemon, authorization, source, repair)?;
+    attach_verification_check(&mut result);
+    Ok(result)
+}
+
+fn verify_source_unchecked(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    source: SourceKind,
+    repair: bool,
+) -> Result<SourceVerificationResult, LocalApiError> {
     let mut config = source_config_state_for_daemon(daemon, &source)?;
     if source_requires_config_patch(&source) && source_patch_disabled(&source) {
         let message = patch_disabled_message(&source);
@@ -14131,7 +14281,10 @@ pub(crate) fn reverify_failed_source(
     source: SourceKind,
 ) -> Result<SourceVerificationResult, LocalApiError> {
     let authorization = RequestAuthorization::TrustedCompanionApp;
-    let result = verify_source(daemon, &authorization, source, false)?;
+    let result =
+        crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Schedule, || {
+            verify_source(daemon, &authorization, source, false)
+        })?;
     if verification_result_should_refresh_agent_status(&result) {
         if let Err(error) =
             refresh_agent_status_for(daemon, &authorization, Some(result.source.clone()))
@@ -14227,21 +14380,16 @@ fn run_one_pi_route_verification(
         return verify_pi_subscription_oauth_route_passively(api_base_url, credentials, route);
     }
 
-    let (before_session_census, smoke_after, smoke) = match run_pi_route_pre_smoke(route) {
+    // The direct Pi import endpoint is retired, so Verify no longer uploads the
+    // smoke transcript. The post-smoke census already ran through the held
+    // pre-smoke root; a new local session without matching backend usage
+    // settles as the existing local-only Warning, never as an upload success.
+    let (_, smoke_after, smoke) = match run_pi_route_pre_smoke(route) {
         Ok(ready) => ready,
         Err(failed) => return *failed,
     };
     if !smoke.succeeded {
         return pi_route_result_from_smoke(route, &smoke, Some(smoke_after));
-    }
-    if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_census) {
-        // Workspace data sharing can be intentionally disabled. It is useful
-        // source status, but not a service error and should not pollute the
-        // daemon's error log.
-        if !is_telemetry_disabled_by_admin_error(&error) {
-            eprintln!("Pi route smoke session import failed: {error}");
-        }
-        return pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error);
     }
 
     let filters = if pi_route_is_unscoped(route) {
@@ -14364,6 +14512,7 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
                 pi_route_label(route)
             ),
         },
+        check: None,
     }
 }
 
@@ -14408,6 +14557,7 @@ fn pi_route_post_smoke_census_failure(
                 pi_route_label(route)
             ),
         },
+        check: None,
     }
 }
 
@@ -14430,8 +14580,14 @@ const PI_PASSIVE_LOOKBACK_HOURS: u32 = 6;
 /// auth_mode=oauth: openai-codex / anthropic / github-copilot). These must not be
 /// live-smoked.
 fn route_is_subscription_oauth(route: &PiModelRoute) -> bool {
-    route.classification.auth_mode.as_deref() == Some("oauth")
-        && route.classification.billing_channel.as_deref() == Some("subscription")
+    is_subscription_oauth(
+        route.classification.auth_mode.as_deref(),
+        route.classification.billing_channel.as_deref(),
+    )
+}
+
+fn is_subscription_oauth(auth_mode: Option<&str>, billing_channel: Option<&str>) -> bool {
+    auth_mode == Some("oauth") && billing_channel == Some("subscription")
 }
 
 /// `now - hours` as an RFC3339 UTC timestamp (mirrors `current_rfc3339`'s
@@ -14459,32 +14615,26 @@ fn verify_pi_subscription_oauth_route_passively(
     route: &PiModelRoute,
 ) -> SourceRouteVerificationResult {
     let lookback = rfc3339_hours_ago(PI_PASSIVE_LOOKBACK_HOURS);
-    // Import recent local Pi sessions BEFORE polling so a fresh user `pi` run is
-    // uploaded and counts as observed usage — otherwise a valid OAuth route with
-    // real recent usage is mislabeled `pi_oauth_reauth_required` just because the
-    // local_sessions collector hasn't uploaded it yet. This only uploads existing
-    // transcripts (no live `pi`), so it can't burn the rotating OAuth token. The
-    // mtime bound matches the passive lookback window. Non-fatal on error.
-    let import_since = SystemTime::now()
+    // Recent local Pi sessions count as local route evidence so a valid OAuth
+    // route with fresh local use is not mislabeled `pi_oauth_reauth_required`.
+    // Only file presence and mtime are read; nothing is uploaded because the
+    // direct Pi import endpoint is retired. The mtime bound matches the passive
+    // lookback window. Non-fatal on error.
+    let local_evidence_since = SystemTime::now()
         .checked_sub(Duration::from_secs(
             u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600,
         ))
         .unwrap_or(UNIX_EPOCH);
-    let recent_session_selection = match recent_pi_session_files(import_since) {
-        Ok(selection) => selection,
+    let recent_session_files = match recent_pi_session_files(local_evidence_since) {
+        Ok(files) => files,
         Err(error) => {
             eprintln!("Pi passive route session discovery failed (non-fatal): {error}");
             None
         }
     };
-    if let Some(selection) = recent_session_selection.as_ref() {
-        if let Err(error) = import_pi_route_session_files(api_base_url, route, selection) {
-            eprintln!("Pi passive route session import failed (non-fatal): {error}");
-        }
-    }
-    let recent_local_session_observed = recent_session_selection
+    let recent_local_session_observed = recent_session_files
         .as_ref()
-        .is_some_and(|selection| !selection.files.is_empty());
+        .is_some_and(|files| !files.is_empty());
     let local_session_observed = Some(recent_local_session_observed);
     let local_evidence_observed = pi_route_has_local_verification_evidence(
         &pi_route_billing_identity_hints(route),
@@ -14626,6 +14776,7 @@ fn pi_route_passive_result(
         error_code,
         local_session_observed,
         message: StableMessage { code, text },
+        check: None,
     }
 }
 
@@ -14634,13 +14785,27 @@ fn run_pi_route_smoke_prompt(
     before_session_count: Option<usize>,
 ) -> SmokeResult {
     let command = pi_smoke_command(Some(route));
-    run_bounded_command(
+    let result = run_bounded_command(
         command.program,
         &command.args,
         PI_SMOKE_COMMAND_TIMEOUT,
         "Pi",
         before_session_count,
-    )
+    );
+    let provider = match route.classification.model_provider.as_deref() {
+        Some("openai") => Some(crate::provider_calls::Provider::Openai),
+        Some("anthropic") => Some(crate::provider_calls::Provider::Anthropic),
+        _ => None,
+    };
+    if let Some(provider) = provider {
+        record_smoke_prompt(
+            provider,
+            crate::provider_calls::CallKind::PiSmokePrompt,
+            pi_route_billing_identity_hints(route).account_identifier_hash,
+            &result,
+        );
+    }
+    result
 }
 
 fn pi_route_billing_identity_hints(route: &PiModelRoute) -> BillingIdentityHints {
@@ -14709,6 +14874,7 @@ fn pi_route_result_from_smoke(
                 smoke.message
             ),
         },
+        check: None,
     }
 }
 
@@ -14779,6 +14945,7 @@ fn pi_route_result_from_verification(
         },
         local_session_observed: smoke.local_session_observed,
         message: StableMessage { code, text },
+        check: None,
     }
 }
 
@@ -14827,6 +14994,7 @@ fn pi_route_result_from_backend_error(
                 source_result.message.text
             ),
         },
+        check: None,
     }
 }
 
@@ -14949,6 +15117,7 @@ fn pi_route_aggregate_result(
             text,
         },
         route_results,
+        check: None,
     }
 }
 
@@ -15368,6 +15537,10 @@ fn agent_costs_url(
     if query.all_machines {
         params.push(("all_machines", "true".to_string()));
     }
+    push_non_empty_query(&mut params, "dimensions", query.dimensions.as_deref());
+    if query.daily {
+        params.push(("daily", "true".to_string()));
+    }
     url_with_query_params(url, params)
 }
 
@@ -15552,10 +15725,9 @@ fn backend_get_json_with_timeout<T: DeserializeOwned>(
 fn backend_error_from_ureq(url: &str, error: ureq::Error) -> LocalApiError {
     match error {
         ureq::Error::Status(status, response) => {
-            let body_excerpt = response
-                .into_string()
-                .ok()
-                .and_then(|body| safe_backend_body_excerpt(&body));
+            let body = response.into_string().ok();
+            let body_excerpt = body.as_deref().and_then(safe_backend_body_excerpt);
+            let reason_code = body.as_deref().and_then(backend_reason_code);
             LocalApiError::Backend(BackendErrorDetails {
                 kind: if status >= 500 {
                     BackendErrorKind::Unavailable
@@ -15565,6 +15737,7 @@ fn backend_error_from_ureq(url: &str, error: ureq::Error) -> LocalApiError {
                 endpoint: safe_backend_endpoint(url),
                 status: Some(status),
                 body_excerpt,
+                reason_code,
             })
         }
         ureq::Error::Transport(transport) if transport_error_timed_out(&transport) => {
@@ -15578,6 +15751,7 @@ fn backend_error_from_ureq(url: &str, error: ureq::Error) -> LocalApiError {
             endpoint: safe_backend_endpoint(url),
             status: None,
             body_excerpt: safe_backend_body_excerpt(&transport.to_string()),
+            reason_code: None,
         }),
     }
 }
@@ -15605,6 +15779,7 @@ fn backend_response_unexpected(url: &str, detail: String) -> LocalApiError {
         endpoint: safe_backend_endpoint(url),
         status: None,
         body_excerpt: safe_backend_body_excerpt(&detail),
+        reason_code: None,
     })
 }
 
@@ -15631,6 +15806,37 @@ fn safe_backend_endpoint(url: &str) -> String {
         return format!("{}{}{}", &endpoint[..identifier_start], replacement, suffix);
     }
     endpoint.to_string()
+}
+
+/// The stable machine code an Ottto error body names: a top-level `code`, a
+/// `detail.code`, or a `detail` that is itself a code
+/// (`{"detail":"timezone_query_unsupported"}`). Only short lowercase
+/// snake_case tokens qualify, so free-text detail never becomes a code.
+fn backend_reason_code(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let detail = value.get("detail");
+    let named = [
+        value.get("code"),
+        detail.and_then(|detail| detail.get("code")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .find(|code| is_backend_reason_code(code));
+    let code = named.or_else(|| {
+        detail
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| code.contains('_') && is_backend_reason_code(code))
+    })?;
+    Some(code.to_string())
+}
+
+fn is_backend_reason_code(value: &str) -> bool {
+    value.len() <= 64
+        && value.starts_with(|character: char| character.is_ascii_lowercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn safe_backend_body_excerpt(body: &str) -> Option<String> {
@@ -15743,6 +15949,97 @@ fn verification_result_with_config(
             text: text.to_string(),
         },
         route_results: Vec::new(),
+        check: None,
+    }
+}
+
+/// Record what kind of check produced `result` and what it established, from
+/// the result alone. A positive scope needs a Verified/Warning status, and no
+/// scope names an account: nothing in a result binds accepted usage to one.
+fn attach_verification_check(result: &mut SourceVerificationResult) {
+    let positive_status = matches!(
+        result.status,
+        SourceVerificationStatus::Verified | SourceVerificationStatus::Warning
+    );
+    let check = match result.source {
+        SourceKind::Codex => SourceVerificationCheck {
+            method: Some(SourceVerificationMethod::ConfigurationCheck),
+            scope: if positive_status
+                && !result.verified
+                && result.message.code == "codex_local_import"
+                && result.config.drift.is_empty()
+            {
+                SourceVerificationScope::Configuration
+            } else {
+                SourceVerificationScope::NotEstablished
+            },
+        },
+        SourceKind::ClaudeCode => SourceVerificationCheck {
+            method: Some(SourceVerificationMethod::LivePrompt),
+            scope: if result.verified && result.status == SourceVerificationStatus::Verified {
+                SourceVerificationScope::UsageReceived
+            } else {
+                SourceVerificationScope::NotEstablished
+            },
+        },
+        SourceKind::Pi => {
+            for route in &mut result.route_results {
+                route.check = Some(pi_route_verification_check(route));
+            }
+            let checks = result
+                .route_results
+                .iter()
+                .filter_map(|route| route.check.as_ref())
+                .collect::<Vec<_>>();
+            let method = checks.first().and_then(|first| {
+                if checks.iter().all(|check| check.method == first.method) {
+                    first.method
+                } else {
+                    Some(SourceVerificationMethod::Mixed)
+                }
+            });
+            let all =
+                |scope: SourceVerificationScope| checks.iter().all(|check| check.scope == scope);
+            let established = checks
+                .iter()
+                .filter(|check| check.scope != SourceVerificationScope::NotEstablished)
+                .count();
+            let scope = if !positive_status || established == 0 {
+                SourceVerificationScope::NotEstablished
+            } else if all(SourceVerificationScope::UsageReceived) {
+                SourceVerificationScope::UsageReceived
+            } else if all(SourceVerificationScope::LocalEvidence) {
+                SourceVerificationScope::LocalEvidence
+            } else {
+                SourceVerificationScope::Partial
+            };
+            SourceVerificationCheck { method, scope }
+        }
+    };
+    result.check = Some(check);
+}
+
+/// Same route split as Verify's dispatch and the aggregate's route counting.
+fn pi_route_verification_check(route: &SourceRouteVerificationResult) -> SourceVerificationCheck {
+    let passive =
+        is_subscription_oauth(route.auth_mode.as_deref(), route.billing_channel.as_deref());
+    SourceVerificationCheck {
+        method: Some(if passive {
+            SourceVerificationMethod::PassiveRecentUsage
+        } else {
+            SourceVerificationMethod::LivePrompt
+        }),
+        scope: if !route.verified {
+            SourceVerificationScope::NotEstablished
+        } else if route.status == SourceVerificationStatus::Verified {
+            SourceVerificationScope::UsageReceived
+        } else if route.status == SourceVerificationStatus::Warning
+            && route.error_code.as_deref() == Some(PI_LOCAL_ONLY_CODE)
+        {
+            SourceVerificationScope::LocalEvidence
+        } else {
+            SourceVerificationScope::NotEstablished
+        },
     }
 }
 
@@ -15839,6 +16136,7 @@ mod tests {
                 used_slots: 1,
                 remaining_slots: 9,
             },
+            daemon_sign_in_supported: None,
         };
 
         assert_eq!(
@@ -15894,6 +16192,7 @@ mod tests {
                 .to_string(),
             status: Some(401),
             body_excerpt: Some(excerpt),
+            reason_code: None,
         });
 
         let message = reattach_required_message(&error).expect("typed reattach message");
@@ -16115,7 +16414,10 @@ mod tests {
             CodexAccountSetupOperationStateV1::WaitingForUserLogin
         );
 
-        let checked = check_codex_account(1, operation_id)
+        // The home has no credential yet, so the setup gate answers without
+        // starting the CLI; the provider-pending path itself is covered by
+        // `codex_waiting_check_storm_stays_under_the_setup_backoff`.
+        let checked = check_codex_account(1, operation_id, false)
             .expect("pending provider login remains a successful status read");
         assert_eq!(
             checked.setup_operation.state,
@@ -16124,6 +16426,1298 @@ mod tests {
         assert!(checked.setup_operation.launch_command.is_some());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A fake `codex` whose app-server answers like a home nobody signed in to:
+    /// `account/read` succeeds without an account, and the quota read fails.
+    /// Each app-server start appends one line to `runs`. With `rewrites`,
+    /// `account/read` also appends to that credential file, as the real CLI
+    /// rewrites `auth.json` when it refreshes the token.
+    #[cfg(unix)]
+    fn write_signed_out_fake_codex(bin: &Path, runs: &Path, rewrites: Option<&Path>) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(bin).expect("fake Codex bin dir");
+        let executable = bin.join("codex");
+        let rewrite = rewrites.map_or_else(String::new, |auth| {
+            format!(
+                "        with open({auth:?}, \"a\") as auth:\n            auth.write(\"\\n\")\n",
+                auth = auth.display().to_string()
+            )
+        });
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/usr/bin/python3
+import sys
+
+if sys.argv[1:] != ["app-server", "--stdio"]:
+    sys.exit(1)
+with open({runs:?}, "a") as runs:
+    runs.write("run\n")
+for line in sys.stdin:
+    if '"id":1' in line:
+        print('{{"id":1,"result":{{"userAgent":"synthetic"}}}}', flush=True)
+    elif '"id":"ottto_account"' in line:
+{rewrite}        print('{{"id":"ottto_account","result":{{"account":null,"requiresOpenaiAuth":true}}}}', flush=True)
+    elif "account/rateLimits/read" in line:
+        print('{{"id":"ottto_rate_limits","error":{{"code":-32600,"message":"codex account authentication required to read rate limits"}}}}', flush=True)
+"#,
+                runs = runs.display().to_string()
+            ),
+        )
+        .expect("fake Codex executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+    }
+
+    #[cfg(unix)]
+    fn counted_lines(path: &Path) -> usize {
+        fs::read_to_string(path)
+            .map(|body| body.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// `codex_app_server_quota` lines with trigger `setup` and result `rpc_error`.
+    #[cfg(unix)]
+    fn setup_rpc_error_call_lines(support: &Path) -> usize {
+        let dir = ottto_core::provider_call_log::provider_call_log_dir(support);
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+            .flat_map(|body| {
+                body.lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<ottto_core::provider_call_log::ProviderCallLine>(
+                            line,
+                        )
+                        .ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|line| {
+                line.kind == "codex_app_server_quota"
+                    && line.trigger == "setup"
+                    && line.result == "rpc_error"
+            })
+            .count()
+    }
+
+    /// Writes a synthetic credential file with the mode managed homes use.
+    #[cfg(unix)]
+    fn write_synthetic_codex_auth(home: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let auth = home.join("auth.json");
+        fs::write(&auth, body).expect("synthetic credential");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("credential mode");
+    }
+
+    /// Opens a Codex setup that waits for sign-in and returns its managed home.
+    #[cfg(unix)]
+    fn open_waiting_codex_setup(operation_id: &str) -> PathBuf {
+        let prepared =
+            prepare_open_codex_account(1, operation_id.to_string()).expect("prepare open");
+        let slot_id = prepared
+            .setup_operation
+            .slot_id
+            .expect("the open setup reserves a home");
+        FileCodexAccountSlotSettingsStore::default()
+            .slot_home(&slot_id)
+            .expect("reserved Codex home")
+    }
+
+    /// Runs the waiting check `times` times and asserts the setup still waits.
+    #[cfg(unix)]
+    fn check_waiting_codex_setup(operation_id: &str, times: usize, explicit: bool) {
+        for _ in 0..times {
+            let checked = check_codex_account(1, operation_id, explicit).expect("waiting check");
+            assert_eq!(
+                checked.setup_operation.state,
+                CodexAccountSetupOperationStateV1::WaitingForUserLogin
+            );
+        }
+    }
+
+    /// The companion checks a setup that waits for sign-in every few seconds.
+    /// Before the fix each check started one `codex app-server` (20 checks, 20
+    /// runs). Now a home without a credential is never read, a failing read
+    /// is spaced, a person's check reads at most once per few seconds, and a
+    /// new sign-in is read at once. The gate's clock is frozen, so the counts
+    /// do not depend on how long the checks take.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_waiting_check_storm_stays_under_the_setup_backoff() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("codex-check-storm")
+            .canonicalize()
+            .expect("canonical Codex account test root");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let runs = root.join("app-server-runs");
+        write_signed_out_fake_codex(&root.join("bin"), &runs, None);
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let clock = crate::agent_status::SetupGateTestClock::frozen_at(std::time::Instant::now());
+        let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
+        let home = open_waiting_codex_setup(operation_id);
+
+        // Before the sign-in writes a credential, no check starts the CLI.
+        check_waiting_codex_setup(operation_id, 20, false);
+        assert_eq!(counted_lines(&runs), 0);
+
+        // A credential whose quota read fails: the first check reads at once
+        // and the following polls wait, and so does a person's check made
+        // right after the failure.
+        write_synthetic_codex_auth(&home, "{}");
+        check_waiting_codex_setup(operation_id, 20, false);
+        check_waiting_codex_setup(operation_id, 1, true);
+        assert_eq!(counted_lines(&runs), 1);
+        clock.set(4);
+        check_waiting_codex_setup(operation_id, 1, true);
+        assert_eq!(counted_lines(&runs), 1);
+        // The person's check reads once the short gap passed.
+        clock.set(5);
+        check_waiting_codex_setup(operation_id, 1, true);
+        check_waiting_codex_setup(operation_id, 20, false);
+        assert_eq!(counted_lines(&runs), 2);
+
+        // A new sign-in is read at once, then spaced again.
+        clock.set(6);
+        write_synthetic_codex_auth(&home, "{\"tokens\":null}");
+        check_waiting_codex_setup(operation_id, 20, false);
+        assert_eq!(counted_lines(&runs), 3);
+
+        // Each failed read still counts as a sent call.
+        assert_eq!(setup_rpc_error_call_lines(&root), 3);
+
+        drop(clock);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Each read refreshes the token, so the CLI rewrites `auth.json` during
+    /// a read that then fails. That rewrite is not a new sign-in: the spacing
+    /// keeps growing, and after the long-failure window automatic reads slow
+    /// to one per 15 minutes. They never stop, and a person's check still
+    /// reads at once.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_waiting_check_spacing_survives_the_reads_own_credential_rewrite() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("codex-check-rewrite")
+            .canonicalize()
+            .expect("canonical Codex account test root");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let runs = root.join("app-server-runs");
+        write_signed_out_fake_codex(&root.join("bin"), &runs, None);
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let clock = crate::agent_status::SetupGateTestClock::frozen_at(std::time::Instant::now());
+        let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
+        let home = open_waiting_codex_setup(operation_id);
+        let auth = home.join("auth.json");
+        write_signed_out_fake_codex(&root.join("bin"), &runs, Some(&auth));
+        write_synthetic_codex_auth(&home, "{}");
+
+        // (seconds after the first read, runs expected after checks then).
+        let schedule = [
+            (0, 1),
+            (4, 1),
+            // Three short retries after the sign-in...
+            (5, 2),
+            (10, 3),
+            (15, 4),
+            // ...then the spacing doubles from 10 s.
+            (24, 4),
+            (25, 5),
+            (44, 5),
+            (45, 6),
+            (84, 6),
+            (85, 7),
+            (164, 7),
+            (165, 8),
+            (324, 8),
+            (325, 9),
+            // Still within the window: due 300 s after the last read.
+            (1799, 10),
+            // The window is over: one read per 15 minutes after the last.
+            (1800, 10),
+            (1799 + 899, 10),
+            (1799 + 900, 11),
+            (1799 + 1799, 11),
+            (1799 + 1800, 12),
+        ];
+        for (seconds, expected_runs) in schedule {
+            clock.set(seconds);
+            check_waiting_codex_setup(operation_id, 3, false);
+            assert_eq!(
+                counted_lines(&runs),
+                expected_runs,
+                "runs after the checks at {seconds} s"
+            );
+        }
+        let rewrites = fs::read_to_string(&auth)
+            .expect("credential")
+            .matches('\n')
+            .count();
+        assert_eq!(rewrites, 12, "every read rewrote the credential");
+
+        // A person's check reads at once, at most once per 5 s.
+        clock.set(1799 + 1801);
+        check_waiting_codex_setup(operation_id, 1, true);
+        assert_eq!(counted_lines(&runs), 12);
+        clock.set(1799 + 1805);
+        check_waiting_codex_setup(operation_id, 2, true);
+        assert_eq!(counted_lines(&runs), 13);
+
+        drop(clock);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A synthetic `auth.json` whose live tokens claim `user` in `workspace`.
+    /// A new `expires_at` is a new token for the same sign-in.
+    #[cfg(unix)]
+    fn synthetic_codex_auth_with_claims(user: &str, workspace: &str, expires_at: i64) -> String {
+        let jwt = |kind: &str| {
+            let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({
+                    "iss": "https://auth.openai.com",
+                    "aud": "synthetic-client",
+                    "exp": expires_at,
+                    "email": "synthetic-account",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_user_id": user,
+                        "chatgpt_account_id": workspace,
+                        "chatgpt_plan_type": "pro"
+                    }
+                })
+                .to_string(),
+            );
+            format!("{header}.{payload}.synthetic-{kind}-signature")
+        };
+        serde_json::json!({
+            "tokens": {"access_token": jwt("access"), "id_token": jwt("id")},
+            "account_id": workspace,
+        })
+        .to_string()
+    }
+
+    /// A reconnect keeps the home and its credential, and the person signs in
+    /// again to the same account and workspace while the old token is still
+    /// live. With a credential that names its account, the read's own token
+    /// refresh still continues the run, but a rewrite made between reads (the
+    /// new sign-in) is read at once, once, and the run keeps its spacing.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_waiting_check_reads_a_same_account_sign_in_at_once() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("codex-check-same-account")
+            .canonicalize()
+            .expect("canonical Codex account test root");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let runs = root.join("app-server-runs");
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let clock = crate::agent_status::SetupGateTestClock::frozen_at(std::time::Instant::now());
+        let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
+        let home = open_waiting_codex_setup(operation_id);
+        let auth = home.join("auth.json");
+        write_signed_out_fake_codex(&root.join("bin"), &runs, Some(&auth));
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64
+            + 24 * 60 * 60;
+        write_synthetic_codex_auth(
+            &home,
+            &synthetic_codex_auth_with_claims("synthetic-user", "synthetic-workspace", expires_at),
+        );
+
+        // The read's own rewrite does not restart the run: the spacing grows.
+        for (seconds, expected_runs) in [
+            (0, 1),
+            (4, 1),
+            (5, 2),
+            (10, 3),
+            (15, 4),
+            (24, 4),
+            (25, 5),
+            (44, 5),
+        ] {
+            clock.set(seconds);
+            check_waiting_codex_setup(operation_id, 3, false);
+            assert_eq!(
+                counted_lines(&runs),
+                expected_runs,
+                "runs after the checks at {seconds} s"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&auth)
+                .expect("credential")
+                .matches('\n')
+                .count(),
+            5,
+            "every read rewrote the credential"
+        );
+
+        // The person signs in again to the same account; the next due read
+        // would be at 45 s, then 85 s. The new credential is read at once,
+        // once.
+        clock.set(30);
+        write_synthetic_codex_auth(
+            &home,
+            &synthetic_codex_auth_with_claims(
+                "synthetic-user",
+                "synthetic-workspace",
+                expires_at + 60,
+            ),
+        );
+        check_waiting_codex_setup(operation_id, 3, false);
+        assert_eq!(counted_lines(&runs), 6);
+        // That read continued the run: six failures, so 40 s after it, not
+        // the short retries of a new run.
+        clock.set(35);
+        check_waiting_codex_setup(operation_id, 3, false);
+        assert_eq!(counted_lines(&runs), 6);
+        clock.set(69);
+        check_waiting_codex_setup(operation_id, 3, false);
+        assert_eq!(counted_lines(&runs), 6);
+        clock.set(70);
+        check_waiting_codex_setup(operation_id, 3, false);
+        assert_eq!(counted_lines(&runs), 7);
+
+        drop(clock);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A fake `codex` for the daemon-run sign-in. `login` follows the mode in
+    /// `<bin>/login-mode`:
+    /// - `success`: prints the sign-in address, writes `<bin>/auth-body` to
+    ///   `$CODEX_HOME/auth.json`, prints the success line and exits 0;
+    /// - `wait`: prints the address and waits; SIGTERM makes it exit 0, as
+    ///   the real CLI does;
+    /// - `early`: exits 0 without saving anything;
+    /// - `fail`: exits 1;
+    /// - `hold`: prints the address and waits for `<bin>/release-login`,
+    ///   then exits with the status written there, saving nothing;
+    /// - `fork`: as the real wrapper, starts a child that listens on the
+    ///   port in `<bin>/listen-port` (its pid in `<bin>/listener-pid`); both
+    ///   ignore SIGTERM.
+    ///
+    /// `app-server` answers with a signed-in account and a fresh quota
+    /// window; the runs listed in `<bin>/failing-reads` (1-based) fail the
+    /// quota read instead. Every login appends its pid to `<bin>/login-runs`,
+    /// every app-server start one line to `<bin>/app-server-runs` and its
+    /// `CODEX_HOME` to `<bin>/app-server-homes`.
+    #[cfg(unix)]
+    fn write_sign_in_fake_codex(bin: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(bin).expect("fake Codex bin dir");
+        let script = format!(
+            r#"#!/usr/bin/python3
+import json, os, signal, sys, time
+BIN = {bin:?}
+
+def read(name, default=""):
+    try:
+        with open(os.path.join(BIN, name)) as f:
+            return f.read()
+    except OSError:
+        return default
+
+args = sys.argv[1:]
+if args == ["login"]:
+    with open(os.path.join(BIN, "login-runs"), "a") as f:
+        f.write("%d\n" % os.getpid())
+    mode = read("login-mode").strip()
+    if mode == "fail":
+        sys.exit(1)
+    if mode == "early":
+        sys.exit(0)
+    if mode == "fork":
+        import socket
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if os.fork() == 0:
+            listener.bind(("127.0.0.1", int(read("listen-port"))))
+            listener.listen(1)
+            with open(os.path.join(BIN, "listener-pid"), "w") as f:
+                f.write("%d" % os.getpid())
+            while True:
+                time.sleep(1)
+        sys.stderr.write("If your browser did not open, navigate to this URL to authenticate:\n\n")
+        sys.stderr.write("https://auth.example.test/oauth/authorize?state=SYNTHETIC-SIGN-IN-URL-MARKER\n\n")
+        sys.stderr.flush()
+        while True:
+            time.sleep(1)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    sys.stderr.write("Starting local login server on http://localhost:1455.\n")
+    sys.stderr.write("If your browser did not open, navigate to this URL to authenticate:\n\n")
+    sys.stderr.write("https://auth.example.test/oauth/authorize?state=SYNTHETIC-SIGN-IN-URL-MARKER\n\n")
+    sys.stderr.flush()
+    if mode == "wait":
+        while True:
+            time.sleep(1)
+    if mode == "hold":
+        while not os.path.exists(os.path.join(BIN, "release-login")):
+            time.sleep(0.05)
+        sys.exit(int(read("release-login").strip() or "0"))
+    time.sleep(0.3)
+    path = os.path.join(os.environ["CODEX_HOME"], "auth.json")
+    with open(path + ".tmp", "w") as f:
+        f.write(read("auth-body"))
+    os.chmod(path + ".tmp", 0o600)
+    os.rename(path + ".tmp", path)
+    sys.stderr.write("Successfully logged in\n")
+    sys.exit(0)
+if args != ["app-server", "--stdio"]:
+    sys.exit(1)
+with open(os.path.join(BIN, "app-server-runs"), "a") as f:
+    f.write("run\n")
+with open(os.path.join(BIN, "app-server-homes"), "a") as f:
+    f.write(os.environ.get("CODEX_HOME", "") + "\n")
+run = len(read("app-server-runs").splitlines())
+failing = [int(n) for n in read("failing-reads").split()]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "initialize":
+        print(json.dumps({{"id": request_id, "result": {{"userAgent": "synthetic"}}}}), flush=True)
+    elif method == "account/read":
+        print(json.dumps({{"id": request_id, "result": {{"account": {{"type": "chatgpt", "email": "synthetic-account", "planType": "pro"}}, "requiresOpenaiAuth": True}}}}), flush=True)
+    elif method == "account/rateLimits/read":
+        if run in failing:
+            print(json.dumps({{"id": request_id, "error": {{"code": -32603, "message": "synthetic failure"}}}}), flush=True)
+        else:
+            print(json.dumps({{"id": request_id, "result": {{"rateLimits": {{"primary": {{"usedPercent": 25, "windowDurationMins": 300}}}}}}}}), flush=True)
+"#,
+            bin = bin.display().to_string()
+        );
+        let executable = bin.join("codex");
+        fs::write(&executable, script).expect("fake Codex executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+    }
+
+    /// One test's daemon-run sign-in setup: a support dir, the fake `codex`,
+    /// short timings and a free stand-in for the sign-in port.
+    #[cfg(unix)]
+    struct SignInFixture {
+        root: PathBuf,
+        bin: PathBuf,
+        port: u16,
+        _timings: crate::codex_sign_in::TestTimingsGuard,
+        _commands: EnvVarGuard,
+        _support: EnvVarGuard,
+        _home: EnvVarGuard,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl SignInFixture {
+        fn new(name: &str, sign_in_timeout: Duration) -> Self {
+            let guard = lock_backend_test_env();
+            let root = control_test_root(name)
+                .canonicalize()
+                .expect("canonical Codex sign-in test root");
+            let support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let bin = root.join("bin");
+            write_sign_in_fake_codex(&bin);
+            let commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &bin);
+            // The schedule's default home is `$HOME/.codex`: none here.
+            let home = EnvVarGuard::set_path("HOME", &root);
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .expect("free port")
+                .local_addr()
+                .expect("port")
+                .port();
+            let timings = crate::codex_sign_in::TestTimingsGuard::set(
+                sign_in_timeout,
+                Duration::from_millis(300),
+                port,
+            );
+            let expires_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_secs() as i64
+                + 24 * 60 * 60;
+            fs::write(
+                bin.join("auth-body"),
+                synthetic_codex_auth_with_claims(
+                    "synthetic-user",
+                    "synthetic-workspace",
+                    expires_at,
+                ),
+            )
+            .expect("auth body");
+            Self {
+                root,
+                bin,
+                port,
+                _timings: timings,
+                _commands: commands,
+                _support: support,
+                _home: home,
+                _guard: guard,
+            }
+        }
+
+        fn set(&self, name: &str, body: &str) {
+            fs::write(self.bin.join(name), body).expect("fake Codex setting");
+        }
+
+        fn app_server_runs(&self) -> usize {
+            counted_lines(&self.bin.join("app-server-runs"))
+        }
+
+        /// App-server runs that read `home`.
+        fn app_server_runs_for(&self, home: &Path) -> usize {
+            fs::read_to_string(self.bin.join("app-server-homes"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| Path::new(line) == home)
+                .count()
+        }
+
+        /// The status once the sign-in waits for the browser with an address.
+        fn waiting_for_browser(&self) -> ottto_protocol::CodexAccountsStatusV1 {
+            let status = self.status_until(|status| {
+                status
+                    .setup_operation
+                    .sign_in
+                    .as_ref()
+                    .is_some_and(|sign_in| sign_in.sign_in_url.is_some())
+            });
+            assert!(status
+                .setup_operation
+                .sign_in
+                .as_ref()
+                .is_some_and(|sign_in| sign_in.sign_in_url.is_some()));
+            status
+        }
+
+        /// A connected account from a daemon sign-in: its slot, home and
+        /// binding hashes.
+        fn connected_account(&self, operation_id: &str) -> (String, PathBuf, String, String) {
+            self.set("login-mode", "success");
+            let home = open_waiting_codex_setup(operation_id);
+            start_codex_sign_in(1, operation_id).expect("start sign-in");
+            let ended = self.ended();
+            assert_eq!(
+                sign_in_outcome(&ended),
+                Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+            );
+            let operation = ended.setup_operation;
+            (
+                operation.slot_id.expect("slot"),
+                home,
+                operation.account_identifier_hash.expect("account hash"),
+                operation.workspace_identifier_hash.expect("workspace hash"),
+            )
+        }
+
+        fn login_pids(&self) -> Vec<i32> {
+            fs::read_to_string(self.bin.join("login-runs"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.parse().ok())
+                .collect()
+        }
+
+        /// The status a client reads, until `done` holds or 20 s pass.
+        fn status_until(
+            &self,
+            done: impl Fn(&ottto_protocol::CodexAccountsStatusV1) -> bool,
+        ) -> ottto_protocol::CodexAccountsStatusV1 {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let status = crate::codex_sign_in::present(
+                    FileCodexAccountSlotSettingsStore::default()
+                        .load()
+                        .expect("status"),
+                );
+                if done(&status) || Instant::now() >= deadline {
+                    return status;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn ended(&self) -> ottto_protocol::CodexAccountsStatusV1 {
+            let status = self.status_until(|status| {
+                status
+                    .setup_operation
+                    .sign_in
+                    .as_ref()
+                    .is_some_and(|sign_in| {
+                        sign_in.phase == ottto_protocol::CodexAccountSignInPhaseV1::Done
+                    })
+            });
+            assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
+                20
+            )));
+            status
+        }
+
+        /// No file under the support dir holds the sign-in address.
+        fn assert_url_never_written(&self) {
+            fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+                for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, found);
+                    } else if fs::read(&path).is_ok_and(|body| {
+                        String::from_utf8_lossy(&body).contains("SYNTHETIC-SIGN-IN-URL-MARKER")
+                    }) {
+                        found.push(path);
+                    }
+                }
+            }
+            let mut found = Vec::new();
+            walk(&self.root, &mut found);
+            // The fake CLI itself holds it.
+            found.retain(|path| !path.starts_with(&self.bin));
+            assert!(found.is_empty(), "sign-in address written to {found:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SignInFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn sign_in_outcome(
+        status: &ottto_protocol::CodexAccountsStatusV1,
+    ) -> Option<ottto_protocol::CodexAccountSignInOutcomeV1> {
+        status
+            .setup_operation
+            .sign_in
+            .as_ref()
+            .and_then(|sign_in| sign_in.outcome)
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    const SIGN_IN_OPERATION: &str = "codex_setup_5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+
+    /// The daemon runs `codex login`: the address it prints is offered to the
+    /// client while the browser is open and never written anywhere; the
+    /// saved credential is checked once (the identity read plus the fresh
+    /// pinned-workspace read) and the account is connected.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_connects_the_account_and_never_writes_the_url() {
+        let fixture = SignInFixture::new("codex-sign-in-success", Duration::from_secs(60));
+        fixture.set("login-mode", "wait");
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+
+        let started = crate::codex_sign_in::present(
+            start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in"),
+        );
+        assert_eq!(started.daemon_sign_in_supported, Some(true));
+        assert_eq!(started.setup_operation.launch_command, None);
+        let waiting = fixture.status_until(|status| {
+            status
+                .setup_operation
+                .sign_in
+                .as_ref()
+                .is_some_and(|sign_in| sign_in.sign_in_url.is_some())
+        });
+        let sign_in = waiting.setup_operation.sign_in.clone().expect("sign-in");
+        assert_eq!(
+            sign_in.phase,
+            ottto_protocol::CodexAccountSignInPhaseV1::WaitingForBrowser
+        );
+        assert_eq!(
+            sign_in.sign_in_url.as_ref().map(|url| url.expose_secret()),
+            Some("https://auth.example.test/oauth/authorize?state=SYNTHETIC-SIGN-IN-URL-MARKER")
+        );
+        assert!(!format!("{waiting:?}").contains("SYNTHETIC-SIGN-IN-URL-MARKER"));
+        // A replay only reports status; a check while it runs reads nothing.
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("replay");
+        for _ in 0..50 {
+            check_codex_account(1, SIGN_IN_OPERATION, false).expect("check while running");
+        }
+        assert_eq!(fixture.login_pids().len(), 1);
+        assert_eq!(fixture.app_server_runs(), 0);
+        fixture.assert_url_never_written();
+
+        // Cancel that one, then sign in for real on a new operation.
+        stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop");
+        let operation = "codex_setup_6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b";
+        fixture.set("login-mode", "success");
+        open_waiting_codex_setup(operation);
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::Complete
+        );
+        assert_eq!(ended.managed_slots.len(), 1);
+        assert_eq!(fixture.app_server_runs(), 2);
+        let sign_in = ended.setup_operation.sign_in.expect("sign-in");
+        assert_eq!(sign_in.sign_in_url, None);
+        // The account reads are logged as setup reads; the browser sign-in is not.
+        let lines = setup_call_lines(&fixture.root);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines
+            .iter()
+            .all(|line| line.kind == "codex_app_server_quota" && line.result == "ok"));
+        fixture.assert_url_never_written();
+    }
+
+    /// Call-log lines with trigger `setup`.
+    #[cfg(unix)]
+    fn setup_call_lines(support: &Path) -> Vec<ottto_core::provider_call_log::ProviderCallLine> {
+        let dir = ottto_core::provider_call_log::provider_call_log_dir(support);
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+            .flat_map(|body| {
+                body.lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<ottto_core::provider_call_log::ProviderCallLine>(
+                            line,
+                        )
+                        .ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|line| line.trigger == "setup")
+            .collect()
+    }
+
+    /// Stop ends `codex login` before the unadopted home is removed, and
+    /// the sign-in ends `cancelled`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_cancel_ends_the_cli_before_removing_the_home() {
+        let fixture = SignInFixture::new("codex-sign-in-cancel", Duration::from_secs(60));
+        fixture.set("login-mode", "wait");
+        let home = open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        fixture.status_until(|status| {
+            status
+                .setup_operation
+                .sign_in
+                .as_ref()
+                .is_some_and(|sign_in| sign_in.sign_in_url.is_some())
+        });
+        let pid = fixture.login_pids()[0];
+        assert!(process_alive(pid));
+
+        let stopped = crate::codex_sign_in::present(
+            stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop"),
+        );
+        assert_eq!(
+            sign_in_outcome(&stopped),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Cancelled)
+        );
+        assert_eq!(
+            stopped.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+        assert!(!process_alive(pid), "codex login still runs");
+        assert!(!home.exists(), "the unadopted home is removed");
+        assert_eq!(
+            stopped
+                .setup_operation
+                .sign_in
+                .expect("sign-in")
+                .sign_in_url,
+            None
+        );
+        assert_eq!(fixture.app_server_runs(), 0);
+        assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
+            5
+        )));
+    }
+
+    /// A sign-in nobody finishes is stopped at the deadline.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_times_out_and_ends_the_cli() {
+        let fixture = SignInFixture::new("codex-sign-in-timeout", Duration::from_secs(1));
+        fixture.set("login-mode", "wait");
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::TimedOut)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+        assert!(!process_alive(fixture.login_pids()[0]));
+        assert_eq!(fixture.app_server_runs(), 0);
+    }
+
+    /// `codex login` exits 0 when stopped too: without a new credential the
+    /// sign-in failed, whatever the exit status. A busy sign-in port starts
+    /// nothing.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_without_a_credential_or_with_a_busy_port_fails_plainly() {
+        let fixture = SignInFixture::new("codex-sign-in-early", Duration::from_secs(60));
+        for (index, mode) in ["early", "fail"].into_iter().enumerate() {
+            fixture.set("login-mode", mode);
+            let operation = format!("codex_setup_{index:032}");
+            open_waiting_codex_setup(&operation);
+            start_codex_sign_in(1, &operation).expect("start sign-in");
+            let ended = fixture.ended();
+            assert_eq!(
+                sign_in_outcome(&ended),
+                Some(ottto_protocol::CodexAccountSignInOutcomeV1::LoginFailed),
+                "{mode}"
+            );
+            assert_eq!(
+                ended.setup_operation.state,
+                CodexAccountSetupOperationStateV1::SetupFailed
+            );
+        }
+        assert_eq!(fixture.login_pids().len(), 2);
+
+        let _held = std::net::TcpListener::bind(("127.0.0.1", fixture.port)).expect("hold port");
+        let operation = "codex_setup_7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c";
+        open_waiting_codex_setup(operation);
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::PortBusy)
+        );
+        assert_eq!(fixture.login_pids().len(), 2, "no login started");
+        assert_eq!(fixture.app_server_runs(), 0);
+    }
+
+    /// A failed account read after the sign-in is retried once; a second
+    /// failure ends `check_failed` after exactly two reads.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_retries_a_failed_account_read_once() {
+        let fixture = SignInFixture::new("codex-sign-in-retry", Duration::from_secs(60));
+        fixture.set("login-mode", "success");
+        fixture.set("failing-reads", "1 2");
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::CheckFailed)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupFailed
+        );
+        assert_eq!(fixture.app_server_runs(), 2);
+
+        // The retry succeeds: one failed read, then the identity read and
+        // the pinned-workspace read.
+        fixture.set("failing-reads", "3");
+        let operation = "codex_setup_8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d";
+        open_waiting_codex_setup(operation);
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+        assert_eq!(fixture.app_server_runs(), 5);
+    }
+
+    /// The pinned-workspace read fails: `workspace_not_kept`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_reports_a_workspace_restriction_that_did_not_hold() {
+        let fixture = SignInFixture::new("codex-sign-in-pinned", Duration::from_secs(60));
+        fixture.set("login-mode", "success");
+        fixture.set("failing-reads", "2");
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::WorkspaceNotKept)
+        );
+        assert_eq!(fixture.app_server_runs(), 2);
+    }
+
+    /// A target setup signed into another account: `identity_mismatch`, and
+    /// the same operation may sign in again.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_after_a_mismatch_runs_again_on_the_same_operation() {
+        let fixture = SignInFixture::new("codex-sign-in-mismatch", Duration::from_secs(60));
+        fixture.set("login-mode", "success");
+        prepare_codex_account(
+            1,
+            SIGN_IN_OPERATION.to_string(),
+            "a".repeat(64),
+            "b".repeat(64),
+        )
+        .expect("prepare target");
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::IdentityMismatch)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::IdentityMismatch
+        );
+        assert_eq!(ended.setup_operation.launch_command, None);
+        assert_eq!(fixture.app_server_runs(), 1);
+
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("sign in again");
+        let ended = fixture.ended();
+        assert_eq!(fixture.login_pids().len(), 2);
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::IdentityMismatch)
+        );
+    }
+
+    /// After a daemon restart a sign-in is never started again: a credential
+    /// saved meanwhile is checked once, otherwise it ends `interrupted`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_recovery_checks_a_saved_credential_once_or_interrupts() {
+        let fixture = SignInFixture::new("codex-sign-in-recovery", Duration::from_secs(60));
+        let store = FileCodexAccountSlotSettingsStore::default();
+        // The run as a daemon that stopped mid-sign-in left it.
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        store
+            .begin_sign_in(
+                1,
+                SIGN_IN_OPERATION,
+                "2026-10-15T12:00:00Z".to_string(),
+                "2026-10-15T12:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        crate::codex_sign_in::recover_at_startup();
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Interrupted)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+
+        let operation = "codex_setup_9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e";
+        let home = open_waiting_codex_setup(operation);
+        store
+            .begin_sign_in(
+                1,
+                operation,
+                "2026-10-15T12:00:00Z".to_string(),
+                "2026-10-15T12:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        write_synthetic_codex_auth(
+            &home,
+            &fs::read_to_string(fixture.bin.join("auth-body")).expect("auth body"),
+        );
+        crate::codex_sign_in::recover_at_startup();
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+        assert_eq!(fixture.app_server_runs(), 2);
+        assert!(fixture.login_pids().is_empty(), "no sign-in restarted");
+    }
+
+    /// A reconnect signs into a home that already has a credential, which
+    /// the person's own Codex sessions may rewrite meanwhile. Scheduled and
+    /// explicit quota reads leave the home alone while the sign-in runs, and
+    /// a rewritten credential counts only with the CLI's own success: a CLI
+    /// that ends early (exit 0 or 1) is `login_failed`, with no account read.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_reconnect_counts_only_the_clis_own_sign_in() {
+        let fixture = SignInFixture::new("codex-sign-in-reconnect", Duration::from_secs(60));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        assert_eq!(fixture.app_server_runs_for(&home), 2);
+        let auth_body = fs::read_to_string(home.join("auth.json")).expect("credential");
+        let later = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_secs()
+                + 24 * 60 * 60
+        };
+
+        fixture.set("login-mode", "hold");
+        for (index, exit) in ["0", "1"].into_iter().enumerate() {
+            let _ = fs::remove_file(fixture.bin.join("release-login"));
+            let operation = format!("codex_setup_{:032}", index + 1);
+            reconnect_codex_account(
+                1,
+                operation.clone(),
+                &slot_id,
+                account.clone(),
+                workspace.clone(),
+            )
+            .expect("reconnect");
+            start_codex_sign_in(1, &operation).expect("start sign-in");
+            fixture.waiting_for_browser();
+
+            // A scheduled round and an explicit refresh during the run.
+            crate::agent_status::codex_scheduled_round_now(later());
+            crate::agent_status::refresh_codex_quota_now(0);
+            assert_eq!(fixture.app_server_runs_for(&home), 2, "exit {exit}");
+            // The person's own Codex session refreshes the credential.
+            write_synthetic_codex_auth(&home, &format!("{auth_body}\n"));
+
+            fixture.set("release-login", exit);
+            let ended = fixture.ended();
+            assert_eq!(
+                sign_in_outcome(&ended),
+                Some(ottto_protocol::CodexAccountSignInOutcomeV1::LoginFailed),
+                "exit {exit}"
+            );
+            assert_eq!(
+                ended.setup_operation.state,
+                CodexAccountSetupOperationStateV1::SetupFailed
+            );
+            assert_eq!(fixture.app_server_runs_for(&home), 2, "no account read");
+        }
+
+        // Once the sign-in has ended, the schedule reads the home again.
+        crate::agent_status::codex_scheduled_round_now(later() + 24 * 60 * 60);
+        assert_eq!(fixture.app_server_runs_for(&home), 3);
+
+        // A reconnect the CLI completes still connects.
+        let operation = "codex_setup_afafafafafafafafafafafafafafafaf";
+        reconnect_codex_account(1, operation.to_string(), &slot_id, account, workspace)
+            .expect("reconnect");
+        fixture.set("login-mode", "success");
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+    }
+
+    /// A daemon restart during a reconnect never verifies the home's
+    /// credential, changed or not: the run ends `interrupted`, and the
+    /// connected home stays.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_restart_during_a_reconnect_interrupts() {
+        let fixture =
+            SignInFixture::new("codex-sign-in-reconnect-restart", Duration::from_secs(60));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        let runs = fixture.app_server_runs();
+        let operation = "codex_setup_bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+        reconnect_codex_account(1, operation.to_string(), &slot_id, account, workspace)
+            .expect("reconnect");
+        FileCodexAccountSlotSettingsStore::default()
+            .begin_sign_in(
+                1,
+                operation,
+                "2026-10-15T12:00:00Z".to_string(),
+                "2026-10-15T12:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        let auth_body = fs::read_to_string(home.join("auth.json")).expect("credential");
+        write_synthetic_codex_auth(&home, &format!("{auth_body}\n"));
+
+        crate::codex_sign_in::recover_at_startup();
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Interrupted)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+        assert_eq!(fixture.app_server_runs(), runs);
+        assert!(home.join("auth.json").exists(), "the connected home stays");
+        assert_eq!(ended.managed_slots.len(), 1);
+    }
+
+    /// A stop that comes while the run starts (here: while a quota read of
+    /// the home holds its lock) starts no `codex login`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_stopped_while_starting_launches_nothing() {
+        let fixture = SignInFixture::new("codex-sign-in-stop-starting", Duration::from_secs(60));
+        fixture.set("login-mode", "wait");
+        let home = open_waiting_codex_setup(SIGN_IN_OPERATION);
+        let stopper = crate::agent_status::with_codex_home_read_lock(&home, || {
+            start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+            let stopper = std::thread::spawn(|| {
+                stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop")
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            stopper
+        });
+        let stopped = crate::codex_sign_in::present(stopper.join().expect("stopper"));
+        assert_eq!(
+            sign_in_outcome(&stopped),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Cancelled)
+        );
+        assert!(fixture.login_pids().is_empty(), "no codex login started");
+        assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
+            5
+        )));
+    }
+
+    /// A recorded run no worker runs (its recovery failed) ends on its own
+    /// once its deadline passed; one within its deadline is left alone.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_without_a_worker_ends_after_its_deadline() {
+        let fixture = SignInFixture::new("codex-sign-in-stale", Duration::from_secs(60));
+        let store = FileCodexAccountSlotSettingsStore::default();
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        store
+            .begin_sign_in(
+                1,
+                SIGN_IN_OPERATION,
+                "2999-01-01T00:00:00Z".to_string(),
+                "2999-01-01T00:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        crate::codex_sign_in::end_stale_run();
+        assert!(store.active_sign_in().expect("read").is_some());
+        stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop");
+
+        let operation = "codex_setup_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        open_waiting_codex_setup(operation);
+        store
+            .begin_sign_in(
+                1,
+                operation,
+                "2020-01-01T00:00:00Z".to_string(),
+                "2020-01-01T00:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        // The daemon's own scheduler pass ends it.
+        crate::agent_status::codex_scheduled_round_now(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_secs(),
+        );
+        let status = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&status),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Interrupted)
+        );
+        assert_eq!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+    }
+
+    /// Removing a connected account during its reconnect sign-in ends
+    /// `codex login` first.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_ends_when_its_account_is_removed() {
+        let fixture = SignInFixture::new("codex-sign-in-remove", Duration::from_secs(60));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        let operation = "codex_setup_dededededededededededededededede";
+        reconnect_codex_account(1, operation.to_string(), &slot_id, account, workspace)
+            .expect("reconnect");
+        fixture.set("login-mode", "wait");
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        fixture.waiting_for_browser();
+        let pid = *fixture.login_pids().last().expect("login pid");
+        assert!(process_alive(pid));
+
+        let removed = remove_codex_account(1, &slot_id).expect("remove");
+        assert!(!process_alive(pid), "codex login still runs");
+        assert!(removed.managed_slots.is_empty());
+        assert!(!home.exists());
+        assert!(!crate::codex_sign_in::is_running(&removed.setup_operation));
+        assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
+            5
+        )));
+    }
+
+    /// The real `codex` is a wrapper whose child listens on the port. A
+    /// stop ends both, even when they ignore SIGTERM, so the port is free.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_stop_ends_the_clis_listener_and_frees_the_port() {
+        let fixture = SignInFixture::new("codex-sign-in-listener", Duration::from_secs(60));
+        fixture.set("login-mode", "fork");
+        fixture.set("listen-port", &fixture.port.to_string());
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        fixture.waiting_for_browser();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let listener = loop {
+            if let Some(pid) = fs::read_to_string(fixture.bin.join("listener-pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "listener never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let wrapper = fixture.login_pids()[0];
+        assert!(std::net::TcpStream::connect(("127.0.0.1", fixture.port)).is_ok());
+
+        let stopped = crate::codex_sign_in::present(
+            stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop"),
+        );
+        assert_eq!(
+            sign_in_outcome(&stopped),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Cancelled)
+        );
+        assert!(!process_alive(wrapper), "the wrapper still runs");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(listener) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!process_alive(listener), "the listener still runs");
+        assert!(std::net::TcpListener::bind(("127.0.0.1", fixture.port)).is_ok());
     }
 
     #[test]
@@ -16346,6 +17940,7 @@ mod tests {
             endpoint: "/api/v1/pi/sessions/import".to_string(),
             status: Some(403),
             body_excerpt: Some(r#"{"detail":"telemetry_disabled_by_admin"}"#.to_string()),
+            reason_code: None,
         });
         assert!(is_telemetry_disabled_by_admin_error(&error));
         let smoke = SmokeResult {
@@ -18030,6 +19625,32 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// Only an app without `quota_refresh` (protocol 15 or older) has its
+    /// status refresh stand in for Refresh, and only for Codex; the CLI and
+    /// newer apps do not.
+    #[test]
+    fn only_older_companion_apps_status_refresh_reads_codex_quota() {
+        for version in [15, 14] {
+            assert_eq!(
+                status_refresh_quota_source(Some(LocalClientKind::CompanionApp), version),
+                Some(SourceKind::Codex)
+            );
+        }
+        assert_eq!(
+            status_refresh_quota_source(Some(LocalClientKind::CompanionApp), 16),
+            None
+        );
+        assert_eq!(
+            status_refresh_quota_source(Some(LocalClientKind::Cli), 15),
+            None
+        );
+        assert_eq!(
+            status_refresh_quota_source(Some(LocalClientKind::WebUi), 15),
+            None
+        );
+        assert_eq!(status_refresh_quota_source(None, 15), None);
     }
 
     #[test]
@@ -19725,42 +21346,186 @@ mod tests {
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
     }
 
-    #[test]
-    fn setup_on_connected_daemon_is_truthful_noop() {
-        let daemon = daemon();
-        daemon
-            .begin_auth_with_claim(crate::PendingAuthClaim {
-                claim_code: "claim_connected_setup".to_string(),
-                claim_token: "token_connected_setup".to_string(),
-                nonce: "nonce_connected_setup".to_string(),
-                claim_url: "https://ottto.net/setup/claim?code=claim_connected_setup".to_string(),
-                expires_at: "2100-01-01T00:00:00Z".to_string(),
-            })
-            .expect("begin claim");
-        daemon
-            .complete_auth_with_account(
-                "claim_connected_setup",
-                "nonce_connected_setup",
-                connected_account(),
-                "run_connected_setup".to_string(),
-                "2100-01-01T00:00:00Z".to_string(),
-                Some("machine_test".to_string()),
-            )
-            .expect("connect account");
+    /// A connected Mac with a device credential and a setup run bound to
+    /// `api_base_url`, inside hermetic support/secret directories.
+    fn connected_binding_fixture(
+        name: &str,
+        api_base_url: String,
+    ) -> (PathBuf, Vec<EnvVarGuard>, LocalDaemon, LocalDeviceBinding) {
+        let root = telemetry_key_store_root(name);
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let guards = vec![
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support")),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root),
+        ];
+        let account = connected_account();
+        let device = LocalDeviceBinding {
+            device_id: "device-connected".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let connection = LocalConnectionBinding {
+            setup_run_id: "run_connected_setup".to_string(),
+            setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url,
+        };
+        FileAccountStore::default().save(&account).unwrap();
+        FileDeviceStore::default().save(&device).unwrap();
+        FileConnectionStore::default().save(&connection).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("connected-secret")
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_connected")
+            .unwrap();
+        let daemon = daemon()
+            .with_account(account)
+            .with_connection(Some(connection));
+        (root, guards, daemon, device)
+    }
 
-        let payload = setup_run(
-            &daemon,
-            &RequestAuthorization::Token("token".to_string()),
-            Vec::new(),
-            None,
-            None,
-            None,
-        )
-        .expect("connected setup no-op");
+    #[test]
+    #[serial]
+    fn setup_on_connected_daemon_is_noop_until_ottto_ends_the_run() {
+        let _lock = lock_backend_test_env();
+        let (api_base_url, server) = scripted_json_backend(vec![
+            (401, r#"{"detail":"Setup run not found for this device"}"#),
+            (401, r#"{"detail":"Setup run expired"}"#),
+        ]);
+        let (root, _guards, daemon, device) =
+            connected_binding_fixture("connected-setup", api_base_url);
+        let authorization = RequestAuthorization::Token("token".to_string());
+
+        // A rejection that is not an authoritative terminal answer proves nothing.
+        let payload = setup_run(&daemon, &authorization, Vec::new(), None, None, None)
+            .expect("connected setup no-op");
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["already_connected"], true);
         assert_eq!(payload["setup_run_id"], "run_connected_setup");
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::Connected
+        );
+
+        // An ended run is not revived: local-only cleanup keeps the prior
+        // device proof and the caller is sent to a fresh browser claim.
+        let error = setup_run(&daemon, &authorization, Vec::new(), None, None, None)
+            .expect_err("an ended setup run is not connected");
+        assert_eq!(cli_error(error).code, CliErrorCode::NeedsUserAction);
+        let requests = server.join().expect("scripted backend");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request
+            .starts_with("POST /api/v1/setup-runs/run_connected_setup/local-client/refresh")));
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::NotConnected
+        );
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert_eq!(
+            FileDeviceStore::new(default_prior_device_path())
+                .load()
+                .unwrap(),
+            Some(device)
+        );
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn setup_terminal_refresh_reset_leaves_a_setup_run_attached_meanwhile() {
+        let _lock = lock_backend_test_env();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind gated backend");
+        let api_base_url = format!("http://{}", listener.local_addr().expect("backend address"));
+        let (request_seen_tx, request_seen) = mpsc::channel();
+        let (allow_response, allow_response_rx) = mpsc::channel::<()>();
+        let (response_sent_tx, response_sent) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept refresh");
+            let request = read_complete_http_request(&mut stream);
+            request_seen_tx.send(()).unwrap();
+            allow_response_rx.recv().unwrap();
+            write_json_response(
+                &mut stream,
+                401,
+                "Unauthorized",
+                r#"{"detail":"Setup run expired"}"#,
+            );
+            response_sent_tx.send(()).unwrap();
+            request
+        });
+        let (root, _guards, daemon, device) =
+            connected_binding_fixture("connected-setup-reattach-race", api_base_url.clone());
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let reattached = LocalConnectionBinding {
+            setup_run_id: "run_reattached".to_string(),
+            setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: Some("claim_reattached".to_string()),
+            api_base_url,
+        };
+
+        thread::scope(|scope| {
+            let login =
+                scope.spawn(|| setup_run(&daemon, &authorization, Vec::new(), None, None, None));
+            request_seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("login refreshes the bound run");
+            // Ottto answers that the old run ended. Before the login's reset
+            // runs, run B is attached the way the claim path does it: under
+            // the lifecycle lock, token, connection file, then daemon state.
+            let lifecycle_lock = lock_setup_run_binding();
+            allow_response.send(()).unwrap();
+            response_sent
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal refresh answer sent");
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .save("otsr_reattached")
+                .unwrap();
+            FileConnectionStore::default().save(&reattached).unwrap();
+            daemon
+                .bind_setup_run_for_authorized_client(reattached.clone())
+                .unwrap();
+            drop(lifecycle_lock);
+            let error = login.join().unwrap().expect_err("the old run ended");
+            assert_eq!(cli_error(error).code, CliErrorCode::NeedsUserAction);
+        });
+        assert!(server
+            .join()
+            .expect("gated backend")
+            .starts_with("POST /api/v1/setup-runs/run_connected_setup/local-client/refresh"));
+
+        // Nothing of run B was cleared.
+        assert_eq!(
+            FileConnectionStore::default().load().unwrap(),
+            Some(reattached.clone())
+        );
+        assert_eq!(
+            daemon.connection_for_authorized_client().unwrap(),
+            Some(reattached)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .unwrap(),
+            "otsr_reattached"
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .unwrap(),
+            "connected-secret"
+        );
+        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::Connected
+        );
+        assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -19770,6 +21535,7 @@ mod tests {
             endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
             status: Some(404),
             body_excerpt: None,
+            reason_code: None,
         });
         assert!(backend_error_indicates_account_gone(&gone_404));
 
@@ -19778,6 +21544,7 @@ mod tests {
             endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
             status: Some(401),
             body_excerpt: Some(r#"{"detail":"account_not_found"}"#.to_string()),
+            reason_code: None,
         });
         assert!(backend_error_indicates_account_gone(&gone_401));
 
@@ -19787,6 +21554,7 @@ mod tests {
             endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
             status: Some(401),
             body_excerpt: Some(r#"{"detail":"setup run companion token expired"}"#.to_string()),
+            reason_code: None,
         });
         assert!(!backend_error_indicates_account_gone(&expired_401));
 
@@ -19796,6 +21564,7 @@ mod tests {
             endpoint: "/api/v1/releases/latest".to_string(),
             status: Some(404),
             body_excerpt: None,
+            reason_code: None,
         });
         assert!(!backend_error_indicates_account_gone(&unrelated_404));
 
@@ -21025,6 +22794,365 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn logout_after_ottto_ended_the_run_cleans_up_locally_and_says_so() {
+        let _lock = lock_backend_test_env();
+        let expired = r#"{"detail":"Setup run expired"}"#;
+        let (api_base_url, server) = scripted_json_backend(vec![
+            (401, expired),
+            (401, r#"{"detail":"Setup run not found for this device"}"#),
+            (401, expired),
+            (401, expired),
+        ]);
+        let (root, _guards, daemon, device) =
+            connected_binding_fixture("logout-ended-run", api_base_url);
+        let logout = |request_id: &str| {
+            handle_request(
+                &daemon,
+                LocalControlRequest {
+                    request_id: request_id.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: Some("token".to_string()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: LocalControlCommand::AuthReset {
+                        local_only: false,
+                        forget_installation: false,
+                    },
+                },
+            )
+        };
+
+        // Not an authoritative end of the run: logout fails, nothing is cleared.
+        let refused = logout("req_logout_unproven");
+        assert!(!refused.ok);
+        assert_eq!(
+            refused.error.expect("error").code,
+            CliErrorCode::BackendRejected
+        );
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::Connected
+        );
+        assert_eq!(
+            FileDeviceStore::default().load().unwrap(),
+            Some(device.clone())
+        );
+
+        let ended = logout("req_logout_ended_run");
+        assert!(ended.ok, "{ended:?}");
+        let payload = ended.payload.expect("payload");
+        assert_eq!(payload["local_only"], true);
+        assert_eq!(payload["cloud_disconnected"], false);
+        assert_eq!(payload["message"]["code"], "setup_run_already_ended");
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::NotConnected
+        );
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert_eq!(
+            FileDeviceStore::new(default_prior_device_path())
+                .load()
+                .unwrap(),
+            Some(device)
+        );
+        let requests = server.join().expect("scripted backend");
+        assert!(requests[0].contains("/local-client/disconnect"));
+        assert!(requests[1].contains("/local-client/refresh"));
+        assert!(requests[2].contains("/local-client/disconnect"));
+        assert!(requests[3].contains("/local-client/refresh"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disconnect_body_carries_release_proof_only_when_both_halves_exist() {
+        let proof =
+            device_release_proof("device_release".to_string(), "secret-release".to_string())
+                .expect("complete proof");
+        assert_eq!(
+            setup_run_disconnect_body(Some(&proof)),
+            json!({
+                "reason": "logout",
+                "release_device_id": "device_release",
+                "release_device_secret": "secret-release",
+            })
+        );
+        assert_eq!(
+            setup_run_disconnect_body(None),
+            json!({ "reason": "logout" })
+        );
+        assert!(device_release_proof(String::new(), "secret-release".to_string()).is_none());
+        assert!(device_release_proof("device_release".to_string(), String::new()).is_none());
+        assert!(!format!("{proof:?}").contains("secret-release"));
+    }
+
+    #[test]
+    fn account_switch_never_releases_the_incoming_device() {
+        let proof = device_release_proof("device_old".to_string(), "secret-old".to_string())
+            .expect("complete proof");
+        assert!(releasable_on_switch(&proof, None));
+        assert!(releasable_on_switch(&proof, Some("device_new")));
+        assert!(!releasable_on_switch(&proof, Some("device_old")));
+    }
+
+    #[test]
+    fn disconnect_response_device_released_defaults_false_for_older_servers() {
+        let legacy: SetupRunDisconnectResponse = serde_json::from_str(
+            r#"{"setup_run_id":"run","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z"}"#,
+        )
+        .expect("legacy disconnect response");
+        assert!(!legacy.device_released);
+        let released: SetupRunDisconnectResponse = serde_json::from_str(
+            r#"{"setup_run_id":"run","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z","device_released":true}"#,
+        )
+        .expect("release disconnect response");
+        assert!(released.device_released);
+    }
+
+    #[test]
+    fn auth_reset_messages_state_whether_the_server_registration_was_released() {
+        let local_forget = auth_reset_message(true, None);
+        assert_eq!(local_forget.code, "installation_forgotten");
+        assert!(local_forget.text.contains("Ottto was not contacted"));
+        assert!(local_forget
+            .text
+            .contains("still registered to the previous Ottto account"));
+        assert!(local_forget.text.contains("(Disconnect)"));
+        assert!(local_forget
+            .text
+            .contains("`ottto logout --forget-installation --confirm` without --local-only"));
+        assert!(!local_forget.text.contains("account scope"));
+
+        let cloud_forget = auth_reset_message(true, Some(true));
+        assert_eq!(cloud_forget.code, "installation_forgotten");
+        assert!(cloud_forget
+            .text
+            .contains("server registration was released"));
+        assert!(!cloud_forget.text.contains("still registered"));
+
+        let cloud_forget_unreleased = auth_reset_message(true, Some(false));
+        assert!(cloud_forget_unreleased.text.contains("may still be active"));
+
+        let cloud = auth_reset_message(false, Some(true));
+        assert_eq!(cloud.code, "cloud_disconnect_complete");
+        assert!(cloud.text.contains("server registration was released"));
+        let cloud_unreleased = auth_reset_message(false, Some(false));
+        assert_eq!(cloud_unreleased.code, "cloud_disconnect_complete");
+        assert!(cloud_unreleased.text.contains("may still be active"));
+
+        assert_eq!(
+            auth_reset_message(false, None).code,
+            "local_disconnect_complete"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cloud_forget_installation_releases_device_before_forgetting() {
+        let root = telemetry_key_store_root("cloud-forget-installation");
+        let support_root = root.join("support");
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(support_root.join("snapshots/destinations/old")).unwrap();
+        fs::create_dir_all(&secret_root).unwrap();
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileMachineStore::default()
+            .save(&LocalMachineBinding {
+                machine_id: "otm_original".to_string(),
+                installation_id: "oti_original".to_string(),
+                hardware_uuid: None,
+            })
+            .unwrap();
+        FileAccountStore::default()
+            .save(&connected_account())
+            .unwrap();
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_cloud_forget".to_string(),
+                machine_id: Some("otm_original".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device-secret-cloud-forget")
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("setup-token-cloud-forget")
+            .unwrap();
+        fs::write(
+            support_root.join("snapshots/destinations/old/codex-scan-index.json"),
+            b"receipt",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind release backend");
+        let address = listener.local_addr().expect("release backend address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept release");
+            let request = read_complete_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"run_cloud_forget","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z","device_released":true}"#,
+            );
+            request
+        });
+        let api_base_url = format!("http://{address}");
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
+        let connection = LocalConnectionBinding {
+            setup_run_id: "run_cloud_forget".to_string(),
+            setup_run_token_expires_at: "2026-10-18T13:00:00Z".to_string(),
+            machine_id: Some("otm_original".to_string()),
+            claim_code: None,
+            api_base_url,
+        };
+        FileConnectionStore::default().save(&connection).unwrap();
+
+        let response = handle_request(
+            &daemon()
+                .with_account(connected_account())
+                .with_connection(Some(connection)),
+            LocalControlRequest {
+                request_id: "req_cloud_forget_installation".to_string(),
+                protocol_version: ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: false,
+                    forget_installation: true,
+                },
+            },
+        );
+        let request = server.join().expect("release backend");
+
+        assert!(response.ok, "{response:?}");
+        assert!(request
+            .starts_with("POST /api/v1/setup-runs/run_cloud_forget/local-client/disconnect "));
+        let body: serde_json::Value =
+            serde_json::from_str(http_request_body(&request)).expect("disconnect body");
+        assert_eq!(
+            body,
+            json!({
+                "reason": "logout",
+                "release_device_id": "device_cloud_forget",
+                "release_device_secret": "device-secret-cloud-forget",
+            })
+        );
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["cloud_disconnected"], true);
+        assert_eq!(payload["device_released"], true);
+        assert_eq!(payload["message"]["code"], "installation_forgotten");
+        assert!(!payload.to_string().contains("device-secret-cloud-forget"));
+        assert!(FileMachineStore::default().load().unwrap().is_none());
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert!(KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .is_err());
+        assert!(!support_root.join("snapshots").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn cloud_logout_without_device_secret_sends_no_release_proof() {
+        let root = telemetry_key_store_root("cloud-logout-no-release");
+        let support_root = root.join("support");
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(&support_root).unwrap();
+        fs::create_dir_all(&secret_root).unwrap();
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_without_secret".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("setup-token-no-release")
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind disconnect backend");
+        let address = listener.local_addr().expect("disconnect backend address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept disconnect");
+            let request = read_complete_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"run_no_release","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z"}"#,
+            );
+            request
+        });
+        let api_base_url = format!("http://{address}");
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
+
+        let response = handle_request(
+            &daemon()
+                .with_account(connected_account())
+                .with_connection(Some(LocalConnectionBinding {
+                    setup_run_id: "run_no_release".to_string(),
+                    setup_run_token_expires_at: "2026-10-18T13:00:00Z".to_string(),
+                    machine_id: Some("machine_test".to_string()),
+                    claim_code: None,
+                    api_base_url,
+                })),
+            LocalControlRequest {
+                request_id: "req_cloud_logout_no_release".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: false,
+                    forget_installation: false,
+                },
+            },
+        );
+        let request = server.join().expect("disconnect backend");
+
+        assert!(response.ok, "{response:?}");
+        let body: serde_json::Value =
+            serde_json::from_str(http_request_body(&request)).expect("disconnect body");
+        assert_eq!(body, json!({ "reason": "logout" }));
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["device_released"], false);
+        assert_eq!(payload["message"]["code"], "cloud_disconnect_complete");
+        assert!(payload["message"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("may still be active")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn cloud_forget_installation_without_connection_points_to_local_only_forget() {
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_cloud_forget_unconnected".to_string(),
+                protocol_version: ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: false,
+                    forget_installation: true,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert!(error.message.contains("--local-only --forget-installation"));
+    }
+
+    #[test]
     fn raw_local_control_json_rejects_stale_protocol_version() {
         let response = handle_request_json_with_peer(
             &daemon(),
@@ -21196,12 +23324,14 @@ mod tests {
                 bucket: Some("day".to_string()),
                 mode: Some("full".to_string()),
                 all_machines: false,
+                dimensions: Some("machine,model".to_string()),
+                daily: true,
             },
         );
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full"
+            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full&dimensions=machine%2Cmodel&daily=true"
         );
     }
 
@@ -25060,15 +27190,6 @@ mod tests {
         assert!(smoke.succeeded, "fake Pi smoke failed: {}", smoke.message);
         let selected = new_pi_route_session_files(&before).expect("select first-use transcript");
         assert_eq!(selected, vec![home.join(".pi/agent/sessions/first.jsonl")]);
-        let mut upload =
-            open_pi_session_upload(&before.root, &selected[0], PI_SESSION_SAFETY_LIMITS)
-                .expect("first-use transcript is import-ready beneath held root");
-        let mut bytes = Vec::new();
-        upload
-            .file
-            .read_to_end(&mut bytes)
-            .expect("read first-use transcript");
-        assert_eq!(bytes, b"{}\n");
         for path in [
             home.join(".pi"),
             home.join(".pi/agent"),
@@ -25081,6 +27202,89 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o700, "new Pi directories must be owner-only");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn live_pi_verify_makes_no_retired_import_request_and_settles_local_only() {
+        let root = control_test_root("pi-live-no-retired-import");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let fake_pi = fake_binary_path(&root, "pi");
+        fs::write(
+            &fake_pi,
+            "#!/bin/sh\nprintf '{}\\n' > \"$HOME/.pi/agent/sessions/smoke.jsonl\"\n",
+        )
+        .expect("write Pi smoke");
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755))
+            .expect("mark fake Pi executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+        let _search_guard = EnvVarGuard::set_os(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            fake_pi
+                .parent()
+                .expect("fake Pi parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Pi verify backend");
+        let api_base_url = format!("http://{}", listener.local_addr().expect("local address"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let request = read_complete_http_request(&mut stream);
+                let request_line = request.lines().next().unwrap_or_default().to_string();
+                recorded.lock().expect("record request").push(request_line);
+                write_json_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    r#"{"verified":false,"records_seen":0,"last_record_id":null,"last_received_at":null,"smoke_after":"2026-10-18T00:00:00Z"}"#,
+                );
+            }
+        });
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "otsr_test".to_string(),
+            connection: LocalConnectionBinding {
+                setup_run_id: "setup_pi_verify".to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                claim_code: None,
+                api_base_url: api_base_url.clone(),
+            },
+        };
+
+        let route =
+            run_one_pi_route_verification(&api_base_url, &mut credentials, &live_pi_route());
+
+        let requests = requests.lock().expect("read requests").clone();
+        assert!(
+            !requests.is_empty(),
+            "Verify still polls setup verification"
+        );
+        for request in &requests {
+            assert!(
+                request.starts_with("GET ")
+                    && request
+                        .contains("/api/v1/setup-runs/setup_pi_verify/local-client/verification"),
+                "Verify must only poll setup verification, saw {request}"
+            );
+            assert!(!request.contains("/api/v1/pi/"));
+            assert!(!request.contains("relay-token"));
+        }
+        assert_eq!(route.status, SourceVerificationStatus::Warning);
+        assert!(route.verified);
+        assert_eq!(route.records_seen, 0);
+        assert_eq!(route.error_code.as_deref(), Some(PI_LOCAL_ONLY_CODE));
+        assert_eq!(route.local_session_observed, Some(true));
+        assert!(!route.message.text.contains("Sign in"));
+        let aggregate = pi_route_aggregate_result(vec![route]);
+        assert_eq!(aggregate.message.code, PI_LOCAL_ONLY_CODE);
+        assert!(!aggregate.message.text.contains("Sign in"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -25389,25 +27593,6 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert!(files.contains(&nested.join("session.jsonl")));
-
-        let opened_root = open_pi_test_root(&root);
-        let body = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &[nested.join("session.jsonl")],
-            "test-boundary",
-            PiSessionSafetyLimits {
-                max_depth: 4,
-                max_entries: 16,
-                max_files: 4,
-                max_file_bytes: 64,
-                max_aggregate_bytes: 128,
-                max_multipart_field_bytes: 64,
-                max_multipart_body_bytes: 4 * 1024,
-            },
-        )
-        .expect("build bounded nested Pi multipart");
-        assert!(body.windows(3).any(|window| window == b"{}\n"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -25558,7 +27743,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pi_session_live_import_refuses_root_replacement_between_censuses() {
+    fn pi_session_live_census_refuses_root_replacement_between_censuses() {
         let parent = control_test_root("pi-session-live-root-replacement");
         let root = parent.join("sessions");
         let original = parent.join("sessions-original");
@@ -25579,12 +27764,8 @@ mod tests {
         fs::write(&replacement_session, b"pre-existing\n")
             .expect("write pre-existing replacement session");
 
-        let error = import_new_pi_route_sessions(
-            "http://127.0.0.1:1",
-            &subscription_oauth_route(),
-            &before,
-        )
-        .expect_err("a different real root generation must be refused before selection or upload");
+        let error = new_pi_route_session_files(&before)
+            .expect_err("a different real root generation must be refused before selection");
 
         assert!(error.to_string().contains("session root changed"));
         assert!(replacement_session.exists());
@@ -25620,7 +27801,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pi_session_upload_rejects_file_and_directory_symlink_swaps() {
+    fn pi_session_open_rejects_file_and_directory_symlink_swaps() {
         use std::os::unix::fs::symlink;
 
         let root = control_test_root("pi-session-swap");
@@ -25637,15 +27818,11 @@ mod tests {
 
         fs::rename(&nested, root.join("nested-original")).expect("move discovered directory");
         symlink(&outside, &nested).expect("swap directory for symlink");
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &discovered.into_iter().collect::<Vec<_>>(),
-            "test-boundary",
-            PI_SESSION_SAFETY_LIMITS,
-        )
-        .expect_err("component-wise no-follow open must reject directory swap");
-        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+        for path in &discovered {
+            let error = open_pi_session_file_beneath_root(&opened_root, path)
+                .expect_err("component-wise no-follow open must reject directory swap");
+            assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        }
 
         fs::remove_file(&nested).expect("remove directory symlink");
         let final_session = root.join("final.jsonl");
@@ -25654,83 +27831,13 @@ mod tests {
             .expect("discover final session");
         fs::remove_file(&final_session).expect("remove discovered final session");
         symlink(&outside_session, &final_session).expect("swap file for symlink");
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &discovered
-                .into_iter()
-                .filter(|path| path == &final_session)
-                .collect::<Vec<_>>(),
-            "test-boundary",
-            PI_SESSION_SAFETY_LIMITS,
-        )
-        .expect_err("no-follow open must reject final-component swap");
-        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+        assert!(discovered.contains(&final_session));
+        let error = open_pi_session_file_beneath_root(&opened_root, &final_session)
+            .expect_err("no-follow open must reject final-component swap");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_upload_reads_held_descriptor_after_path_swap() {
-        use std::os::unix::fs::symlink;
-
-        let root = control_test_root("pi-session-held-open");
-        let outside = control_test_root("pi-session-held-open-outside");
-        let session = root.join("session.jsonl");
-        let moved = root.join("session-original.jsonl");
-        let outside_session = outside.join("session.jsonl");
-        fs::write(&session, b"inside\n").expect("write inside session");
-        fs::write(&outside_session, b"outside-secret\n").expect("write outside session");
-        let opened_root = open_pi_test_root(&root);
-        let mut opened = open_pi_session_upload(&opened_root, &session, PI_SESSION_SAFETY_LIMITS)
-            .expect("open and verify session beneath root");
-
-        fs::rename(&session, &moved).expect("move verified session");
-        symlink(&outside_session, &session).expect("replace verified path with symlink");
-        let mut bytes = Vec::new();
-        opened
-            .file
-            .read_to_end(&mut bytes)
-            .expect("read held descriptor");
-
-        assert_eq!(bytes, b"inside\n");
-        assert!(!bytes.windows(14).any(|window| window == b"outside-secret"));
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_upload_processes_large_file_sets_without_holding_all_descriptors() {
-        let root = control_test_root("pi-session-sequential-descriptors");
-        let mut files = Vec::new();
-        for index in 0..300 {
-            let path = root.join(format!("{index}.jsonl"));
-            fs::write(&path, b"{}\n").expect("write session file");
-            files.push(path);
-        }
-        let opened_root = open_pi_test_root(&root);
-        let limits = PiSessionSafetyLimits {
-            max_files: 512,
-            max_file_bytes: 16,
-            max_aggregate_bytes: 4 * 1024,
-            max_multipart_body_bytes: 128 * 1024,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-
-        let body = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &files,
-            "test-boundary",
-            limits,
-        )
-        .expect("sequential descriptor use must support more than 256 session files");
-
-        assert!(body.ends_with(b"--test-boundary--\r\n"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -25744,7 +27851,6 @@ mod tests {
             max_depth: 1,
             max_entries: 16,
             max_files: 16,
-            ..PI_SESSION_SAFETY_LIMITS
         };
         let error = pi_session_files_in_with_limits(&root, limits)
             .expect_err("deep traversal must be refused");
@@ -25758,7 +27864,6 @@ mod tests {
             max_depth: 4,
             max_entries: 16,
             max_files: 2,
-            ..PI_SESSION_SAFETY_LIMITS
         };
         let error = pi_session_files_in_with_limits(&wide, limits)
             .expect_err("wide traversal must be refused");
@@ -25766,87 +27871,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(wide);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_upload_refuses_file_aggregate_and_multipart_caps() {
-        let root = control_test_root("pi-session-upload-caps");
-        let first = root.join("first.jsonl");
-        let second = root.join("second.jsonl");
-        fs::write(&first, b"12345").expect("write oversized session");
-        fs::write(&second, b"6789").expect("write aggregate session");
-        let opened_root = open_pi_test_root(&root);
-
-        let per_file_limits = PiSessionSafetyLimits {
-            max_file_bytes: 4,
-            max_aggregate_bytes: 16,
-            max_multipart_body_bytes: 4 * 1024,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            std::slice::from_ref(&first),
-            "test-boundary",
-            per_file_limits,
-        )
-        .expect_err("oversized file must be refused before reading");
-        assert!(error.to_string().contains("maximum byte size"));
-
-        let aggregate_limits = PiSessionSafetyLimits {
-            max_file_bytes: 8,
-            max_aggregate_bytes: 8,
-            max_multipart_body_bytes: 4 * 1024,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &[first.clone(), second],
-            "test-boundary",
-            aggregate_limits,
-        )
-        .expect_err("aggregate oversize must be refused before body construction");
-        assert!(error.to_string().contains("aggregate byte size"));
-
-        let mut route = subscription_oauth_route();
-        route.classification.billing_provider = Some("x".repeat(17));
-        let multipart_limits = PiSessionSafetyLimits {
-            max_file_bytes: 8,
-            max_aggregate_bytes: 8,
-            max_multipart_field_bytes: 16,
-            max_multipart_body_bytes: 4 * 1024,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-        let error = build_pi_import_multipart(
-            &route,
-            &opened_root,
-            &[first],
-            "test-boundary",
-            multipart_limits,
-        )
-        .expect_err("oversized multipart metadata must be refused");
-        assert!(error.to_string().contains("multipart field byte cap"));
-
-        let body_limits = PiSessionSafetyLimits {
-            max_file_bytes: 8,
-            max_aggregate_bytes: 8,
-            max_multipart_field_bytes: 64,
-            max_multipart_body_bytes: 16,
-            ..PI_SESSION_SAFETY_LIMITS
-        };
-        let error = build_pi_import_multipart(
-            &subscription_oauth_route(),
-            &opened_root,
-            &[],
-            "test-boundary",
-            body_limits,
-        )
-        .expect_err("multipart framing must honor the total body cap");
-        assert!(error.to_string().contains("multipart body"));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -25933,6 +27957,7 @@ mod tests {
                     code: "verified".to_string(),
                     text: "ok".to_string(),
                 },
+                check: None,
             },
             SourceRouteVerificationResult {
                 provider: Some("google-vertex".to_string()),
@@ -25966,6 +27991,7 @@ mod tests {
                     code: "no_fresh_telemetry".to_string(),
                     text: "missing".to_string(),
                 },
+                check: None,
             },
         ];
 
@@ -26012,6 +28038,7 @@ mod tests {
                     code: PI_LOCAL_ONLY_CODE.to_string(),
                     text: "Pi route created a local session. Pi is local-only.".to_string(),
                 },
+                check: None,
             },
             SourceRouteVerificationResult {
                 provider: Some("google-vertex".to_string()),
@@ -26045,6 +28072,7 @@ mod tests {
                     code: "smoke_command_failed".to_string(),
                     text: "Pi route failed smoke.".to_string(),
                 },
+                check: None,
             },
         ];
 
@@ -26057,12 +28085,172 @@ mod tests {
         assert!(!result.message.text.contains("No Pi model routes passed"));
     }
 
+    #[test]
+    fn verification_check_states_what_each_completed_check_established() {
+        fn checked(mut result: SourceVerificationResult) -> SourceVerificationResult {
+            attach_verification_check(&mut result);
+            result
+        }
+        let check = |method, scope| Some(SourceVerificationCheck { method, scope });
+        use SourceVerificationMethod::{ConfigurationCheck, LivePrompt, Mixed, PassiveRecentUsage};
+        use SourceVerificationScope::{
+            Configuration, LocalEvidence, NotEstablished, Partial, UsageReceived,
+        };
+
+        // Codex: configuration only. The legacy fields stay unchanged.
+        let codex = checked(codex_local_import_verification(empty_source_config(
+            &SourceKind::Codex,
+        )));
+        assert_eq!(codex.check, check(Some(ConfigurationCheck), Configuration));
+        assert_eq!(codex.status, SourceVerificationStatus::Warning);
+        assert!(!codex.verified);
+        let mut drifted = empty_source_config(&SourceKind::Codex);
+        drifted
+            .drift
+            .push(config_drift("otel", "managed", "missing"));
+        let codex_drift = checked(codex_local_import_verification(drifted));
+        assert_eq!(
+            codex_drift.check,
+            check(Some(ConfigurationCheck), NotEstablished)
+        );
+
+        // Claude: only fresh usage after the prompt establishes anything;
+        // warnings (not installed, quiet window) do not.
+        let claude = |status: SourceVerificationStatus, verified: bool, code: &str| {
+            checked(verification_result(
+                SourceKind::ClaudeCode,
+                status,
+                verified,
+                u64::from(verified),
+                None,
+                None,
+                None,
+                code,
+                "text",
+            ))
+        };
+        assert_eq!(
+            claude(SourceVerificationStatus::Verified, true, "verified").check,
+            check(Some(LivePrompt), UsageReceived)
+        );
+        for (status, code) in [
+            (
+                SourceVerificationStatus::Warning,
+                CLAUDE_LOGIN_REFRESH_PENDING_CODE,
+            ),
+            (SourceVerificationStatus::Warning, SOURCE_NOT_INSTALLED_CODE),
+            (
+                SourceVerificationStatus::NoFreshTelemetry,
+                "no_fresh_telemetry",
+            ),
+        ] {
+            assert_eq!(
+                claude(status, false, code).check,
+                check(Some(LivePrompt), NotEstablished)
+            );
+        }
+
+        // Pi: per-route method and scope; partial keeps the legacy verified bit.
+        let smoke = SmokeResult {
+            command_found: true,
+            succeeded: true,
+            exit_status: Some(0),
+            duration_ms: 1,
+            message: "ok".to_string(),
+            diagnostic: None,
+            error_code: None,
+            local_session_observed: Some(false),
+        };
+        let live_verified = pi_route_result_from_verification(
+            &live_pi_route(),
+            &smoke,
+            SetupRunVerificationResponse {
+                verified: true,
+                records_seen: 1,
+                last_record_id: Some("record_1".to_string()),
+                last_received_at: Some("2026-10-19T10:00:00Z".to_string()),
+                smoke_after: "2026-10-19T09:59:00Z".to_string(),
+                error_code: None,
+                clear_condition: None,
+            },
+        );
+        let passive = |status, verified, code: Option<&str>| {
+            pi_route_passive_result(
+                &subscription_oauth_route(),
+                status,
+                verified,
+                0,
+                None,
+                None,
+                Some("2026-10-19T04:00:00Z".to_string()),
+                code.map(str::to_string),
+                "text".to_string(),
+                Some(true),
+            )
+        };
+        let reauth = passive(
+            SourceVerificationStatus::Warning,
+            false,
+            Some(PI_OAUTH_REAUTH_CODE),
+        );
+        let local_only = passive(
+            SourceVerificationStatus::Warning,
+            true,
+            Some(PI_LOCAL_ONLY_CODE),
+        );
+
+        let partial = checked(pi_route_aggregate_result(vec![
+            live_verified.clone(),
+            reauth.clone(),
+        ]));
+        assert_eq!(partial.status, SourceVerificationStatus::Warning);
+        assert!(partial.verified);
+        assert_eq!(partial.message.code, "pi_route_warnings");
+        assert_eq!(partial.check, check(Some(Mixed), Partial));
+        assert_eq!(
+            partial.route_results[0].check,
+            check(Some(LivePrompt), UsageReceived)
+        );
+        assert_eq!(
+            partial.route_results[1].check,
+            check(Some(PassiveRecentUsage), NotEstablished)
+        );
+
+        let local = checked(pi_route_aggregate_result(vec![local_only]));
+        assert_eq!(local.message.code, PI_LOCAL_ONLY_CODE);
+        assert_eq!(local.check, check(Some(PassiveRecentUsage), LocalEvidence));
+
+        let reauth_only = checked(pi_route_aggregate_result(vec![reauth]));
+        assert_eq!(
+            reauth_only.check,
+            check(Some(PassiveRecentUsage), NotEstablished)
+        );
+        let live_only = checked(pi_route_aggregate_result(vec![live_verified]));
+        assert_eq!(live_only.check, check(Some(LivePrompt), UsageReceived));
+
+        // Pi stopped before any route ran: the kind is not determined.
+        let unrouted = checked(verification_result(
+            SourceKind::Pi,
+            SourceVerificationStatus::ReconnectRequired,
+            false,
+            0,
+            None,
+            None,
+            None,
+            "reconnect_required",
+            "text",
+        ));
+        assert_eq!(unrouted.check, check(None, NotEstablished));
+    }
+
     /// Inside the quiet window the Verify smoke does not start Claude Code
     /// and returns a typed, non-blocking warning; outside it, it runs.
     #[test]
     #[serial]
     fn claude_smoke_waits_inside_the_quiet_window() {
+        use crate::provider_calls::CallKind;
         let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("smoke");
+        let account = fake.default_account("smoke-account-uuid");
         fake.default_login_expires_in(time::Duration::minutes(10));
         let smoke = run_smoke_prompt(&SourceKind::ClaudeCode);
         assert!(!smoke.succeeded);
@@ -26074,10 +28262,65 @@ mod tests {
         let result = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
         assert_eq!(result.status, SourceVerificationStatus::Warning);
 
+        assert!(
+            crate::provider_calls::test_lines(CallKind::ClaudeSmokePrompt, &account).is_empty()
+        );
+
         fake.default_login_expires_in(time::Duration::hours(2));
         let smoke = run_smoke_prompt(&SourceKind::ClaudeCode);
         assert!(smoke.succeeded, "{}", smoke.message);
         assert_eq!(fake.spawns().len(), 1);
+        // Only the run that started is a provider call: a prompt sent to
+        // Anthropic, from a person's Verify unless a caller says otherwise.
+        let lines = crate::provider_calls::test_lines(CallKind::ClaudeSmokePrompt, &account);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            (
+                lines[0].provider.as_str(),
+                lines[0].trigger.as_str(),
+                lines[0].result.as_str(),
+                lines[0].basis.as_str(),
+                lines[0].requests_at_least
+            ),
+            ("anthropic", "other", "ok", "subprocess_lower_bound", 1)
+        );
+        assert!(!crate::provider_calls::test_raw_log().contains("fixture-access"));
+    }
+
+    /// Pi's default route names no provider, but its smoke prompt is a real
+    /// model request: one line with provider `unknown` and its own kind.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pi_default_route_smoke_is_one_unknown_provider_line() {
+        use crate::provider_calls::CallKind;
+        use std::os::unix::fs::PermissionsExt;
+        let root = control_test_root("pi-default-smoke");
+        let bin = root.join("bin");
+        create_control_test_dir(&bin);
+        let pi = bin.join("pi");
+        fs::write(&pi, "#!/bin/sh\necho ok\n").expect("fake pi");
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).expect("executable");
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _search = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &bin);
+        let _support =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+
+        let _ = run_smoke_prompt(&SourceKind::Pi);
+
+        let lines = crate::provider_calls::test_lines(CallKind::PiDefaultSmokePrompt, "unknown");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (
+                    line.provider.as_str(),
+                    line.basis.as_str(),
+                    line.requests_at_least
+                ))
+                .collect::<Vec<_>>(),
+            [("unknown", "subprocess_lower_bound", 1)]
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -27236,7 +29479,7 @@ X-API-Key = "otel_redacted"
             action_type: "verify_source".into(),
             source: Some("codex".into()),
         };
-        let (status, _, payload) = run_verify_source_action(
+        let (status, _, payload, verification) = run_verify_source_action(
             &daemon,
             "http://127.0.0.1:1",
             &mut credentials,
@@ -27249,8 +29492,17 @@ X-API-Key = "otel_redacted"
         assert_eq!(payload["records_seen"], 0);
         assert_eq!(payload["live_telemetry_required"], false);
         assert!(payload["smoke_after"].is_null());
+        assert!(payload.get("check").is_none());
+        // The setup completion says configuration only, never usage or an account.
+        assert_eq!(
+            verification.and_then(|result| result.check),
+            Some(SourceVerificationCheck {
+                method: Some(SourceVerificationMethod::ConfigurationCheck),
+                scope: SourceVerificationScope::Configuration,
+            })
+        );
         let disconnected = self::daemon().with_connection(Some(credentials.connection.clone()));
-        let (status, _, payload) = run_verify_source_action(
+        let (status, _, payload, verification) = run_verify_source_action(
             &disconnected,
             "http://127.0.0.1:1",
             &mut credentials,
@@ -27261,9 +29513,15 @@ X-API-Key = "otel_redacted"
         assert_eq!(status, "failed");
         assert_eq!(payload["local_import_ready"], false);
         assert_eq!(payload["error_code"], "account_not_connected");
+        assert_eq!(
+            verification
+                .and_then(|result| result.check)
+                .map(|check| check.scope),
+            Some(SourceVerificationScope::NotEstablished)
+        );
         {
             let _disabled = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
-            let (status, _, payload) = run_verify_source_action(
+            let (status, _, payload, _) = run_verify_source_action(
                 &daemon,
                 "http://127.0.0.1:1",
                 &mut credentials,
@@ -28441,6 +30699,7 @@ X-API-Key = "otel_redacted"
             endpoint: "/api/v1/setup-runs/[id]/local-client/verification".to_string(),
             status: Some(401),
             body_excerpt: Some("Setup run companion token expired".to_string()),
+            reason_code: None,
         });
 
         let result = verification_result_for_backend_error(
@@ -28507,10 +30766,17 @@ X-API-Key = "otel_redacted"
             kind: BackendErrorKind::Rejected,
             endpoint: "/api/v1/setup-runs/[id]/local-client/scan-result".to_string(),
             status: Some(401),
-            body_excerpt: Some("Setup run expired request_id=req_private".to_string()),
+            body_excerpt: Some(
+                r#"{"error":"AuthenticationError","detail":"Setup run expired","request_id":"req_private"}"#
+                    .to_string(),
+            ),
+            reason_code: None,
         }));
 
-        assert_eq!(error.message, SETUP_RUN_REJECTED_MESSAGE);
+        assert_eq!(
+            error.message,
+            "Setup run expired. Run `ottto login` to reconnect this Mac."
+        );
         assert!(!error.message.contains("/api/v1"));
         assert!(!error.message.contains("req_private"));
     }
@@ -28523,6 +30789,7 @@ X-API-Key = "otel_redacted"
                 endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
                 status: Some(409),
                 body_excerpt: Some(body.to_string()),
+                reason_code: None,
             }))
         };
 
@@ -28570,6 +30837,7 @@ X-API-Key = "otel_redacted"
             endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
             status: Some(400),
             body_excerpt: Some(r#"{"detail":"Setup claim session is pending"}"#.to_string()),
+            reason_code: None,
         });
         assert!(auth_complete_error_is_pending(&pending));
 
@@ -28580,6 +30848,7 @@ X-API-Key = "otel_redacted"
             body_excerpt: Some(
                 "Existing installation authority requires an explicit relay device".to_string(),
             ),
+            reason_code: None,
         });
         assert!(!auth_complete_error_is_pending(&terminal));
     }
@@ -28852,721 +31121,134 @@ X-API-Key = "otel_redacted"
         assert!(reject_timezone_override(None).is_ok());
     }
 
-    fn expired_setup_run_read_server(
-        calls: Arc<Mutex<Vec<String>>>,
-        accept_reads: Arc<std::sync::atomic::AtomicBool>,
-    ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind expired run backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
-                    return;
-                };
-                let request = read_complete_http_request(&mut stream);
-                let path = request
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or_default()
-                    .to_string();
-                calls.lock().expect("calls lock").push(path.clone());
-                if accept_reads.load(std::sync::atomic::Ordering::SeqCst) {
-                    if path.contains("/local-client/refresh") {
-                        write_json_response(
-                            &mut stream,
-                            200,
-                            "OK",
-                            r#"{"setup_run_token":"otsr_recovered","expires_at":"2026-05-05T10:45:00Z"}"#,
-                        );
-                    } else {
-                        write_json_response(
-                            &mut stream,
-                            200,
-                            "OK",
-                            r#"{"results_state":"current"}"#,
-                        );
-                    }
-                } else {
-                    write_json_response(
-                        &mut stream,
-                        401,
-                        "Unauthorized",
-                        r#"{"detail":"Setup run expired"}"#,
-                    );
-                }
-            }
-        });
-        format!("http://{address}")
-    }
-
-    /// One backend request held open until the test thread answers it.
-    struct HeldSetupRunRequest {
-        path: String,
-        request: String,
-        respond: mpsc::Sender<(u16, &'static str)>,
-    }
-
-    impl HeldSetupRunRequest {
-        fn answer(self, status: u16, body: &'static str) {
-            self.respond
-                .send((status, body))
-                .expect("backend connection waits for its answer");
-        }
-    }
-
-    /// A backend whose every response is released by the test thread, so read
-    /// and rebind interleavings are fixed by message order rather than timing.
-    fn held_setup_run_backend() -> (String, mpsc::Receiver<HeldSetupRunRequest>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind held backend");
-        let address = listener.local_addr().expect("local address");
-        let (requests_tx, requests_rx) = mpsc::channel();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
-                    return;
-                };
-                let requests_tx = requests_tx.clone();
-                thread::spawn(move || {
-                    let request = read_complete_http_request(&mut stream);
-                    let path = request
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or_default()
-                        .to_string();
-                    let (respond, answer) = mpsc::channel();
-                    if requests_tx
-                        .send(HeldSetupRunRequest {
-                            path,
-                            request,
-                            respond,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if let Ok((status, body)) = answer.recv() {
-                        let reason = if status == 200 { "OK" } else { "Unauthorized" };
-                        write_json_response(&mut stream, status, reason, body);
-                    }
-                });
-            }
-        });
-        (format!("http://{address}"), requests_rx)
-    }
-
     #[test]
-    #[serial]
-    fn setup_run_read_outcome_never_crosses_a_concurrent_rebind() {
-        const EXPIRED: &str = r#"{"detail":"Setup run expired"}"#;
-        const COSTS: &str = r#"{"results_state":"current"}"#;
-        let _guard = lock_backend_test_env();
-        let root = control_test_root("setup-run-read-concurrent-rebind");
-        let secret_root = telemetry_key_store_root("setup-run-read-concurrent-rebind-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .expect("persist relay device binding");
-        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-            .save("device_secret_test")
-            .expect("persist relay device secret");
-        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-            .save("otsr_current")
-            .expect("persist setup token");
-        let (api_base_url, requests) = held_setup_run_backend();
-        let binding = |setup_run_id: &str| LocalConnectionBinding {
-            setup_run_id: setup_run_id.to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base_url.clone(),
-        };
-        let (run_a, run_b) = (binding("run_a"), binding("run_b"));
-        let daemon = daemon()
-            .with_account(connected_account())
-            .with_connection(Some(run_a.clone()));
-        let authorization = RequestAuthorization::Token("token".to_string());
-        let next = || {
-            requests
-                .recv_timeout(Duration::from_secs(30))
-                .expect("the read reaches the backend")
-        };
-        let held = |run: &str, endpoint: &str| {
-            let request = next();
-            assert!(
-                request
-                    .path
-                    .starts_with(&format!("/api/v1/setup-runs/{run}/local-client/{endpoint}")),
-                "expected {run} {endpoint}, got {}",
-                request.path
-            );
-            request
-        };
-        let no_more_requests = || {
-            assert!(
-                matches!(requests.try_recv(), Err(mpsc::TryRecvError::Empty)),
-                "one read makes one request and at most one refresh"
-            );
-        };
-        let run_state = || {
-            daemon
-                .status("token")
-                .expect("status")
-                .canonical_health
-                .expect("canonical health")
-                .account
-                .setup_run_state
-        };
-        let read = || agent_costs(&daemon, &authorization, AgentCostsQuery::default());
-
-        thread::scope(|scope| {
-            // A read of run A is in flight when this Mac reconnects to run B.
-            // Its refresh still targets A: the read keeps the binding the
-            // observer captured instead of looking it up again.
-            let stale_read = scope.spawn(read);
-            let stale_costs = held("run_a", "costs");
-            daemon
-                .bind_setup_run_for_authorized_client(run_b.clone())
-                .expect("reconnect to run B");
-            stale_costs.answer(401, EXPIRED);
-            held("run_a", "refresh").answer(401, EXPIRED);
-            assert!(stale_read.join().expect("read thread").is_err());
-            no_more_requests();
-            assert_eq!(
-                run_state(),
-                ottto_protocol::LocalSetupRunState::Complete,
-                "a rejection of replaced run A must not mark run B rejected"
-            );
-
-            // Same binding: a rejected read of B (one refresh) marks B rejected.
-            let b_read = scope.spawn(read);
-            held("run_b", "costs").answer(401, EXPIRED);
-            held("run_b", "refresh").answer(401, EXPIRED);
-            assert!(b_read.join().expect("read thread").is_err());
-            no_more_requests();
-            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Rejected);
-
-            // A read of run A is in flight when this Mac reconnects to run B
-            // and a read of B is rejected; A's late success cannot clear it.
-            daemon
-                .bind_setup_run_for_authorized_client(run_a.clone())
-                .expect("bind run A for the stale read");
-            let stale_read = scope.spawn(read);
-            let stale_costs = held("run_a", "costs");
-            daemon
-                .bind_setup_run_for_authorized_client(run_b.clone())
-                .expect("reconnect to run B");
-            let b_read = scope.spawn(read);
-            held("run_b", "costs").answer(401, EXPIRED);
-            held("run_b", "refresh").answer(401, EXPIRED);
-            assert!(b_read.join().expect("read thread").is_err());
-            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Rejected);
-            stale_costs.answer(200, COSTS);
-            stale_read
-                .join()
-                .expect("read thread")
-                .expect("run A answered");
-            no_more_requests();
-            assert_eq!(
-                run_state(),
-                ottto_protocol::LocalSetupRunState::Rejected,
-                "a success of replaced run A must not clear run B's rejection"
-            );
-
-            // Same binding: a successful read of B clears B's rejection.
-            let b_read = scope.spawn(read);
-            held("run_b", "costs").answer(200, COSTS);
-            b_read.join().expect("read thread").expect("run B answered");
-            no_more_requests();
-            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Complete);
-
-            // Logout while a rejected read is in flight records nothing.
-            let stale_read = scope.spawn(read);
-            let stale_costs = held("run_b", "costs");
-            daemon
-                .reset_account_for_authorized_client()
-                .expect("logout");
-            stale_costs.answer(401, EXPIRED);
-            held("run_b", "refresh").answer(401, EXPIRED);
-            assert!(stale_read.join().expect("read thread").is_err());
-            no_more_requests();
-            let status = daemon.status("token").expect("status");
-            assert_ne!(
-                status
-                    .local_health_events
-                    .iter()
-                    .rfind(|event| event.event_type.starts_with("SetupRunRead"))
-                    .map(|event| event.event_type.as_str()),
-                Some("SetupRunReadRejected"),
-                "a rejection that finishes after logout must not be recorded"
-            );
-        });
-    }
-
-    #[derive(Default)]
-    struct FakeSetupRunConnectionStore {
-        value: std::cell::RefCell<Option<LocalConnectionBinding>>,
-        fail_save: bool,
-    }
-
-    impl SetupRunConnectionStore for FakeSetupRunConnectionStore {
-        fn load_connection(&self) -> anyhow::Result<Option<LocalConnectionBinding>> {
-            Ok(self.value.borrow().clone())
-        }
-
-        fn save_connection(&self, connection: &LocalConnectionBinding) -> anyhow::Result<()> {
-            if self.fail_save {
-                return Err(anyhow::anyhow!("synthetic connection write failure"));
-            }
-            *self.value.borrow_mut() = Some(connection.clone());
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeSetupRunTokenStore {
-        value: std::cell::RefCell<Option<String>>,
-        fail_save: bool,
-    }
-
-    impl ControlTokenStore for FakeSetupRunTokenStore {
-        fn load(&self) -> Result<String, TokenStoreError> {
-            self.value.borrow().clone().ok_or(TokenStoreError::Missing)
-        }
-
-        fn save(&self, token: &str) -> Result<(), TokenStoreError> {
-            if self.fail_save {
-                return Err(TokenStoreError::Store(
-                    "synthetic token write failure".to_string(),
-                ));
-            }
-            *self.value.borrow_mut() = Some(token.to_string());
-            Ok(())
-        }
-
-        fn delete(&self) -> Result<(), TokenStoreError> {
-            *self.value.borrow_mut() = None;
-            Ok(())
-        }
-    }
-
-    fn refresh_binding(setup_run_id: &str, expires_at: &str) -> LocalConnectionBinding {
-        LocalConnectionBinding {
-            setup_run_id: setup_run_id.to_string(),
-            setup_run_token_expires_at: expires_at.to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: "https://api.ottto.net".to_string(),
-        }
-    }
-
-    #[test]
-    fn refresh_commit_writes_only_for_the_binding_it_belongs_to() {
-        let commit = |persisted: Option<LocalConnectionBinding>,
-                      token: Option<&str>,
-                      expected: &LocalConnectionBinding,
-                      refreshed: &LocalConnectionBinding| {
-            let connections = FakeSetupRunConnectionStore {
-                value: std::cell::RefCell::new(persisted),
-                ..Default::default()
-            };
-            let tokens = FakeSetupRunTokenStore {
-                value: std::cell::RefCell::new(token.map(str::to_string)),
-                ..Default::default()
-            };
-            let result = commit_refreshed_setup_run_binding_locked(
-                expected,
-                refreshed,
-                "otsr_minted",
-                &connections,
-                &tokens,
-            );
-            (result, connections.value.take(), tokens.value.take())
-        };
-        let run_a = refresh_binding("run_a", "2026-05-05T10:00:00Z");
-        let run_a_refreshed = refresh_binding("run_a", "2026-05-05T10:15:00Z");
-        let run_b = refresh_binding("run_b", "2026-05-05T10:05:00Z");
-        let run_c_refreshed = refresh_binding("run_c", "2026-05-05T10:15:00Z");
-
-        // Same binding: the new pair is written.
-        let (result, connection, token) = commit(
-            Some(run_a.clone()),
-            Some("otsr_a"),
-            &run_a,
-            &run_a_refreshed,
-        );
-        assert!(result.is_ok());
-        assert_eq!(connection, Some(run_a_refreshed.clone()));
-        assert_eq!(token.as_deref(), Some("otsr_minted"));
-
-        // The backend rebound to its latest run C; the persisted binding
-        // already names C while the in-memory binding still says A.
-        let (result, connection, token) = commit(
-            Some(refresh_binding("run_c", "2026-05-05T10:00:00Z")),
-            Some("otsr_c"),
-            &run_a,
-            &run_c_refreshed,
-        );
-        assert!(result.is_ok());
-        assert_eq!(connection, Some(run_c_refreshed.clone()));
-        assert_eq!(token.as_deref(), Some("otsr_minted"));
-
-        // Replaced by a reconnect: nothing is written.
-        let (result, connection, token) = commit(
-            Some(run_b.clone()),
-            Some("otsr_b"),
-            &run_a,
-            &run_a_refreshed,
-        );
-        assert!(matches!(
-            result,
-            Err(LocalApiError::SetupRunConnectionMismatch)
-        ));
-        assert_eq!(connection, Some(run_b.clone()));
-        assert_eq!(token.as_deref(), Some("otsr_b"));
-
-        // Same run id against another API base is a different binding.
-        let other_base = LocalConnectionBinding {
-            api_base_url: "https://staging.ottto.net".to_string(),
-            ..run_a.clone()
-        };
-        let (result, connection, token) = commit(
-            Some(other_base.clone()),
-            Some("otsr_other"),
-            &run_a,
-            &run_a_refreshed,
-        );
-        assert!(matches!(
-            result,
-            Err(LocalApiError::SetupRunConnectionMismatch)
-        ));
-        assert_eq!(connection, Some(other_base));
-        assert_eq!(token.as_deref(), Some("otsr_other"));
-
-        // Removed by logout: nothing is written.
-        let (result, connection, token) = commit(None, None, &run_a, &run_a_refreshed);
-        assert!(matches!(
-            result,
-            Err(LocalApiError::SetupRunConnectionMissing)
-        ));
-        assert_eq!(connection, None);
-        assert_eq!(token, None);
-    }
-
-    #[test]
-    fn refresh_commit_storage_failure_never_leaves_a_mixed_pair() {
-        let run_a = refresh_binding("run_a", "2026-05-05T10:00:00Z");
-        let run_c_refreshed = refresh_binding("run_c", "2026-05-05T10:15:00Z");
-
-        // Token write fails: both stores keep the prior pair.
-        let connections = FakeSetupRunConnectionStore {
-            value: std::cell::RefCell::new(Some(run_a.clone())),
-            ..Default::default()
-        };
-        let tokens = FakeSetupRunTokenStore {
-            value: std::cell::RefCell::new(Some("otsr_a".to_string())),
-            fail_save: true,
-        };
-        let result = commit_refreshed_setup_run_binding_locked(
-            &run_a,
-            &run_c_refreshed,
-            "otsr_minted",
-            &connections,
-            &tokens,
-        );
-        assert!(matches!(result, Err(LocalApiError::StatePoisoned)));
-        assert_eq!(connections.value.take(), Some(run_a.clone()));
-        assert_eq!(tokens.value.take().as_deref(), Some("otsr_a"));
-
-        // Connection write fails after the token write: the new token is
-        // removed rather than left beside the old connection, so the next
-        // read refreshes again with the device credential.
-        let connections = FakeSetupRunConnectionStore {
-            value: std::cell::RefCell::new(Some(run_a.clone())),
-            fail_save: true,
-        };
-        let tokens = FakeSetupRunTokenStore {
-            value: std::cell::RefCell::new(Some("otsr_a".to_string())),
-            ..Default::default()
-        };
-        let result = commit_refreshed_setup_run_binding_locked(
-            &run_a,
-            &run_c_refreshed,
-            "otsr_minted",
-            &connections,
-            &tokens,
-        );
-        assert!(matches!(result, Err(LocalApiError::StatePoisoned)));
-        assert_eq!(connections.value.take(), Some(run_a));
-        assert_eq!(tokens.value.take(), None);
-    }
-
-    #[test]
-    #[serial]
-    fn stale_refresh_never_overwrites_a_reconnected_or_logged_out_binding() {
-        const INVALID: &str = r#"{"detail":"Setup run companion token is invalid"}"#;
-        const COSTS: &str = r#"{"results_state":"current"}"#;
-        let _guard = lock_backend_test_env();
-        let root = control_test_root("stale-refresh-binding-cas");
-        let secret_root = telemetry_key_store_root("stale-refresh-binding-cas-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .expect("persist relay device binding");
-        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-            .save("device_secret_test")
-            .expect("persist relay device secret");
-        let (api_base_url, requests) = held_setup_run_backend();
-        let binding = |setup_run_id: &str, expires_at: &str| LocalConnectionBinding {
-            setup_run_id: setup_run_id.to_string(),
-            setup_run_token_expires_at: expires_at.to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base_url.clone(),
-        };
-        let run_a = binding("run_a", "2026-05-05T10:00:00Z");
-        let run_b = binding("run_b", "2026-05-05T10:05:00Z");
-        let tokens = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT);
-        // Model a binding writer (claim, switch, setup attach): it replaces
-        // both stores under the same lock the refresh commit takes.
-        let install = |connection: &LocalConnectionBinding, token: &str| {
-            let _binding_lock = lock_setup_run_binding();
-            tokens.save(token).expect("persist setup token");
-            FileConnectionStore::default()
-                .save(connection)
-                .expect("persist connection binding");
-        };
-        let persisted = || {
+    fn backend_reason_codes_come_only_from_structured_fields() {
+        for (body, expected) in [
             (
-                FileConnectionStore::default()
-                    .load()
-                    .expect("load connection binding"),
-                tokens.load().ok(),
-            )
-        };
-        install(&run_a, "otsr_a");
-        let daemon = daemon()
-            .with_account(connected_account())
-            .with_connection(Some(run_a.clone()));
-        let authorization = RequestAuthorization::Token("token".to_string());
-        let held = |run: &str, endpoint: &str| {
-            let request = requests
-                .recv_timeout(Duration::from_secs(30))
-                .expect("the read reaches the backend");
-            assert!(
-                request
-                    .path
-                    .starts_with(&format!("/api/v1/setup-runs/{run}/local-client/{endpoint}")),
-                "expected {run} {endpoint}, got {}",
-                request.path
-            );
-            request
-        };
-        let no_more_requests = || {
-            assert!(
-                matches!(requests.try_recv(), Err(mpsc::TryRecvError::Empty)),
-                "one read makes one request, at most one refresh and one retry"
-            );
-        };
-        let read = || agent_costs(&daemon, &authorization, AgentCostsQuery::default());
-
-        thread::scope(|scope| {
-            // Same binding: a successful refresh persists the new pair and
-            // the retry uses the new token.
-            let a_read = scope.spawn(read);
-            held("run_a", "costs").answer(401, INVALID);
-            held("run_a", "refresh").answer(
-                200,
-                r#"{"setup_run_id":"run_a","setup_run_token":"otsr_a_refreshed","expires_at":"2026-05-05T10:30:00Z"}"#,
-            );
-            let retry = held("run_a", "costs");
-            assert!(retry
-                .request
-                .contains("X-Ottto-Setup-Run-Token: otsr_a_refreshed"));
-            retry.answer(200, COSTS);
-            a_read.join().expect("read thread").expect("run A answered");
-            no_more_requests();
-            assert_eq!(
-                persisted(),
-                (
-                    Some(binding("run_a", "2026-05-05T10:30:00Z")),
-                    Some("otsr_a_refreshed".to_string())
-                )
-            );
-
-            // A successful refresh of run A finishes after this Mac
-            // reconnected to run B: B's connection and token stay intact and
-            // the stale read does not retry with A's new token.
-            let stale_read = scope.spawn(read);
-            held("run_a", "costs").answer(401, INVALID);
-            let stale_refresh = held("run_a", "refresh");
-            install(&run_b, "otsr_b");
-            daemon
-                .bind_setup_run_for_authorized_client(run_b.clone())
-                .expect("reconnect to run B");
-            stale_refresh.answer(
-                200,
-                r#"{"setup_run_id":"run_a","setup_run_token":"otsr_stale_a","expires_at":"2026-05-05T10:45:00Z"}"#,
-            );
-            assert!(matches!(
-                stale_read.join().expect("read thread"),
-                Err(LocalApiError::SetupRunConnectionMismatch)
-            ));
-            no_more_requests();
-            assert_eq!(
-                persisted(),
-                (Some(run_b.clone()), Some("otsr_b".to_string()))
-            );
-
-            // A successful refresh of run B finishes after logout: nothing
-            // is restored.
-            let stale_read = scope.spawn(read);
-            held("run_b", "costs").answer(401, INVALID);
-            let stale_refresh = held("run_b", "refresh");
-            {
-                let _binding_lock = lock_setup_run_binding();
-                FileConnectionStore::default()
-                    .reset()
-                    .expect("logout removes the connection binding");
-            }
-            let _ = tokens.delete();
-            daemon
-                .reset_account_for_authorized_client()
-                .expect("logout");
-            stale_refresh.answer(
-                200,
-                r#"{"setup_run_id":"run_b","setup_run_token":"otsr_stale_b","expires_at":"2026-05-05T10:45:00Z"}"#,
-            );
-            assert!(matches!(
-                stale_read.join().expect("read thread"),
-                Err(LocalApiError::SetupRunConnectionMissing)
-            ));
-            no_more_requests();
-            assert_eq!(persisted(), (None, None));
-        });
+                r#"{"error":"ResultsUnavailableError","detail":"Filtering by machine isn't available yet","request_id":"req_1","code":"machine_filter_unsupported"}"#,
+                Some("machine_filter_unsupported"),
+            ),
+            (
+                r#"{"detail":"timezone_query_unsupported"}"#,
+                Some("timezone_query_unsupported"),
+            ),
+            (
+                r#"{"detail":{"code":"reattach_required","message":"Reconnect"}}"#,
+                Some("reattach_required"),
+            ),
+            (r#"{"detail":"Setup run companion token expired"}"#, None),
+            (r#"{"detail":"expired"}"#, None),
+            (r#"{"code":"Not A Code"}"#, None),
+            ("Setup run expired machine_filter_unsupported", None),
+        ] {
+            assert_eq!(backend_reason_code(body).as_deref(), expected, "{body}");
+        }
+        assert_eq!(
+            backend_reason_code(&format!(r#"{{"code":"{}"}}"#, "a".repeat(65))),
+            None
+        );
     }
 
     #[test]
-    #[serial]
-    fn expired_setup_run_read_refreshes_once_and_reports_reconnect_required() {
-        let _guard = lock_backend_test_env();
-        let root = control_test_root("expired-setup-run-read");
-        let secret_root = telemetry_key_store_root("expired-setup-run-read-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .expect("persist relay device binding");
-        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-            .save("device_secret_test")
-            .expect("persist relay device secret");
-        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-            .save("otsr_expired_run")
-            .expect("persist setup token");
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let accept_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let api_base_url = expired_setup_run_read_server(calls.clone(), accept_reads.clone());
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_expired".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url,
+    fn backend_reason_code_drives_the_message_and_incidental_expiry_text_does_not() {
+        let backend = |status: u16, body: &str| BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/setup-runs/[id]/local-client/costs".to_string(),
+            status: Some(status),
+            body_excerpt: Some(body.to_string()),
+            reason_code: backend_reason_code(body),
         };
-        FileConnectionStore::default()
-            .save(&connection)
-            .expect("persist connection binding");
-        let daemon = daemon()
-            .with_account(connected_account())
-            .with_connection(Some(connection));
-        let authorization = RequestAuthorization::Token("token".to_string());
 
-        for attempt in 1..=2 {
-            let error = cli_error(
-                agent_costs(&daemon, &authorization, AgentCostsQuery::default())
-                    .expect_err("an expired setup run cannot serve reads"),
-            );
-            assert!(
-                error.message.contains("Reconnect this Mac"),
-                "{}",
-                error.message
-            );
-            assert!(!error.retryable);
-            let paths = calls.lock().expect("calls lock").clone();
+        let machine = cli_error(LocalApiError::Backend(backend(
+            422,
+            r#"{"error":"ResultsUnavailableError","detail":"Filtering by machine isn't available yet","request_id":"req_1","code":"machine_filter_unsupported"}"#,
+        )));
+        assert_eq!(machine.code, CliErrorCode::BackendRejected);
+        assert_eq!(machine.code.exit_code(), 15);
+        assert!(!machine.retryable);
+        assert_eq!(
+            machine.details.get("reason_code"),
+            Some(&RedactedValue::String(
+                "machine_filter_unsupported".to_string()
+            ))
+        );
+        // --all-machines is the no-op default; the explicit filter is what to drop.
+        assert!(machine.message.contains("--machine-id"));
+        assert!(!machine.message.contains("--all-machines"));
+
+        let unavailable = cli_error(LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Unavailable,
+            ..backend(
+                503,
+                r#"{"error":"ResultsUnavailable","code":"no_committed_answer","detail":"Ottto has no cost numbers for this window yet.","results_state":"pending"}"#,
+            )
+        }));
+        assert_eq!(unavailable.code.exit_code(), 16);
+        assert!(unavailable.message.contains("unavailable, not zero"));
+
+        let retired = cli_error(LocalApiError::Backend(backend(
+            422,
+            r#"{"error":"PreviousPipelineRetiredError","detail":"Retired","request_id":"req_4","code":"previous_pipeline_retired"}"#,
+        )));
+        assert_eq!(retired.code.exit_code(), 15);
+        assert_eq!(retired.message, "Ottto can't answer this read yet.");
+
+        // A short-lived companion token that merely expired is not a dead run.
+        let token = cli_error(LocalApiError::Backend(backend(
+            401,
+            r#"{"error":"AuthenticationError","detail":"Setup run companion token expired","request_id":"req_2"}"#,
+        )));
+        assert_eq!(token.code, CliErrorCode::BackendRejected);
+        assert!(!token.details.contains_key("reason_code"));
+        assert!(!token.message.contains("Setup run expired"));
+
+        let expired = cli_error(LocalApiError::Backend(backend(
+            401,
+            r#"{"error":"AuthenticationError","detail":"Setup run expired","request_id":"req_3"}"#,
+        )));
+        assert!(expired.message.starts_with("Setup run expired."));
+
+        // Terminal only for the exact detail from the refresh endpoint.
+        let refresh = |detail: &str| {
+            LocalApiError::Backend(BackendErrorDetails {
+                endpoint: "https://api.ottto.net/api/v1/setup-runs/run_1/local-client/refresh"
+                    .to_string(),
+                ..backend(401, &format!(r#"{{"detail":"{detail}"}}"#))
+            })
+        };
+        for (detail, expected) in [
+            (
+                "Setup run expired",
+                Some(TerminalRefreshRejection::SetupRunEnded),
+            ),
+            (
+                "Setup run cancelled",
+                Some(TerminalRefreshRejection::SetupRunEnded),
+            ),
+            (
+                "Telemetry device is not active",
+                Some(TerminalRefreshRejection::DeviceRejected),
+            ),
+            ("Setup run not found for this device", None),
+            ("Setup run companion token expired", None),
+        ] {
             assert_eq!(
-                paths
-                    .iter()
-                    .filter(|path| path.contains("/local-client/costs"))
-                    .count(),
-                attempt,
-                "one read per command: {paths:?}"
-            );
-            assert_eq!(
-                paths
-                    .iter()
-                    .filter(|path| path.contains("/local-client/refresh"))
-                    .count(),
-                attempt,
-                "at most one refresh per command: {paths:?}"
+                terminal_refresh_rejection(&refresh(detail)),
+                expected,
+                "{detail}"
             );
         }
-        let health = daemon
-            .status("token")
-            .expect("status")
-            .canonical_health
-            .expect("canonical health");
         assert_eq!(
-            health.account.setup_run_state,
-            ottto_protocol::LocalSetupRunState::Rejected
+            terminal_refresh_rejection(&LocalApiError::Backend(backend(
+                401,
+                r#"{"detail":"Setup run expired"}"#
+            ))),
+            None,
+            "a read endpoint's 401 is not a refresh answer"
         );
         assert_eq!(
-            health.account.setup_token_state,
-            ottto_protocol::LocalSetupTokenState::Expired
-        );
-        assert!(health
-            .blockers
-            .iter()
-            .any(|blocker| blocker.code == "setup_run_rejected"));
-
-        accept_reads.store(true, std::sync::atomic::Ordering::SeqCst);
-        agent_costs(&daemon, &authorization, AgentCostsQuery::default())
-            .expect("an accepted refresh restores reads");
-        let recovered = daemon
-            .status("token")
-            .expect("status")
-            .canonical_health
-            .expect("canonical health");
-        assert_eq!(
-            recovered.account.setup_run_state,
-            ottto_protocol::LocalSetupRunState::Complete
-        );
-        assert_eq!(
-            recovered.account.setup_token_state,
-            ottto_protocol::LocalSetupTokenState::Valid
+            terminal_refresh_rejection(&LocalApiError::NetworkUnavailable),
+            None
         );
     }
 
@@ -29655,6 +31337,20 @@ X-API-Key = "otel_redacted"
                 .and_then(serde_json::Value::as_str),
             Some("succeeded")
         );
+        // The completion is bound to the queued action and carries what the
+        // check established, with no account.
+        assert_eq!(
+            response.get("queued_action_id"),
+            response.pointer("/actions/0/action_id")
+        );
+        assert_eq!(
+            response.pointer("/actions/0/action_id"),
+            Some(&json!("action_verify_claude"))
+        );
+        assert_eq!(
+            response.pointer("/actions/0/verification/check"),
+            Some(&json!({"method": "live_prompt", "scope": "usage_received"}))
+        );
         let body_guard = completed_body.lock().expect("completed body lock");
         let body = body_guard.as_ref().expect("complete body observed");
         assert_eq!(
@@ -29666,6 +31362,7 @@ X-API-Key = "otel_redacted"
             result.get("verified").and_then(serde_json::Value::as_bool),
             Some(true)
         );
+        assert!(result.get("check").is_none());
         assert_eq!(
             KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
                 .load()
@@ -29719,6 +31416,7 @@ X-API-Key = "otel_redacted"
         assert_eq!(results[0].action_type, "verify_source");
         assert_eq!(results[0].source.as_deref(), Some("claude_code"));
         assert_eq!(results[0].status, "failed");
+        assert!(results[0].verification.is_none());
         let body_guard = completed_body.lock().expect("completed body lock");
         let body = body_guard.as_ref().expect("complete body observed");
         assert_eq!(
@@ -29801,17 +31499,11 @@ X-API-Key = "otel_redacted"
     #[test]
     fn pi_verify_budgets_fit_interactive_cli_bounds() {
         assert!(PI_SMOKE_COMMAND_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
-        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT > Duration::from_secs(30));
-        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT <= SMOKE_COMMAND_TIMEOUT);
         assert!(PI_VERIFICATION_WAIT_TIMEOUT < VERIFICATION_WAIT_TIMEOUT);
         assert!(PI_VERIFICATION_HTTP_TIMEOUT < SETUP_VERIFICATION_HTTP_TIMEOUT);
         assert!(PI_VERIFICATION_HTTP_TIMEOUT > PI_VERIFICATION_WAIT_TIMEOUT);
         assert!(
-            PI_SMOKE_COMMAND_TIMEOUT
-                + PI_IMPORT_RUN_HTTP_TIMEOUT
-                + PI_VERIFICATION_HTTP_TIMEOUT
-                + PIPE_DRAIN_TIMEOUT
+            PI_SMOKE_COMMAND_TIMEOUT + PI_VERIFICATION_HTTP_TIMEOUT + PIPE_DRAIN_TIMEOUT
                 < Duration::from_secs(90)
         );
     }
@@ -29849,32 +31541,6 @@ X-API-Key = "otel_redacted"
     fn setup_scan_result_http_timeout_covers_synchronous_backend_work() {
         assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT >= Duration::from_secs(120));
         assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn upload_pi_import_accepts_response_slower_than_previous_pi_timeout() {
-        let api_base_url = delayed_pi_import_run_server(Duration::from_secs(31));
-        let root = control_test_root("pi-import-slow-response");
-        let session_file = root.join("session.jsonl");
-        fs::write(
-            &session_file,
-            r#"{"type":"session","id":"pi-slow-import","cwd":"/tmp/pi","version":1}"#,
-        )
-        .expect("write pi session file");
-        let opened_root = open_pi_test_root(&root);
-
-        let started = Instant::now();
-        let result = upload_pi_import_run(
-            &api_base_url,
-            "relay_test",
-            &subscription_oauth_route(),
-            &opened_root,
-            &[session_file],
-        )
-        .expect("Pi import POST should use Pi-specific timeout");
-
-        assert!(started.elapsed() > BACKEND_REQUEST_TIMEOUT);
-        assert_eq!(result["status"], "ok");
     }
 
     #[test]
@@ -30401,21 +32067,6 @@ X-API-Key = "otel_redacted"
         format!("http://{address}")
     }
 
-    fn delayed_pi_import_run_server(delay: Duration) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Pi import backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept Pi import");
-            let request = read_complete_http_request(&mut stream);
-            assert!(request.contains("/api/v1/pi/import-runs"));
-            assert!(request.contains("Authorization: Bearer relay_test"));
-            assert!(request.contains("name=\"files\""));
-            thread::sleep(delay);
-            write_json_response(&mut stream, 200, "OK", r#"{"status":"ok"}"#);
-        });
-        format!("http://{address}")
-    }
-
     fn delayed_setup_verification_server(setup_run_id: &'static str, delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup backend");
         let address = listener.local_addr().expect("local address");
@@ -30674,7 +32325,17 @@ X-API-Key = "otel_redacted"
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Only accept polling is nonblocking. On macOS an accepted
+                        // socket inherits that mode; drain the body before replying
+                        // so a split header/body write cannot race a closed socket.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking install observer connection");
                         let request = read_complete_http_request(&mut stream);
+                        assert!(
+                            http_request_complete(request.as_bytes()),
+                            "complete install observer request"
+                        );
                         if request.contains("/local-client/install-sessions") {
                             write_json_response(
                                 &mut stream,
@@ -30928,6 +32589,27 @@ X-API-Key = "otel_redacted"
             .split_once("\r\n\r\n")
             .map(|(_, body)| body)
             .unwrap_or("")
+    }
+
+    /// Loopback backend answering each request in order with `(status, body)`;
+    /// joining it returns the raw requests.
+    fn scripted_json_backend(
+        answers: Vec<(u16, &'static str)>,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted backend");
+        let address = listener.local_addr().expect("scripted backend address");
+        let server = thread::spawn(move || {
+            answers
+                .into_iter()
+                .map(|(status, body)| {
+                    let (mut stream, _) = listener.accept().expect("accept scripted request");
+                    let request = read_complete_http_request(&mut stream);
+                    write_json_response(&mut stream, status, "Scripted", body);
+                    request
+                })
+                .collect()
+        });
+        (format!("http://{address}"), server)
     }
 
     fn write_json_response(

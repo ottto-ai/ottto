@@ -107,6 +107,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_LOGGED_DIAGNOSTICS_PER_CYCLE: usize = 20;
+/// An unchanged stop is logged again at most this often.
+const REPEATED_CYCLE_LOG_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
 
 const BREAKER_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
 const BREAKER_AUTH_THRESHOLD: u32 = 3;
@@ -402,6 +404,17 @@ struct PersistedGrant {
     excluded_account_fingerprints: BTreeSet<String>,
 }
 
+/// Why the grant file did not yield consent.
+#[derive(Debug)]
+enum GrantFileGap {
+    /// No file: nobody approved on this Mac.
+    Absent,
+    /// The file exists but could not be read.
+    Unreadable(std::io::Error),
+    /// The file was read but is not a usable grant. Closed reason code.
+    Unusable(&'static str),
+}
+
 /// Consent store. One grant per installation, held under the support dir.
 #[derive(Debug, Clone)]
 pub struct GrantStore {
@@ -424,28 +437,53 @@ impl GrantStore {
     }
 
     fn read(&self) -> Result<Option<PersistedGrant>> {
+        match self.read_checked() {
+            Ok(state) => Ok(Some(state)),
+            Err(GrantFileGap::Absent | GrantFileGap::Unusable(_)) => Ok(None),
+            Err(GrantFileGap::Unreadable(error)) => {
+                Err(error).context("read codex daily aggregates grant")
+            }
+        }
+    }
+
+    /// [`Self::read`] that keeps apart the reasons a file is not consent.
+    fn read_checked(&self) -> std::result::Result<PersistedGrant, GrantFileGap> {
         let raw = match fs::read_to_string(&self.path) {
             Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).context("read codex daily aggregates grant"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(GrantFileGap::Absent)
+            }
+            Err(error) => return Err(GrantFileGap::Unreadable(error)),
         };
         let state: PersistedGrant = match serde_json::from_str(&raw) {
             Ok(state) => state,
             // An unreadable or superseded grant file is not consent. Refuse it
             // rather than repairing it into something that looks live.
-            Err(_) => return Ok(None),
+            Err(_) => return Err(GrantFileGap::Unusable("grant_file_corrupt")),
         };
         if state.schema_version != GRANT_FILE_SCHEMA_VERSION {
-            return Ok(None);
+            return Err(GrantFileGap::Unusable("grant_file_schema_unsupported"));
         }
         if !matches!(decode_hex(&state.hmac_key_hex), Some(key) if key.len() == 32) {
-            return Ok(None);
+            return Err(GrantFileGap::Unusable("grant_file_key_invalid"));
         }
-        Ok(Some(state))
+        Ok(state)
     }
 
     pub fn load(&self) -> Result<Option<DailyReferenceGrant>> {
         Ok(self.read()?.map(|state| state.grant))
+    }
+
+    /// [`Self::load`] for the collection cycle, which has to tell "nobody
+    /// approved" (`Ok(None)`, silent) from "a consent file is here but cannot
+    /// be used" (`Err`, a closed reason code). Both are equally not consent.
+    fn load_for_cycle(&self) -> std::result::Result<Option<DailyReferenceGrant>, &'static str> {
+        match self.read_checked() {
+            Ok(state) => Ok(Some(state.grant)),
+            Err(GrantFileGap::Absent) => Ok(None),
+            Err(GrantFileGap::Unreadable(_)) => Err("grant_file_unreadable"),
+            Err(GrantFileGap::Unusable(reason)) => Err(reason),
+        }
     }
 
     /// Derive the account fingerprint for a raw provider account id under this
@@ -1012,7 +1050,6 @@ pub fn collector_status_live(grants: &GrantStore, network_disabled: bool) -> Col
     }
     let runtime = load_runtime_binding()
         .ok()
-        .flatten()
         .map(|(runtime, _credential, _api_base_url)| runtime);
     status_with_live_binding(grants, status, runtime.as_ref())
 }
@@ -1111,6 +1148,15 @@ impl ProviderReadError {
             ProviderReadError::ResponseShape(_) => "provider_response_shape",
             ProviderReadError::RateLimited => "provider_rate_limited",
             ProviderReadError::Transient(_) => "provider_unavailable",
+        }
+    }
+
+    /// The HTTP status, where one alone classifies the failure. Free-form
+    /// detail strings are never logged: they can echo provider output.
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            ProviderReadError::AuthRejected(status) => Some(*status),
+            _ => None,
         }
     }
 }
@@ -1354,7 +1400,22 @@ impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
         if let Some(account_id) = self.credential.account_id.as_deref() {
             request = request.set("ChatGPT-Account-Id", account_id);
         }
-        match request.call() {
+        // The user the request's own token names, as every other Codex line
+        // does (`account_id` is the workspace).
+        let account = crate::agent_status::codex_access_token_claimed_account_hash(
+            &self.credential.access_token,
+        );
+        let started = std::time::Instant::now();
+        let response = request.call();
+        crate::provider_calls::record(crate::provider_calls::ProviderCall::observed(
+            crate::provider_calls::Provider::Openai,
+            crate::provider_calls::CallKind::CodexDailyWorkspaceUsage,
+            crate::provider_calls::trigger_or(crate::provider_calls::Trigger::Schedule),
+            account.as_deref(),
+            crate::provider_calls::http_result(&response),
+            started.elapsed(),
+        ));
+        match response {
             Ok(response) => response
                 .into_json::<Value>()
                 .map_err(|error| ProviderReadError::ResponseShape(format!("unreadable: {error}"))),
@@ -2674,6 +2735,56 @@ impl Collector {
     }
 }
 
+/// The consent gate both cycle entry points run first.
+///
+/// No consent file is the silent case: nothing was promised, so nothing is
+/// owed. A consent file that exists but cannot be used, or a grant that cannot
+/// collect, is the opposite case and must say so, or "consent is on" and
+/// "nothing is being read" look identical. Either way the cycle is `Disabled`.
+fn runtime_ready_grant(grants: &GrantStore) -> std::result::Result<DailyReferenceGrant, Cycle> {
+    let grant = match grants.load_for_cycle() {
+        Ok(Some(grant)) => grant,
+        Ok(None) => return Err(Cycle::new(CycleOutcome::Disabled)),
+        Err(reason) => {
+            return Err(Cycle::with(
+                CycleOutcome::Disabled,
+                warning(
+                    "codex_daily_aggregates_consent_unreadable",
+                    &format!(
+                        "Stored consent exists on this Mac but could not be used: {reason}. Nothing was collected."
+                    ),
+                ),
+            ))
+        }
+    };
+    if let Some(reason) = grant_runtime_block_reason(&grant) {
+        return Err(Cycle::with(
+            CycleOutcome::Disabled,
+            warning(
+                "codex_daily_aggregates_consent_not_runtime_ready",
+                &format!(
+                    "Stored consent exists but cannot collect on this Mac: {reason}. Nothing was read."
+                ),
+            ),
+        ));
+    }
+    Ok(grant)
+}
+
+/// A runtime-ready consent that this cycle cannot act on yet. `reason` is a
+/// closed code naming the missing local piece, never its contents.
+fn deferred(reason: &'static str) -> Cycle {
+    Cycle::with(
+        CycleOutcome::Deferred,
+        warning(
+            "codex_daily_aggregates_deferred",
+            &format!(
+                "Consent is ready but this Mac cannot collect yet: {reason}. Nothing was read."
+            ),
+        ),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_once(
     grants: &GrantStore,
@@ -2695,32 +2806,10 @@ fn collect_once(
         );
     }
 
-    // No consent is the silent case: nothing to report, nothing to warn about.
-    // A grant that exists but cannot collect is not that case, and says so.
-    let grant = match grants.load() {
-        Ok(Some(grant)) => grant,
-        Ok(None) => return Cycle::new(CycleOutcome::Disabled),
-        Err(_) => {
-            return Cycle::with(
-                CycleOutcome::Disabled,
-                warning(
-                    "codex_daily_aggregates_consent_unreadable",
-                    "Stored consent could not be read on this Mac, so nothing was collected.",
-                ),
-            )
-        }
+    let grant = match runtime_ready_grant(grants) {
+        Ok(grant) => grant,
+        Err(cycle) => return cycle,
     };
-    if let Some(reason) = grant_runtime_block_reason(&grant) {
-        return Cycle::with(
-            CycleOutcome::Disabled,
-            warning(
-                "codex_daily_aggregates_consent_not_runtime_ready",
-                &format!(
-                    "Stored consent exists but cannot collect on this Mac: {reason}. Nothing was read."
-                ),
-            ),
-        );
-    }
 
     // Consent is bound to this installation. The live account is attribution,
     // not authorization under disclosure v2: derive its opaque fingerprint on
@@ -2777,7 +2866,7 @@ fn collect_once(
     }
 
     if !transport.is_configured() {
-        return Cycle::new(CycleOutcome::Deferred);
+        return deferred("transport_not_configured");
     }
 
     let identity = state_identity_for_account(&grant, &account_fingerprint, sentinel_disabled);
@@ -3037,13 +3126,25 @@ fn record_provider_failure(
     now: u64,
 ) -> Cycle {
     let category = error.category();
+    let status = error
+        .http_status()
+        .map(|status| format!(" http_status={status}"))
+        .unwrap_or_default();
     let Some(failure) = error.failure_class() else {
         // Transport and 5xx: record the reason, count nothing.
         let mut state = state;
         state.last_error_category = Some(category.to_string());
         let _ = state_store.save(&state);
         let _ = grants.record_health(None, Some(category));
-        return Cycle::new(CycleOutcome::Failed);
+        return Cycle::with(
+            CycleOutcome::Failed,
+            warning(
+                "codex_daily_aggregates_provider_read_failed",
+                &format!(
+                    "The Codex daily aggregate read failed: category={category}{status}; not counted toward a pause; retried at the next fetch."
+                ),
+            ),
+        );
     };
     let was_open = breaker_is_open(&state, now);
     let state = state_after_failure(state, identity, failure, category, now);
@@ -3061,7 +3162,23 @@ fn record_provider_failure(
             ),
         );
     }
-    Cycle::new(CycleOutcome::Failed)
+    // Below the threshold the breaker says nothing yet, so the category is the
+    // only early sign of a credential or route that has stopped working.
+    let consecutive = match failure {
+        ProviderFailure::AuthRejected => state.auth_failures,
+        ProviderFailure::ResponseShape => state.shape_failures,
+        ProviderFailure::RateLimited => state.rate_limit_failures,
+    };
+    Cycle::with(
+        CycleOutcome::Failed,
+        warning(
+            "codex_daily_aggregates_provider_read_failed",
+            &format!(
+                "The Codex daily aggregate read failed: category={category}{status} consecutive={consecutive} pause_at={}; retried at the next fetch.",
+                failure.threshold()
+            ),
+        ),
+    )
 }
 
 fn validate_ack(receipt: &Value, coverage_start: &str, coverage_end: &str) -> Result<()> {
@@ -3287,79 +3404,65 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
     // The default/off path is one local grant read. Nothing below - account,
     // device, connection, destination, credential, or keychain - is touched
     // until consent is capable of becoming runtime-ready.
-    // No consent at all stays silent: nothing was promised, so nothing is owed.
-    // A grant that exists but cannot collect is the opposite case and must say
-    // so, or "consent is on" and "nothing is being read" look identical.
-    let grant = match collector.grants.load() {
-        Ok(Some(grant)) => grant,
-        Ok(None) => return Cycle::new(CycleOutcome::Disabled),
-        Err(_) => {
-            return Cycle::with(
-                CycleOutcome::Disabled,
-                warning(
-                    "codex_daily_aggregates_consent_unreadable",
-                    "Stored consent could not be read on this Mac, so nothing was collected.",
-                ),
-            )
-        }
-    };
-    if let Some(reason) = grant_runtime_block_reason(&grant) {
-        return Cycle::with(
-            CycleOutcome::Disabled,
-            warning(
-                "codex_daily_aggregates_consent_not_runtime_ready",
-                &format!(
-                    "Stored consent exists but cannot collect on this Mac: {reason}. Nothing was read."
-                ),
-            ),
-        );
+    if let Err(cycle) = runtime_ready_grant(&collector.grants) {
+        return cycle;
     }
 
-    let Ok(Some((runtime, credential, api_base_url))) = load_runtime_binding() else {
-        return Cycle::new(CycleOutcome::Deferred);
+    let (runtime, credential, api_base_url) = match load_runtime_binding() {
+        Ok(binding) => binding,
+        Err(reason) => return deferred(reason),
     };
     let Ok((device, device_secret)) = crate::snapshot_client::load_snapshot_device_credentials()
     else {
-        return Cycle::new(CycleOutcome::Deferred);
+        return deferred("device_credentials_unavailable");
     };
     let transport = RelayTransport::new(api_base_url, device, device_secret);
     let reader = ChatGptDailyUsageReader::new(credential);
     collector.collect_once(&runtime, &reader, &transport, now)
 }
 
-type RuntimeBinding = Option<(Runtime, CodexCredential, String)>;
+type RuntimeBinding = (Runtime, CodexCredential, String);
 
-fn load_runtime_binding() -> Result<RuntimeBinding> {
-    let account = FileAccountStore::default().load()?;
+/// The account, device, connection, destination, and Codex sign-in a cycle
+/// collects with. A gap is a closed reason code so a waiting cycle can say
+/// which piece is missing without naming any of its contents.
+fn load_runtime_binding() -> std::result::Result<RuntimeBinding, &'static str> {
+    let account = FileAccountStore::default()
+        .load()
+        .map_err(|_| "account_state_unreadable")?;
     if account.state != LocalAccountState::Connected {
-        return Ok(None);
+        return Err("account_not_connected");
     }
-    let Some(device) = FileDeviceStore::default().load()? else {
-        return Ok(None);
-    };
+    let device = FileDeviceStore::default()
+        .load()
+        .map_err(|_| "device_state_unreadable")?
+        .ok_or("device_missing")?;
     if !is_uuid(&device.device_id) || !device.sources.iter().any(|source| source == SOURCE) {
-        return Ok(None);
+        return Err("device_not_bound_to_codex");
     }
-    let Some(connection) = FileConnectionStore::default().load()? else {
-        return Ok(None);
-    };
-    if connection.setup_run_id.trim().is_empty() || connection.machine_id != device.machine_id {
-        return Ok(None);
+    let connection = FileConnectionStore::default()
+        .load()
+        .map_err(|_| "connection_state_unreadable")?
+        .ok_or("connection_missing")?;
+    if connection.setup_run_id.trim().is_empty() {
+        return Err("connection_setup_incomplete");
+    }
+    if connection.machine_id != device.machine_id {
+        return Err("connection_device_mismatch");
     }
     // Validate the destination before any credential is read, so an on-disk URL
     // can never receive one.
-    let api_base_url = validated_api_base_url(&connection.api_base_url)?;
-    let Some(credential) = read_codex_credential() else {
-        return Ok(None);
-    };
-    Ok(Some((
+    let api_base_url =
+        validated_api_base_url(&connection.api_base_url).map_err(|_| "api_base_url_refused")?;
+    let credential = read_codex_credential().ok_or("codex_sign_in_unavailable")?;
+    Ok((
         Runtime {
             installation_id: device.device_id,
             provider_account_scope: credential.account_scope.clone(),
         },
         credential,
         api_base_url,
-    )))
+    ))
 }
 
 fn validated_api_base_url(raw: &str) -> Result<String> {
@@ -3391,24 +3494,87 @@ pub fn spawn_codex_daily_aggregate_collector() -> Result<CollectorStartup> {
     }
     let spawned = thread::Builder::new()
         .name("ottto-codex-daily-aggregates".to_string())
-        .spawn(|| loop {
-            let cycle = collect_composed_once(OffsetDateTime::now_utc());
-            if !matches!(cycle.outcome, CycleOutcome::Disabled | CycleOutcome::Noop) {
-                eprintln!("{}", cycle_summary_log(&cycle));
+        .spawn(|| {
+            let started = std::time::Instant::now();
+            let mut throttle = CycleLogThrottle::default();
+            loop {
+                let cycle = collect_composed_once(OffsetDateTime::now_utc());
+                for line in throttle.lines(&cycle, started.elapsed().as_secs()) {
+                    eprintln!("{line}");
+                }
+                thread::sleep(POLL_INTERVAL + cycle_jitter());
             }
-            // Diagnostics are printed whatever the outcome. A Disabled cycle is
-            // the one most worth explaining: it is where a live consent quietly
-            // stops collecting. Silent outcomes carry no diagnostics anyway.
-            for line in cycle_diagnostic_log_lines(&cycle.diagnostics) {
-                eprintln!("{line}");
-            }
-            thread::sleep(POLL_INTERVAL + cycle_jitter());
         });
     if let Err(error) = spawned {
         COLLECTOR_SUPERVISOR_STARTED.store(false, AtomicOrdering::Release);
         return Err(anyhow!("spawn Codex daily aggregates collector: {error}"));
     }
     Ok(CollectorStartup::Started)
+}
+
+/// Deduplicates the cycle log of a stuck gate.
+///
+/// Gate outcomes are re-evaluated every tick without contacting anything, so an
+/// unchanged stop would otherwise print the same lines every half hour. A
+/// changed report prints at once; an unchanged one prints again only after
+/// [`REPEATED_CYCLE_LOG_INTERVAL_SECONDS`], with the number of ticks it hid.
+/// Outcomes that follow a provider read are rare (cadence-gated) and always
+/// print.
+#[derive(Debug, Default)]
+struct CycleLogThrottle {
+    last_signature: Option<String>,
+    last_logged_at: u64,
+    suppressed: u64,
+}
+
+impl CycleLogThrottle {
+    /// Lines to print for this cycle. `now` is monotonic seconds.
+    fn lines(&mut self, cycle: &Cycle, now: u64) -> Vec<String> {
+        let mut lines = Vec::new();
+        if !matches!(cycle.outcome, CycleOutcome::Disabled | CycleOutcome::Noop) {
+            lines.push(cycle_summary_log(cycle));
+        }
+        // Diagnostics are printed whatever the outcome. A Disabled cycle is
+        // the one most worth explaining: it is where a live consent quietly
+        // stops collecting. Silent outcomes carry no diagnostics anyway.
+        lines.extend(cycle_diagnostic_log_lines(&cycle.diagnostics));
+        let repeatable_gate = matches!(
+            cycle.outcome,
+            CycleOutcome::Disabled
+                | CycleOutcome::Deferred
+                | CycleOutcome::CircuitOpen
+                | CycleOutcome::AccountExcluded
+        ) && cycle.normalized_row_count.is_none();
+        if lines.is_empty() || !repeatable_gate {
+            self.last_signature = None;
+            return self.with_suppressed_count(lines);
+        }
+        let signature = lines.join("\n");
+        if self.last_signature.as_deref() == Some(signature.as_str())
+            && now.saturating_sub(self.last_logged_at) < REPEATED_CYCLE_LOG_INTERVAL_SECONDS
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return Vec::new();
+        }
+        self.last_signature = Some(signature);
+        self.last_logged_at = now;
+        self.with_suppressed_count(lines)
+    }
+
+    /// Lead printed lines with how many identical reports were hidden since the
+    /// last printed one, so a gap in the log never reads as a gap in ticks.
+    fn with_suppressed_count(&mut self, lines: Vec<String>) -> Vec<String> {
+        if lines.is_empty() || self.suppressed == 0 {
+            return lines;
+        }
+        let mut counted = vec![format!(
+            "codex_daily_aggregates_collector_repeats_suppressed count={}",
+            self.suppressed
+        )];
+        self.suppressed = 0;
+        counted.extend(lines);
+        counted
+    }
 }
 
 fn cycle_summary_log(cycle: &Cycle) -> String {
@@ -4930,6 +5096,53 @@ mod tests {
     }
 
     #[test]
+    fn an_unusable_consent_file_says_why_but_stays_disabled() {
+        let collector = collector("unusable-consent");
+        enabled(&collector);
+        let valid = fs::read(collector.grants().path()).expect("read");
+        let mut superseded: serde_json::Value = serde_json::from_slice(&valid).expect("decode");
+        superseded["schema_version"] = json!("codex_daily_aggregates_grant.v0");
+        let mut bad_key: serde_json::Value = serde_json::from_slice(&valid).expect("decode");
+        bad_key["hmac_key_hex"] = json!("not-hex");
+
+        for (contents, reason) in [
+            (b"{\"truncated".to_vec(), "grant_file_corrupt"),
+            (
+                serde_json::to_vec(&superseded).expect("encode"),
+                "grant_file_schema_unsupported",
+            ),
+            (
+                serde_json::to_vec(&bad_key).expect("encode"),
+                "grant_file_key_invalid",
+            ),
+        ] {
+            fs::write(collector.grants().path(), &contents).expect("write");
+            let cycle =
+                collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+            assert_eq!(cycle.outcome, CycleOutcome::Disabled);
+            assert_eq!(cycle.diagnostics.len(), 1);
+            assert_eq!(
+                cycle.diagnostics[0].code,
+                "codex_daily_aggregates_consent_unreadable"
+            );
+            assert_eq!(
+                cycle.diagnostics[0].severity,
+                AgentDiagnosticSeverity::Warning
+            );
+            assert!(
+                cycle.diagnostics[0].message.contains(reason),
+                "{reason}: {}",
+                cycle.diagnostics[0].message
+            );
+            // The status contract is unchanged: an unusable file is no consent.
+            let status = collector_status(collector.grants(), false);
+            assert_eq!(status.runtime_state, RuntimeState::Off);
+            assert_eq!(status.reason_code, "setup_required");
+            assert!(!status.provider_read_permitted);
+        }
+    }
+
+    #[test]
     fn revoke_stops_collection_before_the_provider_is_contacted() {
         let collector = collector("revoked-collection");
         enabled(&collector);
@@ -5272,6 +5485,10 @@ mod tests {
         enabled(&collector);
         let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &DeferredTransport, now());
         assert_eq!(cycle.outcome, CycleOutcome::Deferred);
+        assert_eq!(cycle.diagnostics[0].code, "codex_daily_aggregates_deferred");
+        assert!(cycle.diagnostics[0]
+            .message
+            .contains("transport_not_configured"));
     }
 
     // -- cadence ----------------------------------------------------------
@@ -5493,13 +5710,17 @@ mod tests {
         ]);
         let transport = RecordingTransport::default();
         let mut clock = now();
-        for _ in 0..2 {
+        for (consecutive, status) in [(1, 401), (2, 403)] {
+            let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+            assert_eq!(cycle.outcome, CycleOutcome::Failed);
+            // Below the threshold the category is still named.
             assert_eq!(
-                collector
-                    .collect_once(&runtime(), &reader, &transport, clock)
-                    .outcome,
-                CycleOutcome::Failed
+                cycle.diagnostics[0].code,
+                "codex_daily_aggregates_provider_read_failed"
             );
+            assert!(cycle.diagnostics[0].message.contains(&format!(
+                "category=provider_auth_rejected http_status={status} consecutive={consecutive} pause_at=3;"
+            )));
             clock += TimeDuration::hours(7);
         }
         let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
@@ -5539,18 +5760,58 @@ mod tests {
         let transport = RecordingTransport::default();
         let mut clock = now();
         for _ in 0..4 {
-            assert_eq!(
-                collector
-                    .collect_once(&runtime(), &reader, &transport, clock)
-                    .outcome,
-                CycleOutcome::Failed
-            );
+            let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+            assert_eq!(cycle.outcome, CycleOutcome::Failed);
+            let message = &cycle.diagnostics[0].message;
+            assert!(message.contains("category=provider_unavailable; not counted"));
+            // The free-form transient detail can echo provider output.
+            for detail in ["dns", "503", "timeout", "reset"] {
+                assert!(!message.contains(detail), "{message}");
+            }
             clock += TimeDuration::hours(7);
         }
         assert_eq!(reader.calls.get(), 4, "transients must keep being retried");
     }
 
     // -- upload ------------------------------------------------------------
+
+    #[test]
+    fn an_unchanged_stop_is_logged_once_per_repeat_interval() {
+        let waiting = deferred("account_not_connected");
+        let mut throttle = CycleLogThrottle::default();
+
+        let first = throttle.lines(&waiting, 0);
+        assert_eq!(first.len(), 2, "summary and reason: {first:?}");
+        for tick in 1..12 {
+            assert!(throttle.lines(&waiting, tick * 30 * 60).is_empty());
+        }
+        // A different reason prints at once and accounts for the hidden ticks.
+        let changed = throttle.lines(&deferred("codex_sign_in_unavailable"), 6 * 60 * 60 - 1);
+        assert_eq!(
+            changed[0],
+            "codex_daily_aggregates_collector_repeats_suppressed count=11"
+        );
+        assert!(changed[2].contains("codex_sign_in_unavailable"));
+        // The same report prints again once the interval has passed.
+        let reason = deferred("codex_sign_in_unavailable");
+        assert!(throttle.lines(&reason, 6 * 60 * 60).is_empty());
+        let repeated = throttle.lines(&reason, 12 * 60 * 60);
+        assert_eq!(
+            repeated[0],
+            "codex_daily_aggregates_collector_repeats_suppressed count=1"
+        );
+        assert_eq!(repeated.len(), 3);
+
+        // Outcomes after a provider read are cadence-gated and always print.
+        let failed = Cycle::with(CycleOutcome::Failed, warning("code", "same"));
+        assert!(!throttle.lines(&failed, 12 * 60 * 60).is_empty());
+        assert!(!throttle.lines(&failed, 12 * 60 * 60 + 1).is_empty());
+        // Silent cycles print nothing and do not mask the next stop.
+        assert!(throttle
+            .lines(&Cycle::new(CycleOutcome::Noop), 12 * 60 * 60 + 2)
+            .is_empty());
+        assert_eq!(throttle.lines(&reason, 12 * 60 * 60 + 3).len(), 2);
+    }
 
     #[test]
     fn diagnostic_log_lines_include_codes_and_cap_output() {

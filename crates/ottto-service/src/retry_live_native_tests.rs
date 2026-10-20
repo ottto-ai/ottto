@@ -186,6 +186,7 @@ impl PiLiveFixture {
             &self.baseline,
             &self.progress,
             &self.items,
+            None,
             &BTreeSet::new(),
             &self.index_path,
             &self.progress_path,
@@ -291,6 +292,40 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
 }
 
 #[test]
+fn bounded_retry_owner_due_boundary_preserves_ordinary_deadline() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = SameSourceAckFixture::new();
+    let now = Instant::now();
+    let due = now + Duration::from_secs(60);
+    let ordinary = now + Duration::from_secs(90);
+    let mut owner = super::bounded_snapshot_retry::RetryOwner::default();
+    assert!(owner.admit(bounded_native_capture(&f, now)));
+    assert_eq!(owner.wake_before(ordinary), due);
+    let mut turns = 0;
+    owner.boundary(std::iter::empty(), due - Duration::from_nanos(1), |_| {
+        turns += 1;
+        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+    });
+    assert_eq!(turns, 0);
+    assert_eq!(owner.wake_before(ordinary), due);
+    owner.boundary(std::iter::empty(), due, |_| {
+        turns += 1;
+        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+    });
+    assert_eq!(turns, 1);
+    assert_eq!(owner.wake_before(ordinary), ordinary);
+    owner.boundary(std::iter::empty(), ordinary, |_| {
+        turns += 1;
+        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+    });
+    assert_eq!(turns, 1);
+}
+
+#[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_and_ack() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -315,7 +350,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         let hint=serde_json::to_string(&serde_json::json!({"source":"pi", "server_time":"2026-10-06T10:05:00Z",
             "last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
             "backfill_window_days":30,"recommended_scan_after":"2026-10-06T10:10:00Z"})).unwrap();
-        let server = std::thread::spawn(move || {
+        let server = bounded_native_server(listener, move |listener| {
             let mut trace = Vec::new();
             for body in ["{\"token\":\"fresh\"}", hint.as_str(), ack.as_str()] {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -331,6 +366,15 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         let daemon = &f.daemon;
         let mut turns = 0;
         let mut anchored = None;
+        // Synchronize fixture eligibility before starting the ordinary wait.
+        // A 30ms sleep inside that 150ms wait can resume after its deadline;
+        // the production loop then correctly returns without entering a turn.
+        // Due/wake ordering is tested above with explicit Instants, independent
+        // of scheduler latency. This native test retains the real idle boundary,
+        // transport, exact ACK and unchanged ordinary wait/anchor assertions.
+        let due = owner.wake_before(Instant::now() + Duration::from_secs(1));
+        bounded_native_wait_until(due);
+        assert!(Instant::now() >= due);
         let started = Instant::now();
         collect_file_activity_with_retry(
             Duration::from_millis(150),
@@ -418,6 +462,8 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
 }
 
 #[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -436,7 +482,7 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
         let server = if change != "policy" {
             None
         } else {
-            Some(std::thread::spawn(move || {
+            Some(bounded_native_server(listener, move |listener| {
                 for body in [
                     "{\"token\":\"fresh\"}",
                     r#"{"source":"pi","server_time":"2026-10-06T10:05:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":30,"session_titles_enabled":false,"recommended_scan_after":"2026-10-06T10:10:00Z"}"#,
@@ -445,6 +491,7 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
                     bounded_native_read(&mut stream);
                     bounded_native_response(&mut stream, "200 OK", body);
                 }
+                let listener = listener.into_inner();
                 listener.set_nonblocking(true).unwrap();
                 listener
             }))
@@ -536,6 +583,7 @@ fn bounded_retry_live_legacy_reconciliation_declines_without_count_only_settleme
         &f.baseline,
         &f.progress,
         &f.items,
+        None,
         &BTreeSet::new(),
         &f.index_path,
         &f.progress_path,

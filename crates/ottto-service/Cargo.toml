@@ -38,8 +38,10 @@ unicode-normalization.workspace = true
 ureq.workspace = true
 webpki-roots.workspace = true
 zeroize.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
+ottto-core = { path = "../ottto-core", features = ["test-secret-store"] }
 serial_test.workspace = true
 
 [build-dependencies]

@@ -124,7 +124,8 @@ fn claude_p92_clock_qualification_and_all_bucket_coverage() {
                 assert!(rebuild_claude_reported_usage(
                     &mut item,
                     &rows,
-                    &BTreeSet::new()
+                    &BTreeSet::new(),
+                    None
                 ));
                 assert_eq!(
                     item.request_count, 2,
@@ -732,6 +733,54 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
     assert_eq!(scan.snapshots.iter().find(|item| item.source_session_id != root.source_session_id).unwrap().request_count, 1);
     assert!(index.accepted_snapshot_fingerprints.is_empty(), "qualification is not an ACK");
     output("native-root-production.json", qualified);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A cycle without the cohort permit builds today's bodies exactly; only a
+/// permitted cycle reaches contract 5.
+#[test]
+fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
+    use crate::snapshots::claude_request_identity as identity;
+    let (dir, root, api, trace) = h296_root_evidence();
+    let support = dir.join("support");
+    let digest = format!("{:x}", Sha256::digest(root.source_session_id.as_bytes()));
+    for (kind, rows) in [
+        ("claude-code-effort", api.evidence[&root.source_session_id].iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>()),
+        ("claude-code-trace-ownership", trace.evidence[&root.source_session_id].iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>()),
+    ] {
+        let path = support.join("local-otel").join(kind).join(format!("{digest}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, rows.iter().map(|row| row.to_string()+"\n").collect::<String>()).unwrap();
+    }
+    let run = |permit: Option<identity::EmissionPermit>| {
+        let mut index = ScanIndex::default();
+        let mut scan = scan_source_roots_with_test_limit(SnapshotSource::ClaudeCode, std::slice::from_ref(&dir), &mut index, "2026-08-02T07:10:00Z", 7, 100, false).unwrap();
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(&support, &mut scan, &mut index, permit);
+        scan.snapshots
+    };
+    let collector = |items: &[SnapshotItem]| items.iter().find(|item| item.source_session_id == root.source_session_id).unwrap().provenance.collector.clone();
+    let claude = SnapshotSource::ClaudeCode;
+    let token = Some(identity::COHORT_HINT_TOKEN);
+    let dark = serde_json::to_vec(&run(None)).unwrap();
+    for denied in [
+        // This build: emission compiled on, but a cycle without the exact
+        // token still gets no permit.
+        identity::emission_permit(claude, None).ok(),
+        identity::emission_permit(claude, Some(" own_request_identity_rows:v1")).ok(),
+        identity::permit_when(true, claude, None).ok(),
+        identity::permit_when(true, claude, Some("own_request_identity_rows:v2")).ok(),
+        identity::permit_when(true, claude, Some(identity::COLLECTOR)).ok(),
+        identity::permit_when(true, SnapshotSource::Codex, token).ok(),
+    ] {
+        assert!(denied.is_none());
+        let items = run(denied);
+        assert_eq!(collector(&items), claude_request_accounts::COMPLETE);
+        assert_eq!(serde_json::to_vec(&items).unwrap(), dark, "denied cycles keep today's bytes");
+    }
+    let permitted = run(identity::permit_when(true, claude, token).ok());
+    assert_eq!(collector(&permitted), identity::COLLECTOR);
+    let released = run(identity::emission_permit(claude, token).ok());
+    assert_eq!(serde_json::to_vec(&released).unwrap(), serde_json::to_vec(&permitted).unwrap());
     fs::remove_dir_all(dir).unwrap();
 }
 

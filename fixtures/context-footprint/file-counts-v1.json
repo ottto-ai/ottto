@@ -1,0 +1,24 @@
+{
+  "auto_memory_limit": {
+    "chars": 25000,
+    "lines": 200
+  },
+  "character_unit": "utf16",
+  "contract_version": "context_footprint_file_counts:v1",
+  "hash_scheme": "sha256(ottto-context-file-v1\\0 || device_salt_32_bytes || file_bytes):hex64",
+  "item": {
+    "content_hash": "67c07bcfd2dd2b7e59d5669d940d2dd93a51c0b4d13b4af4698927f391b1c31f",
+    "file_bytes": 600,
+    "file_chars": 600,
+    "file_lines": 300,
+    "kind": "memory_file",
+    "loaded_lines": 200,
+    "loading_mode": "always_on",
+    "name": "MEMORY.md",
+    "relative_path": "MEMORY.md",
+    "source": "AutoMem",
+    "tokens": 6000,
+    "truncated_by_limit": true
+  },
+  "max_file_bytes": 1048576
+}

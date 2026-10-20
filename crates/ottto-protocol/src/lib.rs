@@ -37,6 +37,12 @@ pub const CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION: u16 = 25;
 /// The base protocol remains unchanged so older clients continue to use every
 /// unrelated command during a rolling local-runtime upgrade.
 pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 24;
+/// Command-scoped version for a Codex sign-in the daemon runs itself: it
+/// starts `codex login` for the managed home of the current setup operation,
+/// supervises it and checks the account once when it ends. The v24 commands
+/// keep their meaning; clients send v26 only when the status carries
+/// `daemon_sign_in_supported`.
+pub const CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION: u16 = 26;
 /// Destructive installation reset is command-scoped so an older daemon cannot
 /// accept the request while silently ignoring `forget_installation`.
 pub const INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION: u16 = 25;
@@ -170,7 +176,30 @@ pub struct DaemonStatus {
     pub local_health_events: Vec<LocalHealthEventV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_ledger: Vec<LocalHealthCommandResultV1>,
+    /// Content-free, process-local comparison progress. Omitted by older or
+    /// inactive daemons. Never provider evidence or server snapshot metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_comparison: Option<NativeComparisonStatus>,
     pub generated_at: Rfc3339Timestamp,
+}
+
+/// Known current-process deferral counts are conservative upper bounds until
+/// a complete settled census reconciles them. Missing counts mean UNKNOWN,
+/// never zero. New-local candidates have no prior local ACK witness; this is
+/// not a claim about server history. A restarted process cannot recover age.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeComparisonStatus {
+    pub observation_available: bool,
+    pub in_flight: bool,
+    pub deferred_family_count: Option<u64>,
+    pub withheld_candidate_count: Option<u64>,
+    pub withheld_new_local_candidate_count: Option<u64>,
+    pub oldest_deferred_age_millis: Option<u64>,
+    pub unknown_age_family_count: Option<u64>,
+    pub prior_process_debt_unknown: bool,
+    pub base_exit_family_count: Option<u64>,
+    pub process_base_exit: bool,
+    pub counts_are_upper_bounds: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -654,6 +683,11 @@ pub struct AuthResetResponse {
     pub setup_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected_at: Option<Rfc3339Timestamp>,
+    /// Whether Ottto released this Mac's server registration during a cloud
+    /// reset. Absent for local-only resets and from older daemons; `false`
+    /// means the registration may still be active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_released: Option<bool>,
     pub message: StableMessage,
 }
 
@@ -737,7 +771,10 @@ pub struct SourceHealth {
     pub reconciliation_enabled: Option<bool>,
 }
 
-/// Bounded machine-local status from one completed incremental transcript scan.
+/// Bounded machine-local status from the latest completed incremental
+/// transcript scan. `sessions` lists every session with recent activity, kept
+/// across scans until that activity ages out; `changed_session_count` counts
+/// only the sessions whose activity advanced in the latest scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSessionReconciliation {
     pub reconciled_at: Rfc3339Timestamp,
@@ -813,6 +850,15 @@ pub struct ActiveSession {
     pub subscription_product: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_attribution_source: Option<String>,
+    /// Content-free reason the daemon withheld this session's account, so an
+    /// app can say why instead of a bare "unknown". Closed values:
+    /// `multiple_accounts` (the session's own request evidence names more than
+    /// one account) and `incomplete_request_evidence` (one account, but not
+    /// every billed request has a request witness). Only ever set while
+    /// `account_identifier_hash` is absent, and never names an account. Apps
+    /// must treat an unknown value as no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_withheld_reason: Option<String>,
     /// Model the session was MOST RECENTLY seen running, not its lifetime
     /// primary. An active session's card answers "what is it running right
     /// now", so a long session that switched models must not keep showing the
@@ -1162,6 +1208,9 @@ pub struct AgentRuntimeDefaults {
     pub priority_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Effort saved per model (Claude Code `modelSettings`), keyed by model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_effort_by_model: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1200,7 +1249,40 @@ pub struct AgentStatusSnapshot {
 }
 
 impl AgentStatusSnapshot {
+    /// Whether this is a Codex snapshot of a failed usage read: the probe
+    /// failed, or a registered account could not be verified.
+    fn is_codex_failed_usage_read(&self) -> bool {
+        self.source == SourceKind::Codex
+            && self.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.code.as_str(),
+                    "codex_usage_probe_failed" | "codex_configured_account_unavailable"
+                )
+            })
+    }
+
     pub fn redacted_for_backend(mut self) -> Self {
+        if self.is_codex_failed_usage_read() {
+            // A failed Codex usage read is uploaded as a failure only. The
+            // daemon's last-known reading (stale meters) is local display; the
+            // backend owns carry-forward of its own last good reading. Plan
+            // words and the subscription period on such a row come from the
+            // local credential, not from the provider, so they are not
+            // uploaded either. `billing_channel` stays: it is the registered
+            // route of the account, part of the identity the backend files
+            // the row under, not a plan fact.
+            self.quota_windows
+                .retain(|window| window.freshness != AgentQuotaWindowFreshness::Stale);
+            self.credit_balances.clear();
+            self.plan_observations.clear();
+            if let Some(account) = self.account.as_mut() {
+                account.plan_type = None;
+                account.subscription_product = None;
+                account.subscription_period_start = None;
+                account.subscription_period_end = None;
+                account.subscription_period_last_checked_at = None;
+            }
+        }
         if let Some(account) = self.account.as_mut() {
             // Display text travels only on this status carrier. Raw provider
             // account and selected organization/workspace ids are identifiers,
@@ -1286,6 +1368,11 @@ impl AgentStatusSnapshot {
             defaults.sandbox_mode = safe_optional_text(defaults.sandbox_mode.take());
             defaults.machine_id = safe_optional_text(defaults.machine_id.take());
             defaults.provenance = safe_optional_text(defaults.provenance.take());
+            defaults.reasoning_effort_by_model =
+                std::mem::take(&mut defaults.reasoning_effort_by_model)
+                    .into_iter()
+                    .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
+                    .collect();
             defaults.selector_context = std::mem::take(&mut defaults.selector_context)
                 .into_iter()
                 .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
@@ -2174,6 +2261,9 @@ pub struct SourceVerificationResult {
     pub message: StableMessage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_results: Vec<SourceRouteVerificationResult>,
+    /// What kind of check ran and what it established. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<SourceVerificationCheck>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2211,6 +2301,53 @@ pub struct SourceRouteVerificationResult {
     pub error_code: Option<String>,
     pub local_session_observed: Option<bool>,
     pub message: StableMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<SourceVerificationCheck>,
+}
+
+/// The kind of check a Verify used and what it established. `scope` never
+/// names an account: no verification result binds accepted usage to one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceVerificationCheck {
+    /// Absent when no route was evaluated, so the kind is not determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<SourceVerificationMethod>,
+    pub scope: SourceVerificationScope,
+}
+
+/// The kind of check. It does not say the check sent a prompt or finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationMethod {
+    /// Local configuration, source registration and CLI presence only.
+    ConfigurationCheck,
+    /// A small provider prompt, then a check for fresh usage.
+    LivePrompt,
+    /// No prompt: recent usage and local route evidence.
+    PassiveRecentUsage,
+    /// Routes used different methods; each route carries its own.
+    Mixed,
+    /// A value from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a completed check established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationScope {
+    NotEstablished,
+    /// Local configuration is ready; upload was not checked.
+    Configuration,
+    /// Local session or route evidence only; upload was not confirmed.
+    LocalEvidence,
+    /// Ottto received fresh matching usage.
+    UsageReceived,
+    /// Some routes established something and others did not, or they differ.
+    Partial,
+    /// A value from a newer daemon; never success.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2783,6 +2920,9 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::CodexAccountCheck { .. }
         | LocalControlCommand::CodexAccountStopWaiting { .. }
         | LocalControlCommand::CodexAccountRemove { .. } => CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+        LocalControlCommand::CodexAccountStartSignIn { .. } => {
+            CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION
+        }
         LocalControlCommand::AuthReset {
             forget_installation: true,
             ..
@@ -3214,6 +3354,17 @@ pub struct ClaudeUnresolvedAccountDescriptorV1 {
     pub unresolved_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
+    /// Present only for one exact Claude Desktop account/organization session
+    /// folder pair; such a row is a daemon-selectable connect target. Absent
+    /// for account-only evidence, which never names an organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// Display only, on an exact pair row: the labels that folder pair's own
+    /// Desktop metadata states. Never identity or authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default)]
@@ -3356,6 +3507,73 @@ pub struct CodexAccountSetupOperationV1 {
     pub launch_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The daemon-run sign-in of this operation (v26), if one was started.
+    /// Older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<CodexAccountSignInV1>,
+}
+
+/// Where a daemon-run Codex sign-in is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSignInPhaseV1 {
+    /// `codex login` is being started.
+    Starting,
+    /// `codex login` runs and waits for the person to finish in the browser.
+    WaitingForBrowser,
+    /// The sign-in saved a credential; the daemon reads the account once.
+    CheckingAccount,
+    /// The run ended; `outcome` says how.
+    Done,
+}
+
+/// How a daemon-run Codex sign-in ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSignInOutcomeV1 {
+    /// The account and workspace were accepted.
+    Complete,
+    /// Another account or workspace signed in; the same operation may start a
+    /// sign-in again.
+    IdentityMismatch,
+    /// That account and workspace is already connected.
+    DuplicateAccount,
+    /// The workspace restriction did not hold in a fresh provider session.
+    WorkspaceNotKept,
+    /// The sign-in saved a credential, but the account could not be read
+    /// (twice, about 15 s apart).
+    CheckFailed,
+    /// `codex login` ended without saving a new credential.
+    LoginFailed,
+    /// Another Codex sign-in holds the local sign-in port, so none started.
+    PortBusy,
+    /// The sign-in did not finish within the time limit and was stopped.
+    TimedOut,
+    /// Stopped on request.
+    Cancelled,
+    /// The daemon restarted during the sign-in, and no new credential was
+    /// saved.
+    Interrupted,
+    /// The Codex CLI could not be found or started.
+    CodexUnavailable,
+}
+
+/// A daemon-run `codex login` for the operation's managed home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSignInV1 {
+    pub phase: CodexAccountSignInPhaseV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<CodexAccountSignInOutcomeV1>,
+    pub started_at: Rfc3339Timestamp,
+    /// When the daemon stops a sign-in that has not finished.
+    pub deadline_at: Rfc3339Timestamp,
+    /// The provider's sign-in page for this run, as `codex login` printed it,
+    /// so a client can open it again or copy it (the CLI opens it in the
+    /// default browser once). Only while the run waits for the browser, only
+    /// through authenticated local control, never stored on disk. Clients
+    /// must not log, upload or show it as text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_url: Option<SecretString>,
 }
 
 impl Default for CodexAccountSetupOperationV1 {
@@ -3370,6 +3588,7 @@ impl Default for CodexAccountSetupOperationV1 {
             workspace_identifier_hash: None,
             launch_command: None,
             message: None,
+            sign_in: None,
         }
     }
 }
@@ -3392,6 +3611,11 @@ pub enum CodexAccountSlotCollectionStateV1 {
     IdentityMismatch,
     ProviderUnavailable,
     DuplicateAccount,
+    /// Local status only: the slot's last read failed and its
+    /// `quota_snapshot` is the account's last-known reading, marked stale.
+    /// Every shipped local client decodes a quota snapshot on this state and
+    /// grants it no slot authority; shipped clients do not show that reading.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3549,6 +3773,11 @@ pub struct CodexAccountsStatusV1 {
     #[serde(default)]
     pub target_coverage: CodexAccountTargetCoverageV1,
     pub capacity: CodexAccountCapacityV1,
+    /// Presence is the capability bit for the v26 daemon-run sign-in
+    /// (`codex_account_start_sign_in`). Older daemons omit it; older clients
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_sign_in_supported: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3599,6 +3828,13 @@ pub struct AgentCostsQuery {
     pub mode: Option<String>,
     #[serde(default)]
     pub all_machines: bool,
+    /// Comma-separated grouped families for `mode=full`; Ottto owns the list
+    /// and its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<String>,
+    /// Include the selected families' daily/hourly series (`mode=full`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub daily: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3684,8 +3920,17 @@ pub enum LocalControlCommand {
         source: Option<SourceKind>,
     },
     AuthStatus,
+    /// Agent status for one source or all. On its own it serves the daemon's
+    /// saved quota readings and starts no provider read; the daemon's own
+    /// schedule keeps them current.
     AgentStatusRefresh {
         source: Option<SourceKind>,
+        /// Explicit refresh (a user's Refresh action): read provider quota
+        /// now for every account of the source(s), at most once a minute per
+        /// account, then answer as above. Holds, breakers and Retry-After
+        /// still apply.
+        #[serde(default, skip_serializing_if = "is_false")]
+        quota_refresh: bool,
     },
     PersonalMeterLocalSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3880,6 +4125,22 @@ pub enum LocalControlCommand {
     },
     /// Re-read the prepared home and accept only its exact expected composite.
     CodexAccountCheck {
+        schema_version: u16,
+        operation_id: String,
+        /// A person's check (a button), not a client's poll. While the setup
+        /// waits for sign-in, the daemon spaces provider reads after a failed
+        /// one; an explicit check reads at most once per few seconds instead.
+        /// Clients set it only for a person's action, never on a timer.
+        #[serde(default, skip_serializing_if = "is_false")]
+        explicit: bool,
+    },
+    /// v26: run `codex login` for the managed home of the current setup
+    /// operation (after prepare, prepare-open, prepare-target or reconnect, or
+    /// after an identity mismatch). The daemon supervises it, stops it after
+    /// ten minutes, and checks the account once when it ends; progress is in
+    /// `setup_operation.sign_in`. `codex_account_stop_waiting` cancels it.
+    /// Replaying the command while the run is active only returns status.
+    CodexAccountStartSignIn {
         schema_version: u16,
         operation_id: String,
     },
@@ -4696,6 +4957,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_refresh_keeps_its_wire_form_and_adds_an_optional_quota_refresh() {
+        let plain: LocalControlCommand = serde_json::from_value(
+            serde_json::json!({"command": "agent_status_refresh", "source": null}),
+        )
+        .unwrap();
+        assert_eq!(
+            plain,
+            LocalControlCommand::AgentStatusRefresh {
+                source: None,
+                quota_refresh: false,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"command": "agent_status_refresh", "source": null})
+        );
+
+        let refresh = LocalControlCommand::AgentStatusRefresh {
+            source: Some(SourceKind::Codex),
+            quota_refresh: true,
+        };
+        let wire = serde_json::to_value(&refresh).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "command": "agent_status_refresh",
+                "source": "codex",
+                "quota_refresh": true
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            refresh
+        );
+    }
+
+    #[test]
     fn setup_answer_command_round_trips() {
         let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
             "request_id": "req_setup_answer",
@@ -4851,6 +5149,12 @@ mod tests {
                 "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
             }),
             serde_json::json!({
+                "command": "codex_account_check",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "explicit": true
+            }),
+            serde_json::json!({
                 "command": "codex_account_stop_waiting",
                 "schema_version": 1,
                 "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
@@ -4911,6 +5215,7 @@ mod tests {
                 used_slots: 1,
                 remaining_slots: 9,
             },
+            daemon_sign_in_supported: None,
         };
 
         let wire = serde_json::to_value(&status).expect("serialize");
@@ -4920,6 +5225,96 @@ mod tests {
             "an empty blocker list must still be sent: {target}"
         );
         assert_eq!(target["setup_blockers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn codex_start_sign_in_is_v26_only() {
+        let wire = serde_json::json!({
+            "request_id": "req_codex_sign_in",
+            "protocol_version": CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "codex_account_start_sign_in",
+            "schema_version": 1,
+            "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+        });
+        let request =
+            serde_json::from_value::<LocalControlRequest>(wire.clone()).expect("v26 sign-in");
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::CodexAccountStartSignIn { ref operation_id, schema_version: 1 }
+                if operation_id == "codex_setup_0123456789abcdef0123456789abcdef"
+        ));
+        assert_eq!(
+            serde_json::to_value(&request).expect("serialize")["command"],
+            "codex_account_start_sign_in"
+        );
+        for wrong in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = wire.clone();
+            stale["protocol_version"] = serde_json::json!(wrong);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("the daemon-run sign-in rejects every other protocol");
+            assert!(error.to_string().contains("expected 26"));
+        }
+        assert_eq!(CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION, 26);
+    }
+
+    #[test]
+    fn codex_sign_in_status_is_additive_and_keeps_the_url_out_of_debug() {
+        // A v24 status (older daemon) has neither field.
+        let legacy: CodexAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "setup_operation": {"state": "waiting_for_user_login"},
+            "default_slot": {"slot_id": "default", "ownership": "default", "collection": {"state": "unverified"}},
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("v24 status decodes");
+        assert_eq!(legacy.daemon_sign_in_supported, None);
+        assert_eq!(legacy.setup_operation.sign_in, None);
+
+        let operation: CodexAccountSetupOperationV1 = serde_json::from_value(serde_json::json!({
+            "state": "waiting_for_user_login",
+            "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+            "sign_in": {
+                "phase": "waiting_for_browser",
+                "started_at": "2026-10-15T12:00:00Z",
+                "deadline_at": "2026-10-15T12:10:00Z",
+                "sign_in_url": "https://auth.example.test/oauth/authorize?state=synthetic-state"
+            }
+        }))
+        .expect("v26 sign-in decodes");
+        let sign_in = operation.sign_in.clone().expect("sign-in");
+        assert_eq!(sign_in.phase, CodexAccountSignInPhaseV1::WaitingForBrowser);
+        assert_eq!(sign_in.outcome, None);
+        assert_eq!(
+            sign_in
+                .sign_in_url
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("https://auth.example.test/oauth/authorize?state=synthetic-state")
+        );
+        assert!(!format!("{operation:?}").contains("synthetic-state"));
+
+        let done = serde_json::to_value(CodexAccountSignInV1 {
+            phase: CodexAccountSignInPhaseV1::Done,
+            outcome: Some(CodexAccountSignInOutcomeV1::PortBusy),
+            started_at: "2026-10-15T12:00:00Z".to_string(),
+            deadline_at: "2026-10-15T12:10:00Z".to_string(),
+            sign_in_url: None,
+        })
+        .expect("serialize");
+        assert_eq!(
+            done,
+            serde_json::json!({
+                "phase": "done",
+                "outcome": "port_busy",
+                "started_at": "2026-10-15T12:00:00Z",
+                "deadline_at": "2026-10-15T12:10:00Z"
+            })
+        );
     }
 
     #[test]
@@ -5873,6 +6268,9 @@ mod tests {
         let descriptor = ClaudeUnresolvedAccountDescriptorV1 {
             unresolved_id: "claude_unresolved_0123456789abcdef".to_string(),
             account_identifier_hash: Some("display-safe-hash".to_string()),
+            organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
             observed_at: Some("2026-08-04T12:00:00Z".to_string()),
             evidence: vec![
                 ClaudeUnresolvedAccountEvidenceKind::CliIdentity,
@@ -5970,6 +6368,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: None,
+                    daily: false,
                 }
             }
         );
@@ -6450,6 +6850,10 @@ mod tests {
                     "service_tier".to_string(),
                     "codex.config.service_tier".to_string(),
                 )]),
+                reasoning_effort_by_model: BTreeMap::from([
+                    ("claude-opus-5-5".to_string(), "medium".to_string()),
+                    ("/Users/ron/.claude".to_string(), "high".to_string()),
+                ]),
                 ..Default::default()
             }),
         }
@@ -6549,6 +6953,10 @@ mod tests {
         );
         // Path-like config value is stripped by backend redaction.
         assert!(!runtime_defaults.selector_context.contains_key("leaked"));
+        assert_eq!(
+            runtime_defaults.reasoning_effort_by_model,
+            BTreeMap::from([("claude-opus-5-5".to_string(), "medium".to_string())])
+        );
     }
 
     fn status_display_fixture() -> AgentStatusSnapshot {
@@ -7677,6 +8085,7 @@ mod tests {
                 organization_identifier_hash: Some("org-hash".to_string()),
                 subscription_product: Some("chatgpt_pro".to_string()),
                 account_attribution_source: Some("current_login_at_reconciliation".to_string()),
+                account_withheld_reason: None,
                 latest_model: Some("claude-opus-5".to_string()),
                 latest_reasoning_effort: Some("high".to_string()),
             }],
@@ -7700,9 +8109,28 @@ mod tests {
         // Snake-case keys the Swift Companion decodes for the session card.
         assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
         assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");
+        // Absent, not null, when the daemon has no withheld reason.
+        assert!(value["sessions"][0]
+            .as_object()
+            .is_some_and(|session| !session.contains_key("account_withheld_reason")));
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
+
+        let mut withheld = reconciliation.clone();
+        withheld.sessions[0].account_identifier_hash = None;
+        withheld.sessions[0].organization_identifier_hash = None;
+        withheld.sessions[0].subscription_product = None;
+        withheld.sessions[0].account_attribution_source = None;
+        withheld.sessions[0].account_withheld_reason = Some("multiple_accounts".to_string());
+        let value = serde_json::to_value(&withheld).expect("serialize withheld reconciliation");
+        assert_eq!(
+            value["sessions"][0]["account_withheld_reason"],
+            "multiple_accounts"
+        );
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize withheld reconciliation");
+        assert_eq!(round_tripped, withheld);
     }
 
     #[test]
@@ -8197,5 +8625,43 @@ mod tests {
         assert!(!is_credit_reason_code("Tenure"));
         assert!(!is_credit_reason_code(&"a".repeat(65)));
         assert!(!is_credit_reason_code("five hour"));
+    }
+
+    #[test]
+    fn verification_check_is_optional_and_unknown_values_stay_unknown() {
+        let old = serde_json::json!({
+            "source": "codex",
+            "config": {"discovered": true, "path_hint": null, "fingerprint": null, "drift": []},
+            "status": "warning",
+            "verified": false,
+            "records_seen": 0,
+            "last_record_id": null,
+            "last_received_at": null,
+            "smoke_after": null,
+            "message": {"code": "codex_local_import", "text": "checked"},
+        });
+        let decoded: SourceVerificationResult = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(decoded.check, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
+
+        let mut future = old;
+        future["check"] = serde_json::json!({"method": "quantum_probe", "scope": "future_scope"});
+        let decoded: SourceVerificationResult = serde_json::from_value(future).unwrap();
+        assert_eq!(
+            decoded.check,
+            Some(SourceVerificationCheck {
+                method: Some(SourceVerificationMethod::Unknown),
+                scope: SourceVerificationScope::Unknown,
+            })
+        );
+
+        let check = SourceVerificationCheck {
+            method: None,
+            scope: SourceVerificationScope::NotEstablished,
+        };
+        assert_eq!(
+            serde_json::to_value(&check).unwrap(),
+            serde_json::json!({"scope": "not_established"})
+        );
     }
 }

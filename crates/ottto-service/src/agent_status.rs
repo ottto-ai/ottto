@@ -1,3 +1,4 @@
+use crate::claude_status_coverage::Observation as CoverageObservation;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use ottto_core::claude_account_identifier_hash;
@@ -50,6 +51,19 @@ use time::{
 
 mod claude_credit_pools;
 mod codex_credit_grants;
+mod codex_last_known;
+mod codex_saved_quota;
+mod codex_setup_gate;
+
+#[cfg(test)]
+pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_now;
+pub use codex_saved_quota::start_codex_quota_scheduler;
+pub(crate) use codex_saved_quota::{
+    refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
+    with_codex_home_read_lock,
+};
+#[cfg(test)]
+pub(crate) use codex_setup_gate::SetupGateTestClock;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -70,17 +84,24 @@ const CLAUDE_OAUTH_USAGE_LEGACY_CACHE_FILE: &str = "claude-code-oauth-usage-cach
 /// Display fallback only: how long a cached payload may still be rendered (as
 /// `Stale`) when the endpoint cannot be reached. Not a refresh cadence.
 const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
-/// Default slot: ~1 read per hour per account binding (~24/day). Sparse
-/// polling is half of the recorded provider-endpoints posture (identify
-/// honestly, poll sparsely, circuit-break instead of adapting). The
-/// activity-based slots in `claude_credit_pools` shorten this to 15 min while
-/// the binding is in active use (up to ~4/hour, ~96/day if active all day) and
-/// lengthen it to 2-3 h once idle; `CLAUDE_ACTIVITY_CADENCE_ENABLED` turns
-/// them off.
-const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 60 * 60;
+/// Unused-account slot: one read per ~40 min per account binding (~36/day).
+/// Sparse polling is half of the recorded provider-endpoints posture
+/// (identify honestly, poll sparsely, circuit-break instead of adapting). The
+/// activity-based slot in `claude_credit_pools` shortens this to 5 min while
+/// the binding is in use on this Mac, and a fresh local statusLine reading
+/// stands in for those reads; `CLAUDE_ACTIVITY_CADENCE_ENABLED` turns the
+/// in-use slot off.
+const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 40 * 60;
 /// Half-width of the deterministic spread applied to the base cadence, giving
-/// an effective gate in the 55-65 minute range.
-const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS: u64 = 5 * 60;
+/// an effective gate in the 38-42 minute range.
+const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS: u64 = 2 * 60;
+/// Spacing after a successful read: 5 min to the next read of the account,
+/// pass to pass. Measured from the start of the collection pass that read
+/// ([`claude_spacing_anchor`]), so the daemon's next 5-min pass finds an
+/// in-use account due wherever in the pass its read falls; two reads can
+/// therefore be up to the anchor cap closer than 5 min. Retry-After and
+/// breaker holds are stored and checked separately and are never shortened
+/// by it.
 const CLAUDE_OAUTH_USAGE_REFRESH_SECONDS: u64 = 5 * 60;
 const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
 /// Off-switch sentinel: while this file exists in the daemon support dir the
@@ -126,6 +147,19 @@ static CLAUDE_SLOT_COLLECTION_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
 const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
 const CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX: usize = 64;
+/// Most plan observations one Desktop pair status carries: exact pairs first,
+/// then their duplicate-session observations. The backend accepts at most 20
+/// plan observations per snapshot and refuses the whole upload over it.
+const CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX: usize = 20;
+/// The backend accepts at most this many status snapshots in one upload.
+const AGENT_STATUS_UPLOAD_SNAPSHOT_MAX: usize = 10;
+/// Whether the account-less Desktop pair status uploads. The backend keeps a
+/// login's metered current row when this status arrives: an account-less,
+/// meterless status no longer takes the profile of its newest linked
+/// observation, so the current-row cleanup cannot delete this Mac's metered
+/// row for that profile. Pair connect targets are local and do not depend on
+/// this.
+const CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED: bool = true;
 // Reuse the daemon's existing detected-use/session retention contract. This
 // warning is a view of the same local activity evidence, not a new lifetime.
 const CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS: i64 =
@@ -164,7 +198,11 @@ struct CodexUsageProbe {
     quota_windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
     account: Option<AgentAccountStatus>,
+    /// Set by a provider read only; a saved reading carries `saved_identity`.
     identity: Option<CodexStrongIdentity>,
+    /// The identity hashes of a saved reading, whose provider validation
+    /// happened when it was read (see `codex_saved_quota`).
+    saved_identity: Option<CodexIdentityHashes>,
     credential_read_failed: bool,
     /// Completion of the app-server read, distinct from quota value changes.
     response_completed_at: Option<String>,
@@ -193,6 +231,44 @@ pub(crate) struct CodexStrongIdentity {
     /// collector holds the raw values, so only it can say they are one account.
     pub(crate) superseded_account_identifier_hash: Option<String>,
     pub(crate) superseded_organization_identifier_hash: Option<String>,
+}
+
+/// The identity hashes of a provider-validated Codex reading, without the raw
+/// workspace id. This is all a saved reading keeps; it grants no setup
+/// authority (setup always reads the provider).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexIdentityHashes {
+    account_identifier_hash: String,
+    workspace_identifier_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_organization_identifier_hash: Option<String>,
+}
+
+impl From<&CodexStrongIdentity> for CodexIdentityHashes {
+    fn from(identity: &CodexStrongIdentity) -> Self {
+        Self {
+            account_identifier_hash: identity.account_identifier_hash.clone(),
+            workspace_identifier_hash: identity.workspace_identifier_hash.clone(),
+            superseded_account_identifier_hash: identity.superseded_account_identifier_hash.clone(),
+            superseded_organization_identifier_hash: identity
+                .superseded_organization_identifier_hash
+                .clone(),
+        }
+    }
+}
+
+/// Where a Codex home's quota comes from in one collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexQuotaRead {
+    /// The home's saved reading (`codex_saved_quota`); never starts a
+    /// provider read. Every status read uses this.
+    Saved,
+    /// Read the provider now (one `codex app-server` run) and save the
+    /// outcome. Only the refresh schedule, an explicit refresh and setup
+    /// checks use this.
+    Provider,
 }
 
 #[derive(Clone)]
@@ -252,6 +328,10 @@ struct ClaudeOAuthUsageCache {
     /// schema and identity are rejected.
     #[serde(default)]
     credit_balances: Vec<AgentCreditBalance>,
+    /// The response said this account has no account-wide weekly limit
+    /// ([`claude_oauth_account_weekly_not_offered`]). Absent in older caches.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    account_weekly_not_offered: bool,
 }
 
 /// v4 adds organization identity and requires exact identity on every embedded
@@ -261,6 +341,11 @@ const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 4;
 const CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION: u16 = 3;
 #[cfg(test)]
 static CLAUDE_OAUTH_PROVIDER_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `codex app-server` runs started by this test process: the seam that proves a
+/// status read never starts one.
+#[cfg(test)]
+static CODEX_APP_SERVER_RUNS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// Tests that must never reach the provider set this: an attempted request is
 /// still counted in `CLAUDE_OAUTH_PROVIDER_CALLS`, then refused locally.
@@ -277,6 +362,9 @@ static CLAUDE_OAUTH_BEFORE_SEND_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
 struct ClaudeOAuthUsage {
     windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
+    /// No account-wide weekly limit applies to this account (provider-stated),
+    /// so a session window alone completes its account windows.
+    account_weekly_not_offered: bool,
 }
 
 /// A collection attempt plus anything the snapshot should say about *why* the
@@ -299,6 +387,40 @@ pub(crate) struct AgentStatusCollection {
     pub source_health_snapshot: AgentStatusSnapshot,
     pub codex_scan_homes: Vec<PathBuf>,
     pub codex_home_bindings: Vec<CodexHomeBinding>,
+}
+
+/// The next time, strictly after `now` (unix seconds), that a Claude binding
+/// in `collection` is due its reset read, so the status lane can run its pass
+/// then rather than up to one interval later. Read from each binding's stored
+/// reading, the same inputs the collector's due check uses.
+pub(crate) fn claude_next_reset_read_at(
+    collection: &AgentStatusCollection,
+    now: u64,
+) -> Option<u64> {
+    collection
+        .snapshots
+        .iter()
+        .flat_map(|snapshot| &snapshot.quota_windows)
+        .filter_map(|window| {
+            Some((
+                window.account_identifier_hash.as_deref()?,
+                window.organization_identifier_hash.as_deref()?,
+            ))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|(account, organization)| {
+            let cache =
+                read_claude_oauth_usage_cache_with_legacy_migration(account, organization, false)?;
+            claude_credit_pools::claude_reset_read_at(
+                &cache.windows,
+                cache.observed_at_epoch_seconds,
+                cache.next_refresh_after_epoch_seconds,
+                claude_credit_pools::claude_reset_read_delay_seconds(account, organization),
+            )
+        })
+        .filter(|at| *at > now)
+        .min()
 }
 
 /// Hash-only identity observed for an exact Codex transcript home.
@@ -1331,6 +1453,21 @@ struct ClaudeDesktopCodeSessionMetadata {
     last_activity_at: Option<Value>,
     #[serde(rename = "createdAt")]
     created_at: Option<Value>,
+    /// Any `importedFrom` tag, null or malformed included, means the session
+    /// was copied into this folder: not native evidence for its folder pair.
+    /// The tag's value is never kept.
+    #[serde(
+        rename = "importedFrom",
+        default,
+        deserialize_with = "deserialize_field_present"
+    )]
+    imported: bool,
+}
+
+fn deserialize_field_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1375,6 +1512,71 @@ struct ClaudeDesktopProfileBuilder {
     session_activity_by_id: BTreeMap<String, Option<i64>>,
     code_session_count: usize,
     agent_mode_session_count: usize,
+}
+
+/// One Desktop `<account>/<organization>` folder pair, across the Code and
+/// agent-mode stores. Every folder takes part in duplicate-session ownership;
+/// only an `exact` one (both names canonical UUIDs) can become a pair. Labels
+/// and plan come only from the same folder pair, never from the account's
+/// other folders.
+#[derive(Debug, Clone, Default)]
+struct ClaudeDesktopPairBuilder {
+    exact: bool,
+    account_label: Option<String>,
+    account_name: Option<String>,
+    organization_label: Option<String>,
+    plan_type: Option<String>,
+    /// Every session seen in the folder pair, imported copies and agent-mode
+    /// sessions included: input to the duplicate-session ownership rule.
+    session_activity_by_id: BTreeMap<String, Option<i64>>,
+    /// Native Code sessions (no `importedFrom`) whose metadata carries a
+    /// parseable activity time. Only these qualify the pair.
+    native_activity_by_id: BTreeMap<String, i64>,
+}
+
+/// One Desktop folder pair: the canonical UUIDs where the names are UUIDs,
+/// otherwise the names as found (a non-UUID name never equals a canonical one).
+type ClaudeDesktopPairKey = (String, String);
+
+fn claude_desktop_pair_builder<'a>(
+    pair_builders: &'a mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
+    account: &str,
+    organization: &str,
+) -> &'a mut ClaudeDesktopPairBuilder {
+    let canonical_account = crate::claude_local_otel::canonical_uuid(account);
+    let canonical_organization = crate::claude_local_otel::canonical_uuid(organization);
+    let exact = canonical_account.is_some() && canonical_organization.is_some();
+    pair_builders
+        .entry((
+            canonical_account.unwrap_or_else(|| account.to_string()),
+            canonical_organization.unwrap_or_else(|| organization.to_string()),
+        ))
+        .or_insert_with(|| ClaudeDesktopPairBuilder {
+            exact,
+            ..ClaudeDesktopPairBuilder::default()
+        })
+}
+
+/// One Desktop metadata scan per status pass: today's per-account observations
+/// for the default snapshot, and the qualified exact folder pairs.
+struct ClaudeDesktopScan {
+    observations: Vec<AgentStatusPlanObservation>,
+    pairs: ClaudeDesktopPairs,
+}
+
+/// Qualified exact Desktop folder pairs, newest native activity first, and the
+/// duplicate sessions they own, newest first. Nothing here is uploaded until
+/// `claude_desktop_pairs_snapshot` subtracts the pairs another upload covers.
+#[derive(Debug, Clone, Default)]
+struct ClaudeDesktopPairs {
+    pairs: Vec<ClaudeDesktopPairObservation>,
+    duplicate_sessions: Vec<ClaudeDesktopPairObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeDesktopPairObservation {
+    binding: ClaudeStrongBinding,
+    observation: AgentStatusPlanObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1497,7 +1699,16 @@ fn collect_codex_status_snapshots(
                 )
             })
             .collect();
-    for process in crate::codex_process_homes::running_codex_homes() {
+    let running_homes = crate::codex_process_homes::running_codex_homes();
+    // A running Codex process holding a rollout in a home is the clearest
+    // evidence that the home is in use; the quota schedule reads it often.
+    codex_saved_quota::note_running_homes(
+        running_homes
+            .iter()
+            .map(|process| process.auth_home.as_path()),
+        current_unix_seconds(),
+    );
+    for process in running_homes {
         // The process holds a rollout in this exact home. Do not publish a
         // current status row for an unregistered home: it can contain labels.
         let process_binding = process_bindings
@@ -1512,6 +1723,7 @@ fn collect_codex_status_snapshots(
                     },
                     &captured_at,
                     &expires_at,
+                    CodexQuotaRead::Saved,
                 );
                 candidate
                     .binding
@@ -1557,6 +1769,7 @@ fn collect_codex_status_snapshots(
     for index in winning_by_binding.into_values() {
         snapshots.push(candidates[index].snapshot.clone());
     }
+    append_failed_default_codex_snapshot(&mut snapshots, &candidates);
     append_configured_codex_unavailable_snapshots(
         &mut snapshots,
         &candidates,
@@ -1601,7 +1814,9 @@ fn append_configured_codex_unavailable_snapshots(
         }
         // These are previously accepted registry bindings, not live credential
         // proof. Never use this fallback for meters, transcript attribution,
-        // successful checks, or labels from the failed/different live identity.
+        // successful checks, or labels from the failed/different live
+        // identity. The binding's last reading is local display only
+        // (`codex_last_known_slot_reading`); the server owns carry-forward.
         let Some((account, workspace)) = candidate
             .slot
             .registered_binding
@@ -1652,6 +1867,178 @@ fn append_configured_codex_unavailable_snapshots(
     }
 }
 
+/// Upload the default home's failed-probe snapshot when it kept the hashes of
+/// its last validated account ([`keep_failed_default_codex_binding`]) and no
+/// other snapshot already represents that account. Without this, a batch that
+/// has any other row never carried the default account's degraded reading.
+/// The candidate's binding stays empty, so transcript attribution is unchanged.
+fn append_failed_default_codex_snapshot(
+    snapshots: &mut Vec<AgentStatusSnapshot>,
+    candidates: &[CodexSlotCandidate],
+) {
+    for candidate in candidates {
+        if candidate.slot.ownership != CodexAccountSlotOwnershipV1::Default
+            || candidate.binding.is_some()
+            || !codex_probe_failed_only(&candidate.status, &candidate.snapshot)
+        {
+            continue;
+        }
+        let Some(kept) = candidate.snapshot.account.as_ref().and_then(|account| {
+            account
+                .account_identifier_hash
+                .as_ref()
+                .zip(account.organization_identifier_hash.as_ref())
+        }) else {
+            continue;
+        };
+        let represented = snapshots.iter().any(|snapshot| {
+            snapshot.account.as_ref().is_some_and(|account| {
+                account.account_identifier_hash.as_ref() == Some(kept.0)
+                    && account.organization_identifier_hash.as_ref() == Some(kept.1)
+            })
+        });
+        if !represented {
+            snapshots.push(candidate.snapshot.clone());
+        }
+    }
+}
+
+/// Whether a slot's only problem is a failed usage probe: the app-server read
+/// failed (`codex_usage_probe_failed`) while the login itself is not known to
+/// be broken. A signed-in home then has no identity hashes
+/// (`identity_unknown`); a signed-out one is `needs_login` and does not count,
+/// and neither does a missing `codex` executable, which is not transient.
+fn codex_probe_failed_only(
+    status: &CodexAccountSlotCollectionStatusV1,
+    snapshot: &AgentStatusSnapshot,
+) -> bool {
+    matches!(
+        status.state,
+        CodexAccountSlotCollectionStateV1::IdentityUnknown
+            | CodexAccountSlotCollectionStateV1::ProviderUnavailable
+    ) && snapshot.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "codex_usage_probe_failed"
+            && !diagnostic
+                .message
+                .starts_with(CODEX_CLI_NOT_FOUND_FOR_PROBE)
+    })
+}
+
+/// The binding last validated at this Codex home, while the home's current
+/// local credential still names that same account and workspace. Decoding the
+/// credential is only a consistency check (the home has not switched
+/// accounts), never authentication: the hashes are those of the earlier
+/// provider-validated reading.
+fn codex_home_kept_binding(codex_home: &Path, home_trust: CodexHomeTrust) -> Option<String> {
+    let last = codex_credit_grants::home_binding(codex_home)?;
+    let credentials = read_codex_auth_credentials_at(codex_home, home_trust)
+        .ok()
+        .flatten()?;
+    let claimed = codex_credential_claimed_binding(&credentials)?;
+    (claimed == last).then_some(last)
+}
+
+/// A default home whose usage probe failed keeps the identity hashes of its
+/// last validated reading (when its credential still names that account), so
+/// the degraded snapshot stays keyed to the same account, and carries that
+/// account's last reading marked stale ([`codex_last_known`]) for local
+/// display; the upload copy drops the reading
+/// (`AgentStatusSnapshot::redacted_for_backend`). The slot's binding stays
+/// empty and the account's confidence is low: kept hashes never become
+/// transcript, session-attribution or live-meter authority.
+fn keep_failed_default_codex_binding(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    snapshot: &mut AgentStatusSnapshot,
+    now: u64,
+) {
+    let Some(binding) = codex_home_kept_binding(codex_home, home_trust) else {
+        return;
+    };
+    let Some((account_hash, workspace_hash)) = binding.split_once(':') else {
+        return;
+    };
+    let Some(account) = snapshot.account.as_mut() else {
+        return;
+    };
+    account.account_identifier_hash = Some(account_hash.to_string());
+    account.organization_identifier_hash = Some(workspace_hash.to_string());
+    // Remembered, not validated in this read: low confidence keeps the kept
+    // hashes out of every consumer that trusts a current login (for example
+    // the current-login fallback of session attribution).
+    account.confidence = AgentStatusConfidence::Low;
+    if let Some((quota_windows, credit_balances)) = codex_last_known::stale_reading(&binding, now) {
+        snapshot.quota_windows = quota_windows;
+        snapshot.credit_balances = credit_balances;
+    }
+}
+
+/// Keep a fresh, bound reading as its binding's last-known meters.
+fn remember_codex_last_known_reading(
+    binding: Option<&(String, String)>,
+    status: &CodexAccountSlotCollectionStatusV1,
+    snapshot: &AgentStatusSnapshot,
+    now: u64,
+) {
+    let Some((account, workspace)) =
+        binding.filter(|_| status.state == CodexAccountSlotCollectionStateV1::Fresh)
+    else {
+        return;
+    };
+    // Keyed on the read itself, not this collection: a saved reading served
+    // again keeps its original read time, so the age cap still holds.
+    let read_at = snapshot
+        .quota_windows
+        .iter()
+        .filter_map(|window| window.observed_at.as_deref())
+        .filter_map(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+        .filter_map(|at| u64::try_from(at.unix_timestamp()).ok())
+        .min()
+        .unwrap_or(now)
+        .min(now);
+    codex_last_known::record(
+        &codex_credit_grants::binding_key(account, workspace),
+        &snapshot.quota_windows,
+        &snapshot.credit_balances,
+        read_at,
+    );
+}
+
+/// Local display only: the last reading of a registered slot whose probe
+/// failed, marked `Stale` with its original read clocks
+/// ([`codex_last_known`]), as the slot's quota snapshot. Only while the
+/// home was last validated as the registered binding and its local
+/// credential still names that account ([`codex_home_kept_binding`]), so a
+/// sign-out or a re-login to another account carries nothing. Never part of
+/// an uploaded snapshot: the server owns carry-forward.
+///
+/// The container's `captured_at` is the time of the failed poll. The time
+/// the reading was taken is each window's and balance's own `observed_at`
+/// (and `grants_observed_at`), which stay the original; a display's "as of"
+/// must come from those.
+///
+/// The candidate keeps its failed state; [`codex_local_slot_status`] gives
+/// the slot the state and hashes local clients need to decode the reading.
+fn codex_last_known_slot_reading(
+    slot: &CodexHomeSlot,
+    captured_at: &str,
+    now: u64,
+) -> Option<CodexAccountSlotQuotaSnapshotV1> {
+    let (account, workspace) = slot.registered_binding.as_ref()?;
+    let binding = codex_credit_grants::binding_key(account, workspace);
+    if codex_home_kept_binding(&slot.home, CodexHomeTrust::Managed).as_deref()
+        != Some(binding.as_str())
+    {
+        return None;
+    }
+    let (quota_windows, credit_balances) = codex_last_known::stale_reading(&binding, now)?;
+    Some(CodexAccountSlotQuotaSnapshotV1 {
+        captured_at: captured_at.to_string(),
+        quota_windows,
+        credit_balances,
+    })
+}
+
 fn codex_source_health_snapshot(
     candidates: &[CodexSlotCandidate],
     captured_at: &str,
@@ -1669,6 +2056,11 @@ fn codex_source_health_snapshot(
                 expires_at.to_string(),
             )
         });
+    // A failed usage probe is a transient read failure, retried at the next
+    // poll; it is not a connection that needs local attention.
+    let probe_failed_only = |candidate: &&CodexSlotCandidate| {
+        codex_probe_failed_only(&candidate.status, &candidate.snapshot)
+    };
     let custom_needs_attention = candidates.iter().any(|candidate| {
         candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed
             && !matches!(
@@ -1676,6 +2068,14 @@ fn codex_source_health_snapshot(
                 CodexAccountSlotCollectionStateV1::Fresh
                     | CodexAccountSlotCollectionStateV1::DuplicateAccount
             )
+            && !probe_failed_only(&candidate)
+    });
+    let usage_read_failed = candidates
+        .iter()
+        .any(|candidate| probe_failed_only(&candidate));
+    let default_probe_failed = candidates.iter().any(|candidate| {
+        candidate.slot.ownership == CodexAccountSlotOwnershipV1::Default
+            && probe_failed_only(&candidate)
     });
     if !custom_needs_attention && source_health_snapshot.status != AgentStatusState::Available {
         if let Some(healthy_anchor) = candidates.iter().find(|candidate| {
@@ -1685,8 +2085,16 @@ fn codex_source_health_snapshot(
             source_health_snapshot = healthy_anchor.snapshot.clone();
         }
     }
+    // A default login whose usage probe failed is still a working login; a
+    // signed-out or otherwise failed one is not, and keeps its own status.
+    let current_login_available = source_health_snapshot.status == AgentStatusState::Available
+        || (default_probe_failed
+            && source_health_snapshot.status == AgentStatusState::Degraded
+            && source_health_snapshot
+                .account
+                .as_ref()
+                .is_some_and(|account| account.login_state == AgentLoginState::SignedIn));
     if custom_needs_attention {
-        let current_login_available = source_health_snapshot.status == AgentStatusState::Available;
         if current_login_available {
             source_health_snapshot.status = AgentStatusState::Degraded;
         }
@@ -1700,6 +2108,15 @@ fn codex_source_health_snapshot(
                 },
                 AgentDiagnosticSeverity::Warning,
                 "One or more durable Codex account connections need local attention; healthy accounts continue collecting independently.",
+            ));
+    } else if usage_read_failed && current_login_available {
+        source_health_snapshot.status = AgentStatusState::Degraded;
+        source_health_snapshot
+            .diagnostics
+            .push(AgentStatusDiagnostic::source(
+                "codex_usage_read_retrying",
+                AgentDiagnosticSeverity::Warning,
+                "A Codex usage check failed (for example it timed out); it is retried at the next poll, and the last readings are kept, marked stale.",
             ));
     }
     source_health_snapshot
@@ -1732,8 +2149,23 @@ impl CodexSlotSetupCollectionError {
     }
 }
 
+/// Which setup step reads a registered Codex home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexSetupRead<'a> {
+    /// A check of a setup that waits for the person's sign-in. Clients repeat
+    /// it every few seconds, so its provider reads are spaced per home
+    /// (`codex_setup_gate`); `explicit` is a person's check.
+    WaitingForLogin {
+        operation_id: &'a str,
+        explicit: bool,
+    },
+    /// A validation step. It moves the setup out of waiting, so it reads now.
+    Validation,
+}
+
 pub(crate) fn collect_registered_codex_slot_for_setup(
     slot_id: &str,
+    read: CodexSetupRead<'_>,
 ) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), CodexSlotSetupCollectionError>
 {
     let store = FileCodexAccountSlotSettingsStore::default();
@@ -1742,13 +2174,41 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
             "Codex durable connection state is unavailable.".to_string(),
         )
     })?;
+    match read {
+        CodexSetupRead::WaitingForLogin {
+            operation_id,
+            explicit,
+        } => codex_setup_gate::read_waiting_setup_home(&home, operation_id, explicit, || {
+            let result = read_registered_codex_home_for_setup(&home);
+            let succeeded = result.is_ok();
+            (result, succeeded)
+        })
+        .unwrap_or_else(|deferred| {
+            Err(CodexSlotSetupCollectionError::ProviderLoginPending(
+                deferred.message(),
+            ))
+        }),
+        CodexSetupRead::Validation => read_registered_codex_home_for_setup(&home),
+    }
+}
+
+fn read_registered_codex_home_for_setup(
+    home: &Path,
+) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), CodexSlotSetupCollectionError>
+{
     let captured_at = crate::current_rfc3339_timestamp();
-    let (snapshot, identity, _) = collect_codex_status_for_home(
-        captured_at.clone(),
-        captured_at,
-        &home,
-        CodexHomeTrust::Managed,
-    );
+    // A setup check needs a fresh provider read; it also refreshes the saved
+    // copy every status read then serves.
+    let (snapshot, identity, _) =
+        crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Setup, || {
+            collect_codex_status_for_home(
+                captured_at.clone(),
+                captured_at,
+                home,
+                CodexHomeTrust::Managed,
+                CodexQuotaRead::Provider,
+            )
+        });
     let identity = identity.ok_or_else(|| {
         CodexSlotSetupCollectionError::ProviderLoginPending(
             "Codex sign-in has not produced a complete account and workspace identity.".to_string(),
@@ -1774,6 +2234,31 @@ fn collect_codex_slot_candidates(
     captured_at: &str,
     expires_at: &str,
 ) -> (CodexAccountsStatusV1, Vec<CodexSlotCandidate>) {
+    let slots = codex_home_slots(&status);
+    let candidates = thread::scope(|scope| {
+        let handles = slots
+            .into_iter()
+            .map(|slot| {
+                scope.spawn(move || {
+                    collect_codex_home_candidate(
+                        slot,
+                        captured_at,
+                        expires_at,
+                        CodexQuotaRead::Saved,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect()
+    });
+    (status, candidates)
+}
+
+/// The default Codex home and every accepted managed slot home.
+fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
     let store = FileCodexAccountSlotSettingsStore::default();
     let mut slots = vec![CodexHomeSlot {
         slot_id: "default".to_string(),
@@ -1804,25 +2289,14 @@ fn collect_codex_slot_candidates(
             });
         }
     }
-    let candidates = thread::scope(|scope| {
-        let handles = slots
-            .into_iter()
-            .map(|slot| {
-                scope.spawn(move || collect_codex_home_candidate(slot, captured_at, expires_at))
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .filter_map(|handle| handle.join().ok())
-            .collect()
-    });
-    (status, candidates)
+    slots
 }
 
 fn collect_codex_home_candidate(
     slot: CodexHomeSlot,
     captured_at: &str,
     expires_at: &str,
+    quota_read: CodexQuotaRead,
 ) -> CodexSlotCandidate {
     let home_trust = match slot.ownership {
         CodexAccountSlotOwnershipV1::Default => CodexHomeTrust::ProviderDefault,
@@ -1837,9 +2311,23 @@ fn collect_codex_home_candidate(
         expires_at.to_string(),
         &slot.home,
         home_trust,
+        quota_read,
     );
     let mut status = codex_collection_status_from_snapshot(&snapshot);
     let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut status);
+    let now = current_unix_seconds();
+    remember_codex_last_known_reading(binding.as_ref(), &status, &snapshot, now);
+    if binding.is_none() && codex_probe_failed_only(&status, &snapshot) {
+        match slot.ownership {
+            CodexAccountSlotOwnershipV1::Default => {
+                keep_failed_default_codex_binding(&slot.home, home_trust, &mut snapshot, now);
+            }
+            CodexAccountSlotOwnershipV1::Managed => {
+                status.quota_snapshot =
+                    codex_last_known_slot_reading(&slot, &snapshot.captured_at, now);
+            }
+        }
+    }
     let quality = codex_snapshot_quality(&snapshot, &status);
     let after = std::fs::metadata(&auth_path)
         .and_then(|metadata| metadata.modified())
@@ -1974,16 +2462,124 @@ fn apply_codex_candidate_statuses(
         .iter()
         .find(|candidate| candidate.slot.slot_id == "default")
     {
-        status.default_slot.collection = candidate.status.clone();
+        status.default_slot.collection = codex_local_slot_status(candidate);
     }
     for descriptor in &mut status.managed_slots {
         if let Some(candidate) = candidates
             .iter()
             .find(|candidate| candidate.slot.slot_id == descriptor.slot_id)
         {
-            descriptor.collection = candidate.status.clone();
+            descriptor.collection = codex_local_slot_status(candidate);
         }
     }
+    // A last-known slot keeps its hashes only when no other slot, the
+    // default one included, carries the same account and workspace. A local
+    // client rejects the whole status when two managed slots share a binding
+    // and are not one anchor plus declared duplicates, and it shows one card
+    // per account from every slot of that account: an `unknown` slot there
+    // would hide the meters another slot of the account read fresh.
+    let mut slots_by_binding = BTreeMap::<(String, String), usize>::new();
+    if let Some(binding) = codex_slot_status_binding(&status.default_slot.collection) {
+        *slots_by_binding.entry(binding).or_default() += 1;
+    }
+    for descriptor in &status.managed_slots {
+        if let Some(binding) = codex_slot_status_binding(&descriptor.collection) {
+            *slots_by_binding.entry(binding).or_default() += 1;
+        }
+    }
+    for descriptor in &mut status.managed_slots {
+        if descriptor.collection.state != CodexAccountSlotCollectionStateV1::Unknown {
+            continue;
+        }
+        let shared = codex_slot_status_binding(&descriptor.collection)
+            .is_some_and(|binding| slots_by_binding.get(&binding).copied().unwrap_or(0) > 1);
+        if !shared {
+            continue;
+        }
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.slot.slot_id == descriptor.slot_id)
+        {
+            descriptor.collection = candidate.status.clone();
+            descriptor.collection.quota_snapshot = None;
+        }
+    }
+}
+
+fn codex_slot_status_binding(
+    status: &CodexAccountSlotCollectionStatusV1,
+) -> Option<(String, String)> {
+    status
+        .account_identifier_hash
+        .clone()
+        .zip(status.workspace_identifier_hash.clone())
+}
+
+/// The slot status as local clients read it.
+///
+/// Shipped clients decode a slot's `quota_snapshot` only on state `unknown`,
+/// `fresh` or `duplicate_account`, only with both identity hashes, and only
+/// when every meter carries those hashes; one slot outside that rule fails
+/// the whole Codex accounts status. A failed read that shows its last-known
+/// reading ([`codex_last_known_slot_reading`]) is therefore sent as
+/// `unknown` with the registered hashes, which
+/// [`codex_last_known_slot_reading`] has already matched against the home's
+/// local credential. Any other snapshot outside the rule is not sent.
+///
+/// Wire shape only: the candidate's own state, binding and health are
+/// unchanged, and `unknown` gives a client no authority over the slot.
+/// Shipped clients decode this shape but do not show the reading of an
+/// `unknown` slot; the slot also gives way to any other slot of the same
+/// account ([`apply_codex_candidate_statuses`]).
+fn codex_local_slot_status(candidate: &CodexSlotCandidate) -> CodexAccountSlotCollectionStatusV1 {
+    let mut status = candidate.status.clone();
+    if status.quota_snapshot.is_none() || codex_slot_quota_snapshot_is_admitted(&status) {
+        return status;
+    }
+    if candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed
+        && candidate.binding.is_none()
+        && codex_probe_failed_only(&candidate.status, &candidate.snapshot)
+    {
+        if let Some((account, workspace)) = candidate.slot.registered_binding.clone() {
+            let mut last_known = status.clone();
+            last_known.state = CodexAccountSlotCollectionStateV1::Unknown;
+            last_known.account_identifier_hash = Some(account);
+            last_known.workspace_identifier_hash = Some(workspace);
+            if codex_slot_quota_snapshot_is_admitted(&last_known) {
+                return last_known;
+            }
+        }
+    }
+    status.quota_snapshot = None;
+    status
+}
+
+/// Whether local clients admit this status's `quota_snapshot`.
+fn codex_slot_quota_snapshot_is_admitted(status: &CodexAccountSlotCollectionStatusV1) -> bool {
+    let Some(snapshot) = status.quota_snapshot.as_ref() else {
+        return true;
+    };
+    if !matches!(
+        status.state,
+        CodexAccountSlotCollectionStateV1::Unknown
+            | CodexAccountSlotCollectionStateV1::Fresh
+            | CodexAccountSlotCollectionStateV1::DuplicateAccount
+    ) {
+        return false;
+    }
+    let (Some(account), Some(workspace)) = (
+        status.account_identifier_hash.as_deref(),
+        status.workspace_identifier_hash.as_deref(),
+    ) else {
+        return false;
+    };
+    snapshot.quota_windows.iter().all(|window| {
+        window.account_identifier_hash.as_deref() == Some(account)
+            && window.organization_identifier_hash.as_deref() == Some(workspace)
+    }) && snapshot.credit_balances.iter().all(|balance| {
+        balance.account_identifier_hash.as_deref() == Some(account)
+            && balance.organization_identifier_hash.as_deref() == Some(workspace)
+    })
 }
 
 /// Shown when the credential does not claim an email for the account.
@@ -2398,9 +2994,8 @@ fn projected_codex_target_health(
         CodexAccountSlotCollectionStateV1::Fresh => CodexAccountTargetHealthV1::Healthy,
         CodexAccountSlotCollectionStateV1::Unverified => CodexAccountTargetHealthV1::Unverified,
         CodexAccountSlotCollectionStateV1::NeedsLogin => CodexAccountTargetHealthV1::NeedsLogin,
-        CodexAccountSlotCollectionStateV1::IdentityUnknown => {
-            CodexAccountTargetHealthV1::IdentityUnknown
-        }
+        CodexAccountSlotCollectionStateV1::IdentityUnknown
+        | CodexAccountSlotCollectionStateV1::Unknown => CodexAccountTargetHealthV1::IdentityUnknown,
         CodexAccountSlotCollectionStateV1::IdentityMismatch => {
             CodexAccountTargetHealthV1::IdentityMismatch
         }
@@ -2499,6 +3094,7 @@ fn empty_codex_accounts_status() -> CodexAccountsStatusV1 {
             used_slots: 1,
             remaining_slots: ottto_core::MAX_CODEX_ACCOUNT_SLOTS.saturating_sub(1),
         },
+        daemon_sign_in_supported: None,
     }
 }
 
@@ -2527,6 +3123,7 @@ fn collect_codex_status_for_home(
     expires_at: String,
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    quota_read: CodexQuotaRead,
 ) -> (
     AgentStatusSnapshot,
     Option<CodexStrongIdentity>,
@@ -2640,7 +3237,8 @@ fn collect_codex_status_for_home(
         "Codex credit balance was not available from the local account probe.",
     );
     let mut strong_identity = None;
-    match collect_codex_usage_for_home(codex_home, home_trust) {
+    let mut probe_failed = false;
+    match collect_codex_usage_for_home(codex_home, home_trust, quota_read) {
         Ok(usage) => {
             if usage.credential_read_failed {
                 append_codex_credential_read_failed_diagnostic(&mut snapshot);
@@ -2648,8 +3246,13 @@ fn collect_codex_status_for_home(
             if let Some(account) = usage.account {
                 snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), account));
             }
-            if let Some(identity) = usage.identity {
-                strong_identity = Some(identity.clone());
+            let identity_hashes = usage
+                .identity
+                .as_ref()
+                .map(CodexIdentityHashes::from)
+                .or(usage.saved_identity);
+            strong_identity = usage.identity;
+            if let Some(identity) = identity_hashes.as_ref() {
                 if let Some(account) = snapshot.account.as_mut() {
                     account.account_identifier_hash =
                         Some(identity.account_identifier_hash.clone());
@@ -2674,7 +3277,7 @@ fn collect_codex_status_for_home(
             });
             if let Some(diagnostic) = codex_app_server_success_diagnostic(
                 usage.response_completed_at.clone(),
-                strong_identity.as_ref(),
+                identity_hashes.as_ref(),
                 !usage.quota_windows.is_empty() || !usage.credit_balances.is_empty(),
             ) {
                 snapshot.diagnostics.push(diagnostic);
@@ -2682,7 +3285,7 @@ fn collect_codex_status_for_home(
             if let Some(summary) = usage.rate_limit_pool_summary {
                 if let Some(mut diagnostic) = codex_app_server_success_diagnostic(
                     usage.response_completed_at.clone(),
-                    strong_identity.as_ref(),
+                    identity_hashes.as_ref(),
                     true,
                 ) {
                     diagnostic.code = "codex_rate_limit_pools_observed".to_string();
@@ -2693,7 +3296,7 @@ fn collect_codex_status_for_home(
             if let Some(summary) = usage.reset_credit_detail_summary {
                 if let Some(mut diagnostic) = codex_app_server_success_diagnostic(
                     usage.response_completed_at,
-                    strong_identity.as_ref(),
+                    identity_hashes.as_ref(),
                     true,
                 ) {
                     diagnostic.code = "codex_reset_credit_details_observed".to_string();
@@ -2719,15 +3322,27 @@ fn collect_codex_status_for_home(
                 );
             }
         }
-        Err(message) => {
+        Err(failure) if failure.message == codex_saved_quota::CODEX_QUOTA_NOT_READ_YET => {
+            // No usable saved reading yet (first start, or the local login
+            // changed): the schedule reads it shortly. Not a failed read.
+            snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                "codex_quota_not_read_yet",
+                AgentDiagnosticSeverity::Info,
+                failure.message,
+            ));
+        }
+        Err(failure) => {
+            probe_failed = !failure.message.starts_with(CODEX_CLI_NOT_FOUND_FOR_PROBE);
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
             snapshot.diagnostics.push(
                 AgentStatusDiagnostic::source(
                     "codex_usage_probe_failed",
                     AgentDiagnosticSeverity::Warning,
-                    message,
+                    failure.message,
                 )
-                .with_observed_at(rfc3339_from_unix_seconds(current_unix_seconds()))
+                // When the read failed, not when it is served.
+                .with_observed_at(rfc3339_from_unix_seconds(failure.at_epoch_seconds))
                 .with_quota_binding(
                     snapshot
                         .account
@@ -2771,6 +3386,11 @@ fn collect_codex_status_for_home(
     {
         snapshot.status = AgentStatusState::Available;
     }
+    // A failed usage read is a degraded reading even when the login works;
+    // `codex_usage_probe_failed` is its stable code.
+    if probe_failed && snapshot.status == AgentStatusState::Available {
+        snapshot.status = AgentStatusState::Degraded;
+    }
     append_current_plan_observation(&mut snapshot);
     let workspace_targets =
         append_codex_workspace_observations_at(&mut snapshot, codex_home, home_trust);
@@ -2781,6 +3401,29 @@ fn collect_codex_status_for_home(
 }
 
 fn collect_codex_usage_for_home(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    quota_read: CodexQuotaRead,
+) -> Result<CodexUsageProbe, codex_saved_quota::CodexQuotaFailure> {
+    match quota_read {
+        CodexQuotaRead::Saved => {
+            codex_saved_quota::serve_saved(codex_home, home_trust, current_unix_seconds())
+        }
+        CodexQuotaRead::Provider => {
+            codex_saved_quota::read_provider_and_save(codex_home, home_trust, |_, _| true)
+                .unwrap_or_else(|| Err(codex_saved_quota::CODEX_QUOTA_NOT_READ_YET.to_string()))
+                .map_err(|message| codex_saved_quota::CodexQuotaFailure {
+                    message,
+                    at_epoch_seconds: current_unix_seconds(),
+                })
+        }
+    }
+}
+
+/// One provider read of a Codex home's quota: the app-server, or the legacy
+/// OAuth endpoint where that is still allowed. Callers go through
+/// [`codex_saved_quota::read_provider_and_save`], which saves the outcome.
+fn read_codex_usage_from_provider(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
 ) -> Result<CodexUsageProbe, String> {
@@ -2856,6 +3499,7 @@ fn build_codex_runtime_defaults_at(
         fast_mode_enabled,
         priority_enabled: None,
         reasoning_effort: defaults.reasoning_effort,
+        reasoning_effort_by_model: BTreeMap::new(),
         approval_policy: defaults.approval_policy,
         sandbox_mode: None,
         selector_context: defaults.selector_context,
@@ -2933,10 +3577,11 @@ fn claude_runtime_defaults_from_paths(
                     speed_mode: None,
                     fast_mode_enabled: defaults.fast_mode_enabled,
                     priority_enabled: None,
-                    // Claude Code's durable `effortLevel` setting, which
-                    // `/effort` writes. Reported exactly as configured; absent
-                    // means absent, never an invented default.
+                    // The saved model's `/effort` (or the legacy top-level
+                    // `effortLevel`), plus every model's saved effort. Reported
+                    // exactly as configured; absent means absent.
                     reasoning_effort: defaults.reasoning_effort,
+                    reasoning_effort_by_model: defaults.reasoning_effort_by_model,
                     approval_policy: defaults.approval_policy,
                     sandbox_mode: defaults.sandbox_mode,
                     selector_context: defaults.selector_context,
@@ -3318,12 +3963,14 @@ pub(crate) fn claude_refresher_skip_reason(
 /// Snapshot diagnostic for the default login's lifetime warning.
 const CLAUDE_RELOGIN_APPROACHING_CODE: &str = "claude_relogin_approaching";
 
+/// Also returns this pass's exact Claude Desktop folder pairs, read in the same
+/// single scan as the default snapshot's Desktop readings.
 fn collect_claude_status(
     captured_at: String,
     expires_at: String,
     slot_owned_bindings: &BTreeSet<ClaudeStrongBinding>,
     keep_signed_in: bool,
-) -> AgentStatusSnapshot {
+) -> (AgentStatusSnapshot, ClaudeDesktopPairs) {
     // Presence is decided by the canonical detector, which requires the `claude`
     // binary. A lone `~/.claude/settings.json` — which Ottto's own relay-base
     // patch writes during onboarding — must NOT read as "installed", or a Mac
@@ -3333,7 +3980,10 @@ fn collect_claude_status(
     let claude_cli_present =
         crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode);
     if !claude_cli_present && !claude_desktop_metadata_present(&claude_desktop_root) {
-        return not_installed_snapshot(SourceKind::ClaudeCode, "claude", captured_at, expires_at);
+        return (
+            not_installed_snapshot(SourceKind::ClaudeCode, "claude", captured_at, expires_at),
+            ClaudeDesktopPairs::default(),
+        );
     }
     let mut snapshot = base_snapshot(
         SourceKind::ClaudeCode,
@@ -3556,8 +4206,10 @@ fn collect_claude_status(
         .as_ref()
         .map(|(account_hash, _)| account_hash.clone())
         .unwrap_or_default();
-    let desktop_plan_observations =
-        claude_desktop_plan_observations_from_root(&claude_desktop_root, &snapshot.captured_at);
+    let ClaudeDesktopScan {
+        observations: desktop_plan_observations,
+        pairs: desktop_pairs,
+    } = claude_desktop_scan_from_root(&claude_desktop_root, &snapshot.captured_at);
     let observable_account_identifier_hashes =
         claude_account_identifier_hashes_from_observations(&desktop_plan_observations);
     let apply_statusline_quota = |snapshot: &mut AgentStatusSnapshot,
@@ -3659,9 +4311,11 @@ fn collect_claude_status(
     // breaker: they travel to the backend with the agent-status upload.
     snapshot.diagnostics.extend(oauth_outcome.diagnostics);
     let mut full_oauth_quota_collected = false;
+    let mut account_weekly_not_offered = false;
     match oauth_outcome.result {
         Ok(usage) if !usage.windows.is_empty() => {
             full_oauth_quota_collected = true;
+            account_weekly_not_offered = usage.account_weekly_not_offered;
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
             snapshot.quota_windows = usage.windows;
             snapshot.credit_balances = usage.credit_balances;
@@ -3774,6 +4428,11 @@ fn collect_claude_status(
         context_capability,
         runtime_defaults.capability,
     ];
+    if account_weekly_not_offered {
+        snapshot
+            .capabilities
+            .push(claude_account_weekly_not_offered_capability());
+    }
     if let Some(diagnostic) = runtime_defaults.diagnostic {
         snapshot.diagnostics.push(diagnostic);
     }
@@ -3801,7 +4460,7 @@ fn collect_claude_status(
             "Claude Desktop Code account/session bucket metadata was detected.",
         ));
     }
-    snapshot
+    (snapshot, desktop_pairs)
 }
 
 /// The registered-slot settings for one collection pass. A failed read is
@@ -3901,7 +4560,7 @@ fn collect_claude_status_snapshots(
     let upkeep_consent = settings.as_ref().is_ok_and(|status| {
         status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
     });
-    let mut default_snapshot = collect_claude_status(
+    let (mut default_snapshot, desktop_pairs) = collect_claude_status(
         captured_at.clone(),
         expires_at.clone(),
         &slot_owned_bindings,
@@ -3977,6 +4636,8 @@ fn collect_claude_status_snapshots(
     custom_descriptors.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
     let (custom_descriptors, overflow_descriptors) =
         bounded_claude_custom_descriptors(custom_descriptors);
+    let coverage_dirs = crate::claude_status_coverage::enabled()
+        .then(|| claude_status_coverage_dirs(&custom_descriptors, &overflow_descriptors));
     for descriptor in overflow_descriptors {
         slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
     }
@@ -3987,6 +4648,7 @@ fn collect_claude_status_snapshots(
                 crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget,
             ) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
+                note_claude_status_coverage(&descriptor, &captured_at, CoverageObservation::Unavailable);
                 continue;
             }
             Some(
@@ -3994,6 +4656,7 @@ fn collect_claude_status_snapshots(
                 | crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveWhileStateUnavailable,
             ) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
+                note_claude_status_coverage(&descriptor, &captured_at, CoverageObservation::Unavailable);
                 slot_states.insert(descriptor.slot_id.clone(), descriptor.collection.clone());
                 continue;
             }
@@ -4007,6 +4670,11 @@ fn collect_claude_status_snapshots(
                 Ok(expected) => expected,
                 Err(status) => {
                     claude_oauth_end_slot_run(&descriptor.slot_id);
+                    note_claude_status_coverage(
+                        &descriptor,
+                        &captured_at,
+                        CoverageObservation::Unavailable,
+                    );
                     slot_states.insert(descriptor.slot_id, status);
                     continue;
                 }
@@ -4035,6 +4703,11 @@ fn collect_claude_status_snapshots(
         );
         if !upkeep.proceed_with_collection {
             claude_oauth_end_slot_run(&descriptor.slot_id);
+            note_claude_status_coverage(
+                &descriptor,
+                &captured_at,
+                CoverageObservation::Unavailable,
+            );
             let result_observed_at = upkeep.result_observed_at.clone();
             let paused = upkeep.paused_awaiting_claude_refresh;
             let mut status = if paused {
@@ -4063,6 +4736,15 @@ fn collect_claude_status_snapshots(
             Ok(resolved) => resolved,
             Err(failure) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
+                note_claude_status_coverage(
+                    &descriptor,
+                    &captured_at,
+                    match failure {
+                        ClaudeSlotProbeFailure::SignedOutByCli
+                        | ClaudeSlotProbeFailure::IdentityUnknown => CoverageObservation::SignedOut,
+                        _ => CoverageObservation::Unavailable,
+                    },
+                );
                 let status = registered_claude_failure_status(
                     &descriptor,
                     failure,
@@ -4082,11 +4764,24 @@ fn collect_claude_status_snapshots(
             &captured_at,
         ) {
             claude_oauth_end_slot_run(&slot_id);
+            note_claude_status_coverage(
+                &descriptor,
+                &captured_at,
+                CoverageObservation::Unavailable,
+            );
             slot_states.insert(slot_id, status);
             continue;
         }
         let account_hash = resolved.account_identifier_hash.clone();
         let organization_hash = resolved.organization_identifier_hash.clone();
+        note_claude_status_coverage(
+            &descriptor,
+            &captured_at,
+            CoverageObservation::Qualified {
+                login: &account_hash,
+                org: &organization_hash,
+            },
+        );
         let access_token = resolved.credential.access_token.take();
         let credential_available = access_token.is_some();
         let outcome = collect_claude_oauth_usage_with_credential(
@@ -4129,6 +4824,12 @@ fn collect_claude_status_snapshots(
                 slot_states.insert(slot_id, state);
             }
         }
+    }
+    if let Some(dirs) = &coverage_dirs {
+        crate::claude_status_coverage::retain_registered(
+            dirs.iter().map(String::as_str),
+            &home_dir().join(".claude"),
+        );
     }
     let approvals = claude_slot_approvals();
     for (slot_id, status) in &mut slot_states {
@@ -4244,6 +4945,8 @@ fn collect_claude_status_snapshots(
         }
     }
     let mut snapshots = Vec::with_capacity(selection.winning_by_binding.len());
+    // Slot id and binding of each candidate upload, in `snapshots` order.
+    let mut uploaded_slots = Vec::with_capacity(selection.winning_by_binding.len());
     for (index, candidate) in candidates.into_iter().enumerate() {
         match dispositions[index] {
             ClaudeSnapshotDisposition::Upload => {
@@ -4258,6 +4961,7 @@ fn collect_claude_status_snapshots(
                     );
                     continue;
                 }
+                uploaded_slots.push((candidate.slot_id.clone(), candidate.binding.clone()));
                 snapshots.push(claude_uploaded_candidate_snapshot(
                     candidate,
                     &anchor_health_by_binding,
@@ -4286,6 +4990,20 @@ fn collect_claude_status_snapshots(
             }
         }
     }
+    let default_binding = default_snapshot.account.as_ref().and_then(|account| {
+        ClaudeStrongBinding::new(
+            account.account_identifier_hash.as_deref()?,
+            account.organization_identifier_hash.as_deref()?,
+        )
+    });
+    if let Some(index) = claude_runtime_defaults_carrier(
+        &snapshots,
+        &uploaded_slots,
+        default_snapshot.runtime_defaults.is_some(),
+        default_binding.as_ref(),
+    ) {
+        snapshots[index].runtime_defaults = default_snapshot.runtime_defaults.clone();
+    }
     snapshots.extend(degraded_claude_slot_snapshots(
         &slot_states,
         &canonical_anchors,
@@ -4293,8 +5011,10 @@ fn collect_claude_status_snapshots(
         &captured_at,
         &expires_at,
     ));
+    append_claude_desktop_pairs_snapshot(&mut snapshots, &desktop_pairs, &captured_at, &expires_at);
     let unresolved_accounts = derive_unresolved_claude_accounts(
         &default_snapshot,
+        &desktop_pairs,
         &snapshots,
         &slot_states,
         OffsetDateTime::parse(&captured_at, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc()),
@@ -4754,6 +5474,38 @@ fn claude_stale_saved_slot_states(
         .collect()
 }
 
+/// Which uploaded candidate snapshot should carry this Mac's Claude Code
+/// settings (`runtime_defaults`), if any.
+///
+/// Only the default login's snapshot is built with them, and when the Claude
+/// accounts are registered slots the default login is usually not uploaded,
+/// so its settings would never reach the server. They are machine-level and
+/// the server keeps one log per machine and install, so exactly one upload
+/// carries a copy, and none when one already does (the default login itself
+/// uploaded) or this pass built none. The carrier is the upload for the
+/// default login's account, otherwise the lowest slot id, so every pass with
+/// the same uploads picks the same one. `uploaded_slots[i]` is the slot id and
+/// binding of `snapshots[i]`.
+fn claude_runtime_defaults_carrier(
+    snapshots: &[AgentStatusSnapshot],
+    uploaded_slots: &[(String, ClaudeStrongBinding)],
+    defaults_built: bool,
+    default_binding: Option<&ClaudeStrongBinding>,
+) -> Option<usize> {
+    if !defaults_built
+        || snapshots
+            .iter()
+            .any(|snapshot| snapshot.runtime_defaults.is_some())
+    {
+        return None;
+    }
+    uploaded_slots
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (slot_id, binding))| (Some(binding) != default_binding, slot_id))
+        .map(|(index, _)| index)
+}
+
 /// A default-login candidate for an account a registered slot owns uploads
 /// only while that account's registered anchor is present this pass.
 fn claude_default_upload_withheld(
@@ -4885,15 +5637,12 @@ fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<Clau
                     .credit_balances
                     .iter()
                     .all(|balance| balance.freshness == AgentQuotaWindowFreshness::Fresh);
-            let complete = snapshot.quota_windows.iter().any(|window| {
-                window.scope == AgentQuotaWindowScope::Account && window.name == "session"
-            }) && snapshot.quota_windows.iter().any(|window| {
-                window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
-            }) && snapshot.quota_windows.iter().any(|window| {
-                window.scope == AgentQuotaWindowScope::Model
-                    || window.model.is_some()
-                    || window.group.is_some()
-            });
+            let complete = claude_snapshot_has_account_windows(snapshot)
+                && snapshot.quota_windows.iter().any(|window| {
+                    window.scope == AgentQuotaWindowScope::Model
+                        || window.model.is_some()
+                        || window.group.is_some()
+                });
             return Some(ClaudeSnapshotQuality {
                 tier: match (fresh, complete) {
                     (true, true) => 4,
@@ -4951,6 +5700,20 @@ fn coherent_claude_provider_observed_at(snapshot: &AgentStatusSnapshot) -> Strin
         .min()
         .unwrap_or(snapshot.captured_at.as_str())
         .to_string()
+}
+
+/// Every registered custom folder for the status-coverage feed. Slots past
+/// collection capacity are still registered: their transcripts must never
+/// read as never-registered.
+fn claude_status_coverage_dirs(
+    collected: &[ClaudeConfigSlotDescriptorV1],
+    overflow: &[ClaudeConfigSlotDescriptorV1],
+) -> Vec<String> {
+    collected
+        .iter()
+        .chain(overflow)
+        .filter_map(|descriptor| descriptor.config_dir.clone())
+        .collect()
 }
 
 fn bounded_claude_custom_descriptors(
@@ -5864,20 +6627,17 @@ fn custom_claude_snapshot_from_usage(
     ) {
         return Err(ClaudeSlotProbeFailure::IdentityMismatch.status(&captured_at));
     }
+    // Credit sections carry their own per-section freshness (each from its own
+    // read time); the slot's state is its meters', as in
+    // `local_claude_quota_snapshot`. A section read on alternate slots goes
+    // Stale while the windows are fresh, which is not a failed read.
     let stale = usage
         .windows
         .iter()
-        .any(|window| window.freshness != AgentQuotaWindowFreshness::Fresh)
-        || usage
-            .credit_balances
-            .iter()
-            .any(|balance| balance.freshness != AgentQuotaWindowFreshness::Fresh);
+        .any(|window| window.freshness != AgentQuotaWindowFreshness::Fresh);
+    let account_weekly_not_offered = usage.account_weekly_not_offered;
     let has_account_windows =
-        usage.windows.iter().any(|window| {
-            window.scope == AgentQuotaWindowScope::Account && window.name == "session"
-        }) && usage.windows.iter().any(|window| {
-            window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
-        });
+        claude_has_account_windows(&usage.windows, account_weekly_not_offered);
     let has_scoped_limits = usage.windows.iter().any(|window| {
         window.scope == AgentQuotaWindowScope::Model
             || window.model.is_some()
@@ -5912,6 +6672,11 @@ fn custom_claude_snapshot_from_usage(
             "Collected from Claude Code's local OAuth usage endpoint.",
         ),
     ];
+    if account_weekly_not_offered {
+        snapshot
+            .capabilities
+            .push(claude_account_weekly_not_offered_capability());
+    }
     snapshot.diagnostics = diagnostics;
     append_current_plan_observation(&mut snapshot);
     let mut state = if stale {
@@ -6099,16 +6864,27 @@ fn stale_local_claude_quota_snapshot(
 ) -> ClaudeConfigSlotQuotaSnapshotV1 {
     let mut snapshot = snapshot.clone();
     snapshot.state = ClaudeConfigSlotQuotaSnapshotStateV1::Stale;
-    for window in &mut snapshot.quota_windows {
-        window.freshness = AgentQuotaWindowFreshness::Stale;
-    }
     for balance in &mut snapshot.credit_balances {
         // A reader-blind row kept from an older daemon (complete, 0) is shown
         // in its §11.10 shape, never as no resets.
         claude_credit_pools::claude_mark_reader_unavailable(balance);
+    }
+    mark_quota_meters_stale(&mut snapshot.quota_windows, &mut snapshot.credit_balances);
+    snapshot
+}
+
+/// Mark a kept reading's meters `Stale`. Only freshness changes: read clocks
+/// (`observed_at`, `grants_observed_at`) and values stay as read.
+fn mark_quota_meters_stale(
+    quota_windows: &mut [AgentQuotaWindow],
+    credit_balances: &mut [AgentCreditBalance],
+) {
+    for window in quota_windows {
+        window.freshness = AgentQuotaWindowFreshness::Stale;
+    }
+    for balance in credit_balances {
         balance.freshness = AgentQuotaWindowFreshness::Stale;
     }
-    snapshot
 }
 
 fn local_claude_quota_snapshot_within_retention(
@@ -6150,8 +6926,7 @@ fn local_claude_quota_snapshot_is_fresh_for_account(
         return false;
     };
     let age_seconds = now.unix_timestamp() - represented_at.unix_timestamp();
-    // The same gate the cache serve path labels with, so a 2-3 h idle slot
-    // does not relabel a retained snapshot stale after the default 55-65 min.
+    // The same gate the cache serve path labels with.
     let gate = claude_oauth_usage_serve_gate_seconds(
         account_identifier_hash,
         organization_identifier_hash,
@@ -7309,22 +8084,18 @@ fn claude_default_slot_collection_status(
                         && window.organization_identifier_hash.as_deref() == Some(organization_hash)
                         && window.freshness == AgentQuotaWindowFreshness::Fresh
                 })
+                // Credit sections keep their own freshness; the state is the meters'.
                 && snapshot.credit_balances.iter().all(|balance| {
                     balance.account_identifier_hash.as_deref() == Some(account_hash)
                         && balance.organization_identifier_hash.as_deref()
                             == Some(organization_hash)
-                        && balance.freshness == AgentQuotaWindowFreshness::Fresh
                 }) =>
         {
             let mut status = fresh_slot_status(
                 &snapshot.captured_at,
                 account_hash,
                 organization_hash,
-                snapshot.quota_windows.iter().any(|window| {
-                    window.scope == AgentQuotaWindowScope::Account && window.name == "session"
-                }) && snapshot.quota_windows.iter().any(|window| {
-                    window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
-                }),
+                claude_snapshot_has_account_windows(snapshot),
                 snapshot.quota_windows.iter().any(|window| {
                     window.scope == AgentQuotaWindowScope::Model
                         || window.model.is_some()
@@ -7355,11 +8126,7 @@ fn claude_default_slot_collection_status(
                             == Some(organization_hash)
                 });
             if exact_values {
-                status.has_account_windows = snapshot.quota_windows.iter().any(|window| {
-                    window.scope == AgentQuotaWindowScope::Account && window.name == "session"
-                }) && snapshot.quota_windows.iter().any(|window| {
-                    window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
-                });
+                status.has_account_windows = claude_snapshot_has_account_windows(snapshot);
                 status.has_scoped_limits = snapshot.quota_windows.iter().any(|window| {
                     window.scope == AgentQuotaWindowScope::Model
                         || window.model.is_some()
@@ -8010,6 +8777,10 @@ fn persist_claude_slot_collection_states_with_registry(
         let Some(account_hash) = unresolved.account_identifier_hash.as_deref() else {
             return true;
         };
+        if let Some(organization_hash) = unresolved.organization_identifier_hash.as_deref() {
+            return ClaudeStrongBinding::new(account_hash, organization_hash)
+                .map_or(true, |binding| !resolved_full_bindings.contains(&binding));
+        }
         resolved_full_bindings
             .iter()
             .filter(|binding| binding.account_identifier_hash == account_hash)
@@ -8080,8 +8851,13 @@ fn persist_one_claude_slot_collection_state_with(
                 })
                 .count();
             persisted.unresolved_accounts.retain(|unresolved| {
-                unresolved.account_identifier_hash.as_deref() != Some(account_hash)
-                    || exact_binding_count != 1
+                if unresolved.account_identifier_hash.as_deref() != Some(account_hash) {
+                    return true;
+                }
+                match unresolved.organization_identifier_hash.as_deref() {
+                    Some(organization) => organization != organization_hash,
+                    None => exact_binding_count != 1,
+                }
             });
         }
     }
@@ -8509,6 +9285,9 @@ fn derive_claude_account_anchor_coverage(
 
     let mut ambiguous = Vec::new();
     for unresolved in &status.unresolved_accounts {
+        if unresolved.organization_identifier_hash.is_some() {
+            continue;
+        }
         let Some(account_hash) = unresolved
             .account_identifier_hash
             .as_deref()
@@ -8531,6 +9310,34 @@ fn derive_claude_account_anchor_coverage(
                 observed_at: unresolved.observed_at.clone(),
             });
         }
+    }
+
+    // An exact Desktop folder pair without full limits is a connect target of
+    // its own. Its binding never replaces an anchored or default row.
+    for unresolved in &status.unresolved_accounts {
+        let Some(binding) = unresolved
+            .account_identifier_hash
+            .as_deref()
+            .and_then(|account| {
+                ClaudeStrongBinding::new(
+                    account,
+                    unresolved.organization_identifier_hash.as_deref()?,
+                )
+            })
+        else {
+            continue;
+        };
+        by_binding
+            .entry(binding.clone())
+            .or_insert_with(|| ClaudeAccountAnchorDescriptorV1 {
+                target_id: Some(claude_anchor_target_id(&binding)),
+                account_identifier_hash: binding.account_identifier_hash.clone(),
+                organization_identifier_hash: Some(binding.organization_identifier_hash.clone()),
+                durability: ClaudeAccountAnchorDurabilityV1::Unresolved,
+                health: None,
+                setup_blockers: Vec::new(),
+                observed_at: unresolved.observed_at.clone(),
+            });
     }
 
     if status.capacity.remaining_slots == 0 {
@@ -8641,24 +9448,25 @@ pub(crate) fn prune_claude_slot_collection_state(slot_id: &str) -> std::io::Resu
     write_persisted_claude_slot_collection_state(&persisted)
 }
 
+/// Desktop evidence for Claude accounts without full limits on this Mac.
+///
+/// Each qualified exact Desktop folder pair is its own row (with its
+/// organization hash, so it is a connect target) unless that exact pair has
+/// full limits. An account with no qualified pair keeps the account-only row.
 fn derive_unresolved_claude_accounts(
     desktop_snapshot: &AgentStatusSnapshot,
+    desktop_pairs: &ClaudeDesktopPairs,
     full_snapshots: &[AgentStatusSnapshot],
     current_slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
     now: OffsetDateTime,
 ) -> Vec<ClaudeUnresolvedAccountDescriptorV1> {
-    let mut resolved = full_snapshots
+    let mut full_accounts = full_snapshots
         .iter()
         .filter(|snapshot| {
-            snapshot.quota_windows.iter().any(|window| {
-                window.name == "session"
-                    && window.scope == AgentQuotaWindowScope::Account
-                    && window.freshness == AgentQuotaWindowFreshness::Fresh
-            }) && snapshot.quota_windows.iter().any(|window| {
-                window.name == "weekly"
-                    && window.scope == AgentQuotaWindowScope::Account
-                    && window.freshness == AgentQuotaWindowFreshness::Fresh
-            }) && snapshot.quota_windows.iter().any(|window| {
+            claude_has_account_windows(
+                &fresh_quota_windows(&snapshot.quota_windows),
+                claude_snapshot_account_weekly_not_offered(snapshot),
+            ) && snapshot.quota_windows.iter().any(|window| {
                 (window.scope == AgentQuotaWindowScope::Model
                     || window.model.is_some()
                     || window.group.is_some())
@@ -8666,9 +9474,14 @@ fn derive_unresolved_claude_accounts(
             })
         })
         .filter_map(|snapshot| snapshot.account.as_ref())
-        .filter_map(|account| account.account_identifier_hash.clone())
-        .collect::<BTreeSet<_>>();
-    resolved.extend(
+        .filter_map(|account| {
+            Some((
+                account.account_identifier_hash.clone()?,
+                account.organization_identifier_hash.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    full_accounts.extend(
         read_persisted_claude_slot_collection_state()
             .slots
             .into_iter()
@@ -8679,8 +9492,70 @@ fn derive_unresolved_claude_accounts(
                     && state.has_account_windows
                     && state.has_scoped_limits
             })
-            .filter_map(|state| state.account_identifier_hash),
+            .filter_map(|state| {
+                Some((
+                    state.account_identifier_hash?,
+                    state.organization_identifier_hash,
+                ))
+            }),
     );
+    let resolved = full_accounts
+        .iter()
+        .map(|(account, _)| account.clone())
+        .collect::<BTreeSet<_>>();
+    let resolved_bindings = full_accounts
+        .iter()
+        .filter_map(|(account, organization)| {
+            ClaudeStrongBinding::new(account, organization.as_deref()?)
+        })
+        .collect::<BTreeSet<_>>();
+    let recent = |observed_at: &str| {
+        OffsetDateTime::parse(observed_at, &Rfc3339).is_ok_and(|observed| {
+            now.unix_timestamp() - observed.unix_timestamp()
+                <= CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS
+        })
+    };
+    let mut descriptors = desktop_pairs
+        .pairs
+        .iter()
+        .filter(|pair| !resolved_bindings.contains(&pair.binding))
+        .filter_map(|pair| {
+            let observed_at = pair.observation.observed_at.clone()?;
+            recent(&observed_at).then(|| {
+                let ClaudeStrongBinding {
+                    account_identifier_hash,
+                    organization_identifier_hash,
+                } = pair.binding.clone();
+                ClaudeUnresolvedAccountDescriptorV1 {
+                    unresolved_id: format!(
+                        "claude-unresolved-{}",
+                        &format!(
+                            "{:x}",
+                            Sha256::digest(
+                                format!(
+                                    "unresolved:{account_identifier_hash}:{organization_identifier_hash}"
+                                )
+                                .as_bytes()
+                            )
+                        )[..16]
+                    ),
+                    account_identifier_hash: Some(account_identifier_hash),
+                    organization_identifier_hash: Some(organization_identifier_hash),
+                    account_label: pair.observation.account_label.clone(),
+                    organization_label: pair.observation.organization_label.clone(),
+                    observed_at: Some(observed_at),
+                    evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+                }
+            })
+        })
+        .take(CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX)
+        .collect::<Vec<_>>();
+    // Only an emitted pair row stands in for its account's account-only row;
+    // a stale, resolved or capped-out pair must not hide recent evidence.
+    let pair_accounts = descriptors
+        .iter()
+        .filter_map(|descriptor| descriptor.account_identifier_hash.clone())
+        .collect::<BTreeSet<_>>();
     let mut by_hash = BTreeMap::<String, String>::new();
     for observation in &desktop_snapshot.plan_observations {
         if observation.evidence_method.as_deref() != Some("claude_desktop_session_bucket")
@@ -8691,7 +9566,10 @@ fn derive_unresolved_claude_accounts(
         let Some(account_hash) = observation.account_identifier_hash.as_ref() else {
             continue;
         };
-        if account_hash.is_empty() || resolved.contains(account_hash) {
+        if account_hash.is_empty()
+            || resolved.contains(account_hash)
+            || pair_accounts.contains(account_hash)
+        {
             continue;
         }
         let Some(observed_at) = observation.observed_at.clone() else {
@@ -8714,24 +9592,25 @@ fn derive_unresolved_claude_accounts(
             })
             .or_insert(observed_at);
     }
-    by_hash
-        .into_iter()
-        .map(|(account_hash, observed_at)| {
-            let unresolved_id = format!(
-                "claude-unresolved-{}",
-                &format!(
-                    "{:x}",
-                    Sha256::digest(format!("unresolved:{account_hash}").as_bytes())
-                )[..16]
-            );
-            ClaudeUnresolvedAccountDescriptorV1 {
-                unresolved_id,
-                account_identifier_hash: Some(account_hash),
-                observed_at: Some(observed_at),
-                evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
-            }
-        })
-        .collect()
+    descriptors.extend(by_hash.into_iter().map(|(account_hash, observed_at)| {
+        let unresolved_id = format!(
+            "claude-unresolved-{}",
+            &format!(
+                "{:x}",
+                Sha256::digest(format!("unresolved:{account_hash}").as_bytes())
+            )[..16]
+        );
+        ClaudeUnresolvedAccountDescriptorV1 {
+            unresolved_id,
+            account_identifier_hash: Some(account_hash),
+            organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
+            observed_at: Some(observed_at),
+            evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+        }
+    }));
+    descriptors
 }
 
 /// Takes the observations rather than recomputing them: the statusLine
@@ -8782,10 +9661,15 @@ fn claude_desktop_metadata_present(root: &Path) -> bool {
         || root.join("local-agent-mode-sessions").is_dir()
 }
 
+#[cfg(test)]
 fn claude_desktop_plan_observations_from_root(
     root: &Path,
     observed_at: &str,
 ) -> Vec<AgentStatusPlanObservation> {
+    claude_desktop_scan_from_root(root, observed_at).observations
+}
+
+fn claude_desktop_scan_from_root(root: &Path, observed_at: &str) -> ClaudeDesktopScan {
     let config = read_claude_desktop_config(root);
     let last_known_account_uuid = config
         .last_known_account_uuid
@@ -8793,16 +9677,21 @@ fn claude_desktop_plan_observations_from_root(
         .and_then(safe_local_identifier)
         .map(ToString::to_string);
     let mut builders: BTreeMap<String, ClaudeDesktopProfileBuilder> = BTreeMap::new();
+    let mut pair_builders: BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder> =
+        BTreeMap::new();
 
     collect_claude_desktop_code_sessions(
         &root.join("claude-code-sessions"),
         last_known_account_uuid.as_deref(),
         &mut builders,
+        &mut pair_builders,
     );
     collect_claude_desktop_agent_mode_sessions(
         &root.join("local-agent-mode-sessions"),
         &mut builders,
+        &mut pair_builders,
     );
+    let pairs = claude_desktop_qualified_pairs(pair_builders);
 
     let builders = builders
         .into_values()
@@ -8871,7 +9760,10 @@ fn claude_desktop_plan_observations_from_root(
         }
     }
 
-    observations
+    ClaudeDesktopScan {
+        observations,
+        pairs,
+    }
 }
 
 /// Returns only duplicated Desktop session IDs. A session is attributed when
@@ -8880,13 +9772,26 @@ fn claude_desktop_plan_observations_from_root(
 fn claude_desktop_unambiguous_duplicate_session_owners(
     builders: &[ClaudeDesktopProfileBuilder],
 ) -> BTreeMap<String, Option<(String, Option<i64>)>> {
-    let mut candidates: BTreeMap<String, Vec<(String, Option<i64>)>> = BTreeMap::new();
-    for builder in builders {
-        for (session_id, activity) in &builder.session_activity_by_id {
+    claude_desktop_duplicate_session_owners(builders.iter().map(|builder| {
+        (
+            builder.account_uuid.clone(),
+            &builder.session_activity_by_id,
+        )
+    }))
+}
+
+/// The same rule over any bucket key: Desktop account buckets for the
+/// per-account readings, exact account/organization folders for pairs.
+fn claude_desktop_duplicate_session_owners<'a, K: Clone + PartialEq>(
+    buckets: impl IntoIterator<Item = (K, &'a BTreeMap<String, Option<i64>>)>,
+) -> BTreeMap<String, Option<(K, Option<i64>)>> {
+    let mut candidates: BTreeMap<String, Vec<(K, Option<i64>)>> = BTreeMap::new();
+    for (key, sessions) in buckets {
+        for (session_id, activity) in sessions {
             candidates
                 .entry(session_id.clone())
                 .or_default()
-                .push((builder.account_uuid.clone(), *activity));
+                .push((key.clone(), *activity));
         }
     }
 
@@ -8925,6 +9830,7 @@ fn collect_claude_desktop_code_sessions(
     root: &Path,
     last_known_account_uuid: Option<&str>,
     builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
+    pair_builders: &mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
 ) {
     let Ok(accounts) = fs::read_dir(root) else {
         return;
@@ -8978,16 +9884,20 @@ fn collect_claude_desktop_code_sessions(
                 .take(CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG)
             {
                 let metadata = read_json_file::<ClaudeDesktopCodeSessionMetadata>(&file.path());
-                let activity = metadata
-                    .as_ref()
-                    .and_then(|metadata| {
-                        timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
-                            .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
-                    })
-                    .or_else(|| file_modified_epoch_seconds(&file.path()));
+                let metadata_activity = metadata.as_ref().and_then(|metadata| {
+                    timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
+                        .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
+                });
+                let activity =
+                    metadata_activity.or_else(|| file_modified_epoch_seconds(&file.path()));
+                let imported = metadata.as_ref().is_some_and(|metadata| metadata.imported);
                 let session_id = metadata
                     .and_then(|metadata| metadata.cli_session_id)
                     .and_then(|value| safe_local_identifier(&value).map(ToString::to_string));
+                if let Some(session_id) = session_id.as_deref() {
+                    claude_desktop_pair_builder(pair_builders, &account_uuid, &org_uuid)
+                        .record_session(session_id, activity, metadata_activity, imported);
+                }
                 let builder = builders.get_mut(&account_uuid).expect("builder exists");
                 builder.code_session_count += 1;
                 if builder.record_activity(activity, session_id)
@@ -9003,6 +9913,7 @@ fn collect_claude_desktop_code_sessions(
 fn collect_claude_desktop_agent_mode_sessions(
     root: &Path,
     builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
+    pair_builders: &mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
 ) {
     let Ok(accounts) = fs::read_dir(root) else {
         return;
@@ -9046,7 +9957,7 @@ fn collect_claude_desktop_agent_mode_sessions(
                     ..Default::default()
                 }
             });
-            builder.organization_uuids.insert(org_uuid);
+            builder.organization_uuids.insert(org_uuid.clone());
             let Ok(files) = fs::read_dir(org.path()) else {
                 continue;
             };
@@ -9068,6 +9979,13 @@ fn collect_claude_desktop_agent_mode_sessions(
                     .as_deref()
                     .and_then(safe_local_identifier)
                     .map(ToString::to_string);
+                // Agent-mode sessions compete for duplicate-session ownership
+                // and label their own folder pair, but never qualify one.
+                let pair = claude_desktop_pair_builder(pair_builders, &account_uuid, &org_uuid);
+                if let Some(session_id) = session_id.as_deref() {
+                    pair.record_session(session_id, activity, None, true);
+                }
+                pair.record_agent_mode_metadata(&metadata);
                 let builder = builders.get_mut(&account_uuid).expect("builder exists");
                 builder.agent_mode_session_count += 1;
                 builder.record_activity(activity, session_id);
@@ -9137,13 +10055,7 @@ fn claude_desktop_builder_plan_observation(
         return None;
     }
     let plan_type = builder.plan_type;
-    let subscription_product = plan_type.clone().map(|plan| {
-        if plan.starts_with("claude_") {
-            plan
-        } else {
-            format!("claude_{plan}")
-        }
-    });
+    let subscription_product = plan_type.clone().map(claude_desktop_subscription_product);
     let is_current = last_known_account_uuid == Some(builder.account_uuid.as_str());
     let activity_observed_at = builder
         .latest_activity_epoch_seconds
@@ -9182,6 +10094,370 @@ fn claude_desktop_builder_plan_observation(
         },
         is_current: Some(is_current),
     })
+}
+
+fn claude_desktop_subscription_product(plan: String) -> String {
+    if plan.starts_with("claude_") {
+        plan
+    } else {
+        format!("claude_{plan}")
+    }
+}
+
+/// Qualify each exact Desktop folder pair and describe it.
+///
+/// A pair qualifies only with at least one native (never imported) Code
+/// session that carries a parseable activity time and that this folder owns:
+/// a session copied into several folders counts only for the folder with its
+/// unambiguously newest activity, and a tie or a missing time counts for none.
+/// Ownership is decided over every Desktop folder pair the scan saw, Code and
+/// agent-mode, UUID-named or not, so no copy the per-account rule sees is
+/// ignored here. Imported-only and ambiguous copied evidence therefore never
+/// makes a pair. `observed_at` is the newest qualifying native activity, and
+/// the pair's session is that activity's session. No organization is ever
+/// chosen for an account: every folder speaks only for itself.
+fn claude_desktop_qualified_pairs(
+    pair_builders: BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
+) -> ClaudeDesktopPairs {
+    let owners = claude_desktop_duplicate_session_owners(
+        pair_builders
+            .iter()
+            .map(|(key, pair)| (key.clone(), &pair.session_activity_by_id)),
+    );
+    let owns = |key: &ClaudeDesktopPairKey, session_id: &str| match owners.get(session_id) {
+        None => true,
+        Some(owner) => owner.as_ref().is_some_and(|(owner, _)| owner == key),
+    };
+    let mut qualified = pair_builders
+        .into_iter()
+        .filter(|(_, pair)| pair.exact)
+        .filter_map(|(key, pair)| {
+            let newest = pair
+                .native_activity_by_id
+                .iter()
+                .filter(|(session_id, _)| owns(&key, session_id.as_str()))
+                .map(|(session_id, activity)| (*activity, session_id.clone()))
+                .max()?;
+            Some((key, newest, pair))
+        })
+        .collect::<Vec<_>>();
+    // Newest first; equal activity falls back to the pair so every pass with
+    // the same folders orders them the same way.
+    qualified.sort_by(
+        |(left_key, (left_activity, _), _), (right_key, (right_activity, _), _)| {
+            right_activity
+                .cmp(left_activity)
+                .then_with(|| left_key.cmp(right_key))
+        },
+    );
+    let mut pairs = Vec::with_capacity(qualified.len());
+    let mut index_by_key = BTreeMap::new();
+    for (key, (activity, session_id), pair) in qualified {
+        if let Some(observation) =
+            claude_desktop_pair_observation(&key, &pair, activity, session_id)
+        {
+            index_by_key.insert(key, pairs.len());
+            pairs.push(observation);
+        }
+    }
+
+    let mut owned_duplicates = owners
+        .into_iter()
+        .filter_map(|(session_id, owner)| {
+            let (key, activity) = owner?;
+            Some((session_id, *index_by_key.get(&key)?, activity?))
+        })
+        .collect::<Vec<_>>();
+    owned_duplicates.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+    let duplicate_sessions = owned_duplicates
+        .into_iter()
+        .filter_map(|(session_id, index, activity)| {
+            let pair: &ClaudeDesktopPairObservation = &pairs[index];
+            if pair.observation.source_session_id.as_deref() == Some(session_id.as_str()) {
+                return None;
+            }
+            let mut duplicate = pair.clone();
+            duplicate.observation.source_session_id = Some(session_id);
+            duplicate.observation.observed_at = u64::try_from(activity)
+                .ok()
+                .and_then(rfc3339_from_unix_seconds);
+            Some(duplicate)
+        })
+        .take(CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX)
+        .collect();
+    ClaudeDesktopPairs {
+        pairs,
+        duplicate_sessions,
+    }
+}
+
+/// One exact Desktop folder pair as a plan observation: raw canonical account
+/// and organization UUIDs with their hashes, so the backend can rebuild the
+/// same pair the session evidence carries. Plan and labels only when that
+/// folder's own agent-mode metadata states them.
+///
+/// Never `is_current`: the backend turns a current observation into a current
+/// account row keyed by the same account and organization as a login's
+/// metered row, so a meterless Desktop reading would replace those meters
+/// whenever the login is not uploaded. A non-current reading still carries
+/// the exact pair.
+fn claude_desktop_pair_observation(
+    (account_id, organization_id): &ClaudeDesktopPairKey,
+    pair: &ClaudeDesktopPairBuilder,
+    activity: i64,
+    session_id: String,
+) -> Option<ClaudeDesktopPairObservation> {
+    let account_identifier_hash = billing_identity_hash("anthropic", "account", account_id)?;
+    let organization_identifier_hash =
+        billing_identity_hash("anthropic", "organization", organization_id)?;
+    let binding =
+        ClaudeStrongBinding::new(&account_identifier_hash, &organization_identifier_hash)?;
+    let account_identifier_hash = Some(account_identifier_hash);
+    let organization_identifier_hash = Some(organization_identifier_hash);
+    let billing_identity_evidence = billing_identity_evidence_for(
+        &account_identifier_hash,
+        &organization_identifier_hash,
+        &None,
+    );
+    Some(ClaudeDesktopPairObservation {
+        binding,
+        observation: AgentStatusPlanObservation {
+            observed_at: u64::try_from(activity)
+                .ok()
+                .and_then(rfc3339_from_unix_seconds),
+            evidence_method: Some("claude_desktop_session_bucket".to_string()),
+            source_session_id: Some(session_id),
+            provider: Some("anthropic".to_string()),
+            billing_provider: Some("anthropic".to_string()),
+            model_provider: Some("anthropic".to_string()),
+            billing_channel: Some("subscription".to_string()),
+            auth_mode: Some("claude_desktop".to_string()),
+            gateway_provider: None,
+            subscription_product: pair
+                .plan_type
+                .clone()
+                .map(claude_desktop_subscription_product),
+            plan_type: pair.plan_type.clone(),
+            account_label: pair
+                .account_label
+                .clone()
+                .or_else(|| pair.account_name.clone()),
+            account_id: Some(account_id.clone()),
+            organization_label: pair.organization_label.clone(),
+            organization_id: Some(organization_id.clone()),
+            account_identifier_hash,
+            organization_identifier_hash,
+            superseded_account_identifier_hash: None,
+            superseded_organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence,
+            billing_identity_confidence: AgentStatusConfidence::High,
+            confidence: AgentStatusConfidence::Medium,
+            is_current: Some(false),
+        },
+    })
+}
+
+/// The Claude Desktop pair status for this pass: one `claude_code` snapshot
+/// whose plan observations are the exact Desktop folder pairs that no other
+/// upload of this pass already carries (its strong account binding, or a plan
+/// observation with both hashes). On a Mac without an uploadable Claude Code
+/// login that is every pair; beside uploaded logins it is only the rest.
+///
+/// It has no root account, so it never stands in for a login or its meters,
+/// and it reports usage as unsupported. Pairs come newest first within the
+/// backend's per-snapshot observation limit; the duplicate sessions they own
+/// fill what is left, and anything left out is disclosed.
+fn claude_desktop_pairs_snapshot(
+    desktop: &ClaudeDesktopPairs,
+    uploads: &[AgentStatusSnapshot],
+    captured_at: &str,
+    expires_at: &str,
+) -> Option<AgentStatusSnapshot> {
+    let exact_binding = |account: Option<&String>, organization: Option<&String>| {
+        ClaudeStrongBinding::new(account?.as_str(), organization?.as_str())
+    };
+    let mut covered = BTreeSet::new();
+    let mut uploaded_sessions = BTreeSet::new();
+    for snapshot in uploads {
+        if let Some(account) = snapshot.account.as_ref() {
+            covered.extend(exact_binding(
+                account.account_identifier_hash.as_ref(),
+                account.organization_identifier_hash.as_ref(),
+            ));
+        }
+        for observation in &snapshot.plan_observations {
+            covered.extend(exact_binding(
+                observation.account_identifier_hash.as_ref(),
+                observation.organization_identifier_hash.as_ref(),
+            ));
+            uploaded_sessions.extend(observation.source_session_id.clone());
+        }
+    }
+    let uncovered = desktop
+        .pairs
+        .iter()
+        .filter(|pair| !covered.contains(&pair.binding))
+        .collect::<Vec<_>>();
+    if uncovered.is_empty() {
+        return None;
+    }
+    let mut plan_observations = Vec::with_capacity(CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX);
+    let mut emitted = BTreeSet::new();
+    for pair in uncovered.iter().take(CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX) {
+        plan_observations.push(pair.observation.clone());
+        emitted.insert(&pair.binding);
+    }
+    let left_out_pairs = uncovered.len() - plan_observations.len();
+    let duplicates = desktop
+        .duplicate_sessions
+        .iter()
+        .filter(|duplicate| {
+            emitted.contains(&duplicate.binding)
+                && duplicate
+                    .observation
+                    .source_session_id
+                    .as_ref()
+                    .is_some_and(|session_id| !uploaded_sessions.contains(session_id))
+        })
+        .collect::<Vec<_>>();
+    let room = CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX - plan_observations.len();
+    let left_out_duplicates = duplicates.len().saturating_sub(room);
+    plan_observations.extend(
+        duplicates
+            .into_iter()
+            .take(room)
+            .map(|duplicate| duplicate.observation.clone()),
+    );
+
+    let mut snapshot = base_snapshot(
+        SourceKind::ClaudeCode,
+        AgentStatusState::Available,
+        AgentStatusCollectionMethod::CommandProbe,
+        captured_at.to_string(),
+        expires_at.to_string(),
+    );
+    snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+    snapshot.capabilities = vec![
+        supported_capability(
+            "desktop_identity",
+            "Read display-safe Claude Desktop account/organization session-folder metadata.",
+        ),
+        unsupported_capability(
+            "quota_windows",
+            "Claude Desktop session folders carry no usage limits; a Claude Code login for the account is needed to show them.",
+        ),
+    ];
+    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+        "claude_desktop_profile_detected",
+        AgentDiagnosticSeverity::Info,
+        "Claude Desktop Code account/session bucket metadata was detected.",
+    ));
+    snapshot.diagnostics.push(if uploads.is_empty() {
+        AgentStatusDiagnostic::source(
+            "claude_desktop_only_no_cli_login",
+            AgentDiagnosticSeverity::Info,
+            "No Claude Code login on this Mac can be uploaded; Claude Desktop account/organization folders are reported without limits.",
+        )
+    } else {
+        AgentStatusDiagnostic::source(
+            "claude_desktop_uncovered_pairs",
+            AgentDiagnosticSeverity::Info,
+            "Claude Desktop account/organization folders that no uploaded Claude Code login covers are reported without limits.",
+        )
+    });
+    if left_out_pairs + left_out_duplicates > 0 {
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "claude_desktop_pairs_truncated",
+            AgentDiagnosticSeverity::Warning,
+            format!(
+                "{left_out_pairs} Claude Desktop folder pair(s) and {left_out_duplicates} duplicate-session reading(s) were left out to stay within the upload limit; the newest were kept."
+            ),
+        ));
+    }
+    snapshot.plan_observations = plan_observations;
+    Some(snapshot)
+}
+
+/// Append this pass's Desktop pair status to the Claude uploads, after every
+/// login and degraded snapshot so coverage is computed from what actually
+/// uploads. The uploads already present are never changed.
+fn append_claude_desktop_pairs_snapshot(
+    snapshots: &mut Vec<AgentStatusSnapshot>,
+    desktop: &ClaudeDesktopPairs,
+    captured_at: &str,
+    expires_at: &str,
+) {
+    if !CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED {
+        return;
+    }
+    let Some(snapshot) = claude_desktop_pairs_snapshot(desktop, snapshots, captured_at, expires_at)
+    else {
+        return;
+    };
+    // One more snapshot past the backend's per-upload limit would refuse every
+    // Claude upload of the pass, the metered ones included.
+    if snapshots.len() < AGENT_STATUS_UPLOAD_SNAPSHOT_MAX {
+        snapshots.push(snapshot);
+    } else {
+        eprintln!("claude_status desktop_pairs=withheld reason=upload_snapshot_limit");
+    }
+}
+
+impl ClaudeDesktopPairBuilder {
+    fn record_session(
+        &mut self,
+        session_id: &str,
+        activity: Option<i64>,
+        metadata_activity: Option<i64>,
+        imported: bool,
+    ) {
+        let recorded = self
+            .session_activity_by_id
+            .entry(session_id.to_string())
+            .or_insert(activity);
+        if activity.is_some_and(|next| recorded.map_or(true, |current| next > current)) {
+            *recorded = activity;
+        }
+        if let (false, Some(activity)) = (imported, metadata_activity) {
+            let native = self
+                .native_activity_by_id
+                .entry(session_id.to_string())
+                .or_insert(activity);
+            *native = (*native).max(activity);
+        }
+    }
+
+    fn record_agent_mode_metadata(&mut self, metadata: &ClaudeDesktopAgentModeSessionMetadata) {
+        self.account_label = self.account_label.take().or_else(|| {
+            first_non_empty([
+                metadata.email_address.as_deref(),
+                metadata.account_email.as_deref(),
+                metadata.email.as_deref(),
+            ])
+            .map(ToString::to_string)
+        });
+        self.account_name = self
+            .account_name
+            .take()
+            .or_else(|| safe_display_label(metadata.account_name.as_deref()));
+        self.organization_label = self.organization_label.take().or_else(|| {
+            first_non_empty([
+                metadata.organization_name.as_deref(),
+                metadata.workspace_name.as_deref(),
+                metadata.team_name.as_deref(),
+            ])
+            .and_then(|value| safe_display_label(Some(value)))
+        });
+        self.plan_type = self.plan_type.take().or_else(|| {
+            first_non_empty([
+                metadata.subscription_type.as_deref(),
+                metadata.plan_type.as_deref(),
+                metadata.plan.as_deref(),
+            ])
+            .map(|value| normalize_plan_type(value.to_string()))
+        });
+    }
 }
 
 impl ClaudeDesktopProfileBuilder {
@@ -9732,6 +11008,9 @@ fn collect_claude_oauth_usage_unstamped(
     }) && caller_auth_hold.is_none()
         && access_token.is_some()
         && !claude_access_token_locally_expired(credential_expires_at, now);
+    let breaker_rate_limited = breaker
+        .as_ref()
+        .is_some_and(|breaker| breaker.rate_limit_failures > 0);
     let open_breaker = breaker.filter(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
 
     // Read cadence (design R7): one read per binding per slot. The
@@ -9747,13 +11026,31 @@ fn collect_claude_oauth_usage_unstamped(
     if read_schedule.observe_activity(latest_activity_at) {
         let _ = claude_credit_pools::write_claude_read_schedule(&account_state_dir, &read_schedule);
     }
-    let slot_seconds = claude_oauth_usage_slot_seconds(
+    let mut slot_seconds = claude_oauth_usage_slot_seconds(
         &read_schedule,
         latest_activity_at,
         account_identifier_hash,
         organization_identifier_hash,
         now,
     );
+    // In use: Claude Code's own statusLine is the free source. While it is
+    // fresh for exactly this binding, the provider is read only at the
+    // unused-account gate (for the meters the statusLine does not carry);
+    // the collection prefers the newer statusLine windows when it serves.
+    // Only the default login's collection merges the statusLine.
+    if slot_seconds == claude_credit_pools::ACTIVE_SLOT_SECONDS
+        && matches!(caller, ClaudeOAuthUsageCaller::Default)
+        && claude_statusline_fresh_for_binding(
+            account_identifier_hash,
+            organization_identifier_hash,
+            now,
+        )
+    {
+        slot_seconds = claude_oauth_usage_fresh_age_seconds(
+            account_identifier_hash,
+            organization_identifier_hash,
+        );
+    }
     let mut last_reading_at = None;
     let mut previous_credit_balances = Vec::new();
 
@@ -9765,6 +11062,7 @@ fn collect_claude_oauth_usage_unstamped(
     }
 
     let mut exact_stale_fallback = None;
+    let mut explicit_refresh_due = false;
     if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
         account_identifier_hash,
         organization_identifier_hash,
@@ -9780,8 +11078,50 @@ fn collect_claude_oauth_usage_unstamped(
             last_reading_at = Some(cache.observed_at_epoch_seconds);
         }
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
+        // An explicit refresh reads now, past the slot and the plain spacing
+        // after a successful read, but never inside a Retry-After hold: the
+        // spacing must be exactly the success floor and no rate limit may be
+        // on record, in the breaker or in this run's own 429 record. Every
+        // later hold and breaker check still applies.
+        explicit_refresh_due = claude_explicit_refresh_requested(
+            account_identifier_hash,
+            organization_identifier_hash,
+            cache.observed_at_epoch_seconds,
+            now,
+        ) && (now >= cache.next_refresh_after_epoch_seconds
+            || (!breaker_rate_limited
+                && !claude_rate_limit_held(
+                    account_identifier_hash,
+                    organization_identifier_hash,
+                    now,
+                )
+                && cache.next_refresh_after_epoch_seconds
+                    <= cache
+                        .observed_at_epoch_seconds
+                        .saturating_add(CLAUDE_OAUTH_USAGE_REFRESH_SECONDS)));
+        if explicit_refresh_due {
+            note_claude_explicit_refresh_attempt(
+                account_identifier_hash,
+                organization_identifier_hash,
+                now,
+            );
+        }
+        // A window that reset after this reading gets one read shortly after
+        // the reset instead of waiting out the slot.
+        let reset_read_due = claude_credit_pools::claude_reset_read_due(
+            &cache.windows,
+            cache.observed_at_epoch_seconds,
+            cache.next_refresh_after_epoch_seconds,
+            claude_credit_pools::claude_reset_read_delay_seconds(
+                account_identifier_hash,
+                organization_identifier_hash,
+            ),
+            now,
+        );
         if !cache.windows.is_empty()
             && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+            && !reset_read_due
+            && !explicit_refresh_due
             && !claude_credit_pools::claude_reading_due(
                 Some(cache.observed_at_epoch_seconds),
                 cache.next_refresh_after_epoch_seconds,
@@ -9806,7 +11146,7 @@ fn collect_claude_oauth_usage_unstamped(
             }
             return outcome;
         }
-        if now < cache.next_refresh_after_epoch_seconds {
+        if now < cache.next_refresh_after_epoch_seconds && !explicit_refresh_due {
             // A stored reading without windows under the hold: the saved-reset
             // section of a windowless variant read, served for this slot.
             if held.active && cache.windows.is_empty() {
@@ -9822,6 +11162,19 @@ fn collect_claude_oauth_usage_unstamped(
         if !cache.windows.is_empty() && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS {
             exact_stale_fallback = Some(cache);
         }
+    } else if claude_explicit_refresh_requested(
+        account_identifier_hash,
+        organization_identifier_hash,
+        0,
+        now,
+    ) {
+        // Nothing stored yet: an explicit refresh may read it now.
+        explicit_refresh_due = true;
+        note_claude_explicit_refresh_attempt(
+            account_identifier_hash,
+            organization_identifier_hash,
+            now,
+        );
     }
 
     // The hold applies even without a stored reading to serve; a servable
@@ -10011,6 +11364,47 @@ fn collect_claude_oauth_usage_unstamped(
             current_unix_seconds(),
         );
     }
+    if claude_transient_failure_held(account_identifier_hash, organization_identifier_hash, now) {
+        let result = match read_claude_oauth_usage_cache_with_legacy_migration(
+            account_identifier_hash,
+            organization_identifier_hash,
+            mirror_legacy_default,
+        )
+        .filter(|cache| {
+            !cache.windows.is_empty()
+                && now.saturating_sub(cache.observed_at_epoch_seconds)
+                    <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+        }) {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => Err(
+                "The latest Claude OAuth quota request failed; it is retried after a minute."
+                    .to_string(),
+            ),
+        };
+        return ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
+            "claude_oauth_usage_check_suppressed",
+            "The latest Claude OAuth quota request failed moments ago; no provider request was made, and any served readings are last-known local readings.",
+            current_unix_seconds(),
+        );
+    }
+    // A status read for the app serves the stored reading: only the daemon's
+    // own passes, an explicit refresh and setup checks call the provider. The
+    // daemon's next pass reads a due account.
+    if claude_pass_saved_only() && !explicit_refresh_due {
+        drop(token);
+        let result = match exact_stale_fallback {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => Err(
+                "Claude quota for this account has no stored reading yet; the daemon reads it shortly."
+                    .to_string(),
+            ),
+        };
+        return ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
+            "claude_oauth_usage_cache_reused",
+            "A status read served the stored quota reading; the daemon's own schedule makes the provider requests.",
+            now,
+        );
+    }
     let authorization = format!("Bearer {token}");
     let user_agent = ottto_user_agent();
     // Same endpoint, same slot: the saved-reset variant replaces the plain
@@ -10031,8 +11425,26 @@ fn collect_claude_oauth_usage_unstamped(
         .map(|respond| respond(&endpoint));
     #[cfg(not(test))]
     let injected: Option<Result<Value, u16>> = None;
+    let call_started = Instant::now();
+    let record_call = |result: crate::provider_calls::CallResult| {
+        use crate::provider_calls::{CallKind, Provider, ProviderCall, Trigger};
+        let trigger = if explicit_refresh_due {
+            claude_explicit_refresh_request().trigger
+        } else {
+            crate::provider_calls::trigger_or(Trigger::Schedule)
+        };
+        crate::provider_calls::record(ProviderCall::observed(
+            Provider::Anthropic,
+            CallKind::ClaudeOauthUsage,
+            trigger,
+            Some(account_identifier_hash),
+            result,
+            call_started.elapsed(),
+        ));
+    };
     let response = match injected {
         Some(Ok(value)) => {
+            record_call(crate::provider_calls::CallResult::Ok);
             return claude_oauth_usage_after_response(
                 ClaudeOAuthReading {
                     account_identifier_hash,
@@ -10064,6 +11476,7 @@ fn collect_claude_oauth_usage_unstamped(
             .timeout(COMMAND_TIMEOUT)
             .call(),
     };
+    record_call(crate::provider_calls::http_result(&response));
     let response = match response {
         Ok(response) => response,
         // The provider rejected the saved-reset variant itself (not auth, not
@@ -10084,6 +11497,12 @@ fn collect_claude_oauth_usage_unstamped(
         }
         Err(ureq::Error::Status(429, response)) => {
             let retry_after = claude_oauth_retry_after_epoch_seconds(&response, now);
+            set_claude_binding_time(
+                &mut claude_rate_limit_holds(),
+                account_identifier_hash,
+                organization_identifier_hash,
+                retry_after,
+            );
             // A cache belonging to another account is not merely skipped here:
             // `unwrap_or` replaces it with an empty cache for the current
             // account, so the write below also clears the stale payload off
@@ -10101,6 +11520,7 @@ fn collect_claude_oauth_usage_unstamped(
                 next_refresh_after_epoch_seconds: retry_after,
                 windows: Vec::new(),
                 credit_balances: Vec::new(),
+                account_weekly_not_offered: false,
             });
             cache.next_refresh_after_epoch_seconds = retry_after;
             let _ = write_claude_oauth_usage_cache(&cache);
@@ -10162,7 +11582,15 @@ fn collect_claude_oauth_usage_unstamped(
                     now,
                     mirror_legacy_default,
                 ),
-                None => Vec::new(),
+                None => {
+                    set_claude_binding_time(
+                        &mut claude_transient_failures(),
+                        account_identifier_hash,
+                        organization_identifier_hash,
+                        current_unix_seconds(),
+                    );
+                    Vec::new()
+                }
             };
             diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.", current_unix_seconds()));
             if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
@@ -10441,6 +11869,7 @@ fn claude_oauth_saved_resets_without_windows(
                 }),
             &credit_read,
         ),
+        account_weekly_not_offered: false,
     };
     claude_oauth_stamp_account_identity(
         &mut usage,
@@ -10469,6 +11898,7 @@ fn claude_oauth_saved_resets_without_windows(
         next_refresh_after_epoch_seconds: next_read,
         windows: Vec::new(),
         credit_balances: Vec::new(),
+        account_weekly_not_offered: false,
     });
     cache.credit_balances = usage.credit_balances;
     cache.next_refresh_after_epoch_seconds = next_read;
@@ -10666,6 +12096,7 @@ fn claude_oauth_usage_record_reading(
     let mut usage = ClaudeOAuthUsage {
         windows: claude_oauth_quota_windows(reading.body),
         credit_balances: Vec::new(),
+        account_weekly_not_offered: claude_oauth_account_weekly_not_offered(reading.body),
     };
     let Some(observed_at) = observed_at.filter(|_| !usage.windows.is_empty()) else {
         usage.credit_balances = claude_oauth_credit_balances(reading.body);
@@ -10716,9 +12147,11 @@ fn claude_oauth_usage_record_reading(
         account_identifier_hash: reading.account_identifier_hash.to_string(),
         organization_identifier_hash: reading.organization_identifier_hash.to_string(),
         observed_at_epoch_seconds: reading.observed_at_epoch_seconds,
-        next_refresh_after_epoch_seconds: reading.now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+        next_refresh_after_epoch_seconds: claude_spacing_anchor(reading.now)
+            + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
         windows: usage.windows.clone(),
         credit_balances: usage.credit_balances.clone(),
+        account_weekly_not_offered: usage.account_weekly_not_offered,
     };
     let _ = write_claude_oauth_usage_cache(&cache);
     if reading.mirror_legacy_default {
@@ -10798,7 +12231,8 @@ fn claude_oauth_latest_activity_at(
     )
 }
 
-/// The binding's read slot: active, default (the jittered gate below) or idle.
+/// The binding's read slot: in use (5 min) or unused (the jittered gate
+/// below).
 fn claude_oauth_usage_slot_seconds(
     read_schedule: &claude_credit_pools::ClaudeReadSchedule,
     latest_activity_at: Option<u64>,
@@ -10810,37 +12244,287 @@ fn claude_oauth_usage_slot_seconds(
         read_schedule,
         latest_activity_at,
         claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash),
-        claude_credit_pools::claude_idle_slot_seconds(
-            account_identifier_hash,
-            organization_identifier_hash,
-        ),
         claude_credit_pools::CLAUDE_ACTIVITY_CADENCE_ENABLED,
         now,
     )
 }
 
-/// How old a stored reading may be and still be labelled fresh: never less
-/// than the default gate, and the full slot while an idle account waits for
-/// its next read.
+/// How old a stored reading may be and still be labelled fresh: the
+/// unused-account gate plus one collection interval. A read becomes due at
+/// the gate, but the next scheduled collection can be up to five minutes
+/// later. Keep that bounded scheduling gap from making healthy idle accounts
+/// flash stale. This does not defer a provider read or move its observation.
+/// The shorter in-use slot never labels a reading stale sooner.
 fn claude_oauth_usage_serve_gate_seconds(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-    now: u64,
+    _now: u64,
 ) -> u64 {
-    let read_schedule =
-        claude_credit_pools::read_claude_read_schedule(&claude_oauth_usage_account_state_dir(
-            account_identifier_hash,
-            organization_identifier_hash,
-        ));
-    claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash).max(
-        claude_oauth_usage_slot_seconds(
-            &read_schedule,
-            claude_oauth_latest_activity_at(account_identifier_hash, organization_identifier_hash),
-            account_identifier_hash,
-            organization_identifier_hash,
-            now,
-        ),
+    claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash)
+        .saturating_add(CLAUDE_OAUTH_USAGE_REFRESH_SECONDS)
+}
+
+/// Whether Claude Code's local statusLine wrote a reading for exactly this
+/// account and organization within the in-use slot: the free local data an
+/// in-use account prefers over a provider read. Only an exact v4 stamp from a
+/// method the serve path attributes (`config_dir`, `session_store`) counts.
+fn claude_statusline_fresh_for_binding(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> bool {
+    let Ok(Some(cache)) = read_claude_statusline_cache(&default_support_dir()) else {
+        return false;
+    };
+    !cache.windows.is_empty()
+        && cache.observed_at_epoch_seconds <= now.saturating_add(60)
+        && now.saturating_sub(cache.observed_at_epoch_seconds)
+            <= claude_credit_pools::ACTIVE_SLOT_SECONDS
+        && !account_identifier_hash.is_empty()
+        && cache.observed_under_account_identifier_hash == account_identifier_hash
+        && cache.observed_under_organization_identifier_hash.as_deref()
+            == Some(organization_identifier_hash)
+        && matches!(
+            cache.observed_under_account_method.as_str(),
+            "config_dir" | "session_store"
+        )
+}
+
+/// Explicit refresh requests from the companion's Refresh button, for the
+/// Claude usage gate: refresh every account now, at most once a minute per
+/// account. A request lapses after [`CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS`] so
+/// a request whose read keeps failing never turns into a retry loop.
+const CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS: u64 = 2 * 60;
+const CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
+
+/// The last explicit refresh request: when it was made (0: never) and why,
+/// for the provider-call log of the reads it causes on the lane thread.
+struct ClaudeExplicitRefreshRequest {
+    at: u64,
+    trigger: crate::provider_calls::Trigger,
+}
+
+fn claude_explicit_refresh_request() -> std::sync::MutexGuard<'static, ClaudeExplicitRefreshRequest>
+{
+    static REQUEST: Mutex<ClaudeExplicitRefreshRequest> =
+        Mutex::new(ClaudeExplicitRefreshRequest {
+            at: 0,
+            trigger: crate::provider_calls::Trigger::ExplicitRefresh,
+        });
+    REQUEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Ask the next Claude collection to read every account now, each only when
+/// its stored reading and its last explicit refresh are both at least a
+/// minute old. The caller's trigger (an older app's status refresh) labels
+/// those reads; a person's Refresh is the default.
+pub(crate) fn request_claude_explicit_refresh() {
+    *claude_explicit_refresh_request() = ClaudeExplicitRefreshRequest {
+        at: current_unix_seconds(),
+        trigger: crate::provider_calls::trigger_or(crate::provider_calls::Trigger::ExplicitRefresh),
+    };
+}
+
+/// Whether an explicit refresh asks to read this binding now: a live request
+/// made after the stored reading and after the last refresh this binding
+/// answered, both at least a minute ago. The read still passes every hold,
+/// breaker and Retry-After check after this.
+fn claude_explicit_refresh_requested(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    reading_observed_at: u64,
+    now: u64,
+) -> bool {
+    let requested_at = claude_explicit_refresh_request().at;
+    let last = claude_binding_time(
+        &claude_explicit_refresh_attempts(),
+        account_identifier_hash,
+        organization_identifier_hash,
     )
+    .map_or(reading_observed_at, |at| at.max(reading_observed_at));
+    let skewed = last > now.saturating_add(60);
+    requested_at != 0
+        && now.saturating_sub(requested_at) <= CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS
+        && (skewed || now.saturating_sub(last) >= CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS)
+        && requested_at > last
+}
+
+/// A per-binding time kept in memory (bounded): the last explicit refresh a
+/// binding answered, or its last transient read failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeBindingTime {
+    account_identifier_hash: String,
+    organization_identifier_hash: String,
+    at: u64,
+}
+
+const CLAUDE_BINDING_TIMES_MAX: usize = 64;
+
+fn claude_binding_time(
+    times: &[ClaudeBindingTime],
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> Option<u64> {
+    times
+        .iter()
+        .find(|time| {
+            time.account_identifier_hash == account_identifier_hash
+                && time.organization_identifier_hash == organization_identifier_hash
+        })
+        .map(|time| time.at)
+}
+
+fn set_claude_binding_time(
+    times: &mut Vec<ClaudeBindingTime>,
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    at: u64,
+) {
+    times.retain(|time| {
+        time.account_identifier_hash != account_identifier_hash
+            || time.organization_identifier_hash != organization_identifier_hash
+    });
+    times.push(ClaudeBindingTime {
+        account_identifier_hash: account_identifier_hash.to_string(),
+        organization_identifier_hash: organization_identifier_hash.to_string(),
+        at,
+    });
+    let excess = times.len().saturating_sub(CLAUDE_BINDING_TIMES_MAX);
+    times.drain(..excess);
+}
+
+/// The last time each binding answered an explicit refresh, whatever the
+/// read's outcome: a failed read consumes the request and still counts for
+/// the once-a-minute limit.
+fn claude_explicit_refresh_attempts() -> std::sync::MutexGuard<'static, Vec<ClaudeBindingTime>> {
+    static ATTEMPTS: Mutex<Vec<ClaudeBindingTime>> = Mutex::new(Vec::new());
+    ATTEMPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn note_claude_explicit_refresh_attempt(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) {
+    set_claude_binding_time(
+        &mut claude_explicit_refresh_attempts(),
+        account_identifier_hash,
+        organization_identifier_hash,
+        now,
+    );
+}
+
+/// Until when each binding's last 429 asked us to wait, kept in memory too: an
+/// explicit refresh never reads inside it, even if the persisted breaker is
+/// not usable (for example after a configuration change).
+fn claude_rate_limit_holds() -> std::sync::MutexGuard<'static, Vec<ClaudeBindingTime>> {
+    static HOLDS: Mutex<Vec<ClaudeBindingTime>> = Mutex::new(Vec::new());
+    HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn claude_rate_limit_held(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> bool {
+    claude_binding_time(
+        &claude_rate_limit_holds(),
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+    .is_some_and(|until| now < until)
+}
+
+/// The collection pass running on this thread: set by the status lane around
+/// each collection.
+#[derive(Debug, Clone, Copy)]
+struct ClaudePass {
+    /// An app's status request: serve stored readings. Only an explicit
+    /// refresh reads the provider in such a pass.
+    saved_only: bool,
+    /// When the pass started (unix seconds).
+    started_at: u64,
+}
+
+thread_local! {
+    static CLAUDE_PASS: std::cell::Cell<Option<ClaudePass>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run one collection as a pass that started at `started_at`. `saved_only`
+/// marks a pass an app's status request started.
+pub(crate) fn with_claude_pass<T>(
+    saved_only: bool,
+    started_at: u64,
+    collect: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<ClaudePass>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLAUDE_PASS.with(|pass| pass.set(self.0));
+        }
+    }
+    let _restore = Restore(CLAUDE_PASS.with(|pass| {
+        pass.replace(Some(ClaudePass {
+            saved_only,
+            started_at,
+        }))
+    }));
+    collect()
+}
+
+/// Whether this thread's collection serves stored Claude readings only.
+pub(crate) fn claude_pass_saved_only() -> bool {
+    CLAUDE_PASS.with(|pass| pass.get().is_some_and(|pass| pass.saved_only))
+}
+
+/// A pass longer than this no longer anchors its reads' spacing.
+const CLAUDE_PASS_ANCHOR_MAX_SECONDS: u64 = 2 * 60;
+
+/// Where the spacing after a successful read is measured from: the start of
+/// the collection pass that read, so the next pass 5 min later finds the
+/// account due wherever in that pass the read falls; `now` outside a pass.
+fn claude_spacing_anchor(now: u64) -> u64 {
+    CLAUDE_PASS
+        .with(|pass| pass.get())
+        .map(|pass| pass.started_at)
+        .filter(|started| *started <= now && now - started <= CLAUDE_PASS_ANCHOR_MAX_SECONDS)
+        .unwrap_or(now)
+}
+
+/// A read that failed without a status the provider asks us to act on (a
+/// server error or a network failure) records no backoff of its own. The
+/// binding then waits [`CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS`] before the
+/// next provider request, so repeated status passes do not retry it at once.
+/// Every other hold, breaker and Retry-After still applies on top.
+const CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS: u64 = 60;
+
+fn claude_transient_failures() -> std::sync::MutexGuard<'static, Vec<ClaudeBindingTime>> {
+    static FAILURES: Mutex<Vec<ClaudeBindingTime>> = Mutex::new(Vec::new());
+    FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn claude_transient_failure_held(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> bool {
+    claude_binding_time(
+        &claude_transient_failures(),
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+    .is_some_and(|at| {
+        at <= now.saturating_add(60)
+            && now.saturating_sub(at) < CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS
+    })
 }
 
 impl From<Result<ClaudeOAuthUsage, String>> for ClaudeOAuthUsageOutcome {
@@ -10865,8 +12549,9 @@ fn claude_quota_check_diagnostic(code: &str, detail: &str, now: u64) -> AgentSta
         .with_observed_at(rfc3339_from_unix_seconds(now))
 }
 
-/// Effective freshness gate for the Claude OAuth usage read: the ~60-minute
-/// base cadence spread deterministically across a 55-65 minute band.
+/// Effective freshness gate for the Claude OAuth usage read of an unused
+/// account: the ~40-minute base cadence spread deterministically across a
+/// 38-42 minute band.
 ///
 /// The spread is load-spreading across OUR OWN users - it stops every Ottto
 /// install from refreshing on the same wall-clock minute. It is explicitly NOT
@@ -12075,6 +13760,24 @@ fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> 
     )
 }
 
+/// Status-coverage feed (plan §2a.9): this slot's already-qualified hashes, or
+/// that the pass has none. Returns nothing, so the feed cannot change status.
+fn note_claude_status_coverage(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    captured_at: &str,
+    observation: CoverageObservation<'_>,
+) {
+    if crate::claude_status_coverage::enabled() {
+        crate::claude_status_coverage::observe(
+            &descriptor.slot_id,
+            descriptor.config_dir.as_deref(),
+            &home_dir().join(".claude"),
+            captured_at,
+            observation,
+        );
+    }
+}
+
 /// Multi-account collection never assigns full meters through organization or
 /// email fallback. Both provider UUIDs must be present and independently
 /// hashed before a window or credit can leave the machine.
@@ -12308,6 +14011,74 @@ fn claude_oauth_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
     }
     windows.extend(claude_oauth_scoped_limit_windows(value));
     windows
+}
+
+/// Whether the body says the account has no account-wide weekly limit (some
+/// Team plans): `seven_day` is present and null, and `limits[]` lists no
+/// account-wide weekly entry. A missing key or a missing `limits[]` proves
+/// nothing, so the weekly window stays expected.
+fn claude_oauth_account_weekly_not_offered(value: &Value) -> bool {
+    let Some(limits) = value.get("limits").and_then(Value::as_array) else {
+        return false;
+    };
+    value.get("seven_day").is_some_and(Value::is_null)
+        && !limits.is_empty()
+        && !limits.iter().any(|entry| {
+            let account_scoped = entry
+                .get("scope")
+                .and_then(|scope| scope.get("model"))
+                .map_or(true, Value::is_null);
+            entry.get("kind").and_then(Value::as_str) == Some("weekly_all")
+                || account_scoped && entry.get("group").and_then(Value::as_str) == Some("weekly")
+        })
+}
+
+/// Capability a Claude snapshot carries when Claude said the account has no
+/// account-wide weekly limit, so completeness checks over the snapshot expect
+/// only its session window.
+const CLAUDE_ACCOUNT_WEEKLY_NOT_OFFERED_CAPABILITY: &str = "account_weekly_window";
+
+fn claude_account_weekly_not_offered_capability() -> AgentCapabilityGap {
+    unsupported_capability(
+        CLAUDE_ACCOUNT_WEEKLY_NOT_OFFERED_CAPABILITY,
+        "Claude reports no account-wide weekly limit for this account.",
+    )
+}
+
+fn claude_snapshot_account_weekly_not_offered(snapshot: &AgentStatusSnapshot) -> bool {
+    snapshot.capabilities.iter().any(|capability| {
+        capability.capability == CLAUDE_ACCOUNT_WEEKLY_NOT_OFFERED_CAPABILITY
+            && capability.status == AgentCapabilityStatus::Unsupported
+    })
+}
+
+fn claude_snapshot_has_account_windows(snapshot: &AgentStatusSnapshot) -> bool {
+    claude_has_account_windows(
+        &snapshot.quota_windows,
+        claude_snapshot_account_weekly_not_offered(snapshot),
+    )
+}
+
+fn fresh_quota_windows(windows: &[AgentQuotaWindow]) -> Vec<AgentQuotaWindow> {
+    windows
+        .iter()
+        .filter(|window| window.freshness == AgentQuotaWindowFreshness::Fresh)
+        .cloned()
+        .collect()
+}
+
+/// Every account-wide window the account has: the session window, plus the
+/// weekly window unless Claude said the account has none.
+fn claude_has_account_windows(
+    windows: &[AgentQuotaWindow],
+    account_weekly_not_offered: bool,
+) -> bool {
+    let has = |name: &str| {
+        windows
+            .iter()
+            .any(|window| window.scope == AgentQuotaWindowScope::Account && window.name == name)
+    };
+    has("session") && (account_weekly_not_offered || has("weekly"))
 }
 
 /// Per-model scoped limits from the `limits[]` array (e.g. `weekly_scoped`
@@ -12640,6 +14411,7 @@ fn claude_oauth_usage_from_cache(cache: ClaudeOAuthUsageCache, now: u64) -> Clau
             );
             credits
         },
+        account_weekly_not_offered: cache.account_weekly_not_offered,
     }
 }
 
@@ -13628,20 +15400,11 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
     })
 }
 
-fn validated_codex_identity(
-    credentials: &CodexAuthCredentials,
-    provider_account: Option<&Value>,
-    rate_limits: Option<&Value>,
-    provider_authenticated_active_credential: bool,
-) -> Option<CodexStrongIdentity> {
-    // Decoding a JWT never authenticates it. This flag is supplied only after
-    // the provider has successfully used the active access token for the same
-    // quota response. App-server does that after account/read refreshes the
-    // credential; the default-only legacy fallback does it when the provider
-    // accepts the access token and workspace header for its quota response.
-    if !provider_authenticated_active_credential {
-        return None;
-    }
+/// The user and workspace ids a local Codex credential claims: the access
+/// token's, agreeing with the stored account id and, when present, the id
+/// token. Decoding a JWT never authenticates it; this names what the
+/// credential says, nothing more.
+fn codex_credential_claimed_ids(credentials: &CodexAuthCredentials) -> Option<(String, String)> {
     let claims = structurally_valid_live_codex_jwt_claims(credentials.access_token.as_deref()?)?;
     let auth_claim = claims.get("https://api.openai.com/auth");
     let account_id = auth_claim
@@ -13666,6 +15429,88 @@ fn validated_codex_identity(
             return None;
         }
     }
+    Some((account_id, raw_workspace_id))
+}
+
+/// The account identifier hash the credential claims (not validated), for
+/// the provider-call log.
+fn codex_credential_claimed_account_hash(credentials: &CodexAuthCredentials) -> Option<String> {
+    let (account_id, _) = codex_credential_claimed_ids(credentials)?;
+    billing_identity_hash("openai", "account", &account_id)
+}
+
+/// The account identifier hash a home's credential claims, for the
+/// provider-call log. `None` when it names none or cannot be read (and, in
+/// unit tests, for any home outside the scratch dir).
+pub(crate) fn codex_home_claimed_account_hash(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+) -> Option<String> {
+    if !crate::provider_calls::readable_for_account(codex_home) {
+        return None;
+    }
+    let credentials = read_codex_auth_credentials_at(codex_home, home_trust).ok()??;
+    codex_credential_claimed_account_hash(&credentials)
+}
+
+/// The account the default Codex home's credential claims, for the
+/// provider-call log of reads that use `~/.codex` itself.
+pub(crate) fn default_codex_home_claimed_account_hash() -> Option<String> {
+    codex_home_claimed_account_hash(&default_codex_home(), CodexHomeTrust::ProviderDefault)
+}
+
+/// The account a Codex CLI run started with the daemon's environment signs
+/// in as (its `CODEX_HOME`, else `~/.codex`), for the provider-call log.
+pub(crate) fn codex_cli_home_claimed_account_hash() -> Option<String> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    match home {
+        Some(home) => codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault),
+        None => default_codex_home_claimed_account_hash(),
+    }
+}
+
+/// The user a Codex access token claims (not validated), hashed like
+/// [`codex_credential_claimed_account_hash`], for the provider-call log of a
+/// request made with exactly that token.
+pub(crate) fn codex_access_token_claimed_account_hash(access_token: &str) -> Option<String> {
+    let claims = structurally_valid_live_codex_jwt_claims(access_token)?;
+    let account_id = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
+        .or_else(|| first_json_string(&claims, &["sub"]))?;
+    billing_identity_hash("openai", "account", &account_id)
+}
+
+/// The binding key ([`codex_credit_grants::binding_key`]) a local Codex
+/// credential claims. Only a key to compare with an earlier provider-validated
+/// binding; it is never an identity and grants no authority.
+fn codex_credential_claimed_binding(credentials: &CodexAuthCredentials) -> Option<String> {
+    let (account_id, raw_workspace_id) = codex_credential_claimed_ids(credentials)?;
+    Some(codex_credit_grants::binding_key(
+        &billing_identity_hash("openai", "account", &account_id)?,
+        &billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
+    ))
+}
+
+fn validated_codex_identity(
+    credentials: &CodexAuthCredentials,
+    provider_account: Option<&Value>,
+    rate_limits: Option<&Value>,
+    provider_authenticated_active_credential: bool,
+) -> Option<CodexStrongIdentity> {
+    // Decoding a JWT never authenticates it. This flag is supplied only after
+    // the provider has successfully used the active access token for the same
+    // quota response. App-server does that after account/read refreshes the
+    // credential; the default-only legacy fallback does it when the provider
+    // accepts the access token and workspace header for its quota response.
+    if !provider_authenticated_active_credential {
+        return None;
+    }
+    let (account_id, raw_workspace_id) = codex_credential_claimed_ids(credentials)?;
+    let claims = structurally_valid_live_codex_jwt_claims(credentials.access_token.as_deref()?)?;
+    let auth_claim = claims.get("https://api.openai.com/auth");
     if let Some(provider_account) = provider_account {
         let active = provider_account.get("account")?;
         if active.get("type").and_then(Value::as_str) != Some("chatgpt") {
@@ -13835,10 +15680,20 @@ fn collect_codex_app_server_usage_for_home(
                 .map(|identity| codex_credit_binding(&identity));
             codex_credit_grants::routine_read_needs_details(binding.as_deref(), rate_limits, now)
         };
+    let started = Instant::now();
     let observation =
         match call_codex_app_server_rate_limits_for_home(codex_home, home_trust, &needs_details) {
             Ok(observation) => observation,
             Err(message) => {
+                eprintln!(
+                    "{}",
+                    codex_probe_failure_log_line(
+                        &message,
+                        codex_home,
+                        started.elapsed(),
+                        current_unix_seconds(),
+                    )
+                );
                 // No reading at all: the detail back-off still applies to the
                 // account last validated at this home (design R7).
                 codex_credit_grants::record_session_failure(codex_home, now);
@@ -13850,6 +15705,64 @@ fn collect_codex_app_server_usage_for_home(
         codex_credit_grants::remember_home_binding(codex_home, &codex_credit_binding(identity));
     }
     Ok(probe)
+}
+
+/// One log line per failed app-server probe: wall-clock time, the session
+/// stage, the error kind, a digest of the Codex home and the elapsed time.
+/// Built from the fixed producer text only; no path, account or provider text.
+fn codex_probe_failure_log_line(
+    message: &str,
+    codex_home: &Path,
+    elapsed: Duration,
+    now: u64,
+) -> String {
+    let (stage, kind) = codex_probe_failure_stage_and_kind(message);
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:codex-home-log:v1\0");
+    digest.update(codex_home.as_os_str().as_encoded_bytes());
+    let home = format!("{:x}", digest.finalize());
+    format!(
+        "codex usage probe failed: at={} stage={stage} kind={kind} home={} elapsed_ms={}",
+        rfc3339_from_unix_seconds(now).unwrap_or_else(|| "unknown".to_string()),
+        &home[..12],
+        elapsed.as_millis()
+    )
+}
+
+/// `(stage, kind)` of a failed app-server probe, from its fixed producer text
+/// (`codex_app_server_rpc_failure`, `codex_app_server_end_failure` and the
+/// session's own messages).
+fn codex_probe_failure_stage_and_kind(message: &str) -> (&'static str, &'static str) {
+    let kind = if message.contains("timed out") {
+        "timeout"
+    } else if message.contains("RPC failed") {
+        "rpc_error"
+    } else if message.contains("stdout closed") {
+        "stdout_closed"
+    } else if message.contains("stdout read failed") {
+        "read_failed"
+    } else if message.contains("exceeded") {
+        "output_bound"
+    } else if message.contains("not found")
+        || message.contains("could not be started")
+        || message.contains("was unavailable")
+    {
+        "start"
+    } else if message.contains("request") && message.contains("failed") {
+        "request_failed"
+    } else {
+        "other"
+    };
+    let stage = message
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find_map(|word| match word {
+            "initialize" => Some("initialize"),
+            "account" => Some("account"),
+            "quota" => Some("quota"),
+            _ => None,
+        })
+        .unwrap_or(if kind == "start" { "start" } else { "session" });
+    (stage, kind)
 }
 
 fn codex_credit_binding(identity: &CodexStrongIdentity) -> String {
@@ -13906,6 +15819,7 @@ fn codex_usage_probe_from_app_server_observation(
         credit_balances,
         account: codex_app_server_account(&observation.account),
         identity,
+        saved_identity: None,
         credential_read_failed: observation.credential_read_failed,
         response_completed_at: observation.response_completed_at,
         reset_credit_detail_summary,
@@ -13961,7 +15875,7 @@ struct CodexAppServerObservation {
 
 fn codex_app_server_success_diagnostic(
     response_completed_at: Option<String>,
-    identity: Option<&CodexStrongIdentity>,
+    identity: Option<&CodexIdentityHashes>,
     has_usage: bool,
 ) -> Option<AgentStatusDiagnostic> {
     let identity = identity.filter(|_| has_usage)?;
@@ -13985,6 +15899,11 @@ fn codex_app_server_success_diagnostic(
 /// the same session: `(account result, rate-limit result, refreshed
 /// credentials)`.
 type CodexNeedsDetails<'a> = &'a dyn Fn(&Value, &Value, Option<&CodexAuthCredentials>) -> bool;
+
+/// No `codex` executable: not a transient read failure (see
+/// [`codex_probe_failed_only`]).
+const CODEX_CLI_NOT_FOUND_FOR_PROBE: &str =
+    "Codex CLI was not found for app-server rate-limit collection.";
 
 /// Fixed producer text only; never persist provider error messages or data.
 fn codex_app_server_rpc_failure(phase: &str, error: &Value) -> String {
@@ -14025,13 +15944,72 @@ fn codex_app_server_end_failure(
     format!("Codex app-server stdout closed during {phase}; child termination was not observed before cleanup.")
 }
 
+/// What one `codex app-server` run asked of the provider, for the
+/// provider-call log.
+#[derive(Debug, Default)]
+struct CodexAppServerRun {
+    spawned: bool,
+    /// Whether the session asked for the detailed rate-limits read.
+    detail_read_sent: bool,
+    /// Whether the CLI rejected the routine read's parameter itself; that
+    /// read never reached the provider, and the detailed read replaced it.
+    routine_read_rejected: bool,
+    timed_out: bool,
+}
+
+/// Provider requests a started `codex app-server` quota session counts at
+/// least, sent whether or not they were answered: the token refresh and the
+/// rate-limits read.
+const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 2;
+
+/// One `codex app-server` quota session for `codex_home`, logged as one
+/// provider-call line when the CLI started.
 fn call_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
     needs_details: CodexNeedsDetails<'_>,
 ) -> Result<CodexAppServerObservation, String> {
+    use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
+    let account_before = codex_home_claimed_account_hash(codex_home, home_trust);
+    let started = Instant::now();
+    let mut run = CodexAppServerRun::default();
+    let result =
+        run_codex_app_server_rate_limits_for_home(codex_home, home_trust, needs_details, &mut run);
+    if run.spawned {
+        let result_class = match &result {
+            Ok(_) => CallResult::Ok,
+            Err(_) if run.timed_out => CallResult::Timeout,
+            Err(message) if message.contains("RPC failed") => CallResult::Error("rpc_error"),
+            Err(message) if message.contains("stdout closed") => CallResult::Error("exited"),
+            Err(message) if message.contains("exceeded its") => CallResult::Error("output_bound"),
+            Err(_) => CallResult::Error("error"),
+        };
+        let account =
+            account_before.or_else(|| codex_home_claimed_account_hash(codex_home, home_trust));
+        crate::provider_calls::record(ProviderCall::subprocess(
+            Provider::Openai,
+            CallKind::CodexAppServerQuota,
+            crate::provider_calls::trigger_or(Trigger::Other),
+            account.as_deref(),
+            result_class,
+            started.elapsed(),
+            CODEX_APP_SERVER_MIN_REQUESTS
+                + u32::from(run.detail_read_sent && !run.routine_read_rejected),
+        ));
+    }
+    result
+}
+
+fn run_codex_app_server_rate_limits_for_home(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    needs_details: CodexNeedsDetails<'_>,
+    run: &mut CodexAppServerRun,
+) -> Result<CodexAppServerObservation, String> {
+    #[cfg(test)]
+    CODEX_APP_SERVER_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let Some(program_path) = crate::command_env::executable_path("codex") else {
-        return Err("Codex CLI was not found for app-server rate-limit collection.".to_string());
+        return Err(CODEX_CLI_NOT_FOUND_FOR_PROBE.to_string());
     };
     let Some(identity) = effective_user_identity() else {
         return Err("Codex app-server user identity was unavailable.".to_string());
@@ -14057,6 +16035,7 @@ fn call_codex_app_server_rate_limits_for_home(
     let mut child = command
         .spawn()
         .map_err(|_| "Codex app-server could not be started.".to_string())?;
+    run.spawned = true;
     let stdout = child
         .stdout
         .take()
@@ -14136,6 +16115,7 @@ fn call_codex_app_server_rate_limits_for_home(
     // `Ok(true)`: settled; `Ok(false)`: timed out or the server went away.
     let outcome: Result<bool, String> = loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            run.timed_out = true;
             break Ok(false);
         };
         let message = match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
@@ -14179,6 +16159,7 @@ fn call_codex_app_server_rate_limits_for_home(
                 // A server that does not accept the routine parameter still
                 // answers the plain read it always accepted.
                 send_details = true;
+                run.routine_read_rejected = true;
             }
             (Some("ottto_rate_limits"), Some(error)) => {
                 break Err(rpc_failure("quota", error));
@@ -14232,6 +16213,7 @@ fn call_codex_app_server_rate_limits_for_home(
                 }
                 break Err("Codex app-server quota request failed.".to_string());
             }
+            run.detail_read_sent = true;
             continue;
         }
         if detail_requested
@@ -14605,7 +16587,7 @@ fn codex_monthly_credit_limit_from_snapshot(container: &Value) -> Option<AgentCr
     };
 
     Some(AgentCreditBalance {
-        name: "workspace_monthly_credits".to_string(),
+        name: codex_credit_grants::WORKSPACE_MONTHLY_CREDITS.to_string(),
         status,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Credits,
@@ -14664,7 +16646,7 @@ fn codex_credit_balance_from_credits_snapshot(
         codex_credit_balance_status(remaining, unlimited, has_credits)
     };
     Some(AgentCreditBalance {
-        name: "credits".to_string(),
+        name: codex_credit_grants::PLAN_CREDITS.to_string(),
         status,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Credits,
@@ -14748,8 +16730,17 @@ fn collect_codex_oauth_usage_at(
     if let Some(account_id) = credentials.account_id.as_deref() {
         request = request.set("ChatGPT-Account-Id", account_id);
     }
-    let value: Value = request
-        .call()
+    let call_started = Instant::now();
+    let response = request.call();
+    crate::provider_calls::record(crate::provider_calls::ProviderCall::observed(
+        crate::provider_calls::Provider::Openai,
+        crate::provider_calls::CallKind::CodexWhamUsage,
+        crate::provider_calls::trigger_or(crate::provider_calls::Trigger::Other),
+        codex_credential_claimed_account_hash(&credentials).as_deref(),
+        crate::provider_calls::http_result(&response),
+        call_started.elapsed(),
+    ));
+    let value: Value = response
         .map_err(codex_usage_probe_error)?
         .into_json()
         .map_err(|_| "Codex usage endpoint returned an unreadable response.".to_string())?;
@@ -14766,6 +16757,7 @@ fn collect_codex_oauth_usage_at(
         credit_balances,
         account: None,
         identity,
+        saved_identity: None,
         credential_read_failed: false,
         response_completed_at: None,
         reset_credit_detail_summary: None,
@@ -14952,7 +16944,7 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         codex_credit_balance_status(remaining, unlimited, has_credits)
     };
     balances.push(AgentCreditBalance {
-        name: "credits".to_string(),
+        name: codex_credit_grants::PLAN_CREDITS.to_string(),
         status,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Credits,
@@ -17028,6 +19020,12 @@ fn run_codex_home_command(
     run_prepared_command_capture(command, timeout)
 }
 
+/// `codex login` for one managed home, with the same binary, PATH and clean
+/// environment as the home's quota reads. `None` when Codex is not found.
+pub(crate) fn codex_login_command(codex_home: &Path) -> Option<Command> {
+    resolved_codex_home_command(codex_home, &["login"], false)
+}
+
 /// Resolve Codex once and run it with one exact credential home. Ambient
 /// provider credentials are deliberately excluded so a managed slot cannot
 /// silently fall back to the default account or an API key.
@@ -17228,6 +19226,8 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod status_coverage_feed;
 
     /// The account resolution `collect_claude_status` performs, for tests that
     /// exercise the OAuth path directly.
@@ -19558,6 +21558,40 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn status_coverage_registers_slots_past_collection_capacity() {
+        use crate::claude_status_coverage::{self as coverage, Registration};
+        let default_dir = Path::new("/tmp/claude-default/.claude");
+        let registration = |dirs: &[String], dir: &str| {
+            coverage::clear_global_for_test();
+            coverage::retain_registered(dirs.iter().map(String::as_str), default_dir);
+            coverage::snapshot()
+                .expect("feed available")
+                .registration(&coverage::home_key(Path::new(dir)), u64::MAX)
+        };
+        for count in [9, 12] {
+            let (collected, overflow) =
+                bounded_claude_custom_descriptors((0..count).map(test_slot_descriptor).collect());
+            let dirs = claude_status_coverage_dirs(&collected, &overflow);
+            assert_eq!(dirs.len(), count, "overflow folders are fed too");
+            for index in 0..count {
+                // Past the ledger cap a folder may be forgotten, never proven absent.
+                assert_ne!(
+                    registration(&dirs, &format!("/tmp/claude-slot-{index}")),
+                    Registration::NeverRegistered
+                );
+            }
+            let unregistered = registration(&dirs, "/tmp/claude-slot-unregistered");
+            if count <= coverage::MAX_SLOTS {
+                assert_eq!(unregistered, Registration::NeverRegistered, "control");
+            } else {
+                assert_eq!(unregistered, Registration::Unknown);
+            }
+        }
+        coverage::clear_global_for_test();
+    }
+
     /// Synthetic Claude and Codex agent-status snapshots exactly as the
     /// collector uploads them: the real account-to-plan-observation copy, the
     /// real hash function, then the protocol backend redaction. The backend
@@ -19922,6 +21956,7 @@ exit 1
                     remaining: Some(credits),
                     ..Default::default()
                 }],
+                account_weekly_not_offered: false,
             };
             claude_oauth_stamp_account_identity(&mut usage, account_hash, Some(organization_hash));
             ClaudeOAuthUsageCache {
@@ -19932,6 +21967,7 @@ exit 1
                 next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
                 windows: usage.windows,
                 credit_balances: usage.credit_balances,
+                account_weekly_not_offered: false,
             }
         };
         write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
@@ -19942,6 +21978,7 @@ exit 1
             next_refresh_after_epoch_seconds: u64::MAX,
             windows: Vec::new(),
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write unavailable primary cache");
         write_claude_oauth_usage_cache(&usage_cache(&secondary_hash, &secondary_org, 77, 777))
@@ -20583,6 +22620,7 @@ for line in sys.stdin:
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexQuotaRead::Provider,
         );
 
         assert!(
@@ -20644,6 +22682,250 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A synthetic Codex install whose provider home is the default home
+    /// (`$HOME/.codex`), with the daemon support dir beside it. The guards
+    /// restore the environment.
+    #[cfg(unix)]
+    fn synthetic_default_codex_install(label: &str) -> (PathBuf, PathBuf, Vec<EnvVarGuard>) {
+        let (root, provider_home) = synthetic_codex_collector_home(label, 0o600);
+        let home = root.join(".codex");
+        std::fs::rename(&provider_home, &home).expect("default Codex home");
+        let support = root.join("support");
+        std::fs::create_dir(&support).expect("support dir");
+        let guards = vec![
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string()),
+            EnvVarGuard::set_os("HOME", root.as_os_str().to_os_string()),
+            EnvVarGuard::set_os(
+                "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+                support.as_os_str().to_os_string(),
+            ),
+        ];
+        (root, home, guards)
+    }
+
+    fn codex_app_server_runs() -> usize {
+        CODEX_APP_SERVER_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn default_codex_slot(home: &Path) -> CodexHomeSlot {
+        CodexHomeSlot {
+            slot_id: "default".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Default,
+            home: home.to_path_buf(),
+            registered_binding: None,
+        }
+    }
+
+    /// Every status read serves the saved reading: the accounts status (the
+    /// companion's 3 s poll) and the per-home reads of the collection lane
+    /// start no `codex app-server`, before and after a provider read, and
+    /// show exactly what the provider read saved.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_status_reads_serve_the_saved_reading_and_never_start_app_server() {
+        let (root, home, _guards) = synthetic_default_codex_install("saved-reads");
+        let read = |quota_read| {
+            collect_codex_home_candidate(
+                default_codex_slot(&home),
+                "2026-08-26T00:00:00Z",
+                "2026-08-26T00:15:00Z",
+                quota_read,
+            )
+        };
+
+        // Before any provider read: nothing saved, no app-server, and an
+        // honest "not read yet" rather than a failed read.
+        let before = codex_app_server_runs();
+        let unread = read(CodexQuotaRead::Saved);
+        let annotated = annotate_codex_accounts_status(empty_codex_accounts_status());
+        assert_eq!(codex_app_server_runs(), before);
+        assert!(unread.binding.is_none());
+        assert!(unread
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_quota_not_read_yet"));
+        assert!(!unread
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+        assert_ne!(unread.snapshot.status, AgentStatusState::Degraded);
+        assert!(annotated.default_slot.collection.quota_snapshot.is_none());
+
+        // One provider read (the schedule's) saves the reading.
+        let fresh = read(CodexQuotaRead::Provider);
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+
+        // Status reads now show it, still without any app-server run.
+        let saved = read(CodexQuotaRead::Saved);
+        let annotated = annotate_codex_accounts_status(empty_codex_accounts_status());
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_eq!(saved.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+        assert_eq!(saved.binding, fresh.binding);
+        assert_eq!(saved.snapshot.quota_windows, fresh.snapshot.quota_windows);
+        assert_eq!(
+            saved.snapshot.credit_balances,
+            fresh.snapshot.credit_balances
+        );
+        assert_eq!(
+            saved
+                .snapshot
+                .account
+                .as_ref()
+                .map(|account| &account.plan_type),
+            fresh
+                .snapshot
+                .account
+                .as_ref()
+                .map(|account| &account.plan_type)
+        );
+        let default_slot = &annotated.default_slot.collection;
+        assert_eq!(default_slot.state, CodexAccountSlotCollectionStateV1::Fresh);
+        assert_eq!(
+            default_slot.account_identifier_hash,
+            fresh.status.account_identifier_hash
+        );
+
+        // A failed provider read is served as that failure by status reads.
+        fail_synthetic_codex_app_server(&root);
+        let failed = read(CodexQuotaRead::Provider);
+        let failed_runs = codex_app_server_runs();
+        let served_failure = read(CodexQuotaRead::Saved);
+        assert_eq!(codex_app_server_runs(), failed_runs);
+        assert_eq!(served_failure.status.state, failed.status.state);
+        assert!(served_failure
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+
+        if let Some((account, workspace)) = fresh.binding.as_ref() {
+            codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+                account, workspace,
+            ));
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The explicit refresh reads now, at most once a minute per home; the
+    /// schedule reads an unused home again only after 15 minutes.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_explicit_refresh_is_rate_limited_and_the_schedule_waits_its_interval() {
+        use crate::provider_calls::{with_trigger, CallKind, Trigger};
+        let (root, home, _guards) = synthetic_default_codex_install("explicit-refresh");
+        let support = root.join("support");
+        codex_saved_quota::forget_running_homes();
+        let before = codex_app_server_runs();
+
+        let first = with_trigger(Trigger::ExplicitRefresh, || refresh_codex_quota_now(0));
+        assert_eq!(first.read, 1);
+        assert_eq!(first.rate_limited, 0);
+        assert_eq!(codex_app_server_runs(), before + 1);
+
+        // A second press within the minute reads nothing.
+        let second = refresh_codex_quota_now(0);
+        assert_eq!(second.read, 0);
+        assert_eq!(second.rate_limited, 1);
+        assert_eq!(codex_app_server_runs(), before + 1);
+
+        // The schedule: the home is not in use, so it is not due before 15
+        // minutes, and due at 15.
+        let now = current_unix_seconds();
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 14 * 60),
+            0
+        );
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_eq!(
+            with_trigger(Trigger::Schedule, || codex_saved_quota::scheduled_round(
+                &support,
+                now + 15 * 60 + 1
+            )),
+            1
+        );
+        assert_eq!(codex_app_server_runs(), before + 2);
+
+        // One provider-call line per app-server run, with the reason its
+        // caller gave (the reads run on per-home threads): at least the token
+        // refresh and the rate-limits read each.
+        let account = codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault)
+            .expect("claimed account");
+        let lines = crate::provider_calls::test_lines(CallKind::CodexAppServerQuota, &account);
+        let summary = lines
+            .iter()
+            .map(|line| {
+                (
+                    line.provider.as_str(),
+                    line.trigger.as_str(),
+                    line.result.as_str(),
+                    line.basis.as_str(),
+                    line.requests_at_least >= 2,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "openai",
+                    "explicit_refresh",
+                    "ok",
+                    "subprocess_lower_bound",
+                    true
+                ),
+                ("openai", "schedule", "ok", "subprocess_lower_bound", true),
+            ]
+        );
+        let raw = crate::provider_calls::test_raw_log();
+        assert!(!raw.contains("synthetic-account") && !raw.contains("synthetic-workspace"));
+        assert!(!raw.contains(&*home.to_string_lossy()));
+
+        let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .ok()
+            .flatten()
+            .and_then(|credentials| codex_credential_claimed_binding(&credentials));
+        if let Some(binding) = binding {
+            codex_credit_grants::forget_binding_cadence(&binding);
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An older app's status refresh stands in for Refresh with a 5-minute
+    /// gap: one read per home, then the saved copy, even for the one-minute
+    /// Refresh, until the home's last read is 5 minutes old.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_older_app_status_refresh_reads_each_home_once_per_five_minutes() {
+        let (root, home, _guards) = synthetic_default_codex_install("legacy-status-refresh");
+        codex_saved_quota::forget_running_homes();
+        let before = codex_app_server_runs();
+
+        let first = refresh_codex_quota_now(5 * 60);
+        assert_eq!((first.read, first.rate_limited), (1, 0));
+        assert_eq!(codex_app_server_runs(), before + 1);
+        let second = refresh_codex_quota_now(5 * 60);
+        assert_eq!((second.read, second.rate_limited), (0, 1));
+        assert_eq!(codex_app_server_runs(), before + 1);
+
+        let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .ok()
+            .flatten()
+            .and_then(|credentials| codex_credential_claimed_binding(&credentials));
+        if let Some(binding) = binding {
+            codex_credit_grants::forget_binding_cadence(&binding);
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -20659,6 +22941,7 @@ for line in sys.stdin:
                 "2026-08-26T00:15:00Z".to_string(),
                 &home,
                 CodexHomeTrust::ProviderDefault,
+                CodexQuotaRead::Provider,
             )
         };
 
@@ -20687,6 +22970,755 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Replace the synthetic home's credential with another account's.
+    #[cfg(unix)]
+    fn write_other_synthetic_codex_account(home: &Path) {
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        std::fs::write(
+            home.join("auth.json"),
+            serde_json::json!({
+                "tokens": {
+                    "access_token": synthetic_codex_access_jwt_with_profile_email(
+                        "other-user",
+                        "other-workspace",
+                        "other-account",
+                        "pro",
+                        expires_at,
+                    ),
+                    "id_token": synthetic_codex_jwt(
+                        "other-user",
+                        "other-workspace",
+                        "other-account",
+                        "pro",
+                        expires_at,
+                    )
+                },
+                "account_id": "other-workspace"
+            })
+            .to_string(),
+        )
+        .expect("other account");
+    }
+
+    /// Make the synthetic app-server end before answering `initialize`; the
+    /// login and model commands still answer, so the home stays signed in.
+    #[cfg(unix)]
+    fn fail_synthetic_codex_app_server(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = root.join("codex");
+        let script = std::fs::read_to_string(&executable).expect("fake Codex");
+        std::fs::write(
+            &executable,
+            script.replace(
+                "for line in sys.stdin:",
+                "sys.exit(3)\nfor line in sys.stdin:",
+            ),
+        )
+        .expect("failing app-server");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+    }
+
+    /// Make the fake app-server rewrite the home's `auth.json` with `body`
+    /// while it answers `account/read`, as Codex does when that read
+    /// refreshes the token.
+    #[cfg(unix)]
+    fn rewrite_auth_during_synthetic_codex_read(root: &Path, home: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let replacement = root.join("auth-after-read.json");
+        std::fs::write(&replacement, body).expect("auth written by the read");
+        let executable = root.join("codex");
+        let script = std::fs::read_to_string(&executable).expect("fake Codex");
+        let rewrite = format!(
+            "        open({}, 'w').write(open({}).read())\n",
+            serde_json::Value::from(home.join("auth.json").to_str().unwrap()),
+            serde_json::Value::from(replacement.to_str().unwrap()),
+        );
+        let marker = "    elif '\"id\":\"ottto_account\"' in line:\n";
+        assert!(script.contains(marker), "fake Codex answers account/read");
+        std::fs::write(
+            &executable,
+            script.replace(marker, &format!("{marker}{rewrite}")),
+        )
+        .expect("rewriting app-server");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+    }
+
+    /// A synthetic `auth.json` for `user` in `workspace`, with tokens that
+    /// expire at `expires_at` (a new value is a new token).
+    fn synthetic_codex_auth_body(user: &str, workspace: &str, expires_at: i64) -> String {
+        serde_json::json!({
+            "tokens": {
+                "access_token": synthetic_codex_access_jwt_with_profile_email(
+                    user,
+                    workspace,
+                    "synthetic-account",
+                    "pro",
+                    expires_at,
+                ),
+                "id_token": synthetic_codex_jwt(
+                    user,
+                    workspace,
+                    "synthetic-account",
+                    "pro",
+                    expires_at,
+                ),
+            },
+            "account_id": workspace,
+        })
+        .to_string()
+    }
+
+    /// Every real provider read refreshes the token, so Codex rewrites
+    /// `auth.json` during it. A rewrite for the same account and workspace
+    /// keeps the reading and the home waits its full interval; a rewrite to
+    /// another login discards the reading and that login is read after a
+    /// minute, then kept.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_auth_rewritten_by_the_read_keeps_the_reading_for_the_same_login() {
+        let (root, home, _guards) = synthetic_default_codex_install("auth-rewrite");
+        let support = root.join("support");
+        codex_saved_quota::forget_running_homes();
+        let later = OffsetDateTime::now_utc().unix_timestamp() + 7_200;
+        rewrite_auth_during_synthetic_codex_read(
+            &root,
+            &home,
+            &synthetic_codex_auth_body("synthetic-user", "synthetic-workspace", later),
+        );
+        let witness = || {
+            std::fs::metadata(home.join("auth.json"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        let before_read = witness();
+        let before = codex_app_server_runs();
+
+        // One scheduled read: the token is rewritten, the reading is kept. A
+        // little ahead of the clock, so every attempt is stamped `now` however
+        // long the fake read takes.
+        let now = current_unix_seconds() + 30;
+        assert_eq!(codex_saved_quota::scheduled_round(&support, now), 1);
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_ne!(witness(), before_read, "the read rewrote auth.json");
+        let served = codex_saved_quota::serve_saved(&home, CodexHomeTrust::ProviderDefault, now)
+            .expect("the reading is served");
+        assert!(!served.quota_windows.is_empty());
+        let reading_binding = served.saved_identity.as_ref().map(|identity| {
+            codex_credit_grants::binding_key(
+                &identity.account_identifier_hash,
+                &identity.workspace_identifier_hash,
+            )
+        });
+        // Not read again a minute later, nor before the unused interval.
+        assert_eq!(codex_saved_quota::scheduled_round(&support, now + 61), 0);
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 15 * 60 - 30),
+            0
+        );
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 15 * 60 + 1),
+            1
+        );
+        assert_eq!(codex_app_server_runs(), before + 2);
+
+        // The next read switches the home to another account: that reading
+        // cannot be told apart, so it is not saved, and the old account's
+        // reading is not served for the new login.
+        rewrite_auth_during_synthetic_codex_read(
+            &root,
+            &home,
+            &synthetic_codex_auth_body("another-user", "another-workspace", later),
+        );
+        let switch_at = now + 30 * 60 + 2;
+        assert_eq!(codex_saved_quota::scheduled_round(&support, switch_at), 1);
+        assert_eq!(
+            codex_saved_quota::serve_saved(&home, CodexHomeTrust::ProviderDefault, switch_at)
+                .err()
+                .map(|failure| failure.message),
+            Some(codex_saved_quota::CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
+        // The new login is read after a minute, and that reading is kept.
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, switch_at + 30),
+            0
+        );
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, switch_at + 61),
+            1
+        );
+        let rebound =
+            codex_saved_quota::serve_saved(&home, CodexHomeTrust::ProviderDefault, switch_at + 61)
+                .expect("the new login's reading is served");
+        let rebound_binding = rebound.saved_identity.as_ref().map(|identity| {
+            codex_credit_grants::binding_key(
+                &identity.account_identifier_hash,
+                &identity.workspace_identifier_hash,
+            )
+        });
+        assert!(rebound_binding.is_some());
+        assert_ne!(rebound_binding, reading_binding);
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, switch_at + 5 * 60),
+            0
+        );
+
+        for binding in [reading_binding, rebound_binding].into_iter().flatten() {
+            codex_credit_grants::forget_binding_cadence(&binding);
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn has_stale_meters(snapshot: &AgentStatusSnapshot) -> bool {
+        snapshot
+            .quota_windows
+            .iter()
+            .any(|window| window.freshness == AgentQuotaWindowFreshness::Stale)
+            || snapshot
+                .credit_balances
+                .iter()
+                .any(|balance| balance.freshness == AgentQuotaWindowFreshness::Stale)
+    }
+
+    /// Test oracle: the rules by which the shipped Mac app's Codex accounts
+    /// decoder reads one slot's `collection` of the local status, described
+    /// by behaviour. A slot this refuses fails the whole status there.
+    fn mac_admits_codex_slot_collection(collection: &serde_json::Value) -> Result<(), String> {
+        let text = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let rows = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        // The state is a closed set; a missing state is `unverified`.
+        let state = text(collection, "state").unwrap_or_else(|| "unverified".to_string());
+        if ![
+            "unverified",
+            "fresh",
+            "needs_login",
+            "identity_unknown",
+            "identity_mismatch",
+            "provider_unavailable",
+            "duplicate_account",
+            "unknown",
+        ]
+        .contains(&state.as_str())
+        {
+            return Err(format!("state {state} is not decodable"));
+        }
+        // An identity hash is 64 lowercase hex.
+        let strong_hash = |key: &str| -> Result<Option<String>, String> {
+            match text(collection, key) {
+                Some(hash)
+                    if hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+                {
+                    Ok(Some(hash))
+                }
+                Some(_) => Err(format!("{key} is not a strong hash")),
+                None => Ok(None),
+            }
+        };
+        let account = strong_hash("account_identifier_hash")?;
+        let workspace = strong_hash("workspace_identifier_hash")?;
+        // Both hashes or neither.
+        if account.is_some() != workspace.is_some() {
+            return Err("one identity hash without the other".to_string());
+        }
+        // A diagnostic has a code and a message.
+        for diagnostic in rows(collection, "diagnostics") {
+            if text(&diagnostic, "code").is_none_or(|code| code.is_empty())
+                || text(&diagnostic, "message").is_none_or(|message| message.is_empty())
+            {
+                return Err("empty diagnostic".to_string());
+            }
+        }
+        let snapshot = collection
+            .get("quota_snapshot")
+            .filter(|value| !value.is_null());
+        let mut fresh_evidence = false;
+        if let Some(snapshot) = snapshot {
+            // A snapshot has a capture time.
+            if text(snapshot, "captured_at").is_none_or(|at| at.is_empty()) {
+                return Err("quota_snapshot without captured_at".to_string());
+            }
+            // A snapshot only on these states.
+            if !["unknown", "fresh", "duplicate_account"].contains(&state.as_str()) {
+                return Err(format!("quota_snapshot on state {state}"));
+            }
+            // A snapshot only with both hashes.
+            let (Some(account), Some(workspace)) = (account.as_ref(), workspace.as_ref()) else {
+                return Err("quota_snapshot without identity hashes".to_string());
+            };
+            let same_identity = |row: &serde_json::Value| {
+                text(row, "account_identifier_hash").as_ref() == Some(account)
+                    && text(row, "organization_identifier_hash").as_ref() == Some(workspace)
+            };
+            // Every window carries the slot's hashes.
+            for window in rows(snapshot, "quota_windows") {
+                if !same_identity(&window) {
+                    return Err("window of another identity".to_string());
+                }
+                // Fresh evidence is an active fresh window.
+                fresh_evidence |= text(&window, "freshness").as_deref() == Some("fresh")
+                    && window.get("is_active").and_then(serde_json::Value::as_bool) != Some(false);
+            }
+            // Every balance carries the slot's hashes
+            // and a known status and unit.
+            for balance in rows(snapshot, "credit_balances") {
+                if !same_identity(&balance) {
+                    return Err("balance of another identity".to_string());
+                }
+                if !text(&balance, "status").is_some_and(|status| {
+                    [
+                        "ok",
+                        "low",
+                        "exhausted",
+                        "unlimited",
+                        "unsupported",
+                        "stale",
+                        "error",
+                        "unknown",
+                    ]
+                    .contains(&status.as_str())
+                }) {
+                    return Err("balance status is not decodable".to_string());
+                }
+                if text(&balance, "unit").is_some_and(|unit| {
+                    !["credits", "usd", "tokens", "resets", "unknown"].contains(&unit.as_str())
+                }) {
+                    return Err("balance unit is not decodable".to_string());
+                }
+                // The oracle counts any fresh balance, which is
+                // looser than the app and only matters for `fresh` slots.
+                fresh_evidence |= text(&balance, "freshness").as_deref() == Some("fresh");
+            }
+        }
+        // A fresh slot proves its reading.
+        if state == "fresh"
+            && (account.is_none()
+                || text(collection, "observed_at").is_none_or(|at| at.is_empty())
+                || !fresh_evidence)
+        {
+            return Err("fresh without identity, read time or fresh meters".to_string());
+        }
+        Ok(())
+    }
+
+    /// Test oracle for the whole status as the shipped Mac app reads it:
+    /// every slot by [`mac_admits_codex_slot_collection`]; slot ids and
+    /// capacity; managed slots that share one account and workspace are one
+    /// anchor plus declared duplicates; and the account card rule: the app
+    /// builds one card per account from every slot with that account's
+    /// hashes, the default slot included, and a slot in state `unknown` is
+    /// not actionable, which hides the whole card's meters and actions. So
+    /// an `unknown` slot with hashes must be the only slot of its account.
+    /// The setup-operation rules are not ported; these fixtures are idle.
+    fn mac_admits_codex_accounts_status(status: &CodexAccountsStatusV1) -> Result<(), String> {
+        let status = serde_json::to_value(status).expect("status JSON");
+        let default_slot = &status["default_slot"];
+        let managed = status["managed_slots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut slot_ids = BTreeSet::new();
+        for slot in std::iter::once(default_slot).chain(managed.iter()) {
+            let slot_id = slot["slot_id"].as_str().unwrap_or_default().to_string();
+            mac_admits_codex_slot_collection(
+                slot.get("collection").unwrap_or(&serde_json::json!({})),
+            )
+            .map_err(|error| format!("{slot_id}: {error}"))?;
+            if !slot_ids.insert(slot_id) {
+                return Err("slot ids repeat".to_string());
+            }
+        }
+        if default_slot["slot_id"] != "default"
+            || managed.iter().any(|slot| slot["slot_id"] == "default")
+        {
+            return Err("default slot id".to_string());
+        }
+        let capacity = &status["capacity"];
+        let used = capacity["used_slots"].as_u64().unwrap_or_default();
+        if capacity["max_slots"].as_u64() != Some(u64::from(ottto_core::MAX_CODEX_ACCOUNT_SLOTS))
+            || used != slot_ids.len() as u64
+            || capacity["max_slots"].as_u64()
+                != Some(used + capacity["remaining_slots"].as_u64().unwrap_or_default())
+        {
+            return Err("capacity".to_string());
+        }
+        let mut by_binding = BTreeMap::<(String, String), (usize, usize)>::new();
+        for slot in &managed {
+            let collection = &slot["collection"];
+            let (Some(account), Some(workspace)) = (
+                collection["account_identifier_hash"].as_str(),
+                collection["workspace_identifier_hash"].as_str(),
+            ) else {
+                continue;
+            };
+            let entry = by_binding
+                .entry((account.to_string(), workspace.to_string()))
+                .or_default();
+            entry.0 += 1;
+            if collection["relationship"] == "duplicate_anchor"
+                || collection["state"] == "duplicate_account"
+            {
+                entry.1 += 1;
+            }
+        }
+        if by_binding
+            .values()
+            .any(|(slots, duplicates)| *slots > 1 && slots - duplicates != 1)
+        {
+            return Err("managed slots share a binding without one anchor".to_string());
+        }
+        let binding_of = |slot: &serde_json::Value| {
+            let collection = &slot["collection"];
+            collection["account_identifier_hash"]
+                .as_str()
+                .zip(collection["workspace_identifier_hash"].as_str())
+                .map(|(account, workspace)| (account.to_string(), workspace.to_string()))
+        };
+        let all_slots = std::iter::once(default_slot)
+            .chain(managed.iter())
+            .collect::<Vec<_>>();
+        for slot in &all_slots {
+            if slot["collection"]["state"] != "unknown" {
+                continue;
+            }
+            let Some(binding) = binding_of(slot) else {
+                continue;
+            };
+            if all_slots
+                .iter()
+                .filter(|other| binding_of(other).as_ref() == Some(&binding))
+                .count()
+                > 1
+            {
+                return Err("an unknown slot hides its account's card".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn codex_accounts_status_for(candidates: &[CodexSlotCandidate]) -> CodexAccountsStatusV1 {
+        let mut status = empty_codex_accounts_status();
+        for candidate in candidates {
+            if candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed {
+                status.managed_slots.push(CodexAccountSlotDescriptorV1 {
+                    slot_id: candidate.slot.slot_id.clone(),
+                    ownership: CodexAccountSlotOwnershipV1::Managed,
+                    collection: Default::default(),
+                });
+            }
+        }
+        status.capacity.used_slots = 1 + status.managed_slots.len() as u8;
+        status.capacity.remaining_slots = status.capacity.max_slots - status.capacity.used_slots;
+        apply_codex_candidate_statuses(&mut status, candidates);
+        status
+    }
+
+    /// The local status of failed probes must decode on every shipped Mac
+    /// app (one refused slot fails the whole Codex accounts status there)
+    /// and must not hide an account's fresh meters.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_local_status_of_failed_probes_decodes_on_shipped_mac_apps() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A default home whose probe fails after one good reading.
+        let (default_root, default_home) = synthetic_codex_collector_home("mac-default", 0o600);
+        let failed_default = {
+            let _commands = EnvVarGuard::set_os(
+                "OTTTO_COMMAND_SEARCH_PATH",
+                default_root.as_os_str().to_os_string(),
+            );
+            let collect = || {
+                collect_codex_home_candidate(
+                    CodexHomeSlot {
+                        slot_id: "default".to_string(),
+                        ownership: CodexAccountSlotOwnershipV1::Default,
+                        home: default_home.clone(),
+                        registered_binding: None,
+                    },
+                    "2026-08-26T00:00:00Z",
+                    "2026-08-26T00:15:00Z",
+                    CodexQuotaRead::Provider,
+                )
+            };
+            let fresh = collect();
+            assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+            fail_synthetic_codex_app_server(&default_root);
+            (fresh, collect())
+        };
+        let (fresh_default, failed_default) = failed_default;
+        assert_eq!(failed_default.snapshot.status, AgentStatusState::Degraded);
+
+        // A managed home in the same case.
+        let (root, home) = synthetic_codex_collector_home("mac-managed", 0o600);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .expect("managed home mode");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let collect = |slot_id: &str, registered_binding| {
+            collect_codex_home_candidate(
+                CodexHomeSlot {
+                    slot_id: slot_id.to_string(),
+                    ownership: CodexAccountSlotOwnershipV1::Managed,
+                    home: home.clone(),
+                    registered_binding,
+                },
+                "2026-08-26T00:05:00Z",
+                "2026-08-26T00:20:00Z",
+                CodexQuotaRead::Provider,
+            )
+        };
+        let mut fresh = collect("codex_slot_mac", None);
+        let registered = fresh.binding.clone().expect("validated binding");
+        fail_synthetic_codex_app_server(&root);
+        let failed = collect("codex_slot_mac", Some(registered.clone()));
+        assert_eq!(
+            failed.status.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(failed.status.quota_snapshot.is_some());
+
+        // What this slot looked like before the fix is what the Mac refuses.
+        let mut refused = codex_accounts_status_for(&[]);
+        refused.managed_slots.push(CodexAccountSlotDescriptorV1 {
+            slot_id: "codex_slot_mac".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            collection: failed.status.clone(),
+        });
+        refused.capacity.used_slots = 2;
+        refused.capacity.remaining_slots = refused.capacity.max_slots - 2;
+        assert!(mac_admits_codex_accounts_status(&refused).is_err());
+
+        // Kept binding: `unknown`, the registered hashes, the stale reading.
+        let candidates = [failed_default, failed];
+        let status = codex_accounts_status_for(&candidates);
+        mac_admits_codex_accounts_status(&status).expect("failed probes decode on the Mac");
+        let managed = &status.managed_slots[0].collection;
+        assert_eq!(managed.state, CodexAccountSlotCollectionStateV1::Unknown);
+        assert_eq!(
+            serde_json::to_value(managed).expect("slot JSON")["state"],
+            "unknown"
+        );
+        assert_eq!(
+            managed.account_identifier_hash.as_deref(),
+            Some(registered.0.as_str())
+        );
+        assert_eq!(
+            managed.workspace_identifier_hash.as_deref(),
+            Some(registered.1.as_str())
+        );
+        let reading = managed.quota_snapshot.as_ref().expect("last reading");
+        assert!(!reading.quota_windows.is_empty());
+        assert!(reading
+            .quota_windows
+            .iter()
+            .all(|window| window.freshness == AgentQuotaWindowFreshness::Stale));
+        assert!(managed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_identity_unknown"));
+        // The default home: no slot reading, no slot hashes.
+        let default = &status.default_slot.collection;
+        assert!(default.quota_snapshot.is_none());
+        assert!(default.account_identifier_hash.is_none());
+        assert_ne!(default.state, CodexAccountSlotCollectionStateV1::Unknown);
+        // The wire shape changes nothing the daemon decides from.
+        let [failed_default, failed] = candidates;
+        assert_eq!(
+            failed.status.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(failed.binding.is_none());
+
+        // Another managed slot holds the same account: the failed slot
+        // gives way instead of becoming a second anchor.
+        fresh.slot.slot_id = "codex_slot_other".to_string();
+        let candidates = [failed_default, failed, fresh];
+        let shared = codex_accounts_status_for(&candidates);
+        let [_, failed, _] = candidates;
+        mac_admits_codex_accounts_status(&shared).expect("shared binding decodes on the Mac");
+        let gave_way = &shared.managed_slots[0].collection;
+        assert_eq!(
+            gave_way.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(gave_way.quota_snapshot.is_none());
+        assert!(gave_way.account_identifier_hash.is_none());
+        assert_eq!(
+            shared.managed_slots[1].collection.state,
+            CodexAccountSlotCollectionStateV1::Fresh
+        );
+
+        // The default login reads the same account fresh while the managed
+        // slot fails: the managed slot gives way, so the account's card
+        // keeps the default login's fresh meters.
+        assert_eq!(fresh_default.binding.as_ref(), Some(&registered));
+        let candidates = [fresh_default, failed];
+        let same_account = codex_accounts_status_for(&candidates);
+        mac_admits_codex_accounts_status(&same_account)
+            .expect("the default login's card keeps its meters");
+        let default = &same_account.default_slot.collection;
+        assert_eq!(default.state, CodexAccountSlotCollectionStateV1::Fresh);
+        assert!(default
+            .quota_snapshot
+            .as_ref()
+            .is_some_and(|reading| reading
+                .quota_windows
+                .iter()
+                .any(|window| window.freshness == AgentQuotaWindowFreshness::Fresh)));
+        let gave_way = &same_account.managed_slots[0].collection;
+        assert_eq!(
+            gave_way.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(gave_way.quota_snapshot.is_none());
+        assert!(gave_way.account_identifier_hash.is_none());
+        // The oracle refuses the shape that would hide that card.
+        let [_, failed] = candidates;
+        let mut hidden = same_account.clone();
+        hidden.managed_slots[0].collection = codex_local_slot_status(&failed);
+        assert_eq!(
+            hidden.managed_slots[0].collection.state,
+            CodexAccountSlotCollectionStateV1::Unknown
+        );
+        assert!(mac_admits_codex_accounts_status(&hidden).is_err());
+
+        // Binding not kept (the credential names another account): no
+        // reading, the state as before.
+        write_other_synthetic_codex_account(&home);
+        let switched = collect("codex_slot_mac", Some(registered.clone()));
+        let status = codex_accounts_status_for(&[switched]);
+        mac_admits_codex_accounts_status(&status).expect("unkept binding decodes on the Mac");
+        let managed = &status.managed_slots[0].collection;
+        assert!(managed.quota_snapshot.is_none());
+        assert_ne!(managed.state, CodexAccountSlotCollectionStateV1::Unknown);
+
+        codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+            &registered.0,
+            &registered.1,
+        ));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(default_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_managed_failed_probe_keeps_the_last_reading_local_and_uploads_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, home) = synthetic_codex_collector_home("last-known", 0o600);
+        // A managed home is private to its owner.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .expect("managed home mode");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let slot = |registered_binding| CodexHomeSlot {
+            slot_id: "codex_slot_last_known".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home: home.clone(),
+            registered_binding,
+        };
+        let collect = |registered_binding| {
+            collect_codex_home_candidate(
+                slot(registered_binding),
+                "2026-08-26T00:05:00Z",
+                "2026-08-26T00:20:00Z",
+                CodexQuotaRead::Provider,
+            )
+        };
+
+        // A successful reading through the collector.
+        let fresh = collect(None);
+        assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+        let registered = fresh.binding.clone().expect("validated binding");
+        assert!(!fresh.snapshot.quota_windows.is_empty());
+
+        fail_synthetic_codex_app_server(&root);
+        let failed = collect(Some(registered.clone()));
+        assert!(failed.binding.is_none());
+        assert_eq!(
+            failed.status.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+
+        // Local status: the slot shows its last reading, marked stale, with
+        // the original read clocks.
+        let mut expected_windows = fresh.snapshot.quota_windows.clone();
+        let mut expected_balances = fresh.snapshot.credit_balances.clone();
+        mark_quota_meters_stale(&mut expected_windows, &mut expected_balances);
+        let local = failed.status.quota_snapshot.clone().expect("local reading");
+        assert_eq!(local.quota_windows, expected_windows);
+        assert_eq!(local.credit_balances, expected_balances);
+        assert!(local
+            .quota_windows
+            .iter()
+            .all(|window| window.observed_at.is_some()));
+
+        // Past the cap nothing is shown.
+        assert!(codex_last_known_slot_reading(
+            &slot(Some(registered.clone())),
+            "2026-08-26T00:05:00Z",
+            current_unix_seconds() + codex_last_known::LAST_KNOWN_MAX_AGE_SECS + 1,
+        )
+        .is_none());
+
+        // Upload: the failure shape only, never the last reading.
+        let placeholder = configured_unavailable_snapshot(failed);
+        assert!(placeholder.quota_windows.is_empty());
+        assert!(placeholder.credit_balances.is_empty());
+        let uploaded = placeholder.redacted_for_backend();
+        assert!(uploaded.quota_windows.is_empty());
+        assert!(uploaded.credit_balances.is_empty());
+        assert_eq!(
+            uploaded
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.as_deref()),
+            Some(registered.0.as_str())
+        );
+
+        // The home's credential now names another account, never validated
+        // here: the registered account's reading is not shown.
+        write_other_synthetic_codex_account(&home);
+        let switched = collect(Some(registered.clone()));
+        assert!(switched.status.quota_snapshot.is_none());
+
+        // Signed out (no credential): nothing either.
+        std::fs::remove_file(home.join("auth.json")).expect("sign out");
+        let signed_out = collect(Some(registered.clone()));
+        assert!(signed_out.status.quota_snapshot.is_none());
+
+        // The failed sessions charged the shared synthetic binding a detail
+        // back-off; other collector tests expect none.
+        codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+            &registered.0,
+            &registered.1,
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -20700,6 +23732,7 @@ for line in sys.stdin:
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexQuotaRead::Provider,
         );
 
         assert!(identity.is_none());
@@ -20746,9 +23779,12 @@ for line in sys.stdin:
             superseded_account_identifier_hash: None,
             superseded_organization_identifier_hash: None,
         };
-        let diagnostic =
-            codex_app_server_success_diagnostic(Some(completed_at.clone()), Some(&identity), true)
-                .expect("bound check");
+        let diagnostic = codex_app_server_success_diagnostic(
+            Some(completed_at.clone()),
+            Some(&CodexIdentityHashes::from(&identity)),
+            true,
+        )
+        .expect("bound check");
         assert_eq!(
             diagnostic.observed_at.as_deref(),
             Some(completed_at.as_str())
@@ -20757,17 +23793,24 @@ for line in sys.stdin:
             diagnostic.organization_identifier_hash.as_deref(),
             Some("workspace-a")
         );
-        assert!(codex_app_server_success_diagnostic(None, Some(&identity), true).is_none());
+        assert!(codex_app_server_success_diagnostic(
+            None,
+            Some(&CodexIdentityHashes::from(&identity)),
+            true
+        )
+        .is_none());
         assert!(
             codex_app_server_success_diagnostic(Some(completed_at.clone()), None, true).is_none()
         );
-        assert!(
-            codex_app_server_success_diagnostic(Some(completed_at), Some(&identity), false)
-                .is_none()
-        );
+        assert!(codex_app_server_success_diagnostic(
+            Some(completed_at),
+            Some(&CodexIdentityHashes::from(&identity)),
+            false
+        )
+        .is_none());
         assert!(codex_app_server_success_diagnostic(
             Some("2099-01-01T00:00:00Z".to_string()),
-            Some(&identity),
+            Some(&CodexIdentityHashes::from(&identity)),
             true
         )
         .is_none());
@@ -20950,6 +23993,11 @@ for line in sys.stdin:
         if mode == "quota_error":
             reply(request_id, code=-32603)
             sys.exit(0)
+        if mode == "routine_rejected" and request_id == "ottto_rate_limits":
+            # An older CLI refuses the routine parameter without asking the
+            # provider.
+            reply(request_id, code=-32602)
+            continue
         reply(request_id, {"rateLimits": {"primary": {"usedPercent": 25, "windowDurationMins": 300}}})
 "#;
 
@@ -21065,6 +24113,70 @@ for line in sys.stdin:
             assert_closed_during(&message, phase, observed_end);
             assert_no_provider_text(&message);
         }
+    }
+
+    /// A request made with a Codex token is logged under the same user hash
+    /// as reads of the home that holds it.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_token_names_the_same_account_as_its_home() {
+        let (root, home) = synthetic_codex_collector_home("token-account", 0o600);
+        let credentials = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .expect("readable")
+            .expect("credential");
+        let from_token = codex_access_token_claimed_account_hash(
+            credentials.access_token.as_deref().expect("token"),
+        );
+        assert!(from_token.is_some());
+        assert_eq!(
+            from_token,
+            codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault)
+        );
+        assert_eq!(codex_access_token_claimed_account_hash("not-a-jwt"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Each app-server run that started is one provider-call line counting
+    /// the requests it sent, answered or not: a failed or timed-out read still
+    /// counts its token refresh and rate-limits read. A routine read an older
+    /// CLI refused locally is not counted.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_probe_runs_count_sent_provider_requests_even_when_they_fail() {
+        use crate::provider_calls::CallKind;
+        let support = crate::test_scratch::ScratchDir::new("codex-probe-call-log");
+        let _support = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support.as_os_str().to_os_string(),
+        );
+        let modes = [
+            "initialize_error",
+            "account_error",
+            "quota_error",
+            "quota_eof",
+            "success",
+            "routine_rejected",
+        ];
+        for mode in modes {
+            let _ = run_codex_probe_failure_fake(mode);
+        }
+        let lines = crate::provider_calls::test_lines(CallKind::CodexAppServerQuota, "unknown");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.result.as_str(), line.requests_at_least))
+                .collect::<Vec<_>>(),
+            [
+                ("rpc_error", 2),
+                ("rpc_error", 2),
+                ("rpc_error", 2),
+                ("exited", 2),
+                ("ok", 2),
+                ("ok", 2),
+            ]
+        );
+        assert!(!crate::provider_calls::test_raw_log().contains("sensitive-provider-text"));
     }
 
     #[cfg(unix)]
@@ -21487,6 +24599,310 @@ for line in sys.stdin:
             "codex_configured_account_unavailable"
         );
         assert!(snapshot.diagnostics[0].observed_at.is_none());
+    }
+
+    /// The same slot after a whole-session probe failure (here the
+    /// `initialize` deadline): still signed in, but no identity hashes, no
+    /// live binding and no reading. The state is the production
+    /// classification (`identity_unknown`).
+    fn codex_failed_probe_candidate(
+        home: &str,
+        account_hash: &str,
+        workspace_hash: &str,
+    ) -> CodexSlotCandidate {
+        let mut candidate = codex_candidate_for_test(
+            "codex_slot_last_known",
+            CodexAccountSlotOwnershipV1::Managed,
+            account_hash,
+            workspace_hash,
+            1,
+        );
+        candidate.slot.home = PathBuf::from(home);
+        let account = candidate.snapshot.account.as_mut().expect("account");
+        account.account_identifier_hash = None;
+        account.organization_identifier_hash = None;
+        candidate.snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+        candidate
+            .snapshot
+            .diagnostics
+            .push(AgentStatusDiagnostic::source(
+                "codex_usage_probe_failed",
+                AgentDiagnosticSeverity::Warning,
+                "Codex app-server initialize read timed out.",
+            ));
+        candidate.status = codex_collection_status_from_snapshot(&candidate.snapshot);
+        candidate.binding = enforce_codex_registered_binding(
+            &candidate.slot,
+            &mut candidate.snapshot,
+            &mut candidate.status,
+        );
+        assert_eq!(
+            candidate.status.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(candidate.binding.is_none());
+        candidate
+    }
+
+    fn configured_unavailable_snapshot(candidate: CodexSlotCandidate) -> AgentStatusSnapshot {
+        let mut snapshots = Vec::new();
+        append_configured_codex_unavailable_snapshots(
+            &mut snapshots,
+            &[candidate],
+            "2026-09-01T10:00:00Z",
+            "2026-09-01T10:15:00Z",
+        );
+        assert_eq!(snapshots.len(), 1);
+        snapshots.remove(0)
+    }
+
+    #[test]
+    fn a_failed_codex_probe_placeholder_is_uploaded_without_meters() {
+        // The binding has a recent reading and the home was validated as it.
+        let home = "/tmp/codex-last-known-test-placeholder";
+        let binding = codex_credit_grants::binding_key("lk-account-1", "lk-workspace-1");
+        codex_credit_grants::remember_home_binding(Path::new(home), &binding);
+        codex_last_known::record(
+            &binding,
+            &[AgentQuotaWindow {
+                name: "primary".to_string(),
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                used_percent: Some(40),
+                ..Default::default()
+            }],
+            &[AgentCreditBalance {
+                name: "reset_bank".to_string(),
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                remaining: Some(2),
+                ..Default::default()
+            }],
+            current_unix_seconds(),
+        );
+
+        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
+            home,
+            "lk-account-1",
+            "lk-workspace-1",
+        ));
+
+        // The upload row is the failure shape; the server carries forward its
+        // own last good reading.
+        assert!(placeholder.quota_windows.is_empty());
+        assert!(placeholder.credit_balances.is_empty());
+        assert_eq!(
+            placeholder
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex_configured_account_unavailable"]
+        );
+    }
+
+    #[test]
+    fn a_slot_without_a_readable_matching_credential_shows_no_last_reading() {
+        // The binding has a recent reading and the home was validated as it,
+        // but the home holds no credential now (a sign-out).
+        let home = "/tmp/codex-last-known-test-no-credential";
+        let binding = codex_credit_grants::binding_key("lk-account-2", "lk-workspace-2");
+        codex_credit_grants::remember_home_binding(Path::new(home), &binding);
+        codex_last_known::record(
+            &binding,
+            &[AgentQuotaWindow::default()],
+            &[],
+            current_unix_seconds(),
+        );
+        assert!(codex_last_known::stale_reading(&binding, current_unix_seconds()).is_some());
+
+        let slot = CodexHomeSlot {
+            slot_id: "codex_slot_last_known".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home: PathBuf::from(home),
+            registered_binding: Some(("lk-account-2".to_string(), "lk-workspace-2".to_string())),
+        };
+        assert!(codex_last_known_slot_reading(
+            &slot,
+            "2026-09-01T10:00:00Z",
+            current_unix_seconds()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_failed_codex_upload_never_carries_stale_meters_or_local_plan_words() {
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Degraded,
+            AgentStatusCollectionMethod::CliText,
+            "2026-09-01T10:00:00Z".to_string(),
+            "2026-09-01T10:15:00Z".to_string(),
+        );
+        let mut account = unsupported_account("openai");
+        account.login_state = AgentLoginState::SignedIn;
+        account.account_identifier_hash = Some("kept-account".to_string());
+        account.organization_identifier_hash = Some("kept-workspace".to_string());
+        account.plan_type = Some("pro".to_string());
+        account.subscription_product = Some("chatgpt_pro".to_string());
+        account.billing_channel = Some("subscription".to_string());
+        account.subscription_period_start = Some("2026-01-01T00:00:00Z".to_string());
+        account.subscription_period_end = Some("2026-02-01T00:00:00Z".to_string());
+        account.subscription_period_last_checked_at = Some("2026-01-15T00:00:00Z".to_string());
+        snapshot.account = Some(account);
+        snapshot.quota_windows = vec![AgentQuotaWindow {
+            name: "primary".to_string(),
+            freshness: AgentQuotaWindowFreshness::Stale,
+            used_percent: Some(40),
+            ..Default::default()
+        }];
+        snapshot.credit_balances = vec![AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            freshness: AgentQuotaWindowFreshness::Stale,
+            remaining: Some(2),
+            ..Default::default()
+        }];
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "codex_usage_probe_failed",
+            AgentDiagnosticSeverity::Warning,
+            "Codex app-server initialize read timed out.",
+        ));
+        append_current_plan_observation(&mut snapshot);
+        assert!(has_stale_meters(&snapshot), "the local copy keeps them");
+
+        let uploaded = snapshot.clone().redacted_for_backend();
+        assert!(uploaded.quota_windows.is_empty());
+        assert!(uploaded.credit_balances.is_empty());
+        assert!(uploaded.plan_observations.is_empty());
+        let account = uploaded.account.as_ref().expect("account");
+        assert!(account.plan_type.is_none());
+        assert!(account.subscription_product.is_none());
+        assert!(account.subscription_period_start.is_none());
+        assert!(account.subscription_period_end.is_none());
+        assert!(account.subscription_period_last_checked_at.is_none());
+        // The registered route is identity, not a plan fact: it stays.
+        assert_eq!(account.billing_channel.as_deref(), Some("subscription"));
+        assert_eq!(
+            account.account_identifier_hash.as_deref(),
+            Some("kept-account")
+        );
+        assert_eq!(
+            account.organization_identifier_hash.as_deref(),
+            Some("kept-workspace")
+        );
+        assert_eq!(uploaded.status, AgentStatusState::Degraded);
+        assert!(uploaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+
+        // A successful Codex reading is uploaded as read.
+        snapshot.diagnostics.clear();
+        mark_all_fresh(&mut snapshot);
+        let uploaded = snapshot.redacted_for_backend();
+        assert_eq!(uploaded.quota_windows.len(), 1);
+        assert_eq!(uploaded.credit_balances.len(), 1);
+        assert_eq!(
+            uploaded
+                .account
+                .as_ref()
+                .and_then(|account| account.plan_type.as_deref()),
+            Some("pro")
+        );
+    }
+
+    fn mark_all_fresh(snapshot: &mut AgentStatusSnapshot) {
+        for window in &mut snapshot.quota_windows {
+            window.freshness = AgentQuotaWindowFreshness::Fresh;
+        }
+        for balance in &mut snapshot.credit_balances {
+            balance.freshness = AgentQuotaWindowFreshness::Fresh;
+        }
+    }
+
+    #[test]
+    fn codex_probe_failure_log_line_names_stage_kind_home_digest_and_elapsed() {
+        let line = codex_probe_failure_log_line(
+            "Codex app-server initialize read timed out.",
+            Path::new("/Users/someone/Library/Application Support/Ottto/codex-accounts/slot"),
+            Duration::from_millis(20_013),
+            1_767_225_600,
+        );
+        let home = line
+            .split(' ')
+            .find_map(|part| part.strip_prefix("home="))
+            .expect("home digest");
+        assert_eq!(home.len(), 12);
+        assert!(home.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(
+            line,
+            format!(
+                "codex usage probe failed: at=2026-01-01T00:00:00Z stage=initialize kind=timeout home={home} elapsed_ms=20013"
+            )
+        );
+        assert!(!line.contains("someone"));
+        assert!(!line.contains("Ottto"));
+    }
+
+    #[test]
+    fn codex_probe_failure_stage_and_kind_cover_every_producer_message() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let _ = child.wait();
+        let cases = [
+            (
+                codex_app_server_end_failure("initialize", false, None, &mut child),
+                ("initialize", "timeout"),
+            ),
+            (
+                codex_app_server_end_failure("account", false, None, &mut child),
+                ("account", "timeout"),
+            ),
+            (
+                codex_app_server_end_failure("quota", true, None, &mut child),
+                ("quota", "stdout_closed"),
+            ),
+            (
+                codex_app_server_rpc_failure("initialize", &serde_json::json!({"code": -32600})),
+                ("initialize", "rpc_error"),
+            ),
+            (
+                codex_app_server_rpc_failure("quota", &serde_json::json!({})),
+                ("quota", "rpc_error"),
+            ),
+            (
+                "Codex app-server quota request failed.".to_string(),
+                ("quota", "request_failed"),
+            ),
+            (
+                "Codex app-server request write failed.".to_string(),
+                ("session", "request_failed"),
+            ),
+            (
+                "Codex app-server stdout read failed.".to_string(),
+                ("session", "read_failed"),
+            ),
+            (
+                "Codex app-server output exceeded its byte limit.".to_string(),
+                ("session", "output_bound"),
+            ),
+            (
+                "Codex app-server could not be started.".to_string(),
+                ("start", "start"),
+            ),
+            (
+                "Codex CLI was not found for app-server rate-limit collection.".to_string(),
+                ("start", "start"),
+            ),
+            (
+                "Codex app-server user identity was unavailable.".to_string(),
+                ("start", "start"),
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                codex_probe_failure_stage_and_kind(&message),
+                expected,
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -22133,6 +25549,352 @@ for line in sys.stdin:
                 .and_then(|account| account.account_identifier_hash),
             Some("managed_user".to_string())
         );
+    }
+
+    fn codex_source_health_codes(health: &AgentStatusSnapshot) -> Vec<&str> {
+        health
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_codex_probe_is_a_retrying_read_not_a_connection_needing_attention() {
+        let default = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            "default_user",
+            "default_workspace",
+            5,
+        );
+        let failed = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-failed-probe",
+            "managed_user",
+            "managed_workspace",
+        );
+
+        let health = codex_source_health_snapshot(
+            &[default, failed],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
+        assert_eq!(health.status, AgentStatusState::Degraded);
+        assert_eq!(
+            codex_source_health_codes(&health),
+            vec!["codex_usage_read_retrying"]
+        );
+    }
+
+    #[test]
+    fn a_failed_default_probe_alone_is_a_retrying_read() {
+        let mut default = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-default-probe",
+            "default_user",
+            "default_workspace",
+        );
+        default.slot.slot_id = "default".to_string();
+        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
+        default.slot.registered_binding = None;
+        default.snapshot.status = AgentStatusState::Degraded;
+
+        let health = codex_source_health_snapshot(
+            &[default],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
+        assert_eq!(health.status, AgentStatusState::Degraded);
+        assert!(codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
+        assert!(!codex_source_health_codes(&health)
+            .iter()
+            .any(|code| code.starts_with("codex_registered_slot_needs_attention")));
+    }
+
+    #[test]
+    fn a_real_connection_problem_still_needs_attention_beside_a_failed_default_probe() {
+        let mut default = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-default-probe-and-login",
+            "default_user",
+            "default_workspace",
+        );
+        default.slot.slot_id = "default".to_string();
+        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
+        default.slot.registered_binding = None;
+        default.snapshot.status = AgentStatusState::Degraded;
+        let mut signed_out = codex_candidate_for_test(
+            "codex_slot_a",
+            CodexAccountSlotOwnershipV1::Managed,
+            "managed_user",
+            "managed_workspace",
+            1,
+        );
+        signed_out.status.state = CodexAccountSlotCollectionStateV1::NeedsLogin;
+
+        let health = codex_source_health_snapshot(
+            &[default, signed_out],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
+        // The default login still works; only its usage read failed.
+        assert!(codex_source_health_codes(&health)
+            .contains(&"codex_registered_slot_needs_attention_current_available"));
+        assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
+    }
+
+    #[test]
+    fn a_signed_out_default_is_not_hidden_behind_a_retrying_read() {
+        let mut default = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            "default_user",
+            "default_workspace",
+            1,
+        );
+        default.snapshot.status = AgentStatusState::AuthRequired;
+        default.status.state = CodexAccountSlotCollectionStateV1::NeedsLogin;
+        let failed = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-signed-out-default",
+            "managed_user",
+            "managed_workspace",
+        );
+
+        let health = codex_source_health_snapshot(
+            &[default, failed],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
+        assert_eq!(health.status, AgentStatusState::AuthRequired);
+        assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
+    }
+
+    #[test]
+    fn an_unconfirmed_default_login_is_not_hidden_behind_a_retrying_read() {
+        let mut default = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-unknown-default-login",
+            "default_user",
+            "default_workspace",
+        );
+        default.slot.slot_id = "default".to_string();
+        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
+        default.slot.registered_binding = None;
+        default.snapshot.status = AgentStatusState::Degraded;
+        default
+            .snapshot
+            .account
+            .as_mut()
+            .expect("account")
+            .login_state = AgentLoginState::Unknown;
+        default.status.state = CodexAccountSlotCollectionStateV1::ProviderUnavailable;
+        let failed = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-unknown-default-managed",
+            "managed_user",
+            "managed_workspace",
+        );
+
+        let health = codex_source_health_snapshot(
+            &[default, failed],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
+        assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
+    }
+
+    /// The default home's failed probe kept account A's hashes (and its stale
+    /// reading); a managed slot uploads account B.
+    fn failed_default_with_kept_hashes(account_hash: &str) -> CodexSlotCandidate {
+        let mut default = codex_failed_probe_candidate(
+            "/tmp/codex-upload-test-failed-default",
+            account_hash,
+            "default_workspace",
+        );
+        default.slot.slot_id = "default".to_string();
+        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
+        default.slot.registered_binding = None;
+        default.snapshot.status = AgentStatusState::Degraded;
+        let account = default.snapshot.account.as_mut().expect("account");
+        account.account_identifier_hash = Some(account_hash.to_string());
+        account.organization_identifier_hash = Some("default_workspace".to_string());
+        default
+    }
+
+    #[test]
+    fn a_failed_default_with_kept_hashes_is_uploaded_beside_other_accounts() {
+        let default = failed_default_with_kept_hashes("default_user");
+        assert!(default.binding.is_none(), "no transcript authority");
+        let expected = default.snapshot.clone();
+        let managed = codex_candidate_for_test(
+            "codex_slot_b",
+            CodexAccountSlotOwnershipV1::Managed,
+            "managed_user",
+            "managed_workspace",
+            5,
+        );
+        let mut snapshots = vec![managed.snapshot.clone()];
+        append_failed_default_codex_snapshot(&mut snapshots, &[default, managed]);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1], expected);
+
+        // Already represented (the same account read fresh elsewhere): no
+        // second row.
+        let mut snapshots = vec![expected.clone()];
+        append_failed_default_codex_snapshot(
+            &mut snapshots,
+            &[failed_default_with_kept_hashes("default_user")],
+        );
+        assert_eq!(snapshots.len(), 1);
+
+        // Without kept hashes nothing is added.
+        let mut unkeyed = failed_default_with_kept_hashes("default_user");
+        let account = unkeyed.snapshot.account.as_mut().expect("account");
+        account.account_identifier_hash = None;
+        account.organization_identifier_hash = None;
+        let mut snapshots = Vec::new();
+        append_failed_default_codex_snapshot(&mut snapshots, &[unkeyed]);
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn a_missing_codex_cli_is_not_a_transient_read_failure() {
+        let mut candidate = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-missing-cli",
+            "managed_user",
+            "managed_workspace",
+        );
+        candidate.snapshot.diagnostics = vec![AgentStatusDiagnostic::source(
+            "codex_usage_probe_failed",
+            AgentDiagnosticSeverity::Warning,
+            CODEX_CLI_NOT_FOUND_FOR_PROBE,
+        )];
+        assert!(!codex_probe_failed_only(
+            &candidate.status,
+            &candidate.snapshot
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_default_probe_failure_is_degraded_and_keeps_its_validated_hashes() {
+        let (root, home) = synthetic_codex_collector_home("default-failure", 0o600);
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let collect = || {
+            collect_codex_home_candidate(
+                CodexHomeSlot {
+                    slot_id: "default".to_string(),
+                    ownership: CodexAccountSlotOwnershipV1::Default,
+                    home: home.clone(),
+                    registered_binding: None,
+                },
+                "2026-08-26T00:00:00Z",
+                "2026-08-26T00:15:00Z",
+                CodexQuotaRead::Provider,
+            )
+        };
+
+        let fresh = collect();
+        assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+        let (account, workspace) = fresh.binding.clone().expect("validated binding");
+
+        // The local credential claims exactly the validated binding; the
+        // claim is a key only and needs no provider-authentication flag.
+        let credentials = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .expect("readable credential")
+            .expect("credential");
+        assert_eq!(
+            codex_credential_claimed_binding(&credentials),
+            Some(codex_credit_grants::binding_key(&account, &workspace))
+        );
+        assert!(
+            validated_codex_identity(&credentials, None, None, false).is_none(),
+            "an identity still needs provider authentication"
+        );
+        let mut inconsistent = credentials;
+        inconsistent.account_id = Some("another-workspace".to_string());
+        assert!(codex_credential_claimed_binding(&inconsistent).is_none());
+
+        fail_synthetic_codex_app_server(&root);
+
+        let failed = collect();
+        // Degraded with the stable failure code, never available.
+        assert_eq!(failed.snapshot.status, AgentStatusState::Degraded);
+        assert!(failed
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+        // Keyed to the account last validated here, with its last reading
+        // marked stale, but no live binding.
+        let kept = failed.snapshot.account.as_ref().expect("account");
+        assert_eq!(
+            kept.account_identifier_hash.as_deref(),
+            Some(account.as_str())
+        );
+        assert_eq!(
+            kept.organization_identifier_hash.as_deref(),
+            Some(workspace.as_str())
+        );
+        assert!(failed.binding.is_none());
+        // A remembered identity is never a trusted current login.
+        assert_eq!(kept.confidence, AgentStatusConfidence::Low);
+        let mut expected_windows = fresh.snapshot.quota_windows.clone();
+        let mut expected_balances = fresh.snapshot.credit_balances.clone();
+        mark_quota_meters_stale(&mut expected_windows, &mut expected_balances);
+        assert_eq!(failed.snapshot.quota_windows, expected_windows);
+        assert_eq!(failed.snapshot.credit_balances, expected_balances);
+
+        // Upload: degraded with the stable code and the kept hashes, but no
+        // last reading and no plan words from the local credential.
+        assert!(failed
+            .snapshot
+            .account
+            .as_ref()
+            .is_some_and(|account| account.plan_type.is_some()));
+        let uploaded = failed.snapshot.clone().redacted_for_backend();
+        assert_eq!(uploaded.status, AgentStatusState::Degraded);
+        assert!(uploaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+        assert!(!has_stale_meters(&uploaded));
+        assert!(uploaded.credit_balances.is_empty());
+        assert!(uploaded.plan_observations.is_empty());
+        let uploaded_account = uploaded.account.as_ref().expect("account");
+        assert!(uploaded_account.plan_type.is_none());
+        assert!(uploaded_account.subscription_product.is_none());
+        assert_eq!(
+            uploaded_account.account_identifier_hash.as_deref(),
+            Some(account.as_str())
+        );
+        assert_eq!(
+            uploaded_account.organization_identifier_hash.as_deref(),
+            Some(workspace.as_str())
+        );
+
+        // The home now holds another account's credential: no hashes kept and
+        // nothing carried.
+        write_other_synthetic_codex_account(&home);
+        let switched = collect();
+        assert_eq!(switched.snapshot.status, AgentStatusState::Degraded);
+        let switched_account = switched.snapshot.account.as_ref().expect("account");
+        assert!(switched_account.account_identifier_hash.is_none());
+        assert!(switched_account.organization_identifier_hash.is_none());
+        assert!(switched
+            .snapshot
+            .quota_windows
+            .iter()
+            .all(|window| window.freshness != AgentQuotaWindowFreshness::Stale));
+        assert!(switched.snapshot.credit_balances.is_empty());
+
+        codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+            &account, &workspace,
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -25218,6 +28980,355 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn claude_desktop_pairs_are_exact_native_uuid_folders() {
+        let root =
+            std::env::temp_dir().join(format!("ottto-claude-desktop-pairs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let (current, other, imported, tied) = (uuid(1), uuid(2), uuid(3), uuid(4));
+        let (org_x, org_y, org_z, org_w) = (uuid(11), uuid(12), uuid(13), uuid(14));
+        let (contested, agent_copied) = (uuid(5), uuid(6));
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("config.json"),
+            format!(r#"{{"lastKnownAccountUuid":"{current}"}}"#),
+        )
+        .expect("write config");
+        let write = |store: &str, account: &str, org: &str, file: &str, body: String| {
+            let directory = root.join(store).join(account).join(org);
+            std::fs::create_dir_all(&directory).expect("create bucket");
+            std::fs::write(directory.join(file), body).expect("write metadata");
+        };
+        let session = |id: &str, activity: i64| {
+            format!(r#"{{"cliSessionId":"{id}","lastActivityAt":{activity}}}"#)
+        };
+        let code = "claude-code-sessions";
+        // The current account, plus a non-current account with two orgs.
+        write(
+            code,
+            &current,
+            &org_x,
+            "local_a.json",
+            session("current-x", 300),
+        );
+        write(
+            code,
+            &other,
+            &org_y,
+            "local_b.json",
+            session("other-y", 200),
+        );
+        write(
+            code,
+            &other,
+            &org_z,
+            "local_c.json",
+            session("other-z", 100),
+        );
+        // Labels come only from the pair's own agent-mode folder.
+        write(
+            "local-agent-mode-sessions",
+            &other,
+            &org_y,
+            "local_label.json",
+            r#"{"emailAddress":"other@example.com","organizationName":"Org Y"}"#.to_string(),
+        );
+        // Imported-only (any importedFrom, null included) is not a pair.
+        write(
+            code,
+            &imported,
+            &org_w,
+            "local_d.json",
+            r#"{"cliSessionId":"copied","lastActivityAt":250,"importedFrom":null}"#.to_string(),
+        );
+        // A tied copy witnesses neither folder; `other`/Y still has its own.
+        write(code, &tied, &org_w, "local_e.json", session("tied", 120));
+        write(code, &other, &org_y, "local_f.json", session("tied", 120));
+        // Non-UUID folders keep their account reading but never form a pair.
+        write(
+            code,
+            "legacy-account",
+            "legacy-org",
+            "local_g.json",
+            session("legacy", 400),
+        );
+        // Copies the per-account rule sees also decide pair ownership: a tie
+        // with a non-UUID folder, and a newer agent-mode copy elsewhere.
+        write(
+            code,
+            &contested,
+            &org_w,
+            "local_h.json",
+            session("contested", 130),
+        );
+        write(
+            code,
+            "legacy-account",
+            "legacy-org",
+            "local_i.json",
+            session("contested", 130),
+        );
+        write(
+            code,
+            &agent_copied,
+            &org_w,
+            "local_j.json",
+            session("agent-copied", 140),
+        );
+        write(
+            "local-agent-mode-sessions",
+            &other,
+            &org_y,
+            "local_k.json",
+            session("agent-copied", 500),
+        );
+
+        let scan = claude_desktop_scan_from_root(&root, "2026-08-12T08:00:00Z");
+        let pairs = scan
+            .pairs
+            .pairs
+            .iter()
+            .map(|pair| &pair.observation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| (pair.account_id.clone(), pair.organization_id.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(current.clone()), Some(org_x.clone())),
+                (Some(other.clone()), Some(org_y.clone())),
+                (Some(other.clone()), Some(org_z.clone())),
+            ],
+            "newest first; imported-only, tied, outranked and non-UUID folders are not pairs"
+        );
+        for pair in &pairs {
+            assert_eq!(
+                pair.account_identifier_hash,
+                billing_identity_hash("anthropic", "account", pair.account_id.as_deref().unwrap())
+            );
+            assert_eq!(
+                pair.organization_identifier_hash,
+                billing_identity_hash(
+                    "anthropic",
+                    "organization",
+                    pair.organization_id.as_deref().unwrap()
+                )
+            );
+            assert_eq!(
+                pair.billing_identity_confidence,
+                AgentStatusConfidence::High
+            );
+            assert_eq!(pair.plan_type, None);
+            // Never current: a current reading would replace a login's
+            // metered row for the same pair on the backend.
+            assert_eq!(pair.is_current, Some(false));
+        }
+        assert_eq!(pairs[0].source_session_id.as_deref(), Some("current-x"));
+        assert_eq!(pairs[1].account_label.as_deref(), Some("other@example.com"));
+        assert_eq!(pairs[1].organization_label.as_deref(), Some("Org Y"));
+        assert_eq!(pairs[2].account_label, None);
+        assert_eq!(pairs[2].organization_label, None);
+        assert!(scan
+            .observations
+            .iter()
+            .any(|observation| observation.account_id.as_deref() == Some("legacy-account")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_desktop_pairs_snapshot_sends_only_uncovered_pairs_within_upload_limits() {
+        let pair = |n: u32| {
+            claude_desktop_pair_observation(
+                &(
+                    format!("00000000-0000-4000-8000-{n:012}"),
+                    format!("00000000-0000-4000-9000-{n:012}"),
+                ),
+                &ClaudeDesktopPairBuilder::default(),
+                1_786_000_000 - i64::from(n),
+                format!("session-{n}"),
+            )
+            .expect("pair")
+        };
+        let mut duplicate = pair(0);
+        duplicate.observation.source_session_id = Some("duplicate-0".to_string());
+        let desktop = ClaudeDesktopPairs {
+            pairs: (0..22).map(pair).collect(),
+            duplicate_sessions: vec![duplicate],
+        };
+        let at = "2026-08-12T08:00:00Z";
+        let until = "2026-08-12T08:15:00Z";
+
+        // Desktop only: newest 20 pairs fill the backend's observation limit.
+        let mut uploads = Vec::new();
+        append_claude_desktop_pairs_snapshot(&mut uploads, &desktop, at, until);
+        assert_eq!(uploads.len(), 1);
+        let only = &uploads[0];
+        assert_eq!(only.source, SourceKind::ClaudeCode);
+        assert!(
+            only.account.is_none(),
+            "a Desktop pair never becomes the root account"
+        );
+        assert_eq!(only.quota_windows, vec![unsupported_quota_window("usage")]);
+        assert_eq!(
+            only.plan_observations.len(),
+            CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX
+        );
+        assert_eq!(
+            only.plan_observations[0].source_session_id.as_deref(),
+            Some("session-0")
+        );
+        let codes = |snapshot: &AgentStatusSnapshot| {
+            snapshot
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(codes(only).contains(&"claude_desktop_only_no_cli_login".to_string()));
+        assert!(codes(only).contains(&"claude_desktop_pairs_truncated".to_string()));
+
+        // Beside an uploaded login: the pairs it carries (root binding or an
+        // exact plan observation) are subtracted, nothing else, and the login
+        // snapshot is left exactly as it was.
+        let mut metered = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            at.to_string(),
+            until.to_string(),
+        );
+        let mut account = unsupported_account("anthropic");
+        account.account_identifier_hash =
+            Some(desktop.pairs[0].binding.account_identifier_hash.clone());
+        account.organization_identifier_hash = Some(
+            desktop.pairs[0]
+                .binding
+                .organization_identifier_hash
+                .clone(),
+        );
+        metered.account = Some(account);
+        metered.plan_observations = vec![desktop.pairs[1].observation.clone()];
+        let mut uploads = vec![metered.clone()];
+        append_claude_desktop_pairs_snapshot(&mut uploads, &desktop, at, until);
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0], metered);
+        let mixed = &uploads[1];
+        assert_eq!(
+            mixed.plan_observations.len(),
+            CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX
+        );
+        assert_eq!(
+            mixed.plan_observations[0].source_session_id.as_deref(),
+            Some("session-2")
+        );
+        assert!(!mixed
+            .plan_observations
+            .iter()
+            .any(|observation| observation.source_session_id.as_deref() == Some("duplicate-0")));
+        assert!(codes(mixed).contains(&"claude_desktop_uncovered_pairs".to_string()));
+
+        // A full upload batch is never pushed past the backend's limit.
+        let mut full = vec![metered; AGENT_STATUS_UPLOAD_SNAPSHOT_MAX];
+        append_claude_desktop_pairs_snapshot(&mut full, &desktop, at, until);
+        assert_eq!(full.len(), AGENT_STATUS_UPLOAD_SNAPSHOT_MAX);
+
+        // Every pair covered: no Desktop status at all.
+        let mut covered = vec![uploads[1].clone()];
+        let covered_desktop = ClaudeDesktopPairs {
+            pairs: desktop.pairs[2..22].to_vec(),
+            duplicate_sessions: Vec::new(),
+        };
+        append_claude_desktop_pairs_snapshot(&mut covered, &covered_desktop, at, until);
+        assert_eq!(covered.len(), 1);
+    }
+
+    #[test]
+    fn claude_desktop_pairs_upload_appends_beside_an_unchanged_metered_login() {
+        let pair = |n: u32| {
+            claude_desktop_pair_observation(
+                &(
+                    format!("00000000-0000-4000-8000-{n:012}"),
+                    format!("00000000-0000-4000-9000-{n:012}"),
+                ),
+                &ClaudeDesktopPairBuilder::default(),
+                1_786_000_000 - i64::from(n),
+                format!("session-{n}"),
+            )
+            .expect("pair")
+        };
+        let desktop = ClaudeDesktopPairs {
+            pairs: vec![pair(0), pair(1)],
+            duplicate_sessions: Vec::new(),
+        };
+        let covered = desktop.pairs[0].binding.clone();
+        let at = "2026-08-12T08:00:00Z";
+        let until = "2026-08-12T08:15:00Z";
+
+        // An ordinary metered login for pair 0, with its current plan reading.
+        let mut metered = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            at.to_string(),
+            until.to_string(),
+        );
+        let mut account = unsupported_account("anthropic");
+        account.account_identifier_hash = Some(covered.account_identifier_hash.clone());
+        account.organization_identifier_hash = Some(covered.organization_identifier_hash.clone());
+        metered.account = Some(account);
+        metered.quota_windows = claude_oauth_quota_windows(&serde_json::json!({
+            "five_hour": {"utilization": 24.0, "resets_at": "2026-08-12T10:00:00+00:00"},
+            "seven_day": {"utilization": 72.0, "resets_at": "2026-08-15T05:00:00+00:00"}
+        }));
+        let mut current = desktop.pairs[0].observation.clone();
+        current.evidence_method =
+            Some(collection_method_key(&AgentStatusCollectionMethod::CliJson).to_string());
+        current.source_session_id = Some("login-session".to_string());
+        current.is_current = Some(true);
+        metered.plan_observations = vec![current];
+        let mut uploads = vec![metered.clone()];
+
+        append_claude_desktop_pairs_snapshot(&mut uploads, &desktop, at, until);
+
+        // The pass's upload path appends the pair status; the login is untouched.
+        assert_eq!(uploads.len(), 2, "the Desktop pair status uploads");
+        assert_eq!(uploads[0], metered);
+        let pairs = &uploads[1];
+        assert_eq!(pairs.source, SourceKind::ClaudeCode);
+        assert!(pairs.account.is_none());
+        assert_eq!(pairs.quota_windows, vec![unsupported_quota_window("usage")]);
+        assert!(pairs.credit_balances.is_empty());
+        // Only the uncovered pair, never current: the covered pair is not
+        // uploaded twice and no Desktop reading competes with the meters.
+        assert_eq!(
+            pairs.plan_observations,
+            vec![desktop.pairs[1].observation.clone()]
+        );
+        assert!(pairs
+            .plan_observations
+            .iter()
+            .all(|observation| observation.is_current == Some(false)));
+        let carries_covered = |snapshot: &AgentStatusSnapshot| {
+            snapshot.plan_observations.iter().any(|observation| {
+                observation.account_identifier_hash.as_deref()
+                    == Some(covered.account_identifier_hash.as_str())
+                    && observation.organization_identifier_hash.as_deref()
+                        == Some(covered.organization_identifier_hash.as_str())
+            })
+        };
+        assert!(!carries_covered(pairs));
+        assert_eq!(
+            uploads
+                .iter()
+                .filter(|snapshot| carries_covered(snapshot))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn claude_desktop_duplicate_session_owner_fails_closed_on_tie() {
         let builders = vec![
             ClaudeDesktopProfileBuilder {
@@ -25524,6 +29635,7 @@ for line in sys.stdin:
                 enabled: Some(true),
                 ..Default::default()
             }],
+            account_weekly_not_offered: false,
         };
 
         let usage = claude_oauth_usage_from_cache(cache, 200);
@@ -25545,7 +29657,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_oauth_usage_cache_marks_old_windows_stale() {
+    fn claude_oauth_usage_cache_covers_collection_gap_then_marks_old_windows_stale() {
         let cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: "account-a".to_string(),
@@ -25573,12 +29685,54 @@ for line in sys.stdin:
                 enabled: Some(true),
                 ..Default::default()
             }],
+            account_weekly_not_offered: false,
         };
 
-        // Past the account's own jittered gate, not the bare base constant.
+        let read_gate = claude_oauth_usage_fresh_age_seconds("account-a", "organization-a");
+        // Idle accounts remain readable while the next scheduled collection
+        // catches up. Cache and retained-slot presentation use the same bound.
+        for age in [
+            read_gate + 1,
+            read_gate + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+        ] {
+            let now = 100 + age;
+            let usage = claude_oauth_usage_from_cache(cache.clone(), now);
+            assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
+            assert_eq!(usage.windows[0].used_percent, Some(72));
+            assert_eq!(
+                usage.windows[0].observed_at.as_deref(),
+                Some("1970-01-01T00:01:40Z")
+            );
+            assert_eq!(
+                usage.credit_balances[0].freshness,
+                AgentQuotaWindowFreshness::Fresh
+            );
+            let snapshot = local_claude_quota_snapshot(
+                "1970-01-01T00:01:40Z",
+                &usage.windows,
+                &usage.credit_balances,
+                true,
+                true,
+            );
+            assert!(local_claude_quota_snapshot_is_fresh_for_account(
+                &snapshot,
+                "account-a",
+                "organization-a",
+                OffsetDateTime::from_unix_timestamp(now as i64).unwrap(),
+            ));
+            // Display tolerance never defers the collection that is due.
+            assert!(claude_credit_pools::claude_reading_due(
+                Some(100),
+                400,
+                read_gate,
+                now,
+            ));
+        }
+
+        // Past the account's display deadline, including the collection gap.
         let usage = claude_oauth_usage_from_cache(
             cache,
-            100 + claude_oauth_usage_fresh_age_seconds("account-a", "organization-a") + 1,
+            100 + claude_oauth_usage_serve_gate_seconds("account-a", "organization-a", 100) + 1,
         );
 
         assert_eq!(usage.windows.len(), 1);
@@ -25728,6 +29882,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write cache");
 
@@ -25763,6 +29918,7 @@ for line in sys.stdin:
                 next_refresh_after_epoch_seconds: retry_after,
                 windows: Vec::new(),
                 credit_balances: Vec::new(),
+                account_weekly_not_offered: false,
             },
         );
         assert!(
@@ -25799,6 +29955,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         assert!(claude_oauth_usage_cache_belongs_to_identity(
             &cache,
@@ -25890,6 +30047,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write exact stale cache");
         let fingerprint = claude_oauth_usage_config_fingerprint();
@@ -25940,6 +30098,7 @@ for line in sys.stdin:
             next_refresh_after_epoch_seconds: 0,
             windows: Vec::new(),
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
 
         assert!(claude_oauth_usage_cache_belongs_to_identity(
@@ -25995,6 +30154,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         fs::write(
             claude_oauth_usage_legacy_cache_path(),
@@ -26042,6 +30202,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         let custom_cache = ClaudeOAuthUsageCache {
             account_identifier_hash: "account-custom".to_string(),
@@ -26182,6 +30343,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         fs::write(
             claude_oauth_usage_legacy_cache_path(),
@@ -26241,6 +30403,7 @@ for line in sys.stdin:
             next_refresh_after_epoch_seconds: 200,
             windows: Vec::new(),
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
 
         #[cfg(unix)]
@@ -26336,6 +30499,7 @@ for line in sys.stdin:
                         next_refresh_after_epoch_seconds: observed_at_epoch_seconds + 100,
                         windows: Vec::new(),
                         credit_balances: Vec::new(),
+                        account_weekly_not_offered: false,
                     })
                 })
             })
@@ -26357,7 +30521,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_oauth_usage_cadence_is_hourly_within_a_five_minute_spread() {
+    fn claude_oauth_usage_cadence_is_forty_minutes_within_a_two_minute_spread() {
         // The spread is load-spreading across our own installs, so it must be
         // bounded and deterministic -- never an open-ended random delay.
         for seed in [
@@ -26368,8 +30532,8 @@ for line in sys.stdin:
         ] {
             let gate = claude_oauth_usage_fresh_age_seconds(seed, "organization-test");
             assert!(
-                (55 * 60..=65 * 60).contains(&gate),
-                "gate for {seed:?} out of the 55-65 minute band: {gate}"
+                (38 * 60..=42 * 60).contains(&gate),
+                "gate for {seed:?} out of the 38-42 minute band: {gate}"
             );
             assert_eq!(
                 gate,
@@ -26382,8 +30546,9 @@ for line in sys.stdin:
             claude_oauth_usage_fresh_age_seconds("account-a", "organization-test"),
             claude_oauth_usage_fresh_age_seconds("account-b", "organization-test")
         );
-        // Sanity on the base cadence itself: ~24 calls/day, not ~96.
-        assert_eq!(CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS, 60 * 60);
+        // Sanity on the base cadence itself: ~36 calls/day for an unused
+        // account, not ~288.
+        assert_eq!(CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS, 40 * 60);
         // The 24h max age stays a display fallback, well clear of the gate.
         assert!(
             CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
@@ -26806,6 +30971,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write cache fixture");
 
@@ -26941,6 +31107,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write cache fixture");
     }
@@ -28774,6 +32941,7 @@ for line in sys.stdin:
             let mut usage = ClaudeOAuthUsage {
                 windows: claude_oauth_quota_windows(&response),
                 credit_balances: claude_oauth_credit_balances(&response),
+                account_weekly_not_offered: false,
             };
             claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
             for window in &mut usage.windows {
@@ -28861,6 +33029,7 @@ for line in sys.stdin:
             let mut usage = ClaudeOAuthUsage {
                 windows: claude_oauth_quota_windows(&response),
                 credit_balances: claude_oauth_credit_balances(&response),
+                account_weekly_not_offered: false,
             };
             claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
             for window in &mut usage.windows {
@@ -29023,6 +33192,7 @@ for line in sys.stdin:
                 name: "Usage credits".to_string(),
                 ..Default::default()
             }],
+            account_weekly_not_offered: false,
         };
 
         claude_oauth_stamp_account_identity(&mut usage, "account-hash", Some("org-hash"));
@@ -29056,6 +33226,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         claude_oauth_stamp_account_identity(&mut unresolved, "", Some(""));
         assert_eq!(unresolved.windows[0].account_identifier_hash, None);
@@ -29677,6 +33848,86 @@ for line in sys.stdin:
         let coverage = derive_claude_account_anchor_coverage(&status);
         assert_eq!(coverage.default_only_accounts, 1);
         assert_eq!(coverage.capacity_blocked_accounts, 1);
+
+        // An exact Desktop pair without full limits is a target of its own:
+        // the target-bound login then expects that account AND organization.
+        // A pair that is already anchored stays the anchor.
+        status.capacity.remaining_slots = 4;
+        let desktop_pair =
+            |account: &str, organization: &str| ClaudeUnresolvedAccountDescriptorV1 {
+                unresolved_id: format!("claude-unresolved-{account}-{organization}"),
+                account_identifier_hash: Some(account.to_string()),
+                organization_identifier_hash: Some(organization.to_string()),
+                account_label: None,
+                organization_label: None,
+                observed_at: Some("2026-08-23T00:00:00Z".to_string()),
+                evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+            };
+        // Two organizations of one account are two targets; an account-only
+        // row keeps today's shape: no organization, no target, ambiguous.
+        status.unresolved_accounts = vec![
+            desktop_pair("account-1", "organization-desktop"),
+            desktop_pair("account-1", "organization-desktop-2"),
+            desktop_pair("account-0", "organization-0"),
+            ClaudeUnresolvedAccountDescriptorV1 {
+                organization_identifier_hash: None,
+                ..desktop_pair("account-legacy", "unused")
+            },
+        ];
+        let coverage = derive_claude_account_anchor_coverage(&status);
+        assert_eq!(coverage.observed_accounts, 9);
+        assert_eq!(coverage.anchored_accounts, 5);
+        assert_eq!(coverage.unresolved_accounts, 3);
+        assert_eq!(coverage.ambiguous_identity_accounts, 1);
+        let legacy = coverage
+            .accounts
+            .iter()
+            .find(|account| account.account_identifier_hash == "account-legacy")
+            .expect("account-only row");
+        assert_eq!(legacy.target_id, None);
+        assert_eq!(legacy.organization_identifier_hash, None);
+        assert_eq!(
+            legacy.setup_blockers,
+            vec![ClaudeAccountAnchorSetupBlockerV1::AmbiguousIdentity]
+        );
+        let second =
+            ClaudeStrongBinding::new("account-1", "organization-desktop-2").expect("binding");
+        let pair_targets = coverage
+            .accounts
+            .iter()
+            .filter(|account| account.account_identifier_hash == "account-1")
+            .filter(|account| account.durability == ClaudeAccountAnchorDurabilityV1::Unresolved)
+            .map(|account| account.target_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(pair_targets.len(), 2);
+        assert!(pair_targets.contains(&Some(claude_anchor_target_id(&second))));
+        let exact = ClaudeStrongBinding::new("account-1", "organization-desktop").expect("binding");
+        let target = coverage
+            .accounts
+            .iter()
+            .find(|account| {
+                account.organization_identifier_hash.as_deref() == Some("organization-desktop")
+            })
+            .expect("exact desktop pair target");
+        assert_eq!(
+            target.durability,
+            ClaudeAccountAnchorDurabilityV1::Unresolved
+        );
+        assert_eq!(target.target_id, Some(claude_anchor_target_id(&exact)));
+        assert_eq!(target.health, None);
+        assert!(target.setup_blockers.is_empty());
+        // No slot left: a pair target is blocked, never silently connectable.
+        status.capacity.remaining_slots = 0;
+        let coverage = derive_claude_account_anchor_coverage(&status);
+        for account in coverage.accounts.iter().filter(|account| {
+            account.durability == ClaudeAccountAnchorDurabilityV1::Unresolved
+                && account.target_id.is_some()
+        }) {
+            assert_eq!(
+                account.setup_blockers,
+                vec![ClaudeAccountAnchorSetupBlockerV1::CapacityReached]
+            );
+        }
     }
 
     #[test]
@@ -30278,9 +34529,9 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Claude Code's `effortLevel` is durable: `/effort` writes it to the
-    /// settings file and it persists across sessions. It maps straight through
-    /// to `reasoning_effort`.
+    /// Claude Code's legacy top-level `effortLevel` still maps straight through
+    /// to `reasoning_effort` when no `modelSettings` entry applies. Current
+    /// `/effort` saves per model; see the `modelSettings` tests in snapshots.
     #[test]
     fn claude_runtime_defaults_report_configured_effort_level() {
         let (root, paths) = claude_settings_fixture(
@@ -30717,6 +34968,285 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             changed.account_profile.is_none(),
             "mismatched embedded profile must not transfer labels"
         );
+    }
+
+    #[test]
+    fn claude_account_without_weekly_limit_reads_complete() {
+        // Some Team plans have no account-wide weekly limit: Claude sends
+        // `seven_day: null` and lists only the session and model limits.
+        let body = serde_json::json!({
+            "five_hour": {"utilization": 45, "resets_at": "2026-09-01T13:00:00+00:00"},
+            "seven_day": null,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 45,
+                 "resets_at": "2026-09-01T13:00:00+00:00", "scope": null},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 0,
+                 "resets_at": "2026-09-03T01:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+            ]
+        });
+        assert!(claude_oauth_account_weekly_not_offered(&body));
+        let mut listed = body.clone();
+        listed["limits"]
+            .as_array_mut()
+            .expect("limits")
+            .push(serde_json::json!({"kind": "weekly_all", "group": "weekly", "percent": 1, "scope": null}));
+        assert!(
+            !claude_oauth_account_weekly_not_offered(&listed),
+            "a listed account weekly limit stays expected"
+        );
+        for key in ["limits", "seven_day"] {
+            let mut missing = body.clone();
+            missing.as_object_mut().expect("body").remove(key);
+            assert!(
+                !claude_oauth_account_weekly_not_offered(&missing),
+                "a missing {key} proves nothing"
+            );
+        }
+
+        let resolved = || ResolvedClaudeSlot {
+            descriptor: ClaudeConfigDirSlot::Default
+                .descriptor("default", ClaudeConfigSlotOwnership::External),
+            account: AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                plan_type: Some("team".to_string()),
+                account_identifier_hash: Some("account-a".to_string()),
+                organization_identifier_hash: Some("org-a".to_string()),
+                ..unsupported_account("anthropic")
+            },
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "org-a".to_string(),
+            credential: ClaudeOAuthCredential {
+                access_token: None,
+                has_refresh_token: true,
+                access_expires_at: None,
+                relogin_required_at: None,
+                has_inference_scope: None,
+                has_profile_scope: false,
+                subscription_type: None,
+            },
+        };
+        let read = |account_weekly_not_offered: bool| {
+            let mut usage = ClaudeOAuthUsage {
+                windows: claude_oauth_quota_windows(&body),
+                credit_balances: Vec::new(),
+                account_weekly_not_offered,
+            };
+            claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
+            custom_claude_snapshot_from_usage(
+                resolved(),
+                ClaudeOAuthUsageOutcome::from(Ok(usage)),
+                true,
+                "2026-09-01T10:00:00Z".to_string(),
+                "2026-09-01T10:05:00Z".to_string(),
+            )
+            .unwrap_or_else(|_| panic!("fresh reading"))
+        };
+        let (snapshot, status) = read(true);
+        assert!(status.has_account_windows);
+        assert!(status.last_full_quota_read_at.is_some());
+        assert_eq!(
+            status.quota_snapshot.expect("snapshot").state,
+            ClaudeConfigSlotQuotaSnapshotStateV1::Fresh
+        );
+        assert!(claude_snapshot_has_account_windows(&snapshot));
+        assert!(claude_default_slot_collection_status(&snapshot).has_account_windows);
+
+        // Without Claude's word, the same windows are still a partial reading.
+        let (snapshot, status) = read(false);
+        assert!(!status.has_account_windows);
+        assert_eq!(
+            status.quota_snapshot.expect("snapshot").state,
+            ClaudeConfigSlotQuotaSnapshotStateV1::Partial
+        );
+        assert!(!claude_snapshot_has_account_windows(&snapshot));
+    }
+
+    #[test]
+    fn claude_slot_with_fresh_meters_stays_fresh_when_a_credit_section_is_stale() {
+        // A plain read refreshes the windows but not the saved-reset section,
+        // which keeps its own older read time and can go Stale before the next
+        // read. That section is labelled Stale on its own; the slot must not
+        // become "temporarily unavailable" while its meters are fresh.
+        let body = serde_json::json!({
+            "five_hour": {"utilization": 0, "resets_at": null},
+            "seven_day": {"utilization": 100, "resets_at": "2026-09-03T05:00:00+00:00"},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 0,
+                 "resets_at": null, "scope": null},
+                {"kind": "weekly_all", "group": "weekly", "percent": 100,
+                 "resets_at": "2026-09-03T05:00:00+00:00", "scope": null},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 2,
+                 "resets_at": "2026-09-03T05:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+            ]
+        });
+        let resolved = || ResolvedClaudeSlot {
+            descriptor: ClaudeConfigDirSlot::Default
+                .descriptor("default", ClaudeConfigSlotOwnership::External),
+            account: AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                plan_type: Some("max".to_string()),
+                account_identifier_hash: Some("account-a".to_string()),
+                organization_identifier_hash: Some("org-a".to_string()),
+                ..unsupported_account("anthropic")
+            },
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "org-a".to_string(),
+            credential: ClaudeOAuthCredential {
+                access_token: None,
+                has_refresh_token: true,
+                access_expires_at: None,
+                relogin_required_at: None,
+                has_inference_scope: None,
+                has_profile_scope: false,
+                subscription_type: None,
+            },
+        };
+        let read = |window_freshness: AgentQuotaWindowFreshness| {
+            let mut windows = claude_oauth_quota_windows(&body);
+            assert!(!windows.is_empty());
+            for window in &mut windows {
+                window.freshness = window_freshness.clone();
+            }
+            let mut usage = ClaudeOAuthUsage {
+                windows,
+                credit_balances: vec![AgentCreditBalance {
+                    name: "reset_bank".to_string(),
+                    kind: Some(ottto_protocol::CreditBalanceKind::SavedResets),
+                    freshness: AgentQuotaWindowFreshness::Stale,
+                    observed_at: Some("2026-09-01T08:40:00Z".to_string()),
+                    ..Default::default()
+                }],
+                account_weekly_not_offered: false,
+            };
+            claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
+            custom_claude_snapshot_from_usage(
+                resolved(),
+                ClaudeOAuthUsageOutcome::from(Ok(usage)),
+                true,
+                "2026-09-01T10:00:00Z".to_string(),
+                "2026-09-01T10:05:00Z".to_string(),
+            )
+            .unwrap_or_else(|_| panic!("reading with windows"))
+        };
+
+        let (snapshot, status) = read(AgentQuotaWindowFreshness::Fresh);
+        // The default login's path reads the same snapshot the same way.
+        let default_status = claude_default_slot_collection_status(&snapshot);
+        assert_eq!(
+            default_status.state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+        assert_ne!(
+            default_status
+                .quota_snapshot
+                .expect("default snapshot")
+                .state,
+            ClaudeConfigSlotQuotaSnapshotStateV1::Stale
+        );
+        assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+        assert!(status.diagnostics.is_empty());
+        assert!(matches!(
+            projected_claude_quota_access_state(&status),
+            Some(ClaudeQuotaAccessState::Full | ClaudeQuotaAccessState::Partial)
+        ));
+        let quota = status.quota_snapshot.expect("snapshot");
+        assert_ne!(quota.state, ClaudeConfigSlotQuotaSnapshotStateV1::Stale);
+        let saved = quota
+            .credit_balances
+            .iter()
+            .find(|balance| balance.kind == Some(ottto_protocol::CreditBalanceKind::SavedResets))
+            .expect("saved-reset section kept");
+        assert_eq!(
+            saved.freshness,
+            AgentQuotaWindowFreshness::Stale,
+            "the section keeps its own Stale label"
+        );
+
+        // Stale meters still mean no current reading.
+        let (snapshot, status) = read(AgentQuotaWindowFreshness::Stale);
+        assert_eq!(
+            status.state,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        );
+        assert_eq!(
+            claude_default_slot_collection_status(&snapshot).state,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_status_lane_wakes_for_a_reset_read_behind_the_spacing_gate() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-reset-read-wake-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let (account, organization) = ("account-reset", "org-reset");
+        let observed = 1_800_000_000_u64;
+        let reset = observed + 3_600;
+        let window = AgentQuotaWindow {
+            name: "session".to_string(),
+            scope: AgentQuotaWindowScope::Account,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            resets_at: rfc3339_from_unix_seconds(reset),
+            account_identifier_hash: Some(account.to_string()),
+            organization_identifier_hash: Some(organization.to_string()),
+            ..Default::default()
+        };
+        let store = |next_refresh_after: u64| {
+            write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                account_identifier_hash: account.to_string(),
+                organization_identifier_hash: organization.to_string(),
+                observed_at_epoch_seconds: observed,
+                next_refresh_after_epoch_seconds: next_refresh_after,
+                windows: vec![window.clone()],
+                credit_balances: Vec::new(),
+                account_weekly_not_offered: false,
+            })
+            .expect("write cache");
+        };
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-09-01T10:00:00Z".to_string(),
+            "2026-09-01T10:15:00Z".to_string(),
+        );
+        snapshot.quota_windows = vec![window.clone()];
+        let collection = AgentStatusCollection {
+            snapshots: vec![snapshot.clone()],
+            source_health_snapshot: snapshot,
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+        };
+        let delay = claude_credit_pools::claude_reset_read_delay_seconds(account, organization);
+
+        store(observed + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS);
+        assert_eq!(
+            claude_next_reset_read_at(&collection, observed),
+            Some(reset + delay)
+        );
+        // Behind the binding's spacing gate, the wake waits for the gate.
+        store(reset + delay + 200);
+        assert_eq!(
+            claude_next_reset_read_at(&collection, reset + delay),
+            Some(reset + delay + 200)
+        );
+        // Once that time has passed, the lane keeps its regular interval.
+        assert_eq!(
+            claude_next_reset_read_at(&collection, reset + delay + 200),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&support_dir);
     }
 
     #[test]
@@ -31539,7 +36069,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         ];
         let unresolved = derive_unresolved_claude_accounts(
             &desktop,
-            &[full],
+            &ClaudeDesktopPairs::default(),
+            &[full.clone()],
             &BTreeMap::new(),
             OffsetDateTime::parse("2026-08-04T10:00:00Z", &Rfc3339).expect("fixed now"),
         );
@@ -31548,10 +36079,83 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             unresolved[0].account_identifier_hash.as_deref(),
             Some("strong-unresolved")
         );
+        assert_eq!(unresolved[0].organization_identifier_hash, None);
         assert_eq!(
             unresolved[0].evidence,
             vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession]
         );
+
+        // Exact Desktop folder pairs: full limits resolve only their own exact
+        // pair, so the account's other organization stays a connect row, and
+        // the account-only row gives way to the exact ones.
+        full.account
+            .as_mut()
+            .expect("full account")
+            .organization_identifier_hash = Some("resolved-org".to_string());
+        let pair = |account: &str, organization: &str| ClaudeDesktopPairObservation {
+            binding: ClaudeStrongBinding::new(account, organization).expect("binding"),
+            observation: AgentStatusPlanObservation {
+                account_identifier_hash: Some(account.to_string()),
+                organization_identifier_hash: Some(organization.to_string()),
+                ..observation(Some(account), AgentStatusConfidence::High)
+            },
+        };
+        let mut pairs = ClaudeDesktopPairs {
+            pairs: vec![
+                pair("resolved", "resolved-org"),
+                pair("resolved", "other-org"),
+                pair("strong-unresolved", "unresolved-org"),
+            ],
+            duplicate_sessions: Vec::new(),
+        };
+        pairs.pairs[1].observation.organization_label = Some("Other org".to_string());
+        let unresolved = derive_unresolved_claude_accounts(
+            &desktop,
+            &pairs,
+            &[full],
+            &BTreeMap::new(),
+            OffsetDateTime::parse("2026-08-04T10:00:00Z", &Rfc3339).expect("fixed now"),
+        );
+        assert_eq!(
+            unresolved
+                .iter()
+                .map(|row| (
+                    row.account_identifier_hash.as_deref(),
+                    row.organization_identifier_hash.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("resolved"), Some("other-org")),
+                (Some("strong-unresolved"), Some("unresolved-org")),
+            ]
+        );
+        // Labels are the pair's own, display only.
+        assert_eq!(
+            unresolved[0].organization_label.as_deref(),
+            Some("Other org")
+        );
+        assert_eq!(unresolved[1].organization_label, None);
+
+        // A pair too old for a connect row does not hide the account's recent
+        // account-only row.
+        pairs
+            .pairs
+            .retain(|pair| pair.binding.account_identifier_hash == "strong-unresolved");
+        pairs.pairs[0].observation.observed_at = Some("2026-05-05T09:59:59Z".to_string());
+        let unresolved = derive_unresolved_claude_accounts(
+            &desktop,
+            &pairs,
+            &[],
+            &BTreeMap::new(),
+            OffsetDateTime::parse("2026-08-04T10:00:00Z", &Rfc3339).expect("fixed now"),
+        );
+        assert!(unresolved.iter().any(|row| {
+            row.account_identifier_hash.as_deref() == Some("strong-unresolved")
+                && row.organization_identifier_hash.is_none()
+        }));
+        assert!(unresolved
+            .iter()
+            .all(|row| row.organization_identifier_hash.is_none()));
     }
 
     #[test]
@@ -31666,6 +36270,9 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             unresolved_accounts: vec![ClaudeUnresolvedAccountDescriptorV1 {
                 unresolved_id: "claude-unresolved-test".to_string(),
                 account_identifier_hash: Some("account-full".to_string()),
+                organization_identifier_hash: None,
+                account_label: None,
+                organization_label: None,
                 observed_at: Some("2026-08-04T10:00:00Z".to_string()),
                 evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
             }],
@@ -31725,6 +36332,9 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let stale_unresolved = ClaudeUnresolvedAccountDescriptorV1 {
             unresolved_id: "claude-unresolved-stale".to_string(),
             account_identifier_hash: Some("account-full".to_string()),
+            organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
             observed_at: Some("2026-08-04T10:00:00Z".to_string()),
             evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
         };
@@ -31978,6 +36588,7 @@ exit 0
                         }))
                         .collect(),
                     credit_balances: Vec::new(),
+                    account_weekly_not_offered: false,
                 };
                 claude_oauth_stamp_account_identity(
                     &mut usage,
@@ -31992,6 +36603,7 @@ exit 0
                     next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
                     windows: usage.windows,
                     credit_balances: usage.credit_balances,
+                    account_weekly_not_offered: false,
                 })
                 .expect("write usage cache");
             }
@@ -32536,6 +37148,7 @@ exit 0
                 next_refresh_after_epoch_seconds: observed,
                 windows: vec![window],
                 credit_balances,
+                account_weekly_not_offered: false,
             })
             .expect("write due cache");
         }
@@ -34007,6 +38620,7 @@ exit 44
                     }))
                     .collect(),
                 credit_balances: Vec::new(),
+                account_weekly_not_offered: false,
             };
             claude_oauth_stamp_account_identity(
                 &mut usage,
@@ -34025,6 +38639,7 @@ exit 44
                 },
                 windows: usage.windows,
                 credit_balances: usage.credit_balances,
+                account_weekly_not_offered: false,
             })
             .expect("write cache");
         }
@@ -34542,6 +39157,158 @@ exit 44
         assert_eq!(
             claude_registered_owned_bindings(true, &["slot-a".to_string()], &current, &previous),
             BTreeSet::from([binding("acct-slot", "org-slot")])
+        );
+    }
+
+    /// Exactly one upload carries this Mac's Claude Code settings: the upload
+    /// for the default login's account, otherwise the lowest slot id. None
+    /// when an upload already carries them or this pass built none.
+    #[test]
+    fn one_upload_carries_the_machine_claude_settings() {
+        let binding = |account: &str| ClaudeStrongBinding::new(account, "org").expect("binding");
+        let snapshot = |carries: bool| {
+            let mut snapshot = base_snapshot(
+                SourceKind::ClaudeCode,
+                AgentStatusState::Available,
+                AgentStatusCollectionMethod::CliJson,
+                "2026-10-17T12:00:00Z".to_string(),
+                "2026-10-17T12:15:00Z".to_string(),
+            );
+            snapshot.runtime_defaults = carries.then(AgentRuntimeDefaults::default);
+            snapshot
+        };
+        let slots = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| (id.to_string(), binding(&format!("account-{id}"))))
+                .collect::<Vec<_>>()
+        };
+        let uploads = slots(&["slot-c", "slot-a", "slot-b"]);
+        let plain = vec![snapshot(false), snapshot(false), snapshot(false)];
+        let carrier = |snapshots: &[AgentStatusSnapshot],
+                       uploads: &[(String, ClaudeStrongBinding)],
+                       built: bool,
+                       default: Option<&ClaudeStrongBinding>| {
+            claude_runtime_defaults_carrier(snapshots, uploads, built, default)
+                .map(|index| uploads[index].0.clone())
+        };
+
+        // The default login's account is uploaded by a slot: that slot.
+        let default_login = binding("account-slot-b");
+        assert_eq!(
+            carrier(&plain, &uploads, true, Some(&default_login)),
+            Some("slot-b".to_string())
+        );
+        // Otherwise the lowest slot id, whatever the upload order.
+        let elsewhere = binding("account-elsewhere");
+        assert_eq!(
+            carrier(&plain, &uploads, true, Some(&elsewhere)),
+            Some("slot-a".to_string())
+        );
+        assert_eq!(
+            carrier(&plain, &uploads, true, None),
+            Some("slot-a".to_string())
+        );
+        let reordered = slots(&["slot-b", "slot-a", "slot-c"]);
+        assert_eq!(
+            carrier(&plain, &reordered, true, None),
+            Some("slot-a".to_string())
+        );
+        // Same inputs, same carrier on every pass.
+        assert_eq!(
+            carrier(&plain, &uploads, true, Some(&default_login)),
+            carrier(&plain, &uploads, true, Some(&default_login))
+        );
+        // The default login uploaded its own snapshot (with the settings): no
+        // second copy.
+        let with_default = vec![snapshot(true), snapshot(false)];
+        let default_uploads = slots(&["default", "slot-a"]);
+        assert_eq!(carrier(&with_default, &default_uploads, true, None), None);
+        // No settings built this pass, or nothing uploaded: nothing to carry.
+        assert_eq!(carrier(&plain, &uploads, false, Some(&default_login)), None);
+        assert_eq!(carrier(&[], &[], true, Some(&default_login)), None);
+    }
+
+    /// The registered slots upload and the default login does not: one slot
+    /// upload, the one for the default login's account, carries the Mac's
+    /// Claude Code settings exactly as built, on every pass. Slot snapshots
+    /// are otherwise unchanged (no settings capability is added).
+    #[test]
+    #[serial]
+    fn the_default_login_settings_ride_on_one_slot_upload() {
+        let fixture = Phase0Fixture::new("runtime-defaults-carrier", true);
+        let home = fixture.root.join("home");
+        fixture.write_identity(&home, SLOT_ACCOUNTS[2]);
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            br#"{"model": "claude-opus-5-5", "effortLevel": "high"}"#,
+        )
+        .expect("settings");
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        let (default_account, _) = Phase0Fixture::hashes(SLOT_ACCOUNTS[2]);
+        for pass in 0..2 {
+            let collection = fixture.collect();
+            let built = collection
+                .source_health_snapshot
+                .runtime_defaults
+                .clone()
+                .expect("the default login built settings");
+            assert_eq!(built.model.as_deref(), Some("claude-opus-5-5"));
+            let carriers = collection
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.runtime_defaults.is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(carriers.len(), 1, "pass {pass}: exactly one carrier");
+            let carrier = carriers[0];
+            assert_eq!(
+                carrier
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.account_identifier_hash.as_deref()),
+                Some(default_account.as_str()),
+                "pass {pass}: the upload for the default login's account"
+            );
+            assert_eq!(carrier.runtime_defaults.as_ref(), Some(&built));
+            assert!(
+                carrier
+                    .capabilities
+                    .iter()
+                    .all(|capability| capability.capability != "runtime_defaults"),
+                "pass {pass}: a registered slot's upload, not the default login's"
+            );
+        }
+    }
+
+    /// The default login uploads its own account with meters: its snapshot
+    /// already carries the settings and no slot upload gets a second copy.
+    #[test]
+    #[serial]
+    fn an_uploaded_default_login_keeps_the_only_settings_copy() {
+        let fixture = Phase0Fixture::new("runtime-defaults-default", true);
+        fs::write(
+            fixture
+                .root
+                .join("home")
+                .join(".claude")
+                .join("settings.json"),
+            br#"{"model": "claude-opus-5-5"}"#,
+        )
+        .expect("settings");
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        let (default_account, _) = Phase0Fixture::hashes(DEFAULT_ACCOUNT);
+        let collection = fixture.collect();
+        let carriers = collection
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.runtime_defaults.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(carriers.len(), 1, "exactly one carrier");
+        assert_eq!(
+            carriers[0]
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.as_deref()),
+            Some(default_account.as_str())
         );
     }
 

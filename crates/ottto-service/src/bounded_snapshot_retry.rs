@@ -291,6 +291,7 @@ impl PreparedRetry {
                 &mut 0,
                 &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
                 &snapshot_upload_body_witness,
+                &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
                 &mut |snapshots| {
                     let lease = crate::client_report::lease();
                     let request = SnapshotBatchRequest {
@@ -383,6 +384,9 @@ impl PreparedRetry {
             &self.baseline,
             &self.progress,
             &self.items,
+            // Retained-body retries carry correction debt unchanged; no new
+            // scan facts can qualify an empty-member completion here.
+            None,
             &BTreeSet::new(),
             &self.index_path,
             &self.progress_path,

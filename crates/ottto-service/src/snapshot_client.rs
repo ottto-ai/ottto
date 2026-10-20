@@ -628,6 +628,12 @@ pub struct ActivityHintResponse {
     /// which every backend accepts.
     #[serde(default)]
     pub census_residue_status_contract: Option<String>,
+    /// Per-account cohort token for contract-5 request identity rows. Only the
+    /// exact `own_request_identity_rows:v1` permits emission, and only in a
+    /// build with emission compiled in; missing / null / any other token keeps
+    /// today's bodies. Read fresh every cycle, never cached.
+    #[serde(default)]
+    pub session_request_identity_contract: Option<String>,
     pub recommended_scan_after: String,
 }
 
@@ -690,6 +696,7 @@ impl SnapshotEntityRejection {
             "hour_bucket_count_above_cap" => "hour_bucket_count_above_cap",
             "divergent_duplicate_logical_session" => "divergent_duplicate_logical_session",
             "accepted_log_transaction_cap" => "accepted_log_transaction_cap",
+            "accepted_log_stale_older_upload" => "accepted_log_stale_older_upload",
             "occurred_at_beyond_write_fence_future" => "occurred_at_beyond_write_fence_future",
             "occurred_at_beyond_journal_retention" => "occurred_at_beyond_journal_retention",
             "body_exceeds_max_bytes" => "body_exceeds_max_bytes",
@@ -705,6 +712,63 @@ impl SnapshotEntityRejection {
 
 fn default_occurrence_count() -> u64 {
     1
+}
+
+/// The existing public ACK version for additive body evidence. Keep synthetic
+/// transport responses on the same contract as the production ACK validator;
+/// internal envelope versions are not public ACK versions.
+pub(crate) fn snapshot_ack_body_witness_version(
+    item: &crate::snapshots::SnapshotItem,
+) -> Result<Option<u64>> {
+    if item.context_curve.is_none()
+        && item.session_account_evidence.is_none()
+        && item.cache_observations.is_none()
+    {
+        return Ok(None);
+    }
+    let version = snapshot_upload_body_witness_version(item)
+        .filter(|version| {
+            matches!(
+                *version,
+                SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
+                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
+                    | 15
+                    | 16
+                    | 19
+                    | 20
+                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
+                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+            )
+        })
+        .ok_or_else(|| anyhow!("snapshot evidence has no supported body witness version"))?;
+    let public_version = match version {
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION => {
+            SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION
+        }
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION => {
+            SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION
+        }
+        15 => 13,
+        16 => 14,
+        19 => 17,
+        20 => 18,
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
+            if item.cache_observations.is_some() {
+                13
+            } else {
+                SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION
+            }
+        }
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION => {
+            if item.cache_observations.is_some() {
+                14
+            } else {
+                SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+            }
+        }
+        _ => unreachable!("the supported-version filter is exhaustive"),
+    };
+    Ok(Some(public_version))
 }
 
 impl SnapshotBatchResponse {
@@ -823,60 +887,13 @@ impl SnapshotBatchResponse {
     fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let mut expected = std::collections::BTreeMap::new();
         for item in &request.snapshots {
-            if item.context_curve.is_none()
-                && item.session_account_evidence.is_none()
-                && item.cache_observations.is_none()
-            {
+            let Some(public_version) = snapshot_ack_body_witness_version(item)? else {
                 continue;
-            }
-            let version = snapshot_upload_body_witness_version(item)
-                .filter(|version| {
-                    matches!(
-                        *version,
-                        SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
-                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
-                            | 15
-                            | 16
-                            | 19
-                            | 20
-                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
-                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
-                    )
-                })
-                .ok_or_else(|| {
-                    anyhow!("snapshot evidence has no supported body witness version")
-                })?;
+            };
             let key = (
                 item.source_session_id.clone(),
                 item.snapshot_fingerprint.clone(),
             );
-            let public_version = match version {
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION => {
-                    SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION
-                }
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION => {
-                    SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION
-                }
-                15 => 13,
-                16 => 14,
-                19 => 17,
-                20 => 18,
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
-                    if item.cache_observations.is_some() {
-                        13
-                    } else {
-                        SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION
-                    }
-                }
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION => {
-                    if item.cache_observations.is_some() {
-                        14
-                    } else {
-                        SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION
-                    }
-                }
-                _ => unreachable!("the supported-version filter is exhaustive"),
-            };
             let proof = (public_version, snapshot_upload_body_witness(item));
             if expected
                 .insert(key, proof.clone())
@@ -2961,6 +2978,22 @@ mod tests {
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;
 
+    #[test]
+    fn stale_older_rejection_reason_is_safe_but_unknown_reasons_are_not() {
+        let mut rejection = SnapshotEntityRejection {
+            source_session_id: "synthetic".into(),
+            snapshot_fingerprint: "a".repeat(64),
+            reason: "accepted_log_stale_older_upload".into(),
+            detail: "private detail".into(),
+            permanent: false,
+            occurrence_count: 1,
+        };
+        assert_eq!(rejection.safe_reason(), "accepted_log_stale_older_upload");
+        assert!(!rejection.permanent);
+        rejection.reason = "future-private-reason".into();
+        assert_eq!(rejection.safe_reason(), "other");
+    }
+
     fn activity_hint_json(extra: &str) -> String {
         format!(
             r#"{{
@@ -3098,6 +3131,31 @@ mod tests {
         );
         assert_eq!(CENSUS_RESIDUE_STATUS_CONTRACT, "census_residue_status:v1");
         assert_eq!(CENSUS_RESIDUE_ERROR_CODE, "census_residue");
+    }
+
+    /// The contract-5 cohort token is read as sent: absent and null read as
+    /// none, and any other string reaches the exact-match permit unchanged.
+    #[test]
+    fn request_identity_cohort_token_defaults_off_and_is_kept_verbatim() {
+        for extra in ["", r#", "session_request_identity_contract":null"#] {
+            let hint: ActivityHintResponse =
+                serde_json::from_str(&activity_hint_json(extra)).expect("activity hint");
+            assert_eq!(hint.session_request_identity_contract, None);
+        }
+        for token in [
+            "own_request_identity_rows:v1",
+            "claude_code_jsonl:own_request_identity_rows:v1",
+            "unknown",
+        ] {
+            let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(&format!(
+                r#", "session_request_identity_contract":"{token}""#
+            )))
+            .expect("token-bearing activity hint");
+            assert_eq!(
+                hint.session_request_identity_contract.as_deref(),
+                Some(token)
+            );
+        }
     }
 
     /// An older daemon's terminal-status journal predates the residue fields.
@@ -4576,7 +4634,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

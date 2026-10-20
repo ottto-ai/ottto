@@ -7,8 +7,10 @@
 //!
 //! Unlike `context_footprint` (a point-in-time `/context` snapshot of static
 //! config), this surface is a per-day *composition* aggregate derived from a
-//! deterministic scan of the local transcript files
-//! (`~/.claude/projects/<slug>/*.jsonl` and `~/.codex/sessions/**/*.jsonl`).
+//! deterministic scan of the local transcript files under the same roots the
+//! session sink reads (`~/.claude/projects` plus registered Claude config
+//! folders; `~/.codex/sessions`, `archived_sessions` and accepted Codex slot
+//! homes).
 //!
 //! The measurement methodology is a straight Rust port of the reference
 //! implementation `context_composition_audit.py` and its `methodology.md`; the
@@ -34,7 +36,7 @@ use anyhow::{anyhow, Result};
 use ottto_core::{default_support_dir, LocalDeviceBinding};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -54,7 +56,7 @@ const COLLECTOR_VERSION: &str = "context-composition-0.1.0";
 const COUNTER_SOURCE: &str = "context_composition_v1";
 /// Local cache identity only. Bump when parsing/classification/ordering changes
 /// without a methodology or collector-version change; never a wire field.
-const COMPOSITION_PARSER_VERSION: &str = "context-composition-parser-v1";
+const COMPOSITION_PARSER_VERSION: &str = "context-composition-parser-v3";
 /// Aggregate rows bucket by the UTC calendar day. `time` in this crate has no
 /// timezone database (formatting/parsing features only) and local-offset lookup
 /// is unsound in a multithreaded daemon, so UTC is the deterministic,
@@ -73,6 +75,10 @@ const CONTEXT_COMPOSITION_CYCLE_BUDGET: Duration = Duration::from_secs(5 * 60);
 /// A single very large transcript is skipped to bound per-file work.
 const MAX_TRANSCRIPT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_WORKSPACES_PER_CYCLE: usize = 12;
+/// A live session appends to its transcript every few seconds, so one such
+/// file would fence its whole workspace on every cycle. Files modified this
+/// recently wait for a later cycle.
+const SETTLE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// Capture window (inclusive) must not exceed the backend cap (92 days).
 const MAX_WINDOW_DAYS: i64 = 92;
 const MAX_TOP_FILES: usize = 100;
@@ -330,6 +336,17 @@ impl ResidencyModel {
     }
 }
 
+/// How one transcript line counts. A line copied from a parent session (a
+/// fork's inherited history, a resumed Claude transcript's earlier records)
+/// entered context where it was first written; here it only stays resident
+/// for this session's own requests, so it adds residency but no events,
+/// entered tokens, files or session totals.
+#[derive(Clone, Copy)]
+struct Weight {
+    mult: u64,
+    copied: bool,
+}
+
 // -------------------------------------------------------------------------
 // Category classifiers (ported 1:1).
 // -------------------------------------------------------------------------
@@ -461,6 +478,10 @@ struct Bucket {
 }
 
 impl Bucket {
+    fn add_resident(&mut self, tokens: u64, mult: u64) {
+        self.residency += tokens * mult;
+    }
+
     fn add(&mut self, tokens: u64, mult: u64, images: u64) {
         self.events += 1;
         self.tokens += tokens;
@@ -511,6 +532,15 @@ pub(crate) struct WorkspaceReport {
     daily: BTreeMap<(Date, Category), Bucket>,
     files: BTreeMap<String, FileAgg>,
     sessions: BTreeMap<String, SessionAgg>,
+    /// Hashes of Claude record uuids already counted in this workspace. A
+    /// resumed or forked transcript repeats earlier records under the same
+    /// uuid. About 8 bytes per record, freed with the report.
+    claude_records: HashSet<u64>,
+    /// Sessions skipped whole: a fork whose copied history has no boundary
+    /// in the file, or a transcript made only of already-counted records.
+    pub(crate) excluded_not_fresh: u64,
+    /// Sessions whose copied history was trimmed to residency only.
+    pub(crate) copied_history_sessions: u64,
 }
 
 impl WorkspaceReport {
@@ -520,6 +550,9 @@ impl WorkspaceReport {
             daily: BTreeMap::new(),
             files: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            claude_records: HashSet::new(),
+            excluded_not_fresh: 0,
+            copied_history_sessions: 0,
         }
     }
 
@@ -529,7 +562,7 @@ impl WorkspaceReport {
         session_id: &str,
         category: Category,
         tokens: u64,
-        mult: u64,
+        weight: Weight,
         images: u64,
         file_path: Option<&str>,
         date: Date,
@@ -538,10 +571,12 @@ impl WorkspaceReport {
         if !self.window.contains(date) {
             return;
         }
-        self.daily
-            .entry((date, category))
-            .or_default()
-            .add(tokens, mult, images);
+        let bucket = self.daily.entry((date, category)).or_default();
+        if weight.copied {
+            bucket.add_resident(tokens, weight.mult);
+            return;
+        }
+        bucket.add(tokens, weight.mult, images);
         if let Some(fp) = file_path {
             let entry = self.files.entry(fp.to_string()).or_insert(FileAgg {
                 category,
@@ -690,6 +725,19 @@ pub(crate) fn parse_claude_session(
         session_id = format!("{session_id} (subagent:{agent_id})");
     }
 
+    let copied = claude_copied_records(&lines, report);
+    if copied.iter().any(|copied| *copied) {
+        if lines
+            .iter()
+            .zip(&copied)
+            .all(|(line, copied)| *copied || line.get("uuid").is_none())
+        {
+            report.excluded_not_fresh += 1;
+            return Ok(());
+        }
+        report.copied_history_sessions += 1;
+    }
+
     // Pass 1: tool_use id -> (name, file_path); residency markers.
     let mut tooluse: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     let mut assistant_ordinals: Vec<usize> = Vec::new();
@@ -717,7 +765,8 @@ pub(crate) fn parse_claude_session(
                     LastAssistantId::Sentinel => true,
                     LastAssistantId::Value(prev) => prev.as_deref() != mid.as_deref(),
                 };
-            if append {
+            // Copied turns were requests of the session that wrote them.
+            if append && !copied[i] {
                 assistant_ordinals.push(i);
             }
             last = LastAssistantId::Value(mid);
@@ -758,7 +807,10 @@ pub(crate) fn parse_claude_session(
     // Pass 2: attribute entered items.
     for (i, o) in lines.iter().enumerate() {
         let t = o.get("type").and_then(Value::as_str).unwrap_or("");
-        let mult = residency.multiplier(i);
+        let weight = Weight {
+            mult: residency.multiplier(i),
+            copied: copied[i],
+        };
         let (date, ts) = line_date(o, fallback);
 
         if t == "attachment" {
@@ -772,7 +824,7 @@ pub(crate) fn parse_claude_session(
                     &session_id,
                     Category::MemoryNotes,
                     toks,
-                    mult,
+                    weight,
                     0,
                     Some(fname),
                     date,
@@ -782,7 +834,7 @@ pub(crate) fn parse_claude_session(
                     &session_id,
                     Category::HarnessAttachments,
                     toks,
-                    mult,
+                    weight,
                     0,
                     other,
                     date,
@@ -820,7 +872,7 @@ pub(crate) fn parse_claude_session(
                             &session_id,
                             Category::OtherTools,
                             toks,
-                            mult,
+                            weight,
                             0,
                             None,
                             date,
@@ -830,7 +882,16 @@ pub(crate) fn parse_claude_session(
                             let name = name.as_deref().unwrap_or("");
                             let fp_str = fp.as_deref().unwrap_or("");
                             let cat = cc_tool_category(name, fp_str);
-                            report.record(&session_id, cat, toks, mult, 0, fp.as_deref(), date, ts);
+                            report.record(
+                                &session_id,
+                                cat,
+                                toks,
+                                weight,
+                                0,
+                                fp.as_deref(),
+                                date,
+                                ts,
+                            );
                         }
                     }
                     if images > 0 {
@@ -838,7 +899,7 @@ pub(crate) fn parse_claude_session(
                             &session_id,
                             Category::BrowserAndImages,
                             images * IMAGE_NOMINAL_TOKENS,
-                            mult,
+                            weight,
                             images,
                             None,
                             date,
@@ -851,7 +912,7 @@ pub(crate) fn parse_claude_session(
                         &session_id,
                         Category::BrowserAndImages,
                         IMAGE_NOMINAL_TOKENS,
-                        mult,
+                        weight,
                         1,
                         None,
                         date,
@@ -896,6 +957,14 @@ pub(crate) fn parse_codex_session(
     }
     let session_id = session_id.unwrap_or_else(|| basename_stem(path));
 
+    let Some(copied) = codex_copied_records(&lines) else {
+        report.excluded_not_fresh += 1;
+        return Ok(());
+    };
+    if copied.iter().any(|copied| *copied) {
+        report.copied_history_sessions += 1;
+    }
+
     // Pass 1: call_id -> name; residency markers.
     let mut callmap: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut assistant_ordinals: Vec<usize> = Vec::new();
@@ -923,9 +992,12 @@ pub(crate) fn parse_codex_session(
                         .or_else(|| (pt == "local_shell_call").then(|| "local_shell".to_string()));
                     callmap.insert(cid.to_string(), name);
                 }
-                assistant_ordinals.push(i);
+                // Copied turns were requests of the session that wrote them.
+                if !copied[i] {
+                    assistant_ordinals.push(i);
+                }
             }
-            "agent_message" => assistant_ordinals.push(i),
+            "agent_message" if !copied[i] => assistant_ordinals.push(i),
             "context_compacted" => compaction_ordinals.push(i),
             _ => {}
         }
@@ -938,7 +1010,10 @@ pub(crate) fn parse_codex_session(
             continue;
         };
         let pt = p.get("type").and_then(Value::as_str).unwrap_or("");
-        let mult = residency.multiplier(i);
+        let weight = Weight {
+            mult: residency.multiplier(i),
+            copied: copied[i],
+        };
         let (date, ts) = line_date(o, fallback);
 
         match pt {
@@ -954,13 +1029,13 @@ pub(crate) fn parse_codex_session(
                     Some(n) => codex_tool_category(n),
                     None => Category::OtherTools,
                 };
-                report.record(&session_id, cat, toks, mult, 0, None, date, ts);
+                report.record(&session_id, cat, toks, weight, 0, None, date, ts);
                 if images > 0 {
                     report.record(
                         &session_id,
                         Category::BrowserAndImages,
                         images * IMAGE_NOMINAL_TOKENS,
-                        mult,
+                        weight,
                         images,
                         None,
                         date,
@@ -974,7 +1049,7 @@ pub(crate) fn parse_codex_session(
                     &session_id,
                     Category::WebFetchSearch,
                     estimate_text_tokens(&text),
-                    mult,
+                    weight,
                     0,
                     None,
                     date,
@@ -988,7 +1063,7 @@ pub(crate) fn parse_codex_session(
                     &session_id,
                     cat,
                     estimate_text_tokens(&text),
-                    mult,
+                    weight,
                     0,
                     None,
                     date,
@@ -999,7 +1074,7 @@ pub(crate) fn parse_codex_session(
                         &session_id,
                         Category::BrowserAndImages,
                         images * IMAGE_NOMINAL_TOKENS,
-                        mult,
+                        weight,
                         images,
                         None,
                         date,
@@ -1011,12 +1086,17 @@ pub(crate) fn parse_codex_session(
                 let role = p.get("role").and_then(Value::as_str).unwrap_or("");
                 if role == "developer" || role == "user" {
                     let (text, images) = extract_blocks_text_and_images(p.get("content"));
-                    if role == "developer" {
+                    let harness_text = if role == "developer" {
+                        text
+                    } else {
+                        codex_injected_user_text(p)
+                    };
+                    if role == "developer" || !harness_text.is_empty() {
                         report.record(
                             &session_id,
                             Category::HarnessAttachments,
-                            estimate_text_tokens(&text),
-                            mult,
+                            estimate_text_tokens(&harness_text),
+                            weight,
                             0,
                             None,
                             date,
@@ -1028,7 +1108,7 @@ pub(crate) fn parse_codex_session(
                             &session_id,
                             Category::BrowserAndImages,
                             images * IMAGE_NOMINAL_TOKENS,
-                            mult,
+                            weight,
                             images,
                             None,
                             date,
@@ -1043,6 +1123,131 @@ pub(crate) fn parse_codex_session(
 
     report.note_session_start(&session_id, session_min_ts);
     Ok(())
+}
+
+/// Codex labels each user-role content block with a `content_item_kinds`
+/// entry. Only `user.*` blocks are typed by the person; every other kind
+/// (`agents_md.instructions`, `environments.environment_context`, ...) is
+/// harness-injected and enters context like a developer message. Rollouts
+/// without labels fall back to the injected-block text prefixes.
+const CODEX_INJECTED_USER_PREFIXES: [&str; 3] = [
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<user_instructions>",
+];
+
+fn codex_injected_user_text(payload: &serde_json::Map<String, Value>) -> String {
+    let Some(blocks) = payload.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let kinds = payload
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|meta| meta.get("content_item_kinds"))
+        .and_then(Value::as_array)
+        .filter(|kinds| kinds.len() == blocks.len());
+    let mut texts: Vec<&str> = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let injected = match kinds {
+            Some(kinds) => kinds[index]
+                .as_str()
+                .is_some_and(|kind| !kind.starts_with("user.")),
+            None => CODEX_INJECTED_USER_PREFIXES
+                .iter()
+                .any(|prefix| text.trim_start().starts_with(prefix)),
+        };
+        if injected {
+            texts.push(text);
+        }
+    }
+    texts.join("\n")
+}
+
+/// Which records of a Claude transcript repeat records already counted in this
+/// workspace (same uuid). Resumed and forked transcripts copy earlier records
+/// with their uuids; the copy is history, not new context. Records this file
+/// adds are then remembered for later files.
+fn claude_copied_records(lines: &[Value], report: &mut WorkspaceReport) -> Vec<bool> {
+    let hashes = lines
+        .iter()
+        .map(|line| line.get("uuid").and_then(Value::as_str).map(record_hash))
+        .collect::<Vec<_>>();
+    let copied = hashes
+        .iter()
+        .map(|hash| hash.is_some_and(|hash| report.claude_records.contains(&hash)))
+        .collect();
+    report.claude_records.extend(hashes.into_iter().flatten());
+    copied
+}
+
+fn record_hash(uuid: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    uuid.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Which records of a Codex rollout are copied parent history, using the
+/// session header's fork markers as the session sink does. `None` means the
+/// rollout is a fork whose copied part has no boundary in the file (a legacy
+/// user fork, or a legacy subagent fork without its trigger turn).
+fn codex_copied_records(lines: &[Value]) -> Option<Vec<bool>> {
+    let meta = lines
+        .iter()
+        .find(|line| line.get("type").and_then(Value::as_str) == Some("session_meta"))
+        .and_then(|line| line.get("payload"));
+    let Some(meta) = meta else {
+        return Some(vec![false; lines.len()]);
+    };
+    let thread_source = meta.get("thread_source").and_then(Value::as_str);
+    let is_subagent = thread_source == Some("subagent")
+        || meta
+            .get("source")
+            .and_then(Value::as_object)
+            .is_some_and(|source| source.contains_key("subagent"));
+    let forked = meta
+        .get("forked_from_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty());
+    let history_base = meta.get("history_base").is_some_and(|base| !base.is_null());
+    let start = meta
+        .get("subagent_history_start_ordinal")
+        .and_then(Value::as_u64);
+
+    if thread_source == Some("agent_created_thread") || (start.is_none() && history_base) {
+        // Created threads and paginated forks keep inherited history outside
+        // the file: every physical record is the session's own.
+        return Some(vec![false; lines.len()]);
+    }
+    if let Some(start) = start {
+        return Some(
+            lines
+                .iter()
+                .map(|line| {
+                    line.get("ordinal")
+                        .and_then(Value::as_u64)
+                        .map_or(true, |ordinal| ordinal < start)
+                })
+                .collect(),
+        );
+    }
+    if !forked {
+        return Some(vec![false; lines.len()]);
+    }
+    if !is_subagent {
+        return None;
+    }
+    // Legacy subagent forks: the session's own records start at the trigger.
+    let trigger = lines.iter().position(|line| {
+        line.get("type").and_then(Value::as_str) == Some("inter_agent_communication_metadata")
+            && line
+                .pointer("/payload/trigger_turn")
+                .and_then(Value::as_bool)
+                == Some(true)
+    })?;
+    Some((0..lines.len()).map(|index| index < trigger).collect())
 }
 
 fn is_truthy_json(value: &Value) -> bool {
@@ -1190,7 +1395,7 @@ fn build_daily_aggregates(report: &WorkspaceReport) -> Vec<DailyAggregate> {
     report
         .daily
         .iter()
-        .filter(|(_, bucket)| bucket.events > 0)
+        .filter(|(_, bucket)| bucket.events > 0 || bucket.residency > 0)
         .map(|((date, category), bucket)| DailyAggregate {
             date: date_ymd(*date),
             category: category.as_str().to_string(),
@@ -1334,7 +1539,7 @@ struct WorkspaceScan {
 }
 
 fn discover_workspaces(
-    root_dir: &Path,
+    roots: &[PathBuf],
     now: SystemTime,
     deadline: Instant,
 ) -> Result<Vec<WorkspaceScan>> {
@@ -1342,8 +1547,10 @@ fn discover_workspaces(
         return Err(anyhow!("workspace discovery budget expired"));
     }
     let mut files = Vec::new();
-    collect_recent_jsonl_files(root_dir, now, &mut files);
-    files.sort_by_key(|item| std::cmp::Reverse(item.1));
+    for root in roots {
+        collect_recent_jsonl_files(root, now, &mut files);
+    }
+    let files = newest_copy_per_file_name(files);
 
     // Map each transcript to a single workspace (its first resolvable cwd).
     let mut by_cwd: BTreeMap<String, WorkspaceScan> = BTreeMap::new();
@@ -1398,6 +1605,45 @@ fn discover_workspaces(
     Ok(out)
 }
 
+/// Registered roots can hold one transcript twice: a copied account folder, or
+/// a rollout present in both `sessions` and `archived_sessions`. Transcript
+/// file names carry the session id, so each counts once, keeping the newest
+/// copy. Output is newest first, ties broken by path.
+fn newest_copy_per_file_name(mut files: Vec<(PathBuf, SystemTime)>) -> Vec<(PathBuf, SystemTime)> {
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut seen = std::collections::BTreeSet::new();
+    files.retain(|(path, _)| seen.insert(transcript_copy_key(path)));
+    files
+}
+
+/// Claude subagent ids are unique only within their parent session
+/// (`<session>/subagents/agent-<id>.jsonl`), so that key keeps the parent.
+fn transcript_copy_key(path: &Path) -> Vec<std::ffi::OsString> {
+    let name = path.file_name().map(|name| name.to_os_string());
+    let session = path
+        .parent()
+        .filter(|dir| dir.file_name() == Some(std::ffi::OsStr::new("subagents")))
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map(|session| session.to_os_string());
+    session.into_iter().chain(name).collect()
+}
+
+/// Leaves out transcripts modified within `SETTLE_WINDOW` of `now` that the
+/// last upload did not include; a later cycle picks them up. An uploaded
+/// transcript stays even when recent, so a replacement never drops its history.
+fn retain_settled_files(
+    files: &mut Vec<(PathBuf, SystemTime)>,
+    now: SystemTime,
+    uploaded: Option<&CompositionFilesSignature>,
+) {
+    files.retain(|(path, mtime)| {
+        now.duration_since(*mtime)
+            .is_ok_and(|age| age >= SETTLE_WINDOW)
+            || uploaded.is_some_and(|files| files.contains_key(path.to_string_lossy().as_ref()))
+    });
+}
+
 fn file_date(mtime: SystemTime) -> Date {
     OffsetDateTime::from(mtime).to_offset(UtcOffset::UTC).date()
 }
@@ -1410,7 +1656,22 @@ fn build_report_for_scan(
     deadline: Instant,
 ) -> Option<WorkspaceReport> {
     let mut report = WorkspaceReport::new(window);
-    for (file, mtime) in &scan.files {
+    // A resumed or forked Claude transcript copies records with their
+    // original uuids and timestamps; the file that holds them first owns them.
+    // Creation time orders that even when the original is appended to later.
+    // Where it is unavailable, modification time is the fallback.
+    let mut files = scan
+        .files
+        .iter()
+        .map(|(file, mtime)| {
+            let created = fs::metadata(file)
+                .and_then(|metadata| metadata.created())
+                .unwrap_or(*mtime);
+            (created, file, mtime)
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    for (_, file, mtime) in files {
         if Instant::now() >= deadline {
             return None;
         }
@@ -1647,13 +1908,26 @@ fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
             continue;
         }
         any_source = true;
+        // A partial root list would rebuild workspaces without the missing
+        // transcripts and replace their last good aggregates. Skip instead.
+        let roots = match crate::snapshot_roots::registered_scan_roots(source, home) {
+            Ok(roots) => roots,
+            Err(error) => {
+                eprintln!(
+                    "context composition harvest skipped for {}: {}",
+                    agent_source_label(source),
+                    crate::snapshot_sync::safe_error(&error)
+                );
+                continue;
+            }
+        };
         if let Err(error) = harvest_source(
             &client,
             &device,
             &device_secret,
             &machine_id,
             &api_base_url,
-            home,
+            &roots,
             support_dir,
             source,
         ) {
@@ -1683,7 +1957,7 @@ fn harvest_source(
     device_secret: &str,
     machine_id: &str,
     api_base_url: &str,
-    home: &Path,
+    roots: &[PathBuf],
     support_dir: &Path,
     source: SnapshotSource,
 ) -> Result<()> {
@@ -1708,14 +1982,12 @@ fn harvest_source(
 
     let deadline = Instant::now() + CONTEXT_COMPOSITION_CYCLE_BUDGET;
     let now = SystemTime::now();
-    let root_dir = match source {
-        SnapshotSource::ClaudeCode => home.join(".claude").join("projects"),
-        SnapshotSource::Codex => home.join(".codex").join("sessions"),
-        _ => return Ok(()),
-    };
+    if !matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
+        return Ok(());
+    }
     // An unresolved transcript can change grouping and full-replacement scope.
     // Abort before uploads or cache writes; retain last-good workspace data.
-    let workspaces = discover_workspaces(&root_dir, now, deadline)?;
+    let workspaces = discover_workspaces(roots, now, deadline)?;
     if workspaces.is_empty() {
         return Ok(());
     }
@@ -1726,13 +1998,26 @@ fn harvest_source(
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
+    let mut excluded_not_fresh = 0u64;
+    let mut copied_history = 0u64;
 
-    for scan in workspaces {
+    for mut scan in workspaces {
         if Instant::now() >= deadline {
             return Err(anyhow!("context composition report budget expired"));
         }
         let workspace_text = scan.workspace.to_string_lossy();
         let workspace_hash = sha256_hex(&[workspace_text.as_ref()]);
+        let path = cache_path(support_dir, agent_source, &workspace_hash);
+        let cache = read_cache(&path);
+        retain_settled_files(
+            &mut scan.files,
+            now,
+            cache.as_ref().map(|entry| &entry.files),
+        );
+        if scan.files.is_empty() {
+            skipped += 1;
+            continue;
+        }
         let signature = match workspace_files_signature(&scan.files, deadline) {
             Ok(signature) => signature,
             Err(_) if Instant::now() >= deadline => {
@@ -1746,8 +2031,6 @@ fn harvest_source(
                 continue;
             }
         };
-        let path = cache_path(support_dir, agent_source, &workspace_hash);
-        let cache = read_cache(&path);
         let now_dt = OffsetDateTime::now_utc();
         if !should_rescan(
             cache.as_ref(),
@@ -1772,6 +2055,8 @@ fn harvest_source(
             eprintln!("context composition report incomplete for workspace_hash={workspace_hash}");
             continue;
         };
+        excluded_not_fresh += report.excluded_not_fresh;
+        copied_history += report.copied_history_sessions;
         let Some(request) = build_request(
             &report,
             &scan.workspace,
@@ -1849,7 +2134,7 @@ fn harvest_source(
     }
 
     eprintln!(
-        "context_composition_harvest_metrics source={agent_source} discovered={} uploaded={uploaded} skipped={skipped} failed={failed}",
+        "context_composition_harvest_metrics source={agent_source} discovered={} uploaded={uploaded} skipped={skipped} failed={failed} excluded_not_fresh={excluded_not_fresh} copied_history={copied_history}",
         uploaded + skipped + failed
     );
     if failed > 0 && uploaded == 0 && skipped == 0 {

@@ -277,10 +277,17 @@ or always-on watcher.
 
 On macOS, external-scheduler attribution may also inventory bounded user
 launchd definitions and the user's crontab at startup and once per day. Raw
-plist, crontab, wrapper-script, command, and path content stays local. A
-specific-file `lsof`, content-free process parent table, and bounded
-`launchctl print` lookup run only for a changed session that already matches a
-plausible scheduler definition; there is no process watcher. Static
+plist, crontab, wrapper-script, command, and path content stays local. Only
+for a recently written session that already matches a plausible scheduler
+definition, a bounded `launchctl print` lookup runs at most once per candidate
+job per scan. Only while such a job is running, the daemon reads process
+parents and start times from the kernel, Claude Code's own running-session
+registration files (`sessions/<pid>.json`: pid, session id, process start), and,
+for Codex, the open file paths of the user's own processes in that job's tree,
+once per scan. A registration counts only while its pid still runs with the
+recorded start, and a job only while its pid still runs with the job's start. A
+single proven job is remembered in memory for that session, bounded, so attribution
+survives the job's exit; there is no process watcher. Static
 correlation requires matching schedule time, prompt signature, provider, and
 repository. Interval jobs require a live job-PID relationship. Missing access,
 timeouts, and ambiguity produce no external-scheduler fact.
@@ -304,6 +311,21 @@ contents. Two events naming the same session with different controllers produce
 no relationship at all. This intake reads only that directory, only while
 session attribution is enabled, and adds no watcher, process inspection, or
 permission prompt.
+
+Codex session-start footprint: for each new Codex session (in `~/.codex` and
+in Ottto-managed Codex account folders) the daemon reads only the rows before
+its first model request, once, and uploads per repository the sizes of what
+Codex loaded, dated at that session's start. For each AGENTS.md file that is
+its loaded size in characters, its byte size (omitted above 1 MiB) and whether
+Codex's `project_doc_max_bytes` limit cut it; a file loaded whole
+also gets its lines, UTF-16 characters and the same device-salted hash as the
+Claude Code file counts (the salt never leaves the Mac, so hashes cannot be
+matched to known files or compared across machines). For each listed skill it
+is the name, the size of its listing line and whether its root is the project,
+the user, the system or a plugin. Paths are repository-relative. Instruction
+and skill text never leave the Mac. The context-footprint opt-outs (including
+`<support>/context_footprint/disabled`) apply, and
+`OTTTO_CODEX_SESSION_START_HARVEST_DISABLED=1` turns off this collector alone.
 
 ## Live Telemetry
 

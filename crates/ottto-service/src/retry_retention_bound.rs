@@ -47,6 +47,12 @@ impl<T: Bound> Bound for Vec<T> {
         Some(())
     }
 }
+impl<T: Bound> Bound for Box<T> {
+    fn heap(&self, b: &mut Budget) -> Option<()> {
+        b.add(size_of::<T>())?;
+        (**self).heap(b)
+    }
+}
 impl<K: Bound, V: Bound> Bound for BTreeMap<K, V> {
     fn heap(&self, b: &mut Budget) -> Option<()> {
         // Closed ordinary schema uses String/String. On rustc1.88 every nonempty
@@ -75,7 +81,10 @@ macro_rules! fields {
         } }
     }
 }
-fields!(SnapshotItem; [claude_usage_request_ids,claude_usage_occurrences,cache_observations,cache_observations_state,cache_base_head_etag,cache_requests,cache_requests_complete,claude_context_curve_boundaries,claude_context_curve_identity_complete,claude_context_curve_request_index_complete,claude_context_curve_owned_start_proven]; session_account_evidence,source_session_id,snapshot_fingerprint,status,input_tokens,output_tokens,cache_read_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,reasoning_output_tokens,unattributed_total_tokens,request_count,usage_accounting_contract,avg_duration_ms,avg_time_to_first_token_ms,max_duration_ms,max_time_to_first_token_ms,peak_context_fill_tokens,first_turn_context_tokens,last_turn_context_tokens,compaction_count,compaction_timestamps,compaction_total_pre_tokens,compaction_total_post_tokens,compaction_total_cumulative_dropped_tokens,compaction_total_duration_ms,context_curve,activity_summary,tool_usage,tool_usage_truncated,model_usage,usage_buckets,cost,session_display_name,session_display_name_source,source_started_at,source_ended_at,source_last_activity_at,collected_at,workspace_hash,workspace_display_label,workspace_label_source,repository_hash,repository_label,repository_label_source,repository_identity_source,workspace_kind,source_file_fingerprint,session_artifacts,provenance,origin,originator,attribution_facts);
+fields!(SnapshotItem; [claude_usage_request_ids,claude_usage_occurrences,claude_org_markers,cache_observations,cache_observations_state,cache_base_head_etag,cache_requests,cache_requests_complete,claude_context_curve_boundaries,claude_context_curve_identity_complete,claude_context_curve_request_index_complete,claude_context_curve_owned_start_proven]; session_account_evidence,source_session_id,snapshot_fingerprint,status,input_tokens,output_tokens,cache_read_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,reasoning_output_tokens,unattributed_total_tokens,request_count,usage_accounting_contract,avg_duration_ms,avg_time_to_first_token_ms,max_duration_ms,max_time_to_first_token_ms,peak_context_fill_tokens,first_turn_context_tokens,last_turn_context_tokens,compaction_count,compaction_timestamps,compaction_total_pre_tokens,compaction_total_post_tokens,compaction_total_cumulative_dropped_tokens,compaction_total_duration_ms,context_curve,activity_summary,tool_usage,tool_usage_truncated,session_start,model_usage,usage_buckets,cost,session_display_name,session_display_name_source,source_started_at,source_ended_at,source_last_activity_at,collected_at,workspace_hash,workspace_display_label,workspace_label_source,repository_hash,repository_label,repository_label_source,repository_identity_source,workspace_kind,source_file_fingerprint,session_artifacts,provenance,origin,originator,attribution_facts,request_evidence,request_identity_refusals,claude_account_withheld_reason);
+fields!(SnapshotSessionStart; []; client_version,user_turn_count,first_request_uncached_input_tokens,first_request_cache_read_tokens,first_request_cache_write_5m_tokens,first_request_cache_write_1h_tokens,opening_request_count,request_2_context_tokens,request_3_context_tokens,opening_output_tokens,opening_tool_calls,opening_truncated_outputs,opening_files,opening_file_overflow,instruction_load_cut,start_parts_method,start_chars_tools,start_chars_system,start_chars_instructions,start_chars_memory,start_chars_skills,start_chars_agents,start_chars_mcp_names,start_chars_mcp_instructions,start_chars_hooks_env,start_chars_prompt,start_chars_other,start_config_fingerprint,file_candidates,files_over_guard,policy_applied,opening_files_unknown);
+fields!(SnapshotOpeningFile; []; request,tool,repo_path,path_hash,ext,chars,reads,instruction_segments,client_loaded,truncated);
+fields!(OpeningFileCandidate; []; row,repo_path,path_hash,ext);
 fields!(SnapshotOrigin; [parent_session_ref]; thread_source,source,source_subagent,originator,agent_role,entrypoint,is_sidechain,session_kind,used_workflow_orchestration);
 fields!(SnapshotActivityCount; []; name,count);
 fields!(SnapshotToolUsage; []; name,count);
@@ -84,7 +93,9 @@ fields!(SnapshotCapabilityBucket; []; bucket_start,capability_id,raw_origin,call
 fields!(SnapshotActivitySummary; []; capability_collection_version,tool_calls,shell_commands,patch_operations,changed_files,lines_added,lines_deleted,web_searches,mcp_calls,subagent_spawns,tool_counts,mcp_tool_counts,capability_counts,capability_buckets,skills);
 fields!(SessionAccountEvidence; []; provider,account_identifier_hash,provider_workspace_hash,identity_hash_scheme,evidence_source,identity_disposition,source_created_at);
 fields!(SnapshotUsageBucket; []; bucket_start,model_usage,first_activity_at,last_activity_at);
-fields!(SnapshotModelUsage; []; model,input_tokens,output_tokens,cache_read_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,reasoning_output_tokens,reasoning_effort,unattributed_total_tokens,request_count,selector_context,selector_sources,auth_mode,billing_channel,billing_provider,gateway_provider,model_provider,subscription_product,account_identifier_hash,cost_usd,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd);
+fields!(SnapshotModelUsage; []; model,input_tokens,output_tokens,cache_read_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,reasoning_output_tokens,reasoning_effort,unattributed_total_tokens,request_count,selector_context,selector_sources,auth_mode,billing_channel,billing_provider,gateway_provider,model_provider,subscription_product,account_identifier_hash,evidence_ref,identity_parts,cost_usd,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd);
+fields!(SnapshotIdentityPart; []; account_identifier_hash,evidence_ref,input_tokens,output_tokens,cache_read_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,reasoning_output_tokens,unattributed_total_tokens,request_count,cost_usd,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd);
+fields!(SnapshotRequestEvidence; []; identity_basis,provider_workspace_hash);
 fields!(SnapshotCost; []; total_cost_usd,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd,evidence_source);
 fields!(SnapshotProvenance; []; collector,source_file_count,input_token_scope,state_total_tokens,state_archived);
 fields!(SessionArtifact; []; kind,value);

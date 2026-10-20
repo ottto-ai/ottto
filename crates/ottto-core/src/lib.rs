@@ -6,6 +6,7 @@ pub mod codex_account_slots;
 pub mod lifecycle;
 pub mod local_client;
 pub mod local_service;
+pub mod provider_call_log;
 pub mod redaction;
 pub mod status;
 pub mod token_store;
@@ -51,8 +52,9 @@ pub use claude_statusline::{
     CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
 };
 pub use codex_account_slots::{
-    read_codex_auth_file_secure, read_codex_config_file_secure, CodexAccountSlotSettingsError,
-    CodexHomeTrust, CodexRegisteredSlotBinding, FileCodexAccountSlotSettingsStore,
+    codex_auth_file_mark, read_codex_auth_file_secure, read_codex_config_file_secure,
+    CodexAccountSlotSettingsError, CodexActiveSignIn, CodexAuthFileMark, CodexHomeTrust,
+    CodexRegisteredSlotBinding, FileCodexAccountSlotSettingsStore,
     CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME, CODEX_MANAGED_ACCOUNTS_DIR_NAME,
     MAX_CODEX_ACCOUNT_SLOTS, MAX_MANAGED_CODEX_ACCOUNT_SLOTS,
 };

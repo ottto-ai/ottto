@@ -264,13 +264,14 @@ fn row_plan_fingerprint(row: &SnapshotModelUsage) -> Option<String> {
     }
 }
 
+/// Reasoning tokens are a part of `output_tokens` for Codex and Claude, so
+/// they are not added again.
 fn row_total_tokens(row: &SnapshotModelUsage) -> u64 {
     row.input_tokens
         .saturating_add(row.output_tokens)
         .saturating_add(row.cache_read_tokens)
         .saturating_add(row.cache_creation_5m_tokens)
         .saturating_add(row.cache_creation_1h_tokens)
-        .saturating_add(row.reasoning_output_tokens)
         .saturating_add(row.unattributed_total_tokens)
 }
 
@@ -323,6 +324,8 @@ mod tests {
             selector_context.insert("plan_window_bucket".to_string(), bucket.to_string());
         }
         SnapshotModelUsage {
+            evidence_ref: None,
+            identity_parts: None,
             model: "test-model".to_string(),
             input_tokens,
             output_tokens,
@@ -369,6 +372,10 @@ mod tests {
         usage_buckets: Vec<SnapshotUsageBucket>,
     ) -> SnapshotItem {
         SnapshotItem {
+            request_evidence: Vec::new(),
+            request_identity_refusals: 0,
+            claude_org_markers: None,
+            claude_account_withheld_reason: None,
             source_session_id: source_session_id.to_string(),
             snapshot_fingerprint: format!("fp-{source_session_id}"),
             status: "active".to_string(),
@@ -410,6 +417,7 @@ mod tests {
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
+            session_start: None,
             model_usage: Vec::new(),
             usage_buckets,
             cost: None,
@@ -507,6 +515,25 @@ mod tests {
             .expect("anthropic group present");
         assert_eq!(anthropic.token_volume_recent[0].tokens, 600);
         assert_eq!(anthropic.last_seen_at, "2026-05-28T09:30:00Z");
+    }
+
+    #[test]
+    fn reasoning_tokens_are_not_counted_on_top_of_output() {
+        let mut row = model_usage(Some("anthropic"), Some("anthropic"), None, None, 1000, 900);
+        row.reasoning_output_tokens = 300;
+        let snapshots = vec![snapshot(
+            "claude-thinking",
+            "2026-05-28T08:45:00Z",
+            vec![usage_bucket(
+                "2026-05-28T08:00:00Z",
+                "2026-05-28T08:45:00Z",
+                vec![row],
+            )],
+        )];
+
+        let detected = aggregate_detected_uses(&snapshots);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].token_volume_recent[0].tokens, 1900);
     }
 
     #[test]
