@@ -17682,6 +17682,23 @@ for line in sys.stdin:
             sign_in_outcome(&ended),
             Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
         );
+
+        // Connecting another workspace after the finished reconnect starts a
+        // new setup and leaves the reconnected slot alone.
+        let opened = prepare_open_codex_account(
+            1,
+            "codex_setup_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd".to_string(),
+        )
+        .expect("open prepare after a finished reconnect");
+        assert_eq!(
+            opened.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+        );
+        assert_ne!(
+            opened.setup_operation.slot_id.as_deref(),
+            Some(slot_id.as_str())
+        );
+        assert!(home.join("auth.json").is_file());
     }
 
     /// A daemon restart during a reconnect never verifies the home's
