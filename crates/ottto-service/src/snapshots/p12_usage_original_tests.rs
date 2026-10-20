@@ -514,3 +514,110 @@ fn native_comparison_original_member_change_unit_oracle() {
     member_change_after_unchanged_proof_fails_closed_until_family_reparse();
     writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: original_body_ran=true original_passed=true controlled_revision_unit=true physical_source_or_performance_proof=false strict_body_ACK_validator=true selected_save=true").unwrap();
 }
+
+// Separately named h559 phase trace. The historical oracle/body/wrapper above
+// remains unchanged and is expected to fail at its old P1 publication claim.
+#[test]
+fn h559_retry_pending_same_page_order_0750_phase_trace() {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(
+            std::io::stderr().lock(),
+            "h559_0750_phase_trace: supported_positive=UNEXECUTED historical_original_passed=false"
+        )
+        .unwrap();
+        return;
+    }
+    let _native = claude_native_comparison::enable_for_test();
+    let mut family = Family::new();
+    let p0 = family.proven_and_corrected();
+    let mut child = family.child("2026-08-02T07:20:00Z", 2);
+    family.page(&mut child, true, "2026-08-02T07:20:00Z");
+    assert!(family.armed(&family.parent_key));
+    let root = family.root_session_id.clone();
+    let mut transcript = fs::read_to_string(&family.child_path).unwrap();
+    transcript.push_str(&format!(
+        "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"assistant\",\"sessionId\":\"{root}\",\"agentId\":\"{CHILD_AGENT}\",\"isSidechain\":true,\"requestId\":\"req_6\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n"
+    ));
+    fs::write(&family.child_path, transcript).unwrap();
+    family
+        .api_rows
+        .push(complete_api_row(&root, "req_6", 6, 10, 1, 0));
+    family
+        .trace_rows
+        .push(complete_trace_row(&root, "req_6", CHILD_AGENT));
+    let mut grown = family.child("2026-08-02T07:30:00Z", 3);
+    let disposition = family.page(&mut grown, false, "2026-08-02T07:30:00Z");
+    assert_eq!(disposition.quarantined_entity_count(), 1);
+    assert_eq!(grown[0].usage_accounting_contract, None);
+    disposition.retain_uploadable(&mut grown);
+    assert!(grown.is_empty());
+    family.page(&mut [], true, "2026-08-02T07:30:00Z");
+    assert_eq!(family.witness(), p0);
+    family.reload();
+
+    let mut all = family.parent("2026-08-02T07:40:00Z");
+    all.append(&mut family.child("2026-08-02T07:40:00Z", 3));
+    let disposition = family.page(&mut all, false, "2026-08-02T07:40:00Z");
+    assert_eq!(disposition.quarantined_entity_count(), 2);
+    let before = family.index.claude_usage_authority_quarantine[&root].clone();
+    let accepted = family.index.accepted_snapshot_fingerprints.clone();
+    assert!(
+        !accepted.is_empty(),
+        "actual primitive prelude accepted prior bodies"
+    );
+    family.page(&mut [], true, "2026-08-02T07:40:00Z");
+    assert_eq!(family.witness(), p0);
+    let record = &family.index.claude_usage_authority_quarantine[&root];
+    assert_eq!(
+        record.proven_witness_fingerprint,
+        claude_usage_family_witness_fingerprint(&family.witness())
+    );
+    assert_eq!(
+        serde_json::to_vec(record).unwrap(),
+        serde_json::to_vec(&before).unwrap()
+    );
+    assert_eq!(family.index.accepted_snapshot_fingerprints, accepted);
+    family.reload();
+    assert_eq!(family.index.accepted_snapshot_fingerprints, accepted);
+    assert_eq!(
+        serde_json::to_vec(&family.index.claude_usage_authority_quarantine[&root]).unwrap(),
+        serde_json::to_vec(&before).unwrap()
+    );
+    writeln!(std::io::stderr().lock(), "h559_0750_phase_trace: phase=0740 partial_members=2 empty_terminal=true P0_pair=true record_deadline_attempt_revisions_unchanged=true ACKs_kept=true reload_intact=true historical_original_passed=false").unwrap();
+
+    // EXACT original next phase: both members on a non-terminal page, with
+    // no clock advance, new proof permit, changed cadence or synthetic grant.
+    let mut all = family.parent("2026-08-02T07:50:00Z");
+    all.append(&mut family.child("2026-08-02T07:50:00Z", 3));
+    let disposition = family.page(&mut all, false, "2026-08-02T07:50:00Z");
+    let quarantined = disposition.quarantined_entity_count();
+    let reported = all
+        .iter()
+        .filter(|item| item.usage_accounting_contract.as_deref() == REPORTED)
+        .count();
+    assert_eq!(all[1].request_count, 2);
+    assert_eq!(all[1].output_tokens, 2);
+    disposition.retain_uploadable(&mut all);
+    writeln!(std::io::stderr().lock(), "h559_0750_phase_trace: phase=0750 census_complete=false quarantined={quarantined} reported={reported} uploadable={} grown_request_count=2 grown_output_tokens=2 historical_original_passed=false fast_resolution_proved=false controlled_primitive_not_physical_scan=true", all.len()).unwrap();
+    assert_eq!(quarantined, 2, "diagnostic: both current bodies still held");
+    assert_eq!(reported, 0);
+    assert!(all.is_empty());
+    assert_eq!(family.witness(), p0);
+    let record = &family.index.claude_usage_authority_quarantine[&root];
+    assert_eq!(
+        record.disposition,
+        ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+    );
+    assert!(record.proof_correction.is_none());
+    assert_eq!(
+        record.proven_witness_fingerprint,
+        claude_usage_family_witness_fingerprint(&family.witness())
+    );
+    assert_eq!(family.index.accepted_snapshot_fingerprints, accepted);
+    family.reload();
+    assert_eq!(family.index.accepted_snapshot_fingerprints, accepted);
+    assert!(family
+        .index
+        .claude_usage_authority_quarantine
+        .contains_key(&root));
+}

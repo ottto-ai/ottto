@@ -259,7 +259,10 @@ fn authority_retry_binding_failed_t1_rebuild_stays_paired_without_late_regrant()
     let mut index = f.old_index(true, true);
     let before = index.claude_usage_authority_quarantine[&f.family].clone();
     for _ in 0..2 {
-        let mut broken = vec![f.raw[0].clone()];
+        // Keep every member current in this controlled fold, so an unrelated
+        // earlier-page rearm cannot change the member revision map between
+        // the two failed rebuilds being compared.
+        let mut broken = f.raw.clone();
         broken[0].claude_usage_occurrences.clear();
         f.fold(&mut index, &mut broken, false);
         let record = &index.claude_usage_authority_quarantine[&f.family];
@@ -307,10 +310,15 @@ fn authority_retry_binding_unsettled_p1_preserves_per_member_own_c5_serialized_r
             !item.request_evidence.is_empty(),
             "own native requests emitted C5 evidence"
         );
-        assert!(item
-            .model_usage
+        // Contract-5 identity parts live on bucket wire rows; the top-level
+        // model_usage is a summary, not the per-request identity carrier.
+        let wire_rows = item
+            .usage_buckets
             .iter()
-            .all(|row| row.identity_parts.is_some()));
+            .flat_map(|bucket| bucket.model_usage.iter())
+            .collect::<Vec<_>>();
+        assert!(!wire_rows.is_empty());
+        assert!(wire_rows.iter().all(|row| row.identity_parts.is_some()));
         assert_eq!(
             serde_json::to_vec(&candidate_body).unwrap(),
             serde_json::to_vec(&control_body).unwrap(),

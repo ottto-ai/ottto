@@ -25,3 +25,14 @@ conservation checks. Controlled fold cases cover same-pass demotion, existing
 resolution, failed terminal correction without a late regrant, and per-member
 contract-5 serialization under the production emission gate and exact ACK
 validator. Supported CI and independent review are required before intake.
+
+The first supported implementation CI repaired the real native writer/load
+failure and passed selected-subset, stale-CAS and restart conservation. It also
+exposed a separate freshness conflict: the historical member-change oracle
+expects the next nonterminal page to resolve from a newly persisted proof, which
+is unsafe while the old restriction remains bound to its prior proof. That
+historical oracle and its wrapper remain byte-identical. A separately named
+phase trace runs the same logical page order and reports the retained proof and
+held next-page bodies. Its passing negative observation must not be reported as
+restored original liveness; the historical oracle remains an expected failure
+until a separately qualified mechanism resolves the conflict. No intake claim.
