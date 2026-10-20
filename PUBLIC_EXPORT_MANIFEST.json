@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 722,
-  "content_sha256": "afc92ba33a354ec9fdb8e935ffdf83a904b8ca01ec81fbd86b77697bf769a1d6",
+  "candidate_file_count": 725,
+  "content_sha256": "23871b65c27b678bff1f06cb0c4ffc65d18ceb0d66a664e29372e31609444a5e",
   "files": [
     {
       "executable": false,
@@ -1196,8 +1196,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_audit.rs",
-      "sha256": "5264a795bf3001074808bb92ee249823d5ddaafaf27ddcd81e12eeecdaa5450e",
-      "size_bytes": 58430
+      "sha256": "69a9048400fc295593d4033a75f8ccb9be95de39faa5a739ef16cff4e0f39e2d",
+      "size_bytes": 60922
     },
     {
       "executable": false,
@@ -1301,8 +1301,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "bdfdf04866faf0132429487dd6b540b8b21d68411ec7d215451e7399c88cf402",
-      "size_bytes": 2906260
+      "sha256": "3b4a518e62c1a811a200063f3c93512fb736a892eafb47d6b7bcfaa63bea5d51",
+      "size_bytes": 2920297
     },
     {
       "executable": false,
@@ -1373,6 +1373,13 @@
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
       "sha256": "c4c6a22805129de08b9f721cae4c33bee598a6d27b78488e4ea77b41a20b0bae",
       "size_bytes": 59711
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_posture_member_waiver_tests.rs",
+      "sha256": "a7128e84a93a47bc7bebdd178f7e6d467976197afea0f1d24116d6e60e88a872",
+      "size_bytes": 22809
     },
     {
       "executable": false,
@@ -2330,8 +2337,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-30-claude-owned-context-posture.md",
-      "sha256": "b249d24e317f7ec59a56b4ced6d7c8ca115f35816af7ef2b6648b0e31a0dbc38",
-      "size_bytes": 6013
+      "sha256": "c35e7ada03f56bfbfa91d703b8280cab0842f86a571a7e190efdcf9699007815",
+      "size_bytes": 6356
     },
     {
       "executable": false,
@@ -3284,6 +3291,13 @@
       "path": "docs/session-2026-10-19-retained-cache-lifecycle.md",
       "sha256": "b0a030fe780592407e0b9ea233fe9e8ef041c4a5994ddda2ae07fd85305fd135",
       "size_bytes": 2797
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-20-claude-posture-member-waiver.md",
+      "sha256": "d96f6d2de0e0a52eaaca1d9c9d2b869ec321d17f8f9223e45791be60e292c9e0",
+      "size_bytes": 3806
     },
     {
       "executable": false,
@@ -4541,6 +4555,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/snapshot-audit/v5-golden-keys.json",
+      "sha256": "9868548f0329a659545f7b0a12d30ba6560b08ee1e6db9fdcbee8515f28a9fdf",
+      "size_bytes": 1055
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/source-health/codex-needs-repair.json",
       "sha256": "7793a21d37711b56d986f20703b95512fdcde73b88d6cf1c18ff480fb322eadb",
       "size_bytes": 5678
@@ -5057,9 +5078,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T15:11:36+00:00",
+  "generated_at": "2026-10-20T21:17:06+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 723,
+  "output_file_count": 726,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5096,5 +5117,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "344b47cd06ede83f2aa8608c6133ab5b59690b45"
+  "source_commit": "c30d6a7fec0e30370aae973f72487761a5edc9d6"
 }
