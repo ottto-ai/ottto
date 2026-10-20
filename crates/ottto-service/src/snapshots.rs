@@ -9818,11 +9818,18 @@ fn load_claude_desktop_session_title(
         });
     }
     // Lineage ids are optional: a missing or malformed one leaves the session
-    // unlinked and never invalidates its title.
-    let desktop_session_id =
-        string_at(&value, &["sessionId"]).filter(|id| is_claude_desktop_session_id(id));
-    let spawned_from_desktop_session_id = string_at(&value, &["spawnedFrom", "sessionId"])
-        .filter(|id| is_claude_desktop_session_id(id));
+    // unlinked and never invalidates its title. They are identities, so they are
+    // read byte-exact rather than through the trimming `string_at`: a padded id
+    // is malformed, never normalized into a link. A padded `cliSessionId` keeps
+    // its trimmed title match but contributes no lineage in either direction.
+    let lineage_ids_exact =
+        codex_identity_at(&value, &["cliSessionId"]).as_deref() == Some(cli_session_id.as_str());
+    let lineage_id_at = |path: &[&str]| {
+        codex_identity_at(&value, path)
+            .filter(|id| lineage_ids_exact && is_claude_desktop_session_id(id))
+    };
+    let desktop_session_id = lineage_id_at(&["sessionId"]);
+    let spawned_from_desktop_session_id = lineage_id_at(&["spawnedFrom", "sessionId"]);
     let spawned_from_unresolved = spawned_from_desktop_session_id.is_none()
         && value
             .get("spawnedFrom")
@@ -53093,52 +53100,91 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawned_session_with_a_path_cli_session_id_emits_no_lineage() {
+        let parent = "94bd328b-f2a9-4c31-bbfe-e174d41b4310";
         let child = "da1dc804-1c50-4401-8c3c-0898b126772f";
-        let (home, transcript_path, projects_root) = claude_desktop_fixture(
-            "claude-desktop-spawned-path-parent",
-            child,
-            &format!(
-                "{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"
+        // (child store record, parent store record, link expected). Lineage ids
+        // are identities: a path or a whitespace-padded id never links.
+        let cases = [
+            (
+                format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"),
+                format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\"{parent}\",\"spawnedFrom\":null}}"),
+                true,
             ),
-            &claude_desktop_spawn_test_transcript(child),
-        );
-        let store_dir = home
-            .join("Library")
-            .join("Application Support")
-            .join("Claude")
-            .join("claude-code-sessions")
-            .join("account-ctx")
-            .join("workspace");
-        // The parent store record resolves, but its `cliSessionId` is a path.
-        fs::write(
-            store_dir.join("local_desktop-0.json"),
-            "{\"sessionId\":\"local_parent\",\"cliSessionId\":\"/Users/example/project\",\"spawnedFrom\":null}",
-        )
-        .expect("write parent store file");
-        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-        assert!(
-            metadata.spawn_lineage.is_empty(),
-            "{:?}",
-            metadata.spawn_lineage
-        );
+            (
+                format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"),
+                "{\"sessionId\":\"local_parent\",\"cliSessionId\":\"/Users/example/project\",\"spawnedFrom\":null}".to_string(),
+                false,
+            ),
+            (
+                format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"),
+                format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\" {parent} \",\"spawnedFrom\":null}}"),
+                false,
+            ),
+            (
+                format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\" local_parent \"}}}}"),
+                format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\"{parent}\",\"spawnedFrom\":null}}"),
+                false,
+            ),
+            (
+                format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\" {child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"),
+                format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\"{parent}\",\"spawnedFrom\":null}}"),
+                false,
+            ),
+        ];
+        for (index, (child_record, parent_record, linked)) in cases.into_iter().enumerate() {
+            let (home, transcript_path, projects_root) = claude_desktop_fixture(
+                &format!("claude-desktop-spawned-bad-id-{index}"),
+                child,
+                &child_record,
+                &claude_desktop_spawn_test_transcript(child),
+            );
+            let store_dir = home
+                .join("Library")
+                .join("Application Support")
+                .join("Claude")
+                .join("claude-code-sessions")
+                .join("account-ctx")
+                .join("workspace");
+            fs::write(store_dir.join("local_desktop-0.json"), parent_record)
+                .expect("write parent store file");
+            let metadata =
+                ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+            assert_eq!(
+                metadata
+                    .spawn_lineage(child)
+                    .map(|lineage| lineage.parent_session_id.as_str()),
+                linked.then_some(parent),
+                "case {index}: {:?}",
+                metadata.spawn_lineage
+            );
+            if !linked {
+                assert!(metadata.spawn_lineage.is_empty(), "case {index}");
+            }
 
-        let item = parse_claude_code_jsonl_file_with_title_metadata(
-            &transcript_path,
-            "2026-10-18T10:20:00Z",
-            "fp".to_string(),
-            &metadata,
-            true,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-        assert!(item.attribution_facts.iter().all(|fact| {
-            fact.evidence.source_version != "claude_desktop_spawn:v1"
-                && !fact.value.contains("/Users/example")
-        }));
-        assert_eq!(claude_snapshot_family_root(&item), child);
-        fs::remove_dir_all(home).expect("remove fixture");
+            let item = parse_claude_code_jsonl_file_with_title_metadata(
+                &transcript_path,
+                "2026-10-18T10:20:00Z",
+                "fp".to_string(),
+                &metadata,
+                true,
+            )
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+            assert_eq!(
+                item.attribution_facts
+                    .iter()
+                    .any(|fact| fact.evidence.source_version == "claude_desktop_spawn:v1"),
+                linked,
+                "case {index}"
+            );
+            assert!(item.attribution_facts.iter().all(|fact| {
+                !fact.value.contains("/Users/example") && fact.value.trim() == fact.value
+            }));
+            assert_eq!(claude_snapshot_family_root(&item), child);
+            fs::remove_dir_all(home).expect("remove fixture");
+        }
     }
 
     #[test]
