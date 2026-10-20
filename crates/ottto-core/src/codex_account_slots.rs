@@ -246,8 +246,28 @@ impl FileCodexAccountSlotSettingsStore {
         self.discard_pending_open_slot(&mut persisted)?;
 
         let slot_id = generate_opaque_slot_id()?;
-        let fresh = self.create_fresh_slot_home(&slot_id)?;
-        let home = fresh.home.clone();
+        ensure_managed_directory(&self.managed_accounts_root()?)?;
+        let slot_root = self.slot_root_unchecked(&slot_id)?;
+        let home = slot_root.join("home");
+        let created_root = create_managed_slot_directory(&slot_root)?;
+        let created_home = match create_managed_slot_directory(&home) {
+            Ok(created) => created,
+            Err(error) => {
+                if created_root {
+                    let _ = fs::remove_dir(&slot_root);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_codex_home_config(&home, None) {
+            if created_home {
+                let _ = fs::remove_dir(&home);
+            }
+            if created_root {
+                let _ = fs::remove_dir(&slot_root);
+            }
+            return Err(error);
+        }
         persisted.pending_open_slot_id = Some(slot_id.clone());
         persisted.setup_operation = CodexAccountSetupOperationV1 {
             state: CodexAccountSetupOperationStateV1::WaitingForUserLogin,
@@ -269,48 +289,8 @@ impl FileCodexAccountSlotSettingsStore {
         // carry over to a slot that has no binding yet.
         persisted.setup_preserves_accepted_binding = false;
         persisted.verifying_pinned_workspace = false;
-        if let Err(error) = self.write_persisted(&persisted) {
-            fresh.remove_unrecorded();
-            return Err(error);
-        }
+        self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
-    }
-
-    /// Create the directories and Codex config of a slot id nobody has
-    /// recorded yet. Until the settings that name the slot are written, the
-    /// caller must call [`FreshSlotHome::remove_unrecorded`] on failure.
-    fn create_fresh_slot_home(
-        &self,
-        slot_id: &str,
-    ) -> Result<FreshSlotHome, CodexAccountSlotSettingsError> {
-        let managed_root = self.managed_accounts_root()?;
-        ensure_managed_directory(&managed_root)?;
-        let slot_root = self.slot_root_unchecked(slot_id)?;
-        let home = slot_root.join("home");
-        let created_root = create_managed_slot_directory(&slot_root)?;
-        let mut fresh = FreshSlotHome {
-            managed_root,
-            slot_id: slot_id.to_string(),
-            root_identity: created_root
-                .then(|| directory_identity(&slot_root))
-                .flatten(),
-            home_identity: None,
-            home,
-        };
-        match create_managed_slot_directory(&fresh.home) {
-            Ok(created) => {
-                fresh.home_identity = created.then(|| directory_identity(&fresh.home)).flatten();
-            }
-            Err(error) => {
-                fresh.remove_unrecorded();
-                return Err(error);
-            }
-        }
-        if let Err(error) = write_codex_home_config(&fresh.home, None) {
-            fresh.remove_unrecorded();
-            return Err(error);
-        }
-        Ok(fresh)
     }
 
     /// Remove a reserved-but-unadopted open slot and its tree.
@@ -400,16 +380,34 @@ impl FileCodexAccountSlotSettingsStore {
         // An open setup that ended before adoption may still hold its
         // reservation; this setup replaces it, as `prepare_open_account` does.
         self.discard_pending_open_slot(&mut persisted)?;
-        let mut fresh = None;
         let (slot_id, home) = if let Some((slot_id, _)) = existing_slot {
             let home = self.slot_home(&slot_id)?;
             write_codex_home_config(&home, None)?;
             (slot_id, home)
         } else {
             let slot_id = generate_opaque_slot_id()?;
-            let created = self.create_fresh_slot_home(&slot_id)?;
-            let home = created.home.clone();
-            fresh = Some(created);
+            ensure_managed_directory(&self.managed_accounts_root()?)?;
+            let slot_root = self.slot_root_unchecked(&slot_id)?;
+            let home = slot_root.join("home");
+            let created_root = create_managed_slot_directory(&slot_root)?;
+            let created_home = match create_managed_slot_directory(&home) {
+                Ok(created) => created,
+                Err(error) => {
+                    if created_root {
+                        let _ = fs::remove_dir(&slot_root);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = write_codex_home_config(&home, None) {
+                if created_home {
+                    let _ = fs::remove_dir(&home);
+                }
+                if created_root {
+                    let _ = fs::remove_dir(&slot_root);
+                }
+                return Err(error);
+            }
             persisted.managed_slot_ids.push(slot_id.clone());
             persisted.managed_slot_ids.sort();
             persisted.managed_bindings.insert(
@@ -440,12 +438,7 @@ impl FileCodexAccountSlotSettingsStore {
         persisted.sign_in_baseline = None;
         persisted.setup_preserves_accepted_binding = false;
         persisted.verifying_pinned_workspace = false;
-        if let Err(error) = self.write_persisted(&persisted) {
-            if let Some(fresh) = fresh {
-                fresh.remove_unrecorded();
-            }
-            return Err(error);
-        }
+        self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
     }
 
@@ -1131,12 +1124,6 @@ impl FileCodexAccountSlotSettingsStore {
         persisted: &PersistedCodexAccountSlotsV1,
     ) -> Result<(), CodexAccountSlotSettingsError> {
         self.validate_persisted(persisted)?;
-        #[cfg(test)]
-        if tests::FAIL_NEXT_SETTINGS_WRITE.with(|fail| fail.replace(false)) {
-            return Err(CodexAccountSlotSettingsError::State(
-                "write settings: injected test failure".to_string(),
-            ));
-        }
         let body = serde_json::to_vec_pretty(persisted).map_err(|error| {
             CodexAccountSlotSettingsError::State(format!("serialize settings: {error}"))
         })?;
@@ -1353,209 +1340,6 @@ impl Default for FileCodexAccountSlotSettingsStore {
     fn default() -> Self {
         Self::new(crate::default_support_dir().join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME))
     }
-}
-
-/// Directories and config a prepare created for a slot id that no written
-/// settings name yet. Each directory is pinned by device and inode when it is
-/// created, so cleanup never acts on a path that was replaced since.
-struct FreshSlotHome {
-    managed_root: PathBuf,
-    slot_id: String,
-    home: PathBuf,
-    root_identity: Option<DirectoryIdentity>,
-    home_identity: Option<DirectoryIdentity>,
-}
-
-impl FreshSlotHome {
-    /// Take back what the prepare created after it failed to record the slot.
-    /// Only directories it created are removed, and only while they hold
-    /// nothing but the config it wrote. Anything unexpected (another entry, a
-    /// symlink, a directory that is no longer the one created) leaves the
-    /// tree in place: an orphan is harmless, deleting someone else's file is
-    /// not.
-    fn remove_unrecorded(self) {
-        let _ = remove_fresh_slot_tree_fd(
-            &self.managed_root,
-            &self.slot_id,
-            self.root_identity,
-            self.home_identity,
-        );
-    }
-}
-
-/// Device and inode of a directory.
-type DirectoryIdentity = (u64, u64);
-
-#[cfg(unix)]
-fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = open_private_directory_chain(path).ok()?.metadata().ok()?;
-    Some((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-fn directory_identity(_path: &Path) -> Option<DirectoryIdentity> {
-    None
-}
-
-/// Remove a fresh slot tree through directory descriptors: no path component
-/// is followed, every directory must still be the one created, and the home
-/// may hold only a regular `config.toml`. Without a recorded root identity
-/// nothing is touched.
-#[cfg(unix)]
-fn remove_fresh_slot_tree_fd(
-    managed_root: &Path,
-    slot_id: &str,
-    root_identity: Option<DirectoryIdentity>,
-    home_identity: Option<DirectoryIdentity>,
-) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-
-    let Some(root_identity) = root_identity else {
-        return Ok(());
-    };
-    let parent = open_private_directory_chain(managed_root)?;
-    let slot_name = CString::new(slot_id).expect("validated opaque slot id");
-    let root = open_pinned_directory_at(&parent, &slot_name, root_identity)?;
-    if let Some(home_identity) = home_identity {
-        let home = open_pinned_directory_at(&root, c"home", home_identity)?;
-        if directory_entry_names(&home)?
-            .iter()
-            .any(|name| name.as_bytes() != b"config.toml")
-        {
-            return Err(unexpected_fresh_slot_entry());
-        }
-        match entry_stat_at(&home, c"config.toml") {
-            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
-                if unsafe { libc::unlinkat(home.as_raw_fd(), c"config.toml".as_ptr(), 0) } != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(_) => return Err(unexpected_fresh_slot_entry()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        remove_pinned_empty_directory_at(&root, c"home", home_identity)?;
-    }
-    remove_pinned_empty_directory_at(&parent, &slot_name, root_identity)?;
-    parent.sync_all()
-}
-
-#[cfg(not(unix))]
-fn remove_fresh_slot_tree_fd(
-    _managed_root: &Path,
-    _slot_id: &str,
-    _root_identity: Option<DirectoryIdentity>,
-    _home_identity: Option<DirectoryIdentity>,
-) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn unexpected_fresh_slot_entry() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        "fresh Codex slot holds something other than its config",
-    )
-}
-
-#[cfg(unix)]
-fn entry_stat_at(directory: &fs::File, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
-    use std::os::fd::AsRawFd;
-
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { stat.assume_init() })
-}
-
-/// Open a child directory without following a symlink and check it is still
-/// the directory that was created.
-#[cfg(unix)]
-fn open_pinned_directory_at(
-    parent: &fs::File,
-    name: &std::ffi::CStr,
-    identity: DirectoryIdentity,
-) -> std::io::Result<fs::File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::MetadataExt;
-
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let directory = unsafe { fs::File::from_raw_fd(fd) };
-    let metadata = directory.metadata()?;
-    if (metadata.dev(), metadata.ino()) != identity {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "fresh Codex slot directory was replaced",
-        ));
-    }
-    Ok(directory)
-}
-
-/// Remove an empty child directory if its name still points at the directory
-/// that was created. `AT_REMOVEDIR` refuses a non-empty directory.
-#[cfg(unix)]
-fn remove_pinned_empty_directory_at(
-    parent: &fs::File,
-    name: &std::ffi::CStr,
-    identity: DirectoryIdentity,
-) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    drop(open_pinned_directory_at(parent, name, identity)?);
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn directory_entry_names(directory: &fs::File) -> std::io::Result<Vec<std::ffi::CString>> {
-    use std::ffi::CStr;
-    use std::os::fd::AsRawFd;
-
-    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let stream = unsafe { libc::fdopendir(duplicate) };
-    if stream.is_null() {
-        unsafe { libc::close(duplicate) };
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut names = Vec::new();
-    loop {
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(name.to_owned());
-        }
-    }
-    unsafe { libc::closedir(stream) };
-    Ok(names)
 }
 
 struct CodexAccountSlotTransactionGuard<'a> {
@@ -2451,11 +2235,6 @@ mod tests {
         assert!(format!("{error}").contains("already active"));
     }
 
-    thread_local! {
-        pub(super) static FAIL_NEXT_SETTINGS_WRITE: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };
-    }
-
     /// Connect one workspace, then run a reconnect of it to `complete`.
     /// Returns the reconnected slot id.
     fn complete_a_reconnect(store: &FileCodexAccountSlotSettingsStore) -> String {
@@ -2655,128 +2434,6 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].slot_id, slot_id);
         assert!(bindings[0].accepted);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn failed_settings_write_removes_only_the_slot_folders_the_prepare_created() {
-        let (root, store) = test_store("prepare-write-failure");
-        let reconnected = complete_a_reconnect(&store);
-        let before = slot_dirs(&root);
-        assert_eq!(before, vec![reconnected.clone()]);
-        let settings_before = fs::read(&store.path).expect("settings");
-
-        FAIL_NEXT_SETTINGS_WRITE.with(|fail| fail.set(true));
-        store
-            .prepare_open_account(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                OPEN_OP.to_string(),
-            )
-            .expect_err("injected open write failure");
-        assert_eq!(slot_dirs(&root), before, "no orphan open slot folder");
-
-        FAIL_NEXT_SETTINGS_WRITE.with(|fail| fail.set(true));
-        store
-            .prepare_managed_account(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                format!("codex_setup_{}", "3".repeat(32)),
-                "4".repeat(64),
-                "5".repeat(64),
-            )
-            .expect_err("injected managed write failure");
-        assert_eq!(slot_dirs(&root), before, "no orphan managed slot folder");
-
-        assert_eq!(fs::read(&store.path).expect("settings"), settings_before);
-        assert!(store
-            .slot_home(&reconnected)
-            .expect("registered slot untouched")
-            .join("config.toml")
-            .is_file());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unrecorded_slot_cleanup_keeps_a_home_that_holds_a_credential() {
-        let (root, store) = test_store("fresh-slot-credential");
-        let slot_id = format!("codex_slot_{}", "7".repeat(32));
-        let fresh = store.create_fresh_slot_home(&slot_id).expect("fresh slot");
-        let home = fresh.home.clone();
-        fs::write(home.join("auth.json"), b"{}").expect("credential");
-
-        fresh.remove_unrecorded();
-
-        assert!(home.join("auth.json").is_file());
-        assert!(home.join("config.toml").is_file());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unrecorded_slot_cleanup_never_follows_a_replaced_home_or_slot_root() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-
-        let (root, store) = test_store("fresh-slot-replaced");
-        let registered = store
-            .prepare_managed_account(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                format!("codex_setup_{}", "1".repeat(32)),
-                "d".repeat(64),
-                "e".repeat(64),
-            )
-            .expect("registered slot")
-            .managed_slots[0]
-            .slot_id
-            .clone();
-        let registered_home = store.slot_home(&registered).expect("registered home");
-        let registered_root = registered_home.parent().expect("slot root").to_path_buf();
-        let registered_config = fs::read(registered_home.join("config.toml")).expect("config");
-        let private_dir = |path: &Path| {
-            fs::create_dir(path).expect("replacement dir");
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private");
-        };
-
-        for (index, swap) in ["home symlink", "root symlink", "home directory"]
-            .into_iter()
-            .enumerate()
-        {
-            let slot_id = format!("codex_slot_{}", index.to_string().repeat(32));
-            let fresh = store.create_fresh_slot_home(&slot_id).expect("fresh slot");
-            let home = fresh.home.clone();
-            let slot_root = home.parent().expect("slot root").to_path_buf();
-            let replacement_config = match swap {
-                "home symlink" => {
-                    fs::rename(&home, slot_root.join("aside")).expect("move home aside");
-                    symlink(&registered_home, &home).expect("home symlink");
-                    registered_home.join("config.toml")
-                }
-                "root symlink" => {
-                    fs::rename(&slot_root, root.join("aside")).expect("move root aside");
-                    symlink(&registered_root, &slot_root).expect("root symlink");
-                    registered_home.join("config.toml")
-                }
-                _ => {
-                    fs::rename(&home, slot_root.join("aside")).expect("move home aside");
-                    private_dir(&home);
-                    fs::write(home.join("config.toml"), b"other").expect("other config");
-                    home.join("config.toml")
-                }
-            };
-
-            fresh.remove_unrecorded();
-
-            assert!(replacement_config.is_file(), "{swap}: config survives");
-            assert_eq!(
-                fs::read(registered_home.join("config.toml")).expect("registered config"),
-                registered_config,
-                "{swap}: registered config untouched"
-            );
-            assert!(
-                fs::symlink_metadata(&slot_root).is_ok(),
-                "{swap}: orphan left"
-            );
-            let _ = fs::remove_file(&slot_root);
-            let _ = fs::remove_dir_all(root.join("aside"));
-        }
         let _ = fs::remove_dir_all(root);
     }
 
