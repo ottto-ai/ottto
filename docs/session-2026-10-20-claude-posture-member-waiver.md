@@ -33,7 +33,20 @@ keeps its scalar tuple only when all of these hold:
 Uniqueness is never proof. A hidden family can only hide negative evidence, and
 the waiver depends on none: a copier cannot hold telemetry for requests another
 session made, so it has no contract and stays cleared. Identity-invalid families
-are unknown, never unique; a visible shared hash keeps every peer fail closed.
+are unknown, never unique; a shared hash visible to the fold keeps every peer
+that holds it fail closed.
+
+## Limits
+
+The visible refusals are defense in depth and only see this fold's evidence:
+retained non-invalid pending, and API or trace rows of the roots loaded for
+this page. While the fence is closed the durable duplicate witness is cleared
+and an invalid census retires ordinary pending, so a copy first seen on a later
+page or window cannot retract scalars an earlier page already admitted. That
+order dependence does not move tokens to the wrong session while each member's
+telemetry proof holds. Closing it needs revision-bound per-member request
+evidence or a persisted veto on the fence side; this change does not alter
+that machinery.
 
 Admitted items rebuild first/peak/last from all owned occurrences. Compaction
 count, timestamps and totals use the copied-prefix boundary rule with the first

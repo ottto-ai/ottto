@@ -1027,15 +1027,21 @@ fn rebuild_claude_context_posture(
 
 /// Visible negative evidence against the Claude posture member waiver, built
 /// only while the global census fence is closed and bounded by the requests of
-/// this page's waiver candidates.
+/// this page's waiver candidates: one entry per candidate request, never one
+/// per matching owner or row.
 #[derive(Default)]
 struct ClaudePostureWaiverEvidence {
     /// Candidate request hashes that retained, non-invalid family pending of
     /// any window assigns to more than one (root, member) owner.
     shared_request_hashes: BTreeSet<String>,
-    /// Candidate request ids, each with every root whose loaded local API or
-    /// trace evidence reports it.
-    reported_request_roots: BTreeMap<String, BTreeSet<String>>,
+    /// Candidate request ids reported by loaded local API or trace evidence,
+    /// with the one reporting root or a marker that several roots report it.
+    reported_request_roots: BTreeMap<String, ClaudeReportedRequestRoot>,
+}
+
+enum ClaudeReportedRequestRoot {
+    One(String),
+    Several,
 }
 
 fn claude_posture_waiver_evidence<'a>(
@@ -1057,7 +1063,9 @@ fn claude_posture_waiver_evidence<'a>(
     // An invalid family has erased its evidence; it stays unknown, never
     // unique. Any family that still shows a candidate request under another
     // owner keeps every peer that shares it fail closed.
-    let mut owners = BTreeMap::<&str, BTreeSet<(&str, &str)>>::new();
+    // `None` once a second owner is seen: the request is shared, and no more
+    // owners need to be retained.
+    let mut owners = BTreeMap::<&str, Option<(&str, &str)>>::new();
     for (root_session_id, pending) in &index.claude_usage_family_pending {
         if pending.invalid {
             continue;
@@ -1075,17 +1083,19 @@ fn claude_posture_waiver_evidence<'a>(
                     }),
             );
         for (member, request_hash) in member_hashes {
-            if candidate_request_hashes.contains(request_hash) {
-                owners
-                    .entry(request_hash.as_str())
-                    .or_default()
-                    .insert((root_session_id.as_str(), member.as_str()));
+            if !candidate_request_hashes.contains(request_hash) {
+                continue;
+            }
+            let owner = (root_session_id.as_str(), member.as_str());
+            let first = owners.entry(request_hash.as_str()).or_insert(Some(owner));
+            if first.is_some_and(|first| first != owner) {
+                *first = None;
             }
         }
     }
     let shared_request_hashes = owners
         .into_iter()
-        .filter(|(_, owners)| owners.len() > 1)
+        .filter(|(_, owner)| owner.is_none())
         .map(|(request_hash, _)| request_hash.to_string())
         .collect();
     let api_rows = api_report.evidence.iter().flat_map(|(root, rows)| {
@@ -1096,14 +1106,17 @@ fn claude_posture_waiver_evidence<'a>(
         rows.iter()
             .map(move |row| (root, row.session_id.as_str(), row.request_id.as_str()))
     });
-    let mut reported_request_roots = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut reported_request_roots = BTreeMap::<String, ClaudeReportedRequestRoot>::new();
     for (root, session_id, request_id) in api_rows.chain(trace_rows) {
-        if candidate_request_ids.contains(request_id) {
-            let roots = reported_request_roots
-                .entry(request_id.to_string())
-                .or_default();
-            roots.insert(root.clone());
-            roots.insert(session_id.to_string());
+        if !candidate_request_ids.contains(request_id) {
+            continue;
+        }
+        let reported = reported_request_roots
+            .entry(request_id.to_string())
+            .or_insert_with(|| ClaudeReportedRequestRoot::One(root.clone()));
+        if matches!(reported, ClaudeReportedRequestRoot::One(first) if first != root || first != session_id)
+        {
+            *reported = ClaudeReportedRequestRoot::Several;
         }
     }
     ClaudePostureWaiverEvidence {
@@ -1133,11 +1146,6 @@ fn claude_withheld_posture_admission(
     excluded_request_hashes: &BTreeSet<String>,
     fence: ClaudePostureFence<'_>,
 ) -> ClaudePostureAdmission {
-    let request_hashes = item
-        .claude_usage_request_ids
-        .iter()
-        .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
-        .collect::<BTreeSet<_>>();
     let exclusive_contract =
         item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1");
     if !(item.claude_context_curve_owned_start_proven
@@ -1146,17 +1154,12 @@ fn claude_withheld_posture_admission(
     {
         return ClaudePostureAdmission::WithheldNoContract;
     }
-    if request_hashes.iter().any(|request_hash| {
-        fence.duplicated_request_hashes.contains(request_hash)
-            && !excluded_request_hashes.contains(request_hash)
-    }) {
+    if !fence.closed {
+        // With an open fence the strict rule withholds a proven start only for
+        // a known duplicate.
         return ClaudePostureAdmission::WithheldDuplicate;
     }
-    if !fence.closed
-        || !fence.reports_healthy
-        || !exclusive_contract
-        || !excluded_request_hashes.is_empty()
-    {
+    if !fence.reports_healthy || !exclusive_contract || !excluded_request_hashes.is_empty() {
         return ClaudePostureAdmission::WithheldGlobalCensus;
     }
     if !item.claude_context_curve_identity_complete
@@ -1165,6 +1168,20 @@ fn claude_withheld_posture_admission(
     {
         return ClaudePostureAdmission::WithheldIdentity;
     }
+    let request_hashes = item
+        .claude_usage_request_ids
+        .iter()
+        .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
+        .collect::<BTreeSet<_>>();
+    if request_hashes
+        .iter()
+        .any(|request_hash| fence.duplicated_request_hashes.contains(request_hash))
+    {
+        return ClaudePostureAdmission::WithheldDuplicate;
+    }
+    // Defense in depth: the fold accumulated this item into its own pending,
+    // so a stale window or a different request set would already have
+    // invalidated the family; the native-observation path is checked too.
     let own_family_current_valid = fence.own_pending.is_some_and(|pending| {
         !pending.invalid
             && pending.census_window_end == fence.census_window_end
@@ -1184,7 +1201,10 @@ fn claude_withheld_posture_admission(
             .evidence
             .reported_request_roots
             .get(request_id)
-            .is_some_and(|roots| roots.iter().any(|root| root != root_session_id))
+            .is_some_and(|reported| match reported {
+                ClaudeReportedRequestRoot::One(root) => root != root_session_id,
+                ClaudeReportedRequestRoot::Several => true,
+            })
     });
     if visibly_shared || reported_elsewhere {
         return ClaudePostureAdmission::WithheldDuplicate;

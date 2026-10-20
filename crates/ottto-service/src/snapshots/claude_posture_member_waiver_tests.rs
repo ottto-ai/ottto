@@ -421,6 +421,76 @@ fn request_reported_under_another_root_withholds() {
 }
 
 #[test]
+fn request_traced_under_another_root_withholds() {
+    let dir = temp_dir("claude-waiver-foreign-trace");
+    let (paths, mut items) = owned_and_cap_invalid(&dir);
+    let mut index = indexed(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+    let mut evidence = reports(&owned_rows());
+    evidence.1.evidence.insert(
+        OTHER_ROOT.to_string(),
+        vec![complete_trace_row(OTHER_ROOT, "req_a3", "")],
+    );
+
+    let disposition = fold(&mut items, &evidence, &mut index, true, WINDOW, 3);
+
+    assert!(disposition.duplicate_census.census_invalid);
+    assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
+    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_duplicate"));
+    assert_cleared(&items[0]);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stale_valid_peer_holding_the_request_withholds() {
+    let dir = temp_dir("claude-waiver-stale-peer");
+    let (paths, mut items) = owned_and_cap_invalid(&dir);
+    let mut index = indexed(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+    // Valid pending retained from an earlier window still shows the copy.
+    index.claude_usage_family_pending.insert(
+        PEER.to_string(),
+        ClaudeUsageFamilyPending {
+            census_window_end: "2026-08-01T00:00:00Z".to_string(),
+            member_request_id_hashes: BTreeMap::from([(
+                PEER.to_string(),
+                BTreeSet::from([format!("{:x}", Sha256::digest(b"req_a1"))]),
+            )]),
+            member_occurrences: BTreeMap::new(),
+            invalid: false,
+        },
+    );
+
+    let disposition = fold(&mut items, &reports(&owned_rows()), &mut index, true, WINDOW, 3);
+
+    assert!(disposition.duplicate_census.census_invalid);
+    assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
+    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_duplicate"));
+    assert_cleared(&items[0]);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn persisted_duplicate_owner_withholds_under_the_closed_fence() {
+    let dir = temp_dir("claude-waiver-persisted-duplicate");
+    let (paths, mut items) = owned_and_cap_invalid(&dir);
+    let mut index = indexed(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+    index.claude_duplicate_request_owners.insert(
+        format!("{:x}", Sha256::digest(b"req_a2")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(OWNED, OWNED),
+            claude_duplicate_request_owner(PEER, PEER),
+        ]),
+    );
+
+    let disposition = fold(&mut items, &reports(&owned_rows()), &mut index, true, WINDOW, 3);
+
+    assert!(disposition.duplicate_census.census_invalid);
+    assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
+    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_duplicate"));
+    assert_cleared(&items[0]);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn incomplete_request_identity_withholds() {
     let dir = temp_dir("claude-waiver-identity");
     // Natural shape: an id-less response leaves the family identity-invalid,
