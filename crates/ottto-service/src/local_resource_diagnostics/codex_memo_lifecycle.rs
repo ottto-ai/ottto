@@ -40,7 +40,10 @@ counters! {
     memo_miss_exact_stamp: MissExactStamp,
     // The grown extent of those misses (the bytes then re-read).
     memo_miss_exact_stamp_bytes: MissExactStampBytes,
-    // Every other miss, including an owed-parent bypass.
+    // Every other miss of a lookup that found an entry, plus an owed-parent
+    // bypass. A lookup that finds no entry is not counted, so thrashing past
+    // the memo's 256-entry cap (entries evicted before their next lookup) is
+    // invisible here; `memo_entries` at the cap is its only signal.
     memo_miss_other: MissOther,
 }
 /// Last stored resident memo bytes (gauge, `set_resident` only). The entry

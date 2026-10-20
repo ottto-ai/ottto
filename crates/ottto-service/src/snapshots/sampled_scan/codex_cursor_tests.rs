@@ -5581,6 +5581,88 @@ fn paused_reserve_outranks_join_provenance() {
     assert_eq!(cache.cursor_resident(), empty);
 }
 
+/// R2-M1: an admission that cannot fit even after every eviction it may make
+/// evicts nothing. A hopeless paused reserve (`JoinStateBound`) keeps both
+/// provenance entries and the retained copy; optional provenance inside the
+/// empty-retained floor window is refused and keeps the copy too.
+#[test]
+fn hopeless_admission_evicts_nothing() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const JOIN_THIRD: &str = "33333333-cccc-4ccc-8ccc-333333333333";
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let copy = cache
+            .take(&key)
+            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+        // Measured with no retained copy and no provenance: the least an
+        // admission could ever evict down to.
+        let floor = retained_floor(&cache);
+        let empty = cache.cursor_resident();
+        cache.insert(
+            key.clone(),
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: copy.checkpoint,
+                reduction: Some(copy.state),
+            },
+            0,
+        );
+        let members = join_members(&["a.jsonl", "b.jsonl"]);
+        cache.record_join_owner(JOIN_OWNER, &members);
+        cache.record_join_owner(JOIN_OTHER, &members);
+        let intact = || {
+            assert!(
+                cache.retained_checkpoint(&key).is_some(),
+                "the copy is kept"
+            );
+            for owner in [JOIN_OWNER, JOIN_OTHER] {
+                assert_eq!(join_entry(&cache, owner), Some(joined(&members)), "{owner}");
+            }
+            assert_eq!(cache.cursor_reserved(), 0);
+        };
+        intact();
+        let resident = cache.cursor_resident();
+        // Fits the state with no provenance, never beside an empty retained
+        // cache (before the fix: both entries and the copy were evicted).
+        // Then a charge the state alone cannot hold.
+        for hopeless in [STATE_BYTES - empty - floor + 1, STATE_BYTES] {
+            assert!(cache.cursor_reserve(hopeless).is_none(), "{hopeless}");
+            intact();
+            assert_eq!(cache.cursor_resident(), resident);
+        }
+        // Optional twin: room for the claim, not for the claim and the floor.
+        let claim = join_charge(JOIN_THIRD, &members);
+        with_test_state_budget(resident + claim + floor - 1, || {
+            cache.record_join_owner(JOIN_THIRD, &members);
+        });
+        assert_eq!(join_entry(&cache, JOIN_THIRD), None);
+        intact();
+        assert_eq!(cache.cursor_resident(), resident);
+        // Control: a reserve that fits once provenance is forgotten still
+        // goes on (baseline progress), now that it is feasible.
+        let credit = cache
+            .cursor_reserve(STATE_BYTES - empty - floor)
+            .expect("feasible after forgetting provenance and copies");
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
 /// J-T8: claim vs retained insert. The insert measures outstanding claims
 /// under the retained lock, so a copy that fits only if the claim is
 /// ignored is not kept.

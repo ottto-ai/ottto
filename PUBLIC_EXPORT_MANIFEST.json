@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 717,
-  "content_sha256": "a0c42eb4b2d20f70fd21519802ed420b806dee3c3dcb40cb84239db3ade199c1",
+  "content_sha256": "3b06e5a37d5d0ec08734dcd52f932d2a2f307400e475445c347ea2e49bfbda90",
   "files": [
     {
       "executable": false,
@@ -1042,8 +1042,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics/codex_memo_lifecycle.rs",
-      "sha256": "906308742b9cae778a41c5c8d409d611354e7a32f707c559dd219946fd302cec",
-      "size_bytes": 4376
+      "sha256": "a852b6f16c2a4f09d4c166e33503d44f03ab6f8bd3390e3f4faa4ebdfee58f56",
+      "size_bytes": 4620
     },
     {
       "executable": false,
@@ -1294,8 +1294,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "7b66c4d6fa385e89e3679d6ebde08c08d6c618c98313661ef362b6105dc258b6",
-      "size_bytes": 2821691
+      "sha256": "6c0c959da6b0cad96d63ce53cf4dc846746e90cb384358a06bb09cad43d752dc",
+      "size_bytes": 2822324
     },
     {
       "executable": false,
@@ -1448,8 +1448,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join/group_job_tests.rs",
-      "sha256": "5e6faf034625287c06ca7ea27dc356385783b4faa0ec838ccbf53bcc5febc4fa",
-      "size_bytes": 87930
+      "sha256": "e1cd5964e213751cacb249bd4e5949e1783d739653f140ea9f659894d36a3d2e",
+      "size_bytes": 91827
     },
     {
       "executable": false,
@@ -1553,15 +1553,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "4a1d004296fd27babb0cb5f3dd3d13f88ceaef371b8c024cd341b143c76e066c",
-      "size_bytes": 164532
+      "sha256": "e1a15d704e1cfa34e16e505fde850a8e23b4d271436124c7a530b84fa22103d7",
+      "size_bytes": 166696
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "e1fadb832bfdfd293b7221213934c5f920b8e1aa73587287b3c4a12cafca2362",
-      "size_bytes": 229852
+      "sha256": "696c0e97bae143c8055b05405ff6f245bfbd8c77460eef5612aa39d24f6d6425",
+      "size_bytes": 233435
     },
     {
       "executable": false,

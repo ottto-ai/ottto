@@ -59767,10 +59767,12 @@ mod tests {
     }
 
     /// SB-T16 (fixture check, not a universal heap bound): the attribution
-    /// of 50 complete zero-usage forks and 50 held forks (10 of them deleted,
-    /// so never pruned) beside 1,000 published forks (no entry) costs at
-    /// most 256 serialized bytes per `by_file` entry. Prints the measured
-    /// cost and the projections for the C-1 counts.
+    /// of 50 complete zero-usage forks and 50 held forks beside 1,000
+    /// published forks (no entry) costs at most 256 serialized bytes per
+    /// `by_file` entry. Prints the measured serialized cost, the accounted
+    /// heap cost (`heap_layout_bound`, the bytes `fields!(ScanIndex)` charges;
+    /// `None` on an unsupported layout) and the projections of both for the
+    /// C-1 counts. Only the serialized figure is asserted.
     #[test]
     fn l_sb_by_file_entry_cost_fixture() {
         let key = |n: usize| {
@@ -59791,7 +59793,8 @@ mod tests {
             let candidate = id(n + 10_000);
             sb_disclose(&mut index, &key(n), &[id(n).as_str(), candidate.as_str()]);
         }
-        // Ten held forks are deleted: nothing runs for them.
+        // Nothing is deleted. A deleted held fork is never pruned, so its
+        // entry costs what a present one does.
         let entries = index.codex_state_only_blocked_by_file.len();
         assert_eq!(entries, 100);
         assert!(index
@@ -59810,11 +59813,17 @@ mod tests {
         .unwrap()
         .len();
         let per_entry = by_file / entries;
+        let accounted =
+            crate::heap_layout_bound::bound(&index.codex_state_only_blocked_by_file, usize::MAX);
+        let accounted_per_entry = accounted.map(|bytes| bytes / entries);
         println!(
             "SB_T16 by_file_entries={entries} by_file_bytes={by_file} four_fields_bytes={fields} \
-             per_entry_bytes={per_entry} projected_bytes_49_entries={} projected_bytes_4189_entries={}",
+             per_entry_bytes={per_entry} projected_bytes_49_entries={} projected_bytes_4189_entries={} \
+             accounted_heap_bytes={accounted:?} accounted_per_entry_bytes={accounted_per_entry:?} \
+             accounted_projected_bytes_4189_entries={:?}",
             per_entry * 49,
-            per_entry * 4_189
+            per_entry * 4_189,
+            accounted_per_entry.map(|bytes| bytes * 4_189)
         );
         assert!(per_entry <= 256, "{per_entry} B per entry");
     }

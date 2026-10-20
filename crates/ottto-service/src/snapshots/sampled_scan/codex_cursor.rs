@@ -1919,6 +1919,14 @@ impl Drop for CursorHeld {
 /// the unwind is about to poison. A poisoned cursor is never settled: it
 /// measures as the whole state budget (`cursor_resident`) and admits nothing
 /// (`cursor_reserve`), so a stranded claim oversubscribes nothing.
+///
+/// Single-cache assumption (R2-L1): the held flag is per thread, not per
+/// cache. Production has one process-owned `SharedCache`. A credit of cache B
+/// that unwinds inside cache A's cursor closure skips its refund (relocking B
+/// there would nest two cursor locks, which the one lock order forbids), so
+/// B's claim stays stranded: fail closed (less admission), never
+/// oversubscription. Settling against another cache's state is a programmer
+/// error, caught by `settle`'s debug assert; release builds fail closed.
 #[must_use = "a credit must be settled or refunded"]
 pub(in crate::snapshots) struct CursorCredit {
     cache: Arc<SharedCache>,
@@ -1935,6 +1943,10 @@ impl CursorCredit {
     /// Settle inside the critical section that made the bytes resident (or
     /// decided they never will be).
     fn settle(mut self, cursor: &mut CursorState) {
+        debug_assert_eq!(
+            cursor.id, self.cursor,
+            "a credit settles only on its own cache"
+        );
         self.settled = true;
         settle_claim(cursor, self.cursor, self.bytes);
     }
@@ -1997,20 +2009,54 @@ fn evict_oldest_join_owner(cursor: &mut CursorState) -> bool {
     true
 }
 
+/// Whether `charge` fits beside the least the state and the retained cache
+/// can measure after every eviction `admit_locked` may make: the empty
+/// retained cache's own bound (`release_until`'s floor) and, for `mandatory`,
+/// the state without its join provenance (an empty map; bounds are additive
+/// per field). False: no eviction can make room, so none may run.
+fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> bool {
+    use crate::heap_layout_bound::bound;
+    let state = bound(cursor, STATE_BYTES).and_then(|state| {
+        if !mandatory {
+            return Some(state);
+        }
+        let empty = BTreeMap::<String, JoinProvenance>::new();
+        let forgettable =
+            bound(&cursor.join_owners, STATE_BYTES)?.checked_sub(bound(&empty, STATE_BYTES)?)?;
+        state.checked_sub(forgettable)
+    });
+    let floor = bound(&super::RetainedCache::default(), STATE_BYTES);
+    state
+        .zip(floor)
+        .and_then(|(state, floor)| {
+            state_budget()
+                .checked_sub(state)?
+                .checked_sub(charge)?
+                .checked_sub(floor)
+        })
+        .is_some()
+}
+
 /// K6 admission of `charge` more cursor bytes, under both locks (retained,
 /// then cursor): measure the cursor state (outstanding claims included),
 /// then release least-recently-useful retained copies until they fit beside
 /// it. If even an empty retained cache does not fit, `mandatory` (a paused
 /// job: baseline progress) may then forget join provenance, which is
 /// optional and only keeps its owner blocked; optional admissions never take
-/// room that way. Unsupported accounting, overflow or
-/// no room: false, nothing admitted.
+/// room that way. Nothing is evicted unless the admission is first proved
+/// feasible (`admission_feasible`, R2-M1): a hopeless charge (a
+/// `JoinStateBound` pause, an optional claim inside the empty-retained floor)
+/// keeps every retained copy and every provenance entry. Unsupported
+/// accounting, overflow or no room: false, nothing admitted.
 fn admit_locked(
     retained: &mut super::RetainedCache,
     cursor: &mut CursorState,
     charge: usize,
     mandatory: bool,
 ) -> bool {
+    if !admission_feasible(cursor, charge, mandatory) {
+        return false;
+    }
     loop {
         let Some(state) = crate::heap_layout_bound::bound(&*cursor, STATE_BYTES) else {
             return false;

@@ -199,6 +199,18 @@ fn sampled_at(
     cache: &Arc<SharedCache>,
     collected_at: &str,
 ) -> (ScanIndex, SourceScanResult) {
+    sampled_in(root, index, limit, cache, collected_at, "group-fixture")
+}
+
+/// `sampled_at` in scan namespace `scope`.
+fn sampled_in(
+    root: &Path,
+    index: ScanIndex,
+    limit: usize,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    scope: &str,
+) -> (ScanIndex, SourceScanResult) {
     let mut owned = OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root.join("sessions")],
@@ -212,7 +224,7 @@ fn sampled_at(
         false,
         false,
     )
-    .with_sampled_acquisition(Arc::clone(cache), Scope("group-fixture".into()));
+    .with_sampled_acquisition(Arc::clone(cache), Scope(scope.into()));
     for _ in 0..100_000 {
         match owned.step(None) {
             OwnedSourceScanStep::Pending(next) => owned = next,
@@ -2261,6 +2273,96 @@ fn join_provenance_refused_at_admission_keeps_the_owner_blocked() {
         );
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+/// R2-M1: J-T1's parity holds under one oversized job. A later group whose
+/// pause can never fit (`JoinStateBound`, another root on the same cache)
+/// forgets no provenance, so `OWNER` is still released when its members
+/// leave. Before the fix the hopeless reserve evicted every entry first.
+#[test]
+fn hopeless_pause_keeps_join_provenance_for_the_release() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const BIG: &str = "33333333-cccc-4ccc-8ccc-333333333333";
+    let cache = Arc::new(SharedCache::default());
+    let (root, index) = refused_first_page(&cache);
+    let big = temp_root("hopeless-pause");
+    write_rows(
+        &big.join("sessions/a.jsonl"),
+        &chain_rows(BIG, "a", "2026-10-01T10:00:00Z", 0, 30),
+    );
+    write_rows(
+        &big.join("sessions/b.jsonl"),
+        &chain_rows(BIG, "b", "2026-10-01T10:30:00Z", 300, 30),
+    );
+    let _ = with_test_limits(2048, 1024, 64, || {
+        with_test_state_budget(1, || sampled(&big, ScanIndex::default(), 10, &cache))
+    });
+    assert_eq!(counters(&cache).jobs_state_bound, 1);
+    assert_eq!(cache.cursor_reserved(), 0);
+    let index = walk_without_members(&root, index, &cache, |index| !held_owner(index, OWNER));
+    assert!(
+        !held_owner(&index, OWNER),
+        "the hopeless pause left B's provenance in place"
+    );
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(big).unwrap();
+}
+
+/// R2-L4: the release's paused-job keep arm, at scan level. A live paused
+/// group job of `OWNER` in another namespace (K10 leaves it in the slot)
+/// keeps `OWNER` blocked although its recorded members left a clean walk
+/// (J-T1 is the control: without the arm, the same walk releases it). The queued and active arms cannot be isolated
+/// here: a queued or active group's members are in this walk, so their
+/// headers hold the owner first.
+#[test]
+fn join_release_keeps_the_paused_group_owner() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let paged = paged_corpus("paused-keep");
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for _ in 0..256 {
+            let (next, _) = sampled_in(
+                &paged,
+                index,
+                10,
+                &cache,
+                "2026-10-06T23:00:00Z",
+                "paused-keep",
+            );
+            index = next;
+            if counters(&cache).jobs_paused > 0 {
+                return;
+            }
+        }
+        panic!("no pause: {:?}", counters(&cache));
+    });
+    assert_eq!(cache.cursor_group_owner().as_deref(), Some(OWNER));
+    // Recorded last, so `OWNER`'s provenance names `root`'s members (the
+    // paused group's queueing recorded its own members first).
+    let (root, index) = refused_first_page(&cache);
+    let index = walk_without_members(&root, index, &cache, |_| false);
+    assert_eq!(
+        cache.cursor_group_owner().as_deref(),
+        Some(OWNER),
+        "the foreign paused job is still live: {:?}",
+        counters(&cache)
+    );
+    // F8 re-blocks a paused owner every page, so the arm shows in the
+    // members' claims: the release would have removed them (J-T2).
+    assert!(held_owner(&index, OWNER));
+    for name in ["a.jsonl", "b.jsonl"] {
+        assert!(
+            claims(&index, &session_key(&root, name)).is_some_and(|owners| owners.contains(OWNER)),
+            "the paused group kept {name}'s claim"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(paged).unwrap();
 }
 
 /// J-T12: a missing traversal skips the release (never an empty census) and
