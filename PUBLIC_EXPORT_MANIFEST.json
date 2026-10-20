@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 722,
-  "content_sha256": "3971db7b225712df012dfcdcd431c2855a20bc125b994050a0bf6ea05078c4ea",
+  "content_sha256": "883e8939da4a5ed3e2eda06ae34e94853fd65bdca9db0df5c403ce9d01f783bb",
   "files": [
     {
       "executable": false,
@@ -545,8 +545,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/codex_account_slots.rs",
-      "sha256": "36be45cd581856b04f330b88cdc44d7f04976b9d77db43d95a3d7b522a9f6065",
-      "size_bytes": 132199
+      "sha256": "9e8b8e6e099264348038571b05e662d54693bfefb886ab722625038d48850c33",
+      "size_bytes": 143714
     },
     {
       "executable": false,
