@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v4";
+const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v5";
 const AUDIT_STATE_SCHEMA_VERSION: &str = "local_snapshot_audit_state:v3";
 const AUDIT_STATE_MARKER_FILE: &str = "audit-state.json";
 const AUDIT_SCAN_INDEX_FILE: &str = "scan-index.json";
@@ -92,6 +92,11 @@ pub struct SnapshotAuditReport {
     pub context_curve_retained_point_count: u64,
     pub context_curve_retained_boundary_count: u64,
     pub context_curve_serialized_bytes: usize,
+    /// Claude sessions per posture admission rule. Empty without Claude
+    /// support-directory evidence, where the ownership fold does not run.
+    pub posture_admission_counts: BTreeMap<&'static str, usize>,
+    pub posture_peak_over_one_million_count: usize,
+    pub posture_incoherent_count: usize,
     pub sessions: Vec<SnapshotAuditSession>,
 }
 
@@ -116,6 +121,12 @@ pub struct SnapshotAuditSession {
     pub request_count: u64,
     pub model_usage_row_count: usize,
     pub usage_bucket_count: usize,
+    pub first_turn_context_tokens: Option<u64>,
+    pub peak_context_fill_tokens: Option<u64>,
+    pub last_turn_context_tokens: Option<u64>,
+    pub compaction_count: Option<u64>,
+    /// The Claude ownership fold's posture rule for this session, when it ran.
+    pub posture_admission: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_curve: Option<SnapshotAuditContextCurve>,
 }
@@ -347,6 +358,12 @@ pub fn run_snapshot_audit<W: Write>(
                 request_count: snapshot.request_count,
                 model_usage_row_count: snapshot.model_usage.len(),
                 usage_bucket_count: snapshot.usage_buckets.len(),
+                first_turn_context_tokens: snapshot.first_turn_context_tokens,
+                peak_context_fill_tokens: snapshot.peak_context_fill_tokens,
+                last_turn_context_tokens: snapshot.last_turn_context_tokens,
+                compaction_count: snapshot.compaction_count,
+                posture_admission: claude_authority_disposition
+                    .posture_admission(&snapshot.source_session_id),
                 context_curve: snapshot.context_curve.as_ref().map(audit_context_curve),
             })
         })
@@ -382,6 +399,21 @@ pub fn run_snapshot_audit<W: Write>(
         .filter_map(|session| session.context_curve.as_ref())
         .map(|curve| curve.serialized_bytes)
         .sum();
+    let mut posture_admission_counts = BTreeMap::new();
+    for admission in sessions
+        .iter()
+        .filter_map(|session| session.posture_admission)
+    {
+        *posture_admission_counts.entry(admission).or_insert(0) += 1;
+    }
+    let posture_peak_over_one_million_count = sessions
+        .iter()
+        .filter(|session| session.peak_context_fill_tokens > Some(1_000_000))
+        .count();
+    let posture_incoherent_count = sessions
+        .iter()
+        .filter(|session| posture_is_incoherent(session))
+        .count();
 
     if let Some(path) = options.private_upload_payload_out.as_deref() {
         let mut uploadable_snapshots = scan.snapshots.clone();
@@ -451,6 +483,9 @@ pub fn run_snapshot_audit<W: Write>(
         context_curve_retained_point_count,
         context_curve_retained_boundary_count,
         context_curve_serialized_bytes,
+        posture_admission_counts,
+        posture_peak_over_one_million_count,
+        posture_incoherent_count,
         sessions,
     };
 
@@ -483,6 +518,23 @@ fn audit_context_curve(
         serialized_bytes: serde_json::to_vec(curve)
             .expect("validated context curve serializes")
             .len(),
+    }
+}
+
+/// First or last context above the peak, or a scalar without a peak.
+fn posture_is_incoherent(session: &SnapshotAuditSession) -> bool {
+    match session.peak_context_fill_tokens {
+        Some(peak) => [
+            session.first_turn_context_tokens,
+            session.last_turn_context_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|context| context > peak),
+        None => {
+            session.first_turn_context_tokens.is_some()
+                || session.last_turn_context_tokens.is_some()
+        }
     }
 }
 
@@ -893,7 +945,11 @@ mod tests {
             .as_str()
             .expect("raw source file fingerprint");
         assert_eq!(report.emitted_session_count, 1);
-        assert_eq!(report.schema_version, "local_snapshot_audit:v4");
+        assert_eq!(report.schema_version, "local_snapshot_audit:v5");
+        // Posture admission is Claude ownership-fold output only.
+        assert!(report.posture_admission_counts.is_empty());
+        assert_eq!(report.sessions[0].posture_admission, None);
+        assert_eq!(report.posture_incoherent_count, 0);
         assert_eq!(report.context_curve_evidence_scope, "source_native");
         assert_eq!(report.component_contract_version, "snapshot_semantic:v1");
         assert_eq!(
@@ -934,7 +990,7 @@ mod tests {
                 <= MAX_LEGACY_POLICY_CANDIDATES
         );
         let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
+            "../../../fixtures/snapshot-audit/v5-golden-keys.json"
         ))
         .expect("parse golden keys");
         assert_eq!(
@@ -1221,7 +1277,7 @@ mod tests {
         assert_ne!(original_sensitive, stripped_sensitive);
         let original_revision = snapshot_revision_key(key, SnapshotSource::Pi, &original);
         let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
+            "../../../fixtures/snapshot-audit/v5-golden-keys.json"
         ))
         .expect("parse golden keys");
         assert_eq!(
