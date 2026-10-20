@@ -3812,3 +3812,1413 @@ fn one_writer_attributes_and_replays_held_totals() {
         (2, 3, 4, 2, 2, 2)
     );
 }
+
+// PR-1 packet tests (rev 5 §6), adjusted to the L-5 amendment: the page
+// borrows the census the index owns, the probe memo is one slot cleared per
+// step call, and both after-parse fences re-open the parent.
+
+const PARENT: &str = "019fa111-2222-7333-8444-aaaaaaaaaaaa";
+const CHILD: &str = "019fa111-2222-7333-8444-bbbbbbbbbbbb";
+
+fn turn_record(at: &str, turn: &str) -> Value {
+    json!({"timestamp": at, "type": "turn_context",
+        "payload": {"turn_id": turn, "model": "gpt-5.6-sol"}})
+}
+
+fn usage_record(at: &str, total: (u64, u64, u64, u64), last: (u64, u64, u64, u64)) -> Value {
+    let usage = |(input, cached, output, reasoning): (u64, u64, u64, u64)| {
+        json!({"input_tokens": input, "cached_input_tokens": cached,
+            "output_tokens": output, "reasoning_output_tokens": reasoning})
+    };
+    json!({"timestamp": at, "type": "event_msg", "payload": {"type": "token_count",
+        "info": {"total_token_usage": usage(total), "last_token_usage": usage(last),
+            "model": "gpt-5.6-sol"}}})
+}
+
+fn jsonl(records: &[Value]) -> Vec<u8> {
+    records
+        .iter()
+        .cloned()
+        .map(codex_line)
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// The memo key `path` is stored under, if any (either path spelling).
+fn stored_key(cache: &SharedCache, path: &Path) -> Option<String> {
+    let scope = Scope("cursor-fixture".into());
+    [
+        path.to_path_buf(),
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    ]
+    .iter()
+    .map(|path| memo_key(&scope, &local_index_key(path)))
+    .find(|key| cache.memo_lookup(key).is_some())
+}
+
+/// `session`'s published usage: (input, requests) per snapshot.
+fn session_usage(scan: &SourceScanResult, session: &str) -> Vec<(u64, u64)> {
+    scan.snapshots
+        .iter()
+        .filter(|snapshot| snapshot.source_session_id == session)
+        .map(|snapshot| (snapshot.input_tokens, snapshot.request_count))
+        .collect()
+}
+
+/// One page stepped to completion, with `between` run before every step
+/// call: a deterministic point between two records of the active file.
+fn page_between(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    mut between: impl FnMut(&OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult) {
+    let mut scan = codex_scan(fixture, index, collected_at)
+        .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    for _ in 0..100_000 {
+        between(&scan);
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan);
+            }
+        }
+    }
+    panic!("the page did not finish");
+}
+
+/// Whether the scan's active file is `path`'s (by file name).
+fn active_is(scan: &OwnedSourceScan, path: &Path) -> bool {
+    scan.active_file
+        .file
+        .as_ref()
+        .is_some_and(|active| active.candidate.path.file_name() == path.file_name())
+}
+
+/// A parent rollout P (two turns with usage: a complete ledger of four
+/// signatures) and an ordinary fork C of P (`forked_from_id`, a `user`
+/// thread) in one sessions root, with no sidecar.
+struct ForkHome {
+    fixture: ScanRoot,
+}
+
+impl ForkHome {
+    fn new(child: &[Value]) -> Self {
+        let home = Self {
+            fixture: ScanRoot::with_sessions(&[]),
+        };
+        fs::write(home.fixture.file(PARENT), jsonl(&Self::parent())).unwrap();
+        home.write_child(child);
+        home
+    }
+
+    fn parent() -> Vec<Value> {
+        vec![
+            json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
+                "payload": {"id": PARENT, "thread_source": "user"}}),
+            turn_record("2026-10-07T08:00:01Z", "parent-turn-1"),
+            usage_record("2026-10-07T08:00:02Z", (100, 80, 10, 2), (100, 80, 10, 2)),
+            turn_record("2026-10-07T08:30:01Z", "parent-turn-2"),
+            usage_record("2026-10-07T08:30:02Z", (160, 125, 18, 4), (60, 45, 8, 2)),
+        ]
+    }
+
+    /// Kind (iii): C's first signature is its own turn, so its prefix
+    /// diverges from P's complete ledger at signature 0 (`AmbiguousFork`,
+    /// held), followed by `usage` own `token_count`s.
+    fn diverging_child(usage: u64) -> Vec<Value> {
+        let mut records = vec![turn_record("2026-10-07T08:20:01Z", "child-turn-1")];
+        for n in 1..=usage {
+            records.push(usage_record(
+                "2026-10-07T08:20:02Z",
+                (10 * n, 5 * n, n, 0),
+                (10, 5, 1, 0),
+            ));
+        }
+        records
+    }
+
+    /// A mid-ledger divergence: P's first turn and usage, then C's own turn
+    /// and usage while later parent signatures exist (owned from there).
+    fn matching_child() -> Vec<Value> {
+        let parent = Self::parent();
+        vec![
+            parent[1].clone(),
+            parent[2].clone(),
+            turn_record("2026-10-07T08:20:01Z", "child-turn-1"),
+            usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
+        ]
+    }
+
+    fn write_child(&self, records: &[Value]) {
+        let mut all = vec![
+            json!({"timestamp": "2026-10-07T08:20:00Z", "type": "session_meta",
+            "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}}),
+        ];
+        all.extend_from_slice(records);
+        fs::write(self.fixture.file(CHILD), jsonl(&all)).unwrap();
+    }
+
+    fn generation(
+        &self,
+        index: ScanIndex,
+        cache: &Arc<SharedCache>,
+        n: u64,
+    ) -> (ScanIndex, SourceScanResult) {
+        self.generation_with(index, cache, n, |_| {})
+    }
+
+    /// One page of census generation `n`; `tweak` runs once the scan object
+    /// is constructed (page start: census frozen, ledgers validated) and
+    /// before its first step.
+    fn generation_with(
+        &self,
+        index: ScanIndex,
+        cache: &Arc<SharedCache>,
+        n: u64,
+        tweak: impl Fn(&mut OwnedSourceScan),
+    ) -> (ScanIndex, SourceScanResult) {
+        let mut index = index;
+        index.traversal = None;
+        let (index, scan, _) = page_with(
+            &self.fixture,
+            index,
+            Some(Arc::clone(cache)),
+            "cursor-fixture",
+            &collected_at(n),
+            tweak,
+        );
+        (index, scan)
+    }
+
+    /// Generations from `n` until the fork is settled: a generation that
+    /// started with P's ledger indexed discloses the same census as the one
+    /// before it. Returns the last generation and the next free `n`.
+    fn settle(
+        &self,
+        index: ScanIndex,
+        cache: &Arc<SharedCache>,
+        n: u64,
+    ) -> (ScanIndex, SourceScanResult, u64) {
+        let (mut index, mut scan) = self.generation(index, cache, n);
+        for next in n + 1..n + 8 {
+            let before = census(&index, &scan);
+            let ledgered = Self::parent_ledger(&index).is_some();
+            let (following, again) = self.generation(index, cache, next);
+            let stable = ledgered && census(&following, &again) == before;
+            index = following;
+            scan = again;
+            if stable {
+                return (index, scan, next + 1);
+            }
+        }
+        panic!("the fork did not settle: {}", counters(cache));
+    }
+
+    /// The cold oracle: a fresh index and cache, settled from generation `n`.
+    fn oracle(&self, n: u64) -> (ScanIndex, SourceScanResult) {
+        let (index, scan, _) =
+            self.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), n);
+        (index, scan)
+    }
+
+    /// The same generation read again with no memo: a fresh cache over a
+    /// copy of the warm index (C-T3's fresh side).
+    fn twin(&self, index: &ScanIndex, n: u64) -> (ScanIndex, SourceScanResult) {
+        self.generation(index.clone(), &Arc::new(SharedCache::default()), n)
+    }
+
+    fn child_entry(&self, cache: &SharedCache) -> Option<MemoEntry> {
+        stored_key(cache, &self.fixture.file(CHILD)).and_then(|key| cache.memo_lookup(&key))
+    }
+
+    /// P's indexed complete ledger identity.
+    fn parent_ledger(index: &ScanIndex) -> Option<String> {
+        index
+            .codex_parent_ownership_ledgers
+            .get(PARENT)
+            .filter(|ledger| ledger.scan_complete)
+            .map(|ledger| ledger.opened_object_identity.clone())
+    }
+}
+
+/// P rewritten in place, not appended: a turn with usage inserted after its
+/// first turn, every later signature kept (B2-T1's change).
+fn rewrite_parent(path: &Path) {
+    let parent = ForkHome::parent();
+    let mut changed = parent[..3].to_vec();
+    changed.push(turn_record("2026-10-07T08:10:01Z", "parent-turn-inserted"));
+    changed.push(usage_record(
+        "2026-10-07T08:10:02Z",
+        (130, 103, 14, 3),
+        (30, 23, 4, 1),
+    ));
+    changed.extend_from_slice(&parent[3..]);
+    fs::write(path, jsonl(&changed)).unwrap();
+}
+
+/// P appended: one more turn with usage (`n` keeps the turn ids distinct).
+fn append_parent_turn(path: &Path, n: u64) {
+    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&jsonl(&[
+        turn_record("2026-10-07T09:00:01Z", &format!("parent-grown-{n}")),
+        usage_record(
+            "2026-10-07T09:00:02Z",
+            (200 + 10 * n, 150 + 5 * n, 20 + n, 4),
+            (10, 5, 1, 0),
+        ),
+    ]))
+    .unwrap();
+}
+
+/// T1 (kind (iii)) and C-T3: a fork whose copied prefix diverges from its
+/// parent's complete ledger at signature 0 is held with usage and memoized
+/// with the ledger it used and the parent's current identity. An unchanged
+/// generation hits at zero transcript bytes and discloses exactly what a
+/// fresh read of the same generation does (same index, no memo), field by
+/// field plus `scanned_session_count`, and what a cold settled scan does.
+#[test]
+fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, settled, n) = home.settle(ScanIndex::default(), &cache, 0);
+    let ledger = ForkHome::parent_ledger(&index).expect("indexed parent ledger");
+    let entry = home
+        .child_entry(&cache)
+        .unwrap_or_else(|| panic!("the kind (iii) hold is memoized: {}", counters(&cache)));
+    let dep = entry.parent.as_ref().expect("parent dependency");
+    assert_eq!(
+        (
+            dep.id.as_str(),
+            dep.ledger.as_deref(),
+            dep.current.as_deref()
+        ),
+        (PARENT, Some(ledger.as_str()), Some(ledger.as_str()))
+    );
+    assert!(session_usage(&settled, CHILD).is_empty());
+    assert_eq!(
+        settled.ownership_incomplete_file_count,
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let hits = counter(&cache, |c| c.memo_hits);
+    let (twin_index, twin) = home.twin(&index, n);
+    let ((index, hit), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 1,
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(
+        counts.memo_hit_estimated_avoided_parser_bytes,
+        home.fixture.len(CHILD)
+    );
+    assert!(session_usage(&hit, CHILD).is_empty());
+    assert_eq!(replayed_census(&hit), replayed_census(&twin));
+    assert_eq!(census(&index, &hit), census(&twin_index, &twin));
+    let (oracle_index, oracle) = home.oracle(n + 1);
+    assert_eq!(census(&index, &hit), census(&oracle_index, &oracle));
+}
+
+/// T14: after a restart (a new `SharedCache`, the index kept) the held fork
+/// is read once and recorded, then hits with the same disclosure.
+#[test]
+fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let (index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
+    let cache = Arc::new(SharedCache::default());
+    let (index, reread) = home.generation(index, &cache, n);
+    assert_eq!(
+        (
+            counter(&cache, |c| c.memo_hits),
+            counter(&cache, |c| c.memo_records)
+        ),
+        (0, 1),
+        "{}",
+        counters(&cache)
+    );
+    let (_, hit) = home.generation(index, &cache, n + 1);
+    assert_eq!(
+        (
+            counter(&cache, |c| c.memo_hits),
+            counter(&cache, |c| c.memo_records)
+        ),
+        (1, 1),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(replayed_census(&hit), replayed_census(&reread));
+}
+
+/// T15: an index reset clears the parent refs; the next memo hit re-requests
+/// the hold's parent exactly as a fresh parse does.
+#[test]
+fn memo_hit_after_an_index_reset_reinserts_the_parent_ref() {
+    let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
+    home.project(home.bytes(2), 2);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(index.codex_parent_ownership_refs.contains(SPAWN_PARENT));
+    index.codex_parent_ownership_refs.clear();
+    let (index, quiet) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert!(
+        index.codex_parent_ownership_refs.contains(SPAWN_PARENT),
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
+}
+
+/// T15b: the parent's object is replaced (same bytes, new inode). The
+/// child's entry misses once, counted `memo_miss_other`, and the fork
+/// settles on the new parent object exactly as a cold scan.
+#[test]
+fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    let before = ForkHome::parent_ledger(&index).unwrap();
+    let hits = counter(&cache, |c| c.memo_hits);
+    let parent = home.fixture.file(PARENT);
+    let replacement = home
+        .fixture
+        .root
+        .parent()
+        .unwrap()
+        .join("parent-replacement");
+    fs::copy(&parent, &replacement).unwrap();
+    fs::rename(&replacement, &parent).unwrap();
+    let ((index, replaced), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+    assert_eq!(
+        (
+            counts.memo_hit_estimated_avoided_parser_bytes,
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_other
+        ),
+        (0, 0, 1),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), hits);
+    assert!(session_usage(&replaced, CHILD).is_empty());
+    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    let after = ForkHome::parent_ledger(&index).unwrap();
+    assert_ne!(after, before);
+    let entry = home.child_entry(&cache).expect("re-recorded");
+    assert_eq!(
+        entry.parent.as_ref().and_then(|dep| dep.ledger.as_deref()),
+        Some(after.as_str())
+    );
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// T15c: a held created thread whose trusted spawn parent P has a local,
+/// complete rollout. The hold never uses a ledger, but its ref makes P's
+/// ledger arrive in the index at an unchanged P identity. That is peer
+/// evidence: the next lookup may miss once, the re-read holds again, and
+/// from then on the unchanged hold hits (main keyed this dependency on the
+/// indexed ledger, so it hit too).
+#[test]
+fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
+    let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
+    home.project(home.bytes(2), 2);
+    let at = |offset: i64| bounded_rfc3339_millis(home.base_ms + offset).unwrap();
+    fs::write(
+        home.fixture
+            .root
+            .join(format!("rollout-2026-10-07T08-00-00-{SPAWN_PARENT}.jsonl")),
+        jsonl(&[
+            json!({"timestamp": at(-60_000), "type": "session_meta",
+                "payload": {"id": SPAWN_PARENT, "thread_source": "user"}}),
+            turn_record(&at(-59_000), "spawn-parent-turn"),
+            usage_record(&at(-58_000), (40, 20, 4, 1), (40, 20, 4, 1)),
+        ]),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut n = 0;
+    while !index
+        .codex_parent_ownership_ledgers
+        .get(SPAWN_PARENT)
+        .is_some_and(|ledger| ledger.scan_complete)
+    {
+        assert!(
+            n < 4,
+            "the spawn parent's ledger never arrived: {}",
+            counters(&cache)
+        );
+        index = home.generation(index, &cache, n).0;
+        n += 1;
+    }
+    assert!(home.memo_entry(&cache).is_some(), "{}", counters(&cache));
+    // At most one miss on the arrival; then the unchanged hold is quiet.
+    let (index, _) = home.generation(index, &cache, n);
+    let hits = counter(&cache, |c| c.memo_hits);
+    let (index, first) = home.generation(index, &cache, n + 1);
+    let (index, second) = home.generation(index, &cache, n + 2);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 2,
+        "a ledger the hold never used keeps waking it: {}",
+        counters(&cache)
+    );
+    assert!(created_usage(&first).is_empty() && created_usage(&second).is_empty());
+    assert_oracle(&home, &cache, &index, &second, n + 2, true, &[]);
+}
+
+/// T15d: a child of a growing parent never hits (the parent's identity moves
+/// every generation) and its misses are `memo_miss_other`, never an
+/// exact-stamp miss; it is never admitted.
+#[test]
+fn child_of_a_growing_parent_never_hits() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _, mut n) = home.settle(ScanIndex::default(), &cache, 0);
+    let hits = counter(&cache, |c| c.memo_hits);
+    let mut other = 0;
+    for grown in 0..3 {
+        append_parent_turn(&home.fixture.file(PARENT), grown);
+        let ((next, scan), counts) =
+            codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+        assert_eq!(
+            (
+                counts.memo_hit_estimated_avoided_parser_bytes,
+                counts.memo_miss_exact_stamp
+            ),
+            (0, 0),
+            "{counts:?}"
+        );
+        assert!(session_usage(&scan, CHILD).is_empty());
+        other += counts.memo_miss_other;
+        index = next;
+        n += 1;
+    }
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits,
+        "{}",
+        counters(&cache)
+    );
+    assert!(other >= 1, "{}", counters(&cache));
+}
+
+/// T1b/N2 and T3b: a `forked_from_id` fork whose parent is not on disk has
+/// no ledger, so it is parent-pending: never recorded, re-read every
+/// generation, its parent requested. T7: once the parent arrives the fork
+/// settles exactly as a cold scan (here held and memoized: kind (iii)).
+#[test]
+fn ledgerless_fork_is_never_memoized_until_its_parent_arrives() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let parent = home.fixture.file(PARENT);
+    let away = home.fixture.root.parent().unwrap().join("parent-away");
+    fs::rename(&parent, &away).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    for n in 0..3 {
+        let (next, scan) = home.generation(index, &cache, n);
+        assert_eq!(scan.scanned_file_count, 1, "re-read: {}", counters(&cache));
+        assert!(session_usage(&scan, CHILD).is_empty());
+        assert!(
+            home.child_entry(&cache).is_none(),
+            "a parent-pending fork is never recorded: {}",
+            counters(&cache)
+        );
+        assert!(next.codex_parent_ownership_refs.contains(PARENT));
+        index = next;
+    }
+    assert_eq!(
+        (
+            counter(&cache, |c| c.memo_hits),
+            counter(&cache, |c| c.memo_records)
+        ),
+        (0, 0),
+        "{}",
+        counters(&cache)
+    );
+    fs::rename(&away, &parent).unwrap();
+    let (index, settled, n) = home.settle(index, &cache, 3);
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// T1d (R1-L4 control): a fork that matches its parent's first signatures
+/// and diverges while later parent signatures exist is owned from there: it
+/// is admitted once with its own usage and never memoized.
+#[test]
+fn mid_ledger_divergence_is_admitted_and_never_memoized() {
+    let home = ForkHome::new(&ForkHome::matching_child());
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut published = Vec::new();
+    for n in 0..6 {
+        let (next, scan) = home.generation(index, &cache, n);
+        published.extend(session_usage(&scan, CHILD));
+        assert!(home.child_entry(&cache).is_none(), "{}", counters(&cache));
+        index = next;
+    }
+    assert_eq!(published, vec![(30, 1)], "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        0,
+        "{}",
+        counters(&cache)
+    );
+}
+
+/// B2-T1 (scan-level liveness and safety): the child grows, so its lookup
+/// misses (exact stamp) after probing P; the seam then rewrites P before
+/// C's parse, which uses the page-start ledger. The fence re-opens P and
+/// refuses C (parent-pending: not recorded, nothing published). Later
+/// generations settle on the new P exactly as a cold scan.
+#[test]
+fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    let before = ForkHome::parent_ledger(&index).unwrap();
+    home.fixture.append(
+        CHILD,
+        &jsonl(&[usage_record(
+            "2026-10-07T08:20:03Z",
+            (40, 20, 4, 0),
+            (10, 5, 1, 0),
+        )]),
+    );
+    let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+    let hook = {
+        let fired = std::rc::Rc::clone(&fired);
+        let (child, parent) = (home.fixture.file(CHILD), home.fixture.file(PARENT));
+        move |path: &Path| {
+            if path.file_name() == child.file_name() {
+                fired.set(fired.get() + 1);
+                rewrite_parent(&parent);
+            }
+        }
+    };
+    let ((index, refused), counts) = codex_memo_lifecycle::observe(|| {
+        crate::snapshots::with_codex_before_parse(hook, || home.generation(index, &cache, n))
+    });
+    assert_eq!(fired.get(), 1, "{}", counters(&cache));
+    assert_eq!(counts.memo_miss_exact_stamp, 1, "{counts:?}");
+    assert!(session_usage(&refused, CHILD).is_empty());
+    assert!(
+        home.child_entry(&cache).is_none(),
+        "refused as parent-pending, not re-recorded: {}",
+        counters(&cache)
+    );
+    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    let after = ForkHome::parent_ledger(&index).unwrap();
+    assert_ne!(after, before);
+    let entry = home
+        .child_entry(&cache)
+        .expect("re-recorded on the new parent");
+    assert_eq!(
+        entry.parent.as_ref().and_then(|dep| dep.ledger.as_deref()),
+        Some(after.as_str())
+    );
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// B2-T2 (resume): C's parse spans step calls. After its header classified
+/// against P's ledger, P changes between two step calls; when C's parse
+/// finishes the fence re-opens P and refuses C. A fresh cache makes C read
+/// in full (no memo). Later generations settle exactly as a cold scan.
+#[test]
+fn parent_changed_between_the_child_step_calls_refuses_it_on_resume() {
+    let home = ForkHome::new(&ForkHome::diverging_child(12));
+    let (mut index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
+    let before = ForkHome::parent_ledger(&index).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (child, parent) = (home.fixture.file(CHILD), home.fixture.file(PARENT));
+    let mut rewritten = 0;
+    index.traversal = None;
+    let (index, refused) = page_between(&home.fixture, index, &cache, &collected_at(n), |scan| {
+        let classified = active_is(scan, &child)
+            && scan.active_file.file.as_ref().is_some_and(|active| {
+                active
+                    .parser
+                    .accumulator
+                    .codex_parent_ledger_identity_used
+                    .is_some()
+            });
+        if classified && rewritten == 0 {
+            rewrite_parent(&parent);
+            rewritten += 1;
+        }
+    });
+    assert_eq!(rewritten, 1, "{}", counters(&cache));
+    assert!(session_usage(&refused, CHILD).is_empty());
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        0,
+        "refused as parent-pending, not recorded: {}",
+        counters(&cache)
+    );
+    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    assert_ne!(ForkHome::parent_ledger(&index).unwrap(), before);
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// B2-T3 (liveness): P is appended after page start (the census is frozen
+/// and its old ledger validated) and before its own parse. The ledger insert
+/// re-opens P after that parse, so the new ledger is still inserted.
+#[test]
+fn parent_appended_after_page_start_still_gets_its_ledger() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    let before = ForkHome::parent_ledger(&index).unwrap();
+    let parent = home.fixture.file(PARENT);
+    let (index, _) = home.generation_with(index, &cache, n, |_| append_parent_turn(&parent, 0));
+    let ledger = index
+        .codex_parent_ownership_ledgers
+        .get(PARENT)
+        .unwrap_or_else(|| panic!("no ledger: {}", counters(&cache)));
+    assert!(ledger.scan_complete);
+    assert_ne!(ledger.opened_object_identity, before);
+    assert_eq!(ledger.signatures.len(), 6);
+    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// L6-T1: a rollout-declared created thread with a spawn parent, flushed to
+/// 9 of the 10 records its projection covers. The bind seeds at that length
+/// (no bind: held), and the 10th record lands between the parser's open and
+/// its read. The hold must not be recorded at a stamp its bind never saw.
+/// Generation 1 binds at the full length and admits once, as cold.
+#[test]
+fn bind_seed_short_of_the_read_extent_is_never_recorded() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::with_lineage(9, false, "user", Some(SPAWN_PARENT));
+    let cache = Arc::new(SharedCache::default());
+    let collected = bounded_rfc3339_millis(home.base_ms + 3_600_000).unwrap();
+    let mut appended = false;
+    let ((index, held), counts) = codex_memo_lifecycle::observe(|| {
+        page_between(
+            &home.fixture,
+            ScanIndex::default(),
+            &cache,
+            &collected,
+            |scan| {
+                if !appended && active_is(scan, &home.path) {
+                    home.flush_from(9);
+                    appended = true;
+                }
+            },
+        )
+    });
+    assert!(appended, "{}", counters(&cache));
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert_eq!(
+        (
+            counter(&cache, |c| c.memo_records),
+            counts.memo_hit_estimated_avoided_parser_bytes
+        ),
+        (0, 0),
+        "{}",
+        counters(&cache)
+    );
+    assert!(home.memo_entry(&cache).is_none());
+    let (index, admitted) = home.generation(index, &cache, 1);
+    assert_eq!(
+        created_usage(&admitted),
+        vec![(200, 3)],
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &admitted, 1, true, &[]);
+}
+
+/// T1c: kind (i) with usage (a rollout-declared created thread whose file
+/// is ahead of its projection) hits while unchanged; growth is an
+/// exact-stamp miss with the grown extent, re-read and held again as cold.
+#[test]
+fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::with_lineage(10, false, "user", Some(SPAWN_PARENT));
+    home.project(home.bytes(9), 9);
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(created_usage(&held).is_empty(), "{}", counters(&cache));
+    assert!(held.recognized_usage_drop_count > 0, "usage-bearing hold");
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+    let (index, quiet) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(replayed_census(&quiet), replayed_census(&home.oracle(1).1));
+    let extra = codex_line(json!({
+        "timestamp": bounded_rfc3339_millis(home.base_ms + 7_000).unwrap(),
+        "type": "turn_context",
+        "payload": {"turn_id": "grown-turn", "model": "gpt-5.6-sol"},
+        "ordinal": 10,
+    }));
+    OpenOptions::new()
+        .append(true)
+        .open(&home.path)
+        .unwrap()
+        .write_all(&extra)
+        .unwrap();
+    let ((index, grown), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 2));
+    assert_eq!(
+        (
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_exact_stamp_bytes,
+            counts.memo_miss_other
+        ),
+        (1, fs::metadata(&home.path).unwrap().len(), 0),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        2,
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &grown, 2, true, &[]);
+}
+
+/// T2: a held fork with a terminal over-line-cap line (one line past
+/// `MAX_JSONL_LINE_BYTES`) is memoized and hits; every replayed count,
+/// `over_line_cap` and the terminal trio included, equals a cold read.
+#[test]
+fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
+    let home = CreatedThreadHome::new(10, true);
+    let mut row = format!(
+        "{{\"timestamp\":\"{}\",\"type\":\"response_item\",\"payload\":\"",
+        bounded_rfc3339_millis(home.base_ms + 7_000).unwrap()
+    )
+    .into_bytes();
+    row.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+    row.extend_from_slice(b"\"}\n");
+    OpenOptions::new()
+        .append(true)
+        .open(&home.path)
+        .unwrap()
+        .write_all(&row)
+        .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert_eq!(held.over_line_cap_count, 1, "{}", counters(&cache));
+    assert!(created_usage(&held).is_empty(), "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let (index, quiet) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    let cold = home.oracle(1).1;
+    assert_eq!(replayed_census(&quiet), replayed_census(&cold));
+    assert_eq!(quiet.over_line_cap_count, 1);
+    assert_eq!(
+        quiet.terminal_over_line_cap_count,
+        held.terminal_over_line_cap_count
+    );
+    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
+}
+
+/// T3: non-monotone holds, `Undetermined` (usage before any session header)
+/// and `AwaitingLegacyTrigger` (a subagent fork with copied usage and no
+/// trigger turn), are memoized at their read end: unchanged, both hit
+/// exactly; a grown one is an exact-stamp miss and is read again.
+#[test]
+fn non_monotone_holds_hit_exactly_and_miss_on_growth() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let fixture = ScanRoot::with_sessions(&[]);
+    fs::write(
+        fixture.file(SESSION),
+        [token_line(1), token_line(2)].concat(),
+    )
+    .unwrap();
+    let mut fork = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": SESSION_B, "forked_from_id": SESSION,
+        "thread_source": "subagent"}}));
+    fork.extend(token_line(1));
+    fork.extend(token_line(2));
+    fs::write(fixture.file(SESSION_B), fork).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let generation = |index: ScanIndex, n: u64| {
+        let mut index = index;
+        index.traversal = None;
+        let (index, scan, _) = page_at(
+            &fixture,
+            index,
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+            &collected_at(n),
+        );
+        (index, scan)
+    };
+    let (index, held) = generation(ScanIndex::default(), 0);
+    assert!(held.snapshots.is_empty(), "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        2,
+        "{}",
+        counters(&cache)
+    );
+    let (index, quiet) = generation(index, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
+    assert_eq!(replayed_census(&quiet), replayed_census(&held));
+    fixture.append(SESSION_B, &token_line(3));
+    let ((index, grown), counts) = codex_memo_lifecycle::observe(|| generation(index, 2));
+    assert_eq!(
+        (
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_exact_stamp_bytes,
+            counts.memo_miss_other
+        ),
+        (1, fixture.len(SESSION_B), 0),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), 3, "{}", counters(&cache));
+    assert!(grown.snapshots.is_empty(), "{}", counters(&cache));
+    let _ = generation(index, 3);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 5, "{}", counters(&cache));
+}
+
+/// T6 and T18 (second half): growth together with a sidecar change is not
+/// an exact-stamp miss (a tail could not replay it): it counts
+/// `memo_miss_other`, re-reads equal to cold, and the new entry hits.
+#[test]
+fn growth_with_a_sidecar_change_counts_an_other_miss() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let (index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let extra = codex_line(json!({
+        "timestamp": bounded_rfc3339_millis(home.base_ms + 7_000).unwrap(),
+        "type": "turn_context",
+        "payload": {"turn_id": "grown-turn", "model": "gpt-5.6-sol"},
+        "ordinal": 10,
+    }));
+    OpenOptions::new()
+        .append(true)
+        .open(&home.path)
+        .unwrap()
+        .write_all(&extra)
+        .unwrap();
+    home.project(home.bytes(10) + extra.len(), 11);
+    let ((index, woken), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 1));
+    assert_eq!(
+        (
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_other,
+            counts.memo_hit_estimated_avoided_parser_bytes
+        ),
+        (0, 1, 0),
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &woken, 1, true, &[]);
+    let _ = home.generation(index, &cache, 2);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+}
+
+/// T8: the held file's object changes without new records: a same-size
+/// touch (mtime and ctime), a replacement (new inode, same bytes) and a
+/// shrink each miss once, re-read equal to cold; a shrink is never counted
+/// as an exact-stamp (growth) miss.
+#[test]
+fn touched_replaced_or_shrunk_held_file_misses() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    let replacement = home.codex().join("held-replacement");
+    let mut n = 1;
+    for name in ["touch", "replace", "shrink"] {
+        let hits = counter(&cache, |c| c.memo_hits);
+        match name {
+            "touch" => File::options()
+                .write(true)
+                .open(&home.path)
+                .unwrap()
+                .set_modified(SystemTime::now() + std::time::Duration::from_secs(120))
+                .unwrap(),
+            "replace" => {
+                fs::copy(&home.path, &replacement).unwrap();
+                fs::rename(&replacement, &home.path).unwrap();
+            }
+            _ => OpenOptions::new()
+                .write(true)
+                .open(&home.path)
+                .unwrap()
+                .set_len(u64::try_from(home.bytes(9)).unwrap())
+                .unwrap(),
+        }
+        let ((next, scan), counts) =
+            codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+        assert_eq!(
+            counter(&cache, |c| c.memo_hits),
+            hits,
+            "{name}: {}",
+            counters(&cache)
+        );
+        assert_eq!(
+            counts.memo_miss_other + counts.memo_miss_exact_stamp,
+            1,
+            "{name}: {counts:?}"
+        );
+        if name == "shrink" {
+            assert_eq!(counts.memo_miss_exact_stamp, 0, "{name}: {counts:?}");
+        }
+        assert_oracle(&home, &cache, &next, &scan, n, true, &[]);
+        index = next;
+        n += 1;
+    }
+    let _ = home.generation(index, &cache, n);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        1,
+        "the last re-read is memoized again: {}",
+        counters(&cache)
+    );
+}
+
+/// T19 (R1-L3) and the T9 fences, at the digest: a tier-receipt content
+/// change with the same `required` (Some → Some), the upload context, each
+/// unscoped-incomplete census flag and the owner member count each change
+/// the memo digest; the same inputs give the same digest.
+#[test]
+fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
+    use crate::snapshots::codex_file_join::AppliedTierReceipt;
+    let temp = Temp::new("memo-fence-digest", b"{\"n\":1}\n");
+    let file = File::open(&temp.0).unwrap();
+    let candidate = CandidateFile {
+        scan_root: PathBuf::from("/synthetic/sessions"),
+        path: PathBuf::from(format!(
+            "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
+        )),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: "revision".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let receipt = |tier: &str| -> AppliedTierReceipt {
+        serde_json::from_value(json!({"version": 1, "derivation": "fixture",
+            "scope": "fixture", "records": 3, "prefix_digest": "prefix",
+            "tiers": {"turn-1": tier}}))
+        .unwrap()
+    };
+    let with_receipt = |receipt: AppliedTierReceipt| {
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&candidate.path),
+            ScanIndexEntry {
+                size_bytes: 8,
+                modified_unix_seconds: 0,
+                modified_unix_nanos: None,
+                source_file_fingerprint: "revision".into(),
+                last_snapshot_fingerprint: None,
+                last_upload_body_witness: None,
+                effective_upload_body_witness_revision: 0,
+                scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                codex_joined_member_set: None,
+                codex_captured_joined_member_set: None,
+                codex_protected_owner: None,
+                codex_applied_tier_receipt: Some(receipt),
+                codex_applied_tier_receipt_required: false,
+                codex_captured_tier_receipt: None,
+                codex_captured_tier_receipt_required: false,
+                codex_captured_uncommitted: false,
+                codex_counting_v2: false,
+            },
+        );
+        index
+    };
+    let digest = |index: &ScanIndex, codex: &CodexTitleMetadata, members: usize| {
+        memo_digest(
+            index,
+            &candidate,
+            &file,
+            "dependencies",
+            codex,
+            members,
+            "counting",
+        )
+        .unwrap()
+    };
+    let codex = CodexTitleMetadata::default();
+    let base = with_receipt(receipt("priority"));
+    let reference = digest(&base, &codex, 1);
+    assert_eq!(
+        reference,
+        digest(&with_receipt(receipt("priority")), &codex, 1)
+    );
+    assert_ne!(
+        reference,
+        digest(&with_receipt(receipt("flex")), &codex, 1),
+        "T19: receipt contents"
+    );
+    let mut context = with_receipt(receipt("priority"));
+    context.active_upload_context_fingerprint = Some("another-upload-context".into());
+    assert_ne!(reference, digest(&context, &codex, 1), "upload context");
+    let flags: [fn(&mut CodexTitleMetadata); 3] = [
+        |codex| codex.created_thread_census_unscoped_incomplete = true,
+        |codex| codex.state_census_unscoped_incomplete = true,
+        |codex| codex.sidecar_census_unscoped_incomplete = true,
+    ];
+    for (n, flag) in flags.iter().enumerate() {
+        let mut flipped = CodexTitleMetadata::default();
+        flag(&mut flipped);
+        assert_ne!(reference, digest(&base, &flipped, 1), "census flag {n}");
+    }
+    assert_ne!(reference, digest(&base, &codex, 2), "owner members");
+}
+
+/// T16: the memo has no clock input. The same unchanged hold collected a
+/// week later hits with the same disclosure.
+#[test]
+fn memo_hit_a_week_later_is_the_same_hit() {
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let (index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    let (index, day) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    let blocked = index.codex_state_only_blocked_session_ids.clone();
+    let (index, week) = home.generation(index, &cache, 7 * 86_400);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
+    assert_eq!(replayed_census(&week), replayed_census(&day));
+    assert_eq!(index.codex_state_only_blocked_session_ids, blocked);
+    assert!(created_usage(&week).is_empty());
+}
+
+const STATE_ONLY: &str = "01a05eed-49cf-7460-9fd7-f7dbfd2f05e4";
+const LEGACY_ONLY: &str = "01a01e9a-49cf-7460-9fd7-f7dbfd2f05e4";
+
+impl CreatedThreadHome {
+    /// A state row with `tokens` and no rollout: a state-only thread.
+    fn state_row(&self, id: &str, tokens: i64) {
+        rusqlite::Connection::open(self.codex().join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Thread', ?2, 'user', 'Summarize', ?3, NULL)",
+                rusqlite::params![id, tokens, self.base_ms],
+            )
+            .unwrap();
+    }
+
+    fn set_tokens(&self, id: &str, tokens: i64) {
+        rusqlite::Connection::open(self.codex().join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE threads SET tokens_used = ?2 WHERE id = ?1",
+                rusqlite::params![id, tokens],
+            )
+            .unwrap();
+    }
+
+    /// The full body, its header with or without `forked_from_id`.
+    fn body_with(&self, fork: bool) -> Vec<u8> {
+        let mut header: Value = serde_json::from_slice(&self.body[0]).unwrap();
+        let payload = header["payload"].as_object_mut().unwrap();
+        if fork {
+            payload.insert("forked_from_id".into(), json!(FORK_SOURCE));
+        } else {
+            payload.remove("forked_from_id");
+        }
+        let mut bytes = codex_line(header);
+        bytes.extend(self.body[1..].concat());
+        bytes
+    }
+
+    /// Rewrite the created thread's rollout and project it in full.
+    fn rewrite(&self, fork: bool) {
+        let body = self.body_with(fork);
+        fs::write(&self.path, &body).unwrap();
+        self.project(body.len(), self.body.len());
+    }
+}
+
+/// State-only totals published by a generation: id → tokens.
+fn state_only(scan: &SourceScanResult) -> BTreeMap<String, u64> {
+    scan.snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot.request_count == 0
+                && snapshot.input_tokens == 0
+                && snapshot.unattributed_total_tokens > 0
+        })
+        .map(|snapshot| {
+            (
+                snapshot.source_session_id.clone(),
+                snapshot.unattributed_total_tokens,
+            )
+        })
+        .collect()
+}
+
+/// C-T1/C-T2 after generation `n`, against a cold oracle of the same files:
+/// - SB-T18: every attributed id is blocked;
+/// - warm ⊇ cold on the blocked set outside `legacy ∪ unattributed` and the
+///   ids a published body covers (cold's set there depends on page order
+///   around an acceptance); the excess is only ids attributed to a key no
+///   longer on disk (class (e));
+/// - warm publishes no state-only total cold does not, and withholds only
+///   ids in that excess, `legacy` or `unattributed`.
+///
+/// Returns the excess and cold's state-only totals.
+fn assert_warm_covers_cold(
+    home: &CreatedThreadHome,
+    cache: &SharedCache,
+    index: &ScanIndex,
+    scan: &SourceScanResult,
+    n: i64,
+) -> (BTreeSet<String>, BTreeMap<String, u64>) {
+    let (oracle_index, oracle) = home.oracle(n);
+    for (key, ids) in &index.codex_state_only_blocked_by_file {
+        for id in ids {
+            assert!(
+                index.codex_state_only_blocked_session_ids.contains(id),
+                "generation {n}: SB-T18 {key} attributes unblocked {id}"
+            );
+        }
+    }
+    let bodies = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .filter(|snapshot| snapshot.request_count > 0)
+            .map(|snapshot| snapshot.source_session_id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let mut covered = bodies(scan);
+    covered.extend(bodies(&oracle));
+    for (key, entry) in &index.files {
+        if entry.last_snapshot_fingerprint.is_some() {
+            covered.extend(codex_session_id_candidates_from_path(Path::new(key)));
+        }
+    }
+    let cold = oracle_index
+        .codex_state_only_blocked_session_ids
+        .difference(&covered)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let warm = index
+        .codex_state_only_blocked_session_ids
+        .iter()
+        .filter(|id| {
+            !covered.contains(*id)
+                && !index.codex_state_only_blocked_legacy.contains(*id)
+                && !index.codex_state_only_blocked_unattributed.contains(*id)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        cold.is_subset(&warm),
+        "generation {n}: warm {warm:?} does not cover cold {cold:?}: {}",
+        counters(cache)
+    );
+    let excess = warm.difference(&cold).cloned().collect::<BTreeSet<_>>();
+    for id in &excess {
+        assert!(
+            index
+                .codex_state_only_blocked_by_file
+                .iter()
+                .any(|(key, ids)| ids.contains(id) && !Path::new(key).exists()),
+            "generation {n}: {id} over-blocked with no deleted holder: {:?}",
+            index.codex_state_only_blocked_by_file
+        );
+    }
+    let (warm_state, cold_state) = (state_only(scan), state_only(&oracle));
+    for (id, tokens) in &warm_state {
+        assert_eq!(
+            cold_state.get(id),
+            Some(tokens),
+            "generation {n}: warm publishes {id} beyond cold"
+        );
+    }
+    for id in cold_state.keys().filter(|id| !warm_state.contains_key(*id)) {
+        assert!(
+            excess.contains(id)
+                || index.codex_state_only_blocked_legacy.contains(id)
+                || index.codex_state_only_blocked_unattributed.contains(id),
+            "generation {n}: warm withholds {id} outside the disclosed excess: {}",
+            counters(cache)
+        );
+    }
+    (excess, cold_state)
+}
+
+/// C-T1 (sweep): one home through nine generations; after each, warm covers
+/// cold (see `assert_warm_covers_cold`). Generations: a held fork appears;
+/// a memo hit; a second file blocks the same id; the first is cured and
+/// publishes while the second still claims the id; the second is deleted;
+/// the first is a held fork again; a memo hit; the held fork is deleted
+/// (warm keeps its block, cold publishes the state total: class (e),
+/// asserted); unchanged after that. Not in this sweep: the capture-boundary
+/// revert, two-page, historical-replay and strict/park generations
+/// (method-level `l_sb_*` tests in `snapshots.rs`).
+#[test]
+fn warm_state_only_blocks_cover_cold_across_a_generation_sweep() {
+    let home = CreatedThreadHome::new(10, true);
+    home.set_tokens(CREATED, 50);
+    home.state_row(STATE_ONLY, 70);
+    let duplicate = home
+        .fixture
+        .root
+        .join(format!("rollout-2026-10-07T11-00-00-{CREATED}.jsonl"));
+    let cache = Arc::new(SharedCache::default());
+    let run = |index: ScanIndex, n: i64| {
+        let (index, scan) = home.generation(index, &cache, n);
+        let (excess, cold_state) = assert_warm_covers_cold(&home, &cache, &index, &scan, n);
+        (index, scan, excess, cold_state)
+    };
+    // (1) a held fork appears.
+    let (index, scan, _, cold_state) = run(ScanIndex::default(), 0);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert_eq!(
+        (
+            state_only(&scan).get(STATE_ONLY),
+            cold_state.get(STATE_ONLY)
+        ),
+        (Some(&70), Some(&70)),
+        "positive control: {}",
+        counters(&cache)
+    );
+    // (2) a memo-hit generation.
+    let (index, _, _, _) = run(index, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    // (3) a second file blocks the same id.
+    fs::write(&duplicate, home.body_with(true)).unwrap();
+    let (index, _, _, _) = run(index, 2);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    // (4) the first file is cured and publishes; the second still claims it.
+    home.rewrite(false);
+    let (index, _, _, _) = run(index, 3);
+    // (5) the second blocker is deleted.
+    fs::remove_file(&duplicate).unwrap();
+    let (index, _, _, _) = run(index, 4);
+    // (6) the first file is a held fork again.
+    home.rewrite(true);
+    let (index, _, _, _) = run(index, 5);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    // (7) a memo-hit generation.
+    let hits = counter(&cache, |c| c.memo_hits);
+    let (index, _, _, _) = run(index, 6);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 1,
+        "{}",
+        counters(&cache)
+    );
+    // (8) the held fork is deleted: no retirement, so warm keeps its block
+    // (class (e)) while cold publishes the state total.
+    fs::remove_file(&home.path).unwrap();
+    let (index, scan, excess, cold_state) = run(index, 7);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert!(!state_only(&scan).contains_key(CREATED));
+    assert_eq!(cold_state.get(CREATED), Some(&50), "{}", counters(&cache));
+    assert_eq!(excess, BTreeSet::from([CREATED.to_owned()]));
+    // (9) unchanged: still blocked, still never published.
+    let (index, scan, _, _) = run(index, 8);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert!(!state_only(&scan).contains_key(CREATED));
+}
+
+/// C-T2 (legacy start): the C-T1 home from a pre-upgrade index (no
+/// attribution, plus a legacy-only claim on a thread whose claimant is never
+/// re-parsed). Legacy ids are never released by attribution; `legacy` never
+/// grows; warm never publishes a state-only total cold does not (cold
+/// publishes the legacy-only thread, warm withholds it). Class (h) is not
+/// asserted as an equality.
+#[test]
+fn legacy_blocks_survive_attribution_from_a_pre_upgrade_index() {
+    let home = CreatedThreadHome::new(10, true);
+    home.set_tokens(CREATED, 50);
+    home.state_row(STATE_ONLY, 70);
+    home.state_row(LEGACY_ONLY, 30);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    index.codex_state_only_blocked_by_file.clear();
+    index.codex_state_only_blocked_unattributed.clear();
+    index.codex_state_only_blocked_legacy.clear();
+    index.codex_state_only_blocked_attributed = false;
+    index
+        .codex_state_only_blocked_session_ids
+        .insert(LEGACY_ONLY.to_owned());
+    let mut legacy = usize::MAX;
+    for n in 1..=6 {
+        match n {
+            3 => home.rewrite(false),
+            5 => home.rewrite(true),
+            _ => {}
+        }
+        let (next, scan) = home.generation(index, &cache, n);
+        let (_, cold_state) = assert_warm_covers_cold(&home, &cache, &next, &scan, n);
+        assert!(next.codex_state_only_blocked_attributed);
+        assert!(
+            next.codex_state_only_blocked_legacy.contains(LEGACY_ONLY)
+                && next
+                    .codex_state_only_blocked_session_ids
+                    .contains(LEGACY_ONLY),
+            "generation {n}: {}",
+            counters(&cache)
+        );
+        assert!(!state_only(&scan).contains_key(LEGACY_ONLY));
+        assert_eq!(cold_state.get(LEGACY_ONLY), Some(&30), "generation {n}");
+        assert!(
+            next.codex_state_only_blocked_legacy.len() <= legacy,
+            "generation {n}: legacy grew"
+        );
+        legacy = next.codex_state_only_blocked_legacy.len();
+        index = next;
+    }
+}
