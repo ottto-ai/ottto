@@ -23,7 +23,9 @@ uploader and source finish against synthetic local transcripts, paired evidence
 and HTTP responses. It establishes a refusal, appends only whitespace to change
 the physical source revision while preserving the body, then checks the carried
 refusal finish and actual next same-context preparation. Retryable conflicts,
-failed terminal status and incomplete evidence are negative controls. Existing
+failed terminal status and a genuinely unclean native census are negative
+controls. A separate positive preserves native census admission without optional
+paired sidecars. Existing
 normal-success, exact-ACK, partial/shed, restart, context and failed-CAS controls
 remain unchanged.
 
@@ -32,7 +34,13 @@ complete conjunction and selected save, then observed an abandoned lease where
 a valid lease was expected. It also exposed a separate test-fixture error: a
 retryable response incorrectly used a non-permanent rejection. The fixture now
 uses the existing conflict response; the production validator is unchanged.
-Candidate CI and independent review must pass before intake.
+Candidate 77feae8d passed carried-refusal and actual next-cycle admission, plus
+retryable/status controls. Its remaining fixture failure incorrectly assumed
+absent optional paired sidecars invalidate a complete native request census.
+That assumption is superseded, not a production defect: the explicit no-sidecar
+control expects native admission, while a malformed physical transcript line
+supplies the actual unclean-census negative. Production gates are unchanged.
+Corrected candidate CI and independent review must pass before intake.
 
 This repairs a demonstrated source exit discrepancy. It does not establish the
 cause of installed scan bursts, healthy request coverage, a memory leak, or

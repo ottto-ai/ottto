@@ -7,7 +7,8 @@ enum FinishOutcome {
     Permanent,
     Retryable,
     PermanentStatusFailure,
-    PermanentIncompleteEvidence,
+    PermanentWithoutSidecars,
+    PermanentUncleanCensus,
 }
 
 struct FinishServer {
@@ -149,8 +150,22 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         "device-secret",
     )
     .unwrap();
-    if !matches!(outcome, FinishOutcome::PermanentIncompleteEvidence) {
+    if !matches!(outcome, FinishOutcome::PermanentWithoutSidecars) {
         write_native_bootstrap_sidecars(&fixture, &support);
+    }
+    if matches!(outcome, FinishOutcome::PermanentUncleanCensus) {
+        // A real parse loss makes the native census unclean. Missing optional
+        // sidecars alone does not invalidate this root's native request census.
+        let transcript = fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(transcript)
+            .unwrap()
+            .write_all(b"{\n")
+            .unwrap();
     }
     let client = SnapshotApiClient::new(server.url.clone());
     let daemon = test_daemon("otm_test");
@@ -189,7 +204,9 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2,
         "cycle {cycle}: no synthetic permit; the third same-context preparation must use its actual saved predecessor");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(scan.census_complete);
+        let unclean = matches!(outcome, FinishOutcome::PermanentUncleanCensus);
+        assert_eq!(scan.census_complete, !unclean);
+        assert_eq!(scan.malformed_json_line_count, usize::from(unclean));
         assert_eq!(
             scan.scanned_file_count,
             usize::from(cycle < 2),
@@ -262,6 +279,11 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             }
         );
         let retained_valid = daemon.native_comparison.retained_valid_for_test();
+        assert_eq!(
+            terminal[cycle]["last_malformed_json_line_count"],
+            usize::from(unclean)
+        );
+        assert_eq!(terminal[cycle]["last_census_complete"], !unclean);
         if cycle > 0 || !matches!(outcome, FinishOutcome::Permanent) {
             assert_eq!(retained_valid, expected_valid,
             "{outcome:?}, cycle {cycle}: only an earned native conjunction or actual predecessor permit plus durable settlement and successful status may reach the common lease finalizer");
@@ -301,8 +323,16 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
     for outcome in [
         FinishOutcome::Retryable,
         FinishOutcome::PermanentStatusFailure,
-        FinishOutcome::PermanentIncompleteEvidence,
+        FinishOutcome::PermanentUncleanCensus,
     ] {
         permanent_finish_pipeline(outcome, false);
     }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
+    permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
 }
