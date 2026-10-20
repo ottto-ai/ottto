@@ -25,6 +25,12 @@ def report(incorrect=False, finding=False):
             'overall_explanation': 'Synthetic review.', 'overall_confidence': 0.9}
 
 
+def report_at(file_path, line=1):
+    cited = report(True, True)
+    cited['findings'][0]['code_location'] = {'file_path': file_path, 'line': line}
+    return cited
+
+
 class AutoReviewTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -62,6 +68,16 @@ if mode == 'finding':
     report['findings'] = [{'title': 'Crash loses state', 'body': 'Durable write missing.',
                           'priority': 'P1', 'confidence': 0.9, 'category': 'bug',
                           'code_location': {'file_path': 'source.rs', 'line': 1}}]
+if mode.endswith('-finding'):
+    root = sys.argv[sys.argv.index('-C') + 1]
+    cited = {'absolute-finding': root + '/source.rs',
+             'alias-finding': root.removeprefix('/private') + '/source.rs',
+             'outside-finding': os.path.dirname(root) + '/source.rs',
+             'traversal-finding': root + '/../repo/source.rs'}[mode]
+    report['overall_correctness'] = 'patch is incorrect'
+    report['findings'] = [{'title': 'Crash loses state', 'body': 'Durable write missing.',
+                          'priority': 'P1', 'confidence': 0.9, 'category': 'bug',
+                          'code_location': {'file_path': cited, 'line': 1}}]
 if mode == 'mutate':
     pathlib.Path('source.rs').write_text('fn unexpected_edit() {}')
 if mode == 'bad-priority-type':
@@ -154,16 +170,57 @@ else:
             review.bundle(self.repo, self.args(mode='release', base=previous, head=head))
 
     def test_validation_never_downgrades(self):
-        review.validate(report(), ['source.rs'])
-        review.validate(report(True, True), ['source.rs'])
+        review.validate(report(), ['source.rs'], self.repo)
+        review.validate(report(True, True), ['source.rs'], self.repo)
         for candidate in [report(True), {'findings': []}, report(True, True)]:
             paths = [] if candidate.get('findings') else ['source.rs']
             with self.assertRaises(review.ReviewError):
-                review.validate(candidate, paths)
+                review.validate(candidate, paths, self.repo)
         bad = report(True, True)
         bad['findings'][0]['code_location']['line'] = True
         with self.assertRaises(review.ReviewError):
-            review.validate(bad, ['source.rs'])
+            review.validate(bad, ['source.rs'], self.repo)
+
+    def test_absolute_finding_paths_bind_to_frozen_review_root(self):
+        real = os.path.realpath(self.repo)
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'source.rs').write_text('fn outside() {}')
+        (self.repo / 'link').symlink_to(outside)
+        (self.repo / 'filelink.rs').symlink_to(outside / 'source.rs')
+        (self.root / 'alias').symlink_to(self.repo)
+        Path(real + '-evil').mkdir()
+        Path(real + '-evil/source.rs').write_text('fn sibling() {}')
+        paths = ['source.rs', 'nested/deleted.rs', 'link/source.rs', 'filelink.rs']
+        # Relative citations and absolute ones below the frozen root (or its macOS
+        # /private alias) map to selected paths; the raw report is never rewritten.
+        accepted = ['source.rs', real + '/source.rs', real + '/nested/deleted.rs']
+        if real.startswith('/private/'):
+            self.assertIn(real.removeprefix('/private'), review.root_aliases(Path(real)))
+            accepted.append(real.removeprefix('/private') + '/source.rs')
+        for root in [Path(real), self.repo]:
+            for cited in accepted + [alias + '/source.rs' for alias in review.root_aliases(root)]:
+                with self.subTest(root=str(root), cited=cited):
+                    candidate = report_at(cited)
+                    review.validate(candidate, paths, root)
+                    self.assertEqual(candidate['findings'][0]['code_location']['file_path'], cited)
+        rejected = [
+            os.path.dirname(real) + '/source.rs', str(outside / 'source.rs'), real + '-evil/source.rs',
+            str(self.root / 'alias/source.rs'), real + '/../repo/source.rs', real + '/nested/../source.rs',
+            real + '//source.rs', real + '/./source.rs', real + '/source.rs/', '/' + real + '/source.rs',
+            real + '/link/source.rs', real + '/filelink.rs', real + '/other.rs', real + '/.git/config',
+            real, real + '/', real + '/source.rs\0', '', './source.rs', 'other.rs', '../repo/source.rs',
+            None, 7, ['source.rs']]
+        for cited in rejected:
+            with self.subTest(cited=cited), self.assertRaises(review.ReviewError):
+                review.validate(report_at(cited), paths, Path(real))
+        for line in [0, -1, True, '1', 1.0, None]:
+            with self.subTest(line=line), self.assertRaises(review.ReviewError):
+                review.validate(report_at(real + '/source.rs', line), paths, Path(real))
+        mixed = report_at(real + '/source.rs')
+        mixed['findings'].append(dict(report_at(real + '-evil/source.rs')['findings'][0]))
+        with self.assertRaises(review.ReviewError):
+            review.validate(mixed, paths, Path(real))
 
     def test_dirty_or_wrong_head_cannot_supply_branch_context(self):
         with self.assertRaises(review.ReviewError):
@@ -182,7 +239,9 @@ else:
         for mode, outcome, code in [('incorrect', 'invalid', 2), ('malformed', 'invalid', 2),
                                     ('unavailable', 'unavailable', 2), ('finding', 'findings', 1),
                                     ('bad-verdict-type', 'invalid', 2), ('bad-priority-type', 'invalid', 2),
-                                    ('bad-category-type', 'invalid', 2)]:
+                                    ('bad-category-type', 'invalid', 2), ('absolute-finding', 'findings', 1),
+                                    ('alias-finding', 'findings', 1), ('outside-finding', 'invalid', 2),
+                                    ('traversal-finding', 'invalid', 2)]:
             with self.subTest(mode=mode):
                 result = self.cli('--allow-budget-exceed', '--reason', 'synthetic regression', mode=mode)
                 self.assertEqual(result.returncode, code, result.stderr)

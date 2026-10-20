@@ -543,6 +543,8 @@ fn disclosure() -> Disclosure {
         state_only_blocked_session_ids: vec![SESSION.into()],
         diagnostic_reason: FileReason::OwnershipIncomplete,
         parsed_snapshot_count: 0,
+        held: HeldCounts::default(),
+        parent_ref: None,
     }
 }
 
@@ -554,6 +556,8 @@ fn strict(reason: DebtReason) -> Disclosure {
         state_only_blocked_session_ids: vec![SESSION.into()],
         diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
+        held: HeldCounts::default(),
+        parent_ref: None,
     }
 }
 
@@ -728,31 +732,52 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     assert!(LiveWitness::read(&file, 10_000).is_none());
     let live = LiveWitness::read(&file, 8).unwrap();
     let stamp = OpenStamp::capture(&file).unwrap();
-    let parent = Some(("parent".to_owned(), Some("ledger-1".to_owned())));
+    let parent = Some(ParentDep {
+        id: "parent".into(),
+        ledger: Some("ledger-1".into()),
+        current: Some("p-1".into()),
+    });
+    let now = |ledger: &str, current: &str| ParentNow {
+        ledger: Some(ledger.into()),
+        current: Some(current.into()),
+    };
+    let now_1 = now("ledger-1", "p-1");
     let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
     assert_eq!(entry.parent_ref(), Some("parent"));
+    assert!(entry.matches("digest", &file, Some(&now_1), "").is_some());
+    assert!(entry.matches("other", &file, Some(&now_1), "").is_none());
+    // PR-1 L4: a changed ledger and, separately, a changed parent object
+    // each miss.
     assert!(entry
-        .matches("digest", &file, Some("ledger-1".into()), "")
-        .is_some());
-    assert!(entry
-        .matches("other", &file, Some("ledger-1".into()), "")
+        .matches("digest", &file, Some(&now("ledger-2", "p-1")), "")
         .is_none());
     assert!(entry
-        .matches("digest", &file, Some("ledger-2".into()), "")
+        .matches("digest", &file, Some(&now("ledger-1", "p-2")), "")
+        .is_none());
+    assert!(entry
+        .matches(
+            "digest",
+            &file,
+            Some(&ParentNow {
+                ledger: Some("ledger-1".into()),
+                current: None,
+            }),
+            ""
+        )
         .is_none());
     assert!(entry.matches("digest", &file, None, "").is_none());
     // Growth past the refused offset cannot cure the hold: still a hit, and
     // the hit returns the grown stamp for the entry to keep.
     temp.append(b"{\"n\":3}\n");
     let grown = entry
-        .matches("digest", &file, Some("ledger-1".into()), "")
+        .matches("digest", &file, Some(&now_1), "")
         .expect("growth is a hit");
     assert!(grown.extent > entry.stamp.extent);
     let mut refreshed = entry.clone();
     refreshed.stamp = grown;
     // No timer: an entry whose evidence is unchanged keeps matching.
     assert!(refreshed
-        .matches("digest", &file, Some("ledger-1".into()), "")
+        .matches("digest", &file, Some(&now_1), "")
         .is_some());
     // A same-length stamp change (an in-place write elsewhere) wakes it.
     OpenOptions::new()
@@ -762,13 +787,11 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
         .unwrap();
     assert!(refreshed
-        .matches("digest", &file, Some("ledger-1".into()), "")
+        .matches("digest", &file, Some(&now_1), "")
         .is_none());
     // A rewritten prefix is a miss (re-read).
     fs::write(&temp.0, b"{\"n\":9}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
-    assert!(entry
-        .matches("digest", &file, Some("ledger-1".into()), "")
-        .is_none());
+    assert!(entry.matches("digest", &file, Some(&now_1), "").is_none());
 }
 
 #[test]
@@ -1066,6 +1089,7 @@ fn paged_singleton_matches_unpaged_read_across_scan_objects() {
     assert!(paused > 0 && resumed == paused);
     assert!(cache.cursor_slot_free());
     assert_eq!(cache.cursor_charge(), 0);
+    assert_eq!(cache.cursor_reserved(), 0);
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
@@ -1441,6 +1465,7 @@ fn concurrent_namespace_leaves_live_job_and_evicts_only_stale_one() {
             counters(&cache)
         );
         assert!(cache.cursor_charge() > 0);
+        assert_eq!(cache.cursor_reserved(), 0);
         let (mut index_b, scan, _) = page_in(
             &fixture,
             ScanIndex::default(),
@@ -1470,6 +1495,7 @@ fn concurrent_namespace_leaves_live_job_and_evicts_only_stale_one() {
         );
         assert_eq!(counter(&cache, |c| c.jobs_started), 2);
         assert_eq!(paused_namespace(&cache).as_deref(), Some("ns-b"));
+        assert_eq!(cache.cursor_reserved(), 0);
     });
 }
 
@@ -1543,6 +1569,7 @@ fn turn_heavy_session_pages_past_the_witness_cap_and_publishes_once() {
     assert_eq!(publishing_pages, 1);
     assert_eq!(counter(&cache, |c| c.jobs_state_bound), 0);
     assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+    assert_eq!(cache.cursor_reserved(), 0);
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
@@ -1561,6 +1588,7 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
         assert!(scan.snapshots.is_empty());
         let charge = cache.cursor_charge();
         assert!(charge > 0, "the job paused: {}", counters(&cache));
+        assert_eq!(cache.cursor_reserved(), 0);
         let claude_root = Temp::new("claude-root", b"");
         fs::remove_file(&claude_root.0).unwrap();
         fs::create_dir_all(claude_root.0.join("projects")).unwrap();
@@ -1589,6 +1617,7 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
         assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
         drop(claude);
         assert_eq!(cache.cursor_charge(), charge, "the paused job survives");
+        assert_eq!(cache.cursor_reserved(), 0);
         assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
         for _ in 0..32 {
             let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
@@ -1638,6 +1667,7 @@ fn frame_drop_mid_job_returns_job_to_slot() {
         assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 1);
         assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
         assert!(cache.cursor_charge() > 0);
+        assert_eq!(cache.cursor_reserved(), 0);
         let mut index = ScanIndex::default();
         for _ in 0..32 {
             let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
@@ -1746,6 +1776,7 @@ fn many_hour_session_pauses_past_the_walk_visit_limit_and_publishes_once() {
     assert_eq!(publishing_pages, 1);
     assert_eq!(counter(&cache, |c| c.jobs_state_bound), 0);
     assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+    assert_eq!(cache.cursor_reserved(), 0);
     assert!(counter(&cache, |c| c.jobs_paused) > 0);
     assert_eq!(
         counter(&cache, |c| c.jobs_resumed),
@@ -2969,9 +3000,9 @@ fn created_usage(scan: &SourceScanResult) -> Vec<(u64, u64)> {
 }
 
 /// #635 (a), #631 review L1: a projection ahead of the flushed rollout holds
-/// the created thread as `AmbiguousFork`. A held prefix with usage drops it
-/// and is never memoized; a usage-free prefix (header, first task and turn
-/// context, flushed before the first `token_count`) is, on its exact stamp.
+/// the created thread as `AmbiguousFork`. A usage-free prefix (header, first
+/// task and turn context, flushed before the first `token_count`) is
+/// memoized on its exact stamp.
 /// While unchanged it is a memo hit (not re-read); once the append that
 /// cures it lands, the next generation reads the appended bytes and admits
 /// the thread once, with its full usage. An unchanged generation after
@@ -3100,10 +3131,10 @@ fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
 
 /// #635 R2-L2: a lagging projection catches up with an unchanged file. The
 /// file is ahead of its projection, so the sidecar binds nothing and the
-/// created thread is held as `AmbiguousFork`. It holds usage, so the hold is
-/// not memoized (pre-existing: a held file with dropped usage is re-read in
-/// full every generation); the projection change alone cures it, and the
-/// thread is admitted once with its full usage.
+/// created thread is held as `AmbiguousFork`. It holds usage and is
+/// memoized (PR-1's wider gate); the projection change misses it, the
+/// change alone cures it, and the thread is admitted once with its full
+/// usage.
 #[test]
 fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     let home = CreatedThreadHome::new(10, false);
@@ -3118,7 +3149,7 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(
         counter(&cache, |c| c.memo_records),
-        0,
+        1,
         "{}",
         counters(&cache)
     );
@@ -3456,8 +3487,9 @@ const ORPHAN: &str = "01a0dead-49cf-7460-9fd7-f7dbfd2f05e4";
 /// and the ordinary session is admitted, exactly as a cold parse.
 #[test]
 fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
-    // The created thread itself is complete and admitted; it records no
-    // memo entry, so every memo counter below is the orphan's.
+    // The created thread itself is complete and admitted; until the state
+    // census drops it, it records no memo entry, so every memo counter
+    // before that is the orphan's.
     let home = CreatedThreadHome::new(10, false);
     let at = |offset: i64| bounded_rfc3339_millis(home.base_ms + offset).unwrap();
     let orphan = [
@@ -3515,14 +3547,2289 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
         "no stale hit: {}",
         counters(&cache)
     );
-    // Not held again: the miss re-read the orphan as an ordinary session.
+    // Not held again: the miss re-read the orphan as an ordinary session,
+    // and its entry is gone. PR-1: the created thread, no longer declared by
+    // the state census, is held with usage, which the wider gate memoizes:
+    // the one new record is its entry.
+    let scope = Scope("cursor-fixture".into());
+    let orphan = home.fixture.root.join("orphan.jsonl");
+    assert!(
+        [orphan.clone(), fs::canonicalize(&orphan).unwrap()]
+            .iter()
+            .all(|path| cache
+                .memo_lookup(&memo_key(&scope, &local_index_key(path)))
+                .is_none()),
+        "{}",
+        counters(&cache)
+    );
+    assert!(home.memo_entry(&cache).is_some(), "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        2,
+        "{}",
+        counters(&cache)
+    );
+    // SB-T1 (L-SB): its usage-free cure publishes nothing, but the re-read
+    // no longer blocks it and no other key holds it, so the warm index
+    // releases it, as a cold parse never sets it.
+    assert!(!index.codex_state_only_blocked_session_ids.contains(ORPHAN));
+    assert_oracle(&home, &cache, &index, &cured, 2, true, &[]);
+}
+
+/// Every census count a held file's fresh parse adds and a memo hit replays
+/// (C-4), plus `scanned_session_count`.
+fn replayed_census(scan: &SourceScanResult) -> Vec<(&'static str, u64)> {
+    vec![
+        ("over_line_cap", scan.over_line_cap_count as u64),
+        (
+            "recognized_usage_drop",
+            scan.recognized_usage_drop_count as u64,
+        ),
+        ("dropped_usage_record", scan.dropped_usage_record_count),
+        (
+            "ownership_incomplete",
+            scan.ownership_incomplete_file_count as u64,
+        ),
+        (
+            "zero_snapshot_usage_evidence",
+            scan.zero_snapshot_usage_evidence_count as u64,
+        ),
+        (
+            "terminal_over_line_cap",
+            scan.terminal_over_line_cap_count as u64,
+        ),
+        (
+            "terminal_recognized_usage_drop",
+            scan.terminal_recognized_usage_drop_count as u64,
+        ),
+        (
+            "terminal_dropped_usage_record",
+            scan.terminal_dropped_usage_record_count,
+        ),
+        ("malformed_json_line", scan.malformed_json_line_count as u64),
+        ("scanned_session", scan.scanned_session_count as u64),
+        (
+            "residue_index_keys",
+            scan.census_residue_index_key_count as u64,
+        ),
+        (
+            "residue_blocked_sessions",
+            scan.census_residue_blocked_session_count as u64,
+        ),
+    ]
+}
+
+/// The memo key the fixture's held file is stored under.
+fn stored_memo_key(home: &CreatedThreadHome, cache: &SharedCache) -> String {
+    let scope = Scope("cursor-fixture".into());
+    [home.path.clone(), fs::canonicalize(&home.path).unwrap()]
+        .iter()
+        .map(|path| memo_key(&scope, &local_index_key(path)))
+        .find(|key| cache.memo_lookup(key).is_some())
+        .expect("stored entry")
+}
+
+/// PR-1 replay and gate. A usage-bearing held fork (the full body with
+/// `forked_from_id` and no trusted parent) is now memoized.
+/// - T1/C-T3: an unchanged generation hits at zero transcript bytes and
+///   discloses exactly what a cold full parse does: every replayed census
+///   count, `scanned_session_count` and the blocked set. The before-parse
+///   seam never runs for a hit.
+/// - T20 (R1-M1): an entry forced to `own_ledger(true)` for an owed parent
+///   is bypassed (counted `memo_miss_other`) and the file is parsed again.
+/// - T18: growth with every other input unchanged is counted as an
+///   exact-stamp miss with the grown extent, then re-read equal to cold.
+#[test]
+fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let parsed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PathBuf>::new()));
+    let hook = {
+        let parsed = std::rc::Rc::clone(&parsed);
+        move |path: &Path| parsed.borrow_mut().push(path.to_path_buf())
+    };
+    let (index, held) = crate::snapshots::with_codex_before_parse(hook.clone(), || {
+        home.generation(ScanIndex::default(), &cache, 0)
+    });
+    assert_eq!(parsed.borrow().len(), 1, "{}", counters(&cache));
+    assert!(created_usage(&held).is_empty(), "{}", counters(&cache));
+    assert!(held.recognized_usage_drop_count > 0, "usage-bearing hold");
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(
         counter(&cache, |c| c.memo_records),
         1,
         "{}",
         counters(&cache)
     );
-    // Its usage-free cure publishes nothing, so the warm index keeps the
-    // block a cold parse never sets.
-    assert_oracle(&home, &cache, &index, &cured, 2, true, &[ORPHAN]);
+    assert_eq!(replayed_census(&held), replayed_census(&home.oracle(0).1));
+    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+
+    let ((index, quiet), counts) = codex_memo_lifecycle::observe(|| {
+        crate::snapshots::with_codex_before_parse(hook.clone(), || {
+            home.generation(index, &cache, 1)
+        })
+    });
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(parsed.borrow().len(), 1, "a hit is never parsed");
+    assert_eq!(
+        counts.memo_hit_estimated_avoided_parser_bytes,
+        fs::metadata(&home.path).unwrap().len()
+    );
+    assert_eq!(replayed_census(&quiet), replayed_census(&home.oracle(1).1));
+    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
+
+    // T20: the owed-parent bypass.
+    let key = stored_memo_key(&home, &cache);
+    let forced = cache.memo_lookup(&key).unwrap().own_ledger(true);
+    assert!(forced.has_own_ledger());
+    cache.memo_record(key.clone(), forced);
+    let mut index = index;
+    index.codex_parent_ownership_refs.insert(CREATED.to_owned());
+    let records = counter(&cache, |c| c.memo_records);
+    let ((mut index, _), counts) = codex_memo_lifecycle::observe(|| {
+        crate::snapshots::with_codex_before_parse(hook.clone(), || {
+            home.generation(index, &cache, 2)
+        })
+    });
+    assert_eq!(counts.memo_miss_other, 1, "{counts:?}");
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(parsed.borrow().len(), 2, "bypassed: parsed again");
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        records + 1,
+        "{}",
+        counters(&cache)
+    );
+    assert!(!cache.memo_lookup(&key).unwrap().has_own_ledger());
+    index.codex_parent_ownership_refs.remove(CREATED);
+
+    // T18: growth alone.
+    let extra = codex_line(json!({
+        "timestamp": bounded_rfc3339_millis(home.base_ms + 7_000).unwrap(),
+        "type": "turn_context",
+        "payload": {"turn_id": "grown-turn", "model": "gpt-5.6-sol"},
+        "ordinal": 10,
+    }));
+    OpenOptions::new()
+        .append(true)
+        .open(&home.path)
+        .unwrap()
+        .write_all(&extra)
+        .unwrap();
+    let ((index, grown), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 3));
+    assert_eq!(
+        (
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_exact_stamp_bytes,
+            counts.memo_miss_other,
+            counts.memo_hit_estimated_avoided_parser_bytes,
+        ),
+        (1, fs::metadata(&home.path).unwrap().len(), 0, 0),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(replayed_census(&grown), replayed_census(&home.oracle(3).1));
+    assert_oracle(&home, &cache, &index, &grown, 3, true, &[]);
+}
+
+/// L-SB site 3 (the one writer): a settleable disclosure replaces the key's
+/// attribution and releases what it no longer blocks; a strict one keeps
+/// the prior attribution and adds its owner (R1-M2). A replayed disclosure
+/// adds the held line and drop totals and re-requests its parent.
+#[test]
+fn one_writer_attributes_and_replays_held_totals() {
+    let candidate = CandidateFile {
+        scan_root: PathBuf::from("/synthetic/sessions"),
+        path: PathBuf::from(format!(
+            "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
+        )),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: "revision".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let key = local_index_key(&candidate.path);
+    let mut index = ScanIndex::default();
+    let mut census = ScanCensus::default();
+    let mut disclose = |disclosure: &Disclosure, index: &mut ScanIndex| {
+        let mut residue = BTreeSet::new();
+        let mut residue_blocked = BTreeSet::new();
+        let mut blocked = BTreeSet::new();
+        let mut pending = Vec::new();
+        disclose_terminal_codex_debt(
+            disclosure,
+            &candidate,
+            (None, None),
+            index,
+            DisclosureTargets {
+                census: &mut census,
+                residue_index_keys: &mut residue,
+                residue_blocked_session_ids: &mut residue_blocked,
+                codex_state_only_blocked_session_ids: &mut blocked,
+                pending_finalization: &mut pending,
+            },
+        );
+    };
+    let mut held = disclosure();
+    held.state_only_blocked_session_ids = vec![SESSION.into(), SESSION_B.into()];
+    held.held = HeldCounts {
+        over_line_cap: 2,
+        recognized_usage_drop: 3,
+        dropped_usage_record: 4,
+        terminal_line_loss: 2,
+    };
+    held.parent_ref = Some("019fa111-2222-7333-8444-777777777777".into());
+    disclose(&held, &mut index);
+    assert_eq!(
+        index.codex_state_only_blocked_by_file[&key],
+        BTreeSet::from([SESSION.to_owned(), SESSION_B.to_owned()])
+    );
+    assert!(index
+        .codex_parent_ownership_refs
+        .contains("019fa111-2222-7333-8444-777777777777"));
+    // A strict disclosure keeps the prior attribution and adds.
+    let mut owner = strict(DebtReason::JoinStateBound);
+    owner.state_only_blocked_session_ids = vec!["019fa111-2222-7333-8444-888888888888".into()];
+    disclose(&owner, &mut index);
+    assert_eq!(index.codex_state_only_blocked_by_file[&key].len(), 3);
+    // A shrinking settleable replay releases what it no longer blocks.
+    disclose(&disclosure(), &mut index);
+    assert_eq!(
+        index.codex_state_only_blocked_by_file[&key],
+        BTreeSet::from([SESSION.to_owned()])
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(SESSION));
+    assert!(!index
+        .codex_state_only_blocked_session_ids
+        .contains(SESSION_B));
+    // Only the first (settleable, replayed) disclosure added totals.
+    assert_eq!(
+        (
+            census.over_line_cap_count,
+            census.recognized_usage_drop_count,
+            census.dropped_usage_record_count,
+            census.terminal_over_line_cap_count,
+            census.terminal_recognized_usage_drop_count,
+            census.terminal_dropped_usage_record_count,
+        ),
+        (2, 3, 4, 2, 2, 2)
+    );
+}
+
+// PR-1 packet tests (rev 5 §6), adjusted to the L-5 amendment: the page
+// borrows the census the index owns, the probe memo is one slot cleared per
+// step call, and both after-parse fences re-open the parent.
+
+const PARENT: &str = "019fa111-2222-7333-8444-aaaaaaaaaaaa";
+const CHILD: &str = "019fa111-2222-7333-8444-bbbbbbbbbbbb";
+
+fn turn_record(at: &str, turn: &str) -> Value {
+    json!({"timestamp": at, "type": "turn_context",
+        "payload": {"turn_id": turn, "model": "gpt-5.6-sol"}})
+}
+
+fn usage_record(at: &str, total: (u64, u64, u64, u64), last: (u64, u64, u64, u64)) -> Value {
+    let usage = |(input, cached, output, reasoning): (u64, u64, u64, u64)| {
+        json!({"input_tokens": input, "cached_input_tokens": cached,
+            "output_tokens": output, "reasoning_output_tokens": reasoning})
+    };
+    json!({"timestamp": at, "type": "event_msg", "payload": {"type": "token_count",
+        "info": {"total_token_usage": usage(total), "last_token_usage": usage(last),
+            "model": "gpt-5.6-sol"}}})
+}
+
+fn jsonl(records: &[Value]) -> Vec<u8> {
+    records
+        .iter()
+        .cloned()
+        .map(codex_line)
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// The memo key `path` is stored under, if any (either path spelling).
+fn stored_key(cache: &SharedCache, path: &Path) -> Option<String> {
+    let scope = Scope("cursor-fixture".into());
+    [
+        path.to_path_buf(),
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    ]
+    .iter()
+    .map(|path| memo_key(&scope, &local_index_key(path)))
+    .find(|key| cache.memo_lookup(key).is_some())
+}
+
+/// `session`'s published usage: (input, requests) per snapshot.
+fn session_usage(scan: &SourceScanResult, session: &str) -> Vec<(u64, u64)> {
+    scan.snapshots
+        .iter()
+        .filter(|snapshot| snapshot.source_session_id == session)
+        .map(|snapshot| (snapshot.input_tokens, snapshot.request_count))
+        .collect()
+}
+
+/// One page stepped to completion, with `between` run before every step
+/// call: a deterministic point between two records of the active file.
+fn page_between(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    mut between: impl FnMut(&OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult) {
+    let mut scan = codex_scan(fixture, index, collected_at)
+        .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    for _ in 0..100_000 {
+        between(&scan);
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan);
+            }
+        }
+    }
+    panic!("the page did not finish");
+}
+
+/// Whether the scan's active file is `path`'s (by file name).
+fn active_is(scan: &OwnedSourceScan, path: &Path) -> bool {
+    scan.active_file
+        .file
+        .as_ref()
+        .is_some_and(|active| active.candidate.path.file_name() == path.file_name())
+}
+
+/// A parent rollout P (two turns with usage: a complete ledger of four
+/// signatures) and an ordinary fork C of P (`forked_from_id`, a `user`
+/// thread) in one sessions root, with no sidecar.
+struct ForkHome {
+    fixture: ScanRoot,
+}
+
+impl ForkHome {
+    fn new(child: &[Value]) -> Self {
+        let home = Self {
+            fixture: ScanRoot::with_sessions(&[]),
+        };
+        fs::write(home.fixture.file(PARENT), jsonl(&Self::parent())).unwrap();
+        home.write_child(child);
+        home
+    }
+
+    fn parent() -> Vec<Value> {
+        vec![
+            json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
+                "payload": {"id": PARENT, "thread_source": "user"}}),
+            turn_record("2026-10-07T08:00:01Z", "parent-turn-1"),
+            usage_record("2026-10-07T08:00:02Z", (100, 80, 10, 2), (100, 80, 10, 2)),
+            turn_record("2026-10-07T08:30:01Z", "parent-turn-2"),
+            usage_record("2026-10-07T08:30:02Z", (160, 125, 18, 4), (60, 45, 8, 2)),
+        ]
+    }
+
+    /// Kind (iii): C's first signature is its own turn, so its prefix
+    /// diverges from P's complete ledger at signature 0 (`AmbiguousFork`,
+    /// held), followed by `usage` own `token_count`s.
+    fn diverging_child(usage: u64) -> Vec<Value> {
+        let mut records = vec![turn_record("2026-10-07T08:20:01Z", "child-turn-1")];
+        for n in 1..=usage {
+            records.push(usage_record(
+                "2026-10-07T08:20:02Z",
+                (10 * n, 5 * n, n, 0),
+                (10, 5, 1, 0),
+            ));
+        }
+        records
+    }
+
+    /// A mid-ledger divergence: P's first turn and usage, then C's own turn
+    /// and usage while later parent signatures exist (owned from there).
+    fn matching_child() -> Vec<Value> {
+        let parent = Self::parent();
+        vec![
+            parent[1].clone(),
+            parent[2].clone(),
+            turn_record("2026-10-07T08:20:01Z", "child-turn-1"),
+            usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
+        ]
+    }
+
+    fn write_child(&self, records: &[Value]) {
+        let mut all = vec![
+            json!({"timestamp": "2026-10-07T08:20:00Z", "type": "session_meta",
+            "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}}),
+        ];
+        all.extend_from_slice(records);
+        fs::write(self.fixture.file(CHILD), jsonl(&all)).unwrap();
+    }
+
+    fn generation(
+        &self,
+        index: ScanIndex,
+        cache: &Arc<SharedCache>,
+        n: u64,
+    ) -> (ScanIndex, SourceScanResult) {
+        self.generation_with(index, cache, n, |_| {})
+    }
+
+    /// One page of census generation `n`; `tweak` runs once the scan object
+    /// is constructed (page start: census frozen, ledgers validated) and
+    /// before its first step.
+    fn generation_with(
+        &self,
+        index: ScanIndex,
+        cache: &Arc<SharedCache>,
+        n: u64,
+        tweak: impl Fn(&mut OwnedSourceScan),
+    ) -> (ScanIndex, SourceScanResult) {
+        let mut index = index;
+        index.traversal = None;
+        let (index, scan, _) = page_with(
+            &self.fixture,
+            index,
+            Some(Arc::clone(cache)),
+            "cursor-fixture",
+            &collected_at(n),
+            tweak,
+        );
+        (index, scan)
+    }
+
+    /// Generations from `n` until the fork is settled: a generation that
+    /// started with P's ledger indexed discloses the same census as the one
+    /// before it. Returns the last generation and the next free `n`.
+    fn settle(
+        &self,
+        index: ScanIndex,
+        cache: &Arc<SharedCache>,
+        n: u64,
+    ) -> (ScanIndex, SourceScanResult, u64) {
+        let (mut index, mut scan) = self.generation(index, cache, n);
+        for next in n + 1..n + 8 {
+            let before = census(&index, &scan);
+            let ledgered = Self::parent_ledger(&index).is_some();
+            let (following, again) = self.generation(index, cache, next);
+            let stable = ledgered && census(&following, &again) == before;
+            index = following;
+            scan = again;
+            if stable {
+                return (index, scan, next + 1);
+            }
+        }
+        panic!("the fork did not settle: {}", counters(cache));
+    }
+
+    /// The cold oracle: a fresh index and cache, settled from generation `n`.
+    fn oracle(&self, n: u64) -> (ScanIndex, SourceScanResult) {
+        let (index, scan, _) =
+            self.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), n);
+        (index, scan)
+    }
+
+    /// The same generation read again with no memo: a fresh cache over a
+    /// copy of the warm index (C-T3's fresh side).
+    fn twin(&self, index: &ScanIndex, n: u64) -> (ScanIndex, SourceScanResult) {
+        self.generation(index.clone(), &Arc::new(SharedCache::default()), n)
+    }
+
+    fn child_entry(&self, cache: &SharedCache) -> Option<MemoEntry> {
+        stored_key(cache, &self.fixture.file(CHILD)).and_then(|key| cache.memo_lookup(&key))
+    }
+
+    /// P's indexed complete ledger identity.
+    fn parent_ledger(index: &ScanIndex) -> Option<String> {
+        index
+            .codex_parent_ownership_ledgers
+            .get(PARENT)
+            .filter(|ledger| ledger.scan_complete)
+            .map(|ledger| ledger.opened_object_identity.clone())
+    }
+}
+
+/// P rewritten in place, not appended: a turn with usage inserted after its
+/// first turn, every later signature kept (B2-T1's change).
+fn rewrite_parent(path: &Path) {
+    let parent = ForkHome::parent();
+    let mut changed = parent[..3].to_vec();
+    changed.push(turn_record("2026-10-07T08:10:01Z", "parent-turn-inserted"));
+    changed.push(usage_record(
+        "2026-10-07T08:10:02Z",
+        (130, 103, 14, 3),
+        (30, 23, 4, 1),
+    ));
+    changed.extend_from_slice(&parent[3..]);
+    fs::write(path, jsonl(&changed)).unwrap();
+}
+
+/// P appended: one more turn with usage (`n` keeps the turn ids distinct).
+fn append_parent_turn(path: &Path, n: u64) {
+    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&jsonl(&[
+        turn_record("2026-10-07T09:00:01Z", &format!("parent-grown-{n}")),
+        usage_record(
+            "2026-10-07T09:00:02Z",
+            (200 + 10 * n, 150 + 5 * n, 20 + n, 4),
+            (10, 5, 1, 0),
+        ),
+    ]))
+    .unwrap();
+}
+
+/// T1 (kind (iii)) and C-T3: a fork whose copied prefix diverges from its
+/// parent's complete ledger at signature 0 is held with usage and memoized
+/// with the ledger it used and the parent's current identity. An unchanged
+/// generation hits at zero transcript bytes and discloses exactly what a
+/// fresh read of the same generation does (same index, no memo), field by
+/// field plus `scanned_session_count`, and what a cold settled scan does.
+#[test]
+fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, settled, n) = home.settle(ScanIndex::default(), &cache, 0);
+    let ledger = ForkHome::parent_ledger(&index).expect("indexed parent ledger");
+    let entry = home
+        .child_entry(&cache)
+        .unwrap_or_else(|| panic!("the kind (iii) hold is memoized: {}", counters(&cache)));
+    let dep = entry.parent.as_ref().expect("parent dependency");
+    assert_eq!(
+        (
+            dep.id.as_str(),
+            dep.ledger.as_deref(),
+            dep.current.as_deref()
+        ),
+        (PARENT, Some(ledger.as_str()), Some(ledger.as_str()))
+    );
+    assert!(session_usage(&settled, CHILD).is_empty());
+    assert_eq!(
+        settled.ownership_incomplete_file_count,
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let hits = counter(&cache, |c| c.memo_hits);
+    let (twin_index, twin) = home.twin(&index, n);
+    let ((index, hit), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 1,
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(
+        counts.memo_hit_estimated_avoided_parser_bytes,
+        home.fixture.len(CHILD)
+    );
+    assert!(session_usage(&hit, CHILD).is_empty());
+    assert_eq!(replayed_census(&hit), replayed_census(&twin));
+    assert_eq!(census(&index, &hit), census(&twin_index, &twin));
+    let (oracle_index, oracle) = home.oracle(n + 1);
+    assert_eq!(census(&index, &hit), census(&oracle_index, &oracle));
+}
+
+/// T14: after a restart (a new `SharedCache`, the index kept) the held fork
+/// is read once and recorded, then hits with the same disclosure.
+#[test]
+fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let (index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
+    let cache = Arc::new(SharedCache::default());
+    let (index, reread) = home.generation(index, &cache, n);
+    assert_eq!(
+        (
+            counter(&cache, |c| c.memo_hits),
+            counter(&cache, |c| c.memo_records)
+        ),
+        (0, 1),
+        "{}",
+        counters(&cache)
+    );
+    let (_, hit) = home.generation(index, &cache, n + 1);
+    assert_eq!(
+        (
+            counter(&cache, |c| c.memo_hits),
+            counter(&cache, |c| c.memo_records)
+        ),
+        (1, 1),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(replayed_census(&hit), replayed_census(&reread));
+}
+
+/// T15: an index reset clears the parent refs; the next memo hit re-requests
+/// the hold's parent exactly as a fresh parse does.
+#[test]
+fn memo_hit_after_an_index_reset_reinserts_the_parent_ref() {
+    let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
+    home.project(home.bytes(2), 2);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(index.codex_parent_ownership_refs.contains(SPAWN_PARENT));
+    index.codex_parent_ownership_refs.clear();
+    let (index, quiet) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert!(
+        index.codex_parent_ownership_refs.contains(SPAWN_PARENT),
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
+}
+
+/// T15b: the parent's object is replaced (same bytes, new inode). The
+/// child's entry misses once, counted `memo_miss_other`, and the fork
+/// settles on the new parent object exactly as a cold scan.
+#[test]
+fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    let before = ForkHome::parent_ledger(&index).unwrap();
+    let hits = counter(&cache, |c| c.memo_hits);
+    let parent = home.fixture.file(PARENT);
+    let replacement = home
+        .fixture
+        .root
+        .parent()
+        .unwrap()
+        .join("parent-replacement");
+    fs::copy(&parent, &replacement).unwrap();
+    fs::rename(&replacement, &parent).unwrap();
+    let ((index, replaced), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+    assert_eq!(
+        (
+            counts.memo_hit_estimated_avoided_parser_bytes,
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_other
+        ),
+        (0, 0, 1),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), hits);
+    assert!(session_usage(&replaced, CHILD).is_empty());
+    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    let after = ForkHome::parent_ledger(&index).unwrap();
+    assert_ne!(after, before);
+    let entry = home.child_entry(&cache).expect("re-recorded");
+    assert_eq!(
+        entry.parent.as_ref().and_then(|dep| dep.ledger.as_deref()),
+        Some(after.as_str())
+    );
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// T15c: a held created thread whose trusted spawn parent P has a local,
+/// complete rollout. The hold never uses a ledger, but its ref makes P's
+/// ledger arrive in the index at an unchanged P identity. That is peer
+/// evidence: the next lookup may miss once, the re-read holds again, and
+/// from then on the unchanged hold hits (main keyed this dependency on the
+/// indexed ledger, so it hit too).
+#[test]
+fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
+    let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
+    home.project(home.bytes(2), 2);
+    let at = |offset: i64| bounded_rfc3339_millis(home.base_ms + offset).unwrap();
+    fs::write(
+        home.fixture
+            .root
+            .join(format!("rollout-2026-10-07T08-00-00-{SPAWN_PARENT}.jsonl")),
+        jsonl(&[
+            json!({"timestamp": at(-60_000), "type": "session_meta",
+                "payload": {"id": SPAWN_PARENT, "thread_source": "user"}}),
+            turn_record(&at(-59_000), "spawn-parent-turn"),
+            usage_record(&at(-58_000), (40, 20, 4, 1), (40, 20, 4, 1)),
+        ]),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut n = 0;
+    while !index
+        .codex_parent_ownership_ledgers
+        .get(SPAWN_PARENT)
+        .is_some_and(|ledger| ledger.scan_complete)
+    {
+        assert!(
+            n < 4,
+            "the spawn parent's ledger never arrived: {}",
+            counters(&cache)
+        );
+        index = home.generation(index, &cache, n).0;
+        n += 1;
+    }
+    let entry = home.memo_entry(&cache).expect("memoized hold");
+    let dep = entry.parent.as_ref().expect("spawn parent dependency");
+    // The hold used no ledger; the index now has one for the same parent.
+    assert_eq!(
+        (dep.id.as_str(), dep.ledger.as_deref()),
+        (SPAWN_PARENT, None)
+    );
+    // At most one miss on the arrival; then the unchanged hold is quiet.
+    let (index, _) = home.generation(index, &cache, n);
+    let hits = counter(&cache, |c| c.memo_hits);
+    let (index, first) = home.generation(index, &cache, n + 1);
+    let (index, second) = home.generation(index, &cache, n + 2);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 2,
+        "a ledger the hold never used keeps waking it: {}",
+        counters(&cache)
+    );
+    assert!(created_usage(&first).is_empty() && created_usage(&second).is_empty());
+    assert_oracle(&home, &cache, &index, &second, n + 2, true, &[]);
+}
+
+/// T15d: a child of a growing parent never hits (the parent's identity moves
+/// every generation) and its misses are `memo_miss_other`, never an
+/// exact-stamp miss; it is never admitted.
+#[test]
+fn child_of_a_growing_parent_never_hits() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _, mut n) = home.settle(ScanIndex::default(), &cache, 0);
+    let hits = counter(&cache, |c| c.memo_hits);
+    let mut other = 0;
+    for grown in 0..3 {
+        append_parent_turn(&home.fixture.file(PARENT), grown);
+        let ((next, scan), counts) =
+            codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+        assert_eq!(
+            (
+                counts.memo_hit_estimated_avoided_parser_bytes,
+                counts.memo_miss_exact_stamp
+            ),
+            (0, 0),
+            "{counts:?}"
+        );
+        assert!(session_usage(&scan, CHILD).is_empty());
+        other += counts.memo_miss_other;
+        index = next;
+        n += 1;
+    }
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits,
+        "{}",
+        counters(&cache)
+    );
+    assert!(other >= 1, "{}", counters(&cache));
+}
+
+/// T1b/N2 and T3b: a `forked_from_id` fork whose parent is not on disk has
+/// no ledger, so it is parent-pending: never recorded, re-read every
+/// generation, its parent requested. T7: once the parent arrives the fork
+/// settles exactly as a cold scan (here held and memoized: kind (iii)).
+#[test]
+fn ledgerless_fork_is_never_memoized_until_its_parent_arrives() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let parent = home.fixture.file(PARENT);
+    let away = home.fixture.root.parent().unwrap().join("parent-away");
+    fs::rename(&parent, &away).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    for n in 0..3 {
+        let (next, scan) = home.generation(index, &cache, n);
+        assert_eq!(scan.scanned_file_count, 1, "re-read: {}", counters(&cache));
+        assert!(session_usage(&scan, CHILD).is_empty());
+        assert!(
+            home.child_entry(&cache).is_none(),
+            "a parent-pending fork is never recorded: {}",
+            counters(&cache)
+        );
+        assert!(next.codex_parent_ownership_refs.contains(PARENT));
+        index = next;
+    }
+    assert_eq!(
+        (
+            counter(&cache, |c| c.memo_hits),
+            counter(&cache, |c| c.memo_records)
+        ),
+        (0, 0),
+        "{}",
+        counters(&cache)
+    );
+    fs::rename(&away, &parent).unwrap();
+    let (index, settled, n) = home.settle(index, &cache, 3);
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// T1d (R1-L4 control): a fork that matches its parent's first signatures
+/// and diverges while later parent signatures exist is owned from there: it
+/// is admitted once with its own usage and never memoized.
+#[test]
+fn mid_ledger_divergence_is_admitted_and_never_memoized() {
+    let home = ForkHome::new(&ForkHome::matching_child());
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut published = Vec::new();
+    for n in 0..6 {
+        let (next, scan) = home.generation(index, &cache, n);
+        published.extend(session_usage(&scan, CHILD));
+        assert!(home.child_entry(&cache).is_none(), "{}", counters(&cache));
+        index = next;
+    }
+    assert_eq!(published, vec![(30, 1)], "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        0,
+        "{}",
+        counters(&cache)
+    );
+}
+
+/// B2-T1 (scan-level liveness and safety): the child grows, so its lookup
+/// misses (exact stamp) after probing P; the seam then rewrites P before
+/// C's parse, which uses the page-start ledger. The fence re-opens P and
+/// refuses C (parent-pending: not recorded, nothing published). Later
+/// generations settle on the new P exactly as a cold scan.
+#[test]
+fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    let before = ForkHome::parent_ledger(&index).unwrap();
+    home.fixture.append(
+        CHILD,
+        &jsonl(&[usage_record(
+            "2026-10-07T08:20:03Z",
+            (40, 20, 4, 0),
+            (10, 5, 1, 0),
+        )]),
+    );
+    let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+    let hook = {
+        let fired = std::rc::Rc::clone(&fired);
+        let (child, parent) = (home.fixture.file(CHILD), home.fixture.file(PARENT));
+        move |path: &Path| {
+            if path.file_name() == child.file_name() {
+                fired.set(fired.get() + 1);
+                rewrite_parent(&parent);
+            }
+        }
+    };
+    let ((index, refused), counts) = codex_memo_lifecycle::observe(|| {
+        crate::snapshots::with_codex_before_parse(hook, || home.generation(index, &cache, n))
+    });
+    assert_eq!(fired.get(), 1, "{}", counters(&cache));
+    assert_eq!(counts.memo_miss_exact_stamp, 1, "{counts:?}");
+    assert!(session_usage(&refused, CHILD).is_empty());
+    assert!(
+        home.child_entry(&cache).is_none(),
+        "refused as parent-pending, not re-recorded: {}",
+        counters(&cache)
+    );
+    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    let after = ForkHome::parent_ledger(&index).unwrap();
+    assert_ne!(after, before);
+    let entry = home
+        .child_entry(&cache)
+        .expect("re-recorded on the new parent");
+    assert_eq!(
+        entry.parent.as_ref().and_then(|dep| dep.ledger.as_deref()),
+        Some(after.as_str())
+    );
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// B2-T2 (resume): C's parse spans step calls. After its header classified
+/// against P's ledger, P changes between two step calls; when C's parse
+/// finishes the fence re-opens P and refuses C. A fresh cache makes C read
+/// in full (no memo). Later generations settle exactly as a cold scan.
+#[test]
+fn parent_changed_between_the_child_step_calls_refuses_it_on_resume() {
+    let home = ForkHome::new(&ForkHome::diverging_child(12));
+    let (mut index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
+    let before = ForkHome::parent_ledger(&index).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (child, parent) = (home.fixture.file(CHILD), home.fixture.file(PARENT));
+    let mut rewritten = 0;
+    index.traversal = None;
+    let (index, refused) = page_between(&home.fixture, index, &cache, &collected_at(n), |scan| {
+        let classified = active_is(scan, &child)
+            && scan.active_file.file.as_ref().is_some_and(|active| {
+                active
+                    .parser
+                    .accumulator
+                    .codex_parent_ledger_identity_used
+                    .is_some()
+            });
+        if classified && rewritten == 0 {
+            rewrite_parent(&parent);
+            rewritten += 1;
+        }
+    });
+    assert_eq!(rewritten, 1, "{}", counters(&cache));
+    assert!(session_usage(&refused, CHILD).is_empty());
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        0,
+        "refused as parent-pending, not recorded: {}",
+        counters(&cache)
+    );
+    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    assert_ne!(ForkHome::parent_ledger(&index).unwrap(), before);
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// B2-T3 (liveness): P is appended after page start (the census is frozen
+/// and its old ledger validated) and before its own parse. The ledger insert
+/// re-opens P after that parse, so the new ledger is still inserted.
+#[test]
+fn parent_appended_after_page_start_still_gets_its_ledger() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    let before = ForkHome::parent_ledger(&index).unwrap();
+    let parent = home.fixture.file(PARENT);
+    let (index, _) = home.generation_with(index, &cache, n, |_| append_parent_turn(&parent, 0));
+    let ledger = index
+        .codex_parent_ownership_ledgers
+        .get(PARENT)
+        .unwrap_or_else(|| panic!("no ledger: {}", counters(&cache)));
+    assert!(ledger.scan_complete);
+    assert_ne!(ledger.opened_object_identity, before);
+    assert_eq!(ledger.signatures.len(), 6);
+    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// L6-T1: a rollout-declared created thread with a spawn parent, flushed to
+/// 9 of the 10 records its projection covers. The bind seeds at that length
+/// (no bind: held), and the 10th record lands between the parser's open and
+/// its read. The hold must not be recorded at a stamp its bind never saw.
+/// Generation 1 binds at the full length and admits once, as cold.
+#[test]
+fn bind_seed_short_of_the_read_extent_is_never_recorded() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::with_lineage(9, false, "user", Some(SPAWN_PARENT));
+    let cache = Arc::new(SharedCache::default());
+    let collected = bounded_rfc3339_millis(home.base_ms + 3_600_000).unwrap();
+    let mut appended = false;
+    let ((index, held), counts) = codex_memo_lifecycle::observe(|| {
+        page_between(
+            &home.fixture,
+            ScanIndex::default(),
+            &cache,
+            &collected,
+            |scan| {
+                if !appended && active_is(scan, &home.path) {
+                    home.flush_from(9);
+                    appended = true;
+                }
+            },
+        )
+    });
+    assert!(appended, "{}", counters(&cache));
+    assert!(
+        created_usage(&held).is_empty(),
+        "held: {}",
+        counters(&cache)
+    );
+    assert_eq!(
+        (
+            counter(&cache, |c| c.memo_records),
+            counts.memo_hit_estimated_avoided_parser_bytes
+        ),
+        (0, 0),
+        "{}",
+        counters(&cache)
+    );
+    assert!(home.memo_entry(&cache).is_none());
+    let (index, admitted) = home.generation(index, &cache, 1);
+    assert_eq!(
+        created_usage(&admitted),
+        vec![(200, 3)],
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &admitted, 1, true, &[]);
+}
+
+/// T1c: kind (i) with usage (a rollout-declared created thread whose file
+/// is ahead of its projection) hits while unchanged; growth is an
+/// exact-stamp miss with the grown extent, re-read and held again as cold.
+#[test]
+fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::with_lineage(10, false, "user", Some(SPAWN_PARENT));
+    home.project(home.bytes(9), 9);
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(created_usage(&held).is_empty(), "{}", counters(&cache));
+    assert!(held.recognized_usage_drop_count > 0, "usage-bearing hold");
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+    let (index, quiet) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(replayed_census(&quiet), replayed_census(&home.oracle(1).1));
+    let extra = codex_line(json!({
+        "timestamp": bounded_rfc3339_millis(home.base_ms + 7_000).unwrap(),
+        "type": "turn_context",
+        "payload": {"turn_id": "grown-turn", "model": "gpt-5.6-sol"},
+        "ordinal": 10,
+    }));
+    OpenOptions::new()
+        .append(true)
+        .open(&home.path)
+        .unwrap()
+        .write_all(&extra)
+        .unwrap();
+    let ((index, grown), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 2));
+    assert_eq!(
+        (
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_exact_stamp_bytes,
+            counts.memo_miss_other
+        ),
+        (1, fs::metadata(&home.path).unwrap().len(), 0),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        2,
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &grown, 2, true, &[]);
+}
+
+/// T2: a held fork with a terminal over-line-cap line (one line past
+/// `MAX_JSONL_LINE_BYTES`) is memoized and hits; every replayed count,
+/// `over_line_cap` and the terminal trio included, equals a cold read.
+#[test]
+fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
+    let home = CreatedThreadHome::new(10, true);
+    let mut row = format!(
+        "{{\"timestamp\":\"{}\",\"type\":\"response_item\",\"payload\":\"",
+        bounded_rfc3339_millis(home.base_ms + 7_000).unwrap()
+    )
+    .into_bytes();
+    row.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+    row.extend_from_slice(b"\"}\n");
+    OpenOptions::new()
+        .append(true)
+        .open(&home.path)
+        .unwrap()
+        .write_all(&row)
+        .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+    assert_eq!(held.over_line_cap_count, 1, "{}", counters(&cache));
+    assert!(created_usage(&held).is_empty(), "{}", counters(&cache));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let (index, quiet) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    let cold = home.oracle(1).1;
+    assert_eq!(replayed_census(&quiet), replayed_census(&cold));
+    assert_eq!(quiet.over_line_cap_count, 1);
+    assert_eq!(
+        quiet.terminal_over_line_cap_count,
+        held.terminal_over_line_cap_count
+    );
+    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
+}
+
+/// T3: a non-monotone hold (`AwaitingLegacyTrigger`: a subagent fork with
+/// copied usage and no trigger turn) is memoized at its read end: unchanged
+/// it hits exactly; grown, it is an exact-stamp miss and is read again. Its
+/// parent is not on disk, so no parent ledger ever arrives (T15c covers
+/// that). (An `Undetermined` file, usage before any header, never reaches
+/// the memo: its first record is not an owning header, so the header
+/// inventory holds the page, as on main.)
+#[test]
+fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let fixture = ScanRoot::with_sessions(&[]);
+    let mut fork = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": SESSION_B, "forked_from_id": SESSION,
+        "thread_source": "subagent"}}));
+    fork.extend(token_line(1));
+    fork.extend(token_line(2));
+    fs::write(fixture.file(SESSION_B), fork).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let generation = |index: ScanIndex, n: u64| {
+        let mut index = index;
+        index.traversal = None;
+        let (index, scan, _) = page_at(
+            &fixture,
+            index,
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+            &collected_at(n),
+        );
+        (index, scan)
+    };
+    let (index, held) = generation(ScanIndex::default(), 0);
+    assert!(
+        session_usage(&held, SESSION_B).is_empty(),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(
+        held.ownership_incomplete_file_count,
+        1,
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let (index, quiet) = generation(index, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(
+        census(&index, &quiet).0,
+        census(&index, &held).0,
+        "{}",
+        counters(&cache)
+    );
+    fixture.append(SESSION_B, &token_line(3));
+    let ((index, grown), counts) = codex_memo_lifecycle::observe(|| generation(index, 2));
+    assert_eq!(
+        (
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_exact_stamp_bytes,
+            counts.memo_miss_other
+        ),
+        (1, fixture.len(SESSION_B), 0),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert!(session_usage(&grown, SESSION_B).is_empty());
+    let _ = generation(index, 3);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
+}
+
+/// T3 (second shape): a fork that matches every signature of its parent's
+/// ledger and ends there stays `AwaitingParentPrefix` (non-monotone, not
+/// parent-pending): memoized, hit while unchanged; growth is an exact-stamp
+/// miss and the re-read settles exactly as a cold scan.
+#[test]
+fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = ForkHome::new(&ForkHome::parent()[1..]);
+    let cache = Arc::new(SharedCache::default());
+    let (index, settled, n) = home.settle(ScanIndex::default(), &cache, 0);
+    assert!(session_usage(&settled, CHILD).is_empty());
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    let hits = counter(&cache, |c| c.memo_hits);
+    let (index, _) = home.generation(index, &cache, n);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 1,
+        "{}",
+        counters(&cache)
+    );
+    home.fixture.append(
+        CHILD,
+        &jsonl(&[turn_record("2026-10-07T08:40:01Z", "child-turn-1")]),
+    );
+    let ((index, _), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n + 1));
+    assert_eq!(
+        (counts.memo_miss_exact_stamp, counts.memo_miss_other),
+        (1, 0),
+        "{counts:?}"
+    );
+    let (index, settled, n) = home.settle(index, &cache, n + 2);
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// T6 and T18 (second half): growth together with a sidecar change is not
+/// an exact-stamp miss (a tail could not replay it): it counts
+/// `memo_miss_other`, re-reads equal to cold, and the new entry hits.
+#[test]
+fn growth_with_a_sidecar_change_counts_an_other_miss() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let (index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    let extra = codex_line(json!({
+        "timestamp": bounded_rfc3339_millis(home.base_ms + 7_000).unwrap(),
+        "type": "turn_context",
+        "payload": {"turn_id": "grown-turn", "model": "gpt-5.6-sol"},
+        "ordinal": 10,
+    }));
+    OpenOptions::new()
+        .append(true)
+        .open(&home.path)
+        .unwrap()
+        .write_all(&extra)
+        .unwrap();
+    home.project(home.bytes(10) + extra.len(), 11);
+    let ((index, woken), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 1));
+    assert_eq!(
+        (
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_other,
+            counts.memo_hit_estimated_avoided_parser_bytes
+        ),
+        (0, 1, 0),
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &woken, 1, true, &[]);
+    let _ = home.generation(index, &cache, 2);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+}
+
+/// T8: the held file's object changes without new records: a same-size
+/// touch (mtime and ctime), a replacement (new inode, same bytes) and a
+/// shrink each miss once, re-read equal to cold; a shrink is never counted
+/// as an exact-stamp (growth) miss.
+#[test]
+fn touched_replaced_or_shrunk_held_file_misses() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    let replacement = home.codex().join("held-replacement");
+    let mut n = 1;
+    for name in ["touch", "replace", "shrink"] {
+        let hits = counter(&cache, |c| c.memo_hits);
+        match name {
+            "touch" => File::options()
+                .write(true)
+                .open(&home.path)
+                .unwrap()
+                .set_modified(SystemTime::now() + std::time::Duration::from_secs(120))
+                .unwrap(),
+            "replace" => {
+                fs::copy(&home.path, &replacement).unwrap();
+                fs::rename(&replacement, &home.path).unwrap();
+            }
+            _ => OpenOptions::new()
+                .write(true)
+                .open(&home.path)
+                .unwrap()
+                .set_len(u64::try_from(home.bytes(9)).unwrap())
+                .unwrap(),
+        }
+        let ((next, scan), counts) =
+            codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+        assert_eq!(
+            counter(&cache, |c| c.memo_hits),
+            hits,
+            "{name}: {}",
+            counters(&cache)
+        );
+        assert_eq!(
+            counts.memo_miss_other + counts.memo_miss_exact_stamp,
+            1,
+            "{name}: {counts:?}"
+        );
+        if name == "shrink" {
+            assert_eq!(counts.memo_miss_exact_stamp, 0, "{name}: {counts:?}");
+        }
+        assert_oracle(&home, &cache, &next, &scan, n, true, &[]);
+        index = next;
+        n += 1;
+    }
+    let _ = home.generation(index, &cache, n);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        1,
+        "the last re-read is memoized again: {}",
+        counters(&cache)
+    );
+}
+
+/// T19 (R1-L3) and the T9 fences, at the digest: a tier-receipt content
+/// change with the same `required` (Some → Some), the upload context, each
+/// unscoped-incomplete census flag and the owner member count each change
+/// the memo digest; the same inputs give the same digest.
+#[test]
+fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
+    use crate::snapshots::codex_file_join::AppliedTierReceipt;
+    let temp = Temp::new("memo-fence-digest", b"{\"n\":1}\n");
+    let file = File::open(&temp.0).unwrap();
+    let candidate = CandidateFile {
+        scan_root: PathBuf::from("/synthetic/sessions"),
+        path: PathBuf::from(format!(
+            "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
+        )),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: "revision".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let receipt = |tier: &str| -> AppliedTierReceipt {
+        serde_json::from_value(json!({"version": 1, "derivation": "fixture",
+            "scope": "fixture", "records": 3, "prefix_digest": "prefix",
+            "tiers": {"turn-1": tier}}))
+        .unwrap()
+    };
+    let with_receipt = |receipt: AppliedTierReceipt| {
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&candidate.path),
+            ScanIndexEntry {
+                size_bytes: 8,
+                modified_unix_seconds: 0,
+                modified_unix_nanos: None,
+                source_file_fingerprint: "revision".into(),
+                last_snapshot_fingerprint: None,
+                last_upload_body_witness: None,
+                effective_upload_body_witness_revision: 0,
+                scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                codex_joined_member_set: None,
+                codex_captured_joined_member_set: None,
+                codex_protected_owner: None,
+                codex_applied_tier_receipt: Some(receipt),
+                codex_applied_tier_receipt_required: false,
+                codex_captured_tier_receipt: None,
+                codex_captured_tier_receipt_required: false,
+                codex_captured_uncommitted: false,
+                codex_counting_v2: false,
+            },
+        );
+        index
+    };
+    let digest = |index: &ScanIndex, codex: &CodexTitleMetadata, members: usize| {
+        memo_digest(
+            index,
+            &candidate,
+            &file,
+            "dependencies",
+            codex,
+            members,
+            "counting",
+        )
+        .unwrap()
+    };
+    let codex = CodexTitleMetadata::default();
+    let base = with_receipt(receipt("priority"));
+    let reference = digest(&base, &codex, 1);
+    assert_eq!(
+        reference,
+        digest(&with_receipt(receipt("priority")), &codex, 1)
+    );
+    assert_ne!(
+        reference,
+        digest(&with_receipt(receipt("flex")), &codex, 1),
+        "T19: receipt contents"
+    );
+    let mut context = with_receipt(receipt("priority"));
+    context.active_upload_context_fingerprint = Some("another-upload-context".into());
+    assert_ne!(reference, digest(&context, &codex, 1), "upload context");
+    let flags: [fn(&mut CodexTitleMetadata); 3] = [
+        |codex| codex.created_thread_census_unscoped_incomplete = true,
+        |codex| codex.state_census_unscoped_incomplete = true,
+        |codex| codex.sidecar_census_unscoped_incomplete = true,
+    ];
+    for (n, flag) in flags.iter().enumerate() {
+        let mut flipped = CodexTitleMetadata::default();
+        flag(&mut flipped);
+        assert_ne!(reference, digest(&base, &flipped, 1), "census flag {n}");
+    }
+    assert_ne!(reference, digest(&base, &codex, 2), "owner members");
+}
+
+/// T16: the memo has no clock input. The same unchanged hold collected a
+/// week later hits with the same disclosure.
+#[test]
+fn memo_hit_a_week_later_is_the_same_hit() {
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let (index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    let (index, day) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    let blocked = index.codex_state_only_blocked_session_ids.clone();
+    let (index, week) = home.generation(index, &cache, 7 * 86_400);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
+    assert_eq!(replayed_census(&week), replayed_census(&day));
+    assert_eq!(index.codex_state_only_blocked_session_ids, blocked);
+    assert!(created_usage(&week).is_empty());
+}
+
+const STATE_ONLY: &str = "01a05eed-49cf-7460-9fd7-f7dbfd2f05e4";
+const LEGACY_ONLY: &str = "01a01e9a-49cf-7460-9fd7-f7dbfd2f05e4";
+
+impl CreatedThreadHome {
+    /// A state row with `tokens` and no rollout: a state-only thread.
+    fn state_row(&self, id: &str, tokens: i64) {
+        rusqlite::Connection::open(self.codex().join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Thread', ?2, 'user', 'Summarize', ?3, NULL)",
+                rusqlite::params![id, tokens, self.base_ms],
+            )
+            .unwrap();
+    }
+
+    fn set_tokens(&self, id: &str, tokens: i64) {
+        rusqlite::Connection::open(self.codex().join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE threads SET tokens_used = ?2 WHERE id = ?1",
+                rusqlite::params![id, tokens],
+            )
+            .unwrap();
+    }
+
+    /// The full body, its header with or without `forked_from_id`.
+    fn body_with(&self, fork: bool) -> Vec<u8> {
+        let mut header: Value = serde_json::from_slice(&self.body[0]).unwrap();
+        let payload = header["payload"].as_object_mut().unwrap();
+        if fork {
+            payload.insert("forked_from_id".into(), json!(FORK_SOURCE));
+        } else {
+            payload.remove("forked_from_id");
+        }
+        let mut bytes = codex_line(header);
+        bytes.extend(self.body[1..].concat());
+        bytes
+    }
+
+    /// Rewrite the created thread's rollout and project it in full.
+    fn rewrite(&self, fork: bool) {
+        let body = self.body_with(fork);
+        fs::write(&self.path, &body).unwrap();
+        self.project(body.len(), self.body.len());
+    }
+}
+
+/// State-only totals published by a generation: id → tokens.
+fn state_only(scan: &SourceScanResult) -> BTreeMap<String, u64> {
+    scan.snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot.request_count == 0
+                && snapshot.input_tokens == 0
+                && snapshot.unattributed_total_tokens > 0
+        })
+        .map(|snapshot| {
+            (
+                snapshot.source_session_id.clone(),
+                snapshot.unattributed_total_tokens,
+            )
+        })
+        .collect()
+}
+
+/// C-T1/C-T2 after generation `n`, against a cold oracle of the same files:
+/// - SB-T18: every attributed id is blocked;
+/// - warm ⊇ cold on the blocked set outside the ids a published body covers
+///   (cold's set there depends on page order around an acceptance); the
+///   excess outside `legacy ∪ unattributed` is only ids attributed to a key
+///   no longer on disk (class (e));
+/// - warm publishes no state-only total cold does not, and withholds only
+///   ids in that excess, `legacy` or `unattributed`.
+///
+/// Returns the excess and cold's state-only totals.
+fn assert_warm_covers_cold(
+    home: &CreatedThreadHome,
+    cache: &SharedCache,
+    index: &ScanIndex,
+    scan: &SourceScanResult,
+    n: i64,
+) -> (BTreeSet<String>, BTreeMap<String, u64>) {
+    let (oracle_index, oracle) = home.oracle(n);
+    for (key, ids) in &index.codex_state_only_blocked_by_file {
+        for id in ids {
+            assert!(
+                index.codex_state_only_blocked_session_ids.contains(id),
+                "generation {n}: SB-T18 {key} attributes unblocked {id}"
+            );
+        }
+    }
+    let bodies = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .filter(|snapshot| snapshot.request_count > 0)
+            .map(|snapshot| snapshot.source_session_id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let mut covered = bodies(scan);
+    covered.extend(bodies(&oracle));
+    for (key, entry) in &index.files {
+        if entry.last_snapshot_fingerprint.is_some() {
+            covered.extend(codex_session_id_candidates_from_path(Path::new(key)));
+        }
+    }
+    let cold = oracle_index
+        .codex_state_only_blocked_session_ids
+        .difference(&covered)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let warm = index
+        .codex_state_only_blocked_session_ids
+        .difference(&covered)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        cold.is_subset(&warm),
+        "generation {n}: warm {warm:?} does not cover cold {cold:?}: {}",
+        counters(cache)
+    );
+    let excess = warm
+        .difference(&cold)
+        .filter(|id| {
+            !index.codex_state_only_blocked_legacy.contains(*id)
+                && !index.codex_state_only_blocked_unattributed.contains(*id)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for id in &excess {
+        assert!(
+            index
+                .codex_state_only_blocked_by_file
+                .iter()
+                .any(|(key, ids)| ids.contains(id) && !Path::new(key).exists()),
+            "generation {n}: {id} over-blocked with no deleted holder: {:?}",
+            index.codex_state_only_blocked_by_file
+        );
+    }
+    let (warm_state, cold_state) = (state_only(scan), state_only(&oracle));
+    for (id, tokens) in &warm_state {
+        assert_eq!(
+            cold_state.get(id),
+            Some(tokens),
+            "generation {n}: warm publishes {id} beyond cold"
+        );
+    }
+    for id in cold_state.keys().filter(|id| !warm_state.contains_key(*id)) {
+        assert!(
+            excess.contains(id)
+                || index.codex_state_only_blocked_legacy.contains(id)
+                || index.codex_state_only_blocked_unattributed.contains(id),
+            "generation {n}: warm withholds {id} outside the disclosed excess: {}",
+            counters(cache)
+        );
+    }
+    (excess, cold_state)
+}
+
+/// C-T1 (sweep): one home through nine generations; after each, warm covers
+/// cold (see `assert_warm_covers_cold`). Generations: a held fork appears;
+/// a memo hit; a second file blocks the same id; the first is cured and
+/// publishes while the second still claims the id; the second is deleted;
+/// the first is a held fork again; a memo hit; the held fork is deleted
+/// (warm keeps its block, cold publishes the state total: class (e),
+/// asserted); unchanged after that. Not in this sweep: the capture-boundary
+/// revert, two-page, historical-replay and strict/park generations
+/// (method-level `l_sb_*` tests in `snapshots.rs`).
+#[test]
+fn warm_state_only_blocks_cover_cold_across_a_generation_sweep() {
+    let home = CreatedThreadHome::new(10, true);
+    home.set_tokens(CREATED, 50);
+    home.state_row(STATE_ONLY, 70);
+    let duplicate = home
+        .fixture
+        .root
+        .join(format!("rollout-2026-10-07T11-00-00-{CREATED}.jsonl"));
+    let cache = Arc::new(SharedCache::default());
+    let run = |index: ScanIndex, n: i64| {
+        let (index, scan) = home.generation(index, &cache, n);
+        let (excess, cold_state) = assert_warm_covers_cold(&home, &cache, &index, &scan, n);
+        (index, scan, excess, cold_state)
+    };
+    // (1) a held fork appears.
+    let (index, scan, _, cold_state) = run(ScanIndex::default(), 0);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert_eq!(
+        (
+            state_only(&scan).get(STATE_ONLY),
+            cold_state.get(STATE_ONLY)
+        ),
+        (Some(&70), Some(&70)),
+        "positive control: {}",
+        counters(&cache)
+    );
+    // (2) a memo-hit generation.
+    let (index, _, _, _) = run(index, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    // (3) a second file blocks the same id.
+    fs::write(&duplicate, home.body_with(true)).unwrap();
+    let (index, _, _, _) = run(index, 2);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    // (4) the first file is cured and publishes; the second still claims it.
+    home.rewrite(false);
+    let (index, _, _, _) = run(index, 3);
+    // (5) the second blocker is deleted.
+    fs::remove_file(&duplicate).unwrap();
+    let (index, _, _, _) = run(index, 4);
+    // (6) the first file is a held fork again.
+    home.rewrite(true);
+    let (index, _, _, _) = run(index, 5);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    // (7) a memo-hit generation.
+    let hits = counter(&cache, |c| c.memo_hits);
+    let (index, _, _, _) = run(index, 6);
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 1,
+        "{}",
+        counters(&cache)
+    );
+    // (8) the held fork is deleted: no retirement, so warm keeps its block
+    // (class (e)) while cold publishes the state total.
+    fs::remove_file(&home.path).unwrap();
+    let (index, scan, _, cold_state) = run(index, 7);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert!(!state_only(&scan).contains_key(CREATED));
+    assert_eq!(cold_state.get(CREATED), Some(&50), "{}", counters(&cache));
+    // (9) unchanged: still blocked, still never published.
+    let (index, scan, _, _) = run(index, 8);
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert!(!state_only(&scan).contains_key(CREATED));
+}
+
+/// C-T2 (legacy start): the C-T1 home from a pre-upgrade index (no
+/// attribution, plus a legacy-only claim on a thread whose claimant is never
+/// re-parsed). Legacy ids are never released by attribution; `legacy` never
+/// grows; warm never publishes a state-only total cold does not (cold
+/// publishes the legacy-only thread, warm withholds it). Class (h) is not
+/// asserted as an equality.
+#[test]
+fn legacy_blocks_survive_attribution_from_a_pre_upgrade_index() {
+    let home = CreatedThreadHome::new(10, true);
+    home.set_tokens(CREATED, 50);
+    home.state_row(STATE_ONLY, 70);
+    home.state_row(LEGACY_ONLY, 30);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    index.codex_state_only_blocked_by_file.clear();
+    index.codex_state_only_blocked_unattributed.clear();
+    index.codex_state_only_blocked_legacy.clear();
+    index.codex_state_only_blocked_attributed = false;
+    index
+        .codex_state_only_blocked_session_ids
+        .insert(LEGACY_ONLY.to_owned());
+    let mut legacy = usize::MAX;
+    for n in 1..=6 {
+        match n {
+            3 => home.rewrite(false),
+            5 => home.rewrite(true),
+            _ => {}
+        }
+        let (next, scan) = home.generation(index, &cache, n);
+        let (_, cold_state) = assert_warm_covers_cold(&home, &cache, &next, &scan, n);
+        assert!(next.codex_state_only_blocked_attributed);
+        assert!(
+            next.codex_state_only_blocked_legacy.contains(LEGACY_ONLY)
+                && next
+                    .codex_state_only_blocked_session_ids
+                    .contains(LEGACY_ONLY),
+            "generation {n}: {}",
+            counters(&cache)
+        );
+        assert!(!state_only(&scan).contains_key(LEGACY_ONLY));
+        assert_eq!(cold_state.get(LEGACY_ONLY), Some(&30), "generation {n}");
+        assert!(
+            next.codex_state_only_blocked_legacy.len() <= legacy,
+            "generation {n}: legacy grew"
+        );
+        legacy = next.codex_state_only_blocked_legacy.len();
+        index = next;
+    }
+}
+
+// #641 join resource (H1-H9): J-T4c, J-T6..J-T11 and credit settlement.
+
+const JOIN_OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const JOIN_OTHER: &str = "ffffffff-1111-4111-8111-ffffffffffff";
+
+fn join_member(path: PathBuf) -> CandidateFile {
+    CandidateFile {
+        scan_root: PathBuf::from("/synthetic/sessions"),
+        path,
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: String::new(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    }
+}
+
+fn join_members(names: &[&str]) -> Vec<CandidateFile> {
+    names
+        .iter()
+        .map(|name| join_member(PathBuf::from(format!("/synthetic/sessions/{name}"))))
+        .collect()
+}
+
+/// The members' exact `local_index_key`s joined by '\0'.
+fn joined(members: &[CandidateFile]) -> String {
+    members
+        .iter()
+        .map(|member| local_index_key(&member.path))
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+fn join_entry(cache: &SharedCache, owner: &str) -> Option<String> {
+    cache
+        .with_cursor(|cursor| cursor.join_owners.get(owner).map(|(_, keys)| keys.clone()))
+        .flatten()
+}
+
+/// The exact accounted size of one new entry (J-T10).
+fn join_charge(owner: &str, members: &[CandidateFile]) -> usize {
+    crate::heap_layout_bound::tree_node_bytes::<String, JoinProvenance>().unwrap()
+        + owner.len()
+        + joined(members).len()
+}
+
+/// The retained cache's own bound: admission keeps it beside the state.
+fn retained_floor(cache: &SharedCache) -> usize {
+    crate::heap_layout_bound::bound(&*cache.retained().unwrap(), usize::MAX).unwrap()
+}
+
+/// Every release `release_join_owners` reports, with its member keys.
+fn released(
+    cache: &SharedCache,
+    census: &BTreeSet<String>,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<(String, Vec<String>)> {
+    let mut released = Vec::new();
+    cache.release_join_owners(census, keep, |owner, members| {
+        released.push((owner.to_owned(), members.map(str::to_owned).collect()));
+    });
+    released
+}
+
+/// J-T4 (c): `keep` holds a queued or paused owner; without it the owner is
+/// released exactly once with its exact member keys, and only when every
+/// member left the census. Another owner's provenance survives.
+#[test]
+fn join_release_reports_exact_members_once_unless_kept() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let empty = cache.cursor_resident();
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    let others = join_members(&["c.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &members);
+    cache.record_join_owner(JOIN_OTHER, &others);
+    let keys = members
+        .iter()
+        .map(|member| local_index_key(&member.path))
+        .collect::<Vec<_>>();
+    let census = BTreeSet::from([local_index_key(&others[0].path)]);
+    assert!(released(&cache, &census, |owner| owner == JOIN_OWNER).is_empty());
+    assert!(join_entry(&cache, JOIN_OWNER).is_some());
+    // One member still in the census keeps it.
+    let partial = BTreeSet::from([keys[0].clone(), local_index_key(&others[0].path)]);
+    assert!(released(&cache, &partial, |_| false).is_empty());
+    assert_eq!(
+        released(&cache, &census, |_| false),
+        vec![(JOIN_OWNER.to_owned(), keys)]
+    );
+    assert!(released(&cache, &census, |_| false).is_empty());
+    assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+    assert_eq!(join_entry(&cache, JOIN_OTHER), Some(joined(&others)));
+    assert_eq!(
+        cache.cursor_resident(),
+        empty + join_charge(JOIN_OTHER, &others)
+    );
+}
+
+/// J-T6 + J-T10: the entry's resident delta is exactly its admitted charge;
+/// an unchanged re-record builds and admits nothing; a new member list
+/// moves it by the key-length difference; one byte short of the charge is
+/// refused and forgets the older entry.
+#[test]
+fn join_provenance_charge_is_the_exact_accounted_delta() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let empty = cache.cursor_resident();
+    let three = join_members(&["a.jsonl", "bb.jsonl", "rollout-ccc.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &three);
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert_eq!(
+        cache.cursor_resident() - empty,
+        join_charge(JOIN_OWNER, &three)
+    );
+    assert_eq!(cache.cursor_reserved(), 0);
+    // Unchanged membership needs no room at all.
+    let resident = cache.cursor_resident();
+    with_test_state_budget(0, || cache.record_join_owner(JOIN_OWNER, &three));
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert_eq!(cache.cursor_resident(), resident);
+    // A new member list: the stored owner key is kept.
+    let two = join_members(&["a.jsonl", "b.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &two);
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&two)));
+    assert_eq!(
+        resident - cache.cursor_resident(),
+        joined(&three).len() - joined(&two).len()
+    );
+    // One byte short: refused, and the older entry is forgotten.
+    let state = cache.cursor_resident();
+    let charge = join_charge(JOIN_OWNER, &three);
+    with_test_state_budget(state + charge + floor - 1, || {
+        cache.record_join_owner(JOIN_OWNER, &three);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+    assert_eq!(cache.cursor_resident(), empty);
+    assert!(released(&cache, &BTreeSet::new(), |_| false).is_empty());
+    // Exactly enough: admitted.
+    with_test_state_budget(empty + charge + floor, || {
+        cache.record_join_owner(JOIN_OWNER, &three);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert_eq!(cache.cursor_resident(), empty + charge);
+    assert_eq!(cache.cursor_reserved(), 0);
+}
+
+/// J-T11: a non-UTF-8 member key is built, measured and matched exactly as
+/// `local_index_key`; empty, NUL-bearing and empty-list provenance is
+/// refused before anything is reserved, and forgets an older entry.
+#[test]
+fn join_keys_match_local_index_key_and_malformed_ones_are_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let lossy = [
+        &b"/synthetic/sessions/rollout-\xff.jsonl"[..],
+        &b"/synthetic/sessions/rollout-\xff\xfe-\xe2\x82-x.jsonl"[..],
+        &b"/synthetic/sessions/plain.jsonl"[..],
+    ]
+    .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
+    for path in &lossy {
+        let key = local_index_key(path);
+        let mut built = String::new();
+        push_join_key(&mut built, path);
+        assert_eq!(built, key);
+        assert_eq!(join_key_len(path), Some(key.len()));
+        assert!(join_key_eq(&key, path));
+        assert!(!join_key_eq(&key[..key.len() - 1], path));
+        assert!(!join_key_eq(&format!("{key}x"), path));
+    }
+    let members = lossy.iter().cloned().map(join_member).collect::<Vec<_>>();
+    assert!(same_join_members(&joined(&members), &members));
+    assert!(!same_join_members(&joined(&members[..2]), &members));
+    assert_eq!(join_keys_len(&members), Some(joined(&members).len()));
+    let nul = PathBuf::from(std::ffi::OsStr::from_bytes(
+        b"/synthetic/sessions/a\0b.jsonl",
+    ));
+    assert_eq!(join_key_len(&nul), None);
+    assert_eq!(join_key_len(Path::new("")), None);
+    assert_eq!(join_keys_len(&[]), None);
+    for stored in ["", "a\0", "\0a", "a\0\0b"] {
+        assert!(!join_members_well_formed(stored), "{stored:?}");
+    }
+    assert!(join_members_well_formed("a\0b"));
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let empty = cache.cursor_resident();
+    cache.record_join_owner(JOIN_OWNER, &members);
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+    assert_eq!(
+        cache.cursor_resident() - empty,
+        join_charge(JOIN_OWNER, &members)
+    );
+    let malformed: [Vec<CandidateFile>; 3] = [
+        vec![join_member(nul.clone())],
+        vec![members[0].clone(), join_member(PathBuf::new())],
+        Vec::new(),
+    ];
+    for members in &malformed {
+        cache.record_join_owner(JOIN_OWNER, &members[..]);
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        assert_eq!(cache.cursor_resident(), empty);
+    }
+    cache.record_join_owner("", &members);
+    assert_eq!(join_entry(&cache, ""), None);
+    assert_eq!(cache.cursor_resident(), empty);
+    assert_eq!(cache.cursor_reserved(), 0);
+    // Malformed or partial stored provenance is never released.
+    cache.with_cursor(|cursor| {
+        for (owner, stored) in [(JOIN_OWNER, ""), (JOIN_OTHER, "a\0")] {
+            let used = cursor.tick();
+            cursor
+                .join_owners
+                .insert(owner.to_owned(), (used, stored.to_owned()));
+        }
+    });
+    assert!(released(&cache, &BTreeSet::new(), |_| false).is_empty());
+    assert!(join_entry(&cache, JOIN_OWNER).is_some());
+    assert!(join_entry(&cache, JOIN_OTHER).is_some());
+}
+
+/// J-T7: claim vs claim. An outstanding claim is charged like resident
+/// state, so a second claim and optional provenance cannot spend its room;
+/// settling and refunding each return it exactly once.
+#[test]
+fn outstanding_claim_blocks_a_second_claim_and_provenance() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let state = cache.cursor_resident();
+    let claim = 4096;
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    with_test_state_budget(state + claim + floor, || {
+        let credit = cache.cursor_reserve(claim).expect("the claim fits");
+        assert_eq!(credit.bytes(), claim);
+        assert_eq!(cache.cursor_reserved(), claim);
+        assert_eq!(cache.cursor_resident(), state + claim);
+        let second = cache.cursor_reserve(claim);
+        assert!(second.is_none(), "the claimed room is spent once");
+        assert_eq!(cache.cursor_reserved(), claim);
+        cache.record_join_owner(JOIN_OTHER, &members);
+        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+        cache.with_cursor(|cursor| credit.settle(cursor)).unwrap();
+        assert_eq!(cache.cursor_reserved(), 0);
+        let credit = cache
+            .cursor_reserve(claim)
+            .expect("the settled room is free");
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert_eq!(cache.cursor_resident(), state);
+    });
+}
+
+/// The mandatory paused-job reserve forgets optional join provenance for
+/// room; optional provenance never forgets other provenance and never takes
+/// a claim's room back (baseline progress keeps its reserve).
+#[test]
+fn paused_reserve_outranks_join_provenance() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let empty = cache.cursor_resident();
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &members);
+    let claim = join_charge(JOIN_OWNER, &members);
+    with_test_state_budget(empty + claim + floor, || {
+        cache.record_join_owner(JOIN_OTHER, &members);
+        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+        assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+        let credit = cache
+            .cursor_reserve(claim)
+            .expect("baseline progress forgets provenance first");
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        assert_eq!(cache.cursor_resident(), empty + claim);
+        cache.record_join_owner(JOIN_OWNER, &members);
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        credit.refund();
+    });
+    assert_eq!(cache.cursor_reserved(), 0);
+    assert_eq!(cache.cursor_resident(), empty);
+}
+
+/// R2-M1: an admission that cannot fit even after every eviction it may make
+/// evicts nothing. A hopeless paused reserve (`JoinStateBound`) keeps both
+/// provenance entries and the retained copy; optional provenance inside the
+/// empty-retained floor window is refused and keeps the copy too.
+#[test]
+fn hopeless_admission_evicts_nothing() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const JOIN_THIRD: &str = "33333333-cccc-4ccc-8ccc-333333333333";
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let copy = cache
+            .take(&key)
+            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+        // Measured with no retained copy and no provenance: the least an
+        // admission could ever evict down to.
+        let floor = retained_floor(&cache);
+        let empty = cache.cursor_resident();
+        cache.insert(
+            key.clone(),
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: copy.checkpoint,
+                reduction: Some(copy.state),
+            },
+            0,
+        );
+        let members = join_members(&["a.jsonl", "b.jsonl"]);
+        cache.record_join_owner(JOIN_OWNER, &members);
+        cache.record_join_owner(JOIN_OTHER, &members);
+        let intact = || {
+            assert!(
+                cache.retained_checkpoint(&key).is_some(),
+                "the copy is kept"
+            );
+            for owner in [JOIN_OWNER, JOIN_OTHER] {
+                assert_eq!(join_entry(&cache, owner), Some(joined(&members)), "{owner}");
+            }
+            assert_eq!(cache.cursor_reserved(), 0);
+        };
+        intact();
+        let resident = cache.cursor_resident();
+        // Fits the state with no provenance, never beside an empty retained
+        // cache (before the fix: both entries and the copy were evicted).
+        // Then a charge the state alone cannot hold.
+        for hopeless in [STATE_BYTES - empty - floor + 1, STATE_BYTES] {
+            assert!(cache.cursor_reserve(hopeless).is_none(), "{hopeless}");
+            intact();
+            assert_eq!(cache.cursor_resident(), resident);
+        }
+        // Optional twin: room for the claim, not for the claim and the floor.
+        let claim = join_charge(JOIN_THIRD, &members);
+        with_test_state_budget(resident + claim + floor - 1, || {
+            cache.record_join_owner(JOIN_THIRD, &members);
+        });
+        assert_eq!(join_entry(&cache, JOIN_THIRD), None);
+        intact();
+        assert_eq!(cache.cursor_resident(), resident);
+        // Control: a reserve that fits once provenance is forgotten still
+        // goes on (baseline progress), now that it is feasible.
+        let credit = cache
+            .cursor_reserve(STATE_BYTES - empty - floor)
+            .expect("feasible after forgetting provenance and copies");
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+/// J-T8: claim vs retained insert. The insert measures outstanding claims
+/// under the retained lock, so a copy that fits only if the claim is
+/// ignored is not kept.
+#[test]
+fn outstanding_claim_is_charged_against_a_retained_insert() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let copy = cache
+            .take(&key)
+            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+        let completed = |copy: crate::transcript_cache::Retained<_>| {
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: copy.checkpoint,
+                reduction: Some(copy.state),
+            }
+        };
+        // Control: without a claim the copy fits.
+        cache.insert(key.clone(), completed(copy), 0);
+        assert!(cache.retained_checkpoint(&key).is_some());
+        let with_copy = retained_floor(&cache);
+        let state = cache.cursor_resident();
+        assert!(with_copy + state <= STATE_BYTES);
+        let copy = cache.take(&key).expect("retained");
+        // A claim that leaves one byte too few for it.
+        let claim = STATE_BYTES - state - with_copy + 1;
+        let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
+        cache.insert(key.clone(), completed(copy), 0);
+        assert!(cache.retained_checkpoint(&key).is_none(), "refused");
+        assert!(retained_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+/// J-T9: one lock order (retained, then cursor) and no recursive cursor
+/// locking, checked in debug builds before any lock is taken.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "cursor lock taken while this thread holds it")]
+fn nested_cursor_lock_is_refused() {
+    let cache = SharedCache::default();
+    cache.with_cursor(|_| cache.with_cursor(|_| ()));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "retained lock taken under the cursor lock")]
+fn retained_lock_under_the_cursor_lock_is_refused() {
+    let cache = SharedCache::default();
+    cache.with_cursor(|_| drop(cache.retained()));
+}
+
+/// J-T9 control and settlement: `cursor_reserve` takes retained, then
+/// cursor; a credit unwound outside the lock refunds itself; one unwound
+/// inside a cursor closure does not relock; the held flag resets on every
+/// unwind; a poisoned cursor admits nothing and strands nothing.
+#[test]
+fn credits_settle_once_on_every_path() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let credit = cache.cursor_reserve(64).expect("room");
+    assert_eq!(cache.cursor_reserved(), 64);
+    credit.refund();
+    assert_eq!(cache.cursor_reserved(), 0);
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        let _credit = cache.cursor_reserve(64).expect("room");
+        assert_eq!(cache.cursor_reserved(), 64);
+        panic!("unwind with an outstanding credit");
+    }));
+    assert!(unwound.is_err());
+    assert!(!cursor_held());
+    assert_eq!(
+        cache.cursor_reserved(),
+        0,
+        "dropped while unwinding: refunded"
+    );
+    let stranded = cache.cursor_reserve(64).expect("room");
+    let inside = cache.cursor_reserve(64).expect("room");
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        cache.with_cursor(move |_| {
+            let _inside = inside;
+            panic!("poison the cursor");
+        });
+    }));
+    assert!(unwound.is_err());
+    assert!(!cursor_held(), "reset on unwind");
+    // Poisoned: measured as the whole budget; admits and settles nothing.
+    assert_eq!(cache.cursor_reserved(), usize::MAX);
+    assert_eq!(cache.cursor_resident(), STATE_BYTES);
+    assert!(cache.cursor_reserve(1).is_none());
+    stranded.refund();
+    cache.record_join_owner(JOIN_OWNER, &join_members(&["a.jsonl"]));
+    assert!(released(&cache, &BTreeSet::new(), |_| false).is_empty());
+}
+
+/// Corrupt credit accounting (a claim that is not outstanding, or one
+/// against another state) fails closed: the state measures unbounded.
+#[test]
+fn corrupt_credit_accounting_fails_closed() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    for wrong_state in [false, true] {
+        let cache = Arc::new(SharedCache::default());
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            cache.with_cursor(|cursor| {
+                let id = cursor.id + u64::from(wrong_state);
+                cursor.reserved = usize::from(wrong_state);
+                settle_claim(cursor, id, 1);
+            });
+        }));
+        assert_eq!(unwound.is_err(), cfg!(debug_assertions));
+        assert!(!cursor_held());
+        assert_eq!(cache.cursor_reserved(), usize::MAX);
+        assert_eq!(cache.cursor_resident(), STATE_BYTES);
+        assert!(cache.cursor_reserve(1).is_none());
+    }
+}
+
+/// H5: a job the slot no longer names is freed, counted lost, and only
+/// then is its claim refunded; nothing stays reserved or charged.
+#[test]
+fn failed_store_drops_the_job_then_refunds_its_claim() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 4096, 64, || {
+        let mut scan = codex_scan(&fixture, ScanIndex::default(), NOW)
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        for _ in 0..10_000 {
+            if scan
+                .active_file
+                .as_ref()
+                .is_some_and(|active| active.cursor.is_some())
+            {
+                break;
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { .. } => panic!("the job never started"),
+            }
+        }
+        assert!(!cache.cursor_slot_free(), "the frame holds the job");
+        // The impossible case `store` still handles: the slot moved on.
+        cache.with_cursor(|cursor| cursor.slot = Slot::Empty);
+        drop(scan);
+        assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 0);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert_eq!(cache.cursor_charge(), 0);
+    });
 }

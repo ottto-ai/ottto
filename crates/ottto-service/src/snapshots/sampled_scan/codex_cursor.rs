@@ -837,15 +837,29 @@ fn bounded_insert<V>(
     map.insert(key.to_owned(), value);
 }
 
+/// One owner's L-1 provenance: (LRU tick, member keys joined by '\0').
+type JoinProvenance = (u64, String);
+
+static NEXT_CURSOR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(in crate::snapshots) struct CursorState {
     slot: Slot,
     slot_key: Option<String>,
     /// Member keys of the slot's group job (empty for a singleton): selection
     /// skips them while the job exists (§d.1.2 c).
     slot_members: BTreeSet<String>,
-    /// Owners B blocked for queued groups, with their compact member keys
-    /// (§d.1.3 provenance, L-1). RAM only; bounded.
-    join_owners: BTreeMap<String, (u64, Vec<u64>)>,
+    /// Owners B blocked for queued groups, with their exact member keys
+    /// joined by '\0' (§d.1.3 provenance, L-1): the release's only deletion
+    /// authority. RAM only; at most `JOIN_OWNERS`; admitted before it is built.
+    join_owners: BTreeMap<String, JoinProvenance>,
+    /// Bytes claimed by outstanding `CursorCredit`s: charged like resident
+    /// state until settled, so no later admission can spend the same room.
+    /// `usize::MAX` marks corrupt credit accounting: the state then measures
+    /// unbounded and admits nothing (fail closed).
+    reserved: usize,
+    /// This state's identity; a credit settles only against the state that
+    /// claimed it.
+    id: u64,
     /// Requested-layout charge of the paused job, measured when it paused.
     slot_charge: usize,
     /// Cursor page when the paused job last paused or resumed (K10).
@@ -867,6 +881,8 @@ impl Default for CursorState {
             slot_key: None,
             slot_members: BTreeSet::new(),
             join_owners: BTreeMap::new(),
+            reserved: 0,
+            id: NEXT_CURSOR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             slot_charge: 0,
             slot_touched: 0,
             next_token: 1,
@@ -887,6 +903,8 @@ impl HeapLayoutBound for CursorState {
             slot_key,
             slot_members,
             join_owners,
+            reserved,
+            id: _,
             slot_charge,
             slot_touched,
             next_token,
@@ -905,8 +923,10 @@ impl HeapLayoutBound for CursorState {
         }
         slot_key.heap_bound(c)?;
         slot_members.heap_bound(c)?;
-        // Owner strings are visited; member keys are inline u64s.
+        // Owner strings and joined member keys are visited (one each).
         join_owners.heap_bound(c)?;
+        // Outstanding claims count as resident until settled.
+        c.add(*reserved)?;
         slot_touched.heap_bound(c)?;
         next_token.heap_bound(c)?;
         clock.heap_bound(c)?;
@@ -1131,8 +1151,8 @@ impl CursorLease {
         shrink_paused_buffer(&mut job.parser.reader.buf);
         let inputs = job.parser.take_live_reduction_inputs();
         let tee_inputs = job.group.as_mut().and_then(|group| group.take_tee_inputs());
-        let admitted = paused_charge(&job).filter(|charge| self.cache.cursor_make_room(*charge));
-        let Some(charge) = admitted else {
+        let admitted = paused_charge(&job).and_then(|charge| self.cache.cursor_reserve(charge));
+        let Some(credit) = admitted else {
             job.parser.restore_live_reduction_inputs(inputs);
             if let Some(group) = job.group.as_mut() {
                 group.restore_tee_inputs(tee_inputs);
@@ -1174,8 +1194,8 @@ impl CursorLease {
         };
         drop(inputs);
         drop(tee_inputs);
-        record_paused_charge(&mut job, charge);
-        self.store(job, charge, count);
+        record_paused_charge(&mut job, credit.bytes());
+        self.store(job, credit, count);
         PauseEnd::Paused
     }
 
@@ -1185,32 +1205,42 @@ impl CursorLease {
         shrink_paused_buffer(&mut job.parser.reader.buf);
         drop(job.parser.take_live_reduction_inputs());
         drop(job.group.as_mut().and_then(|group| group.take_tee_inputs()));
-        match paused_charge(&job).filter(|charge| self.cache.cursor_make_room(*charge)) {
-            Some(charge) => {
-                record_paused_charge(&mut job, charge);
-                self.store(job, charge, |counters| counters.jobs_frame_returned += 1);
+        match paused_charge(&job).and_then(|charge| self.cache.cursor_reserve(charge)) {
+            Some(credit) => {
+                record_paused_charge(&mut job, credit.bytes());
+                self.store(job, credit, |counters| counters.jobs_frame_returned += 1);
             }
             None => self.end(|cursor| cursor.counters.jobs_lost += 1),
         }
     }
 
-    /// Move the job into the slot this lease holds, then disarm.
-    fn store(self, job: Box<OwnedActiveFile>, charge: usize, count: fn(&mut Counters)) {
+    /// Move the job into the slot this lease holds, then disarm. The credit
+    /// becomes `slot_charge` in the same critical section (atomic swap).
+    fn store(self, job: Box<OwnedActiveFile>, credit: CursorCredit, count: fn(&mut Counters)) {
         let token = self.token;
         let cache = Arc::clone(&self.cache);
         let mut job = Some(job);
+        let mut credit = Some(credit);
         self.end(|cursor| {
             if matches!(cursor.slot, Slot::ActiveElsewhere { token: held } if held == token) {
                 cursor.slot = Slot::Paused(job.take().expect("job moved once"));
-                cursor.slot_charge = charge;
+                let credit = credit.take().expect("credit settled once");
+                cursor.slot_charge = credit.bytes();
+                credit.settle(cursor);
                 cursor.slot_touched = cursor.rotation.page;
                 count(&mut cursor.counters);
             }
         });
-        if job.is_some() {
+        if let Some(job) = job.take() {
             // The slot no longer named this lease (impossible while armed).
             // The path is still pending, so the next page restarts the job.
+            // The unretained job is freed BEFORE its claim is refunded, so no
+            // other admission can spend those bytes while they are allocated.
+            drop(job);
             cache.with_cursor(|cursor| cursor.counters.jobs_lost += 1);
+        }
+        if let Some(credit) = credit {
+            credit.refund();
         }
     }
 
@@ -1606,13 +1636,75 @@ pub(in crate::snapshots) fn read_end(job: &OwnedActiveFile) -> u64 {
         .saturating_add(job.parser.reader.consumed_bytes())
 }
 
-/// First eight bytes of SHA-256 of a path key: L-1 provenance is matched
-/// against the walk's rollout paths through the same digest.
-pub(in crate::snapshots) fn compact_key(key: &str) -> u64 {
-    let digest = Sha256::digest(key.as_bytes());
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(bytes)
+/// Exact byte length of `local_index_key(path)` (`to_string_lossy`: each
+/// valid UTF-8 run as is, one U+FFFD, 3 bytes, per invalid run). No
+/// allocation. None for an empty key, a key with an embedded NUL (the
+/// provenance separator; a `Path` can hold one even though no file can) or
+/// overflow.
+fn join_key_len(path: &Path) -> Option<usize> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.is_empty() || bytes.contains(&0) {
+        return None;
+    }
+    bytes.utf8_chunks().try_fold(0usize, |len, chunk| {
+        len.checked_add(chunk.valid().len())?
+            .checked_add(if chunk.invalid().is_empty() { 0 } else { 3 })
+    })
+}
+
+/// Append exactly `local_index_key(path)`.
+fn push_join_key(out: &mut String, path: &Path) {
+    for chunk in path.as_os_str().as_encoded_bytes().utf8_chunks() {
+        out.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            out.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+}
+
+/// `stored == local_index_key(path)`, without building the key.
+fn join_key_eq(stored: &str, path: &Path) -> bool {
+    let mut rest = stored;
+    for chunk in path.as_os_str().as_encoded_bytes().utf8_chunks() {
+        let Some(after) = rest.strip_prefix(chunk.valid()) else {
+            return false;
+        };
+        rest = after;
+        if !chunk.invalid().is_empty() {
+            let Some(after) = rest.strip_prefix(char::REPLACEMENT_CHARACTER) else {
+                return false;
+            };
+            rest = after;
+        }
+    }
+    rest.is_empty()
+}
+
+/// Length of the members' keys joined by '\0'. None (refuse the provenance)
+/// for an empty list, any empty or NUL-bearing key, or overflow.
+fn join_keys_len(members: &[CandidateFile]) -> Option<usize> {
+    let mut members = members.iter();
+    let first = join_key_len(&members.next()?.path)?;
+    members.try_fold(first, |len, member| {
+        len.checked_add(1)?.checked_add(join_key_len(&member.path)?)
+    })
+}
+
+/// `stored` holds exactly these members, in order. No allocation.
+fn same_join_members(stored: &str, members: &[CandidateFile]) -> bool {
+    let mut stored = stored.split('\0');
+    members.iter().all(|member| {
+        stored
+            .next()
+            .is_some_and(|key| join_key_eq(key, &member.path))
+    }) && stored.next().is_none()
+}
+
+/// A stored member list the release may act on: non-empty, no empty key.
+/// `record_join_owner` never stores anything else; this guards the release
+/// against malformed or partial provenance all the same.
+fn join_members_well_formed(stored: &str) -> bool {
+    !stored.is_empty() && stored.split('\0').all(|key| !key.is_empty())
 }
 
 /// Arm a group job's freshly opened member reader (P2). A sealed member
@@ -1785,9 +1877,247 @@ pub(in crate::snapshots) fn job_files(job: &OwnedActiveFile) -> Vec<&CandidateFi
     }
 }
 
+thread_local! {
+    /// This thread holds the cursor lock (inside `with_cursor`). Always
+    /// compiled: a `CursorCredit` dropped while unwinding out of a cursor
+    /// closure reads it to avoid relocking. Lock-order checks on it are
+    /// debug-only (`debug_assert!`): controls, not proof.
+    static CURSOR_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread holds the cursor lock.
+pub(super) fn cursor_held() -> bool {
+    CURSOR_HELD.with(std::cell::Cell::get)
+}
+
+/// Marks the cursor lock held for its scope. Reset on drop, so an unwind out
+/// of a cursor closure (a `should_panic` test included) clears it.
+struct CursorHeld;
+impl CursorHeld {
+    fn enter() -> Self {
+        // One order: retained, then cursor. A cursor closure must never call
+        // a locking `SharedCache` helper (no recursive locking).
+        debug_assert!(
+            !cursor_held(),
+            "cursor lock taken while this thread holds it"
+        );
+        CURSOR_HELD.with(|held| held.set(true));
+        Self
+    }
+}
+impl Drop for CursorHeld {
+    fn drop(&mut self) {
+        CURSOR_HELD.with(|held| held.set(false));
+    }
+}
+
+/// A claim on the state budget made by `SharedCache::cursor_reserve`,
+/// counted in `CursorState::reserved` until settled. Linear: settle it once,
+/// with `settle` inside the cursor critical section that makes its bytes
+/// resident, or with `refund` outside any. A credit dropped unsettled (an
+/// unwind) refunds itself unless this thread holds the cursor lock, which
+/// the unwind is about to poison. A poisoned cursor is never settled: it
+/// measures as the whole state budget (`cursor_resident`) and admits nothing
+/// (`cursor_reserve`), so a stranded claim oversubscribes nothing.
+///
+/// Single-cache assumption (R2-L1): the held flag is per thread, not per
+/// cache. Production has one process-owned `SharedCache`. A credit of cache B
+/// that unwinds inside cache A's cursor closure skips its refund (relocking B
+/// there would nest two cursor locks, which the one lock order forbids), so
+/// B's claim stays stranded: fail closed (less admission), never
+/// oversubscription. Settling against another cache's state is a programmer
+/// error, caught by `settle`'s debug assert; release builds fail closed.
+#[must_use = "a credit must be settled or refunded"]
+pub(in crate::snapshots) struct CursorCredit {
+    cache: Arc<SharedCache>,
+    cursor: u64,
+    bytes: usize,
+    settled: bool,
+}
+
+impl CursorCredit {
+    pub(in crate::snapshots) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Settle inside the critical section that made the bytes resident (or
+    /// decided they never will be).
+    fn settle(mut self, cursor: &mut CursorState) {
+        debug_assert_eq!(
+            cursor.id, self.cursor,
+            "a credit settles only on its own cache"
+        );
+        self.settled = true;
+        settle_claim(cursor, self.cursor, self.bytes);
+    }
+
+    /// Return the claim. Never call it while holding the cursor lock.
+    fn refund(mut self) {
+        self.settled = true;
+        let (id, bytes) = (self.cursor, self.bytes);
+        self.cache
+            .with_cursor(|cursor| settle_claim(cursor, id, bytes));
+    }
+}
+
+impl Drop for CursorCredit {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        debug_assert!(
+            std::thread::panicking(),
+            "a cursor credit was dropped without being settled"
+        );
+        if cursor_held() {
+            return;
+        }
+        if let Ok(mut cursor) = self.cache.cursor.lock() {
+            let _held = CursorHeld::enter();
+            settle_claim(&mut cursor, self.cursor, self.bytes);
+        }
+    }
+}
+
+/// Checked: a claim that is not outstanding on this state is corrupt
+/// accounting. Fail closed: the state measures unbounded from then on.
+fn settle_claim(cursor: &mut CursorState, id: u64, bytes: usize) {
+    match cursor
+        .reserved
+        .checked_sub(bytes)
+        .filter(|_| cursor.id == id && cursor.reserved != usize::MAX)
+    {
+        Some(rest) => cursor.reserved = rest,
+        None => {
+            cursor.reserved = usize::MAX;
+            debug_assert!(
+                std::thread::panicking(),
+                "cursor credit accounting is corrupt"
+            );
+        }
+    }
+}
+
+/// The least recently recorded join provenance, dropped under the cursor
+/// lock without copying its key. False when there is none.
+fn evict_oldest_join_owner(cursor: &mut CursorState) -> bool {
+    let Some(oldest) = cursor.join_owners.values().map(|(used, _)| *used).min() else {
+        return false;
+    };
+    // Ticks are unique (`tick`), so this drops exactly one entry, in place.
+    cursor.join_owners.retain(|_, (used, _)| *used != oldest);
+    true
+}
+
+/// Whether `charge` fits beside the least the state and the retained cache
+/// can measure after every eviction `admit_locked` may make: the empty
+/// retained cache's own bound (`release_until`'s floor) and, for `mandatory`,
+/// the state without its join provenance (an empty map; bounds are additive
+/// per field). False: no eviction can make room, so none may run.
+fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> bool {
+    use crate::heap_layout_bound::bound;
+    let state = bound(cursor, STATE_BYTES).and_then(|state| {
+        if !mandatory {
+            return Some(state);
+        }
+        let empty = BTreeMap::<String, JoinProvenance>::new();
+        let forgettable =
+            bound(&cursor.join_owners, STATE_BYTES)?.checked_sub(bound(&empty, STATE_BYTES)?)?;
+        state.checked_sub(forgettable)
+    });
+    let floor = bound(&super::RetainedCache::default(), STATE_BYTES);
+    state
+        .zip(floor)
+        .and_then(|(state, floor)| {
+            state_budget()
+                .checked_sub(state)?
+                .checked_sub(charge)?
+                .checked_sub(floor)
+        })
+        .is_some()
+}
+
+/// K6 admission of `charge` more cursor bytes, under both locks (retained,
+/// then cursor): measure the cursor state (outstanding claims included),
+/// then release least-recently-useful retained copies until they fit beside
+/// it. If even an empty retained cache does not fit, `mandatory` (a paused
+/// job: baseline progress) may then forget join provenance, which is
+/// optional and only keeps its owner blocked; optional admissions never take
+/// room that way. Nothing is evicted unless the admission is first proved
+/// feasible (`admission_feasible`, R2-M1): a hopeless charge (a
+/// `JoinStateBound` pause, an optional claim inside the empty-retained floor)
+/// keeps every retained copy and every provenance entry. Unsupported
+/// accounting, overflow or no room: false, nothing admitted.
+fn admit_locked(
+    retained: &mut super::RetainedCache,
+    cursor: &mut CursorState,
+    charge: usize,
+    mandatory: bool,
+) -> bool {
+    if !admission_feasible(cursor, charge, mandatory) {
+        return false;
+    }
+    loop {
+        let Some(state) = crate::heap_layout_bound::bound(&*cursor, STATE_BYTES) else {
+            return false;
+        };
+        let room = state_budget()
+            .checked_sub(state)
+            .and_then(|room| room.checked_sub(charge));
+        if room.is_some_and(|room| retained.release_until(room)) {
+            return true;
+        }
+        // Even an empty retained cache did not fit beside the state (or the
+        // state alone left no room): only a mandatory charge goes on, one
+        // forgotten provenance entry at a time (at most `JOIN_OWNERS`).
+        if !mandatory || !evict_oldest_join_owner(cursor) {
+            return false;
+        }
+    }
+}
+
 impl SharedCache {
     fn with_cursor<T>(&self, run: impl FnOnce(&mut CursorState) -> T) -> Option<T> {
-        self.cursor.lock().ok().map(|mut cursor| run(&mut cursor))
+        // Checked before locking: a relock would deadlock, not panic.
+        debug_assert!(
+            !cursor_held(),
+            "cursor lock taken while this thread holds it"
+        );
+        let mut cursor = self.cursor.lock().ok()?;
+        let _held = CursorHeld::enter();
+        Some(run(&mut cursor))
+    }
+
+    /// K6 reservation for a paused job (mandatory). In one critical section
+    /// under the retained lock, then the cursor lock (never the reverse): admit
+    /// `charge` (`admit_locked`) and claim it in the cursor state, where every
+    /// later measurement (`cursor_resident`, another admission, a retained
+    /// insert) sees it until the credit is settled. None: nothing claimed.
+    fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
+        let mut retained = self.retained().ok()?;
+        let claimed = self
+            .with_cursor(|cursor| {
+                if !admit_locked(&mut retained, cursor, charge, true) {
+                    return None;
+                }
+                cursor.reserved = cursor.reserved.checked_add(charge)?;
+                Some(cursor.id)
+            })
+            .flatten()?;
+        drop(retained);
+        Some(CursorCredit {
+            cache: Arc::clone(self),
+            cursor: claimed,
+            bytes: charge,
+            settled: false,
+        })
+    }
+
+    /// Outstanding claimed bytes (`usize::MAX`: poisoned or corrupt).
+    #[cfg(test)]
+    pub(in crate::snapshots) fn cursor_reserved(&self) -> usize {
+        self.with_cursor(|cursor| cursor.reserved)
+            .unwrap_or(usize::MAX)
     }
 
     /// Requested-layout charge of the paused job.
@@ -1807,27 +2137,6 @@ impl SharedCache {
         self.with_cursor(|cursor| crate::heap_layout_bound::bound(&*cursor, STATE_BYTES))
             .flatten()
             .unwrap_or(STATE_BYTES)
-    }
-
-    /// Release least-recently-useful retained copies until the cursor state
-    /// plus `charge` fits the state budget beside them (K6). False when it
-    /// cannot fit even beside an empty retained cache.
-    fn cursor_make_room(&self, charge: usize) -> bool {
-        let Some(state) = self
-            .with_cursor(|cursor| crate::heap_layout_bound::bound(&*cursor, STATE_BYTES))
-            .flatten()
-        else {
-            return false;
-        };
-        let Some(room) = state_budget()
-            .checked_sub(state)
-            .and_then(|room| room.checked_sub(charge))
-        else {
-            return false;
-        };
-        self.inner
-            .lock()
-            .is_ok_and(|mut retained| retained.release_until(room))
     }
 
     /// Content-free cursor diagnostics for the scan's one completion log
@@ -1994,53 +2303,110 @@ impl SharedCache {
         .unwrap_or(false)
     }
 
-    /// §d.1.3: B blocked `owner` for a queued group of `members`.
+    /// §d.1.3: B blocked `owner` for a queued group of `members`. The exact
+    /// member keys are the L-1 release's deletion authority. Admission,
+    /// construction and commit run in one critical section (retained lock,
+    /// then cursor lock): the entry's accounted size is admitted before any
+    /// byte of it is allocated (optional: it never forgets other provenance or
+    /// a paused job's room for it), so nothing built is ever uncharged and no
+    /// other admission can spend the same room. Refused provenance (malformed
+    /// keys, unsupported accounting, overflow, no room, a poisoned lock) is
+    /// forgotten, which keeps the owner blocked; it never releases one, and
+    /// nothing partial is stored.
     pub(in crate::snapshots) fn record_join_owner(&self, owner: &str, members: &[CandidateFile]) {
-        let keys = members
-            .iter()
-            .map(|member| compact_key(&local_index_key(&member.path)))
-            .collect::<Vec<_>>();
+        // Encoding is checked before anything is reserved or allocated.
+        let charge = join_keys_len(members)
+            .filter(|_| !owner.is_empty())
+            .and_then(|keys_len| {
+                // Requested-layout accounting (the supported toolchain's
+                // contract, as every cursor charge): a new map node, the owner
+                // key (`with_capacity(len)`, exact) and the joined keys
+                // (`with_capacity(keys_len)`, filled exactly, never regrown).
+                let charge = crate::heap_layout_bound::tree_node_bytes::<String, JoinProvenance>()?
+                    .checked_add(owner.len())?
+                    .checked_add(keys_len)?;
+                Some((charge, keys_len))
+            });
+        let Some((charge, keys_len)) = charge else {
+            self.with_cursor(|cursor| cursor.join_owners.remove(owner));
+            return;
+        };
+        let Ok(mut retained) = self.retained() else {
+            self.with_cursor(|cursor| cursor.join_owners.remove(owner));
+            return;
+        };
         self.with_cursor(|cursor| {
             let used = cursor.tick();
-            if !cursor.join_owners.contains_key(owner) && cursor.join_owners.len() >= JOIN_OWNERS {
-                // Forgetting the least recent provenance only keeps that owner
-                // blocked (today's behavior); it never releases one.
-                if let Some(oldest) = cursor
-                    .join_owners
-                    .iter()
-                    .min_by_key(|(_, (used, _))| *used)
-                    .map(|(owner, _)| owner.clone())
-                {
-                    cursor.join_owners.remove(&oldest);
+            // Unchanged membership: refresh recency; nothing is built.
+            if let Some((tick, stored)) = cursor.join_owners.get_mut(owner) {
+                if same_join_members(stored, members) {
+                    *tick = used;
+                    return;
                 }
             }
-            cursor.join_owners.insert(owner.to_owned(), (used, keys));
+            if !admit_locked(&mut retained, cursor, charge, false) {
+                cursor.join_owners.remove(owner);
+                return;
+            }
+            // Construction, within the admitted charge. While it runs the old
+            // entry (if any) stays counted beside it: the overlap is charged.
+            let mut keys = String::with_capacity(keys_len);
+            for (position, member) in members.iter().enumerate() {
+                if position > 0 {
+                    keys.push('\0');
+                }
+                push_join_key(&mut keys, &member.path);
+            }
+            let replacing = cursor.join_owners.contains_key(owner);
+            let built = crate::heap_layout_bound::tree_node_bytes::<String, JoinProvenance>()
+                .and_then(|node| node.checked_add(if replacing { 0 } else { owner.len() }))
+                .and_then(|bytes| bytes.checked_add(keys.capacity()));
+            if keys.len() != keys_len || !built.is_some_and(|built| built <= charge) {
+                // Outside the accounting contract: refuse, freed here.
+                cursor.join_owners.remove(owner);
+                return;
+            }
+            // Commit. Replacing keeps the stored owner key (no copy); a new
+            // owner at the cap first forgets the least recent provenance, which
+            // only keeps that owner blocked. Replaced or evicted bytes are freed
+            // here, under the lock that counted them.
+            if let Some(entry) = cursor.join_owners.get_mut(owner) {
+                *entry = (used, keys);
+            } else {
+                if cursor.join_owners.len() >= JOIN_OWNERS {
+                    evict_oldest_join_owner(cursor);
+                }
+                cursor.join_owners.insert(owner.to_owned(), (used, keys));
+            }
         });
     }
 
-    /// L-1: owners whose every recorded member is absent from `present`
-    /// (compact keys of the completed walk's rollout paths) and for which
-    /// `keep` is false. Their provenance is dropped with the release.
+    /// L-1: every owner whose recorded member keys are all absent from
+    /// `census` (exact `local_index_key` equality) and for which `keep` is
+    /// false is removed, and `release(owner, its recorded member keys)` runs
+    /// for it, all under the cursor lock; each entry is freed there, so no
+    /// released bytes outlive their charge and nothing is copied out.
+    /// Malformed or empty provenance is never released. Neither closure may
+    /// call a `SharedCache` method (enforced in debug builds). A poisoned
+    /// cursor releases nothing, which keeps every owner blocked.
     pub(in crate::snapshots) fn release_join_owners(
         &self,
-        present: &BTreeSet<u64>,
+        census: &BTreeSet<String>,
         keep: impl Fn(&str) -> bool,
-    ) -> Vec<String> {
+        mut release: impl FnMut(&str, std::str::Split<'_, char>),
+    ) {
         self.with_cursor(|cursor| {
-            let released = cursor
-                .join_owners
-                .iter()
-                .filter(|(owner, (_, members))| {
-                    !keep(owner) && members.iter().all(|member| !present.contains(member))
-                })
-                .map(|(owner, _)| owner.clone())
-                .collect::<Vec<_>>();
-            for owner in &released {
-                cursor.join_owners.remove(owner);
-            }
-            released
-        })
-        .unwrap_or_default()
+            // In place: `release` reads the entry, which `retain` then drops.
+            cursor.join_owners.retain(|owner, (_, members)| {
+                let departed = join_members_well_formed(members)
+                    && !keep(owner.as_str())
+                    && members.split('\0').all(|member| !census.contains(member));
+                if departed {
+                    release(owner.as_str(), members.split('\0'));
+                }
+                !departed
+            });
+        });
     }
 
     /// The disclosure of a parked `JoinStateBound` file that is the same
@@ -2535,11 +2901,17 @@ impl SharedCache {
             if cursor.memo.insert(key, entry) {
                 cursor.counters.memo_records += 1;
             }
+            // `insert` changes the map either way (insert, evict, or remove).
+            cursor.memo.publish_resident();
         });
     }
 
     pub(in crate::snapshots) fn memo_forget(&self, key: &str) {
-        self.with_cursor(|cursor| cursor.memo.remove(key));
+        self.with_cursor(|cursor| {
+            if cursor.memo.remove(key) {
+                cursor.memo.publish_resident();
+            }
+        });
     }
 }
 
@@ -3249,10 +3621,45 @@ pub(in crate::snapshots) struct Disclosure {
     pub(in crate::snapshots) state_only_blocked_session_ids: Vec<String>,
     pub(in crate::snapshots) diagnostic_reason: FileReason,
     pub(in crate::snapshots) parsed_snapshot_count: usize,
+    /// The fresh held parse's line and drop totals, replayed on a hit.
+    pub(in crate::snapshots) held: HeldCounts,
+    /// The parse's parent request, replayed on a hit (same 256 rule).
+    pub(in crate::snapshots) parent_ref: Option<String>,
 }
 crate::heap_layout_bound::fields!(Disclosure; reason, ownership_incomplete_file_count,
     zero_snapshot_usage_evidence, state_only_blocked_session_ids, diagnostic_reason,
-    parsed_snapshot_count);
+    parsed_snapshot_count, held, parent_ref);
+
+/// PR-1: the line and drop totals a fresh held parse adds to the census,
+/// replayed on a hit. All inline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct HeldCounts {
+    pub(in crate::snapshots) over_line_cap: usize,
+    pub(in crate::snapshots) recognized_usage_drop: usize,
+    pub(in crate::snapshots) dropped_usage_record: u64,
+    /// `ParsedJsonlFile::terminal_line_loss_count`.
+    pub(in crate::snapshots) terminal_line_loss: usize,
+}
+crate::heap_layout_bound::fields!(HeldCounts; over_line_cap, recognized_usage_drop,
+    dropped_usage_record, terminal_line_loss);
+
+/// PR-1: what the held classification depended on in its parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct ParentDep {
+    pub(in crate::snapshots) id: String,
+    /// The ledger identity the classification used (`None`: none was used).
+    pub(in crate::snapshots) ledger: Option<String>,
+    /// The parent's opened identity at record time: the identity the
+    /// after-parse fence just proved when a ledger was used, else the probe.
+    pub(in crate::snapshots) current: Option<String>,
+}
+crate::heap_layout_bound::fields!(ParentDep; id, ledger, current);
+
+/// The parent's state at lookup: the index ledger identity and the probe.
+pub(in crate::snapshots) struct ParentNow {
+    pub(in crate::snapshots) ledger: Option<String>,
+    pub(in crate::snapshots) current: Option<String>,
+}
 
 /// Strict debt of a job that ended without a publishable result
 /// (`JoinStateBound`, `MemberChanged`): its owner is blocked, the prior body
@@ -3271,6 +3678,8 @@ fn strict_disclosure(
         state_only_blocked_session_ids: owner.into_iter().collect(),
         diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
+        held: HeldCounts::default(),
+        parent_ref: None,
     }
 }
 
@@ -3294,28 +3703,32 @@ pub(in crate::snapshots) struct MemoEntry {
     live: Option<LiveWitness>,
     /// The held file's stamp when recorded or last matched.
     stamp: OpenStamp,
-    /// Parent ref and its ledger identity: a new or changed parent ledger
-    /// is peer evidence that can cure an ambiguous-fork hold.
-    parent: Option<(String, Option<String>)>,
+    /// Parent ref, the ledger identity used, and the parent's opened
+    /// identity: a new or changed parent ledger or parent object is peer
+    /// evidence that can change the hold.
+    parent: Option<ParentDep>,
     /// `sidecar_fingerprint` when recorded, for holds sidecar evidence can
     /// cure (`sidecar_wakes`).
     sidecar: Option<String>,
     /// The hold may be cured by the file catching up with its sidecar
     /// extent (`growth_may_cure`): only the exact recorded stamp is a hit.
     exact_stamp: bool,
+    /// This parse produced a `scan_complete` ledger of its own, so a re-read
+    /// as a referenced parent would insert it.
+    own_ledger: bool,
     disclosure: Disclosure,
     used: u64,
     charge: usize,
 }
 crate::heap_layout_bound::fields!(MemoEntry; digest, live, stamp, parent, sidecar, exact_stamp,
-    disclosure, used, charge);
+    own_ledger, disclosure, used, charge);
 
 impl MemoEntry {
     pub(in crate::snapshots) fn new(
         digest: String,
         live: LiveWitness,
         stamp: OpenStamp,
-        parent: Option<(String, Option<String>)>,
+        parent: Option<ParentDep>,
         sidecar: Option<String>,
         disclosure: Disclosure,
     ) -> Self {
@@ -3328,7 +3741,7 @@ impl MemoEntry {
         digest: String,
         live: Option<LiveWitness>,
         stamp: OpenStamp,
-        parent: Option<(String, Option<String>)>,
+        parent: Option<ParentDep>,
         sidecar: Option<String>,
         disclosure: Disclosure,
     ) -> Self {
@@ -3339,6 +3752,7 @@ impl MemoEntry {
             parent,
             sidecar,
             exact_stamp: false,
+            own_ledger: false,
             disclosure,
             used: 0,
             charge: 0,
@@ -3351,23 +3765,55 @@ impl MemoEntry {
         self
     }
 
+    /// This parse produced a `scan_complete` ledger of its own. Always
+    /// false for an ownership-incomplete parse today (its ledger is cleared);
+    /// a guard should that change.
+    pub(in crate::snapshots) fn own_ledger(mut self, own_ledger: bool) -> Self {
+        self.own_ledger = own_ledger;
+        self
+    }
+
+    pub(in crate::snapshots) fn has_own_ledger(&self) -> bool {
+        self.own_ledger
+    }
+
     pub(in crate::snapshots) fn disclosure(&self) -> &Disclosure {
         &self.disclosure
     }
 
     pub(in crate::snapshots) fn parent_ref(&self) -> Option<&str> {
-        self.parent.as_ref().map(|(parent, _)| parent.as_str())
+        self.parent.as_ref().map(|dep| dep.id.as_str())
     }
 
-    /// Every wake dependency is unchanged, the held file only grew or is
-    /// untouched since its stamp, and the live witness still holds at the
-    /// refused offset. Growth past that offset is a hit. Returns the current
-    /// stamp on a hit.
+    /// Every wake dependency except the stamp holds.
+    fn dependencies_hold(
+        &self,
+        digest: &str,
+        file: &File,
+        parent_now: Option<&ParentNow>,
+        sidecar_now: &str,
+    ) -> bool {
+        self.digest == digest
+            && self.parent.as_ref().map_or(true, |dep| {
+                parent_now.is_some_and(|now| dep.ledger == now.ledger && dep.current == now.current)
+            })
+            && self
+                .sidecar
+                .as_deref()
+                .map_or(true, |sidecar| sidecar == sidecar_now)
+            && self.live.as_ref().map_or(true, |live| {
+                LiveWitness::read(file, live.offset).as_ref() == Some(live)
+            })
+    }
+
+    /// Every wake dependency is unchanged, the held file is untouched since
+    /// its stamp (or only grew, for a non-exact group entry), and the live
+    /// witness still holds. Returns the current stamp on a hit.
     pub(in crate::snapshots) fn matches(
         &self,
         digest: &str,
         file: &File,
-        parent_ledger: Option<String>,
+        parent_now: Option<&ParentNow>,
         sidecar_now: &str,
     ) -> Option<OpenStamp> {
         let now = OpenStamp::capture(file).ok()?;
@@ -3376,20 +3822,25 @@ impl MemoEntry {
         } else {
             self.stamp.append_compatible(&now)
         };
-        (self.digest == digest
-            && stamp_holds
-            && self
-                .parent
-                .as_ref()
-                .map_or(true, |(_, ledger)| *ledger == parent_ledger)
-            && self
-                .sidecar
-                .as_deref()
-                .map_or(true, |sidecar| sidecar == sidecar_now)
-            && self.live.as_ref().map_or(true, |live| {
-                LiveWitness::read(file, live.offset).as_ref() == Some(live)
-            }))
-        .then_some(now)
+        (stamp_holds && self.dependencies_hold(digest, file, parent_now, sidecar_now))
+            .then_some(now)
+    }
+
+    /// L-2: an exact entry whose file only grew while every other wake input
+    /// held (the re-read a counted tail would save): the current extent.
+    pub(in crate::snapshots) fn grew_past_exact(
+        &self,
+        digest: &str,
+        file: &File,
+        parent_now: Option<&ParentNow>,
+        sidecar_now: &str,
+    ) -> Option<u64> {
+        let now = OpenStamp::capture(file).ok()?;
+        (self.exact_stamp
+            && now != self.stamp
+            && self.stamp.append_compatible(&now)
+            && self.dependencies_hold(digest, file, parent_now, sidecar_now))
+        .then(|| now.extent())
     }
 }
 
@@ -3446,8 +3897,19 @@ impl SingletonMemo {
         }
     }
 
-    fn remove(&mut self, key: &str) {
-        self.entries.remove(key);
+    fn remove(&mut self, key: &str) -> bool {
+        self.entries.remove(key).is_some()
+    }
+
+    /// L-2 gauge: the memo's measured bytes (the per-entry charges). O(entries
+    /// <= MEMO_ENTRIES), under the cursor lock already held. The entry count
+    /// is `CodexCursorRetained.memo_entries`.
+    fn publish_resident(&self) {
+        let bytes = self
+            .entries
+            .values()
+            .fold(0_u64, |sum, entry| sum.saturating_add(entry.charge as u64));
+        crate::local_resource_diagnostics::codex_memo_lifecycle::set_resident(bytes);
     }
 }
 
@@ -3472,7 +3934,7 @@ pub(in crate::snapshots) fn memo_digest(
 ) -> Option<String> {
     let stamp = OpenStamp::capture(file).ok()?;
     Some(sha256_hex(&[
-        "codex_singleton_memo:v2",
+        "codex_singleton_memo:v3",
         CODEX_JOIN_PROOF_VERSION,
         SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
@@ -3484,6 +3946,20 @@ pub(in crate::snapshots) fn memo_digest(
             .as_deref()
             .unwrap_or("none"),
         counting,
+        // PR-1: the tier receipt configures the parse
+        // (`configure_tier_replay`), contents included.
+        &{
+            let (receipt, required) = crate::snapshots::codex_file_join::receipt_state(
+                index.files.get(&local_index_key(&candidate.path)),
+            );
+            let receipt = receipt.map_or_else(
+                || "none".to_owned(),
+                |receipt| {
+                    serde_json::to_string(&receipt).unwrap_or_else(|_| "unserializable".to_owned())
+                },
+            );
+            format!("receipt:{required}:{receipt}")
+        },
         dependencies,
         // Class 7: an identity conflict on a candidate changes the blocked
         // ids of any hold, sidecar-woken or not.
@@ -3581,6 +4057,19 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
             .codex_state_only_blocked_session_ids
             .insert(session_id);
     }
+    // L-SB: a settleable disclosure is this key's whole latest parse; a
+    // strict one keeps the prior body, so it keeps the prior attribution
+    // plus its owner.
+    let blocked = disclosure
+        .state_only_blocked_session_ids
+        .iter()
+        .map(|session_id| resolve_codex_identity(session_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    if settleable {
+        index.attribute_codex_blocked(&index_key, blocked);
+    } else {
+        index.extend_codex_blocked_attribution(&index_key, blocked);
+    }
     targets.pending_finalization.push(PendingIndexFinalization {
         sampled_audit_verified: false,
         codex_pending_recovery: index
@@ -3601,6 +4090,34 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
             disclosure.ownership_incomplete_file_count;
         targets.census.zero_snapshot_usage_evidence_count +=
             usize::from(disclosure.zero_snapshot_usage_evidence);
+        // PR-1: the fresh finish's line and drop totals.
+        let held = &disclosure.held;
+        targets.census.over_line_cap_count += held.over_line_cap;
+        targets.census.recognized_usage_drop_count += held.recognized_usage_drop;
+        targets.census.dropped_usage_record_count = targets
+            .census
+            .dropped_usage_record_count
+            .saturating_add(held.dropped_usage_record);
+        if held.terminal_line_loss > 0 {
+            let loss = held.terminal_line_loss;
+            targets.census.terminal_over_line_cap_count = targets
+                .census
+                .terminal_over_line_cap_count
+                .saturating_add(loss);
+            targets.census.terminal_recognized_usage_drop_count = targets
+                .census
+                .terminal_recognized_usage_drop_count
+                .saturating_add(loss);
+            targets.census.terminal_dropped_usage_record_count = targets
+                .census
+                .terminal_dropped_usage_record_count
+                .saturating_add(loss as u64);
+        }
+        // PR-1: a memo hit is this child's parent request too (refs are
+        // cleared on index reset).
+        if let Some(parent) = disclosure.parent_ref.as_deref() {
+            index.record_codex_parent_ref(parent);
+        }
     } else {
         targets
             .census

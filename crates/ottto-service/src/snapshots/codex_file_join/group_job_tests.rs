@@ -199,6 +199,18 @@ fn sampled_at(
     cache: &Arc<SharedCache>,
     collected_at: &str,
 ) -> (ScanIndex, SourceScanResult) {
+    sampled_in(root, index, limit, cache, collected_at, "group-fixture")
+}
+
+/// `sampled_at` in scan namespace `scope`.
+fn sampled_in(
+    root: &Path,
+    index: ScanIndex,
+    limit: usize,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    scope: &str,
+) -> (ScanIndex, SourceScanResult) {
     let mut owned = OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root.join("sessions")],
@@ -212,7 +224,7 @@ fn sampled_at(
         false,
         false,
     )
-    .with_sampled_acquisition(Arc::clone(cache), Scope("group-fixture".into()));
+    .with_sampled_acquisition(Arc::clone(cache), Scope(scope.into()));
     for _ in 0..100_000 {
         match owned.step(None) {
             OwnedSourceScanStep::Pending(next) => owned = next,
@@ -1071,6 +1083,7 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
             with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache));
         let bound = counters(&cache);
         assert_eq!(bound.jobs_state_bound, 1, "{bound:?}");
+        assert_eq!(cache.cursor_reserved(), 0);
         assert_eq!(bound.groups_started, 1, "{bound:?}");
         assert!(first.snapshots.is_empty());
         assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
@@ -1993,4 +2006,424 @@ fn active_cutover_resume_follows_every_member_ack() {
         );
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+// #641 L-1 join release (H1-H9): J-T2..J-T6 and J-T12 beside J-T1 above.
+
+/// `owner` is blocked: no state-only body publishes for it.
+fn held_owner(index: &ScanIndex, owner: &str) -> bool {
+    index.codex_state_only_blocked_session_ids.contains(owner)
+}
+
+fn session_key(root: &Path, name: &str) -> String {
+    local_index_key(&root.join("sessions").join(name))
+}
+
+/// The owners whose block `key`'s latest disclosure holds.
+fn claims(index: &ScanIndex, key: &str) -> Option<BTreeSet<String>> {
+    index.codex_state_only_blocked_by_file.get(key).cloned()
+}
+
+/// J-T1's steps after its first page: members `a` and `b` leave, then later
+/// generations walk the corpus until `done` (at most 8 pages).
+fn walk_without_members(
+    root: &Path,
+    mut index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    done: impl Fn(&ScanIndex) -> bool,
+) -> ScanIndex {
+    fs::remove_file(root.join("sessions/a.jsonl")).unwrap();
+    fs::remove_file(root.join("sessions/b.jsonl")).unwrap();
+    index.traversal = None;
+    for _ in 0..8 {
+        let (next, _) = sampled(root, index, 10, cache);
+        index = next;
+        if done(&index) {
+            break;
+        }
+    }
+    index
+}
+
+/// J-T1's fixture after its first page: `OWNER` blocked by its refused group.
+fn refused_first_page(cache: &Arc<SharedCache>) -> (PathBuf, ScanIndex) {
+    let root = refused_fixture();
+    write_rows(
+        &root.join("sessions/c.jsonl"),
+        &member(OTHER, "healthy", 100, 100),
+    );
+    let (index, _) = sampled(&root, ScanIndex::default(), 10, cache);
+    assert!(held_owner(&index, OWNER));
+    (root, index)
+}
+
+/// J-T2: the release removes only the recorded members' claims on the
+/// owner. A departed non-member key (never on disk, so never in the census)
+/// keeps its claim, and with it the owner's block.
+#[test]
+fn join_release_keeps_a_non_member_claim_on_the_same_owner() {
+    let cache = Arc::new(SharedCache::default());
+    let (root, mut index) = refused_first_page(&cache);
+    let [a, b, n] = ["a.jsonl", "b.jsonl", "n.jsonl"].map(|name| session_key(&root, name));
+    index
+        .codex_state_only_blocked_by_file
+        .insert(n.clone(), BTreeSet::from([OWNER.to_owned()]));
+    let index = walk_without_members(&root, index, &cache, |index| {
+        !claims(index, &a).is_some_and(|owners| owners.contains(OWNER))
+    });
+    for key in [&a, &b] {
+        assert!(
+            !claims(&index, key).is_some_and(|owners| owners.contains(OWNER)),
+            "the member's own claim is released"
+        );
+    }
+    assert_eq!(claims(&index, &n), Some(BTreeSet::from([OWNER.to_owned()])));
+    assert!(
+        held_owner(&index, OWNER),
+        "the non-member claim still holds it"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+thread_local! {
+    /// J-T3: `(from, to)`: the posted compact key of `from` is `to`'s.
+    static FORCE_COLLISION: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Main's `compact_key` body, test-local, with the forced collision.
+fn posted_compact_key(key: &str) -> u64 {
+    let key = FORCE_COLLISION.with(|forced| match &*forced.borrow() {
+        Some((from, to)) if from == key => to.clone(),
+        _ => key.to_owned(),
+    });
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(key.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+/// A clean walk's traversal whose census is exactly `census`.
+fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoint {
+    crate::snapshots::ScanTraversalCheckpoint {
+        context_fingerprint: "join-release-fixture".to_string(),
+        census_window_end: "2026-10-06T23:00:00Z".to_string(),
+        scan_roots: Vec::new(),
+        pending_directories: std::collections::VecDeque::new(),
+        pending_candidates: std::collections::VecDeque::new(),
+        observed_index_keys: BTreeSet::new(),
+        codex_rollout_paths: census.iter().map(|key| (*key).to_owned()).collect(),
+        codex_join_directory_census: None,
+        reconciliation_upper_bound: None,
+        reconciliation_after: None,
+        reconciliation_started: false,
+        watcher_hint_seen: false,
+        codex_parent_resolution_retry_required: false,
+        unhealthy_retry_attempt: 0,
+        unhealthy_retry_not_before_unix_seconds: None,
+        counts: crate::snapshots::ScanTraversalCounts::default(),
+        residue: crate::snapshots::ScanTraversalResidue::default(),
+    }
+}
+
+/// `OWNER` recorded for members `a` and `b` (both claiming it, blocked),
+/// beside a departed non-member claim `n`.
+fn recorded_release_fixture(cache: &SharedCache) -> (ScanIndex, [String; 3]) {
+    let members = [candidate("a.jsonl", 100), candidate("b.jsonl", 200)];
+    cache.record_join_owner(OWNER, &members);
+    let keys = [
+        local_index_key(&members[0].path),
+        local_index_key(&members[1].path),
+        local_index_key(Path::new("/fixture/sessions/n.jsonl")),
+    ];
+    let mut index = ScanIndex::default();
+    for key in &keys {
+        index
+            .codex_state_only_blocked_by_file
+            .insert(key.clone(), BTreeSet::from([OWNER.to_owned()]));
+    }
+    index
+        .codex_state_only_blocked_session_ids
+        .insert(OWNER.to_owned());
+    (index, keys)
+}
+
+/// J-T3: a forced compact-key collision (`n` digests as member `a`) makes
+/// the posted digest filter select the non-member `n`; the amended release
+/// matches exact keys, so the collision has nothing to act on.
+#[test]
+fn forced_compact_key_collision_cannot_remove_a_non_member_claim() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, [a, b, n]) = recorded_release_fixture(&cache);
+    let census = "/fixture/sessions/c.jsonl";
+    index.traversal = Some(census_traversal(&[census]));
+    FORCE_COLLISION.with(|forced| *forced.borrow_mut() = Some((n.clone(), a.clone())));
+    // The posted (B) filter, verbatim, on this state.
+    let members = [&a, &b].map(|key| posted_compact_key(key.as_str()));
+    let present = BTreeSet::from([posted_compact_key(census)]);
+    let selected = index
+        .codex_state_only_blocked_by_file
+        .keys()
+        .filter(|key| {
+            members.contains(&posted_compact_key(key.as_str()))
+                && !present.contains(&posted_compact_key(key.as_str()))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(selected.contains(&n), "the forced collision is real");
+    crate::snapshots::release_departed_join_owners(&mut index, &cache, |_| false);
+    FORCE_COLLISION.with(|forced| *forced.borrow_mut() = None);
+    assert_eq!(claims(&index, &a), None);
+    assert_eq!(claims(&index, &b), None);
+    assert_eq!(claims(&index, &n), Some(BTreeSet::from([OWNER.to_owned()])));
+    assert!(held_owner(&index, OWNER));
+}
+
+/// J-T4 (a): an unclean walk (a rejected symlink) releases nothing.
+#[test]
+fn join_release_waits_for_a_clean_census() {
+    let cache = Arc::new(SharedCache::default());
+    let (root, index) = refused_first_page(&cache);
+    let before = [session_key(&root, "a.jsonl"), session_key(&root, "b.jsonl")]
+        .map(|key| claims(&index, &key));
+    assert!(before
+        .iter()
+        .all(|owners| owners.as_ref().is_some_and(|owners| owners.contains(OWNER))));
+    std::os::unix::fs::symlink(
+        root.join("sessions/c.jsonl"),
+        root.join("sessions/link.jsonl"),
+    )
+    .unwrap();
+    let index = walk_without_members(&root, index, &cache, |_| false);
+    assert!(held_owner(&index, OWNER));
+    let after = [session_key(&root, "a.jsonl"), session_key(&root, "b.jsonl")]
+        .map(|key| claims(&index, &key));
+    assert_eq!(after, before);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// J-T4 (b): an inventoried header naming the owner keeps it (main's `keep`).
+#[test]
+fn join_release_keeps_an_owner_a_header_still_names() {
+    let cache = Arc::new(SharedCache::default());
+    let (root, index) = refused_first_page(&cache);
+    let before = [session_key(&root, "a.jsonl"), session_key(&root, "b.jsonl")]
+        .map(|key| claims(&index, &key));
+    assert!(before
+        .iter()
+        .all(|owners| owners.as_ref().is_some_and(|owners| owners.contains(OWNER))));
+    write_rows(
+        &root.join("sessions/d.jsonl"),
+        &member(OWNER, "single", 100, 100),
+    );
+    let index = walk_without_members(&root, index, &cache, |_| false);
+    assert!(held_owner(&index, OWNER));
+    let after = [session_key(&root, "a.jsonl"), session_key(&root, "b.jsonl")]
+        .map(|key| claims(&index, &key));
+    assert_eq!(after, before);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// J-T5: releasing `OWNER` removes only its claims: `OTHER`'s claim on the
+/// same member key and its block survive; an emptied key is removed.
+#[test]
+fn join_release_of_one_owner_never_deletes_another() {
+    let cache = Arc::new(SharedCache::default());
+    let (root, mut index) = refused_first_page(&cache);
+    let [a, b] = ["a.jsonl", "b.jsonl"].map(|name| session_key(&root, name));
+    index
+        .codex_state_only_blocked_by_file
+        .entry(a.clone())
+        .or_default()
+        .insert(OTHER.to_owned());
+    index
+        .codex_state_only_blocked_session_ids
+        .insert(OTHER.to_owned());
+    let index = walk_without_members(&root, index, &cache, |index| !held_owner(index, OWNER));
+    assert!(!held_owner(&index, OWNER), "B's provenance releases it");
+    assert_eq!(claims(&index, &a), Some(BTreeSet::from([OTHER.to_owned()])));
+    assert!(held_owner(&index, OTHER));
+    assert_eq!(claims(&index, &b), None);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// J-T6: provenance refused at admission (no room) is never recorded, so
+/// the owner stays blocked when its members leave (J-T1 is the control).
+#[test]
+fn join_provenance_refused_at_admission_keeps_the_owner_blocked() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let root = refused_fixture();
+    write_rows(
+        &root.join("sessions/c.jsonl"),
+        &member(OTHER, "healthy", 100, 100),
+    );
+    let (index, _) = with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache));
+    assert!(held_owner(&index, OWNER));
+    let index = walk_without_members(&root, index, &cache, |_| false);
+    assert!(held_owner(&index, OWNER));
+    for name in ["a.jsonl", "b.jsonl"] {
+        assert!(
+            claims(&index, &session_key(&root, name)).is_some_and(|owners| owners.contains(OWNER))
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// R2-M1: J-T1's parity holds under one oversized job. A later group whose
+/// pause can never fit (`JoinStateBound`, another root on the same cache)
+/// forgets no provenance, so `OWNER` is still released when its members
+/// leave. Before the fix the hopeless reserve evicted every entry first.
+#[test]
+fn hopeless_pause_keeps_join_provenance_for_the_release() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const BIG: &str = "33333333-cccc-4ccc-8ccc-333333333333";
+    let cache = Arc::new(SharedCache::default());
+    let (root, index) = refused_first_page(&cache);
+    let big = temp_root("hopeless-pause");
+    write_rows(
+        &big.join("sessions/a.jsonl"),
+        &chain_rows(BIG, "a", "2026-10-01T10:00:00Z", 0, 30),
+    );
+    write_rows(
+        &big.join("sessions/b.jsonl"),
+        &chain_rows(BIG, "b", "2026-10-01T10:30:00Z", 300, 30),
+    );
+    let _ = with_test_limits(2048, 1024, 64, || {
+        with_test_state_budget(1, || sampled(&big, ScanIndex::default(), 10, &cache))
+    });
+    assert_eq!(counters(&cache).jobs_state_bound, 1);
+    assert_eq!(cache.cursor_reserved(), 0);
+    let index = walk_without_members(&root, index, &cache, |index| !held_owner(index, OWNER));
+    assert!(
+        !held_owner(&index, OWNER),
+        "the hopeless pause left B's provenance in place"
+    );
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(big).unwrap();
+}
+
+/// R2-L4: the release's paused-job keep arm, at scan level. A live paused
+/// group job of `OWNER` in another namespace (K10 leaves it in the slot)
+/// keeps `OWNER` blocked although its recorded members left a clean walk
+/// (J-T1 is the control: without the arm, the same walk releases it). The queued and active arms cannot be isolated
+/// here: a queued or active group's members are in this walk, so their
+/// headers hold the owner first.
+#[test]
+fn join_release_keeps_the_paused_group_owner() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let paged = paged_corpus("paused-keep");
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for _ in 0..256 {
+            let (next, _) = sampled_in(
+                &paged,
+                index,
+                10,
+                &cache,
+                "2026-10-06T23:00:00Z",
+                "paused-keep",
+            );
+            index = next;
+            if counters(&cache).jobs_paused > 0 {
+                return;
+            }
+        }
+        panic!("no pause: {:?}", counters(&cache));
+    });
+    assert_eq!(cache.cursor_group_owner().as_deref(), Some(OWNER));
+    // Recorded last, so `OWNER`'s provenance names `root`'s members (the
+    // paused group's queueing recorded its own members first).
+    let (root, index) = refused_first_page(&cache);
+    let index = walk_without_members(&root, index, &cache, |_| false);
+    assert_eq!(
+        cache.cursor_group_owner().as_deref(),
+        Some(OWNER),
+        "the foreign paused job is still live: {:?}",
+        counters(&cache)
+    );
+    // F8 re-blocks a paused owner every page, so the arm shows in the
+    // members' claims: the release would have removed them (J-T2).
+    assert!(held_owner(&index, OWNER));
+    for name in ["a.jsonl", "b.jsonl"] {
+        assert!(
+            claims(&index, &session_key(&root, name)).is_some_and(|owners| owners.contains(OWNER)),
+            "the paused group kept {name}'s claim"
+        );
+    }
+    // Tail control (delta L-a): once the foreign job goes stale (K10: 16
+    // cursor pages) this namespace's resume evicts it, and the next clean
+    // walk releases the same claims. So the provenance named `root`'s
+    // members all along, and only the paused arm kept it.
+    let owned = |index: &ScanIndex, name: &str| {
+        claims(index, &session_key(&root, name)).is_some_and(|owners| owners.contains(OWNER))
+    };
+    let mut index = index;
+    for _ in 0..24 {
+        index.traversal = None;
+        let (next, _) = sampled(&root, index, 10, &cache);
+        index = next;
+        if !owned(&index, "a.jsonl") {
+            break;
+        }
+    }
+    assert_eq!(cache.cursor_group_owner(), None, "{:?}", counters(&cache));
+    for name in ["a.jsonl", "b.jsonl"] {
+        assert!(!owned(&index, name), "released once the job left: {name}");
+    }
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(paged).unwrap();
+}
+
+/// J-T12: a missing traversal skips the release (never an empty census) and
+/// keeps the provenance; with a census lacking the members the same call
+/// releases the owner exactly once and puts the traversal back unchanged.
+#[test]
+fn join_release_skips_a_missing_traversal() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, [a, b, n]) = recorded_release_fixture(&cache);
+    index.codex_state_only_blocked_by_file.remove(&n);
+    crate::snapshots::release_departed_join_owners(&mut index, &cache, |_| false);
+    assert!(index.traversal.is_none());
+    assert!(held_owner(&index, OWNER));
+    for key in [&a, &b] {
+        assert_eq!(
+            claims(&index, key),
+            Some(BTreeSet::from([OWNER.to_owned()]))
+        );
+    }
+    // Control: the provenance survived the skip.
+    index.traversal = Some(census_traversal(&["/fixture/sessions/c.jsonl"]));
+    let traversal = serde_json::to_value(index.traversal.as_ref()).unwrap();
+    crate::snapshots::release_departed_join_owners(&mut index, &cache, |_| false);
+    assert_eq!(
+        serde_json::to_value(index.traversal.as_ref()).unwrap(),
+        traversal
+    );
+    assert!(!held_owner(&index, OWNER));
+    assert_eq!(claims(&index, &a), None);
+    assert_eq!(claims(&index, &b), None);
+    // Released once: the provenance went with it.
+    index
+        .codex_state_only_blocked_by_file
+        .insert(a.clone(), BTreeSet::from([OWNER.to_owned()]));
+    index
+        .codex_state_only_blocked_session_ids
+        .insert(OWNER.to_owned());
+    crate::snapshots::release_departed_join_owners(&mut index, &cache, |_| false);
+    assert!(held_owner(&index, OWNER));
+    assert_eq!(cache.cursor_reserved(), 0);
 }
