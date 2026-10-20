@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 718,
-  "content_sha256": "ce256d1b98d8fe6fe935325eb68a57aeaaf9dfd0a64ded3d791621c5bc163d72",
+  "content_sha256": "422d71dcd19b3f1d629542a240be72ea21cbfb1701d5982129727117a368576b",
   "files": [
     {
       "executable": false,
@@ -1273,8 +1273,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/permanent_finish_pipeline_tests.rs",
-      "sha256": "79dda8705f40f0ce5493efefe3419c7fa463cc8394846af4db28be2018999281",
-      "size_bytes": 11153
+      "sha256": "541c53abcd9cc4ecd5443289bc732fcc1fcb7046c10c1816708352d9309b9e7d",
+      "size_bytes": 12818
     },
     {
       "executable": false,
@@ -5029,7 +5029,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T09:54:12+00:00",
+  "generated_at": "2026-10-20T09:58:17+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 719,
   "public_roots": [

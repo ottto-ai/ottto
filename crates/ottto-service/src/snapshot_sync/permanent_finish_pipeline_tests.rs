@@ -117,7 +117,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
     }
     let fixture = IdentityPipelineHome::new();
     let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
-    let _cadence = IdentityPipelineCadence::new();
+    let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("permanent-finish-support");
     let secrets = fixture.base.join("permanent-finish-secrets");
     std::fs::create_dir_all(&support).unwrap();
@@ -150,93 +150,127 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
     };
-    let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
-        prepare_sync_source(
-            &client,
-            &device,
-            "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
-            &fixture.home,
-            &support,
-            &daemon,
-            &mut transport,
-            daemon.snapshot_scan_account_witness().unwrap(),
-            false,
-        )
-    })
-    .unwrap()
-    .expect("real due native preparation");
-    assert!(
-        !frame.native_comparison_lease.as_ref().unwrap().allowed(),
-        "no synthetic or pre-existing permit"
-    );
-    let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-    assert!(scan.census_complete);
-    assert_eq!(scan.scanned_file_count, 1);
-    assert_eq!(scan.snapshots.len(), 1);
-    let index_path = preparation.index_path.clone();
-    let progress_path = preparation.upload_progress_path.clone();
-    let result = crate::agent_status_refresh::with_test_collection(collection(), || {
-        finish_sync_source(
-            preparation,
-            index,
-            scan,
-            &client,
-            &device,
-            "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
-            &fixture.home,
-            &support,
-            &daemon,
-            &mut transport,
-            &mut retry,
-        )
-    });
-    assert_eq!(
-        result.is_ok(),
-        !matches!(outcome, FinishOutcome::Retryable),
-        "{outcome:?}: {result:?}"
-    );
-    let saved = ScanIndex::load(&index_path).unwrap();
-    assert!(saved.generation > 0, "real selected save");
-    let offered = server.offered.lock().unwrap();
-    assert_eq!(offered.len(), 1);
-    let fingerprint = offered[0]["snapshot_fingerprint"].as_str().unwrap();
-    assert!(
-        !saved.accepted_snapshot_fingerprint_recorded(fingerprint),
-        "a refusal is never an ACK"
-    );
-    assert!(saved
-        .quarantined_snapshot_fingerprints
-        .contains_key(fingerprint));
-    let progress = SnapshotUploadProgress::load(
-        &progress_path,
-        &snapshot_upload_destination_namespace(&device, "device-secret"),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )
-    .unwrap();
-    assert!(!progress.accepted_fingerprints.contains(fingerprint));
-    if !matches!(outcome, FinishOutcome::Retryable) {
-        assert!(
-            progress.permanent_rejections.contains_key(fingerprint),
-            "permanent refusal debt survives finish"
+    let cycles = if matches!(outcome, FinishOutcome::Permanent) {
+        3
+    } else {
+        1
+    };
+    for cycle in 0..cycles {
+        cadence.next_due_cycle();
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        })
+        .unwrap()
+        .expect("real due native preparation");
+        assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2,
+        "cycle {cycle}: no synthetic permit; the third same-context preparation must use its actual saved predecessor");
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(scan.census_complete);
+        assert_eq!(
+            scan.scanned_file_count,
+            usize::from(cycle < 2),
+            "actual native read, then ordinary quiet page"
         );
-    }
-    let terminal = server.terminal.lock().unwrap();
-    assert_eq!(terminal.len(), 1, "one unchanged terminal report");
-    assert_eq!(
-        terminal[0]["last_error_code"],
-        if matches!(outcome, FinishOutcome::Retryable) {
-            "server_error"
-        } else {
-            "backend_validation_error"
+        if cycle == 0 {
+            assert_eq!(scan.snapshots.len(), 1);
         }
-    );
-    assert_eq!(daemon.native_comparison.retained_valid_for_test(), expected_valid,
-        "{outcome:?}: only an earned native conjunction plus durable settlement and successful status may reach the common lease finalizer");
-    writeln!(std::io::stderr().lock(), "permanent_finish_pipeline: outcome={outcome:?} real_native_read=true selected_save=true refusal_not_accepted=true refusal_debt_retained=true retained_valid={expected_valid}").unwrap();
+        let index_path = preparation.index_path.clone();
+        let progress_path = preparation.upload_progress_path.clone();
+        let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                &mut retry,
+            )
+        });
+        assert_eq!(
+            result.is_ok(),
+            !matches!(outcome, FinishOutcome::Retryable),
+            "{outcome:?}: {result:?}"
+        );
+        let saved = ScanIndex::load(&index_path).unwrap();
+        assert!(saved.generation > 0, "real selected save");
+        let offered = server.offered.lock().unwrap();
+        assert_eq!(offered.len(), 1);
+        let fingerprint = offered[0]["snapshot_fingerprint"].as_str().unwrap();
+        assert!(
+            !saved.accepted_snapshot_fingerprint_recorded(fingerprint),
+            "a refusal is never an ACK"
+        );
+        assert!(saved
+            .quarantined_snapshot_fingerprints
+            .contains_key(fingerprint));
+        let progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &snapshot_upload_destination_namespace(&device, "device-secret"),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        assert!(!progress.accepted_fingerprints.contains(fingerprint));
+        if !matches!(outcome, FinishOutcome::Retryable) {
+            assert!(
+                progress.permanent_rejections.contains_key(fingerprint),
+                "permanent refusal debt survives finish"
+            );
+        }
+        let terminal = server.terminal.lock().unwrap();
+        assert_eq!(
+            terminal.len(),
+            cycle + 1,
+            "one terminal report per actual finish"
+        );
+        assert_eq!(
+            terminal[cycle]["last_error_code"],
+            if matches!(outcome, FinishOutcome::Retryable) {
+                "server_error"
+            } else {
+                "backend_validation_error"
+            }
+        );
+        let retained_valid = daemon.native_comparison.retained_valid_for_test();
+        if cycle > 0 || !matches!(outcome, FinishOutcome::Permanent) {
+            assert_eq!(retained_valid, expected_valid,
+            "{outcome:?}, cycle {cycle}: only an earned native conjunction or actual predecessor permit plus durable settlement and successful status may reach the common lease finalizer");
+        }
+        writeln!(std::io::stderr().lock(), "permanent_finish_pipeline: outcome={outcome:?} cycle={cycle} selected_save=true refusal_not_accepted=true refusal_debt_retained=true retained_valid={retained_valid}").unwrap();
+        if cycle == 0 && matches!(outcome, FinishOutcome::Permanent) {
+            // Change only the source revision, not usage or its body witness. The
+            // normal-window pass must perform its own native parse and retain the
+            // original permanent refusal without offering that body again.
+            let transcript = fixture
+                .home
+                .join(".claude/projects/-synthetic-repo")
+                .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(transcript)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+        }
+    }
 }
 
 #[test]
