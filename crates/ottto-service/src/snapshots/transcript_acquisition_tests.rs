@@ -1166,6 +1166,113 @@ fn sampled_production_unretainable_full_file_preserves_other_native_tails() {
     }
 }
 
+/// L-A1: the `sampled_production_unretainable_full_file_preserves_other_native_tails`
+/// rows, read with the sidecar census incomplete, so the large file is an
+/// unsampled synchronous native read rather than a sampled `Full` one.
+fn append_unretainable_rows(large: &ScanFixture, source: SnapshotSource) {
+    for n in 0..150 {
+        let mut row = usage(source, 100 + n as u64, n, &format!("model-{n}"));
+        if source == SnapshotSource::ClaudeCode && n == 0 {
+            row["message"]["id"] =
+                Value::String("x".repeat(crate::transcript_cache::ENTRY_BYTES + 1));
+        }
+        large.file.append(&row);
+    }
+}
+fn incomplete_sidecar_census(scan: &mut OwnedSourceScan) {
+    scan.sidecar_census_complete = false;
+}
+
+/// L-A1: an unsampled native read (Claude, or Codex under the 64MiB singleton
+/// limit, with the sidecar census incomplete) owns no optimization state. Its
+/// copy refusal must not wipe an unrelated, independently bounded resident
+/// reduction, and must not insert one of its own.
+#[test]
+fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let small = ScanFixture::new(source);
+        let large = ScanFixture::new(source);
+        let small_key = local_index_key(&small.file.0);
+        let large_key = local_index_key(&large.file.0);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        small.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (index, _, _) = production_scan(
+            &small,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        assert!(
+            cache.retained_checkpoint(&small_key).is_some(),
+            "precondition: the unrelated reduction is resident {source:?}"
+        );
+        append_unretainable_rows(&large, source);
+        let (mut parser, _, _) = native_parser(&large.file, source);
+        while !parser.step().unwrap() {}
+        assert!(
+            crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).is_none(),
+            "precondition: the fixture refuses optional copies {source:?}"
+        );
+        let ((_, large_scan, large_modes, _), lifecycle) =
+            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+                production_scan_at_with_setup(
+                    &large,
+                    source,
+                    ScanIndex::default(),
+                    Some(cache.clone()),
+                    "mixed-files",
+                    NOW,
+                    incomplete_sidecar_census,
+                )
+            });
+        assert_eq!(
+            large_modes,
+            (0, 0, 0),
+            "precondition: the large file is read unsampled {source:?}"
+        );
+        let (_, large_full, _, _) = production_scan_at_with_setup(
+            &large,
+            source,
+            ScanIndex::default(),
+            None,
+            "mixed-files",
+            NOW,
+            incomplete_sidecar_census,
+        );
+        assert_eq!(
+            production_body(source, large_scan),
+            production_body(source, large_full),
+            "precondition: native output {source:?}"
+        );
+        assert_eq!(
+            lifecycle.clear_other_active, 0,
+            "unsampled native copy refusal wiped the cache {source:?}"
+        );
+        assert_eq!(lifecycle.clear_entries_released, 0, "{source:?}");
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0, "{source:?}");
+        assert_eq!(lifecycle.clear_metadata_unsupported, 0, "{source:?}");
+        assert_eq!(lifecycle.clear_no_active, 0, "{source:?}");
+        assert!(
+            cache.retained_checkpoint(&small_key).is_some(),
+            "the unrelated reduction survives {source:?}"
+        );
+        assert!(
+            cache.retained_checkpoint(&large_key).is_none(),
+            "the unsampled file inserted nothing {source:?}"
+        );
+        small.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes) = production_scan(&small, source, index, Some(cache), "mixed-files");
+        assert_eq!(modes, (0, 1, 0), "unrelated unsampled refusal {source:?}");
+        let (_, full, _) =
+            production_scan(&small, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
 #[test]
 fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() {
     if !crate::heap_layout_bound::layout_supported() {
