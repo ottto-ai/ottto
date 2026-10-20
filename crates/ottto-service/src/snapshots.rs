@@ -13024,6 +13024,44 @@ fn validated_codex_parent_ownership_ledgers(
     validated
 }
 
+/// L-1 release (§d.1.3) of every owner whose recorded members all left the
+/// clean walk's census. Exact authority: only those member keys' claims on
+/// that owner go (`accept_codex_block`); any other key still blocking it, and
+/// every other owner, stay. A missing traversal skips the release: it is
+/// never read as an empty census.
+fn release_departed_join_owners(
+    index: &mut ScanIndex,
+    cache: &sampled_scan::SharedCache,
+    keep: impl Fn(&str) -> bool,
+) {
+    /// Puts the taken traversal back on every exit, an unwind included.
+    struct Restore<'a> {
+        index: &'a mut ScanIndex,
+        traversal: Option<ScanTraversalCheckpoint>,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            self.index.traversal = self.traversal.take();
+        }
+    }
+    // Moved out (no copy) so the census is borrowed beside `&mut index`;
+    // `accept_codex_block` never reads `traversal`.
+    let Some(traversal) = index.traversal.take() else {
+        return;
+    };
+    let mut restore = Restore {
+        index,
+        traversal: Some(traversal),
+    };
+    let Restore { index, traversal } = &mut restore;
+    let Some(traversal) = traversal.as_ref() else {
+        return;
+    };
+    cache.release_join_owners(&traversal.codex_rollout_paths, keep, |owner, members| {
+        index.accept_codex_block(members, owner);
+    });
+}
+
 fn invalidate_stale_codex_parent_resolution(
     parsed: &mut ParsedJsonlFile,
     identities: &mut CodexParentIdentities,
@@ -16462,19 +16500,10 @@ impl OwnedSourceScan {
                     if let (SnapshotSource::Codex, true, Some(context), Some(inventory)) =
                         (source, clean, sampling.as_ref(), inventory)
                     {
-                        let present = index
-                            .traversal
-                            .as_ref()
-                            .map(|traversal| {
-                                traversal
-                                    .codex_rollout_paths
-                                    .iter()
-                                    .map(|key| sampled_scan::codex_cursor::compact_key(key))
-                                    .collect::<BTreeSet<_>>()
-                            })
-                            .unwrap_or_default();
+                        // Read before the release: `keep` runs under the cursor
+                        // lock and must not take it again.
                         let paused = context.cache.cursor_group_owner();
-                        let released = context.cache.release_join_owners(&present, |owner| {
+                        release_departed_join_owners(index, &context.cache, |owner| {
                             inventory.headers.iter().any(|header| header.owner == owner)
                                 || paused.as_deref() == Some(owner)
                                 || codex_join_groups.iter().any(|group| group.owner == owner)
@@ -16482,14 +16511,6 @@ impl OwnedSourceScan {
                                     .as_ref()
                                     .is_some_and(|boot| boot.group.owner == owner)
                         });
-                        for owner in released {
-                            index.codex_state_only_blocked_unattributed.remove(&owner);
-                            index.codex_state_only_blocked_legacy.remove(&owner);
-                            // L-SB: a key whose latest disclosure still blocks the
-                            // owner keeps it (including a deleted or moved key,
-                            // which is never retired).
-                            index.release_codex_block(&owner);
-                        }
                     }
                 }
                 let traversal_snapshot = index
@@ -28550,21 +28571,22 @@ impl ScanIndex {
     /// `session_id`. Any other key whose latest disclosure still blocks it
     /// keeps it blocked; the accepted body covers it meanwhile. A legacy-only
     /// claim is cleared here, as on main (class (h), disclosed).
-    pub(in crate::snapshots) fn accept_codex_block(
+    pub(in crate::snapshots) fn accept_codex_block<K: AsRef<str>>(
         &mut self,
-        accepting_keys: impl IntoIterator<Item = String>,
+        accepting_keys: impl IntoIterator<Item = K>,
         session_id: &str,
     ) {
         for key in accepting_keys {
+            let key = key.as_ref();
             let emptied = self
                 .codex_state_only_blocked_by_file
-                .get_mut(&key)
+                .get_mut(key)
                 .is_some_and(|blocked| {
                     blocked.remove(session_id);
                     blocked.is_empty()
                 });
             if emptied {
-                self.codex_state_only_blocked_by_file.remove(&key);
+                self.codex_state_only_blocked_by_file.remove(key);
             }
         }
         self.codex_state_only_blocked_unattributed

@@ -1089,6 +1089,7 @@ fn paged_singleton_matches_unpaged_read_across_scan_objects() {
     assert!(paused > 0 && resumed == paused);
     assert!(cache.cursor_slot_free());
     assert_eq!(cache.cursor_charge(), 0);
+    assert_eq!(cache.cursor_reserved(), 0);
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
@@ -1464,6 +1465,7 @@ fn concurrent_namespace_leaves_live_job_and_evicts_only_stale_one() {
             counters(&cache)
         );
         assert!(cache.cursor_charge() > 0);
+        assert_eq!(cache.cursor_reserved(), 0);
         let (mut index_b, scan, _) = page_in(
             &fixture,
             ScanIndex::default(),
@@ -1493,6 +1495,7 @@ fn concurrent_namespace_leaves_live_job_and_evicts_only_stale_one() {
         );
         assert_eq!(counter(&cache, |c| c.jobs_started), 2);
         assert_eq!(paused_namespace(&cache).as_deref(), Some("ns-b"));
+        assert_eq!(cache.cursor_reserved(), 0);
     });
 }
 
@@ -1566,6 +1569,7 @@ fn turn_heavy_session_pages_past_the_witness_cap_and_publishes_once() {
     assert_eq!(publishing_pages, 1);
     assert_eq!(counter(&cache, |c| c.jobs_state_bound), 0);
     assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+    assert_eq!(cache.cursor_reserved(), 0);
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
@@ -1584,6 +1588,7 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
         assert!(scan.snapshots.is_empty());
         let charge = cache.cursor_charge();
         assert!(charge > 0, "the job paused: {}", counters(&cache));
+        assert_eq!(cache.cursor_reserved(), 0);
         let claude_root = Temp::new("claude-root", b"");
         fs::remove_file(&claude_root.0).unwrap();
         fs::create_dir_all(claude_root.0.join("projects")).unwrap();
@@ -1612,6 +1617,7 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
         assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
         drop(claude);
         assert_eq!(cache.cursor_charge(), charge, "the paused job survives");
+        assert_eq!(cache.cursor_reserved(), 0);
         assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
         for _ in 0..32 {
             let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
@@ -1661,6 +1667,7 @@ fn frame_drop_mid_job_returns_job_to_slot() {
         assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 1);
         assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
         assert!(cache.cursor_charge() > 0);
+        assert_eq!(cache.cursor_reserved(), 0);
         let mut index = ScanIndex::default();
         for _ in 0..32 {
             let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
@@ -1769,6 +1776,7 @@ fn many_hour_session_pauses_past_the_walk_visit_limit_and_publishes_once() {
     assert_eq!(publishing_pages, 1);
     assert_eq!(counter(&cache, |c| c.jobs_state_bound), 0);
     assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+    assert_eq!(cache.cursor_reserved(), 0);
     assert!(counter(&cache, |c| c.jobs_paused) > 0);
     assert_eq!(
         counter(&cache, |c| c.jobs_resumed),
@@ -5277,4 +5285,469 @@ fn legacy_blocks_survive_attribution_from_a_pre_upgrade_index() {
         legacy = next.codex_state_only_blocked_legacy.len();
         index = next;
     }
+}
+
+// #641 join resource (H1-H9): J-T4c, J-T6..J-T11 and credit settlement.
+
+const JOIN_OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const JOIN_OTHER: &str = "ffffffff-1111-4111-8111-ffffffffffff";
+
+fn join_member(path: PathBuf) -> CandidateFile {
+    CandidateFile {
+        scan_root: PathBuf::from("/synthetic/sessions"),
+        path,
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: String::new(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    }
+}
+
+fn join_members(names: &[&str]) -> Vec<CandidateFile> {
+    names
+        .iter()
+        .map(|name| join_member(PathBuf::from(format!("/synthetic/sessions/{name}"))))
+        .collect()
+}
+
+/// The members' exact `local_index_key`s joined by '\0'.
+fn joined(members: &[CandidateFile]) -> String {
+    members
+        .iter()
+        .map(|member| local_index_key(&member.path))
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+fn join_entry(cache: &SharedCache, owner: &str) -> Option<String> {
+    cache
+        .with_cursor(|cursor| cursor.join_owners.get(owner).map(|(_, keys)| keys.clone()))
+        .flatten()
+}
+
+/// The exact accounted size of one new entry (J-T10).
+fn join_charge(owner: &str, members: &[CandidateFile]) -> usize {
+    crate::heap_layout_bound::tree_node_bytes::<String, JoinProvenance>().unwrap()
+        + owner.len()
+        + joined(members).len()
+}
+
+/// The retained cache's own bound: admission keeps it beside the state.
+fn retained_floor(cache: &SharedCache) -> usize {
+    crate::heap_layout_bound::bound(&*cache.retained().unwrap(), usize::MAX).unwrap()
+}
+
+/// Every release `release_join_owners` reports, with its member keys.
+fn released(
+    cache: &SharedCache,
+    census: &BTreeSet<String>,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<(String, Vec<String>)> {
+    let mut released = Vec::new();
+    cache.release_join_owners(census, keep, |owner, members| {
+        released.push((owner.to_owned(), members.map(str::to_owned).collect()));
+    });
+    released
+}
+
+/// J-T4 (c): `keep` holds a queued or paused owner; without it the owner is
+/// released exactly once with its exact member keys, and only when every
+/// member left the census. Another owner's provenance survives.
+#[test]
+fn join_release_reports_exact_members_once_unless_kept() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let empty = cache.cursor_resident();
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    let others = join_members(&["c.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &members);
+    cache.record_join_owner(JOIN_OTHER, &others);
+    let keys = members
+        .iter()
+        .map(|member| local_index_key(&member.path))
+        .collect::<Vec<_>>();
+    let census = BTreeSet::from([local_index_key(&others[0].path)]);
+    assert!(released(&cache, &census, |owner| owner == JOIN_OWNER).is_empty());
+    assert!(join_entry(&cache, JOIN_OWNER).is_some());
+    // One member still in the census keeps it.
+    let partial = BTreeSet::from([keys[0].clone(), local_index_key(&others[0].path)]);
+    assert!(released(&cache, &partial, |_| false).is_empty());
+    assert_eq!(
+        released(&cache, &census, |_| false),
+        vec![(JOIN_OWNER.to_owned(), keys)]
+    );
+    assert!(released(&cache, &census, |_| false).is_empty());
+    assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+    assert_eq!(join_entry(&cache, JOIN_OTHER), Some(joined(&others)));
+    assert_eq!(
+        cache.cursor_resident(),
+        empty + join_charge(JOIN_OTHER, &others)
+    );
+}
+
+/// J-T6 + J-T10: the entry's resident delta is exactly its admitted charge;
+/// an unchanged re-record builds and admits nothing; a new member list
+/// moves it by the key-length difference; one byte short of the charge is
+/// refused and forgets the older entry.
+#[test]
+fn join_provenance_charge_is_the_exact_accounted_delta() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let empty = cache.cursor_resident();
+    let three = join_members(&["a.jsonl", "bb.jsonl", "rollout-ccc.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &three);
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert_eq!(
+        cache.cursor_resident() - empty,
+        join_charge(JOIN_OWNER, &three)
+    );
+    assert_eq!(cache.cursor_reserved(), 0);
+    // Unchanged membership needs no room at all.
+    let resident = cache.cursor_resident();
+    with_test_state_budget(0, || cache.record_join_owner(JOIN_OWNER, &three));
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert_eq!(cache.cursor_resident(), resident);
+    // A new member list: the stored owner key is kept.
+    let two = join_members(&["a.jsonl", "b.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &two);
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&two)));
+    assert_eq!(
+        resident - cache.cursor_resident(),
+        joined(&three).len() - joined(&two).len()
+    );
+    // One byte short: refused, and the older entry is forgotten.
+    let state = cache.cursor_resident();
+    let charge = join_charge(JOIN_OWNER, &three);
+    with_test_state_budget(state + charge + floor - 1, || {
+        cache.record_join_owner(JOIN_OWNER, &three);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+    assert_eq!(cache.cursor_resident(), empty);
+    assert!(released(&cache, &BTreeSet::new(), |_| false).is_empty());
+    // Exactly enough: admitted.
+    with_test_state_budget(empty + charge + floor, || {
+        cache.record_join_owner(JOIN_OWNER, &three);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert_eq!(cache.cursor_resident(), empty + charge);
+    assert_eq!(cache.cursor_reserved(), 0);
+}
+
+/// J-T11: a non-UTF-8 member key is built, measured and matched exactly as
+/// `local_index_key`; empty, NUL-bearing and empty-list provenance is
+/// refused before anything is reserved, and forgets an older entry.
+#[test]
+fn join_keys_match_local_index_key_and_malformed_ones_are_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let lossy = [
+        &b"/synthetic/sessions/rollout-\xff.jsonl"[..],
+        &b"/synthetic/sessions/rollout-\xff\xfe-\xe2\x82-x.jsonl"[..],
+        &b"/synthetic/sessions/plain.jsonl"[..],
+    ]
+    .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
+    for path in &lossy {
+        let key = local_index_key(path);
+        let mut built = String::new();
+        push_join_key(&mut built, path);
+        assert_eq!(built, key);
+        assert_eq!(join_key_len(path), Some(key.len()));
+        assert!(join_key_eq(&key, path));
+        assert!(!join_key_eq(&key[..key.len() - 1], path));
+        assert!(!join_key_eq(&format!("{key}x"), path));
+    }
+    let members = lossy.iter().cloned().map(join_member).collect::<Vec<_>>();
+    assert!(same_join_members(&joined(&members), &members));
+    assert!(!same_join_members(&joined(&members[..2]), &members));
+    assert_eq!(join_keys_len(&members), Some(joined(&members).len()));
+    let nul = PathBuf::from(std::ffi::OsStr::from_bytes(
+        b"/synthetic/sessions/a\0b.jsonl",
+    ));
+    assert_eq!(join_key_len(&nul), None);
+    assert_eq!(join_key_len(Path::new("")), None);
+    assert_eq!(join_keys_len(&[]), None);
+    for stored in ["", "a\0", "\0a", "a\0\0b"] {
+        assert!(!join_members_well_formed(stored), "{stored:?}");
+    }
+    assert!(join_members_well_formed("a\0b"));
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let empty = cache.cursor_resident();
+    cache.record_join_owner(JOIN_OWNER, &members);
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+    assert_eq!(
+        cache.cursor_resident() - empty,
+        join_charge(JOIN_OWNER, &members)
+    );
+    let malformed: [Vec<CandidateFile>; 3] = [
+        vec![join_member(nul.clone())],
+        vec![members[0].clone(), join_member(PathBuf::new())],
+        Vec::new(),
+    ];
+    for members in &malformed {
+        cache.record_join_owner(JOIN_OWNER, &members[..]);
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        assert_eq!(cache.cursor_resident(), empty);
+    }
+    cache.record_join_owner("", &members);
+    assert_eq!(join_entry(&cache, ""), None);
+    assert_eq!(cache.cursor_resident(), empty);
+    assert_eq!(cache.cursor_reserved(), 0);
+    // Malformed or partial stored provenance is never released.
+    cache.with_cursor(|cursor| {
+        for (owner, stored) in [(JOIN_OWNER, ""), (JOIN_OTHER, "a\0")] {
+            let used = cursor.tick();
+            cursor
+                .join_owners
+                .insert(owner.to_owned(), (used, stored.to_owned()));
+        }
+    });
+    assert!(released(&cache, &BTreeSet::new(), |_| false).is_empty());
+    assert!(join_entry(&cache, JOIN_OWNER).is_some());
+    assert!(join_entry(&cache, JOIN_OTHER).is_some());
+}
+
+/// J-T7: claim vs claim. An outstanding claim is charged like resident
+/// state, so a second claim and optional provenance cannot spend its room;
+/// settling and refunding each return it exactly once.
+#[test]
+fn outstanding_claim_blocks_a_second_claim_and_provenance() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let state = cache.cursor_resident();
+    let claim = 4096;
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    with_test_state_budget(state + claim + floor, || {
+        let credit = cache.cursor_reserve(claim).expect("the claim fits");
+        assert_eq!(credit.bytes(), claim);
+        assert_eq!(cache.cursor_reserved(), claim);
+        assert_eq!(cache.cursor_resident(), state + claim);
+        let second = cache.cursor_reserve(claim);
+        assert!(second.is_none(), "the claimed room is spent once");
+        assert_eq!(cache.cursor_reserved(), claim);
+        cache.record_join_owner(JOIN_OTHER, &members);
+        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+        cache.with_cursor(|cursor| credit.settle(cursor)).unwrap();
+        assert_eq!(cache.cursor_reserved(), 0);
+        let credit = cache
+            .cursor_reserve(claim)
+            .expect("the settled room is free");
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert_eq!(cache.cursor_resident(), state);
+    });
+}
+
+/// The mandatory paused-job reserve forgets optional join provenance for
+/// room; optional provenance never forgets other provenance and never takes
+/// a claim's room back (baseline progress keeps its reserve).
+#[test]
+fn paused_reserve_outranks_join_provenance() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let empty = cache.cursor_resident();
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &members);
+    let claim = join_charge(JOIN_OWNER, &members);
+    with_test_state_budget(empty + claim + floor, || {
+        cache.record_join_owner(JOIN_OTHER, &members);
+        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+        assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+        let credit = cache
+            .cursor_reserve(claim)
+            .expect("baseline progress forgets provenance first");
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        assert_eq!(cache.cursor_resident(), empty + claim);
+        cache.record_join_owner(JOIN_OWNER, &members);
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        credit.refund();
+    });
+    assert_eq!(cache.cursor_reserved(), 0);
+    assert_eq!(cache.cursor_resident(), empty);
+}
+
+/// J-T8: claim vs retained insert. The insert measures outstanding claims
+/// under the retained lock, so a copy that fits only if the claim is
+/// ignored is not kept.
+#[test]
+fn outstanding_claim_is_charged_against_a_retained_insert() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let copy = cache
+            .take(&key)
+            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+        let completed = |copy: crate::transcript_cache::Retained<_>| {
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: copy.checkpoint,
+                reduction: Some(copy.state),
+            }
+        };
+        // Control: without a claim the copy fits.
+        cache.insert(key.clone(), completed(copy), 0);
+        assert!(cache.retained_checkpoint(&key).is_some());
+        let with_copy = retained_floor(&cache);
+        let state = cache.cursor_resident();
+        assert!(with_copy + state <= STATE_BYTES);
+        let copy = cache.take(&key).expect("retained");
+        // A claim that leaves one byte too few for it.
+        let claim = STATE_BYTES - state - with_copy + 1;
+        let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
+        cache.insert(key.clone(), completed(copy), 0);
+        assert!(cache.retained_checkpoint(&key).is_none(), "refused");
+        assert!(retained_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+/// J-T9: one lock order (retained, then cursor) and no recursive cursor
+/// locking, checked in debug builds before any lock is taken.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "cursor lock taken while this thread holds it")]
+fn nested_cursor_lock_is_refused() {
+    let cache = SharedCache::default();
+    cache.with_cursor(|_| cache.with_cursor(|_| ()));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "retained lock taken under the cursor lock")]
+fn retained_lock_under_the_cursor_lock_is_refused() {
+    let cache = SharedCache::default();
+    cache.with_cursor(|_| drop(cache.retained()));
+}
+
+/// J-T9 control and settlement: `cursor_reserve` takes retained, then
+/// cursor; a credit unwound outside the lock refunds itself; one unwound
+/// inside a cursor closure does not relock; the held flag resets on every
+/// unwind; a poisoned cursor admits nothing and strands nothing.
+#[test]
+fn credits_settle_once_on_every_path() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let credit = cache.cursor_reserve(64).expect("room");
+    assert_eq!(cache.cursor_reserved(), 64);
+    credit.refund();
+    assert_eq!(cache.cursor_reserved(), 0);
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        let _credit = cache.cursor_reserve(64).expect("room");
+        assert_eq!(cache.cursor_reserved(), 64);
+        panic!("unwind with an outstanding credit");
+    }));
+    assert!(unwound.is_err());
+    assert!(!cursor_held());
+    assert_eq!(
+        cache.cursor_reserved(),
+        0,
+        "dropped while unwinding: refunded"
+    );
+    let stranded = cache.cursor_reserve(64).expect("room");
+    let inside = cache.cursor_reserve(64).expect("room");
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        cache.with_cursor(move |_| {
+            let _inside = inside;
+            panic!("poison the cursor");
+        });
+    }));
+    assert!(unwound.is_err());
+    assert!(!cursor_held(), "reset on unwind");
+    // Poisoned: measured as the whole budget; admits and settles nothing.
+    assert_eq!(cache.cursor_reserved(), usize::MAX);
+    assert_eq!(cache.cursor_resident(), STATE_BYTES);
+    assert!(cache.cursor_reserve(1).is_none());
+    stranded.refund();
+    cache.record_join_owner(JOIN_OWNER, &join_members(&["a.jsonl"]));
+    assert!(released(&cache, &BTreeSet::new(), |_| false).is_empty());
+}
+
+/// Corrupt credit accounting (a claim that is not outstanding, or one
+/// against another state) fails closed: the state measures unbounded.
+#[test]
+fn corrupt_credit_accounting_fails_closed() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    for wrong_state in [false, true] {
+        let cache = Arc::new(SharedCache::default());
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            cache.with_cursor(|cursor| {
+                let id = cursor.id + u64::from(wrong_state);
+                cursor.reserved = usize::from(wrong_state);
+                settle_claim(cursor, id, 1);
+            });
+        }));
+        assert_eq!(unwound.is_err(), cfg!(debug_assertions));
+        assert!(!cursor_held());
+        assert_eq!(cache.cursor_reserved(), usize::MAX);
+        assert_eq!(cache.cursor_resident(), STATE_BYTES);
+        assert!(cache.cursor_reserve(1).is_none());
+    }
+}
+
+/// H5: a job the slot no longer names is freed, counted lost, and only
+/// then is its claim refunded; nothing stays reserved or charged.
+#[test]
+fn failed_store_drops_the_job_then_refunds_its_claim() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 4096, 64, || {
+        let mut scan = codex_scan(&fixture, ScanIndex::default(), NOW)
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        for _ in 0..10_000 {
+            if scan
+                .active_file
+                .as_ref()
+                .is_some_and(|active| active.cursor.is_some())
+            {
+                break;
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { .. } => panic!("the job never started"),
+            }
+        }
+        assert!(!cache.cursor_slot_free(), "the frame holds the job");
+        // The impossible case `store` still handles: the slot moved on.
+        cache.with_cursor(|cursor| cursor.slot = Slot::Empty);
+        drop(scan);
+        assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 0);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert_eq!(cache.cursor_charge(), 0);
+    });
 }

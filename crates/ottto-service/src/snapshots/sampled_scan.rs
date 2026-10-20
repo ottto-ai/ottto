@@ -15,8 +15,11 @@ const STATE_BYTES: usize =
 
 pub(super) mod codex_cursor;
 
+/// The retained-copy cache behind `SharedCache::retained`.
+pub(super) type RetainedCache = TranscriptCache<sampled_jsonl::CachedJsonlReduction>;
+
 pub(crate) struct SharedCache {
-    inner: Mutex<TranscriptCache<sampled_jsonl::CachedJsonlReduction>>,
+    inner: Mutex<RetainedCache>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
     /// here; copy budgets and insert admission see it through this cache.
     cursor: Mutex<codex_cursor::CursorState>,
@@ -41,11 +44,22 @@ impl HeapLayoutBound for SharedCache {
     }
 }
 impl SharedCache {
+    /// The retained-copy lock. Lock order: retained, then cursor, never the
+    /// reverse (checked in debug builds).
+    pub(super) fn retained(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, RetainedCache>> {
+        debug_assert!(
+            !codex_cursor::cursor_held(),
+            "retained lock taken under the cursor lock"
+        );
+        self.inner.lock()
+    }
     /// Copy-refusal release: evicts retained copies only. The paused cursor
     /// job, the held-singleton memo, parked records and rotation state are
     /// charged and bounded in `heap_bound`, and survive (K6).
     pub(super) fn clear(&self) {
-        if let Ok(mut cache) = self.inner.lock() {
+        if let Ok(mut cache) = self.retained() {
             cache.clear();
         } else {
             record(Event::ClearPoisonedLock);
@@ -55,7 +69,7 @@ impl SharedCache {
         &self,
         key: &str,
     ) -> Option<crate::transcript_cache::Retained<sampled_jsonl::CachedJsonlReduction>> {
-        match self.inner.lock() {
+        match self.retained() {
             Ok(mut cache) => cache.take(key),
             Err(_) => {
                 record(Event::TakePoisonedLock);
@@ -64,14 +78,14 @@ impl SharedCache {
         }
     }
     pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
-        self.inner.lock().ok()?.sealed_offset(key)
+        self.retained().ok()?.sealed_offset(key)
     }
     #[cfg(test)]
     pub(super) fn retained_checkpoint(
         &self,
         key: &str,
     ) -> Option<crate::transcript_acquisition::Checkpoint> {
-        self.inner.lock().ok()?.checkpoint(key)
+        self.retained().ok()?.checkpoint(key)
     }
     pub(super) fn insert(
         &self,
@@ -80,11 +94,12 @@ impl SharedCache {
         live_bytes: usize,
     ) {
         if let Some(state) = completed.reduction {
-            // The whole cursor state (paused job, memo, parked and rotation
-            // records) keeps its charge: admission may not fill the state
-            // budget underneath it.
-            let live_bytes = live_bytes.saturating_add(self.cursor_resident());
-            if let Ok(mut cache) = self.inner.lock() {
+            if let Ok(mut cache) = self.retained() {
+                // The whole cursor state (paused job, memo, parked and rotation
+                // records, outstanding claims) keeps its charge: admission may
+                // not fill the state budget underneath it. Measured under the
+                // retained lock, so every claim made before this insert is seen.
+                let live_bytes = live_bytes.saturating_add(self.cursor_resident());
                 cache.insert_reserving(
                     key,
                     crate::transcript_cache::Retained {
