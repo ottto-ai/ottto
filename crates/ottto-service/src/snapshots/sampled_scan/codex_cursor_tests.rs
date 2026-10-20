@@ -545,6 +545,7 @@ fn disclosure() -> Disclosure {
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
         parent_ref: None,
+        parent_unresolvable: None,
     }
 }
 
@@ -558,6 +559,7 @@ fn strict(reason: DebtReason) -> Disclosure {
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
         parent_ref: None,
+        parent_unresolvable: None,
     }
 }
 
@@ -736,10 +738,12 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
         id: "parent".into(),
         ledger: Some("ledger-1".into()),
         current: Some("p-1".into()),
+        witnessed: None,
     });
     let now = |ledger: &str, current: &str| ParentNow {
         ledger: Some(ledger.into()),
         current: Some(current.into()),
+        witnessed: None,
     };
     let now_1 = now("ledger-1", "p-1");
     let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
@@ -761,6 +765,7 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
             Some(&ParentNow {
                 ledger: Some("ledger-1".into()),
                 current: None,
+                witnessed: None,
             }),
             ""
         )

@@ -52,6 +52,9 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
             codex_parent_ledger_identity_used: None,
             codex_parent_resolution_pending: false,
             codex_parent_ownership_ledger: None,
+            codex_parent_unresolvable: None,
+            codex_parent_ledger_unusable: None,
+            codex_parent_ledger_consulted: false,
         };
         let mut payload = Counter::new(usize::MAX);
         for snapshot in &parsed.snapshots {

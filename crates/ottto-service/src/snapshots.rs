@@ -1,6 +1,7 @@
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
-    RecoveryLineage, StateRowFieldDiffs, UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
+    ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs, UnreadableCause,
+    UnreadableCauses, LINEAGE_SAMPLES,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -1753,6 +1754,9 @@ struct ScanTraversalCounts {
     symlink_rejected_count: usize,
     unreadable_path_count: usize,
     unreadable_causes: UnreadableCauses,
+    /// PR-P: held fork children per parent cause, traversal-cumulative.
+    /// Additive: old checkpoints load as zero (struct-level `serde(default)`).
+    parent_unresolvable: ParentUnresolvableCauses,
     oversized_file_count: usize,
     disappeared_file_count: usize,
     malformed_json_line_count: usize,
@@ -2042,6 +2046,11 @@ struct CodexParentOwnershipLedger {
     /// children retry instead of treating the newly inherited suffix as local.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     opened_object_identity: String,
+    /// PR-P: a step-map-only witness that this parent yields no usable ledger
+    /// (never persisted, never `scan_complete`, so every existing reader
+    /// ignores it). A ledger insert under the same key replaces it.
+    #[serde(skip)]
+    unresolvable: Option<CodexParentUnresolvable>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10147,6 +10156,10 @@ struct SnapshotAccumulator {
     codex_parent_session_ref: Option<String>,
     codex_parent_signatures: Option<Vec<String>>,
     codex_parent_ledger_identity_used: Option<String>,
+    /// PR-P: the step-map witness this fork read for its parent.
+    codex_parent_unresolvable: Option<CodexParentUnresolvable>,
+    /// PR-P: this fork read a parent ledger (the only arm that does).
+    codex_parent_ledger_consulted: bool,
     codex_parent_signature_index: usize,
     // Fresh provider-created rollouts use a native creation envelope and one
     // gap-free ordinal stream. These fields bind the first task/turn to that
@@ -10350,6 +10363,8 @@ impl SnapshotAccumulator {
             codex_parent_session_ref: None,
             codex_parent_signatures: None,
             codex_parent_ledger_identity_used: None,
+            codex_parent_unresolvable: None,
+            codex_parent_ledger_consulted: false,
             codex_parent_signature_index: 0,
             codex_native_created_thread_valid: true,
             codex_created_thread_native_only: false,
@@ -10745,22 +10760,41 @@ impl SnapshotAccumulator {
         } else if is_subagent && forked_from_id.is_some() {
             CodexOwnershipBoundary::AwaitingLegacyTrigger
         } else if !is_subagent && forked_from_id.is_some() {
-            let parent_ledger = forked_from_id.as_deref().and_then(|parent_id| {
+            // PR-P: only this arm reads a parent ledger, so only its children
+            // request one and can be parent-pending.
+            self.codex_parent_ledger_consulted = true;
+            let evidence = forked_from_id.as_deref().and_then(|parent_id| {
                 self.codex_parent_ownership_ledgers
                     .as_ref()
                     .and_then(|ledgers| ledgers.lock().ok())
                     .and_then(|ledgers| ledgers.get(parent_id).cloned())
-                    .filter(|ledger| ledger.scan_complete && !ledger.signatures.is_empty())
             });
-            if let Some(parent_ledger) = parent_ledger {
-                self.codex_parent_ledger_identity_used = Some(parent_ledger.opened_object_identity);
-                self.codex_parent_signatures = Some(parent_ledger.signatures);
-                CodexOwnershipBoundary::AwaitingParentPrefix
-            } else {
-                // Missing, partial, or overflowed parent evidence is not a
-                // boundary. The scan records the parent ref and retries after
-                // a bounded structural prepass has populated its ledger.
-                CodexOwnershipBoundary::AmbiguousFork
+            match evidence {
+                Some(parent_ledger)
+                    if parent_ledger.scan_complete && !parent_ledger.signatures.is_empty() =>
+                {
+                    self.codex_parent_ledger_identity_used =
+                        Some(parent_ledger.opened_object_identity);
+                    self.codex_parent_signatures = Some(parent_ledger.signatures);
+                    CodexOwnershipBoundary::AwaitingParentPrefix
+                }
+                Some(CodexParentOwnershipLedger {
+                    unresolvable: Some(cause),
+                    ..
+                }) => {
+                    // PR-P: witnessed unusable or deferred. An empty ledger keeps
+                    // the fork absorbing: held and settleable, not pending. The
+                    // witness admits nothing; the child stays held.
+                    self.codex_parent_signatures = Some(Vec::new());
+                    self.codex_parent_unresolvable = Some(cause);
+                    CodexOwnershipBoundary::AmbiguousFork
+                }
+                _ => {
+                    // Missing, partial, or overflowed parent evidence is not a
+                    // boundary. The scan records the parent ref and retries after
+                    // a bounded structural prepass has populated its ledger.
+                    CodexOwnershipBoundary::AmbiguousFork
+                }
             }
         } else {
             CodexOwnershipBoundary::AllLocal
@@ -11133,6 +11167,10 @@ impl SnapshotAccumulator {
 
     fn codex_parent_resolution_pending(&self) -> bool {
         !self.codex_created_thread_native_only
+            // PR-P: only a child that read a parent ledger can be cured by
+            // one. Any other parent-less ambiguous fork (a subagent whose
+            // bootstrap buffer overflowed) is held, not pending.
+            && self.codex_parent_ledger_consulted
             && self.codex_parent_session_ref.is_some()
             && self.codex_parent_signatures.is_none()
             && matches!(
@@ -11166,6 +11204,7 @@ impl SnapshotAccumulator {
                     && self.codex_physical_signatures_complete
                     && !self.codex_physical_signatures.is_empty(),
                 opened_object_identity: String::new(),
+                unresolvable: None,
             },
         ))
     }
@@ -12905,14 +12944,104 @@ fn scan_source_roots_with_limit(
 }
 
 /// L-5: why a parent has no usable current identity. PR-1 constructs the
-/// identity causes; PR-P adds the ledger, parent-debt and deferral causes.
+/// identity causes; PR-P adds the ledger, parent-debt, policy and deferral
+/// causes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum CodexParentUnresolvable {
+    // Identity evidence (L-5, PR-1).
     Absent,
     Duplicated,
     NotRegular,
     Oversize,
+    // Ledger evidence. `NoLedger`: no session id, no session meta, or zero
+    // signatures.
+    NoLedger,
+    LedgerCapped,
+    // Parent debt: the parent itself is held or lossy. Transitive: cured when
+    // the parent or one of its ancestors changes.
+    ParentHeld,
+    ParentLossy,
+    /// PR-P: the parent rollout is outside the backfill window, so discovery
+    /// never makes it a candidate.
+    OutOfWindow,
+    /// PR-P: the fork chain returns to itself.
+    ForkCycle,
+    // Scheduling: non-progressing held disclosure, never ownership proof.
+    /// PR-P: the parent ref did not fit the interim 256-ref cap.
+    DeferredRef,
+    /// PR-P: the scope's restart budget is spent and the parent is still owed
+    /// (derived, never a settling witness).
+    DeferredRestart,
 }
+impl CodexParentUnresolvable {
+    pub(in crate::snapshots) const COUNT: usize = 12;
+    pub(in crate::snapshots) fn cap(self) -> bool {
+        matches!(self, Self::Oversize | Self::LedgerCapped)
+    }
+    pub(in crate::snapshots) fn parent_debt(self) -> bool {
+        matches!(self, Self::ParentHeld | Self::ParentLossy)
+    }
+    pub(in crate::snapshots) fn deferred(self) -> bool {
+        matches!(self, Self::DeferredRef | Self::DeferredRestart)
+    }
+    /// A witness of this cause explains the parent, so the parent is no
+    /// longer owed: no forced reparse, no memo bypass, no derivation. It only
+    /// suppresses redundant parent-resolution scheduling; it proves nothing
+    /// about the child. Only `DeferredRestart` leaves the parent owed,
+    /// because only it can be cured by re-reading the parent this scope.
+    pub(in crate::snapshots) fn settles_owed(self) -> bool {
+        self != Self::DeferredRestart
+    }
+    pub(in crate::snapshots) fn index(self) -> usize {
+        self as usize
+    }
+    /// The once-per-process log line of this cause's class (no ids).
+    fn held_log_line(self) -> &'static str {
+        use CodexParentUnresolvable::*;
+        if self.cap() {
+            return "ottto-service: codex fork(s) held: parent over a cap; child usage is withheld as disclosed debt until the streaming parent ledger lands";
+        }
+        if self.parent_debt() {
+            return "ottto-service: codex fork(s) held: parent itself held or lossy; child held until the parent or one of its ancestors changes";
+        }
+        match self {
+            NoLedger => {
+                "ottto-service: codex fork(s) held: parent has no ownership ledger; child held until the parent changes"
+            }
+            OutOfWindow => {
+                "ottto-service: codex fork(s) held: parent rollout outside the backfill window; child held until the parent is modified or the window widens"
+            }
+            ForkCycle => {
+                "ottto-service: codex fork(s) held: fork parents form a cycle; held until a member changes"
+            }
+            DeferredRef => {
+                "ottto-service: codex fork(s) deferred: more than 256 distinct fork parents; child usage withheld as counted debt until the parent-ref limit is lifted"
+            }
+            DeferredRestart => {
+                "ottto-service: codex fork(s) deferred: parent resolution restart budget spent; the parent is re-read and the child retried next generation"
+            }
+            // Identity evidence (`Absent`, `Duplicated`, `NotRegular`).
+            _ => {
+                "ottto-service: codex fork(s) held: parent rollout absent (or present only compressed, .jsonl.zst, which is not read yet), duplicated or not a regular file; child held until the parent changes"
+            }
+        }
+    }
+    /// Logs this cause's class once per process.
+    fn log_held_once(self) {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static LOGGED: AtomicU16 = AtomicU16::new(0);
+        let bit = 1_u16 << self.index();
+        if LOGGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            eprintln!("{} ({self:?})", self.held_log_line());
+        }
+    }
+}
+const _: () = assert!(
+    CodexParentUnresolvable::DeferredRestart as usize + 1 == CodexParentUnresolvable::COUNT
+);
+const _: () = assert!(
+    CodexParentUnresolvable::COUNT == crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES
+);
 impl crate::heap_layout_bound::HeapLayoutBound for CodexParentUnresolvable {
     const INLINE_ONLY: bool = true;
     const STABLE_HEAP: bool = true;
@@ -13002,6 +13131,16 @@ pub(in crate::snapshots) struct CodexParentIdentities {
     /// with an opened identity (a 64-byte SHA-256 hex digest,
     /// `opened_object_identity`) or a cause: at most 100 heap bytes.
     last: Option<CodexParentProbeSlot>,
+    /// PR-P: the step-start pass ran on this page (`codex_parent_step_start`).
+    parents_applied: bool,
+    /// PR-P: the scope's restart budget is spent; read by the record site.
+    pub(in crate::snapshots) restart_budget_spent: bool,
+    /// PR-P: the scope's restart count, established on this page by the
+    /// step-start pass (`ParentState.restarts`) or by the restart hunk
+    /// (`note_parent_restart`'s return). `None` when neither ran on this page
+    /// (a discovery page, or no shared cache): the diagnostics then omit
+    /// `parent_restarts_in_scope` instead of reporting a fabricated 0.
+    parent_restarts: Option<u64>,
 }
 
 struct CodexParentProbeSlot {
@@ -13009,7 +13148,7 @@ struct CodexParentProbeSlot {
     probe: CodexParentProbe,
 }
 crate::heap_layout_bound::fields!(CodexParentProbeSlot; session_id, probe);
-crate::heap_layout_bound::fields!(CodexParentIdentities; census_valid, last);
+crate::heap_layout_bound::fields!(CodexParentIdentities; census_valid, last, parents_applied, restart_budget_spent, parent_restarts);
 
 impl CodexParentIdentities {
     pub(in crate::snapshots) fn new(
@@ -13020,7 +13159,14 @@ impl CodexParentIdentities {
             census_valid: source == SnapshotSource::Codex
                 && traversal.is_some_and(codex_frozen_census_valid),
             last: None,
+            parents_applied: false,
+            restart_budget_spent: false,
+            parent_restarts: None,
         }
+    }
+
+    pub(in crate::snapshots) fn census_valid(&self) -> bool {
+        self.census_valid
     }
 
     /// Parent identity is not unique until the frozen directory census has
@@ -13102,27 +13248,78 @@ impl CodexParentIdentities {
     }
 }
 
-/// Uncached: one census pass and one no-follow open of the parent's single
-/// rollout. The `File` is for PR-P; PR-1 callers drop it.
-fn codex_parent_open(
+/// PR-P: where one wanted parent id appears in the census.
+#[derive(Clone, Copy)]
+enum CodexCensusMatch<'a> {
+    Absent,
+    One(&'a str),
+    Duplicated,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// P-T38: census passes made by `codex_parent_census_matches` (every
+    /// caller: validation, the step-start match, L-5 probes and fences).
+    static CODEX_PARENT_CENSUS_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// P-T14: step-start matching passes only (the matching branch of
+    /// `codex_parent_step_start`).
+    static CODEX_PARENT_STEP_START_MATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn codex_parent_census_passes_for_test() -> u64 {
+    CODEX_PARENT_CENSUS_PASSES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn codex_parent_step_start_matches_for_test() -> u64 {
+    CODEX_PARENT_STEP_START_MATCHES.with(std::cell::Cell::get)
+}
+
+/// PR-P: ONE pass over the census for every id in `wanted` (resolved ids,
+/// sorted and deduplicated, borrowed: no copy). Per census path: the same
+/// candidate-id parse as one L-5 probe, plus one binary search per candidate
+/// id over `wanted`. A path is kept per id only until a second path claims
+/// it (`Duplicated`), as a borrowed census key.
+fn codex_parent_census_matches<'a>(
+    census: CodexParentCensus<'a>,
+    wanted: &[&str],
+) -> Vec<CodexCensusMatch<'a>> {
+    #[cfg(test)]
+    CODEX_PARENT_CENSUS_PASSES.with(|passes| passes.set(passes.get() + 1));
+    let mut found = vec![CodexCensusMatch::Absent; wanted.len()];
+    // An unavailable census is empty: every id is the baseline `Absent`.
+    for key in census.paths {
+        for candidate in codex_session_id_candidates_from_path(Path::new(key)).iter() {
+            if let Ok(at) = wanted.binary_search(&candidate.as_str()) {
+                found[at] = match found[at] {
+                    CodexCensusMatch::Absent => CodexCensusMatch::One(key.as_str()),
+                    CodexCensusMatch::One(path) if path == key.as_str() => {
+                        CodexCensusMatch::One(path)
+                    }
+                    _ => CodexCensusMatch::Duplicated,
+                };
+            }
+        }
+    }
+    found
+}
+
+/// The shared tail of every parent open: scan root, no-follow metadata,
+/// regular-file and size checks, `open_candidate_file`. Returns the path for
+/// the window test.
+fn codex_parent_open_match(
     census: CodexParentCensus<'_>,
-    session_id: &str,
-) -> Result<(String, File), CodexParentUnresolvable> {
+    found: CodexCensusMatch<'_>,
+) -> Result<(PathBuf, String, File), CodexParentUnresolvable> {
     use CodexParentUnresolvable::*;
-    let session_id = resolve_codex_identity(session_id);
-    let mut matching_paths = census.paths.iter().filter_map(|key| {
-        let path = PathBuf::from(key);
-        codex_session_id_candidates_from_path(&path)
-            .iter()
-            .any(|candidate| candidate == &session_id)
-            .then_some(path)
-    });
-    let path = matching_paths.next().ok_or(Absent)?;
     // More than one physical rollout claiming the same source session id is
     // ambiguous evidence, even if one happens to match the old witness.
-    if matching_paths.next().is_some() {
-        return Err(Duplicated);
-    }
+    let path = match found {
+        CodexCensusMatch::Absent => return Err(Absent),
+        CodexCensusMatch::Duplicated => return Err(Duplicated),
+        CodexCensusMatch::One(key) => PathBuf::from(key),
+    };
     let scan_root = census
         .scan_roots
         .iter()
@@ -13159,7 +13356,18 @@ fn codex_parent_open(
         opened_object_identity: String::new(),
     };
     let file = open_candidate_file(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
-    Ok((candidate.opened_object_identity, file))
+    Ok((candidate.path, candidate.opened_object_identity, file))
+}
+
+/// Uncached: one census pass and one no-follow open of the parent's single
+/// rollout. The `File` is for PR-P; PR-1 callers drop it.
+fn codex_parent_open(
+    census: CodexParentCensus<'_>,
+    session_id: &str,
+) -> Result<(String, File), CodexParentUnresolvable> {
+    let session_id = resolve_codex_identity(session_id);
+    let found = codex_parent_census_matches(census, &[session_id.as_str()]);
+    codex_parent_open_match(census, found[0]).map(|(_path, identity, file)| (identity, file))
 }
 
 #[cfg(test)]
@@ -13185,40 +13393,351 @@ pub(in crate::snapshots) fn with_codex_before_parse<T>(
     value
 }
 
+/// PR-P: this page's step map of validated parent ledgers and witnesses.
+type CodexStepMap = Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>;
+
+/// PR-P: `cause` for `parent` in this page's step map. A validated ledger is
+/// never replaced by a witness; a ledger insert replaces a witness. A witness
+/// is RAM-only evidence of why proof is unavailable: it admits nothing.
+fn witness_in_step_map(
+    shared: Option<&CodexStepMap>,
+    parent: &str,
+    cause: CodexParentUnresolvable,
+) {
+    if let Some(mut shared) = shared.and_then(|shared| shared.lock().ok()) {
+        let entry = shared.entry(resolve_codex_identity(parent)).or_default();
+        if !entry.scan_complete {
+            *entry = CodexParentOwnershipLedger {
+                unresolvable: Some(cause),
+                ..Default::default()
+            };
+        }
+    }
+}
+
+/// PR-P: remove a witness, never a validated ledger.
+fn unwitness_in_step_map(shared: Option<&CodexStepMap>, parent: &str) {
+    if let Some(mut shared) = shared.and_then(|shared| shared.lock().ok()) {
+        let parent = resolve_codex_identity(parent);
+        if shared
+            .get(&parent)
+            .is_some_and(|entry| !entry.scan_complete)
+        {
+            shared.remove(&parent);
+        }
+    }
+}
+
+/// PR-P: the step map's witness for `parent`, as the classifier would read it.
+fn step_map_witness(
+    shared: Option<&CodexStepMap>,
+    parent: &str,
+) -> Option<CodexParentUnresolvable> {
+    shared
+        .and_then(|shared| shared.lock().ok())
+        .and_then(|shared| {
+            shared
+                .get(resolve_codex_identity(parent).as_str())
+                .filter(|entry| !entry.scan_complete)
+                .and_then(|entry| entry.unresolvable)
+        })
+}
+
+/// PR-P: a requested parent this page's step map does not explain: no
+/// validated ledger and no settling witness. Reads only the step map, never
+/// the raw index ledger, which may have failed step-start validation (a
+/// duplicate, or a parent grown past the source cap).
+fn codex_parent_owed(shared: Option<&CodexStepMap>, parent: &str) -> bool {
+    !shared
+        .and_then(|shared| shared.lock().ok())
+        .is_some_and(|shared| {
+            shared
+                .get(resolve_codex_identity(parent).as_str())
+                .is_some_and(|entry| {
+                    entry.scan_complete
+                        || entry
+                            .unresolvable
+                            .is_some_and(CodexParentUnresolvable::settles_owed)
+                })
+        })
+}
+
+/// PR-P: the referenced ids of this path whose parse can still produce new
+/// evidence: main's index clause minus parents that a settling witness
+/// already explains. The raw index clause stays here only: a stale index
+/// ledger means no reparse.
+fn codex_parent_reparse_owed_ids(
+    index: &ScanIndex,
+    shared: Option<&CodexStepMap>,
+    path: &Path,
+) -> Vec<String> {
+    codex_session_id_candidates_from_path(path)
+        .iter()
+        .map(|id| resolve_codex_identity(id))
+        .filter(|id| {
+            index.codex_parent_ownership_refs.contains(id)
+                && !index
+                    .codex_parent_ownership_ledgers
+                    .get(id)
+                    .is_some_and(|ledger| ledger.scan_complete)
+                && codex_parent_owed(shared, id)
+        })
+        .collect()
+}
+
+/// PR-P: whether a RAM witness still describes this parent, given this
+/// traversal's open of it (one census pass for all parents).
+fn witness_holds(
+    witness: &sampled_scan::codex_cursor::ParentWitness,
+    opened: &Result<String, CodexParentUnresolvable>,
+) -> bool {
+    match (witness.identity.as_deref(), opened) {
+        (None, Err(cause)) => *cause == witness.cause,
+        (Some(identity), Ok(current)) => identity == current,
+        _ => false,
+    }
+}
+
+/// PR-P: once per page, before any candidate is classified. It applies the
+/// namespace's witnesses to the step map and decides the restart budget.
+/// Matching (re-validation, event (a), the window test and cycle detection)
+/// runs once per traversal, over ONE census pass.
+fn codex_parent_step_start(
+    index: &ScanIndex,
+    context: &sampled_scan::Context,
+    identities: &mut CodexParentIdentities,
+    page: &mut sampled_scan::codex_cursor::PageBudget,
+    shared: Option<&CodexStepMap>,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+) {
+    use sampled_scan::codex_cursor::{self as cursor, ParentWitness, SAMPLE_READ_BYTES};
+    use CodexParentUnresolvable::*;
+    let Some(traversal) = index.traversal.as_ref() else {
+        return;
+    };
+    let scope = cursor::group_scope(index);
+    let state = context.cache.parent_state(&context.namespace, &scope);
+    identities.restart_budget_spent = state.restarts >= cursor::PARENT_RESTART_BUDGET;
+    identities.parent_restarts = Some(state.restarts);
+    let census = identities.census(index);
+    let end = traversal.census_window_end.as_str();
+    let matched = state
+        .matched
+        .as_ref()
+        .is_some_and(|(at, restarts)| at == end && *restarts == state.restarts);
+    if matched || !identities.census_valid() {
+        // A later page of a matched traversal, or an invalid census:
+        // re-apply without probing, dropping or marking. A witness only
+        // holds, and no child can resolve without a valid census anyway.
+        // Wait records are not applied; the derivation below covers them.
+        for (parent, witness) in &state.witnesses {
+            if witness.cause != DeferredRestart {
+                witness_in_step_map(shared, parent, witness.cause);
+            }
+        }
+    } else {
+        // Every parent this match may open (each witness, each owed ref),
+        // found in one census pass. Borrowed ids; witness keys are refs, so
+        // at most 256 distinct.
+        let mut wanted = state
+            .witnesses
+            .iter()
+            .map(|(parent, _)| parent.as_str())
+            .chain(
+                index
+                    .codex_parent_ownership_refs
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|parent| codex_parent_owed(shared, parent)),
+            )
+            .collect::<Vec<_>>();
+        wanted.sort_unstable();
+        wanted.dedup();
+        // Nothing wanted (no witness, no owed ref) is free on every page, so
+        // it makes no census pass, no mark and no `parents` entry; steps 1-3
+        // are empty loops then.
+        let matching = !wanted.is_empty();
+        #[cfg(test)]
+        if matching {
+            CODEX_PARENT_STEP_START_MATCHES.with(|passes| passes.set(passes.get() + 1));
+        }
+        let found = if matching {
+            codex_parent_census_matches(census, &wanted)
+        } else {
+            Vec::new()
+        };
+        // Every opened parent is wanted. A miss is fail-closed instead of a
+        // panic: `None`, and the caller skips that parent this traversal.
+        let mut open = |parent: &str| {
+            let at = wanted.binary_search(&parent).ok();
+            debug_assert!(at.is_some(), "every opened parent is wanted");
+            let at = at?;
+            if matches!(found[at], CodexCensusMatch::One(_)) {
+                page.charge(false, SAMPLE_READ_BYTES);
+            }
+            Some(codex_parent_open_match(census, found[at]))
+        };
+        // 1. Re-validate every witness against this traversal's open.
+        let mut dropped = Vec::new();
+        for (parent, witness) in &state.witnesses {
+            let Some(opened) = open(parent) else { continue };
+            let opened = opened.map(|(_path, identity, _file)| identity);
+            if !witness_holds(witness, &opened) {
+                dropped.push(parent.clone());
+            } else if witness.cause != DeferredRestart {
+                witness_in_step_map(shared, parent, witness.cause);
+            }
+        }
+        context
+            .cache
+            .drop_parent_witnesses(&context.namespace, &scope, &dropped);
+        // 2. A wait cycle never resolves, so witness its members `ForkCycle`
+        //    at their own identities.
+        let waits = state
+            .witnesses
+            .iter()
+            .filter(|(parent, witness)| {
+                witness.cause == DeferredRestart && !dropped.contains(parent)
+            })
+            .collect::<Vec<_>>();
+        for (start, witness) in &waits {
+            let mut at = witness.waits_on.as_deref();
+            for _ in 0..MAX_CODEX_PARENT_LEDGER_REFS {
+                let Some(next) = at else { break };
+                if next == start.as_str() {
+                    witness_in_step_map(shared, start, ForkCycle);
+                    context.cache.witness_parent(
+                        &context.namespace,
+                        &scope,
+                        start,
+                        ParentWitness {
+                            cause: ForkCycle,
+                            identity: witness.identity.clone(),
+                            waits_on: None,
+                        },
+                    );
+                    break;
+                }
+                at = waits
+                    .binary_search_by(|entry| entry.0.as_str().cmp(next))
+                    .ok()
+                    .and_then(|i| waits[i].1.waits_on.as_deref());
+            }
+        }
+        // 3. Event (a) and the window test: every ref the step map still owes
+        //    is opened once, whatever the restart budget.
+        for parent in &index.codex_parent_ownership_refs {
+            if !codex_parent_owed(shared, parent) {
+                continue;
+            }
+            let Some(opened) = open(parent) else { continue };
+            let witness = match opened {
+                Err(cause) => ParentWitness {
+                    cause,
+                    identity: None,
+                    waits_on: None,
+                },
+                Ok((path, identity, file))
+                    if codex_parent_outside_window(
+                        &index.files,
+                        &path,
+                        &file,
+                        census_unix_seconds,
+                        backfill_window_days,
+                    ) =>
+                {
+                    ParentWitness {
+                        cause: OutOfWindow,
+                        identity: Some(identity),
+                        waits_on: None,
+                    }
+                }
+                Ok(_) => continue,
+            };
+            witness_in_step_map(shared, parent, witness.cause);
+            context
+                .cache
+                .witness_parent(&context.namespace, &scope, parent, witness);
+        }
+        if matching {
+            context
+                .cache
+                .mark_parents_matched(&context.namespace, &scope, end, state.restarts);
+        }
+    }
+    // 4. `DeferredRestart` is derived from the counter. Once the budget is
+    //    spent, every ref the step map still owes holds its children for this
+    //    page. Applied last, so a witness keeps its cause. It never settles:
+    //    the parent stays owed (forced reparse, memo bypass).
+    if identities.restart_budget_spent {
+        for parent in &index.codex_parent_ownership_refs {
+            if codex_parent_owed(shared, parent) {
+                witness_in_step_map(shared, parent, DeferredRestart);
+            }
+        }
+    }
+}
+
 /// Return only persisted parent-prefix ledgers whose exact rollout object is
 /// still current. Parent files are sampled through the same no-follow,
 /// opened-object identity path as normal parsing. A missing, duplicated,
 /// replaced, or appended parent is deliberately omitted: the child remains
 /// retryable until a normal parent parse publishes fresh structural evidence.
+/// PR-P: one census pass for every eligible ledger, then one open per
+/// distinct resolved id; the fold is PR-1's.
 fn validated_codex_parent_ownership_ledgers(
     index: &ScanIndex,
     census: CodexParentCensus<'_>,
 ) -> BTreeMap<String, CodexParentOwnershipLedger> {
+    let eligible = index
+        .codex_parent_ownership_ledgers
+        .iter()
+        .filter(|(_, ledger)| {
+            ledger.scan_complete
+                && !ledger.signatures.is_empty()
+                && !ledger.opened_object_identity.is_empty()
+        })
+        .map(|(session_id, ledger)| (resolve_codex_identity(session_id.as_str()), ledger))
+        .collect::<Vec<_>>();
+    let mut wanted = eligible
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return BTreeMap::new();
+    }
+    // The file is dropped at once, as PR-1 drops it per ledger.
+    let opened = codex_parent_census_matches(census, &wanted)
+        .into_iter()
+        .map(|found| {
+            codex_parent_open_match(census, found)
+                .ok()
+                .map(|(_path, identity, _file)| identity)
+        })
+        .collect::<Vec<_>>();
+    // PR-1's fold: a matching identity validates; two different ledgers
+    // under one resolved id conflict and are both dropped.
     let mut validated = BTreeMap::new();
     let mut conflicts = BTreeSet::new();
-    for (session_id, ledger) in &index.codex_parent_ownership_ledgers {
-        let session_id = resolve_codex_identity(session_id.as_str());
-        if !ledger.scan_complete
-            || ledger.signatures.is_empty()
-            || ledger.opened_object_identity.is_empty()
-            || conflicts.contains(session_id.as_str())
-        {
+    for (session_id, ledger) in &eligible {
+        if conflicts.contains(session_id.as_str()) {
             continue;
         }
-        if codex_parent_open(census, session_id.as_str())
-            .ok()
-            .map(|(identity, _file)| identity)
-            .as_deref()
-            == Some(ledger.opened_object_identity.as_str())
-        {
+        let Ok(at) = wanted.binary_search(&session_id.as_str()) else {
+            continue; // unreachable: every eligible id is wanted
+        };
+        if opened[at].as_deref() == Some(ledger.opened_object_identity.as_str()) {
             if validated
                 .get(session_id.as_str())
-                .is_some_and(|existing| existing != ledger)
+                .is_some_and(|existing| existing != *ledger)
             {
                 validated.remove(session_id.as_str());
-                conflicts.insert(session_id);
+                conflicts.insert(session_id.clone());
             } else {
-                validated.insert(session_id, ledger.clone());
+                validated.insert(session_id.clone(), (*ledger).clone());
             }
         }
     }
@@ -13288,6 +13807,8 @@ fn invalidate_stale_codex_parent_resolution(
     // reparses the parent and retries the unchanged child.
     parsed.snapshots.clear();
     parsed.codex_parent_resolution_pending = true;
+    // PR-P: the parse that computed the parent-side cause is refused too.
+    parsed.codex_parent_ledger_unusable = None;
     parsed.zero_snapshot_usage_evidence = false;
     if let Some((_, ledger)) = parsed.codex_parent_ownership_ledger.as_mut() {
         ledger.scan_complete = false;
@@ -14552,6 +15073,29 @@ impl OwnedSourceScan {
         let index = &mut index_storage;
         // L-5: a resumed step re-probes everything it needs.
         codex_parent_identities.begin_step();
+        // PR-P: once per page, on a selecting page (discovery done), before any
+        // candidate is classified: apply the namespace's parent witnesses and
+        // decide the restart budget.
+        if source == SnapshotSource::Codex
+            && !codex_parent_identities.parents_applied
+            && index
+                .traversal
+                .as_ref()
+                .is_some_and(|traversal| traversal.pending_directories.is_empty())
+        {
+            if let Some(context) = sampling.as_ref() {
+                codex_parent_step_start(
+                    index,
+                    context,
+                    &mut codex_parent_identities,
+                    &mut codex_page,
+                    codex_parent_ownership_ledgers.as_ref(),
+                    census_unix_seconds,
+                    backfill_window_days,
+                );
+            }
+            codex_parent_identities.parents_applied = true;
+        }
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
         // Construct the large continuation once. Repeating it in every yield
         // branch multiplies debug-build stack slots and can overflow native
@@ -15993,6 +16537,22 @@ impl OwnedSourceScan {
                     &mut codex_parent_identities,
                     codex_parent_census,
                 );
+                // PR-P: an overflowing ref is held `DeferredRef` debt, never a
+                // restart. Once the scope's restart budget is spent, a pending
+                // child holds `DeferredRestart` instead of restarting again.
+                // Both are non-progressing held disclosure: nothing is admitted.
+                if source == SnapshotSource::Codex && parsed_file.codex_parent_resolution_pending {
+                    if parsed_file
+                        .codex_parent_session_ref
+                        .as_deref()
+                        .is_some_and(|parent| !index.codex_parent_ref_fits(parent))
+                    {
+                        parsed_file.defer_parent_resolution(CodexParentUnresolvable::DeferredRef);
+                    } else if codex_parent_identities.restart_budget_spent {
+                        parsed_file
+                            .defer_parent_resolution(CodexParentUnresolvable::DeferredRestart);
+                    }
+                }
                 codex_parent_resolution_retry_required |=
                     parsed_file.codex_parent_resolution_pending;
                 let parse_complete = parsed_file.complete();
@@ -16034,34 +16594,182 @@ impl OwnedSourceScan {
                 } else {
                     FileReason::ReadOrLineLoss
                 };
+                // PR-P: a fresh held child counted under its parent cause; the
+                // memo replay counts the same (`disclose_terminal_codex_debt`).
+                if let Some(cause) = parsed_file
+                    .codex_parent_unresolvable
+                    .filter(|_| !parse_complete)
+                {
+                    census.parent_unresolvable.record(cause.index(), 1);
+                    cause.log_held_once();
+                }
                 let terminal_loss = parsed_file.terminal_loss();
-                if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
+                if let Some(parent_session_ref) = parsed_file
+                    .codex_parent_session_ref
+                    .as_ref()
+                    .filter(|_| parsed_file.codex_parent_ledger_consulted)
+                {
                     index.record_codex_parent_ref(parent_session_ref);
                 }
-                if let Some((session_id, ledger)) =
-                    parsed_file.codex_parent_ownership_ledger.as_ref()
-                {
-                    let session_id = resolve_codex_identity(session_id.as_str());
-                    // L-5: a fresh open after the parent's own parse, only for a
-                    // referenced parent (the only kind whose ledger is kept).
-                    if index
-                        .codex_parent_ownership_refs
-                        .contains(session_id.as_str())
-                        && ledger.scan_complete
-                        && codex_parent_identities
+                if source == SnapshotSource::Codex {
+                    // PR-P: the parent-side identity of this parse: its own
+                    // ledger object when a child asked for that id; otherwise a
+                    // referenced path id at the opened object (no ledger object
+                    // at all). A ledger under session id B while children ask
+                    // for this path's id A can never serve them (the census and
+                    // the classifier look parents up by path id), so A is
+                    // witnessed `NoLedger` at this identity either way.
+                    let parent_side = parsed_file
+                        .codex_parent_ownership_ledger
+                        .as_ref()
+                        .map(|(session_id, ledger)| {
+                            (
+                                resolve_codex_identity(session_id.as_str()),
+                                ledger.opened_object_identity.clone(),
+                                ledger.scan_complete,
+                                parsed_file.codex_parent_ledger_unusable,
+                            )
+                        })
+                        .filter(|(session_id, ..)| {
+                            index
+                                .codex_parent_ownership_refs
+                                .contains(session_id.as_str())
+                        })
+                        .or_else(|| {
+                            codex_session_id_candidates_from_path(&candidate.path)
+                                .iter()
+                                .map(|id| resolve_codex_identity(id))
+                                .find(|id| index.codex_parent_ownership_refs.contains(id))
+                                .map(|id| {
+                                    (
+                                        id,
+                                        candidate.opened_object_identity.clone(),
+                                        false,
+                                        Some(CodexParentUnresolvable::NoLedger),
+                                    )
+                                })
+                        });
+                    // The id the branch below settles, if any.
+                    let settled_id = parent_side
+                        .as_ref()
+                        .map(|(session_id, ..)| session_id.clone());
+                    if let Some((session_id, identity, scan_complete, cause)) = parent_side {
+                        // L-5: a fresh open after the parent's own parse, only for
+                        // a referenced parent (the only kind whose ledger is kept).
+                        let at_current = codex_parent_identities
                             .reprobe(codex_parent_identities.census(index), &session_id)
                             .ok()
                             .as_deref()
-                            == Some(ledger.opened_object_identity.as_str())
-                    {
-                        index
-                            .codex_parent_ownership_ledgers
-                            .insert(session_id.clone(), ledger.clone());
-                        if let Some(shared) = codex_parent_ownership_ledgers.as_ref() {
-                            if let Ok(mut shared) = shared.lock() {
-                                shared.insert(session_id.clone(), ledger.clone());
+                            == Some(identity.as_str());
+                        let shared = codex_parent_ownership_ledgers.as_ref();
+                        let scope = sampling
+                            .as_ref()
+                            .map(|_| sampled_scan::codex_cursor::group_scope(index));
+                        let ram = sampling.as_ref().zip(scope.as_ref());
+                        match (at_current, scan_complete, cause) {
+                            (true, true, _) => {
+                                // A usable ledger at the current object ends every
+                                // witness for this parent, kept or not.
+                                if let Some((context, scope)) = ram {
+                                    context.cache.drop_parent_witnesses(
+                                        &context.namespace,
+                                        scope,
+                                        std::slice::from_ref(&session_id),
+                                    );
+                                }
+                                if let Some((_, ledger)) =
+                                    parsed_file.codex_parent_ownership_ledger.as_ref()
+                                {
+                                    index
+                                        .codex_parent_ownership_ledgers
+                                        .insert(session_id.clone(), ledger.clone());
+                                    if let Some(mut shared) =
+                                        shared.and_then(|shared| shared.lock().ok())
+                                    {
+                                        // Replaces any step-map witness under this key.
+                                        shared.insert(session_id.clone(), ledger.clone());
+                                    }
+                                }
                             }
+                            (true, false, Some(cause)) => {
+                                // Event (b): deterministic over these bytes and
+                                // this classification; witness it so its children
+                                // hold (RAM only; it admits nothing).
+                                if let Some((context, scope)) = ram {
+                                    context.cache.witness_parent(
+                                        &context.namespace,
+                                        scope,
+                                        &session_id,
+                                        sampled_scan::codex_cursor::ParentWitness {
+                                            cause,
+                                            identity: Some(identity),
+                                            waits_on: None,
+                                        },
+                                    );
+                                }
+                                witness_in_step_map(shared, &session_id, cause);
+                            }
+                            (true, false, None) => {
+                                // Pending, or held `DeferredRestart`: no cause, so
+                                // no earlier witness may keep holding its children.
+                                // The wait record replaces it; it settles nothing
+                                // (still owed) and only feeds cycle detection.
+                                if let Some((context, scope)) = ram {
+                                    context.cache.witness_parent(
+                                        &context.namespace,
+                                        scope,
+                                        &session_id,
+                                        sampled_scan::codex_cursor::ParentWitness {
+                                            cause: CodexParentUnresolvable::DeferredRestart,
+                                            identity: Some(identity),
+                                            waits_on: parsed_file.codex_parent_session_ref.clone(),
+                                        },
+                                    );
+                                }
+                                unwitness_in_step_map(shared, &session_id);
+                            }
+                            (false, ..) => {}
                         }
+                    }
+                    // A referenced path id other than the settled one (at most
+                    // two path candidates) is never served by this parse. If
+                    // the step map still owes it and this object is its current
+                    // rollout, witness it `NoLedger` here, so it is not re-read
+                    // every generation. Gated like `at_current`.
+                    for path_id in codex_session_id_candidates_from_path(&candidate.path)
+                        .iter()
+                        .map(|id| resolve_codex_identity(id))
+                        .filter(|id| settled_id.as_deref() != Some(id.as_str()))
+                        .filter(|id| index.codex_parent_ownership_refs.contains(id))
+                        .filter(|id| codex_parent_owed(codex_parent_ownership_ledgers.as_ref(), id))
+                        .collect::<Vec<_>>()
+                    {
+                        let at_current = codex_parent_identities
+                            .reprobe(codex_parent_identities.census(index), &path_id)
+                            .ok()
+                            .as_deref()
+                            == Some(candidate.opened_object_identity.as_str());
+                        if !at_current {
+                            continue;
+                        }
+                        if let Some(context) = sampling.as_ref() {
+                            let scope = sampled_scan::codex_cursor::group_scope(index);
+                            context.cache.witness_parent(
+                                &context.namespace,
+                                &scope,
+                                &path_id,
+                                sampled_scan::codex_cursor::ParentWitness {
+                                    cause: CodexParentUnresolvable::NoLedger,
+                                    identity: Some(candidate.opened_object_identity.clone()),
+                                    waits_on: None,
+                                },
+                            );
+                        }
+                        witness_in_step_map(
+                            codex_parent_ownership_ledgers.as_ref(),
+                            &path_id,
+                            CodexParentUnresolvable::NoLedger,
+                        );
                     }
                 }
                 let index_key = local_index_key(&candidate.path);
@@ -16158,6 +16866,10 @@ impl OwnedSourceScan {
                                                     })
                                             }),
                                             current,
+                                            // PR-P: the step-map witness this
+                                            // parse read, so its arrival, change
+                                            // or removal misses once.
+                                            witnessed: parsed_file.codex_parent_unresolvable,
                                         }
                                     });
                             let own_ledger = parsed_file
@@ -16194,7 +16906,13 @@ impl OwnedSourceScan {
                                             terminal_line_loss: parsed_file
                                                 .terminal_line_loss_count,
                                         },
-                                        parent_ref: parsed_file.codex_parent_session_ref.clone(),
+                                        // PR-P: only a ledger-consulting
+                                        // child requests its parent ref.
+                                        parent_ref: parsed_file
+                                            .codex_parent_session_ref
+                                            .clone()
+                                            .filter(|_| parsed_file.codex_parent_ledger_consulted),
+                                        parent_unresolvable: parsed_file.codex_parent_unresolvable,
                                     },
                                 )
                                 // Every singleton entry is exact (PR-1).
@@ -16581,6 +17299,10 @@ impl OwnedSourceScan {
                         .counts
                         .unreadable_causes
                         .merge(census.unreadable_causes);
+                    traversal
+                        .counts
+                        .parent_unresolvable
+                        .merge(census.parent_unresolvable);
                     traversal.counts.oversized_file_count += census.oversized_file_count;
                     traversal.counts.disappeared_file_count += census.disappeared_file_count;
                     traversal.counts.malformed_json_line_count += census.malformed_json_line_count;
@@ -16764,6 +17486,17 @@ impl OwnedSourceScan {
                 let parent_resolution_restart = traversal_discovery_done
                     && traversal_snapshot.pending_candidates.is_empty()
                     && traversal_snapshot.codex_parent_resolution_retry_required;
+                if parent_resolution_restart {
+                    if let Some(context) = sampling.as_ref() {
+                        // Inline table: never refused. The new count is what
+                        // this page's diagnostics report.
+                        codex_parent_identities.parent_restarts =
+                            Some(context.cache.note_parent_restart(
+                                &context.namespace,
+                                &sampled_scan::codex_cursor::group_scope(index),
+                            ));
+                    }
+                }
                 let raw_census_complete = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
@@ -16966,6 +17699,11 @@ impl OwnedSourceScan {
                             version: 1,
                             generation: index.generation,
                             unreadable_causes: counts.unreadable_causes,
+                            // PR-P: traversal-cumulative per-page counts, as
+                            // `unreadable_causes`.
+                            parent_unresolvable: counts.parent_unresolvable,
+                            // PR-P: omitted unless established on this page.
+                            parent_restarts_in_scope: codex_parent_identities.parent_restarts,
                             gates: CensusGates {
                                 discovery_done: traversal_discovery_done,
                                 traversal_healthy,
@@ -17172,32 +17910,55 @@ impl OwnedSourceScan {
                     *count = count.saturating_add(1);
                 }
             }
-            if source == SnapshotSource::Codex
-            && decision == CandidateDecision::Skip
-            // A terminal disposition at this exact file fingerprint and parser
-            // generation means the previous traversal already parsed this
-            // object to completion and disclosed its loss. Parsing is
-            // deterministic over unchanged bytes, so a reparse would rebuild
-            // the same lossy ledger, be rejected again, and re-arm this
-            // override forever - an unbounded full reread of a multi-hundred-MB
-            // parent every cycle. The child stays fail-closed on the missing
-            // prefix evidence; only a new fingerprint or generation re-opens
-            // the file (`candidate_decision`, `terminal_jsonl_loss`).
-            && index.terminal_jsonl_loss(&candidate).is_none()
-            && codex_session_id_candidates_from_path(&candidate.path)
-                .iter()
-                .any(|session_id| {
-                    index.codex_parent_ownership_refs.contains(session_id)
-                        && !index
-                            .codex_parent_ownership_ledgers
-                            .get(session_id)
-                            .is_some_and(|ledger| ledger.scan_complete)
-                })
-            {
-                // An unresolved child requested this unchanged parent after its
-                // earlier page had already passed. Reparse only that parent to
-                // populate bounded structural evidence.
-                decision = CandidateDecision::Parse;
+            if source == SnapshotSource::Codex && decision == CandidateDecision::Skip {
+                let shared = codex_parent_ownership_ledgers.as_ref();
+                let owed = codex_parent_reparse_owed_ids(index, shared, &candidate.path);
+                if !owed.is_empty() && index.terminal_jsonl_loss(&candidate).is_none() {
+                    // An unresolved child requested this unchanged parent after
+                    // its earlier page had already passed. Reparse only that
+                    // parent to populate bounded structural evidence.
+                    decision = CandidateDecision::Parse;
+                } else if let Some(context) = sampling.as_ref().filter(|_| !owed.is_empty()) {
+                    // A terminal disposition at this exact file fingerprint and
+                    // parser generation means the previous traversal already
+                    // parsed this object to completion and disclosed its loss.
+                    // Parsing is deterministic over unchanged bytes, so a
+                    // reparse would rebuild the same lossy ledger, be rejected
+                    // again, and re-arm this override forever - an unbounded
+                    // full reread of a multi-hundred-MB parent every cycle.
+                    // PR-P event (c): witness it instead, gated on this object
+                    // being the parent's unique current rollout. The child
+                    // stays held; only a new fingerprint or generation
+                    // re-opens the file (`candidate_decision`,
+                    // `terminal_jsonl_loss`).
+                    let scope = sampled_scan::codex_cursor::group_scope(index);
+                    for parent in &owed {
+                        let (current, fresh) = codex_parent_identities
+                            .probe(codex_parent_identities.census(index), parent);
+                        if fresh {
+                            codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                        }
+                        if current.ok().as_deref()
+                            == Some(candidate.opened_object_identity.as_str())
+                        {
+                            context.cache.witness_parent(
+                                &context.namespace,
+                                &scope,
+                                parent,
+                                sampled_scan::codex_cursor::ParentWitness {
+                                    cause: CodexParentUnresolvable::ParentLossy,
+                                    identity: Some(candidate.opened_object_identity.clone()),
+                                    waits_on: None,
+                                },
+                            );
+                            witness_in_step_map(
+                                shared,
+                                parent,
+                                CodexParentUnresolvable::ParentLossy,
+                            );
+                        }
+                    }
+                }
             }
             match decision {
                 CandidateDecision::Skip => {
@@ -17233,21 +17994,22 @@ impl OwnedSourceScan {
                 // context, so concurrent namespaces must not evict each other.
                 let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
                 use crate::local_resource_diagnostics::codex_memo_lifecycle;
-                // R1-M1: an owed parent whose held parse yields its own ledger
-                // must be re-read so the ledger is inserted.
-                let owed_parent = codex_session_id_candidates_from_path(&candidate.path)
-                    .iter()
-                    .any(|id| {
-                        let id = resolve_codex_identity(id);
-                        index.codex_parent_ownership_refs.contains(&id)
-                            && !index
-                                .codex_parent_ownership_ledgers
-                                .get(&id)
-                                .is_some_and(|ledger| ledger.scan_complete)
-                    });
+                // R1-M1 (PR-1) and PR-P: an owed parent must be parsed, so a
+                // held memo hit cannot hide its own ledger (PR-1) or its
+                // parent-side cause (event (b)). A parent that a settling
+                // witness already explains is not owed; `DeferredRestart`
+                // never settles, so quietness cannot hide a parent.
+                let owed_parent = !codex_parent_reparse_owed_ids(
+                    index,
+                    codex_parent_ownership_ledgers.as_ref(),
+                    &candidate.path,
+                )
+                .is_empty();
                 let entry = context.cache.memo_lookup(&memo_key);
-                let bypass =
-                    owed_parent && entry.as_ref().is_some_and(|entry| entry.has_own_ledger());
+                // PR-P widens PR-1's `has_own_ledger()` condition to every
+                // entry: a held parent without its own ledger must also fire
+                // event (b).
+                let bypass = owed_parent && entry.is_some();
                 if bypass {
                     codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther);
                 }
@@ -17272,6 +18034,19 @@ impl OwnedSourceScan {
                                 .get(resolve_codex_identity(parent).as_str())
                                 .map(|ledger| ledger.opened_object_identity.clone()),
                             current: current.ok(),
+                            // PR-P: the step map's witness, as the classifier
+                            // would read it now; an overflowing ref is
+                            // `DeferredRef` with no entry. Only for an entry
+                            // whose parse consulted the step map (marked by
+                            // `Disclosure.parent_ref`); any other child
+                            // recorded `witnessed: None` and compares equal.
+                            witnessed: entry.disclosure().parent_ref.as_ref().and_then(|_| {
+                                step_map_witness(codex_parent_ownership_ledgers.as_ref(), parent)
+                                    .or_else(|| {
+                                        (!index.codex_parent_ref_fits(parent))
+                                            .then_some(CodexParentUnresolvable::DeferredRef)
+                                    })
+                            }),
                         }
                     });
                     let digest = sampled_scan::reduction_dependencies(
@@ -18534,9 +19309,35 @@ struct ParsedJsonlFile {
     /// malformed/lossy transcript. It still keeps the file uncommittable.
     codex_parent_resolution_pending: bool,
     codex_parent_ownership_ledger: Option<(String, CodexParentOwnershipLedger)>,
+    /// PR-P: the child's own held cause (a step-map witness it read, or a
+    /// deferral at the record site). Held disclosure only, never proof.
+    codex_parent_unresolvable: Option<CodexParentUnresolvable>,
+    /// PR-P: this file's cause when it is a referenced parent (event (b)).
+    codex_parent_ledger_unusable: Option<CodexParentUnresolvable>,
+    /// PR-P: this file read a parent ledger (it may record a parent ref).
+    codex_parent_ledger_consulted: bool,
 }
 
 impl ParsedJsonlFile {
+    /// PR-P: a parent-pending fork that a restart cannot resolve becomes held,
+    /// non-progressing debt under a deferred cause. Not pending, so it never
+    /// sets `codex_parent_resolution_retry_required`. It is not admitted and
+    /// not forgiven: its usage stays withheld and its ids stay blocked.
+    fn defer_parent_resolution(&mut self, cause: CodexParentUnresolvable) {
+        debug_assert!(cause.deferred() && self.codex_parent_resolution_pending);
+        self.codex_parent_resolution_pending = false;
+        self.ownership_incomplete_file_count = 1;
+        self.codex_parent_unresolvable = Some(cause);
+        // No ledger proved this parse; the memo dependency records the probe,
+        // not a stale fence identity.
+        self.codex_parent_ledger_identity_used = None;
+        // `DeferredRef` cannot be cured in this scope, so if this file is
+        // itself a referenced parent, its children are witnessed under it.
+        // `DeferredRestart` can be cured (owed, re-read).
+        self.codex_parent_ledger_unusable =
+            (cause == CodexParentUnresolvable::DeferredRef).then_some(cause);
+    }
+
     fn complete(&self) -> bool {
         self.report.complete_except_over_line_cap()
             && self.report.over_line_cap_count == self.terminal_line_loss_count
@@ -18853,6 +19654,43 @@ impl OwnedJsonlParser {
         if let Some((_, ledger)) = codex_parent_ownership_ledger.as_mut() {
             ledger.opened_object_identity = expected_opened_object_identity.to_string();
         }
+        // PR-P: what this file's children see when it is their parent. Own-byte
+        // causes first; an inherited deferral suppresses only `ParentHeld`.
+        // Computed before the clear below, which empties the ledger of a held,
+        // lossy or pending file.
+        let codex_parent_unresolvable = accumulator.codex_parent_unresolvable;
+        let codex_parent_ledger_consulted = accumulator.codex_parent_ledger_consulted;
+        let codex_parent_ledger_unusable = {
+            use CodexParentUnresolvable::*;
+            if source != SnapshotSource::Codex || codex_parent_resolution_pending {
+                // Waits on its own parent: never a debt or evidence witness.
+                None
+            } else if !report.complete() || recognized_usage_drop_count > 0 {
+                Some(ParentLossy)
+            } else if codex_parent_ownership_ledger.is_none() {
+                // No session id, so no ledger object can ever exist.
+                Some(NoLedger)
+            } else if !accumulator.codex_physical_signatures_complete {
+                Some(LedgerCapped)
+            } else if codex_parent_unresolvable.is_some_and(CodexParentUnresolvable::deferred) {
+                // `DeferredRef` cannot be cured this scope and propagates;
+                // `DeferredRestart` can, so it stays owed.
+                codex_parent_unresolvable.filter(|cause| *cause == DeferredRef)
+            } else if codex_parent_unresolvable == Some(ForkCycle) {
+                // A cycle member re-parsed under its step-map `ForkCycle` keeps
+                // that cause instead of turning into `ParentHeld`.
+                Some(ForkCycle)
+            } else if ownership_incomplete_file_count > 0 {
+                Some(ParentHeld)
+            } else if !codex_parent_ownership_ledger
+                .as_ref()
+                .is_some_and(|(_, ledger)| ledger.scan_complete)
+            {
+                Some(NoLedger)
+            } else {
+                None
+            }
+        };
         if !report.complete()
             || recognized_usage_drop_count > 0
             || ownership_incomplete_file_count > 0
@@ -18919,6 +19757,9 @@ impl OwnedJsonlParser {
             codex_parent_ledger_identity_used,
             codex_parent_resolution_pending,
             codex_parent_ownership_ledger,
+            codex_parent_unresolvable,
+            codex_parent_ledger_unusable,
+            codex_parent_ledger_consulted,
         })
     }
 }
@@ -23005,6 +23846,9 @@ struct ScanCensus {
     symlink_rejected_count: usize,
     unreadable_path_count: usize,
     unreadable_causes: UnreadableCauses,
+    /// PR-P: held fork children of this page per parent cause (fresh parses
+    /// and memo replays), merged into the traversal counts.
+    parent_unresolvable: ParentUnresolvableCauses,
     oversized_file_count: usize,
     disappeared_file_count: usize,
     malformed_json_line_count: usize,
@@ -25192,6 +26036,7 @@ fn ensure_bounded_traversal(
         symlink_rejected_count: census.symlink_rejected_count,
         unreadable_path_count: census.unreadable_path_count,
         unreadable_causes: census.unreadable_causes,
+        parent_unresolvable: census.parent_unresolvable,
         oversized_file_count: census.oversized_file_count,
         disappeared_file_count: census.disappeared_file_count,
         malformed_json_line_count: census.malformed_json_line_count,
@@ -26020,6 +26865,27 @@ fn opened_candidate_is_within_frozen_window(
     census_unix_seconds.map_or(true, |now| {
         is_recent_enough_at(candidate.modified_unix_seconds, now, backfill_window_days)
     })
+}
+
+/// PR-P: the opened parent is outside this traversal's backfill window and
+/// has no verification rescue, the exact discovery filter. Discovery never
+/// makes it a candidate, so no parse can produce its ledger.
+fn codex_parent_outside_window(
+    files: &BTreeMap<String, ScanIndexEntry>,
+    path: &Path,
+    file: &File,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+) -> bool {
+    let modified = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(unix_seconds)
+        .unwrap_or_default();
+    !sampled_audit::path_requires_verification(files, path)
+        && census_unix_seconds
+            .is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
 }
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
@@ -28827,15 +29693,24 @@ impl ScanIndex {
         }
     }
 
+    /// Whether `parent` fits the interim ref cap (lifted by L-R).
+    pub(in crate::snapshots) fn codex_parent_ref_fits(&self, parent: &str) -> bool {
+        self.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
+            || self
+                .codex_parent_ownership_refs
+                .contains(resolve_codex_identity(parent).as_str())
+    }
+
     /// The bounded parent-ref set (`MAX_CODEX_PARENT_LEDGER_REFS`): a fresh
-    /// parse and a memo replay request the same way.
-    pub(in crate::snapshots) fn record_codex_parent_ref(&mut self, parent: &str) {
-        let parent = resolve_codex_identity(parent);
-        if self.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
-            || self.codex_parent_ownership_refs.contains(parent.as_str())
-        {
-            self.codex_parent_ownership_refs.insert(parent);
+    /// parse and a memo replay request the same way. `false` when the ref did
+    /// not fit (PR-P: the child is then held `DeferredRef`).
+    pub(in crate::snapshots) fn record_codex_parent_ref(&mut self, parent: &str) -> bool {
+        let fits = self.codex_parent_ref_fits(parent);
+        if fits {
+            self.codex_parent_ownership_refs
+                .insert(resolve_codex_identity(parent));
         }
+        fits
     }
 
     fn effective_upload_body_witness_revision_requires_adoption(&self, key: &str) -> bool {
@@ -30789,6 +31664,7 @@ mod tests {
                 .collect(),
             scan_complete: true,
             opened_object_identity: String::new(),
+            unresolvable: None,
         };
         let ledgers = BTreeMap::from([(parent.to_string(), parent_ledger)]);
         let unresolved =
@@ -55975,6 +56851,7 @@ mod tests {
                 signatures,
                 scan_complete: true,
                 opened_object_identity: String::new(),
+                unresolvable: None,
             },
         )]);
         parse_codex_test_with_ledgers(path, ledgers)
@@ -56122,6 +56999,7 @@ mod tests {
                     .collect(),
                 scan_complete: true,
                 opened_object_identity: String::new(),
+                unresolvable: None,
             },
         )]);
         let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
@@ -58215,6 +59093,7 @@ mod tests {
                 signatures: vec!["signature".to_string()],
                 scan_complete: true,
                 opened_object_identity: "object".to_string(),
+                unresolvable: None,
             },
         );
         assert!(index.canonicalize_codex_identity_keys());
@@ -59842,6 +60721,9 @@ mod tests {
         let mut ids = CodexParentIdentities {
             census_valid: true,
             last: None,
+            parents_applied: false,
+            restart_budget_spent: false,
+            parent_restarts: None,
         };
         let (old_identity, fresh) = ids.probe(census, parent_id);
         assert!(fresh && old_identity.is_ok());
@@ -59975,6 +60857,9 @@ mod tests {
         let mut ids = CodexParentIdentities {
             census_valid: true,
             last: None,
+            parents_applied: false,
+            restart_budget_spent: false,
+            parent_restarts: None,
         };
 
         // A UUID-shaped parent is kept: a 36-byte id and a 64-byte identity.
@@ -64581,7 +65466,7 @@ crate::heap_layout_bound::fields!(ClaudeProofCorrectionCandidate; index_key, roo
 crate::heap_layout_bound::fields!(ClaudeCutoffCorrectionCandidate; index_key, root, member, proof, revision);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyPending; census_window_end, member_request_id_hashes, member_occurrences, invalid);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyWitness; evidence_fingerprint, member_request_id_fingerprints, member_occurrence_fingerprints, assigned_request_id_fingerprints, legacy_excluded_request_id_hashes, legacy_exclusion_evidence_fingerprint, legacy_owner_roots);
-crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity);
+crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity, unresolvable);
 crate::heap_layout_bound::fields!(CodexPathSidecarCandidate; identity, recorded_evidence, created_thread, identity_conflict, detail_incomplete, rollout_file_matches, parent, child_created_at_nanos, projected_next_ordinal);
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
@@ -64591,19 +65476,20 @@ crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete)
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count,
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
-    codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger);
+    codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
+    codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
-crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2);
+crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids, codex_inventory_hold);
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
@@ -64611,7 +65497,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
