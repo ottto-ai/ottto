@@ -4,6 +4,10 @@
 //! `with_test_forced_routing`, `codex_cursor::with_test_limits`,
 //! `with_test_state_budget`, the `sampled_scan` clock). Sparse fixtures at
 //! production constants assert that they are sparse and panic otherwise.
+//! The `cfg(test)` counters measure identity-sample bytes (at most 8 KiB
+//! per open) and parser constructions only; the other reads on these paths
+//! (header inventory, group probe, live witness) are bounded by their own
+//! construction, not measured here.
 use super::*;
 use crate::transcript_acquisition::Scope;
 use sampled_scan::codex_cursor::{
@@ -69,8 +73,8 @@ fn token_line(n: u64) -> Vec<u8> {
     )
 }
 
-/// The file's first priority usage: a tail that adds it needs the full
-/// replay (O7).
+/// Priority usage: every tail that carries any needs the full replay (O7),
+/// not only the first one.
 fn priority_line(n: u64) -> Vec<u8> {
     codex_line(
         json!({"timestamp": "2026-10-07T10:30:00Z", "type": "event_msg",
@@ -321,6 +325,18 @@ fn reset_counters() {
     take_test_identity_bytes_read();
 }
 
+/// The page's running `OpenRead` unreadable count.
+fn open_read_unreadable(scan: &SourceScanResult) -> u64 {
+    let causes = scan
+        .local_codex_diagnostics
+        .as_ref()
+        .expect("Codex diagnostics")
+        .unreadable_causes;
+    serde_json::to_value(causes).unwrap()["counts"][UnreadableCause::OpenRead as usize]
+        .as_u64()
+        .unwrap()
+}
+
 // F-T1 (with the `max_jsonl_file_bytes` test in `snapshots.rs`): discovery
 // admits an over-limit Codex rollout; the unsampled scan refuses it exactly
 // once, at the unpaged open, before any byte or parser. Claude and Pi keep
@@ -560,6 +576,28 @@ fn admission_and_overrun_truth_tables() {
             refuse_unpaged_overrun(codex, Bounded, &file, 200, false),
             None
         );
+        // R-c's `Oversized`: an `Unpaged` descriptor over the limit.
+        assert_eq!(
+            refuse_unpaged_overrun(codex, Unpaged, &file, 0, false),
+            Some(Overrun::Oversized)
+        );
+        // M1: the open-time size refusal (S2 and the O7 reopen) is only an
+        // `Unpaged` `InvalidData` refusal of a descriptor over the limit.
+        use std::io::{Error, ErrorKind};
+        for (admission, kind, len, refused) in [
+            (Unpaged, ErrorKind::InvalidData, 101, true),
+            (Unpaged, ErrorKind::InvalidData, 100, false),
+            (Bounded, ErrorKind::InvalidData, 101, false),
+            (Unpaged, ErrorKind::NotFound, 101, false),
+            (Bounded, ErrorKind::NotFound, 101, false),
+            (Unpaged, ErrorKind::PermissionDenied, 101, false),
+        ] {
+            assert_eq!(
+                unpaged_size_refused(codex, admission, &Error::from(kind), len),
+                refused,
+                "{admission:?} {kind:?} {len}"
+            );
+        }
     });
 }
 
@@ -951,8 +989,8 @@ fn sampled_group_unpaged_over_the_limit_is_oversized() {
 }
 
 /// The O7 tail page: a file read in one page and retained, then a small
-/// tail that adds the file's first priority tier, which needs the full
-/// replay. `singleton` and `unpaged` are functions of the file's length
+/// tail with priority usage (here the file's first; any would do), which
+/// needs the full replay. `singleton` and `unpaged` are functions of the file's length
 /// after the tail.
 struct O7Tail {
     fixture: Root,
@@ -1040,6 +1078,28 @@ fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
         );
         let c = counters(&row.cache);
         assert_eq!(c.jobs_started, 1, "one cursor read, no requeue loop: {c:?}");
+        // R2-M2: the cost is per change. A second priority tail on the
+        // certified file requeues again and costs a second whole cursor read.
+        row.fixture.append(SESSION, &priority_line(26));
+        let next = 1 + certified.pages;
+        let before = counters(&row.cache);
+        let (index, again, stats) = page(
+            &row.fixture,
+            certified.index,
+            Some(&row.cache),
+            &collected_at(next),
+        );
+        assert_eq!(stats.tail, 1, "{stats:?}");
+        assert_eq!(stats.priority_replays, 0, "no in-page full replay");
+        assert!(again.snapshots.is_empty());
+        assert_eq!(counters(&row.cache).deferred, before.deferred + 1);
+        let recertified = page_until_certified(&row.fixture, index, &row.cache, next + 1);
+        assert_eq!(
+            fingerprints(&recertified.scan),
+            oracle(&row.fixture, &recertified.collected_at)
+        );
+        let c = counters(&row.cache);
+        assert_eq!(c.jobs_started, 2, "a second whole cursor read: {c:?}");
     });
 }
 
@@ -1059,8 +1119,104 @@ fn o7_replay_over_the_unpaged_limit_requeues_through_the_backstop() {
     assert!(pending(&row.index, &row.fixture.file(SESSION)));
 }
 
+// F-T7 reopen failure (M1): the O7 reopen of a `Bounded` over-limit file
+// fails for a reason other than size (the path is gone; the tail was read
+// through its held descriptor). It is a read failure (`OpenRead`), as on
+// main, never `oversized`.
+#[test]
+fn o7_reopen_failure_on_a_bounded_over_limit_file_is_an_open_read() {
+    if !layout() {
+        return;
+    }
+    let fixture = Root::new(&[(SESSION, 24)]);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let tail = priority_line(25);
+    let after_tail = fixture.len(SESSION) + tail.len() as u64;
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(after_tail - 1, || {
+        with_test_limits(1024, after_tail, 64, || {
+            let (index, first, stats) = page(&fixture, ScanIndex::default(), Some(&cache), NOW);
+            assert_eq!(stats.full, 1);
+            assert!(!first.snapshots.is_empty());
+            assert!(cache.retained_checkpoint(&key).is_some(), "precondition");
+            fixture.append(SESSION, &tail);
+            let before = counters(&cache);
+            let gone = path.clone();
+            let (_, scan, stats) = with_codex_before_parse(
+                move |opened| {
+                    if opened == gone.as_path() {
+                        fs::remove_file(opened).unwrap();
+                    }
+                },
+                || page(&fixture, index, Some(&cache), NOW),
+            );
+            assert_eq!(stats.tail, 1, "{stats:?}");
+            assert_eq!(stats.priority_replays, 0);
+            assert!(scan.snapshots.is_empty());
+            assert_eq!(scan.oversized_file_count, 0, "{scan:?}");
+            assert_eq!(open_read_unreadable(&scan), 1, "{scan:?}");
+            assert_eq!(counters(&cache).deferred, before.deferred);
+        })
+    });
+}
+
+// F-T7 oversized row (R1-L2): on an `Unpaged` handle (forced on a sampled
+// scan), a file that grows past the unpaged limit after its open is refused
+// by the O7 reopen's own size check: counted oversized, never read. (The
+// R-c arm proper, on the same reopened descriptor, is reachable only by a
+// growth race between that check and R-c; its helper's `Oversized` result
+// is in `admission_and_overrun_truth_tables`.)
+#[test]
+fn o7_unpaged_reopen_over_the_limit_is_oversized() {
+    if !layout() {
+        return;
+    }
+    let fixture = Root::new(&[(SESSION, 24)]);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let tail = priority_line(25);
+    let after_tail = fixture.len(SESSION) + tail.len() as u64;
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(after_tail, || {
+        with_test_forced_routing(None, Some(ReadAdmission::Unpaged), || {
+            with_test_limits(1024, 2 * after_tail, 64, || {
+                let (index, first, stats) = page(&fixture, ScanIndex::default(), Some(&cache), NOW);
+                assert_eq!(stats.full, 1);
+                assert!(!first.snapshots.is_empty());
+                assert!(cache.retained_checkpoint(&key).is_some(), "precondition");
+                fixture.append(SESSION, &tail);
+                let grown = path.clone();
+                reset_counters();
+                let (_, scan, stats) = with_codex_before_parse(
+                    move |opened| {
+                        if opened == grown.as_path() {
+                            OpenOptions::new()
+                                .append(true)
+                                .open(opened)
+                                .unwrap()
+                                .write_all(&token_line(26))
+                                .unwrap();
+                        }
+                    },
+                    || page(&fixture, index, Some(&cache), NOW),
+                );
+                assert_eq!(stats.priority_replays, 0);
+                assert!(scan.snapshots.is_empty());
+                assert_eq!(scan.oversized_file_count, 1, "{scan:?}");
+                assert_eq!(open_read_unreadable(&scan), 0, "{scan:?}");
+                assert_eq!(
+                    take_test_parser_constructions(),
+                    1,
+                    "the tail's parser only"
+                );
+            })
+        })
+    });
+}
+
 // F-T7 Fenced row (R2-L1): a file whose cursor attempt completed in this
-// census generation, re-tailed with its first priority tier, is requeued
+// census generation, re-tailed with priority usage, is requeued
 // and then fenced to the next generation, where it publishes.
 #[test]
 fn o7_requeue_after_an_attempt_in_the_generation_is_fenced() {
@@ -1261,17 +1417,33 @@ fn state_pressure_never_falls_back_to_an_unpaged_read() {
         with_test_limits(2048, 1024, 64, || {
             with_test_state_budget(1, || {
                 let mut index = ScanIndex::default();
+                let mut started = counters(&cache).jobs_started;
                 for number in 0..8 {
                     reset_counters();
                     let (next, scan, stats) =
                         page(&fixture, index, Some(&cache), &collected_at(number));
                     index = next;
+                    // An unpaged fallback would build a parser with no job
+                    // start: every parser on a page belongs to a cursor job
+                    // that started on it.
+                    let now_started = counters(&cache).jobs_started;
+                    assert!(
+                        take_test_parser_constructions() <= now_started - started,
+                        "{:?}",
+                        counters(&cache)
+                    );
+                    started = now_started;
                     assert_eq!(stats.priority_replays, 0);
                     assert!(scan.snapshots.is_empty(), "{:?}", counters(&cache));
                     assert_eq!(scan.oversized_file_count, 0);
                 }
                 let c = counters(&cache);
                 assert_eq!(c.jobs_certified, 0, "{c:?}");
+                assert!(c.jobs_started >= 1, "{c:?}");
+                assert!(
+                    c.jobs_state_bound >= 1,
+                    "the job ends as state-bound debt: {c:?}"
+                );
             })
         })
     });

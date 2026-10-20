@@ -16490,16 +16490,27 @@ impl OwnedSourceScan {
                         &mut reopened_candidate,
                         active.admission,
                     );
-                    let Ok(file) = reopened else {
-                        if source == SnapshotSource::Codex
-                            && reopened_candidate.size_bytes > unpaged_read_limit(source)
+                    let file = match reopened {
+                        Ok(file) => file,
+                        // Only the unpaged size refusal (as at open) counts
+                        // as oversized; every other failure, under either
+                        // admission, is a read failure as on main.
+                        Err(error)
+                            if unpaged_size_refused(
+                                source,
+                                active.admission,
+                                &error,
+                                reopened_candidate.size_bytes,
+                            ) =>
                         {
                             census.oversized_file_count += 1;
                             scanned_file_count = scanned_file_count.saturating_sub(1);
-                        } else {
-                            census.record_unreadable(UnreadableCause::OpenRead, 1);
+                            pending!();
                         }
-                        pending!();
+                        Err(_) => {
+                            census.record_unreadable(UnreadableCause::OpenRead, 1);
+                            pending!();
+                        }
                     };
                     // The replay below reads the whole file in this page. A
                     // file larger than the singleton budget is instead
@@ -27698,6 +27709,21 @@ fn take_test_parser_constructions() -> u64 {
     TEST_PARSER_CONSTRUCTIONS.with(|count| count.replace(0))
 }
 
+/// The one open-time size refusal (S2 and the O7 reopen): only an `Unpaged`
+/// open refuses on size, with `InvalidData`, and `len` is the opened
+/// descriptor's length (`open_candidate_file_admitted` refreshes it before
+/// the cap). Every other open failure is not a size refusal.
+fn unpaged_size_refused(
+    source: SnapshotSource,
+    admission: ReadAdmission,
+    error: &std::io::Error,
+    len: u64,
+) -> bool {
+    admission == ReadAdmission::Unpaged
+        && error.kind() == std::io::ErrorKind::InvalidData
+        && len > unpaged_read_limit(source)
+}
+
 /// Why a non-cursor read must not start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Overrun {
@@ -27856,10 +27882,7 @@ fn open_and_identify_scan_candidate(
             );
             return None;
         }
-        Err(error)
-            if error.kind() == std::io::ErrorKind::InvalidData
-                && candidate.size_bytes > unpaged_read_limit(source) =>
-        {
+        Err(error) if unpaged_size_refused(source, admission, &error, candidate.size_bytes) => {
             census.oversized_file_count += 1;
             return None;
         }

@@ -25,8 +25,12 @@ refusal excluded files that the cursor could read.
   scan cannot page it. This is decided from the opened descriptor's length.
   Parent witnesses come only from the sampled parent pass, as before: on an
   unsampled scan an over-limit parent is refused at its unpaged open, and
-  its child stays held with no recorded cause unless a valid persisted
-  ledger resolves it.
+  its child stays held with no recorded cause. The refusal keeps the
+  parent's persisted ledger, and ledger validation (identity only) still
+  validates it. A fresh unsampled traversal validates ledgers before its
+  discovery fills the census, so in that run the ledger does not resolve the
+  child (existing census ordering, unchanged). The ledger helps where the
+  census exists at validation: a resumed traversal, or a sampled scan.
 - **One runtime refusal** (`refuse_unpaged_overrun`), at every point where a
   non-cursor read starts:
   - R-a: the main-loop read;
@@ -38,10 +42,15 @@ refusal excluded files that the cursor could read.
   `Unpaged` handle is counted oversized and is not read, as at open.
 - **Group members.** A member's identify-time length is not final. Each
   member body open still checks its own descriptor under the job's
-  admission, and a member that grew past the limit ends the job as `Strict`.
+  admission, and a member that grew past the limit ends the job as `Strict`
+  debt. That member is disclosed as strict debt, not counted in
+  `oversized_file_count`.
 - **O7 (protected-tier replay).** It now requeues to the cursor when the file
   is larger than the 64 MiB singleton budget. Before, it re-read the whole
-  file in one page up to 2 GiB.
+  file in one page up to 2 GiB. A failed O7 reopen counts as oversized only
+  when it is the unpaged size refusal (`Unpaged`, `InvalidData`, the
+  descriptor over the limit: the same predicate as at open). Any other
+  failure is `OpenRead`, as before.
 
 Preserved: opened-descriptor identity and TOCTOU checks, #645 `NotFound`
 causes, prior bodies, held, ACK and protected state, and truthful observed
@@ -61,6 +70,10 @@ A consumer must treat an unknown or missing completeness field,
 audit leg. This is a producer change only. The private validator's v5
 support is separate work, and no audit was run or collected for this change.
 
+`v4-golden-keys.json` is kept, unreferenced by tests now: it is the
+provenance of the v5 keys (their inputs were checked against it) and the
+reference for the validator's v4 mapping. A later cleanup may retire it.
+
 The v5 golden keys come from supported CI, not a local build. A first CI
 pass with placeholder keys failed on purpose and printed the actual keys and
 their unblinded fixture inputs: the payload and rescanned fingerprints, the
@@ -71,16 +84,45 @@ keys CI printed. Only then were the keys written to
 
 ## Latency trade-off (O7)
 
-O7 needs no flag: a build that contains this change behaves this way. An
-existing protected-tier tail over 64 MiB used to publish within one page. It
-now waits for a cursor read of the whole file: `ceil(L / 64 MiB)` pages
-(2 to 32 pages for 65 MiB to 2 GiB: about 10 minutes to 2.7 hours at the
-5-minute cadence, 20 minutes to 5.3 hours at the idle cadence), plus any
-wait for the single cursor slot, plus the census-generation fence when the
-file was already attempted in the generation. The bytes read are the same;
-they are spread over pages. This is a material publication-latency cost,
-not a counter shift. It is the price of never reading more than the
-singleton budget in one page.
+O7 needs no flag: a build that contains this change behaves this way.
+
+**It recurs on every change.** O7 fires on every tail that carries any
+priority-tier usage, not only the first (`has_protected_tiers` is true for
+any priority record the tail parsed). An active priority-tier session over
+64 MiB used to publish each change within one page. Now each such change
+waits for a cursor read of the whole file, `ceil(L / 64 MiB)` pages:
+
+| File length L | Pages per change | 5-minute cadence | Idle cadence (10 min) |
+|---|---|---|---|
+| 65 MiB – 2 GiB (existing) | 2 – 32 | 10 min – 2.7 h | 20 min – 5.3 h |
+| 4 GiB (newly admitted) | 64 | 5.3 h | 10.7 h |
+| over 2 GiB in general | `ceil(L / 64 MiB)` | no upper bound: linear in L | no upper bound |
+
+Files over 2 GiB are new coverage (they were excluded before), but each
+priority change on them costs this much.
+
+**Plus the slot wait.** There is one cursor slot, rotated by whole attempts.
+Each such change holds the slot for a whole attempt, so every other paged
+read (first reads over 64 MiB, every file over 2 GiB, other O7 requeues)
+waits behind it, and it waits behind them. This is the standing load behind
+the cursor-slot-starvation residual below.
+
+**Plus the generation fence (K7).** A file whose cursor attempt already
+completed in the current census generation is `Fenced`: its next large read
+waits for the next generation. A generation is one bounded traversal
+(`census_token`: context fingerprint and census window). It completes only
+when no directory or candidate is pending, and deferred or in-progress large
+files stay pending. So the fence lasts the rest of the current traversal:
+at least one page, at most the remaining pages of every large read still
+pending in it (the sum of `ceil(Fj / 64 MiB)` over those files). Then come
+the file's own `ceil(L / 64 MiB)` pages in the next generation. With no
+other large read pending, the traversal ends with the file's own attempt and
+there is no fence.
+
+The bytes read per change are the same as before; they are spread over pages
+instead of one page of up to 2 GiB. This is a material publication-latency
+cost for priority-tier sessions over 64 MiB, not a counter shift. It is the
+price of never reading more than the singleton budget in one page.
 
 ## Residuals (unchanged by this change)
 
@@ -91,7 +133,12 @@ singleton budget in one page.
 - Restart, memory pressure and unsupported layouts. A scan with an
   unsupported layout still refuses Codex files over 2 GiB, counted and
   disclosed.
-- Cursor slot starvation.
+- Cursor slot starvation, which O7 makes a standing load (see above).
+- A non-paged group member that grows past the unpaged limit after identify
+  ends the job as strict debt; it is not counted in `oversized_file_count`.
+- `ta::sample_at` above 2^32 (the audit sample a `Full(AuditDue)` read takes
+  on a file over 4 GiB) has no test here: the function is private to
+  `transcript_acquisition` (F-T6c).
 
 Scaled tests prove the routing. They do not prove real throughput above
 2 GiB.

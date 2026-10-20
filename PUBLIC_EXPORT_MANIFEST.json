@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 734,
-  "content_sha256": "4fec1178eea8ca606b373bdaf945f85eecd6b82f794558083806ad39ebed19d0",
+  "content_sha256": "6f7f24f4d459eb5601c06184e91e47029d2cb9075f2e5842729542a5988ba4db",
   "files": [
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "d576f2b2ae0f9db92f735a7edffc33bcdaad33709a46205b46b13f627cabc054",
-      "size_bytes": 2957186
+      "sha256": "4859d0261150dc3d0daafd188eecddd2d7ea11328ea7cc0877331f45e100c1a6",
+      "size_bytes": 2958184
     },
     {
       "executable": false,
@@ -1476,8 +1476,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_paged_admission_tests.rs",
-      "sha256": "1b50d9960ab32121da3c262c3e0f2e4a1ee3380f094deb70d6e3a10291faee9f",
-      "size_bytes": 72004
+      "sha256": "4bf695937acc6963f9881eda300a3555d9bbc6cb27da32a451ff846099cd5b63",
+      "size_bytes": 79737
     },
     {
       "executable": false,
@@ -3331,8 +3331,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-20-codex-paged-admission.md",
-      "sha256": "651454bc8af7888a98dbff148b10789569f4fb23a7aea8afe6bf0e447e7f94c9",
-      "size_bytes": 5312
+      "sha256": "8643e09415efa5c65c1119fdb25f25ec53e7e637888b01dc4674470bc1eed199",
+      "size_bytes": 8140
     },
     {
       "executable": false,
