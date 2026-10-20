@@ -18,6 +18,8 @@ struct Hook {
     before: Option<crate::retry_allocation_probe::Stats>,
     observations: Vec<Observation>,
     conflict_path: Option<PathBuf>,
+    retry_clock: Option<u64>,
+    retry_clock_reads: usize,
 }
 thread_local! {
     static HOOK: RefCell<Hook> = RefCell::new(Hook::default());
@@ -25,6 +27,16 @@ thread_local! {
 
 pub(crate) fn keep_prior() -> bool {
     HOOK.with(|state| state.borrow().keep)
+}
+pub(crate) fn retry_clock() -> Option<u64> {
+    HOOK.with(|state| {
+        let mut state = state.borrow_mut();
+        let clock = state.retry_clock;
+        if clock.is_some() {
+            state.retry_clock_reads += 1;
+        }
+        clock
+    })
 }
 pub(crate) fn before_retirement() {
     HOOK.with(|state| {
@@ -58,7 +70,7 @@ pub(crate) fn after_retirement(retained: bool) {
 }
 struct Guard;
 impl Guard {
-    fn new(keep: bool, conflict_path: Option<PathBuf>) -> Self {
+    fn new(keep: bool, conflict_path: Option<PathBuf>, retry_clock: Option<u64>) -> Self {
         HOOK.with(|state| {
             assert!(!state.borrow().enabled);
             *state.borrow_mut() = Hook {
@@ -66,6 +78,7 @@ impl Guard {
                 keep,
                 observations: Vec::with_capacity(8),
                 conflict_path,
+                retry_clock,
                 ..Default::default()
             };
         });
@@ -73,6 +86,9 @@ impl Guard {
     }
     fn observations(&self) -> Vec<Observation> {
         HOOK.with(|state| state.borrow().observations.clone())
+    }
+    fn retry_clock_reads(&self) -> usize {
+        HOOK.with(|state| state.borrow().retry_clock_reads)
     }
 }
 impl Drop for Guard {
@@ -166,6 +182,10 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
     };
     let mut common = None;
     let mut output = Vec::new();
+    // Freeze only the existing retry-deadline clock for these paired finishes.
+    // The same real instant is supplied before either outcome is produced;
+    // no persisted field is normalized after the fact.
+    let pair_retry_clock = current_unix_seconds();
     for keep in [true, false] {
         std::fs::remove_dir_all(&support).unwrap();
         for (path, bytes) in &initial {
@@ -219,7 +239,11 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
         let index = index.clone();
         let scan = scan.clone();
         let progress_path = preparation.upload_progress_path.clone();
-        let guard = Guard::new(keep, conflict.then(|| index_path.clone()));
+        let guard = Guard::new(
+            keep,
+            conflict.then(|| index_path.clone()),
+            Some(pair_retry_clock),
+        );
         let (result, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
             // Charge P's actual deep clone to this born-pointer scope. Freeing
             // its pre-existing predecessor cannot mask a subsequent peak.
@@ -245,6 +269,12 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
         let observations = guard.observations();
         assert_eq!(observations.len(), 1, "actual final-save boundary reached");
         assert_eq!(observations[0].retained, keep);
+        if matches!(outcome, FinishOutcome::Retryable) {
+            assert!(
+                guard.retry_clock_reads() > 0,
+                "actual retry clock was controlled"
+            );
+        }
         assert_eq!(
             result.is_ok(),
             !conflict && !matches!(outcome, FinishOutcome::Retryable),
@@ -279,6 +309,10 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
             ok: result.is_ok(),
         });
         drop(guard);
+        assert!(
+            retry_clock().is_none(),
+            "retry clock cannot escape its pair run"
+        );
     }
     output.try_into().ok().unwrap()
 }
@@ -334,7 +368,7 @@ fn prior_index_lifetime_retains_real_earned_receipt_path() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let guard = Guard::new(false, None);
+    let guard = Guard::new(false, None, None);
     permanent_finish_pipeline(FinishOutcome::Permanent, true);
     let records = guard.observations();
     assert_eq!(records.len(), 3);
