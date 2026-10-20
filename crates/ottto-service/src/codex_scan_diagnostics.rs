@@ -190,6 +190,42 @@ pub(crate) struct UnreadableBreakdown {
 }
 crate::heap_layout_bound::fields!(UnreadableCauses; counts);
 
+/// PR-P: number of `CodexParentUnresolvable` causes (asserted in `snapshots`).
+pub(crate) const PARENT_UNRESOLVABLE_CAUSES: usize = 12;
+/// Held fork children per parent cause; counts only. Persisted inside
+/// `ScanTraversalCounts`, so old traversals default to zero, and an older
+/// binary ignores the unknown field (as `UnreadableCauses`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ParentUnresolvableCauses {
+    counts: [u64; PARENT_UNRESOLVABLE_CAUSES],
+}
+impl ParentUnresolvableCauses {
+    /// `cause` is `CodexParentUnresolvable::index()` (this module cannot name
+    /// the enum); saturating, like `UnreadableCauses::record`.
+    pub(crate) fn record(&mut self, cause: usize, count: u64) {
+        if let Some(slot) = self.counts.get_mut(cause) {
+            *slot = slot.saturating_add(count);
+        }
+    }
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (slot, incoming) in self.counts.iter_mut().zip(other.counts) {
+            *slot = slot.saturating_add(incoming);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> [u64; PARENT_UNRESOLVABLE_CAUSES] {
+        self.counts
+    }
+    #[cfg(test)]
+    pub(crate) fn saturated() -> Self {
+        Self {
+            counts: [u64::MAX; PARENT_UNRESOLVABLE_CAUSES],
+        }
+    }
+}
+crate::heap_layout_bound::fields!(ParentUnresolvableCauses; counts);
+
 #[derive(Default, Serialize)]
 struct CensusLossCounts {
     discovered: u64,
@@ -752,6 +788,19 @@ pub(crate) struct CodexScanDiagnostics {
     pub identity_conflict_taxonomy: IdentityConflictTaxonomy,
     pub gates: CensusGates,
     pub unreadable_causes: UnreadableCauses,
+    /// PR-P: held fork children per parent cause. Traversal-cumulative, as
+    /// `unreadable_causes`: every page reports the running traversal total.
+    pub parent_unresolvable: ParentUnresolvableCauses,
+    /// PR-P: the scope's parent-resolution restart budget consumed, only when
+    /// this page established it (its step-start pass or a restart ran).
+    /// Omitted, never a fabricated 0, on discovery pages or without a shared
+    /// cache, and omitted when the cursor is poisoned (N1: the scan still
+    /// treats the budget as spent, but the count is unknown). A budget
+    /// counter, not a count of actual restarts: an evicted slot re-enters
+    /// spent, so it may read 2 (or exceed it after re-entry) with fewer
+    /// restarts run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_restarts_in_scope: Option<u64>,
     pub quarantine_count: u64,
     pub sample_offset: u64,
     pub lineage: [Option<RecoveryLineage>; LINEAGE_SAMPLES],
@@ -808,7 +857,7 @@ pub(crate) struct CountingV2Receipts {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, identity_conflict_taxonomy, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
 crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
@@ -897,6 +946,39 @@ mod tests {
         assert_eq!(evidence.completed_roots, 1);
         assert!(!serde_json::to_string(&evidence).unwrap().contains("secret"));
     }
+    /// PR-P: both parent fields are additive. `parent_restarts_in_scope` is
+    /// omitted when unknown (never a fabricated 0) and present when
+    /// established, 0 included; cause counts saturate, ignore an
+    /// out-of-range cause, and a pre-PR-P value loads as zero.
+    #[test]
+    fn parent_fields_are_additive_and_unknown_restarts_are_omitted() {
+        let mut diagnostics = CodexScanDiagnostics::default();
+        let value = serde_json::to_value(diagnostics).unwrap();
+        assert!(value.get("parent_restarts_in_scope").is_none());
+        assert_eq!(
+            value["parent_unresolvable"]["counts"],
+            serde_json::to_value([0_u64; PARENT_UNRESOLVABLE_CAUSES]).unwrap()
+        );
+        diagnostics.parent_restarts_in_scope = Some(0);
+        diagnostics.parent_unresolvable.record(3, 2);
+        diagnostics
+            .parent_unresolvable
+            .record(PARENT_UNRESOLVABLE_CAUSES, 1);
+        let value = serde_json::to_value(diagnostics).unwrap();
+        assert_eq!(value["parent_restarts_in_scope"], 0);
+        let mut expected = [0_u64; PARENT_UNRESOLVABLE_CAUSES];
+        expected[3] = 2;
+        assert_eq!(diagnostics.parent_unresolvable.counts(), expected);
+        let old: ParentUnresolvableCauses = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, ParentUnresolvableCauses::default());
+        let back: ParentUnresolvableCauses =
+            serde_json::from_value(serde_json::to_value(diagnostics.parent_unresolvable).unwrap())
+                .unwrap();
+        assert_eq!(back, diagnostics.parent_unresolvable);
+        let mut merged = ParentUnresolvableCauses::saturated();
+        merged.merge(diagnostics.parent_unresolvable);
+        assert_eq!(merged, ParentUnresolvableCauses::saturated());
+    }
     #[test]
     fn fully_populated_schema_stays_bounded_and_content_free() {
         let mut diagnostics = CodexScanDiagnostics {
@@ -914,6 +996,9 @@ mod tests {
             sqlite_extended_code: Some(i32::MAX),
             ..Default::default()
         };
+        // PR-P: the two parent fields at their maxima.
+        diagnostics.parent_unresolvable = ParentUnresolvableCauses::saturated();
+        diagnostics.parent_restarts_in_scope = Some(u64::MAX);
         diagnostics.state_titles = evidence;
         diagnostics.state_threads = evidence;
         diagnostics.spawn_edges = evidence;

@@ -244,6 +244,7 @@ fn parse(f: &Fixture) -> Observation {
                 signatures,
                 scan_complete: true,
                 opened_object_identity: String::new(),
+                unresolvable: None,
             },
         )]))))
     } else {

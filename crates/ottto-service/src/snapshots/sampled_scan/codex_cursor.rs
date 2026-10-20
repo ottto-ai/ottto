@@ -700,6 +700,17 @@ pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) groups_fenced: u64,
     pub(in crate::snapshots) probe_bound: u64,
     pub(in crate::snapshots) join_terminal_debt: [u64; codex_file_join::JOIN_REFUSALS],
+    /// PR-P (RAM/test only; not in the diagnostics projection, no export):
+    /// parent witnesses refused at admission, forgotten by a feasible
+    /// mandatory admission (one per witness), new namespaces refused past
+    /// `ROTATION_KEYS`, restart slots evicted past `ROTATION_KEYS`, and match
+    /// marks refused. Production sees their effects only through the census
+    /// `parent_unresolvable` counts and `parent_restarts_in_scope`.
+    pub(in crate::snapshots) parent_witness_refused: u64,
+    pub(in crate::snapshots) parent_witness_evicted: u64,
+    pub(in crate::snapshots) parent_namespace_refused: u64,
+    pub(in crate::snapshots) parent_restart_slot_evicted: u64,
+    pub(in crate::snapshots) parent_match_unmarked: u64,
 }
 crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resumed,
     jobs_certified, jobs_uncertified, jobs_invalidated, jobs_member_changed, jobs_state_bound,
@@ -708,7 +719,9 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
     deferred_next_generation, namespace_busy, cursor_disabled_unsupported_layout, audit_overdue,
     audit_overdue_max_age_seconds, sealed_fragment_withheld, eof_record_applied,
     jobs_unavailable_ended, memo_hits, memo_records, parked_hits, groups_started,
-    group_memo_hits, join_in_progress_members, groups_fenced, probe_bound, join_terminal_debt);
+    group_memo_hits, join_in_progress_members, groups_fenced, probe_bound, join_terminal_debt,
+    parent_witness_refused, parent_witness_evicted, parent_namespace_refused,
+    parent_restart_slot_evicted, parent_match_unmarked);
 
 /// A `JoinStateBound` file waits here until its object or reduction
 /// dependencies change. Its job ran out of a build constant
@@ -840,6 +853,161 @@ fn bounded_insert<V>(
 /// One owner's L-1 provenance: (LRU tick, member keys joined by '\0').
 type JoinProvenance = (u64, String);
 
+/// PR-P: a parent witnessed unusable: RAM-only, event-based evidence of why
+/// ownership proof is unavailable. It admits nothing, releases nothing and
+/// proves nothing; identity change, eviction or process restart loses it and
+/// the parent is revalidated fail-closed. `identity: None` only for event (a)
+/// identity causes (no current object); every other witness carries the
+/// opened identity it was established at, so any change of the parent drops
+/// it. `waits_on` is set only on a `DeferredRestart` wait record: the
+/// parent's own pending parent, for cycle detection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct ParentWitness {
+    pub(in crate::snapshots) cause: CodexParentUnresolvable,
+    pub(in crate::snapshots) identity: Option<String>,
+    pub(in crate::snapshots) waits_on: Option<String>,
+}
+crate::heap_layout_bound::fields!(ParentWitness; cause, identity, waits_on);
+
+/// Witnesses of one namespace, each with its stored heap charge (key and
+/// strings, measured once at insert like `SingletonMemo`), so a cache-wide
+/// walk is two visits whatever the count.
+#[derive(Default)]
+struct ParentWitnesses {
+    entries: BTreeMap<String, (ParentWitness, usize)>,
+    charge: usize,
+}
+impl HeapLayoutBound for ParentWitnesses {
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        crate::heap_layout_bound::tree_nodes::<String, (ParentWitness, usize)>(
+            self.entries.len(),
+            c,
+        )?;
+        c.add(self.charge)
+    }
+}
+
+/// PR-P per-namespace witnesses; RAM only. Never stale-pruned: bounded at
+/// `ROTATION_KEYS` entries (an optional admission for a new namespace past
+/// them is refused, `parent_namespace_full`), charged, and released early
+/// only by a feasible mandatory admission under memory pressure
+/// (`admit_locked`), in bounded batches. The restart counters live apart
+/// (`ParentRestarts`).
+struct NamespaceParents {
+    /// `group_scope` the witnesses belong to; a change drops the entry.
+    scope: String,
+    /// `rotation.page` at the last access by any parent method.
+    touched: u64,
+    /// The traversal the witnesses were last matched against: the exact
+    /// `(census_window_end, restarts at match)`.
+    matched: Option<(String, u64)>,
+    witnesses: ParentWitnesses,
+}
+crate::heap_layout_bound::fields!(NamespaceParents; scope, touched, matched, witnesses);
+
+/// PR-P restart counter of one (namespace, scope). Inline only; keyed by
+/// both, so a scope change is a new slot, never a reset.
+#[derive(Clone, Copy, Debug, Default)]
+struct RestartSlot {
+    key: u64,
+    restarts: u64,
+    touched: u64,
+}
+
+/// A fixed inline table, reserved by construction. Nothing is inserted at
+/// runtime, so the restart bound can never be refused, and no staleness rule
+/// removes a slot: only LRU past `ROTATION_KEYS` (namespace, scope) pairs
+/// does, and the re-entering pair starts spent.
+struct ParentRestarts([Option<RestartSlot>; ROTATION_KEYS]);
+impl Default for ParentRestarts {
+    fn default() -> Self {
+        Self([None; ROTATION_KEYS])
+    }
+}
+impl HeapLayoutBound for ParentRestarts {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+impl ParentRestarts {
+    /// The slot of `key` (`parent_restart_key(namespace, scope)`), created as
+    /// needed; refreshes `touched`. There is no reset branch: a new receipt
+    /// scope or a replay is a new key, so a new slot and a new budget, unless
+    /// the table is full. `true` when another pair's slot was evicted.
+    fn touch(&mut self, key: u64, page: u64) -> (&mut RestartSlot, bool) {
+        let at = self
+            .0
+            .iter()
+            .position(|slot| slot.is_some_and(|slot| slot.key == key))
+            .or_else(|| self.0.iter().position(Option::is_none))
+            .unwrap_or_else(|| {
+                (0..ROTATION_KEYS)
+                    .min_by_key(|&i| self.0[i].map_or(0, |slot| slot.touched))
+                    .unwrap_or(0)
+            });
+        let evicted = self.0[at].is_some_and(|slot| slot.key != key);
+        let slot = self.0[at].get_or_insert(RestartSlot {
+            key,
+            restarts: 0,
+            touched: page,
+        });
+        if slot.key != key {
+            // This key's spent budget may have been evicted with an earlier
+            // slot. Start spent (fail closed: no restart, only latency), so
+            // the bound holds unconditionally, re-entry included.
+            *slot = RestartSlot {
+                key,
+                restarts: PARENT_RESTART_BUDGET,
+                touched: page,
+            };
+        }
+        slot.touched = page;
+        (slot, evicted)
+    }
+}
+
+/// Restart slots stay inline, so one (namespace, scope) is keyed by the
+/// first eight bytes of the SHA-256 of the namespace's length (u64,
+/// big-endian), the namespace, then the scope: the length prefix makes the
+/// pair unambiguous. A collision only makes two pairs share one budget: a
+/// budget is spent sooner, never refilled (fail closed, latency only).
+fn parent_restart_key(namespace: &str, scope: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update((namespace.len() as u64).to_be_bytes());
+    hasher.update(namespace.as_bytes());
+    hasher.update(scope.as_bytes());
+    let digest = hasher.finalize();
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(prefix)
+}
+
+/// Parent-resolution restarts per (process start, namespace, scope).
+pub(in crate::snapshots) const PARENT_RESTART_BUDGET: u64 = 2;
+
+/// A namespace's parent state, cloned out under the cursor lock.
+pub(in crate::snapshots) struct ParentState {
+    /// The restart count deciding the budget; a poisoned cursor reads it
+    /// spent (fail closed).
+    pub(in crate::snapshots) restarts: u64,
+    /// N1: `restarts` was observed in the table. False on a poisoned cursor,
+    /// whose fail-closed `restarts` is a decision, not a count: the
+    /// diagnostics then omit `parent_restarts_in_scope`.
+    pub(in crate::snapshots) restarts_observed: bool,
+    pub(in crate::snapshots) matched: Option<(String, u64)>,
+    pub(in crate::snapshots) witnesses: Vec<(String, ParentWitness)>,
+}
+
+/// A copy of `value` whose capacity is exactly its length (the requested-
+/// layout contract every cursor charge relies on).
+fn exact_copy(value: &str) -> String {
+    let mut copy = String::with_capacity(value.len());
+    copy.push_str(value);
+    copy
+}
+
 static NEXT_CURSOR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(in crate::snapshots) struct CursorState {
@@ -872,6 +1040,10 @@ pub(in crate::snapshots) struct CursorState {
     parked: BTreeMap<String, Parked>,
     rotation: Rotation,
     counters: Counters,
+    /// PR-P: parent witnesses per namespace (charged, LRU at `ROTATION_KEYS`).
+    parents: BTreeMap<String, NamespaceParents>,
+    /// PR-P: parent-resolution restart counters (inline, never charged).
+    parent_restarts: ParentRestarts,
 }
 
 impl Default for CursorState {
@@ -892,6 +1064,8 @@ impl Default for CursorState {
             parked: BTreeMap::new(),
             rotation: Rotation::default(),
             counters: Counters::default(),
+            parents: BTreeMap::new(),
+            parent_restarts: ParentRestarts::default(),
         }
     }
 }
@@ -914,6 +1088,8 @@ impl HeapLayoutBound for CursorState {
             parked,
             rotation,
             counters,
+            parents,
+            parent_restarts,
         } = self;
         // The paused job was walked once when it paused; its charge stays
         // fixed while it sits here because nothing mutates a paused parser.
@@ -934,7 +1110,10 @@ impl HeapLayoutBound for CursorState {
         invalidations.heap_bound(c)?;
         parked.heap_bound(c)?;
         rotation.heap_bound(c)?;
-        counters.heap_bound(c)
+        counters.heap_bound(c)?;
+        // PR-P: witnesses are charged; the restart table is inline.
+        parents.heap_bound(c)?;
+        parent_restarts.heap_bound(c)
     }
 }
 
@@ -2009,11 +2188,142 @@ fn evict_oldest_join_owner(cursor: &mut CursorState) -> bool {
     true
 }
 
+/// PR-P: the mandatory valve's last step, after all join provenance. One
+/// bounded batch from the least-recently `touched` namespace: identity-cause
+/// witnesses first (`identity: None`, one probe to restore), then the others
+/// in key order (a re-read to restore), each freeing exactly its accounted
+/// node and stored charge, until `deficit` bytes are freed or the namespace
+/// is empty. An emptied entry (or one holding only a match mark) is then
+/// dropped with its key, scope and mark. In place, no key copy, no heap walk.
+/// The caller re-measures once per batch, so the valve costs at most one
+/// state measurement per namespace. False when `parents` is empty or the
+/// layout is unsupported (nothing evicted).
+fn evict_lru_parent_witnesses(cursor: &mut CursorState, deficit: usize) -> bool {
+    let Some(node) = crate::heap_layout_bound::tree_node_bytes::<String, (ParentWitness, usize)>()
+    else {
+        return false;
+    };
+    let Some(oldest) = cursor.parents.values().map(|entry| entry.touched).min() else {
+        return false;
+    };
+    let mut freed = 0_usize;
+    let mut evicted = 0_u64;
+    let mut corrupt = false;
+    if let Some(entry) = cursor
+        .parents
+        .values_mut()
+        .find(|entry| entry.touched == oldest)
+    {
+        for identity_causes_only in [true, false] {
+            let witnesses = &mut entry.witnesses;
+            let charge = &mut witnesses.charge;
+            witnesses.entries.retain(|_, (witness, stored)| {
+                if freed >= deficit || (identity_causes_only && witness.identity.is_some()) {
+                    return true;
+                }
+                match charge.checked_sub(*stored) {
+                    Some(left) => *charge = left,
+                    None => corrupt = true,
+                }
+                freed = freed.saturating_add(node).saturating_add(*stored);
+                evicted += 1;
+                false
+            });
+        }
+    }
+    if corrupt {
+        // Charge accounting is corrupt: fail closed. The state then measures
+        // unbounded and admits nothing.
+        debug_assert!(
+            std::thread::panicking(),
+            "parent witness charge accounting is corrupt"
+        );
+        if let Some(entry) = cursor
+            .parents
+            .values_mut()
+            .find(|entry| entry.touched == oldest)
+        {
+            entry.witnesses.charge = usize::MAX;
+        }
+        return false;
+    }
+    cursor.counters.parent_witness_evicted += evicted;
+    // Drop the processed entry (the first at `oldest`, as `find` saw it) only
+    // when it holds no witness.
+    let mut first = true;
+    let before = cursor.parents.len();
+    cursor.parents.retain(|_, entry| {
+        if !first || entry.touched != oldest {
+            return true;
+        }
+        first = false;
+        !entry.witnesses.entries.is_empty()
+    });
+    evicted > 0 || cursor.parents.len() < before
+}
+
+/// PR-P: the extra charge of a namespace entry: none when it exists for this
+/// scope; otherwise its map node, key, scope and empty witness-map root (the
+/// root `tree_nodes` charges for an empty map).
+fn parent_entry_charge(exists: bool, namespace: &str, scope: &str) -> Option<usize> {
+    if exists {
+        return Some(0);
+    }
+    crate::heap_layout_bound::tree_node_bytes::<String, NamespaceParents>()?
+        .checked_add(namespace.len())?
+        .checked_add(scope.len())?
+        .checked_add(crate::heap_layout_bound::tree_node_bytes::<
+            String,
+            (ParentWitness, usize),
+        >()?)
+}
+
+/// PR-P (N2): whether `namespace` would be a new entry past `ROTATION_KEYS`.
+/// Every caller is an optional admission and refuses it before admitting
+/// anything (`parent_namespace_refused`): the retained namespaces and their
+/// witnesses are never evicted for a newcomer (the count bound, not the memory
+/// valve). The newcomer's parents stay owed (re-read, fail-closed). An entry
+/// of another scope is not new: it is replaced in place.
+fn parent_namespace_full(cursor: &CursorState, namespace: &str) -> bool {
+    cursor.parents.len() >= ROTATION_KEYS && !cursor.parents.contains_key(namespace)
+}
+
+/// PR-P: the namespace's entry after admission: an entry of another scope is
+/// dropped and replaced. None for a new namespace past `ROTATION_KEYS`
+/// (`parent_namespace_full`, which the caller checked before admitting).
+fn parent_entry<'a>(
+    cursor: &'a mut CursorState,
+    exists: bool,
+    namespace: &str,
+    scope: &str,
+    page: u64,
+) -> Option<&'a mut NamespaceParents> {
+    if !exists {
+        if parent_namespace_full(cursor, namespace) {
+            return None;
+        }
+        cursor.parents.remove(namespace);
+        cursor.parents.insert(
+            exact_copy(namespace),
+            NamespaceParents {
+                scope: exact_copy(scope),
+                touched: page,
+                matched: None,
+                witnesses: ParentWitnesses::default(),
+            },
+        );
+    }
+    let entry = cursor.parents.get_mut(namespace)?;
+    entry.touched = page;
+    Some(entry)
+}
+
 /// Whether `charge` fits beside the least the state and the retained cache
 /// can measure after every eviction `admit_locked` may make: the empty
 /// retained cache's own bound (`release_until`'s floor) and, for `mandatory`,
-/// the state without its join provenance (an empty map; bounds are additive
-/// per field). False: no eviction can make room, so none may run.
+/// the state without its join provenance and without its parent witnesses
+/// (empty maps; bounds are additive per field). False: no eviction can make
+/// room, so none may run.
 fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> bool {
     use crate::heap_layout_bound::bound;
     let state = bound(cursor, STATE_BYTES).and_then(|state| {
@@ -2023,7 +2333,11 @@ fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> b
         let empty = BTreeMap::<String, JoinProvenance>::new();
         let forgettable =
             bound(&cursor.join_owners, STATE_BYTES)?.checked_sub(bound(&empty, STATE_BYTES)?)?;
-        state.checked_sub(forgettable)
+        // PR-P: parent witnesses are evictable for a mandatory charge only.
+        let no_parents = BTreeMap::<String, NamespaceParents>::new();
+        let witnesses =
+            bound(&cursor.parents, STATE_BYTES)?.checked_sub(bound(&no_parents, STATE_BYTES)?)?;
+        state.checked_sub(forgettable)?.checked_sub(witnesses)
     });
     let floor = bound(&super::RetainedCache::default(), STATE_BYTES);
     state
@@ -2043,11 +2357,17 @@ fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> b
 /// it. If even an empty retained cache does not fit, `mandatory` (a paused
 /// job: baseline progress) may then forget join provenance, which is
 /// optional and only keeps its owner blocked; optional admissions never take
-/// room that way. Nothing is evicted unless the admission is first proved
-/// feasible (`admission_feasible`, R2-M1): a hopeless charge (a
-/// `JoinStateBound` pause, an optional claim inside the empty-retained floor)
-/// keeps every retained copy and every provenance entry. Unsupported
-/// accounting, overflow or no room: false, nothing admitted.
+/// room that way. Once no provenance is left, a mandatory charge then forgets
+/// parent witnesses in bounded batches sized by the checked shortfall
+/// (`evict_lru_parent_witnesses`, PR-P). Nothing is evicted unless the
+/// admission is first proved feasible (`admission_feasible`, R2-M1): a
+/// hopeless charge (a `JoinStateBound` pause, an optional claim inside the
+/// empty-retained floor) keeps every retained copy, provenance entry and
+/// witness. Unsupported accounting, overflow or no room: false, nothing
+/// admitted. The loop measures the state at most `JOIN_OWNERS` +
+/// `ROTATION_KEYS` + 2 times: once per provenance entry, once per witness
+/// batch (each either covers the shortfall or empties its namespace), and
+/// once more to admit.
 fn admit_locked(
     retained: &mut super::RetainedCache,
     cursor: &mut CursorState,
@@ -2069,8 +2389,28 @@ fn admit_locked(
         }
         // Even an empty retained cache did not fit beside the state (or the
         // state alone left no room): only a mandatory charge goes on, one
-        // forgotten provenance entry at a time (at most `JOIN_OWNERS`).
-        if !mandatory || !evict_oldest_join_owner(cursor) {
+        // forgotten provenance entry at a time (at most `JOIN_OWNERS`), then
+        // parent witnesses in batches covering the checked shortfall.
+        if !mandatory {
+            return false;
+        }
+        if evict_oldest_join_owner(cursor) {
+            continue;
+        }
+        let Some(floor) =
+            crate::heap_layout_bound::bound(&super::RetainedCache::default(), STATE_BYTES)
+        else {
+            return false;
+        };
+        let Some(deficit) = state
+            .checked_add(charge)
+            .and_then(|need| need.checked_add(floor))
+            .and_then(|need| need.checked_sub(state_budget()))
+            .filter(|deficit| *deficit > 0)
+        else {
+            return false;
+        };
+        if !evict_lru_parent_witnesses(cursor, deficit) {
             return false;
         }
     }
@@ -2301,6 +2641,265 @@ impl SharedCache {
             fenced
         })
         .unwrap_or(false)
+    }
+
+    /// PR-P: the namespace's parent state for one page, under the cursor lock.
+    /// Touches the (namespace, scope) restart slot and the witness entry; an
+    /// entry of another scope is dropped (its witnesses are lost and
+    /// revalidated fail-closed). Never inserts into `parents`. A poisoned
+    /// cursor reports the budget spent and nothing witnessed (fail closed),
+    /// with the count unobserved (N1).
+    pub(in crate::snapshots) fn parent_state(&self, namespace: &Scope, scope: &str) -> ParentState {
+        self.with_cursor(|cursor| {
+            let page = cursor.rotation.page;
+            let (slot, evicted) = cursor
+                .parent_restarts
+                .touch(parent_restart_key(&namespace.0, scope), page);
+            let restarts = slot.restarts;
+            if evicted {
+                cursor.counters.parent_restart_slot_evicted += 1;
+            }
+            if cursor
+                .parents
+                .get(&namespace.0)
+                .is_some_and(|entry| entry.scope != scope)
+            {
+                cursor.parents.remove(&namespace.0);
+            }
+            match cursor.parents.get_mut(&namespace.0) {
+                Some(entry) => {
+                    entry.touched = page;
+                    ParentState {
+                        restarts,
+                        restarts_observed: true,
+                        matched: entry.matched.clone(),
+                        witnesses: entry
+                            .witnesses
+                            .entries
+                            .iter()
+                            .map(|(parent, (witness, _))| (parent.clone(), witness.clone()))
+                            .collect(),
+                    }
+                }
+                None => ParentState {
+                    restarts,
+                    restarts_observed: true,
+                    matched: None,
+                    witnesses: Vec::new(),
+                },
+            }
+        })
+        .unwrap_or(ParentState {
+            restarts: PARENT_RESTART_BUDGET,
+            restarts_observed: false,
+            matched: None,
+            witnesses: Vec::new(),
+        })
+    }
+
+    /// PR-P: admits one witness, optionally (it never forgets provenance or
+    /// witnesses to make room and never takes a claim's room), in one
+    /// critical section under the retained lock, then the cursor lock. The
+    /// charge is computed from lengths before any key is copied: the witness
+    /// node, the key and the moved-in strings' capacities, plus a new entry's
+    /// node, key, scope and empty-map root. Construction is checked against it. Unsupported
+    /// layout or no room: refused (`parent_witness_refused`), nothing kept.
+    /// The count bound is separate: a witness for a new namespace past
+    /// `ROTATION_KEYS` (the 65th) is refused before admission
+    /// (`parent_namespace_refused`, also `parent_witness_refused`); the 64
+    /// retained namespaces keep their witnesses, and the newcomer's parent
+    /// stays owed.
+    pub(in crate::snapshots) fn witness_parent(
+        &self,
+        namespace: &Scope,
+        scope: &str,
+        parent: &str,
+        witness: ParentWitness,
+    ) -> bool {
+        let refuse = |cache: &Self| {
+            cache.with_cursor(|cursor| cursor.counters.parent_witness_refused += 1);
+            false
+        };
+        let stored = parent
+            .len()
+            .checked_add(witness.identity.as_ref().map_or(0, String::capacity))
+            .and_then(|bytes| {
+                bytes.checked_add(witness.waits_on.as_ref().map_or(0, String::capacity))
+            });
+        let Some(stored) = stored else {
+            return refuse(self);
+        };
+        let Ok(mut retained) = self.retained() else {
+            return refuse(self);
+        };
+        let admitted = self.with_cursor(|cursor| {
+            let page = cursor.rotation.page;
+            if parent_namespace_full(cursor, &namespace.0) {
+                cursor.counters.parent_namespace_refused += 1;
+                cursor.counters.parent_witness_refused += 1;
+                return false;
+            }
+            let exists = cursor
+                .parents
+                .get(&namespace.0)
+                .is_some_and(|entry| entry.scope == scope);
+            let Some(charge) = parent_entry_charge(exists, &namespace.0, scope).and_then(|entry| {
+                crate::heap_layout_bound::tree_node_bytes::<String, (ParentWitness, usize)>()?
+                    .checked_add(stored)?
+                    .checked_add(entry)
+            }) else {
+                cursor.counters.parent_witness_refused += 1;
+                return false;
+            };
+            if !crate::heap_layout_bound::layout_supported()
+                || !admit_locked(&mut retained, cursor, charge, false)
+            {
+                cursor.counters.parent_witness_refused += 1;
+                return false;
+            }
+            let key = exact_copy(parent);
+            let built = key
+                .capacity()
+                .checked_add(witness.identity.as_ref().map_or(0, String::capacity))
+                .and_then(|bytes| {
+                    bytes.checked_add(witness.waits_on.as_ref().map_or(0, String::capacity))
+                });
+            if built != Some(stored) {
+                // Outside the accounting contract: refuse, freed here.
+                cursor.counters.parent_witness_refused += 1;
+                return false;
+            }
+            let Some(entry) = parent_entry(cursor, exists, &namespace.0, scope, page) else {
+                return false;
+            };
+            let previous = entry.witnesses.entries.insert(key, (witness, stored));
+            let charge = previous
+                .map_or(Some(entry.witnesses.charge), |(_, old)| {
+                    entry.witnesses.charge.checked_sub(old)
+                })
+                .and_then(|charge| charge.checked_add(stored));
+            entry.witnesses.charge = charge.unwrap_or_else(|| {
+                // Corrupt accounting: fail closed (measures unbounded).
+                debug_assert!(
+                    std::thread::panicking(),
+                    "parent witness charge accounting is corrupt"
+                );
+                usize::MAX
+            });
+            true
+        });
+        drop(retained);
+        admitted.unwrap_or(false)
+    }
+
+    /// PR-P: removes and uncharges witnesses, under the cursor lock only
+    /// (frees). An empty list, or an absent entry, is a no-op.
+    pub(in crate::snapshots) fn drop_parent_witnesses(
+        &self,
+        namespace: &Scope,
+        scope: &str,
+        parents: &[String],
+    ) {
+        if parents.is_empty() {
+            return;
+        }
+        self.with_cursor(|cursor| {
+            let page = cursor.rotation.page;
+            let Some(entry) = cursor
+                .parents
+                .get_mut(&namespace.0)
+                .filter(|entry| entry.scope == scope)
+            else {
+                return;
+            };
+            entry.touched = page;
+            for parent in parents {
+                if let Some((_, stored)) = entry.witnesses.entries.remove(parent.as_str()) {
+                    entry.witnesses.charge = entry
+                        .witnesses
+                        .charge
+                        .checked_sub(stored)
+                        .unwrap_or_else(|| {
+                            debug_assert!(
+                                std::thread::panicking(),
+                                "parent witness charge accounting is corrupt"
+                            );
+                            usize::MAX
+                        });
+                }
+            }
+        });
+    }
+
+    /// PR-P: marks the namespace matched for this traversal, admitted like
+    /// `witness_parent` (the copied end, plus a new entry; a new namespace
+    /// past `ROTATION_KEYS` is refused the same way). A refusal leaves it
+    /// unmarked, so the next page re-matches (`parent_match_unmarked`).
+    pub(in crate::snapshots) fn mark_parents_matched(
+        &self,
+        namespace: &Scope,
+        scope: &str,
+        end: &str,
+        restarts: u64,
+    ) {
+        let unmarked = |cache: &Self| {
+            cache.with_cursor(|cursor| cursor.counters.parent_match_unmarked += 1);
+        };
+        let Ok(mut retained) = self.retained() else {
+            return unmarked(self);
+        };
+        self.with_cursor(|cursor| {
+            let page = cursor.rotation.page;
+            if parent_namespace_full(cursor, &namespace.0) {
+                cursor.counters.parent_namespace_refused += 1;
+                cursor.counters.parent_match_unmarked += 1;
+                return;
+            }
+            let exists = cursor
+                .parents
+                .get(&namespace.0)
+                .is_some_and(|entry| entry.scope == scope);
+            let Some(charge) = parent_entry_charge(exists, &namespace.0, scope)
+                .and_then(|entry| entry.checked_add(end.len()))
+            else {
+                cursor.counters.parent_match_unmarked += 1;
+                return;
+            };
+            if !crate::heap_layout_bound::layout_supported()
+                || !admit_locked(&mut retained, cursor, charge, false)
+            {
+                cursor.counters.parent_match_unmarked += 1;
+                return;
+            }
+            let Some(entry) = parent_entry(cursor, exists, &namespace.0, scope, page) else {
+                cursor.counters.parent_match_unmarked += 1;
+                return;
+            };
+            entry.matched = Some((exact_copy(end), restarts));
+        });
+    }
+
+    /// PR-P: one parent-resolution restart of (namespace, scope); returns the
+    /// new count. Inline table: never refused, no heap. A poisoned cursor
+    /// counts nothing and returns None (N1: an unknown count, never the
+    /// budget reported as observed).
+    pub(in crate::snapshots) fn note_parent_restart(
+        &self,
+        namespace: &Scope,
+        scope: &str,
+    ) -> Option<u64> {
+        self.with_cursor(|cursor| {
+            let page = cursor.rotation.page;
+            let (slot, evicted) = cursor
+                .parent_restarts
+                .touch(parent_restart_key(&namespace.0, scope), page);
+            slot.restarts = slot.restarts.saturating_add(1);
+            let restarts = slot.restarts;
+            if evicted {
+                cursor.counters.parent_restart_slot_evicted += 1;
+            }
+            restarts
+        })
     }
 
     /// §d.1.3: B blocked `owner` for a queued group of `members`. The exact
@@ -3625,10 +4224,13 @@ pub(in crate::snapshots) struct Disclosure {
     pub(in crate::snapshots) held: HeldCounts,
     /// The parse's parent request, replayed on a hit (same 256 rule).
     pub(in crate::snapshots) parent_ref: Option<String>,
+    /// PR-P: the held child's parent cause, replayed into the census on a
+    /// hit (held disclosure only, never proof).
+    pub(in crate::snapshots) parent_unresolvable: Option<CodexParentUnresolvable>,
 }
 crate::heap_layout_bound::fields!(Disclosure; reason, ownership_incomplete_file_count,
     zero_snapshot_usage_evidence, state_only_blocked_session_ids, diagnostic_reason,
-    parsed_snapshot_count, held, parent_ref);
+    parsed_snapshot_count, held, parent_ref, parent_unresolvable);
 
 /// PR-1: the line and drop totals a fresh held parse adds to the census,
 /// replayed on a hit. All inline.
@@ -3652,13 +4254,17 @@ pub(in crate::snapshots) struct ParentDep {
     /// The parent's opened identity at record time: the identity the
     /// after-parse fence just proved when a ledger was used, else the probe.
     pub(in crate::snapshots) current: Option<String>,
+    /// PR-P: the step-map witness the classification read (`None`: none).
+    pub(in crate::snapshots) witnessed: Option<CodexParentUnresolvable>,
 }
-crate::heap_layout_bound::fields!(ParentDep; id, ledger, current);
+crate::heap_layout_bound::fields!(ParentDep; id, ledger, current, witnessed);
 
-/// The parent's state at lookup: the index ledger identity and the probe.
+/// The parent's state at lookup: the index ledger identity, the probe and
+/// (PR-P) the step-map witness the classifier would read now.
 pub(in crate::snapshots) struct ParentNow {
     pub(in crate::snapshots) ledger: Option<String>,
     pub(in crate::snapshots) current: Option<String>,
+    pub(in crate::snapshots) witnessed: Option<CodexParentUnresolvable>,
 }
 
 /// Strict debt of a job that ended without a publishable result
@@ -3680,6 +4286,7 @@ fn strict_disclosure(
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
         parent_ref: None,
+        parent_unresolvable: None,
     }
 }
 
@@ -3773,6 +4380,9 @@ impl MemoEntry {
         self
     }
 
+    /// PR-P: production bypasses every owed parent's entry (B14); tests
+    /// still read the flag.
+    #[cfg(test)]
     pub(in crate::snapshots) fn has_own_ledger(&self) -> bool {
         self.own_ledger
     }
@@ -3795,7 +4405,11 @@ impl MemoEntry {
     ) -> bool {
         self.digest == digest
             && self.parent.as_ref().map_or(true, |dep| {
-                parent_now.is_some_and(|now| dep.ledger == now.ledger && dep.current == now.current)
+                parent_now.is_some_and(|now| {
+                    dep.ledger == now.ledger
+                        && dep.current == now.current
+                        && dep.witnessed == now.witnessed
+                })
             })
             && self
                 .sidecar
@@ -4117,6 +4731,10 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         // cleared on index reset).
         if let Some(parent) = disclosure.parent_ref.as_deref() {
             index.record_codex_parent_ref(parent);
+        }
+        // PR-P: the fresh parse's held parent cause, counted again.
+        if let Some(cause) = disclosure.parent_unresolvable {
+            targets.census.parent_unresolvable.record(cause.index(), 1);
         }
     } else {
         targets
