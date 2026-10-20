@@ -1179,9 +1179,10 @@ fn claude_withheld_posture_admission(
     {
         return ClaudePostureAdmission::WithheldDuplicate;
     }
-    // Defense in depth: the fold accumulated this item into its own pending,
-    // so a stale window or a different request set would already have
-    // invalidated the family; the native-observation path is checked too.
+    // Defense in depth: this fold accumulated the item into its own pending,
+    // which resets a stale window to the current one and invalidates the
+    // family on a changed request set. These checks also hold when the
+    // pending came from earlier native observations.
     let own_family_current_valid = fence.own_pending.is_some_and(|pending| {
         !pending.invalid
             && pending.census_window_end == fence.census_window_end

@@ -76,6 +76,8 @@ family with a reconstructed witness, a stale unrelated family on an incomplete
 pass, a copied-prefix successor without a contract, a legacy-excluded successor,
 a visible duplicate in a valid peer family, a request reported under another
 root, incomplete identity, owned-boundary compaction filtering, the open-fence
-strict rule, and family-level-only trace attribution. The existing hidden-copy
+strict rule, family-level-only trace attribution, a persisted duplicate owner
+under the closed fence, a stale valid peer holding the request, and a request
+traced under another root. The existing hidden-copy
 regression now records that the curve stays fenced while the provider-owned
 child keeps its scalars and the hidden copy is cleared.
