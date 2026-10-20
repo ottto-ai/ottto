@@ -731,6 +731,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
                                     signatures: Vec::new(),
                                     scan_complete: true,
                                     opened_object_identity: "synthetic-unrelated".into(),
+                                    unresolvable: None,
                                 },
                             )
                         })

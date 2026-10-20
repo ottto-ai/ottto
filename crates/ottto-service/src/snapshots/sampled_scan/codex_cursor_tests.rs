@@ -6,6 +6,8 @@ use std::io::{BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES;
+
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "019fa111-2222-7333-8444-555555555555";
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -545,6 +547,7 @@ fn disclosure() -> Disclosure {
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
         parent_ref: None,
+        parent_unresolvable: None,
     }
 }
 
@@ -558,6 +561,7 @@ fn strict(reason: DebtReason) -> Disclosure {
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
         parent_ref: None,
+        parent_unresolvable: None,
     }
 }
 
@@ -736,10 +740,12 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
         id: "parent".into(),
         ledger: Some("ledger-1".into()),
         current: Some("p-1".into()),
+        witnessed: None,
     });
     let now = |ledger: &str, current: &str| ParentNow {
         ledger: Some(ledger.into()),
         current: Some(current.into()),
+        witnessed: None,
     };
     let now_1 = now("ledger-1", "p-1");
     let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
@@ -761,6 +767,7 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
             Some(&ParentNow {
                 ledger: Some("ledger-1".into()),
                 current: None,
+                witnessed: None,
             }),
             ""
         )
@@ -4178,20 +4185,21 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
     assert_eq!(replayed_census(&hit), replayed_census(&reread));
 }
 
-/// T15: an index reset clears the parent refs; the next memo hit re-requests
-/// the hold's parent exactly as a fresh parse does.
+/// T15 (PR-P §2.4): a created thread never consults a parent ledger, so it
+/// records no parent ref, before or after an index reset; its memo hit
+/// re-requests nothing. P-T32 covers an ordinary fork's re-request.
 #[test]
-fn memo_hit_after_an_index_reset_reinserts_the_parent_ref() {
+fn memo_hit_after_an_index_reset_requests_no_parent_ref() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
     let cache = Arc::new(SharedCache::default());
     let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
-    assert!(index.codex_parent_ownership_refs.contains(SPAWN_PARENT));
+    assert!(!index.codex_parent_ownership_refs.contains(SPAWN_PARENT));
     index.codex_parent_ownership_refs.clear();
     let (index, quiet) = home.generation(index, &cache, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
     assert!(
-        index.codex_parent_ownership_refs.contains(SPAWN_PARENT),
+        !index.codex_parent_ownership_refs.contains(SPAWN_PARENT),
         "{}",
         counters(&cache)
     );
@@ -4244,12 +4252,15 @@ fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
     assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
-/// T15c: a held created thread whose trusted spawn parent P has a local,
-/// complete rollout. The hold never uses a ledger, but its ref makes P's
-/// ledger arrive in the index at an unchanged P identity. That is peer
-/// evidence: the next lookup may miss once, the re-read holds again, and
-/// from then on the unchanged hold hits (main keyed this dependency on the
-/// indexed ledger, so it hit too).
+/// T15c, rewritten for PR-P in two legs.
+/// (a) A held created thread whose trusted spawn parent has a local,
+/// complete rollout: the hold never consults a ledger, so the parent gets no
+/// ref and no index ledger. From its second generation the unchanged hold
+/// hits every generation and discloses what a cold scan does.
+/// (b) The live case, an ordinary fork C of P whose first parse precedes P
+/// on the page: C is pending (never recorded) until P's ledger arrives at an
+/// unchanged P identity, then recorded once, then quiet: nothing is parsed
+/// again, and the census equals the cold oracle.
 #[test]
 fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
@@ -4269,40 +4280,118 @@ fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
     .unwrap();
     let cache = Arc::new(SharedCache::default());
     let mut index = ScanIndex::default();
-    let mut n = 0;
-    while !index
-        .codex_parent_ownership_ledgers
-        .get(SPAWN_PARENT)
-        .is_some_and(|ledger| ledger.scan_complete)
-    {
+    let mut hits = Vec::new();
+    let mut last = None;
+    for n in 0..4 {
+        let (next, scan) = home.generation(index, &cache, n);
         assert!(
-            n < 4,
-            "the spawn parent's ledger never arrived: {}",
+            !next.codex_parent_ownership_refs.contains(SPAWN_PARENT)
+                && !next
+                    .codex_parent_ownership_ledgers
+                    .contains_key(SPAWN_PARENT),
+            "generation {n}: {}",
             counters(&cache)
         );
-        index = home.generation(index, &cache, n).0;
-        n += 1;
+        assert!(created_usage(&scan).is_empty());
+        hits.push(counter(&cache, |c| c.memo_hits));
+        index = next;
+        last = Some(scan);
     }
     let entry = home.memo_entry(&cache).expect("memoized hold");
     let dep = entry.parent.as_ref().expect("spawn parent dependency");
-    // The hold used no ledger; the index now has one for the same parent.
     assert_eq!(
         (dep.id.as_str(), dep.ledger.as_deref()),
         (SPAWN_PARENT, None)
     );
-    // At most one miss on the arrival; then the unchanged hold is quiet.
-    let (index, _) = home.generation(index, &cache, n);
+    // At most one miss after the first record, then a hit per generation.
+    assert_eq!(hits[3] - hits[1], 2, "{}", counters(&cache));
+    assert!(
+        counter(&cache, |c| c.memo_records) <= 2,
+        "{}",
+        counters(&cache)
+    );
+    assert_oracle(&home, &cache, &index, &last.unwrap(), 3, true, &[]);
+
+    // (b) C's rollout sorts before P's, so its first parse precedes P.
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let early = home
+        .fixture
+        .root
+        .join(format!("rollout-2026-10-07T09-00-00-{CHILD}.jsonl"));
+    fs::rename(home.fixture.file(CHILD), &early).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    let ledger = ForkHome::parent_ledger(&index).expect("indexed parent ledger");
+    let key = stored_key(&cache, &early)
+        .unwrap_or_else(|| panic!("C is held and memoized: {}", counters(&cache)));
+    let entry = cache.memo_lookup(&key).unwrap();
+    let dep = entry.parent.as_ref().expect("parent dependency");
+    assert_eq!(
+        (dep.ledger.as_deref(), dep.witnessed),
+        (Some(ledger.as_str()), None)
+    );
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "never recorded while pending, once after the ledger: {}",
+        counters(&cache)
+    );
     let hits = counter(&cache, |c| c.memo_hits);
-    let (index, first) = home.generation(index, &cache, n + 1);
-    let (index, second) = home.generation(index, &cache, n + 2);
+    let ((index, quiet), parsed) = parses(|| {
+        let (index, _) = home.generation(index, &cache, n);
+        home.generation(index, &cache, n + 1)
+    });
+    assert!(parsed.is_empty(), "{parsed:?}: {}", counters(&cache));
     assert_eq!(
         counter(&cache, |c| c.memo_hits),
         hits + 2,
-        "a ledger the hold never used keeps waking it: {}",
+        "{}",
         counters(&cache)
     );
-    assert!(created_usage(&first).is_empty() && created_usage(&second).is_empty());
-    assert_oracle(&home, &cache, &index, &second, n + 2, true, &[]);
+    let (oracle_index, oracle) = home.oracle(n + 2);
+    assert_eq!(census(&index, &quiet), census(&oracle_index, &oracle));
+}
+
+/// Every parse started inside `run`, by file name: the B2-T1 seam fires
+/// after a memo miss (or no lookup) and before the parse, never on a hit.
+fn parses<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = std::rc::Rc::clone(&seen);
+    let value = crate::snapshots::with_codex_before_parse(
+        move |path: &Path| {
+            sink.borrow_mut().push(
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+        },
+        run,
+    );
+    let seen = seen.borrow().clone();
+    (value, seen)
+}
+
+/// `scan`'s traversal-cumulative held-parent counts, by cause index.
+fn parent_causes(scan: &SourceScanResult) -> [u64; PARENT_UNRESOLVABLE_CAUSES] {
+    scan.local_codex_diagnostics
+        .as_ref()
+        .expect("Codex diagnostics")
+        .parent_unresolvable
+        .counts()
+}
+
+/// `count` held children under `cause` and none elsewhere.
+fn only(cause: CodexParentUnresolvable, count: u64) -> [u64; PARENT_UNRESOLVABLE_CAUSES] {
+    let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
+    expected[cause.index()] = count;
+    expected
+}
+
+fn restarts_in_scope(scan: &SourceScanResult) -> Option<u64> {
+    scan.local_codex_diagnostics
+        .as_ref()
+        .expect("Codex diagnostics")
+        .parent_restarts_in_scope
 }
 
 /// T15d: a child of a growing parent never hits (the parent's identity moves
@@ -4342,42 +4431,73 @@ fn child_of_a_growing_parent_never_hits() {
     assert!(other >= 1, "{}", counters(&cache));
 }
 
-/// T1b/N2 and T3b: a `forked_from_id` fork whose parent is not on disk has
-/// no ledger, so it is parent-pending: never recorded, re-read every
-/// generation, its parent requested. T7: once the parent arrives the fork
-/// settles exactly as a cold scan (here held and memoized: kind (iii)).
+/// T1b/N2 and T3b, with PR-P (P-T1a): a `forked_from_id` fork whose parent
+/// is not on disk is pending on its first generation: its parent requested,
+/// never recorded. From the next match the parent is witnessed `Absent`, so
+/// the fork is held, counted under `Absent` (with the scope's restart
+/// count), recorded once and then hits. T7: once the parent arrives the
+/// witness drops and the fork settles exactly as a cold scan (here held and
+/// memoized: kind (iii)).
 #[test]
-fn ledgerless_fork_is_never_memoized_until_its_parent_arrives() {
+fn absent_parent_fork_is_held_then_settles_when_its_parent_arrives() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let parent = home.fixture.file(PARENT);
     let away = home.fixture.root.parent().unwrap().join("parent-away");
     fs::rename(&parent, &away).unwrap();
     let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    for n in 0..3 {
+    let (mut index, first) = home.generation(ScanIndex::default(), &cache, 0);
+    assert!(session_usage(&first, CHILD).is_empty());
+    assert!(
+        home.child_entry(&cache).is_none(),
+        "a parent-pending fork is never recorded: {}",
+        counters(&cache)
+    );
+    assert!(index.codex_parent_ownership_refs.contains(PARENT));
+    let mut hits = counter(&cache, |c| c.memo_hits);
+    for n in 1..4 {
         let (next, scan) = home.generation(index, &cache, n);
-        assert_eq!(scan.scanned_file_count, 1, "re-read: {}", counters(&cache));
         assert!(session_usage(&scan, CHILD).is_empty());
-        assert!(
-            home.child_entry(&cache).is_none(),
-            "a parent-pending fork is never recorded: {}",
+        assert_eq!(
+            parent_causes(&scan),
+            only(CodexParentUnresolvable::Absent, 1),
+            "generation {n}: {}",
             counters(&cache)
         );
+        assert!(
+            restarts_in_scope(&scan).is_some_and(|restarts| restarts <= 1),
+            "generation {n}: {:?}",
+            restarts_in_scope(&scan)
+        );
+        assert_eq!(
+            counter(&cache, |c| c.memo_records),
+            1,
+            "generation {n}: {}",
+            counters(&cache)
+        );
+        if n > 1 {
+            assert_eq!(
+                counter(&cache, |c| c.memo_hits),
+                hits + 1,
+                "generation {n}: {}",
+                counters(&cache)
+            );
+        }
+        hits = counter(&cache, |c| c.memo_hits);
         assert!(next.codex_parent_ownership_refs.contains(PARENT));
         index = next;
     }
+    let entry = home.child_entry(&cache).expect("held and recorded");
     assert_eq!(
-        (
-            counter(&cache, |c| c.memo_hits),
-            counter(&cache, |c| c.memo_records)
-        ),
-        (0, 0),
-        "{}",
-        counters(&cache)
+        entry.parent.as_ref().and_then(|dep| dep.witnessed),
+        Some(CodexParentUnresolvable::Absent)
     );
     fs::rename(&away, &parent).unwrap();
-    let (index, settled, n) = home.settle(index, &cache, 3);
+    let (index, settled, n) = home.settle(index, &cache, 4);
     assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    assert_eq!(
+        parent_causes(&settled),
+        only(CodexParentUnresolvable::Absent, 0)
+    );
     let (oracle_index, oracle) = home.oracle(n);
     assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
@@ -5832,4 +5952,1715 @@ fn failed_store_drops_the_job_then_refunds_its_claim() {
         assert_eq!(cache.cursor_reserved(), 0);
         assert_eq!(cache.cursor_charge(), 0);
     });
+}
+
+// PR-P: parent witnesses, the restart table and held parent causes.
+
+fn absent_witness() -> ParentWitness {
+    ParentWitness {
+        cause: CodexParentUnresolvable::Absent,
+        identity: None,
+        waits_on: None,
+    }
+}
+
+/// The witness keys of `namespace`, read without touching anything.
+fn witness_keys(cache: &SharedCache, namespace: &str) -> Vec<String> {
+    cache
+        .with_cursor(|cursor| {
+            cursor
+                .parents
+                .get(namespace)
+                .map(|entry| entry.witnesses.entries.keys().cloned().collect())
+                .unwrap_or_default()
+        })
+        .unwrap()
+}
+
+/// A namespace's whole parent entry: scope, match mark and every witness
+/// with its stored charge.
+type WitnessEntry = (
+    String,
+    Option<(String, u64)>,
+    Vec<(String, ParentWitness, usize)>,
+);
+
+/// `namespace`'s whole parent entry, read without touching anything.
+fn witness_entry(cache: &SharedCache, namespace: &str) -> Option<WitnessEntry> {
+    cache
+        .with_cursor(|cursor| {
+            cursor.parents.get(namespace).map(|entry| {
+                (
+                    entry.scope.clone(),
+                    entry.matched.clone(),
+                    entry
+                        .witnesses
+                        .entries
+                        .iter()
+                        .map(|(parent, (witness, charge))| {
+                            (parent.clone(), witness.clone(), *charge)
+                        })
+                        .collect(),
+                )
+            })
+        })
+        .unwrap()
+}
+
+/// `namespace`'s RAM witness of `parent`, read without touching anything.
+fn witness_of(cache: &SharedCache, namespace: &str, parent: &str) -> Option<ParentWitness> {
+    cache
+        .with_cursor(|cursor| {
+            cursor
+                .parents
+                .get(namespace)
+                .and_then(|entry| entry.witnesses.entries.get(parent))
+                .map(|(witness, _)| witness.clone())
+        })
+        .unwrap()
+}
+
+/// P-T26 (L1): a restart slot is keyed by (namespace, scope). A new scope is
+/// a new slot; the old scope's spent budget is never reset; two pairs whose
+/// keys collide share one budget (spent sooner, never refilled).
+#[test]
+fn restart_slots_are_per_scope_and_never_reset() {
+    let x = parent_restart_key("namespace", "scope-x");
+    let y = parent_restart_key("namespace", "scope-y");
+    assert_ne!(x, y);
+    // The length prefix keeps the pair unambiguous.
+    assert_ne!(parent_restart_key("ab", "c"), parent_restart_key("a", "bc"));
+    let mut table = ParentRestarts::default();
+    for page in 0..PARENT_RESTART_BUDGET {
+        table.touch(x, page).0.restarts += 1;
+    }
+    assert_eq!(table.touch(y, 10).0.restarts, 0);
+    assert_eq!(table.touch(x, 11).0.restarts, PARENT_RESTART_BUDGET);
+    for page in 12..32 {
+        assert_eq!(table.touch(x, page).0.restarts, PARENT_RESTART_BUDGET);
+    }
+    // Two pairs forced onto one key share one budget.
+    let mut shared = ParentRestarts::default();
+    shared.touch(7, 1).0.restarts += 1;
+    shared.touch(7, 2).0.restarts += 1;
+    assert_eq!(shared.touch(7, 3).0.restarts, PARENT_RESTART_BUDGET);
+}
+
+/// P-T26 (L4, cache level): the inline table holds `ROTATION_KEYS` pairs.
+/// An evicting insert starts spent, and so does an evicted pair that comes
+/// back: no restart is ever refilled. `parent_state` never inserts into
+/// `parents`, and 20 later pages of another namespace change nothing.
+#[test]
+fn evicted_restart_slot_reenters_spent() {
+    let cache = SharedCache::default();
+    let first = Scope("namespace-00".into());
+    assert_eq!(cache.parent_state(&first, "scope").restarts, 0);
+    assert_eq!(cache.note_parent_restart(&first, "scope"), Some(1));
+    for n in 1..ROTATION_KEYS {
+        cache.with_cursor(|cursor| cursor.rotation.page += 1);
+        let namespace = Scope(format!("namespace-{n:02}"));
+        assert_eq!(cache.parent_state(&namespace, "scope").restarts, 0);
+    }
+    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 0);
+    cache.with_cursor(|cursor| cursor.rotation.page += 1);
+    let last = Scope("namespace-64".into());
+    assert_eq!(
+        cache.parent_state(&last, "scope").restarts,
+        PARENT_RESTART_BUDGET,
+        "an evicting insert starts spent"
+    );
+    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 1);
+    cache.with_cursor(|cursor| cursor.rotation.page += 1);
+    assert_eq!(
+        cache.parent_state(&first, "scope").restarts,
+        PARENT_RESTART_BUDGET,
+        "the evicted pair re-enters spent"
+    );
+    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 2);
+    for _ in 0..20 {
+        cache.with_cursor(|cursor| cursor.rotation.page += 1);
+        assert_eq!(
+            cache.parent_state(&last, "scope").restarts,
+            PARENT_RESTART_BUDGET
+        );
+    }
+    assert_eq!(
+        cache.note_parent_restart(&first, "scope"),
+        Some(PARENT_RESTART_BUDGET + 1),
+        "counted, never reset"
+    );
+    assert!(cache
+        .with_cursor(|cursor| cursor.parents.is_empty())
+        .unwrap());
+}
+
+/// P-T19 (unit): a refused witness keeps nothing and is counted; a refused
+/// match mark leaves the namespace unmarked (it re-matches next page).
+#[test]
+fn refused_witness_and_mark_keep_nothing() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = SharedCache::default();
+    let namespace = Scope("namespace".into());
+    let resident = cache.cursor_resident();
+    with_test_state_budget(0, || {
+        assert!(!cache.witness_parent(&namespace, "scope", PARENT, absent_witness()));
+        cache.mark_parents_matched(&namespace, "scope", "window-end", 0);
+    });
+    assert_eq!(counter(&cache, |c| c.parent_witness_refused), 1);
+    assert_eq!(counter(&cache, |c| c.parent_match_unmarked), 1);
+    assert_eq!(cache.cursor_resident(), resident);
+    let state = cache.parent_state(&namespace, "scope");
+    assert!(state.witnesses.is_empty() && state.matched.is_none());
+    // Admitted under the production budget: kept with its exact charge.
+    assert!(cache.witness_parent(&namespace, "scope", PARENT, absent_witness()));
+    let state = cache.parent_state(&namespace, "scope");
+    assert_eq!(state.witnesses, vec![(PARENT.to_owned(), absent_witness())]);
+    // A scope change drops the namespace's witnesses (revalidated later).
+    assert!(cache
+        .parent_state(&namespace, "other-scope")
+        .witnesses
+        .is_empty());
+    assert_eq!(cache.cursor_resident(), resident);
+}
+
+/// P-T17 (R2-L4): 5,000 witnesses across 80 namespaces under the production
+/// budget stay inside the state budget (at most `ROTATION_KEYS` namespace
+/// entries), and a paused job's mandatory reserve still gets its room by
+/// forgetting them.
+#[test]
+fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let empty = cache.cursor_resident();
+    for n in 0..5_000_u64 {
+        if n % 64 == 0 {
+            cache.with_cursor(|cursor| cursor.rotation.page += 1);
+        }
+        let namespace = Scope(format!("namespace-{:02}", n % 80));
+        cache.witness_parent(
+            &namespace,
+            "scope",
+            &format!("parent-{n:05}"),
+            ParentWitness {
+                cause: CodexParentUnresolvable::ParentHeld,
+                identity: Some(format!("identity-{n}")),
+                waits_on: None,
+            },
+        );
+    }
+    assert!(cache.cursor_resident() < STATE_BYTES);
+    assert!(cache.with_cursor(|cursor| cursor.parents.len()).unwrap() <= ROTATION_KEYS);
+    assert!(counter(&cache, |c| c.parent_namespace_refused) > 0);
+    let credit = cache
+        .cursor_reserve(STATE_BYTES - empty - floor)
+        .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
+    assert!(counter(&cache, |c| c.parent_witness_evicted) > 0);
+    assert!(cache
+        .with_cursor(|cursor| cursor.parents.is_empty())
+        .unwrap());
+    credit.refund();
+    assert_eq!(cache.cursor_reserved(), 0);
+    assert_eq!(cache.cursor_resident(), empty);
+}
+
+/// #643 intake ruling (a), N2: an optional witness or match mark for a new
+/// 65th namespace is refused before admission and changes nothing retained:
+/// the 64 namespaces keep their entries, witnesses and marks, and the
+/// newcomer gets no settling witness and no match mark, so step start applies
+/// nothing to it and its parent stays owed (re-read, fail-closed). An existing
+/// namespace's update and a mandatory admission's eviction are unchanged.
+#[test]
+fn optional_65th_namespace_is_refused_and_the_retained_64_are_kept() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let empty = cache.cursor_resident();
+    let namespace = |n: usize| Scope(format!("namespace-{n:02}"));
+    for n in 0..ROTATION_KEYS {
+        cache.with_cursor(|cursor| cursor.rotation.page += 1);
+        assert!(cache.witness_parent(&namespace(n), "scope", PARENT, absent_witness()));
+        cache.mark_parents_matched(&namespace(n), "scope", "window-end", 0);
+    }
+    let retained = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| {
+                cursor
+                    .parents
+                    .iter()
+                    .map(|(key, entry)| {
+                        (
+                            key.clone(),
+                            entry.scope.clone(),
+                            entry.touched,
+                            entry.matched.clone(),
+                            entry
+                                .witnesses
+                                .entries
+                                .iter()
+                                .map(|(parent, (witness, charge))| {
+                                    (parent.clone(), witness.clone(), *charge)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+    };
+    let before = retained(&cache);
+    assert_eq!(before.len(), ROTATION_KEYS);
+    let resident = cache.cursor_resident();
+    let newcomer = namespace(ROTATION_KEYS);
+    cache.with_cursor(|cursor| cursor.rotation.page += 1);
+    assert!(!cache.witness_parent(&newcomer, "scope", PARENT, absent_witness()));
+    cache.mark_parents_matched(&newcomer, "scope", "window-end", 0);
+    assert_eq!(retained(&cache), before, "the retained 64 are unchanged");
+    assert_eq!(cache.cursor_resident(), resident);
+    assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
+    assert_eq!(counter(&cache, |c| c.parent_witness_refused), 1);
+    assert_eq!(counter(&cache, |c| c.parent_match_unmarked), 1);
+    let state = cache.parent_state(&newcomer, "scope");
+    assert!(
+        state.witnesses.is_empty() && state.matched.is_none(),
+        "the overflow stays owed"
+    );
+    // An existing namespace still takes an update past the count bound.
+    assert!(cache.witness_parent(&namespace(0), "scope", "another-parent", absent_witness()));
+    assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
+    // A mandatory admission still forgets witnesses for its room.
+    let credit = cache
+        .cursor_reserve(STATE_BYTES - empty - floor)
+        .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
+    assert!(cache
+        .with_cursor(|cursor| cursor.parents.is_empty())
+        .unwrap());
+    credit.refund();
+}
+
+/// #643 intake N1: a poisoned cursor keeps the fail-closed restart decision
+/// (the budget reads spent) but reports the count as unknown, so the
+/// diagnostics omit `parent_restarts_in_scope` instead of reporting the
+/// budget as an observed `Some(2)`.
+#[test]
+fn poisoned_cursor_spends_the_budget_but_reports_no_restart_count() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let cache = SharedCache::default();
+    let namespace = Scope("namespace".into());
+    let state = cache.parent_state(&namespace, "scope");
+    assert!(state.restarts_observed);
+    assert_eq!(state.restarts, 0);
+    assert_eq!(cache.note_parent_restart(&namespace, "scope"), Some(1));
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        cache.with_cursor(|_| panic!("poison the cursor"));
+    }));
+    assert!(unwound.is_err());
+    assert!(!cursor_held(), "reset on unwind");
+    let state = cache.parent_state(&namespace, "scope");
+    assert!(!state.restarts_observed, "unknown, not observed");
+    assert!(
+        state.restarts >= PARENT_RESTART_BUDGET,
+        "fail closed: the budget reads spent"
+    );
+    assert_eq!(cache.note_parent_restart(&namespace, "scope"), None);
+}
+
+/// P-T30 (R2-L2): the witness store's walk costs a fixed number of visits
+/// per namespace whatever its witness count (stored charges, no per-witness
+/// walk), so a full store stays far inside `Counter`'s 4,096-visit limit.
+#[test]
+fn witness_store_visits_do_not_grow_with_witness_count() {
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let visits = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| {
+                let mut counter = Counter::new(usize::MAX);
+                cursor.heap_bound(&mut counter).unwrap();
+                counter.visits_for_test()
+            })
+            .unwrap()
+    };
+    let cache = SharedCache::default();
+    let fill = |per: usize| {
+        for namespace in 0..ROTATION_KEYS {
+            for parent in 0..per {
+                assert!(cache.witness_parent(
+                    &Scope(format!("namespace-{namespace:02}")),
+                    "scope",
+                    &format!("parent-{parent:03}"),
+                    absent_witness(),
+                ));
+            }
+        }
+    };
+    let empty = visits(&cache);
+    fill(1);
+    let one = visits(&cache);
+    fill(50);
+    let many = visits(&cache);
+    assert_eq!(many, one, "visits grew with the witness count");
+    assert!(one - empty <= ROTATION_KEYS * 8 + 8, "{empty} -> {one}");
+    assert!(many < 4096, "{many}");
+}
+
+const WITNESS_NAMESPACES: [&str; 2] = ["witness-namespace-1", "witness-namespace-2"];
+const WITNESS_KEYS: [&str; 2] = ["parent-a", "parent-b"];
+
+/// #641's `hopeless_admission_evicts_nothing` setup with witnesses: a real
+/// certified retained copy, `floor` and `empty` measured with no copy, no
+/// provenance and no witnesses, then two provenance entries and two
+/// witnesses in each of two namespaces (namespace 1 strictly older).
+struct WitnessAdmission {
+    _fixture: ScanRoot,
+    cache: Arc<SharedCache>,
+    key: String,
+    members: Vec<CandidateFile>,
+    floor: usize,
+    empty: usize,
+}
+
+fn witness_admission() -> WitnessAdmission {
+    let fixture = ScanRoot::new(40);
+    let key = local_index_key(&fixture.file(SESSION));
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    for _ in 0..64 {
+        let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+        index = next;
+        if counter(&cache, |c| c.jobs_certified) == 1 {
+            break;
+        }
+    }
+    let copy = cache
+        .take(&key)
+        .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+    let floor = retained_floor(&cache);
+    let empty = cache.cursor_resident();
+    // A single-session root has no parent refs: no `parents` entry exists.
+    assert!(cache
+        .with_cursor(|cursor| cursor.parents.is_empty())
+        .unwrap());
+    cache.insert(
+        key.clone(),
+        sampled_jsonl::CompletedNativeAcquisition {
+            checkpoint: copy.checkpoint,
+            reduction: Some(copy.state),
+        },
+        0,
+    );
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &members);
+    cache.record_join_owner(JOIN_OTHER, &members);
+    for namespace in WITNESS_NAMESPACES {
+        for parent in WITNESS_KEYS {
+            assert!(cache.witness_parent(
+                &Scope(namespace.into()),
+                "scope",
+                parent,
+                absent_witness()
+            ));
+        }
+        cache.with_cursor(|cursor| cursor.rotation.page += 1);
+    }
+    WitnessAdmission {
+        _fixture: fixture,
+        cache,
+        key,
+        members,
+        floor,
+        empty,
+    }
+}
+
+/// P-T37 (the witness twin of `hopeless_admission_evicts_nothing`): a
+/// hopeless reserve keeps every witness, provenance entry and the retained
+/// copy, byte for byte; an optional witness inside the floor window is
+/// refused and keeps them too. A reserve that fits once both provenance
+/// entries and exactly one witness are forgotten forgets exactly that one:
+/// the oldest namespace's first key.
+#[test]
+fn hopeless_admission_keeps_every_witness() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let setup = witness_admission();
+        let cache = &setup.cache;
+        // R2-L4: every witness value, charge, scope and match mark, not
+        // only the keys.
+        let entries = WITNESS_NAMESPACES.map(|namespace| witness_entry(cache, namespace));
+        assert!(entries.iter().all(Option::is_some));
+        let intact = || {
+            assert!(
+                cache.retained_checkpoint(&setup.key).is_some(),
+                "the copy is kept"
+            );
+            for owner in [JOIN_OWNER, JOIN_OTHER] {
+                assert_eq!(
+                    join_entry(cache, owner),
+                    Some(joined(&setup.members)),
+                    "{owner}"
+                );
+            }
+            for namespace in WITNESS_NAMESPACES {
+                assert_eq!(witness_keys(cache, namespace), WITNESS_KEYS, "{namespace}");
+            }
+            assert_eq!(
+                WITNESS_NAMESPACES.map(|namespace| witness_entry(cache, namespace)),
+                entries
+            );
+            assert_eq!(counter(cache, |c| c.parent_witness_evicted), 0);
+            assert_eq!(cache.cursor_reserved(), 0);
+        };
+        intact();
+        let resident = cache.cursor_resident();
+        for hopeless in [STATE_BYTES - setup.empty - setup.floor + 1, STATE_BYTES] {
+            assert!(cache.cursor_reserve(hopeless).is_none(), "{hopeless}");
+            intact();
+            assert_eq!(cache.cursor_resident(), resident);
+        }
+        // Optional twin: a third namespace inside the floor window.
+        let refused = counter(cache, |c| c.parent_witness_refused);
+        with_test_state_budget(resident + setup.floor + 1, || {
+            assert!(!cache.witness_parent(
+                &Scope("witness-namespace-3".into()),
+                "scope",
+                "parent-c",
+                absent_witness()
+            ));
+        });
+        assert_eq!(counter(cache, |c| c.parent_witness_refused), refused + 1);
+        intact();
+        assert_eq!(cache.cursor_resident(), resident);
+        // Proportional: room once both provenance entries and exactly one
+        // witness (its node and key) are forgotten.
+        let node =
+            crate::heap_layout_bound::tree_node_bytes::<String, (ParentWitness, usize)>().unwrap();
+        let after = resident
+            - join_charge(JOIN_OWNER, &setup.members)
+            - join_charge(JOIN_OTHER, &setup.members)
+            - node
+            - WITNESS_KEYS[0].len();
+        let credit = cache
+            .cursor_reserve(STATE_BYTES - setup.floor - after)
+            .unwrap_or_else(|| panic!("fits after one witness: {}", counters(cache)));
+        assert_eq!(counter(cache, |c| c.parent_witness_evicted), 1);
+        assert_eq!(join_entry(cache, JOIN_OWNER), None);
+        assert_eq!(join_entry(cache, JOIN_OTHER), None);
+        assert_eq!(
+            witness_keys(cache, WITNESS_NAMESPACES[0]),
+            [WITNESS_KEYS[1]]
+        );
+        assert_eq!(witness_keys(cache, WITNESS_NAMESPACES[1]), WITNESS_KEYS);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+/// P-T37's feasible control (and P-T26b's feasible variant), on a fresh
+/// setup: a reserve that fits only once provenance and every witness are
+/// forgotten forgets them all and succeeds; both namespace entries go.
+#[test]
+fn feasible_reserve_forgets_provenance_then_witnesses() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let setup = witness_admission();
+        let cache = &setup.cache;
+        let credit = cache
+            .cursor_reserve(STATE_BYTES - setup.empty - setup.floor)
+            .unwrap_or_else(|| panic!("feasible: {}", counters(cache)));
+        assert_eq!(join_entry(cache, JOIN_OWNER), None);
+        assert_eq!(join_entry(cache, JOIN_OTHER), None);
+        assert_eq!(counter(cache, |c| c.parent_witness_evicted), 4);
+        assert!(cache
+            .with_cursor(|cursor| cursor.parents.is_empty())
+            .unwrap());
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+/// N1: `parent_restarts_in_scope` is reported only when the page
+/// established it: omitted, never a fabricated 0, without a shared cache;
+/// present on a cached page whose step-start pass ran.
+#[test]
+fn parent_restarts_in_scope_is_omitted_unless_established() {
+    let fixture = ScanRoot::new(3);
+    let (_, uncached) = page(&fixture, ScanIndex::default(), None);
+    let diagnostic = uncached.local_codex_diagnostics.expect("Codex diagnostics");
+    assert_eq!(diagnostic.parent_restarts_in_scope, None);
+    assert!(serde_json::to_value(diagnostic)
+        .unwrap()
+        .get("parent_restarts_in_scope")
+        .is_none());
+    let (_, cached) = page(
+        &fixture,
+        ScanIndex::default(),
+        Some(Arc::new(SharedCache::default())),
+    );
+    assert_eq!(restarts_in_scope(&cached), Some(0));
+}
+
+/// P-T21/P-T22: with the scope's budget already spent, a new fork of an
+/// absent parent is held `DeferredRestart` on its first generation (no third
+/// restart), then `Absent` from the next match: never `DeferredRestart` at
+/// two consecutive generations.
+#[test]
+fn spent_budget_holds_a_new_fork_deferred_once_then_absent() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    fs::rename(
+        home.fixture.file(PARENT),
+        home.fixture.root.parent().unwrap().join("parent-away"),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let namespace = Scope("cursor-fixture".into());
+    let scope = group_scope(&ScanIndex::default());
+    for _ in 0..PARENT_RESTART_BUDGET {
+        cache.note_parent_restart(&namespace, &scope);
+    }
+    let mut index = ScanIndex::default();
+    for n in 0..4 {
+        let (next, scan) = home.generation(index, &cache, n);
+        assert!(session_usage(&scan, CHILD).is_empty());
+        assert_eq!(
+            restarts_in_scope(&scan),
+            Some(PARENT_RESTART_BUDGET),
+            "generation {n}: no third restart"
+        );
+        let expected = if n == 0 {
+            only(CodexParentUnresolvable::DeferredRestart, 1)
+        } else {
+            only(CodexParentUnresolvable::Absent, 1)
+        };
+        assert_eq!(
+            parent_causes(&scan),
+            expected,
+            "generation {n}: {}",
+            counters(&cache)
+        );
+        index = next;
+    }
+}
+
+/// P-T5/P-T33b (D2): with the ref set full, a new fork's ref does not fit,
+/// so the fork is held `DeferredRef` (counted, never published) with no
+/// restart, and memo-hits from its second generation. Once refs leave the
+/// set it resolves as a cold scan does.
+#[test]
+fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS {
+        index
+            .codex_parent_ownership_refs
+            .insert(format!("prefilled-{n:03}"));
+    }
+    let mut hits = Vec::new();
+    for n in 0..3 {
+        let (next, scan) = home.generation(index, &cache, n);
+        assert!(session_usage(&scan, CHILD).is_empty());
+        assert!(!next.codex_parent_ownership_refs.contains(PARENT));
+        assert_eq!(restarts_in_scope(&scan), Some(0), "generation {n}");
+        assert_eq!(
+            parent_causes(&scan),
+            only(CodexParentUnresolvable::DeferredRef, 1),
+            "generation {n}: {}",
+            counters(&cache)
+        );
+        hits.push(counter(&cache, |c| c.memo_hits));
+        index = next;
+    }
+    assert_eq!(hits[2] - hits[1], 1, "{}", counters(&cache));
+    index
+        .codex_parent_ownership_refs
+        .retain(|parent| !parent.starts_with("prefilled-"));
+    let (index, settled, n) = home.settle(index, &cache, 3);
+    assert_eq!(
+        parent_causes(&settled),
+        only(CodexParentUnresolvable::Absent, 0)
+    );
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// P-T14 (M1): the step-start match runs once per traversal: one census
+/// pass per generation here (each generation is one traversal and one
+/// page), and the namespace is marked matched for exactly that traversal,
+/// so a later page of it re-applies without matching.
+#[test]
+fn step_start_matches_once_per_traversal() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    fs::rename(
+        home.fixture.file(PARENT),
+        home.fixture.root.parent().unwrap().join("parent-away"),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    for n in 1..4 {
+        let before = crate::snapshots::codex_parent_step_start_matches_for_test();
+        let (next, _) = home.generation(index, &cache, n);
+        assert_eq!(
+            crate::snapshots::codex_parent_step_start_matches_for_test() - before,
+            1,
+            "generation {n}"
+        );
+        // The completed traversal's census window end is this page's.
+        let end = Some(collected_at(n));
+        let matched = cache
+            .with_cursor(|cursor| {
+                cursor
+                    .parents
+                    .get("cursor-fixture")
+                    .and_then(|entry| entry.matched.clone())
+            })
+            .unwrap();
+        assert_eq!(matched.map(|(at, _)| at), end, "generation {n}");
+        index = next;
+    }
+}
+
+/// P-T35 (L3, N3): referenced id A's only rollout is a file named A whose
+/// `session_meta` id is B, and a fork of B has no file named B. A is
+/// witnessed `NoLedger` at that file's identity and B `Absent`; each child
+/// is held under its parent's cause. From then on nothing is parsed. An
+/// append to the file drops A's witness and the file is read again.
+/// (Rev 5's admitted-B variant is dropped per the lease's N3.)
+#[test]
+fn misnamed_parent_rollout_witnesses_no_ledger_and_absent() {
+    const A: &str = "019fa111-2222-7333-8444-cccccccccccc";
+    const B: &str = "019fa111-2222-7333-8444-dddddddddddd";
+    const CHILD_A: &str = "019fa111-2222-7333-8444-eeeeeeeeeeee";
+    const CHILD_B: &str = "019fa111-2222-7333-8444-ffffffffffff";
+    let fixture = ScanRoot::with_sessions(&[]);
+    let mut misnamed = ForkHome::parent();
+    misnamed[0] = json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
+        "payload": {"id": B, "thread_source": "user"}});
+    fs::write(fixture.file(A), jsonl(&misnamed)).unwrap();
+    for (child, parent) in [(CHILD_A, A), (CHILD_B, B)] {
+        let mut records = vec![json!({"timestamp": "2026-10-07T08:20:00Z",
+            "type": "session_meta",
+            "payload": {"id": child, "forked_from_id": parent, "thread_source": "user"}})];
+        records.extend(ForkHome::diverging_child(2));
+        fs::write(fixture.file(child), jsonl(&records)).unwrap();
+    }
+    let cache = Arc::new(SharedCache::default());
+    let generation = |index: ScanIndex, n: u64| {
+        let mut index = index;
+        index.traversal = None;
+        let (index, scan, _) = page_with(
+            &fixture,
+            index,
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+            &collected_at(n),
+            |_| {},
+        );
+        (index, scan)
+    };
+    let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
+    expected[CodexParentUnresolvable::NoLedger.index()] = 1;
+    expected[CodexParentUnresolvable::Absent.index()] = 1;
+    let mut index = ScanIndex::default();
+    let mut held_at = None;
+    for n in 0..4 {
+        let (next, scan) = generation(index, n);
+        index = next;
+        assert!(restarts_in_scope(&scan).is_some_and(|restarts| restarts <= PARENT_RESTART_BUDGET));
+        if parent_causes(&scan) == expected {
+            held_at = Some(n);
+            break;
+        }
+    }
+    let held_at = held_at.unwrap_or_else(|| panic!("both children held: {}", counters(&cache)));
+    assert!(held_at <= 2, "{held_at}");
+    assert!(!index.codex_parent_ownership_ledgers.contains_key(B));
+    assert!(!index
+        .codex_parent_ownership_ledgers
+        .get(A)
+        .is_some_and(|ledger| ledger.scan_complete));
+    for n in held_at + 1..held_at + 3 {
+        let ((next, scan), parsed) = parses(|| generation(index, n));
+        assert!(parsed.is_empty(), "generation {n}: {parsed:?}");
+        assert_eq!(parent_causes(&scan), expected, "generation {n}");
+        index = next;
+    }
+    fixture.append(
+        A,
+        &jsonl(&[turn_record("2026-10-07T09:00:01Z", "appended")]),
+    );
+    let n = held_at + 3;
+    let (_, parsed) = parses(|| generation(index, n));
+    let name = fixture
+        .file(A)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(parsed.contains(&name), "{parsed:?}");
+}
+
+/// One cached generation of `fixture` (a fresh traversal at page `n`).
+fn fixture_generation(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    n: u64,
+) -> (ScanIndex, SourceScanResult) {
+    let mut index = index;
+    index.traversal = None;
+    let (index, scan, _) = page_with(
+        fixture,
+        index,
+        Some(Arc::clone(cache)),
+        "cursor-fixture",
+        &collected_at(n),
+        |_| {},
+    );
+    (index, scan)
+}
+
+/// A rollout of `id`, optionally a fork of `parent`, with `records` after
+/// its `session_meta`.
+fn write_rollout(fixture: &ScanRoot, id: &str, parent: Option<&str>, records: &[Value]) {
+    let mut payload = json!({"id": id, "thread_source": "user"});
+    if let Some(parent) = parent {
+        payload["forked_from_id"] = json!(parent);
+    }
+    let mut all = vec![json!({"timestamp": "2026-10-07T08:00:00Z",
+        "type": "session_meta", "payload": payload})];
+    all.extend_from_slice(records);
+    fs::write(fixture.file(id), jsonl(&all)).unwrap();
+}
+
+/// P-T32: a held ordinary fork whose parent is witnessed `Absent` memo-hits
+/// after an index reset and re-requests its parent ref, exactly as its
+/// fresh parse did.
+#[test]
+fn witnessed_fork_memo_hit_after_an_index_reset_re_requests_its_parent_ref() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    fs::rename(
+        home.fixture.file(PARENT),
+        home.fixture.root.parent().unwrap().join("parent-away"),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    for n in 0..3 {
+        index = home.generation(index, &cache, n).0;
+    }
+    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
+    index.codex_parent_ownership_refs.clear();
+    let hits = counter(&cache, |c| c.memo_hits);
+    let ((index, scan), parsed) = parses(|| home.generation(index, &cache, 3));
+    assert!(parsed.is_empty(), "{parsed:?}");
+    assert_eq!(
+        counter(&cache, |c| c.memo_hits),
+        hits + 1,
+        "{}",
+        counters(&cache)
+    );
+    assert!(index.codex_parent_ownership_refs.contains(PARENT));
+    assert_eq!(
+        parent_causes(&scan),
+        only(CodexParentUnresolvable::Absent, 1)
+    );
+}
+
+/// P-T18 (witness lifetime): G is absent, P forks G and C forks P. P is held
+/// `Absent` and witnessed `ParentHeld`, so C is held `ParentHeld`. When G
+/// appears (sorted before P), G and P are read, P is admitted with its own
+/// usage, P's RAM witness is gone, and the chain settles as a cold scan.
+#[test]
+fn admitted_parent_loses_its_witness_and_its_child_resolves() {
+    let fixture = chain_fixture(false);
+    let away = fixture.root.parent().unwrap().join("grandparent-away");
+    fs::rename(fixture.file(GRANDPARENT), &away).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
+    expected[CodexParentUnresolvable::Absent.index()] = 1;
+    expected[CodexParentUnresolvable::ParentHeld.index()] = 1;
+    let mut index = ScanIndex::default();
+    let mut held = false;
+    for n in 0..4 {
+        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
+        index = next;
+        assert!(session_usage(&scan, PARENT).is_empty());
+        if parent_causes(&scan) == expected {
+            held = true;
+            break;
+        }
+    }
+    assert!(held, "P held Absent, C ParentHeld: {}", counters(&cache));
+    assert!(
+        witness_keys(&cache, "cursor-fixture").contains(&PARENT.to_owned()),
+        "{}",
+        counters(&cache)
+    );
+    fs::rename(&away, fixture.file(GRANDPARENT)).unwrap();
+    let mut published = Vec::new();
+    let mut settled = None;
+    for n in 4..10 {
+        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
+        published.extend(session_usage(&scan, PARENT));
+        let stable = parent_causes(&scan) == [0; PARENT_UNRESOLVABLE_CAUSES]
+            && settled
+                .as_ref()
+                .is_some_and(|(_, before)| census(&next, &scan) == *before);
+        settled = Some((n, census(&next, &scan)));
+        index = next;
+        if stable {
+            break;
+        }
+    }
+    assert!(
+        !witness_keys(&cache, "cursor-fixture").contains(&PARENT.to_owned()),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(published, vec![(30, 1)], "{}", counters(&cache));
+    let (n, warm) = settled.unwrap();
+    let mut oracle_index = ScanIndex::default();
+    let oracle_cache = Arc::new(SharedCache::default());
+    let mut oracle = None;
+    for m in n..n + 6 {
+        let (next, scan) = fixture_generation(&fixture, &oracle_cache, oracle_index, m);
+        oracle = Some(census(&next, &scan));
+        oracle_index = next;
+    }
+    assert_eq!(warm, oracle.unwrap());
+}
+
+/// P-T25 (R1-M2): a parent last modified outside the backfill window is
+/// witnessed `OutOfWindow`: its fork is held under that cause and never
+/// `DeferredRestart` at two consecutive generations. Touching the parent
+/// changes its identity: the witness drops, the parent is read and the
+/// fork settles as a cold scan.
+#[test]
+fn out_of_window_parent_holds_its_fork_until_touched() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let set_modified = |at: std::time::SystemTime| {
+        OpenOptions::new()
+            .write(true)
+            .open(home.fixture.file(PARENT))
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000));
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut previous_deferred = false;
+    let mut held_at = None;
+    for n in 0..4 {
+        let (next, scan) = home.generation(index, &cache, n);
+        let causes = parent_causes(&scan);
+        let deferred = causes[CodexParentUnresolvable::DeferredRestart.index()] > 0;
+        assert!(!(deferred && previous_deferred), "generation {n}");
+        previous_deferred = deferred;
+        assert!(session_usage(&scan, CHILD).is_empty());
+        if causes == only(CodexParentUnresolvable::OutOfWindow, 1) {
+            held_at.get_or_insert(n);
+        }
+        index = next;
+    }
+    assert!(
+        held_at.is_some_and(|n| n <= 2),
+        "{held_at:?}: {}",
+        counters(&cache)
+    );
+    set_modified(std::time::SystemTime::now());
+    let (index, settled, n) = home.settle(index, &cache, 4);
+    assert_eq!(parent_causes(&settled), [0; PARENT_UNRESOLVABLE_CAUSES]);
+    let (oracle_index, oracle) = home.oracle(n);
+    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// P-T28 (N3, M4): C forks P and P forks C. With the budget spent, both wait
+/// on each other (`DeferredRestart` wait records); the next match finds the
+/// cycle and witnesses both `ForkCycle`. From then both are held `ForkCycle`
+/// and neither file is read again.
+#[test]
+fn fork_cycle_is_witnessed_and_then_quiet() {
+    let fixture = ScanRoot::with_sessions(&[]);
+    write_rollout(&fixture, PARENT, Some(CHILD), &ForkHome::diverging_child(2));
+    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let namespace = Scope("cursor-fixture".into());
+    let scope = group_scope(&ScanIndex::default());
+    for _ in 0..PARENT_RESTART_BUDGET {
+        cache.note_parent_restart(&namespace, &scope);
+    }
+    let cycle = only(CodexParentUnresolvable::ForkCycle, 2);
+    let mut index = ScanIndex::default();
+    let mut held_at = None;
+    for n in 0..5 {
+        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
+        index = next;
+        assert_eq!(restarts_in_scope(&scan), Some(PARENT_RESTART_BUDGET));
+        if parent_causes(&scan) == cycle {
+            held_at = Some(n);
+            break;
+        }
+    }
+    let held_at = held_at.unwrap_or_else(|| panic!("cycle never witnessed: {}", counters(&cache)));
+    assert!(held_at <= 3, "{held_at}");
+    for n in held_at + 1..held_at + 3 {
+        let ((next, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, n));
+        assert!(parsed.is_empty(), "generation {n}: {parsed:?}");
+        assert_eq!(parent_causes(&scan), cycle, "generation {n}");
+        index = next;
+    }
+}
+
+const GRANDPARENT: &str = "019fa111-2222-7333-8444-111111111111";
+
+/// G, P forking G (owned from a mid-ledger divergence, so admitted once G's
+/// ledger is known) and C forking P (kind (iii) against P). `reversed`
+/// names the rollouts so C sorts first and G last.
+fn chain_fixture(reversed: bool) -> ScanRoot {
+    let fixture = ScanRoot::with_sessions(&[]);
+    let grandparent = ForkHome::parent();
+    let own = [
+        grandparent[1].clone(),
+        grandparent[2].clone(),
+        turn_record("2026-10-07T08:20:01Z", "parent-own-turn"),
+        usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
+    ];
+    write_rollout(&fixture, GRANDPARENT, None, &grandparent[1..]);
+    write_rollout(&fixture, PARENT, Some(GRANDPARENT), &own);
+    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
+    if reversed {
+        for (id, hour) in [(CHILD, "07"), (PARENT, "08"), (GRANDPARENT, "09")] {
+            fs::rename(
+                fixture.file(id),
+                fixture
+                    .root
+                    .join(format!("rollout-2026-10-07T{hour}-00-00-{id}.jsonl")),
+            )
+            .unwrap();
+        }
+    }
+    fixture
+}
+
+/// P-T10b: C -> P -> G with G present and resolvable, in both page orders:
+/// no generation ever counts `ParentHeld`, and P is admitted once.
+#[test]
+fn resolvable_chain_never_counts_parent_held() {
+    for reversed in [false, true] {
+        let fixture = chain_fixture(reversed);
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        let mut published = Vec::new();
+        for n in 0..6 {
+            let (next, scan) = fixture_generation(&fixture, &cache, index, n);
+            assert_eq!(
+                parent_causes(&scan)[CodexParentUnresolvable::ParentHeld.index()],
+                0,
+                "reversed {reversed}, generation {n}: {}",
+                counters(&cache)
+            );
+            assert!(restarts_in_scope(&scan).is_some_and(|restarts| restarts <= 2));
+            published.extend(session_usage(&scan, PARENT));
+            index = next;
+        }
+        assert_eq!(published, vec![(30, 1)], "reversed {reversed}");
+    }
+}
+
+/// P-T26b (M2): a `ParentHeld` witness is never stale-pruned. After 20
+/// pages of another namespace (past `NAMESPACE_STALE_PAGES`), the held
+/// chain's next generation parses nothing and its holds memo-hit.
+#[test]
+fn parent_held_witness_survives_another_namespaces_pages() {
+    let fixture = chain_fixture(false);
+    let away = fixture.root.parent().unwrap().join("grandparent-away");
+    fs::rename(fixture.file(GRANDPARENT), &away).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    for n in 0..4 {
+        index = fixture_generation(&fixture, &cache, index, n).0;
+    }
+    assert!(
+        witness_keys(&cache, "cursor-fixture").contains(&PARENT.to_owned()),
+        "{}",
+        counters(&cache)
+    );
+    let other = ScanRoot::new(3);
+    let mut other_index = ScanIndex::default();
+    for _ in 0..20 {
+        other_index = page_in(
+            &other,
+            other_index,
+            Some(Arc::clone(&cache)),
+            "other-namespace",
+        )
+        .0;
+    }
+    let hits = counter(&cache, |c| c.memo_hits);
+    let ((_, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, 4));
+    assert!(parsed.is_empty(), "{parsed:?}: {}", counters(&cache));
+    assert!(
+        counter(&cache, |c| c.memo_hits) >= hits + 2,
+        "{}",
+        counters(&cache)
+    );
+    let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
+    expected[CodexParentUnresolvable::Absent.index()] = 1;
+    expected[CodexParentUnresolvable::ParentHeld.index()] = 1;
+    assert_eq!(parent_causes(&scan), expected);
+}
+
+/// Generations from 0 until `scan`'s causes equal `expected` (at most
+/// `limit`), then two more that must parse nothing and keep them.
+fn held_then_quiet(
+    fixture: &ScanRoot,
+    expected: [u64; PARENT_UNRESOLVABLE_CAUSES],
+    limit: u64,
+    never: CodexParentUnresolvable,
+) {
+    let cache = Arc::new(SharedCache::default());
+    held_then_quiet_from(
+        fixture,
+        &cache,
+        ScanIndex::default(),
+        0,
+        expected,
+        limit,
+        never,
+    );
+}
+
+/// `held_then_quiet` continuing `cache` and `index` from generation `from`.
+fn held_then_quiet_from(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    from: u64,
+    expected: [u64; PARENT_UNRESOLVABLE_CAUSES],
+    limit: u64,
+    never: CodexParentUnresolvable,
+) {
+    let mut index = index;
+    let mut held_at = None;
+    let mut history = Vec::new();
+    for n in from..=from + limit {
+        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, cache, index, n));
+        index = next;
+        history.push(format!(
+            "{n}: causes {:?} restarts {:?} parsed {parsed:?} scanned {} incomplete {} \
+             census {} refs {} ledger {:?}",
+            parent_causes(&scan),
+            restarts_in_scope(&scan),
+            scan.scanned_file_count,
+            scan.ownership_incomplete_file_count,
+            scan.census_complete,
+            index.codex_parent_ownership_refs.contains(PARENT),
+            index
+                .codex_parent_ownership_ledgers
+                .get(PARENT)
+                .map(|ledger| ledger.scan_complete),
+        ));
+        assert_eq!(parent_causes(&scan)[never.index()], 0, "{history:#?}");
+        if parent_causes(&scan) == expected {
+            held_at = Some(n);
+            break;
+        }
+    }
+    let held_at =
+        held_at.unwrap_or_else(|| panic!("never held: {history:#?}\n{}", counters(cache)));
+    for n in held_at + 1..held_at + 3 {
+        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, cache, index, n));
+        assert!(parsed.is_empty(), "generation {n}: {parsed:?}");
+        assert_eq!(parent_causes(&scan), expected, "generation {n}");
+        index = next;
+    }
+}
+
+/// P-T31 (R1-L1): a second rollout claiming P's id makes P `Duplicated`:
+/// the fork is held under it, never `ParentLossy`, and nothing is read
+/// again.
+#[test]
+fn duplicated_parent_holds_its_fork_duplicated() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    fs::copy(
+        home.fixture.file(PARENT),
+        home.fixture
+            .root
+            .join(format!("rollout-2026-10-07T11-00-00-{PARENT}.jsonl")),
+    )
+    .unwrap();
+    held_then_quiet(
+        &home.fixture,
+        only(CodexParentUnresolvable::Duplicated, 1),
+        3,
+        CodexParentUnresolvable::ParentLossy,
+    );
+}
+
+// PR-P fix round 1: event (c), deferral chains, multi-page folds and the
+// wait-record transition.
+
+/// `id`'s rollout at `hour` on 2026-10-07 (`ScanRoot::file` is hour 10).
+fn rollout_at(fixture: &ScanRoot, id: &str, hour: &str) -> PathBuf {
+    fixture
+        .root
+        .join(format!("rollout-2026-10-07T{hour}-00-00-{id}.jsonl"))
+}
+
+/// The name `parses` records for `path`.
+fn file_name(path: &Path) -> String {
+    path.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// `scan`'s held children under a `parent_debt()` cause.
+fn parent_debt(scan: &SourceScanResult) -> u64 {
+    let causes = parent_causes(scan);
+    causes[CodexParentUnresolvable::ParentHeld.index()]
+        + causes[CodexParentUnresolvable::ParentLossy.index()]
+}
+
+/// One line past `MAX_JSONL_LINE_BYTES` (an image row) appended to `path`:
+/// a terminal over-line-cap loss, so a complete parse of the file records a
+/// terminal disposition and publishes no ledger.
+fn append_oversized_line(path: &Path) {
+    let mut row = b"{\"timestamp\":\"2026-10-07T08:40:01Z\",\"type\":\"response_item\",\
+        \"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\
+        \"image_url\":\""
+        .to_vec();
+    row.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+    row.extend_from_slice(b"\"}]}}\n");
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(&row)
+        .unwrap();
+}
+
+/// P-T34 (R1-M1, R2-M1): event (c). P's only rollout ends in a terminal
+/// over-line-cap line, so its one complete parse records a terminal
+/// disposition and no ledger. When C requests P, the unchanged P is skipped
+/// and witnessed `ParentLossy` at its probed identity instead of being read
+/// again: P is parsed exactly once, C is held `ParentLossy`, and from then on
+/// nothing is read.
+#[test]
+fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    append_oversized_line(&home.fixture.file(PARENT));
+    let parent = file_name(&home.fixture.file(PARENT));
+    let lossy = only(CodexParentUnresolvable::ParentLossy, 1);
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut parent_parses = 0;
+    let mut held_at = None;
+    let mut history = Vec::new();
+    for n in 0..6 {
+        let ((next, scan), parsed) = parses(|| home.generation(index, &cache, n));
+        index = next;
+        parent_parses += parsed.iter().filter(|name| **name == parent).count();
+        history.push(format!(
+            "{n}: causes {:?} restarts {:?} parsed {parsed:?}",
+            parent_causes(&scan),
+            restarts_in_scope(&scan)
+        ));
+        assert!(session_usage(&scan, CHILD).is_empty(), "{history:#?}");
+        if held_at.is_some() {
+            assert!(parsed.is_empty(), "{history:#?}");
+            assert_eq!(parent_causes(&scan), lossy, "{history:#?}");
+        } else if parent_causes(&scan) == lossy {
+            held_at = Some(n);
+        }
+    }
+    let held_at =
+        held_at.unwrap_or_else(|| panic!("never held: {history:#?}\n{}", counters(&cache)));
+    assert!(held_at <= 2, "{history:#?}");
+    assert_eq!(parent_parses, 1, "{history:#?}");
+    assert!(index
+        .terminal_jsonl_dispositions
+        .contains_key(&local_index_key(&home.fixture.file(PARENT))));
+    assert!(index.codex_parent_ownership_refs.contains(PARENT));
+    assert!(!index
+        .codex_parent_ownership_ledgers
+        .get(PARENT)
+        .is_some_and(|ledger| ledger.scan_complete));
+    let witness = witness_of(&cache, "cursor-fixture", PARENT);
+    assert!(
+        witness.as_ref().is_some_and(|witness| witness.cause
+            == CodexParentUnresolvable::ParentLossy
+            && witness.identity.is_some()
+            && witness.waits_on.is_none()),
+        "{witness:?}"
+    );
+}
+
+/// P-T34's duplicate-copy leg: a lossy P is read once and recorded with a
+/// terminal disposition. Then C (sorted first) and a second rollout named
+/// with P's id appear together. That rollout's header is another session,
+/// so the join inventory (grouped by header id) does not hold P, while the
+/// census (by path id) sees P twice: when C requests P, the skipped P
+/// reaches event (c), whose probe is `Duplicated`, so P is never witnessed
+/// `ParentLossy` (in RAM or in any count). The next match witnesses P
+/// `Duplicated`, C is held under it, and nothing is read again. (Identical
+/// copies are a join `CandidateCopy` refusal before any parse, so they
+/// never reach event (c).)
+#[test]
+fn duplicated_lossy_parent_is_never_witnessed_parent_lossy() {
+    const OTHER_HEADER: &str = "019fa111-2222-7333-8444-444444444444";
+    let fixture = ScanRoot::with_sessions(&[]);
+    fs::write(fixture.file(PARENT), jsonl(&ForkHome::parent())).unwrap();
+    append_oversized_line(&fixture.file(PARENT));
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    for n in 0..2 {
+        index = fixture_generation(&fixture, &cache, index, n).0;
+    }
+    assert!(
+        index
+            .terminal_jsonl_dispositions
+            .contains_key(&local_index_key(&fixture.file(PARENT))),
+        "{}",
+        counters(&cache)
+    );
+    let mut second = ForkHome::parent();
+    second[0] = json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
+        "payload": {"id": OTHER_HEADER, "thread_source": "user"}});
+    fs::write(rollout_at(&fixture, PARENT, "11"), jsonl(&second)).unwrap();
+    let mut records = vec![json!({"timestamp": "2026-10-07T08:20:00Z",
+        "type": "session_meta",
+        "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}})];
+    records.extend(ForkHome::diverging_child(3));
+    fs::write(rollout_at(&fixture, CHILD, "05"), jsonl(&records)).unwrap();
+    let duplicated = only(CodexParentUnresolvable::Duplicated, 1);
+    let mut held_at = None;
+    let mut history = Vec::new();
+    for n in 2..8 {
+        let ((next, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, n));
+        index = next;
+        let witness = witness_of(&cache, "cursor-fixture", PARENT);
+        history.push(format!(
+            "{n}: causes {:?} restarts {:?} parsed {parsed:?} witness {witness:?}",
+            parent_causes(&scan),
+            restarts_in_scope(&scan)
+        ));
+        assert_eq!(
+            parent_causes(&scan)[CodexParentUnresolvable::ParentLossy.index()],
+            0,
+            "{history:#?}"
+        );
+        assert!(
+            !matches!(
+                witness,
+                Some(ParentWitness {
+                    cause: CodexParentUnresolvable::ParentLossy,
+                    ..
+                })
+            ),
+            "{history:#?}"
+        );
+        if held_at.is_some() {
+            assert!(parsed.is_empty(), "{history:#?}");
+            assert_eq!(parent_causes(&scan), duplicated, "{history:#?}");
+        } else if parent_causes(&scan) == duplicated {
+            held_at = Some(n);
+        }
+    }
+    assert!(
+        held_at.is_some_and(|n| n <= 4),
+        "{history:#?}\n{}",
+        counters(&cache)
+    );
+}
+
+const ABSENT_GRANDPARENT: &str = "019fa111-2222-7333-8444-333333333333";
+
+/// P-T5b (R2-B1): C -> P -> X with X's ref the 257th, so it never fits. P is
+/// held `DeferredRef` and witnessed `DeferredRef` (settling), and C is held
+/// `DeferredRef` under it: never a `parent_debt()` cause. P is not re-read
+/// every generation: from generation 2 nothing is parsed. P before C (P's
+/// ref already held from an earlier traversal) runs no restart; C before P
+/// runs at most one (C is pending before P's step-map entry exists).
+#[test]
+fn deferred_intermediate_parent_is_not_reread_every_generation() {
+    for c_first in [false, true] {
+        let fixture = ScanRoot::with_sessions(&[]);
+        write_rollout(
+            &fixture,
+            PARENT,
+            Some(ABSENT_GRANDPARENT),
+            &ForkHome::parent()[1..],
+        );
+        write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
+        let mut index = ScanIndex::default();
+        for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS - 1 {
+            index
+                .codex_parent_ownership_refs
+                .insert(format!("prefilled-{n:03}"));
+        }
+        if c_first {
+            fs::rename(fixture.file(CHILD), rollout_at(&fixture, CHILD, "09")).unwrap();
+        } else {
+            index.codex_parent_ownership_refs.insert(PARENT.to_owned());
+        }
+        let parent = file_name(&fixture.file(PARENT));
+        let cache = Arc::new(SharedCache::default());
+        let mut parent_parses = 0;
+        let mut history = Vec::new();
+        for n in 0..6 {
+            let ((next, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, n));
+            index = next;
+            parent_parses += parsed.iter().filter(|name| **name == parent).count();
+            history.push(format!(
+                "{n}: causes {:?} restarts {:?} parsed {parsed:?}",
+                parent_causes(&scan),
+                restarts_in_scope(&scan)
+            ));
+            assert_eq!(parent_debt(&scan), 0, "c_first {c_first}: {history:#?}");
+            assert!(!index
+                .codex_parent_ownership_refs
+                .contains(ABSENT_GRANDPARENT));
+            let restarts = restarts_in_scope(&scan);
+            if c_first {
+                assert!(
+                    restarts.is_some_and(|restarts| restarts <= 1),
+                    "{history:#?}"
+                );
+            } else {
+                assert_eq!(restarts, Some(0), "{history:#?}");
+            }
+            if n >= 2 {
+                assert!(parsed.is_empty(), "c_first {c_first}: {history:#?}");
+                assert_eq!(
+                    parent_causes(&scan),
+                    only(CodexParentUnresolvable::DeferredRef, 2),
+                    "c_first {c_first}: {history:#?}"
+                );
+            }
+        }
+        if c_first {
+            assert!(parent_parses <= 2, "{history:#?}");
+        } else {
+            assert_eq!(parent_parses, 1, "{history:#?}");
+        }
+        let witness = witness_of(&cache, "cursor-fixture", PARENT);
+        assert!(
+            witness
+                .as_ref()
+                .is_some_and(|witness| witness.cause == CodexParentUnresolvable::DeferredRef),
+            "c_first {c_first}: {witness:?}"
+        );
+    }
+}
+
+const GREAT_GRANDPARENT: &str = "019fa111-2222-7333-8444-222222222222";
+
+/// The settled census of `fixture` from generation `n` on a fresh index and
+/// cache (unspent budget): the cold oracle of a chain.
+fn cold_census(fixture: &ScanRoot, n: u64) -> (Vec<(&'static str, u64)>, BTreeSet<String>) {
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut last = None;
+    for m in n..n + 8 {
+        let (next, scan) = fixture_generation(fixture, &cache, index, m);
+        last = Some(census(&next, &scan));
+        index = next;
+    }
+    last.unwrap()
+}
+
+/// P-T10c (R2-M1, covers P-T10): C -> P -> G -> H in the worst page order (C
+/// first, H last) with the scope's restart budget already spent. No restart
+/// runs; links wait as `DeferredRestart` while the chain converges, never a
+/// `parent_debt()` cause; the chain then settles as a cold scan does.
+#[test]
+fn spent_budget_chain_never_counts_parent_debt_and_converges() {
+    let fixture = ScanRoot::with_sessions(&[]);
+    let root = ForkHome::parent();
+    let grandparent = [
+        root[1].clone(),
+        root[2].clone(),
+        turn_record("2026-10-07T08:20:01Z", "grandparent-own-turn"),
+        usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
+        turn_record("2026-10-07T08:40:01Z", "grandparent-own-turn-2"),
+        usage_record("2026-10-07T08:40:02Z", (150, 115, 17, 4), (20, 15, 3, 1)),
+    ];
+    let mut parent = grandparent[..4].to_vec();
+    parent.push(turn_record("2026-10-07T08:30:01Z", "parent-own-turn"));
+    parent.push(usage_record(
+        "2026-10-07T08:30:02Z",
+        (145, 110, 16, 3),
+        (15, 10, 2, 0),
+    ));
+    write_rollout(&fixture, GREAT_GRANDPARENT, None, &root[1..]);
+    write_rollout(&fixture, GRANDPARENT, Some(GREAT_GRANDPARENT), &grandparent);
+    write_rollout(&fixture, PARENT, Some(GRANDPARENT), &parent);
+    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
+    for (id, hour) in [
+        (CHILD, "05"),
+        (PARENT, "06"),
+        (GRANDPARENT, "07"),
+        (GREAT_GRANDPARENT, "08"),
+    ] {
+        fs::rename(fixture.file(id), rollout_at(&fixture, id, hour)).unwrap();
+    }
+    let cache = Arc::new(SharedCache::default());
+    let namespace = Scope("cursor-fixture".into());
+    let scope = group_scope(&ScanIndex::default());
+    for _ in 0..PARENT_RESTART_BUDGET {
+        cache.note_parent_restart(&namespace, &scope);
+    }
+    let mut index = ScanIndex::default();
+    let mut history = Vec::new();
+    let mut previous = None;
+    let mut settled = None;
+    for n in 0..10 {
+        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
+        index = next;
+        history.push(format!(
+            "{n}: causes {:?} restarts {:?}",
+            parent_causes(&scan),
+            restarts_in_scope(&scan)
+        ));
+        assert_eq!(parent_debt(&scan), 0, "{history:#?}");
+        assert_eq!(
+            restarts_in_scope(&scan),
+            Some(PARENT_RESTART_BUDGET),
+            "{history:#?}"
+        );
+        let now = census(&index, &scan);
+        let quiet = parent_causes(&scan) == [0; PARENT_UNRESOLVABLE_CAUSES];
+        if quiet && previous.as_ref() == Some(&now) {
+            settled = Some((n, now));
+            break;
+        }
+        previous = quiet.then_some(now);
+    }
+    let (n, warm) =
+        settled.unwrap_or_else(|| panic!("never settled: {history:#?}\n{}", counters(&cache)));
+    assert_eq!(warm, cold_census(&fixture, n + 1), "{history:#?}");
+}
+
+/// P-T16 (R2-M1): a traversal spanning pages. Twelve changed sessions and C
+/// (a fork of absent P, sorted first) are 13 candidates over 10-file pages.
+/// On each steady traversal the step-start match runs once, C's `Absent`
+/// count appears on its page and every later page of the traversal reports
+/// it again (the page-to-traversal fold, traversal-cumulative per page),
+/// P's witness survives every page, and restarts stay within budget.
+#[test]
+fn multi_page_traversal_folds_parent_causes_and_matches_once() {
+    let fillers = (0..12)
+        .map(|n| format!("019fa111-2222-7333-8444-9000000000{n:02}"))
+        .collect::<Vec<_>>();
+    let sessions = fillers
+        .iter()
+        .map(|id| (id.as_str(), 2))
+        .collect::<Vec<_>>();
+    let fixture = ScanRoot::with_sessions(&sessions);
+    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
+    fs::rename(fixture.file(CHILD), rollout_at(&fixture, CHILD, "05")).unwrap();
+    let absent = only(CodexParentUnresolvable::Absent, 1);
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut page = 0;
+    for traversal in 0..5 {
+        for id in &fillers {
+            fixture.append(id, &token_line(3 + traversal));
+        }
+        let before = crate::snapshots::codex_parent_step_start_matches_for_test();
+        let mut pages = Vec::new();
+        loop {
+            let (next, scan, _) = page_with(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(page),
+                |_| {},
+            );
+            index = next;
+            page += 1;
+            pages.push((
+                parent_causes(&scan),
+                restarts_in_scope(&scan),
+                witness_of(&cache, "cursor-fixture", PARENT).map(|witness| witness.cause),
+            ));
+            if index.traversal.is_none() {
+                break;
+            }
+            assert!(pages.len() < 10, "traversal {traversal}: {pages:?}");
+        }
+        let matches = crate::snapshots::codex_parent_step_start_matches_for_test() - before;
+        for (_, restarts, _) in &pages {
+            assert!(
+                !restarts.is_some_and(|restarts| restarts > PARENT_RESTART_BUDGET),
+                "traversal {traversal}: {pages:?}"
+            );
+        }
+        if traversal < 2 {
+            continue;
+        }
+        assert!(pages.len() >= 2, "traversal {traversal}: {pages:?}");
+        assert_eq!(matches, 1, "traversal {traversal}: {pages:?}");
+        let at = pages
+            .iter()
+            .position(|(causes, ..)| *causes == absent)
+            .unwrap_or_else(|| panic!("traversal {traversal}: {pages:?}"));
+        assert!(at + 1 < pages.len(), "traversal {traversal}: {pages:?}");
+        for (causes, ..) in &pages[..at] {
+            assert_eq!(
+                *causes, [0; PARENT_UNRESOLVABLE_CAUSES],
+                "traversal {traversal}: {pages:?}"
+            );
+        }
+        for (causes, _, witness) in &pages[at..] {
+            assert_eq!(*causes, absent, "traversal {traversal}: {pages:?}");
+            assert_eq!(
+                *witness,
+                Some(CodexParentUnresolvable::Absent),
+                "traversal {traversal}: {pages:?}"
+            );
+        }
+    }
+}
+
+/// P-T18b (R1-M2): P-T18 with P before G on the page. G absent: P is held
+/// `Absent` and witnessed `ParentHeld`, C is held `ParentHeld`. When G
+/// appears, P's re-read finds G not yet read, so P's settling witness is
+/// replaced by a `DeferredRestart` wait record on G (and unwitnessed in the
+/// step map) before P resolves. With P and C both before G, C is never
+/// counted `ParentHeld` after G appears. With C first (`chain_fixture(true)`)
+/// C may keep the conservative `ParentHeld` label until P's actual
+/// dependency-triggered re-read (the general bound; not one traversal by
+/// wall clock). In this fixture that re-read runs on the first such
+/// generation, so C may count `ParentHeld` then, never later. Both settle as
+/// a cold scan.
+#[test]
+fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
+    for c_first in [false, true] {
+        let fixture = chain_fixture(c_first);
+        let grandparent = if c_first {
+            rollout_at(&fixture, GRANDPARENT, "09")
+        } else {
+            for (id, hour) in [(PARENT, "06"), (CHILD, "07")] {
+                fs::rename(fixture.file(id), rollout_at(&fixture, id, hour)).unwrap();
+            }
+            fixture.file(GRANDPARENT)
+        };
+        let away = fixture.root.parent().unwrap().join("grandparent-away");
+        fs::rename(&grandparent, &away).unwrap();
+        let mut held = [0; PARENT_UNRESOLVABLE_CAUSES];
+        held[CodexParentUnresolvable::Absent.index()] = 1;
+        held[CodexParentUnresolvable::ParentHeld.index()] = 1;
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        let mut history = Vec::new();
+        let mut n = 0;
+        loop {
+            let (next, scan) = fixture_generation(&fixture, &cache, index, n);
+            index = next;
+            history.push(format!("{n}: causes {:?}", parent_causes(&scan)));
+            n += 1;
+            if parent_causes(&scan) == held {
+                break;
+            }
+            assert!(n < 6, "c_first {c_first}: {history:#?}");
+        }
+        let witness = witness_of(&cache, "cursor-fixture", PARENT);
+        assert!(
+            witness
+                .as_ref()
+                .is_some_and(|witness| witness.cause == CodexParentUnresolvable::ParentHeld),
+            "c_first {c_first}: {witness:?}"
+        );
+        fs::rename(&away, &grandparent).unwrap();
+        let mut published = Vec::new();
+        let mut censuses = Vec::new();
+        for m in n..n + 6 {
+            let (next, scan) = fixture_generation(&fixture, &cache, index, m);
+            index = next;
+            let witness = witness_of(&cache, "cursor-fixture", PARENT);
+            history.push(format!(
+                "{m}: causes {:?} restarts {:?} witness {witness:?}",
+                parent_causes(&scan),
+                restarts_in_scope(&scan)
+            ));
+            let parent_held = parent_causes(&scan)[CodexParentUnresolvable::ParentHeld.index()];
+            assert!(
+                parent_held == 0 || (c_first && m == n),
+                "c_first {c_first}: {history:#?}"
+            );
+            if m == n {
+                assert!(
+                    witness.as_ref().is_some_and(|witness| witness.cause
+                        == CodexParentUnresolvable::DeferredRestart
+                        && witness.waits_on.as_deref() == Some(GRANDPARENT)),
+                    "c_first {c_first}: {history:#?}\n{}",
+                    counters(&cache)
+                );
+            }
+            published.extend(session_usage(&scan, PARENT));
+            censuses.push(census(&index, &scan));
+        }
+        assert_eq!(
+            witness_of(&cache, "cursor-fixture", PARENT),
+            None,
+            "c_first {c_first}: {history:#?}"
+        );
+        assert_eq!(published, vec![(30, 1)], "c_first {c_first}: {history:#?}");
+        let warm = censuses.pop().unwrap();
+        assert_eq!(Some(&warm), censuses.last(), "c_first {c_first}");
+        assert_eq!(warm, cold_census(&fixture, n + 6), "c_first {c_first}");
+    }
+}
+
+/// P-T23 (R1-M1, R2-M1): P's index ledger is admitted and the fork settled;
+/// then a copy of P appears and C changes once. The admitted ledger no
+/// longer validates and does not hide P: C is held `Duplicated` (never
+/// `ParentLossy`) and then nothing, neither copy of P nor C, is read again.
+#[test]
+fn duplicate_after_an_admitted_ledger_holds_the_fork_duplicated() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
+    assert!(ForkHome::parent_ledger(&index).is_some());
+    fs::copy(
+        home.fixture.file(PARENT),
+        rollout_at(&home.fixture, PARENT, "11"),
+    )
+    .unwrap();
+    home.fixture.append(
+        CHILD,
+        &jsonl(&[usage_record(
+            "2026-10-07T08:20:03Z",
+            (40, 20, 4, 0),
+            (10, 5, 1, 0),
+        )]),
+    );
+    held_then_quiet_from(
+        &home.fixture,
+        &cache,
+        index,
+        n,
+        only(CodexParentUnresolvable::Duplicated, 1),
+        4,
+        CodexParentUnresolvable::ParentLossy,
+    );
 }

@@ -108,6 +108,7 @@ pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosur
         parsed_snapshot_count: 0,
         held: cursor::HeldCounts::default(),
         parent_ref: None,
+        parent_unresolvable: None,
     }
 }
 
@@ -123,6 +124,7 @@ fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
         parsed_snapshot_count: 0,
         held: cursor::HeldCounts::default(),
         parent_ref: None,
+        parent_unresolvable: None,
     }
 }
 
