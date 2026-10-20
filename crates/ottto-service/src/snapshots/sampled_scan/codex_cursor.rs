@@ -2000,9 +2000,10 @@ fn evict_oldest_join_owner(cursor: &mut CursorState) -> bool {
 /// K6 admission of `charge` more cursor bytes, under both locks (retained,
 /// then cursor): measure the cursor state (outstanding claims included),
 /// then release least-recently-useful retained copies until they fit beside
-/// it. `mandatory` (a paused job: baseline progress) may first forget join
-/// provenance, which is optional and only keeps its owner blocked; optional
-/// admissions never take room that way. Unsupported accounting, overflow or
+/// it. If even an empty retained cache does not fit, `mandatory` (a paused
+/// job: baseline progress) may then forget join provenance, which is
+/// optional and only keeps its owner blocked; optional admissions never take
+/// room that way. Unsupported accounting, overflow or
 /// no room: false, nothing admitted.
 fn admit_locked(
     retained: &mut super::RetainedCache,
@@ -2014,12 +2015,15 @@ fn admit_locked(
         let Some(state) = crate::heap_layout_bound::bound(&*cursor, STATE_BYTES) else {
             return false;
         };
-        if let Some(room) = state_budget()
+        let room = state_budget()
             .checked_sub(state)
-            .and_then(|room| room.checked_sub(charge))
-        {
-            return retained.release_until(room);
+            .and_then(|room| room.checked_sub(charge));
+        if room.is_some_and(|room| retained.release_until(room)) {
+            return true;
         }
+        // Even an empty retained cache did not fit beside the state (or the
+        // state alone left no room): only a mandatory charge goes on, one
+        // forgotten provenance entry at a time (at most `JOIN_OWNERS`).
         if !mandatory || !evict_oldest_join_owner(cursor) {
             return false;
         }
