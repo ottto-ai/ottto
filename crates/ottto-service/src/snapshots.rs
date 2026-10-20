@@ -25272,6 +25272,10 @@ const CLAUDE_LEGACY_EFFORT_MODELS: &[&str] = &[
 /// wins. The value is reported exactly as configured; nothing is normalized and
 /// no default is invented when the key is absent. `reasoning_effort_by_model` reports every saved per-model effort
 /// on its own, so a `/effort` change shows even when no model is saved.
+///
+/// `fast_mode_enabled` is the one field with a default: Claude Code's Fast is
+/// off until `fastMode` is saved, so a readable chain without that key reports
+/// `false` with the `claude_code.default.fastMode` source.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeConfigDefaults {
     pub model: Option<String>,
@@ -25285,18 +25289,17 @@ pub(crate) struct ClaudeConfigDefaults {
     pub selector_sources: BTreeMap<String, String>,
 }
 
+/// `selector_sources` label for a Fast default that no settings key sets.
+const CLAUDE_FAST_MODE_DEFAULT_SOURCE: &str = "claude_code.default.fastMode";
+
 /// Result of reading the Claude Code settings chain.
-///
-/// `NothingConfigured` and `Unreadable` are kept apart on purpose: the UI must
-/// be able to say "you have not configured a default" rather than implying
-/// Ottto failed to look.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClaudeConfigDefaultsOutcome {
-    /// At least one display-safe default is configured somewhere in the chain.
+    /// At least one settings file parsed cleanly. Fast mode is always known
+    /// then: a chain without `fastMode` reports Claude Code's default, off.
     Configured(ClaudeConfigDefaults),
-    /// A settings file parsed cleanly, but none of the mapped keys are set.
-    NothingConfigured,
-    /// No settings file in the chain could be read and parsed.
+    /// No settings file in the chain could be read and parsed, so nothing is
+    /// reported, not even the Fast default.
     Unreadable,
 }
 
@@ -25406,20 +25409,21 @@ pub(crate) fn load_claude_settings_defaults(
     // `fastModePerSessionOptIn` means Fast never persists across sessions, so
     // the durable default is off regardless of a stored `fastMode` flag. This
     // mirrors how Codex's `fast_default_opt_out` overrides `[features].fast_mode`.
-    let fast_mode = match (&raw.fast_mode_per_session_opt_in, &raw.fast_mode) {
-        (Some((true, source)), _) => Some((false, source.clone())),
-        (_, Some((enabled, source))) => Some((*enabled, source.clone())),
-        _ => None,
-    };
-    if let Some((enabled, source)) = fast_mode {
-        insert(
-            &mut defaults,
-            "fast_mode_enabled",
-            enabled.to_string(),
-            &source,
-        );
-        defaults.fast_mode_enabled = Some(enabled);
-    }
+    // At least one file was read, so a chain without `fastMode` means Claude
+    // Code's own default: off. That default is labelled as such, never as a key.
+    let (fast_mode_enabled, fast_mode_source) =
+        match (&raw.fast_mode_per_session_opt_in, &raw.fast_mode) {
+            (Some((true, source)), _) => (false, source.clone()),
+            (_, Some((enabled, source))) => (*enabled, source.clone()),
+            _ => (false, CLAUDE_FAST_MODE_DEFAULT_SOURCE.to_string()),
+        };
+    insert(
+        &mut defaults,
+        "fast_mode_enabled",
+        fast_mode_enabled.to_string(),
+        &fast_mode_source,
+    );
+    defaults.fast_mode_enabled = Some(fast_mode_enabled);
     // `autoAllowBashIfSandboxed` only means something once the sandbox is on,
     // so an unset `sandbox.enabled` stays quiet rather than guessing a mode.
     let sandbox_mode = match &raw.sandbox_enabled {
@@ -25438,9 +25442,6 @@ pub(crate) fn load_claude_settings_defaults(
         defaults.sandbox_mode = Some(mode.to_string());
     }
 
-    if defaults.selector_context.is_empty() && defaults.reasoning_effort_by_model.is_empty() {
-        return ClaudeConfigDefaultsOutcome::NothingConfigured;
-    }
     ClaudeConfigDefaultsOutcome::Configured(defaults)
 }
 
@@ -43119,14 +43120,13 @@ mod tests {
     }
 
     #[test]
-    fn claude_settings_defaults_report_nothing_configured_and_unreadable_apart() {
+    fn claude_settings_defaults_report_fast_off_only_when_a_file_was_read() {
         let root = temp_dir("claude-settings-empty");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
         let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
 
-        // No settings file at all: we could not look, which is not the same as
-        // "nothing configured".
+        // No settings file at all: we could not look, so Fast stays unknown.
         assert_eq!(
             load_claude_defaults(&paths),
             ClaudeConfigDefaultsOutcome::Unreadable
@@ -43139,18 +43139,71 @@ mod tests {
             ClaudeConfigDefaultsOutcome::Unreadable
         );
 
-        // Readable settings that configure none of the mapped keys.
+        // Readable settings without `fastMode`: Claude Code's default, off, and
+        // labelled as the default rather than as a key in the file.
         fs::write(
             claude_dir.join("settings.json"),
             "{\"agentPushNotifEnabled\": true, \"cleanupPeriodDays\": 30}\n",
         )
         .expect("write settings");
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.fast_mode_enabled, Some(false));
         assert_eq!(
-            load_claude_defaults(&paths),
-            ClaudeConfigDefaultsOutcome::NothingConfigured
+            defaults
+                .selector_context
+                .get("fast_mode_enabled")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("fast_mode_enabled")
+                .map(String::as_str),
+            Some("claude_code.default.fastMode")
+        );
+        assert_eq!(defaults.model, None);
+        assert_eq!(defaults.reasoning_effort, None);
+        assert_eq!(defaults.approval_policy, None);
+        assert_eq!(defaults.sandbox_mode, None);
+
+        // An explicit `fastMode: false` keeps its key as the source.
+        fs::write(claude_dir.join("settings.json"), "{\"fastMode\": false}\n")
+            .expect("write settings");
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.fast_mode_enabled, Some(false));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("fast_mode_enabled")
+                .map(String::as_str),
+            Some("claude_code.settings.fastMode")
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_config_without_fast_keys_leaves_fast_mode_unknown() {
+        // Codex may default to Fast on some plans (hence `fast_default_opt_out`),
+        // so a config without a tier or Fast key does not mean Fast is off.
+        let defaults =
+            parse_codex_config_defaults("model = \"gpt-5.5\"\n").expect("config defaults present");
+        assert_eq!(defaults.display_fast_mode(), None);
+        assert!(!defaults.selector_context.contains_key("mode"));
+
+        let defaults =
+            parse_codex_config_defaults("model = \"gpt-5.5\"\n[features]\nfast_mode = false\n")
+                .expect("config defaults present");
+        assert_eq!(defaults.display_fast_mode(), Some(false));
+        let defaults =
+            parse_codex_config_defaults("model = \"gpt-5.5\"\n[features]\nfast_mode = true\n")
+                .expect("config defaults present");
+        assert_eq!(defaults.display_fast_mode(), Some(true));
     }
 
     #[test]
@@ -43188,7 +43241,7 @@ mod tests {
             panic!("expected configured Claude defaults");
         };
         // Only the four mapped keys are read; the sandbox contributes its mode
-        // and nothing from filesystem/credentials.
+        // and nothing from filesystem/credentials. Fast is the unset default.
         assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(defaults.sandbox_mode.as_deref(), Some("auto_allow"));
         // `bypassPermissions` is a local safety posture, never uploaded.
@@ -43196,7 +43249,7 @@ mod tests {
         assert!(!defaults.selector_context.contains_key("approval_policy"));
         assert_eq!(
             defaults.selector_context.keys().collect::<Vec<_>>(),
-            vec!["model", "sandbox_mode"]
+            vec!["fast_mode_enabled", "model", "sandbox_mode"]
         );
 
         let leaked = defaults

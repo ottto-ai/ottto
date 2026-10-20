@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 722,
-  "content_sha256": "afc92ba33a354ec9fdb8e935ffdf83a904b8ca01ec81fbd86b77697bf769a1d6",
+  "candidate_file_count": 723,
+  "content_sha256": "1ac925ca51a0047c0b8ebc3e17cf3e7569bd7ebc96d6239f18d7bc856a5db935",
   "files": [
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "48f1a280fbf8a6bf772a6047f218a277bf7c10db1d209fee99b6373f2e1eab93",
-      "size_bytes": 1632395
+      "sha256": "4de491949ba8e7fe3d61b7f8992263a29daca644fa88ae297a752e37c431afb4",
+      "size_bytes": 1631778
     },
     {
       "executable": false,
@@ -1301,8 +1301,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "bdfdf04866faf0132429487dd6b540b8b21d68411ec7d215451e7399c88cf402",
-      "size_bytes": 2906260
+      "sha256": "ad8d4c41008a557434ebfb12377f457052812faa94b21b06dda71020013a4382",
+      "size_bytes": 2908900
     },
     {
       "executable": false,
@@ -3288,6 +3288,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-20-claude-fast-mode-default-off.md",
+      "sha256": "55ea86718f08cdccd8379865d53ad766428127bb09e353bd72de149a031ebb85",
+      "size_bytes": 2020
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-20-disappearance-reason-diagnostics.md",
       "sha256": "dd95e5cefff11b39414156e2ce0b5759c3fce7e3fe40b101d9b3645e04b3d98e",
       "size_bytes": 3299
@@ -5057,9 +5064,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T15:11:36+00:00",
+  "generated_at": "2026-10-20T21:02:11+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 723,
+  "output_file_count": 724,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5096,5 +5103,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "344b47cd06ede83f2aa8608c6133ab5b59690b45"
+  "source_commit": "95e484665cc18be331bc0a89bb54e38c10472878"
 }
