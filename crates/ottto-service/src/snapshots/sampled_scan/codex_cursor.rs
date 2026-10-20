@@ -3079,10 +3079,11 @@ fn revalidate_decisions(
 ///
 /// A parentless thread missing its sidecar projection (no `trace_id`, a
 /// state row that disagrees, or a sidecar rollout extent that lags the file)
-/// is cured by sidecar evidence, never by an append: it is memoized too, and
-/// wakes on any change of the path's full sidecar fingerprint (rollout
-/// extent, state row, title and decoration included) or identity conflicts,
-/// which the entry records (`sidecar_fingerprint`). Zero accepted usage is
+/// is cured by sidecar evidence or by the file catching up with its extent:
+/// it is memoized too, on its exact stamp (`growth_may_cure`), and wakes on
+/// any change of the path's full sidecar fingerprint (rollout extent, state
+/// row, title and decoration included) or conflicted candidate ids, which
+/// the entry records (`sidecar_fingerprint`). Zero accepted usage is
 /// append-curable and never memoized.
 pub(in crate::snapshots) fn held_monotone(accumulator: &SnapshotAccumulator) -> bool {
     match accumulator.codex_ownership_boundary {
@@ -3104,43 +3105,20 @@ pub(in crate::snapshots) fn held_monotone(accumulator: &SnapshotAccumulator) -> 
     }
 }
 
-/// R1-H1: a parentless created thread held for a missing sidecar projection
-/// may be cured by an append, when the sidecar's rollout extent is ahead of
-/// the flushed file and the file catches up. Its memo entry hits only on the
-/// exact recorded stamp, so any growth re-reads it.
+/// B1 (steady-state rev 2): every hold that the classifier's created-thread
+/// branch, or its identity-ambiguous return, produced depends on the file
+/// length and on the sidecar. The sidecar bind needs the rollout extent to
+/// equal the file length (`codex_sidecar_rollout_file_matches`) and only then
+/// sets the trusted parent, projection and creation time, whether the thread
+/// is state- or rollout-declared. Growth or a sidecar change may therefore
+/// cure the hold (an admission) or change its parent ref, so its memo entry
+/// hits only on the exact recorded stamp, and any growth re-reads it.
 ///
-/// #635: a state-declared created thread whose rollout extent does not match
-/// the file binds no projection and no creation time, so its header is held
-/// as `AmbiguousFork`, not `NativeCreatedThread`: the same growth-curable
-/// hold. Memo eligibility only; admission is unchanged.
+/// `NativeCreatedThread` is set only inside that branch, so this covers the
+/// parentless missing-projection hold (R1-H1) and #635's unbound
+/// `AmbiguousFork` hold. Memo eligibility only; admission is unchanged.
 pub(in crate::snapshots) fn growth_may_cure(accumulator: &SnapshotAccumulator) -> bool {
-    match accumulator.codex_ownership_boundary {
-        CodexOwnershipBoundary::NativeCreatedThread => {
-            accumulator.codex_parent_session_ref.is_none()
-                && accumulator.codex_sidecar_projected_next_ordinal.is_none()
-        }
-        CodexOwnershipBoundary::AmbiguousFork => unbound_created_thread(accumulator),
-        _ => false,
-    }
-}
-
-/// A state-declared created thread whose sidecar bound neither a parent nor
-/// a projection (#635): no extent, any rollout mismatch (extent, path,
-/// inode or created time), or the identity-conflict / incomplete-detail
-/// return of the sidecar bind. The class keys on
-/// bound sidecar facts, not header claims, so it includes copy-evidence
-/// forks (`forked_from_id`, `history_base`) and parented threads whose
-/// binding was skipped: the created-thread branch overwrites
-/// `codex_parent_session_ref` with the trusted (bound) parent, so the ref
-/// conjunct only bites on the identity-ambiguous return. Excluding header
-/// lineage would bring the stale hit back for a parented thread that binds
-/// once its file catches up. A member pays an exact-stamp re-read on growth
-/// or sidecar change; admission is still decided by the classifier.
-fn unbound_created_thread(accumulator: &SnapshotAccumulator) -> bool {
-    accumulator.codex_sidecar_created_thread
-        && accumulator.codex_sidecar_parent.is_none()
-        && accumulator.codex_parent_session_ref.is_none()
-        && accumulator.codex_sidecar_projected_next_ordinal.is_none()
+    accumulator.codex_created_thread_native_only
 }
 
 /// Memo key: namespace and path, like rotation keys (R1-M1).
@@ -3150,35 +3128,47 @@ pub(in crate::snapshots) fn memo_key(namespace: &Scope, key: &str) -> String {
 
 /// Every hold except an ambiguous fork (cured by peer parent evidence, which
 /// the entry's parent ledger records) also wakes on sidecar change. When in
-/// doubt the sidecar is kept as a wake input (K3). An unbound created
-/// thread's `AmbiguousFork` is cured by its projection, so it wakes too
-/// (#635).
+/// doubt the sidecar is kept as a wake input (K3). A created-thread or
+/// identity-ambiguous hold's `AmbiguousFork` is decided by its sidecar bind,
+/// so it wakes too (B1).
 pub(in crate::snapshots) fn sidecar_wakes(accumulator: &SnapshotAccumulator) -> bool {
     !matches!(
         accumulator.codex_ownership_boundary,
         CodexOwnershipBoundary::AmbiguousFork
-    ) || unbound_created_thread(accumulator)
+    ) || accumulator.codex_created_thread_native_only
 }
 
 /// The path's full sidecar facts (K3): the non-reduction sidecar
 /// fingerprint (rollout extent `next_byte_offset`/`next_ordinal`, state row
-/// `rollout_path`/`created_at`, title, decoration, family) and how many of
-/// the path's candidate ids are identity conflicts. Its census flags are in
-/// the memo digest.
+/// `rollout_path`/`created_at`, title, decoration, family) and which of the
+/// path's candidate ids are identity conflicts. Its census flags are in the
+/// memo digest.
 pub(in crate::snapshots) fn sidecar_fingerprint(codex: &CodexTitleMetadata, path: &Path) -> String {
-    let conflicts = codex_session_id_candidates_from_path(path)
-        .iter()
-        .filter(|identity| {
-            codex
-                .identity_conflicts
-                .contains(resolve_codex_identity(identity.as_str()).as_str())
-        })
-        .count();
     sha256_hex(&[
-        "codex_memo_sidecar:v1",
+        "codex_memo_sidecar:v2",
         &codex.path_sidecar_fingerprint(path),
-        &conflicts.to_string(),
+        &conflicted_identities(codex, path),
     ])
+}
+
+/// The path's candidate ids that are identity conflicts, resolved, sorted
+/// and newline-joined. The set, not its size: a conflict moving from one
+/// candidate to another at an equal count also wakes (R1-L1). A path with no
+/// rollout id is identity-ambiguous exactly while the state census holds
+/// any created thread (`seed_codex_sidecar_parent`), so that bit stands in.
+fn conflicted_identities(codex: &CodexTitleMetadata, path: &Path) -> String {
+    let candidates = codex_session_id_candidates_from_path(path);
+    if candidates.is_empty() {
+        return format!("no_candidates:{}", !codex.state_created_threads.is_empty());
+    }
+    candidates
+        .iter()
+        .map(|identity| resolve_codex_identity(identity.as_str()))
+        .filter(|identity| codex.identity_conflicts.contains(identity.as_str()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Head and boundary samples before the refused offset. A sample match is a
@@ -3464,8 +3454,9 @@ impl SingletonMemo {
 /// The memo key for a singleton: parser, identity and proof versions, the
 /// file's logical key and opened `{dev, ino}` (never its growing length),
 /// the receipt scope, the counting view, and the wake dependencies
-/// (path-scoped reduction facts and header witness, the global sidecar
-/// census flags, and how many inventory members its owner has). The upload
+/// (path-scoped reduction facts and header witness, the path's conflicted
+/// candidate ids, the global sidecar census flags, and how many inventory
+/// members its owner has). The upload
 /// context and the census flags cannot cure most holds but are kept as
 /// conservative wake inputs (K3); their cost is one re-read per held file
 /// when they change.
@@ -3481,7 +3472,7 @@ pub(in crate::snapshots) fn memo_digest(
 ) -> Option<String> {
     let stamp = OpenStamp::capture(file).ok()?;
     Some(sha256_hex(&[
-        "codex_singleton_memo:v1",
+        "codex_singleton_memo:v2",
         CODEX_JOIN_PROOF_VERSION,
         SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
@@ -3494,6 +3485,9 @@ pub(in crate::snapshots) fn memo_digest(
             .unwrap_or("none"),
         counting,
         dependencies,
+        // Class 7: an identity conflict on a candidate changes the blocked
+        // ids of any hold, sidecar-woken or not.
+        &conflicted_identities(codex, &candidate.path),
         if codex.created_thread_census_unscoped_incomplete {
             "created_incomplete"
         } else {

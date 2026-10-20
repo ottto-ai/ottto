@@ -153,12 +153,13 @@ const CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX: usize = 64;
 const CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX: usize = 20;
 /// The backend accepts at most this many status snapshots in one upload.
 const AGENT_STATUS_UPLOAD_SNAPSHOT_MAX: usize = 10;
-/// Whether the account-less Desktop pair status uploads. Held off until the
-/// backend keeps a login's metered current row when it arrives: today an
-/// account-less status takes the profile of its newest linked observation,
-/// and the current-row cleanup then deletes this Mac's older metered row for
-/// that profile. Pair connect targets are local and do not depend on this.
-const CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED: bool = false;
+/// Whether the account-less Desktop pair status uploads. The backend keeps a
+/// login's metered current row when this status arrives: an account-less,
+/// meterless status no longer takes the profile of its newest linked
+/// observation, so the current-row cleanup cannot delete this Mac's metered
+/// row for that profile. Pair connect targets are local and do not depend on
+/// this.
+const CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED: bool = true;
 // Reuse the daemon's existing detected-use/session retention contract. This
 // warning is a view of the same local activity evidence, not a new lifetime.
 const CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS: i64 =
@@ -5010,14 +5011,7 @@ fn collect_claude_status_snapshots(
         &captured_at,
         &expires_at,
     ));
-    if CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED {
-        append_claude_desktop_pairs_snapshot(
-            &mut snapshots,
-            &desktop_pairs,
-            &captured_at,
-            &expires_at,
-        );
-    }
+    append_claude_desktop_pairs_snapshot(&mut snapshots, &desktop_pairs, &captured_at, &expires_at);
     let unresolved_accounts = derive_unresolved_claude_accounts(
         &default_snapshot,
         &desktop_pairs,
@@ -10394,6 +10388,9 @@ fn append_claude_desktop_pairs_snapshot(
     captured_at: &str,
     expires_at: &str,
 ) {
+    if !CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED {
+        return;
+    }
     let Some(snapshot) = claude_desktop_pairs_snapshot(desktop, snapshots, captured_at, expires_at)
     else {
         return;
@@ -12253,14 +12250,18 @@ fn claude_oauth_usage_slot_seconds(
 }
 
 /// How old a stored reading may be and still be labelled fresh: the
-/// unused-account gate. The shorter in-use slot never labels a reading stale
-/// sooner.
+/// unused-account gate plus one collection interval. A read becomes due at
+/// the gate, but the next scheduled collection can be up to five minutes
+/// later. Keep that bounded scheduling gap from making healthy idle accounts
+/// flash stale. This does not defer a provider read or move its observation.
+/// The shorter in-use slot never labels a reading stale sooner.
 fn claude_oauth_usage_serve_gate_seconds(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     _now: u64,
 ) -> u64 {
     claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash)
+        .saturating_add(CLAUDE_OAUTH_USAGE_REFRESH_SECONDS)
 }
 
 /// Whether Claude Code's local statusLine wrote a reading for exactly this
@@ -29244,6 +29245,90 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn claude_desktop_pairs_upload_appends_beside_an_unchanged_metered_login() {
+        let pair = |n: u32| {
+            claude_desktop_pair_observation(
+                &(
+                    format!("00000000-0000-4000-8000-{n:012}"),
+                    format!("00000000-0000-4000-9000-{n:012}"),
+                ),
+                &ClaudeDesktopPairBuilder::default(),
+                1_786_000_000 - i64::from(n),
+                format!("session-{n}"),
+            )
+            .expect("pair")
+        };
+        let desktop = ClaudeDesktopPairs {
+            pairs: vec![pair(0), pair(1)],
+            duplicate_sessions: Vec::new(),
+        };
+        let covered = desktop.pairs[0].binding.clone();
+        let at = "2026-08-12T08:00:00Z";
+        let until = "2026-08-12T08:15:00Z";
+
+        // An ordinary metered login for pair 0, with its current plan reading.
+        let mut metered = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            at.to_string(),
+            until.to_string(),
+        );
+        let mut account = unsupported_account("anthropic");
+        account.account_identifier_hash = Some(covered.account_identifier_hash.clone());
+        account.organization_identifier_hash = Some(covered.organization_identifier_hash.clone());
+        metered.account = Some(account);
+        metered.quota_windows = claude_oauth_quota_windows(&serde_json::json!({
+            "five_hour": {"utilization": 24.0, "resets_at": "2026-08-12T10:00:00+00:00"},
+            "seven_day": {"utilization": 72.0, "resets_at": "2026-08-15T05:00:00+00:00"}
+        }));
+        let mut current = desktop.pairs[0].observation.clone();
+        current.evidence_method =
+            Some(collection_method_key(&AgentStatusCollectionMethod::CliJson).to_string());
+        current.source_session_id = Some("login-session".to_string());
+        current.is_current = Some(true);
+        metered.plan_observations = vec![current];
+        let mut uploads = vec![metered.clone()];
+
+        append_claude_desktop_pairs_snapshot(&mut uploads, &desktop, at, until);
+
+        // The pass's upload path appends the pair status; the login is untouched.
+        assert_eq!(uploads.len(), 2, "the Desktop pair status uploads");
+        assert_eq!(uploads[0], metered);
+        let pairs = &uploads[1];
+        assert_eq!(pairs.source, SourceKind::ClaudeCode);
+        assert!(pairs.account.is_none());
+        assert_eq!(pairs.quota_windows, vec![unsupported_quota_window("usage")]);
+        assert!(pairs.credit_balances.is_empty());
+        // Only the uncovered pair, never current: the covered pair is not
+        // uploaded twice and no Desktop reading competes with the meters.
+        assert_eq!(
+            pairs.plan_observations,
+            vec![desktop.pairs[1].observation.clone()]
+        );
+        assert!(pairs
+            .plan_observations
+            .iter()
+            .all(|observation| observation.is_current == Some(false)));
+        let carries_covered = |snapshot: &AgentStatusSnapshot| {
+            snapshot.plan_observations.iter().any(|observation| {
+                observation.account_identifier_hash.as_deref()
+                    == Some(covered.account_identifier_hash.as_str())
+                    && observation.organization_identifier_hash.as_deref()
+                        == Some(covered.organization_identifier_hash.as_str())
+            })
+        };
+        assert!(!carries_covered(pairs));
+        assert_eq!(
+            uploads
+                .iter()
+                .filter(|snapshot| carries_covered(snapshot))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn claude_desktop_duplicate_session_owner_fails_closed_on_tie() {
         let builders = vec![
             ClaudeDesktopProfileBuilder {
@@ -29572,7 +29657,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_oauth_usage_cache_marks_old_windows_stale() {
+    fn claude_oauth_usage_cache_covers_collection_gap_then_marks_old_windows_stale() {
         let cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: "account-a".to_string(),
@@ -29603,10 +29688,51 @@ for line in sys.stdin:
             account_weekly_not_offered: false,
         };
 
-        // Past the account's own jittered gate, not the bare base constant.
+        let read_gate = claude_oauth_usage_fresh_age_seconds("account-a", "organization-a");
+        // Idle accounts remain readable while the next scheduled collection
+        // catches up. Cache and retained-slot presentation use the same bound.
+        for age in [
+            read_gate + 1,
+            read_gate + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+        ] {
+            let now = 100 + age;
+            let usage = claude_oauth_usage_from_cache(cache.clone(), now);
+            assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
+            assert_eq!(usage.windows[0].used_percent, Some(72));
+            assert_eq!(
+                usage.windows[0].observed_at.as_deref(),
+                Some("1970-01-01T00:01:40Z")
+            );
+            assert_eq!(
+                usage.credit_balances[0].freshness,
+                AgentQuotaWindowFreshness::Fresh
+            );
+            let snapshot = local_claude_quota_snapshot(
+                "1970-01-01T00:01:40Z",
+                &usage.windows,
+                &usage.credit_balances,
+                true,
+                true,
+            );
+            assert!(local_claude_quota_snapshot_is_fresh_for_account(
+                &snapshot,
+                "account-a",
+                "organization-a",
+                OffsetDateTime::from_unix_timestamp(now as i64).unwrap(),
+            ));
+            // Display tolerance never defers the collection that is due.
+            assert!(claude_credit_pools::claude_reading_due(
+                Some(100),
+                400,
+                read_gate,
+                now,
+            ));
+        }
+
+        // Past the account's display deadline, including the collection gap.
         let usage = claude_oauth_usage_from_cache(
             cache,
-            100 + claude_oauth_usage_fresh_age_seconds("account-a", "organization-a") + 1,
+            100 + claude_oauth_usage_serve_gate_seconds("account-a", "organization-a", 100) + 1,
         );
 
         assert_eq!(usage.windows.len(), 1);

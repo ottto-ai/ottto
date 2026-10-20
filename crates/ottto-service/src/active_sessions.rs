@@ -570,11 +570,25 @@ fn account_attribution(
         EvidenceResolution::Resolved(account_hash) => Some(account_hash),
         EvidenceResolution::Conflict => return None,
     };
+    // One own login beside untagged usage names nothing by itself, but any
+    // other account contradicts the session's own requests.
+    let own_login = match snapshot_account_hash {
+        Some(_) => None,
+        None => match own_request_logins(snapshot) {
+            OwnRequestLogins::One(login) => Some(login),
+            OwnRequestLogins::Absent | OwnRequestLogins::Several => None,
+        },
+    };
+    let contradicts_own_login =
+        |account_hash: Option<&str>| own_login.is_some_and(|login| account_hash != Some(login));
 
     if exact_observation
         .and_then(|observation| observation.account_identifier_hash.as_deref())
         .zip(snapshot_account_hash.as_deref())
         .is_some_and(|(observation, snapshot)| observation != snapshot)
+        || exact_observation.is_some_and(|observation| {
+            contradicts_own_login(observation.account_identifier_hash.as_deref())
+        })
     {
         return None;
     }
@@ -597,7 +611,10 @@ fn account_attribution(
         return None;
     }
     match lineage_account_attribution(snapshot, status) {
-        EvidenceResolution::Resolved(lineage) => return Some(lineage),
+        EvidenceResolution::Resolved(lineage) => {
+            return (!contradicts_own_login(lineage.account_identifier_hash.as_deref()))
+                .then_some(lineage)
+        }
         EvidenceResolution::Conflict => return None,
         EvidenceResolution::Missing => {}
     }
@@ -613,6 +630,7 @@ fn account_attribution(
             .as_deref()
             .is_some_and(non_empty)
         || !snapshot_matches_current_account(snapshot, status)
+        || contradicts_own_login(account.account_identifier_hash.as_deref())
     {
         return None;
     }
@@ -695,7 +713,12 @@ fn exact_snapshot_account_hash(snapshot: &SnapshotItem) -> EvidenceResolution<St
         })
         .collect::<BTreeSet<_>>();
     if hashes.is_empty() {
-        return EvidenceResolution::Missing;
+        // Rows split by request carry no row hash, but their parts still name
+        // the session's own logins: two of them conflict like two row hashes.
+        return match own_request_logins(snapshot) {
+            OwnRequestLogins::Several => EvidenceResolution::Conflict,
+            OwnRequestLogins::Absent | OwnRequestLogins::One(_) => EvidenceResolution::Missing,
+        };
     }
     if hashes.len() > 1
         || rows.iter().any(|row| {
@@ -709,10 +732,60 @@ fn exact_snapshot_account_hash(snapshot: &SnapshotItem) -> EvidenceResolution<St
     EvidenceResolution::Resolved(hashes.into_iter().next().expect("one hash").to_string())
 }
 
+enum OwnRequestLogins<'s> {
+    Absent,
+    One(&'s str),
+    Several,
+}
+
+/// The logins contract 5 tagged on the session's own requests from their own
+/// telemetry, read until a second one appears. Auxiliary and foreign requests
+/// are never tagged; org-only, census and untagged usage name no own login.
+fn own_request_logins(snapshot: &SnapshotItem) -> OwnRequestLogins<'_> {
+    use crate::snapshots::claude_request_identity::{COLLECTOR, TELEMETRY, TELEMETRY_LOGIN};
+    if snapshot.provenance.collector != COLLECTOR {
+        return OwnRequestLogins::Absent;
+    }
+    let mut logins = snapshot
+        .model_usage
+        .iter()
+        .chain(
+            snapshot
+                .usage_buckets
+                .iter()
+                .flat_map(|bucket| bucket.model_usage.iter()),
+        )
+        .flat_map(|row| {
+            std::iter::once((row.account_identifier_hash.as_deref(), row.evidence_ref)).chain(
+                row.identity_parts
+                    .iter()
+                    .flatten()
+                    .map(|part| (part.account_identifier_hash.as_deref(), part.evidence_ref)),
+            )
+        })
+        .filter_map(|(hash, evidence_ref)| {
+            let entry = snapshot.request_evidence.get(usize::from(evidence_ref?))?;
+            matches!(entry.identity_basis.as_str(), TELEMETRY | TELEMETRY_LOGIN)
+                .then_some(hash?)
+                .filter(|hash| non_empty(hash))
+        });
+    let Some(first) = logins.next() else {
+        return OwnRequestLogins::Absent;
+    };
+    if logins.any(|login| login != first) {
+        OwnRequestLogins::Several
+    } else {
+        OwnRequestLogins::One(first)
+    }
+}
+
 fn lineage_account_attribution(
     snapshot: &SnapshotItem,
     status: &AgentStatusSnapshot,
 ) -> EvidenceResolution<AccountAttribution> {
+    // A launched session is a separate run that may sign in to a different
+    // account, so its starter's account is never borrowed. Other lineage facts
+    // on the same session still count.
     let session_refs = snapshot
         .attribution_facts
         .iter()
@@ -721,6 +794,7 @@ fn lineage_account_attribution(
                 fact.field.as_str(),
                 "parent_session_ref" | "root_session_ref"
             ) && fact.evidence.strength == "direct"
+                && !fact.evidence.states_independent_launch()
                 && non_empty(&fact.value)
         })
         .map(|fact| fact.value.as_str())
@@ -2158,6 +2232,76 @@ mod tests {
     }
 
     #[test]
+    fn launched_session_never_borrows_its_starters_account() {
+        let attribution = |facts: &[(&str, &str)], own_hash: Option<&str>| {
+            let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
+            for (field, source_version) in facts {
+                let mut fact = direct_fact(field, "parent");
+                fact.evidence.source_version = source_version.to_string();
+                snapshot.attribution_facts.push(fact);
+            }
+            let mut status = test_status();
+            status.plan_observations.push(test_plan_observation(
+                "parent",
+                "parent_hash",
+                AgentStatusConfidence::High,
+            ));
+            if let Some(own_hash) = own_hash {
+                status.plan_observations.push(test_plan_observation(
+                    "child",
+                    own_hash,
+                    AgentStatusConfidence::High,
+                ));
+            }
+            let active =
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+            (
+                active.account_identifier_hash,
+                active.account_attribution_source,
+            )
+        };
+        let borrowed = (
+            Some("parent_hash".to_string()),
+            Some("lineage_plan_observation".to_string()),
+        );
+
+        // Launched by a launcher or by the desktop app, on either lineage field:
+        // the starter's account stays the starter's.
+        let launched: [&[(&str, &str)]; 3] = [
+            &[("parent_session_ref", "launcher_event:v1")],
+            &[("parent_session_ref", "claude_desktop_spawn:v1")],
+            &[("root_session_ref", "claude_desktop_spawn:v1")],
+        ];
+        for facts in launched {
+            assert_eq!(attribution(facts, None), (None, None), "{facts:?}");
+            assert_eq!(
+                attribution(facts, Some("child_hash")),
+                (
+                    Some("child_hash".to_string()),
+                    Some("session_plan_observation".to_string())
+                ),
+                "{facts:?}"
+            );
+        }
+        // Nested work, unknown or look-alike parsers, and a non-launched fact
+        // beside a launched one keep the lineage fallback.
+        let not_launched: [&[(&str, &str)]; 6] = [
+            &[("parent_session_ref", "claude_code_jsonl:v40")],
+            &[("parent_session_ref", "test:v1")],
+            &[("root_session_ref", "")],
+            &[("parent_session_ref", "launcher_events:v1")],
+            &[("parent_session_ref", "claude_desktop_spawner:v1")],
+            &[
+                ("parent_session_ref", "launcher_event:v1"),
+                ("root_session_ref", "claude_code_jsonl:v40"),
+            ],
+        ];
+        for facts in not_launched {
+            assert_eq!(attribution(facts, None), borrowed, "{facts:?}");
+        }
+    }
+
+    #[test]
     fn refuses_conflict_between_exact_observation_and_snapshot_identity() {
         let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
         snapshot.model_usage[0].account_identifier_hash = Some("snapshot_hash".to_string());
@@ -2229,6 +2373,204 @@ mod tests {
 
         assert_eq!(active.account_identifier_hash, None);
         assert_eq!(active.account_attribution_source, None);
+    }
+
+    #[test]
+    fn own_request_parts_gate_account_fallbacks() {
+        use crate::claude_local_otel::{
+            ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence,
+            ClaudeTraceOwnershipLoadReport,
+        };
+        use crate::snapshots::claude_request_identity as identity;
+        use sha2::{Digest, Sha256};
+
+        // A subagent's two requests in one hour on one model, read by the
+        // parser and tagged by contract 5 from each request's own telemetry.
+        let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let agent = "a4d1585d310070d0f";
+        let dir = temp_dir("own-request-parts");
+        let transcript = dir
+            .join(parent)
+            .join("subagents")
+            .join(format!("agent-{agent}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let line = |n: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-08-02T07:00:0{n}Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"req_{n}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
+            )
+        };
+        std::fs::write(&transcript, line(1) + &line(2)).unwrap();
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        // `None` leaves that request without telemetry, so it stays untagged.
+        let tagged = |logins: [Option<&str>; 2]| {
+            let mut api = ClaudeLocalOtelLoadReport::default();
+            let mut trace = ClaudeTraceOwnershipLoadReport::default();
+            for (n, login) in (1_u64..).zip(logins) {
+                let Some(login) = login else { continue };
+                let mut row = ClaudeLocalOtelEvidence {
+                    capture_revision: "claude_api_request:v2".to_string(),
+                    session_id: parent.to_string(),
+                    request_id: format!("req_{n}"),
+                    client_request_id: format!("client-req_{n}"),
+                    observed_at: format!("2026-08-02T07:00:0{n}Z"),
+                    model: "claude-haiku-4-5".to_string(),
+                    effort: "high".to_string(),
+                    query_source: "user".to_string(),
+                    speed: "fast".to_string(),
+                    cost_usd_micros: Some(100),
+                    event_sequence: Some(n),
+                    app_version: "2.1.226".to_string(),
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    request_count: 1,
+                    account_identity_checked: true,
+                    account_identifier_hash: Some(login.to_string()),
+                    ..Default::default()
+                };
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&row).unwrap())
+                );
+                let mut owner = ClaudeTraceOwnershipEvidence {
+                    capture_revision: "claude_llm_request_ownership:v1".to_string(),
+                    session_id: parent.to_string(),
+                    request_id: format!("req_{n}"),
+                    client_request_id: format!("client-req_{n}"),
+                    agent_id: agent.to_string(),
+                    observed_at: "2026-08-02T07:00:30Z".to_string(),
+                    ..Default::default()
+                };
+                owner.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&owner).unwrap())
+                );
+                api.evidence
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(row);
+                trace
+                    .evidence
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(owner);
+            }
+            let mut items = crate::snapshots::parse_claude_code_jsonl_file(
+                &transcript,
+                "2026-08-02T07:01:00Z",
+                "child-fp".to_string(),
+            )
+            .unwrap();
+            let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+            assert_eq!(
+                identity::apply_scan(&mut items, &evidence, BTreeMap::new()).sent,
+                1
+            );
+            let item = items.remove(0);
+            assert_eq!(item.source_session_id, format!("{parent}_agent-{agent}"));
+            // Every row splits into parts: no row carries a hash.
+            assert!(item
+                .model_usage
+                .iter()
+                .chain(
+                    item.usage_buckets
+                        .iter()
+                        .flat_map(|bucket| &bucket.model_usage)
+                )
+                .all(|row| row.account_identifier_hash.is_none()
+                    && row
+                        .identity_parts
+                        .as_ref()
+                        .is_some_and(|parts| parts.len() == 2)));
+            item
+        };
+        let lineage = |account_hash: &str| {
+            let mut status = test_status();
+            status.plan_observations.push(test_plan_observation(
+                parent,
+                account_hash,
+                AgentStatusConfidence::High,
+            ));
+            status
+        };
+        let attribution = |item: &SnapshotItem, status: &AgentStatusSnapshot| {
+            let active =
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, item, Some(status));
+            (
+                active.account_identifier_hash,
+                active.account_attribution_source,
+            )
+        };
+
+        // Two own logins: neither the parent's account nor an observation of
+        // either login stands in for them.
+        let mixed = tagged([Some(a.as_str()), Some(b.as_str())]);
+        assert_eq!(attribution(&mixed, &lineage(c.as_str())), (None, None));
+        assert_eq!(attribution(&mixed, &lineage(a.as_str())), (None, None));
+        // A stored mixed-account reason still explains the withheld account.
+        let mut mixed = mixed;
+        mixed.claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
+        for status in [lineage(c.as_str()), lineage(a.as_str())] {
+            let active =
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, &mixed, Some(&status));
+            assert_eq!(active.account_identifier_hash, None);
+            assert_eq!(active.account_attribution_source, None);
+            assert_eq!(
+                active.account_withheld_reason.as_deref(),
+                Some("multiple_accounts")
+            );
+        }
+
+        // One own login beside an untagged request: lineage, an exact
+        // observation or the current login naming another account is refused;
+        // the same account keeps its source.
+        let one = tagged([Some(a.as_str()), None]);
+        assert_eq!(attribution(&one, &lineage(b.as_str())), (None, None));
+        assert_eq!(
+            attribution(&one, &lineage(a.as_str())),
+            (
+                Some(a.clone()),
+                Some("lineage_plan_observation".to_string())
+            )
+        );
+        let session = one.source_session_id.clone();
+        let exact = |account_hash: &str| {
+            let mut status = test_status();
+            status.plan_observations.push(test_plan_observation(
+                &session,
+                account_hash,
+                AgentStatusConfidence::High,
+            ));
+            status
+        };
+        assert_eq!(attribution(&one, &exact(b.as_str())), (None, None));
+        assert_eq!(
+            attribution(&one, &exact(a.as_str())),
+            (
+                Some(a.clone()),
+                Some("session_plan_observation".to_string())
+            )
+        );
+        let mut one = one;
+        one.model_usage[0].model_provider = Some("anthropic".to_string());
+        one.model_usage[0].subscription_product = Some("claude_max".to_string());
+        let login = |account_hash: &str| {
+            let mut status = test_status();
+            let mut account = test_current_account(account_hash);
+            account.provider = Some("anthropic".to_string());
+            account.plan_type = None;
+            account.subscription_product = Some("claude_max".to_string());
+            status.account = Some(account);
+            status
+        };
+        assert_eq!(attribution(&one, &login(b.as_str())), (None, None));
+        assert_eq!(
+            attribution(&one, &login(a.as_str())),
+            (
+                Some(a.clone()),
+                Some("current_login_at_reconciliation".to_string())
+            )
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
