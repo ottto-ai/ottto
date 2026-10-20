@@ -27583,14 +27583,14 @@ thread_local! {
 /// A scaled unpaged limit for tests only; production values never change.
 #[cfg(test)]
 fn with_test_unpaged_limit<T>(limit: u64, run: impl FnOnce() -> T) -> T {
-    struct Reset;
+    // Restores the enclosing limit, so an unscaled oracle can nest.
+    struct Reset(Option<u64>);
     impl Drop for Reset {
         fn drop(&mut self) {
-            TEST_UNPAGED_LIMIT.with(|slot| slot.set(None));
+            TEST_UNPAGED_LIMIT.with(|slot| slot.set(self.0));
         }
     }
-    TEST_UNPAGED_LIMIT.with(|slot| slot.set(Some(limit)));
-    let _reset = Reset;
+    let _reset = Reset(TEST_UNPAGED_LIMIT.with(|slot| slot.replace(Some(limit))));
     run()
 }
 

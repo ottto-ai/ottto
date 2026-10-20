@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 734,
-  "content_sha256": "c7c94d7cbcb4b92a3b4351a8e979b0a1fd417f846c478fe9f9ff32a391e5e19f",
+  "content_sha256": "78883cb98d956fd48a0d7fa51bffdbfa169f7f438ca701e871a8a5ef693efb5a",
   "files": [
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "0b0e6be5eb503b5e55f57115f2364cf2a1aec89c673f15d2ffd1b7846e46ddb0",
-      "size_bytes": 2957102
+      "sha256": "d576f2b2ae0f9db92f735a7edffc33bcdaad33709a46205b46b13f627cabc054",
+      "size_bytes": 2957186
     },
     {
       "executable": false,
@@ -1476,8 +1476,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_paged_admission_tests.rs",
-      "sha256": "9b2f39b738877724700e8434d4a2f2de57bac11a06520004779aad0ab4070419",
-      "size_bytes": 69976
+      "sha256": "fda4d4223950be2b2fbb2a8175ae544be482c7134a3a7b34d61802a6eed34914",
+      "size_bytes": 70583
     },
     {
       "executable": false,
@@ -4619,8 +4619,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/v5-golden-keys.json",
-      "sha256": "5197b48de41737a03f043c17b85d38a1012a2adaeb1e48a37abd66cc36d1df4b",
-      "size_bytes": 820
+      "sha256": "9868548f0329a659545f7b0a12d30ba6560b08ee1e6db9fdcbee8515f28a9fdf",
+      "size_bytes": 1055
     },
     {
       "executable": false,

@@ -251,9 +251,12 @@ fn page_until_certified(
     panic!("no certification within 64 pages: {:?}", counters(cache));
 }
 
-/// Main's unpaged read of the same files at the same collection time.
+/// Main's unpaged read of the same files at the same collection time, with
+/// no scaled unpaged limit.
 fn oracle(fixture: &Root, collected_at: &str) -> Vec<String> {
-    let (_, scan, _) = page(fixture, ScanIndex::default(), None, collected_at);
+    let (_, scan, _) = with_test_unpaged_limit(MAX_CODEX_JSONL_FILE_BYTES, || {
+        page(fixture, ScanIndex::default(), None, collected_at)
+    });
     assert!(!scan.snapshots.is_empty());
     fingerprints(&scan)
 }
@@ -1163,7 +1166,8 @@ fn cursor_job_growing_past_the_unpaged_limit_certifies() {
         with_test_limits(1024, 2048, 64, || {
             let (index, _, _) = page(&fixture, ScanIndex::default(), Some(&cache), NOW);
             assert_eq!(counters(&cache).jobs_started, 1, "a cursor job");
-            for n in 41..=48 {
+            // Past the unpaged limit, yet a tail within the singleton budget.
+            for n in 41..=42 {
                 fixture.append(SESSION, &token_line(n));
             }
             assert!(fixture.len(SESSION) > start + 100);
@@ -1568,6 +1572,29 @@ fn child_usage(scan: &SourceScanResult) -> bool {
         .any(|snapshot| snapshot.source_session_id == CHILD)
 }
 
+/// Generations until the child is held under an `Oversize` parent witness.
+/// The child's first read records the parent ref; the witness lands with
+/// the parent prepass, so it shows from a later generation on.
+fn held_by_oversize(
+    home: &ForkHome,
+    mut index: ScanIndex,
+    cache: Option<&Arc<SharedCache>>,
+) -> ScanIndex {
+    for n in 0..6 {
+        let (next, scan) = home.generation(index, cache, n);
+        index = next;
+        assert!(!child_usage(&scan), "the child stays held");
+        if parent_causes(&scan)[CodexParentUnresolvable::Oversize.index()] > 0 {
+            assert_eq!(
+                parent_causes(&scan)[CodexParentUnresolvable::Oversize.index()],
+                1
+            );
+            return index;
+        }
+    }
+    panic!("no Oversize witness within 6 generations");
+}
+
 // F-T10: on a paged scan an over-limit parent is no `Oversize` witness: it
 // is cursor-read, its ledger validates and the child resolves.
 #[test]
@@ -1608,16 +1635,9 @@ fn unsampled_parent_over_the_limit_is_oversize_unless_its_ledger_is_valid() {
     let home = ForkHome::new();
     let parent_len = home.fixture.len(PARENT);
     assert!(home.fixture.len(CHILD) < parent_len - 1);
-    let (_, held) = with_test_unpaged_limit(parent_len - 1, || {
-        home.generation(ScanIndex::default(), None, 0)
+    with_test_unpaged_limit(parent_len - 1, || {
+        held_by_oversize(&home, ScanIndex::default(), None)
     });
-    let causes = parent_causes(&held);
-    assert_eq!(
-        causes[CodexParentUnresolvable::Oversize.index()],
-        1,
-        "{causes:?}"
-    );
-    assert!(!child_usage(&held));
     // Settle the ledger with no limit, then change the child.
     let mut index = ScanIndex::default();
     let mut settled = false;
@@ -1679,16 +1699,10 @@ fn shrunk_parent_drops_its_oversize_witness() {
     let cache = Arc::new(SharedCache::default());
     with_test_unpaged_limit(short, || {
         with_test_forced_routing(None, Some(ReadAdmission::Unpaged), || {
-            let (index, held) = home.generation(ScanIndex::default(), Some(&cache), 0);
-            let causes = parent_causes(&held);
-            assert_eq!(
-                causes[CodexParentUnresolvable::Oversize.index()],
-                1,
-                "{causes:?}"
-            );
+            let index = held_by_oversize(&home, ScanIndex::default(), Some(&cache));
             fs::write(home.fixture.file(PARENT), jsonl(&ForkHome::parent())).unwrap();
             let mut index = index;
-            for n in 1..4 {
+            for n in 10..16 {
                 let (next, scan) = home.generation(index, Some(&cache), n);
                 index = next;
                 if child_usage(&scan) {
