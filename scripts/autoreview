@@ -267,7 +267,35 @@ def infer_profile(paths: list[str]) -> str:
     return 'standard'
 
 
-def validate(report: dict[str, Any], paths: list[str]) -> None:
+def root_aliases(root: Path) -> list[str]:
+    # The review root as passed to the engine, its real path, and the macOS
+    # /private-less spelling; each must resolve to the same directory.
+    real = os.path.realpath(root)
+    candidates = {str(root), real}
+    candidates |= {c.removeprefix('/private') for c in candidates if c.startswith('/private/')}
+    return sorted(c for c in candidates if c != '/' and os.path.realpath(c) == real)
+
+
+def finding_path(value: Any, paths: list[str], root: Path) -> str | None:
+    # Engines run in the frozen review root and may cite it absolutely. Map only
+    # a normalized path below that root naming a selected file without symlinks.
+    if not isinstance(value, str) or not value.startswith('/'):
+        return value if value in paths else None
+    path = PurePosixPath(value)
+    if '\0' in value or value.startswith('//') or str(path) != value or '..' in path.parts:
+        return None
+    matches = [value[len(alias) + 1:] for alias in root_aliases(root) if value.startswith(alias + '/')]
+    if len(matches) != 1 or matches[0] not in paths or not source_path(matches[0]):
+        return None
+    current = os.path.realpath(root)
+    for part in PurePosixPath(matches[0]).parts:
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            return None
+    return matches[0]
+
+
+def validate(report: dict[str, Any], paths: list[str], root: Path) -> None:
     # Validate the same upstream schema without downgrading invalid verdicts.
     if not isinstance(report, dict) or set(report) != set(SCHEMA['required']):
         raise ReviewError('invalid report fields')
@@ -294,7 +322,7 @@ def validate(report: dict[str, Any], paths: list[str]) -> None:
         location = finding['code_location']
         if not isinstance(location, dict) or set(location) != {'file_path', 'line'}:
             raise ReviewError('invalid location')
-        if location['file_path'] not in paths or type(location['line']) is not int or location['line'] < 1:
+        if finding_path(location['file_path'], paths, root) is None or type(location['line']) is not int or location['line'] < 1:
             raise ReviewError('finding outside selected change or invalid line')
     if report['overall_correctness'] == 'patch is incorrect' and not report['findings']:
         raise ReviewError('inconclusive: incorrect verdict without a discrete finding')
@@ -500,7 +528,7 @@ def main() -> int:
         finish(repo, record, outcome, duration_seconds=time.monotonic() - start)
         raise ReviewError(str(error)) from None
     try:
-        validate(report, change['paths'])
+        validate(report, change['paths'], args.repo)
     except ReviewError:
         finish(repo, record, 'invalid', resolved_model=resolved, duration_seconds=time.monotonic() - start)
         raise
