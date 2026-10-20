@@ -1,0 +1,17 @@
+{
+  "audit_key_source": "first_32_bytes_of_pi_session_fixture",
+  "machine_key": "36d6c7f5a8abe0d958ffba3676633996d07861f8092f4318669bc363fbcfaacf",
+  "session_key": "55babf9f84f0bab4ed50ceb0629178c9156903e4c2823ddc0b3fd2c9f068755a",
+  "semantic_key": "pending-ci-inputs",
+  "revision_key_with_fixture_input_fingerprint": "pending-ci-inputs",
+  "policy_neutral_component_keys": {
+    "latency": "fe628886c1cd7e20f56f7702d5c8a737dffd63e8ca6114b6f68cccf26bb41a95",
+    "lifecycle_activity": "pending-ci-inputs",
+    "usage_accounting": "pending-ci-inputs"
+  },
+  "policy_sensitive_component_keys": {
+    "artifacts": "26a2f062e6d8e85acf9cd01705dc7fa4642395ab5417f4d9ce45368eccd2dd61",
+    "attribution": "98a418ff9fab3c3479fcdc3e84bcd8419ac79326de16ff7ac60285e958db0147",
+    "display_identity": "pending-ci-inputs"
+  }
+}

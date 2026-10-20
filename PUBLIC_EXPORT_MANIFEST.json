@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 731,
-  "content_sha256": "523e1187f702afb96f2a762d05d37ea1d5f947d142f4094b05cf2bdc1f1f8157",
+  "candidate_file_count": 734,
+  "content_sha256": "ac429d9d467458b1142eb2fba04d0641c90c0c2d24951c0a59c57355e10aada2",
   "files": [
     {
       "executable": false,
@@ -1196,8 +1196,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_audit.rs",
-      "sha256": "5264a795bf3001074808bb92ee249823d5ddaafaf27ddcd81e12eeecdaa5450e",
-      "size_bytes": 58430
+      "sha256": "1e7f2c36c41c55420180d96869075e19b9f2668bdfa9473813861709805d726f",
+      "size_bytes": 63406
     },
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "7d5f21d8dfb674ceff073e7d1e28b3bd72226a37e69b75e0295ec8264c7635b0",
-      "size_bytes": 2936210
+      "sha256": "b40508b7752d8da783843b78d23c4e88d69d3778fb97f6c0156f38c07ef26cb2",
+      "size_bytes": 2957050
     },
     {
       "executable": false,
@@ -1455,22 +1455,29 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join.rs",
-      "sha256": "4bae4d8a486cae5b5959605aab50fb3f60c309a4f58e1b7de11a92cc83c6291e",
-      "size_bytes": 159732
+      "sha256": "597d966906f37b285940c153d5aa28f9407284fb9e357f6ad71d2981b93efdd4",
+      "size_bytes": 160006
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join/group_job.rs",
-      "sha256": "49d15a04431a567b90b09c9ea5ab25d6eb200e6e6c555b47d032208a5d8dc944",
-      "size_bytes": 51916
+      "sha256": "7d7191ffbb201b2735d615d56c896f22fd03f4371b678bdeca696645e3da7991",
+      "size_bytes": 52935
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join/group_job_tests.rs",
-      "sha256": "78976048824ebdcd7604260b999f3a62e5b223e5288bc72792fb8495a46cf3e9",
-      "size_bytes": 93310
+      "sha256": "701a8e3da879aa81043ff5ad35489a2a6b7f09c3edbeb052d2eddcba9b9179fe",
+      "size_bytes": 93336
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/codex_paged_admission_tests.rs",
+      "sha256": "e4161ea0b98f2ab3f94c49b5080250e5ae08c25a7fccee98e284c45816856678",
+      "size_bytes": 51764
     },
     {
       "executable": false,
@@ -1497,8 +1504,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/disappearance_diagnostics.rs",
-      "sha256": "8d8fbf0b7735c541ee8191d754d95ebb96e1904374bc605e830ffcdb95b4d49b",
-      "size_bytes": 19127
+      "sha256": "d000e48d1d82b9e1036eae181f644e6a7dd4c9d5474a305b100658a6025d2e06",
+      "size_bytes": 19182
     },
     {
       "executable": false,
@@ -3323,6 +3330,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-20-codex-paged-admission.md",
+      "sha256": "27767d0bb33a1c17d2e0f9aa03903f39051e0d16d5309dd388c71d449ccf55b1",
+      "size_bytes": 4826
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-20-disappearance-reason-diagnostics.md",
       "sha256": "dd95e5cefff11b39414156e2ce0b5759c3fce7e3fe40b101d9b3645e04b3d98e",
       "size_bytes": 3299
@@ -4604,6 +4618,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/snapshot-audit/v5-golden-keys.json",
+      "sha256": "5197b48de41737a03f043c17b85d38a1012a2adaeb1e48a37abd66cc36d1df4b",
+      "size_bytes": 820
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/source-health/codex-needs-repair.json",
       "sha256": "7793a21d37711b56d986f20703b95512fdcde73b88d6cf1c18ff480fb322eadb",
       "size_bytes": 5678
@@ -5122,7 +5143,7 @@
   ],
   "generated_at": "2026-10-21T08:15:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 732,
+  "output_file_count": 735,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

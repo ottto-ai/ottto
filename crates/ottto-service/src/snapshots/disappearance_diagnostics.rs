@@ -125,8 +125,8 @@ mod tests {
     use super::super::{
         advance_bounded_directory_traversal, candidate_from_traversal_path,
         ensure_bounded_traversal, open_and_identify_scan_candidate, OwnedSourceScan,
-        OwnedSourceScanStep, ScanCensus, ScanIndex, ScanTraversalPath, SourceScanResult,
-        BACKFILL_WINDOW_DAYS,
+        OwnedSourceScanStep, ReadAdmission, ScanCensus, ScanIndex, ScanTraversalPath,
+        SourceScanResult, BACKFILL_WINDOW_DAYS,
     };
     use super::*;
     use std::{collections::BTreeMap, fs};
@@ -311,6 +311,7 @@ mod tests {
                 None,
                 BACKFILL_WINDOW_DAYS,
                 &BTreeMap::new(),
+                ReadAdmission::Unpaged,
             )
         });
         assert!(opened.is_none());
