@@ -15905,7 +15905,19 @@ impl OwnedSourceScan {
                                         };
                                         sampled_scan::codex_cursor::ParentDep {
                                             id: parent.to_owned(),
-                                            ledger: used.clone(),
+                                            // An invalidation dependency only, never
+                                            // proof of use: the ledger the parse used
+                                            // takes precedence; with none, the indexed
+                                            // identity (main's term), so its arrival,
+                                            // change or removal misses once.
+                                            ledger: used.clone().or_else(|| {
+                                                index
+                                                    .codex_parent_ownership_ledgers
+                                                    .get(resolve_codex_identity(parent).as_str())
+                                                    .map(|ledger| {
+                                                        ledger.opened_object_identity.clone()
+                                                    })
+                                            }),
                                             current,
                                         }
                                     });
