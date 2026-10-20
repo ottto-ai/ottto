@@ -2731,6 +2731,257 @@ pub(super) mod tests {
             .as_ref()
             .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
     }
+
+    // Model incomplete dependencies, not a malformed local file: the native
+    // scanner must earn discovery and local health while these gates stay red.
+    // These conservative test inputs do not alter parsing or ownership metadata.
+    fn retained_dependency_page(
+        root: &Path,
+        index: ScanIndex,
+        collected_at: &str,
+        hints: &[PathBuf],
+    ) -> (ScanIndex, SourceScanResult) {
+        let mut owned = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[root.join("sessions")],
+            index,
+            collected_at,
+            7,
+            10,
+            false,
+            None,
+            hints,
+            false,
+            false,
+        );
+        owned.state_census_complete = false;
+        owned.sidecar_census_complete = false;
+        for _ in 0..1000 {
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+            }
+        }
+        panic!("dependency-incomplete native scan did not finish its page");
+    }
+
+    // Use the existing common test settlement, not a server ACK assertion.
+    fn settle_dependency_page(
+        previous: &ScanIndex,
+        mut index: ScanIndex,
+        mut scan: SourceScanResult,
+    ) -> (ScanIndex, SourceScanResult) {
+        if let Some(validator) = scan.codex_joining_validator() {
+            validator.validate(&scan.snapshots).unwrap();
+        }
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        scan.finish_codex_capture_boundary(&mut index);
+        let accepted = scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        (
+            index.committable_subset(previous, &accepted, &BTreeMap::new()),
+            scan,
+        )
+    }
+
+    fn assert_retained_dependency_shape(index: &ScanIndex, scan: &SourceScanResult) {
+        let traversal = index.traversal.as_ref().expect("retained traversal");
+        assert!(traversal.pending_directories.is_empty());
+        assert!(traversal.pending_candidates.is_empty());
+        assert!(!traversal.counts.has_errors(), "local traversal is healthy");
+        assert!(!traversal.watcher_hint_seen);
+        assert!(!traversal.codex_parent_resolution_retry_required);
+        assert!(traversal.residue.codex_inventory_hold.is_none());
+        assert_eq!(retry_deadline(index), None, "no local-error retry clock");
+        let gates = &scan.local_codex_diagnostics.as_ref().unwrap().gates;
+        assert!(gates.discovery_done && gates.traversal_healthy && gates.frozen_generation);
+        assert!(!gates.state_complete && !gates.sidecar_complete);
+        assert!(!gates.reconciliation_complete && !gates.census_complete);
+        assert!(!scan.census_complete);
+    }
+
+    fn retained_dependency_fixture() -> (crate::test_scratch::ScratchDir, ScanIndex) {
+        let root = crate::test_scratch::ScratchDir::new("codex-retained-dependency");
+        fs::create_dir(root.join("sessions")).unwrap();
+        write_rows(
+            &root.join("sessions/a.jsonl"),
+            &member(KNOWN, "k-1", 100, 100),
+        );
+        let previous = ScanIndex::default();
+        let (index, scan) = retained_dependency_page(&root, previous.clone(), RETAINED_AT, &[]);
+        assert_eq!(scan.snapshots.len(), 1, "initial native body exists");
+        assert_eq!(scan.snapshots[0].source_session_id, KNOWN);
+        assert_eq!(scan.snapshots[0].input_tokens, 100);
+        let (index, scan) = settle_dependency_page(&previous, index, scan);
+        let fingerprint = scan.snapshots[0].snapshot_fingerprint.clone();
+        assert_retained_dependency_shape(&index, &scan);
+        assert_eq!(
+            index.files[&local_index_key(&root.join("sessions/a.jsonl"))]
+                .last_snapshot_fingerprint
+                .as_ref(),
+            Some(&fingerprint),
+            "common settlement preserves the initial exact body"
+        );
+        (root, index)
+    }
+
+    fn append_retained_known_growth(root: &Path) {
+        use std::io::Write;
+
+        let sessions = root.join("sessions");
+        let directory_before = metadata_witness(&fs::metadata(&sessions).unwrap());
+        let path = sessions.join("a.jsonl");
+        let size_before = fs::metadata(&path).unwrap().len();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for row in &member(KNOWN, "k-2", 150, 250)[1..] {
+            writeln!(file, "{}", serde_json::to_string(row).unwrap()).unwrap();
+        }
+        drop(file);
+        assert!(fs::metadata(&path).unwrap().len() > size_before);
+        assert_eq!(
+            metadata_witness(&fs::metadata(sessions).unwrap()),
+            directory_before,
+            "append changes no directory membership witness"
+        );
+    }
+
+    #[test]
+    fn retained_dependency_incomplete_common_settled_sibling_control() {
+        let (root, previous) = retained_dependency_fixture();
+        append_retained_known_growth(&root);
+        let known_key = local_index_key(&root.join("sessions/a.jsonl"));
+        let prior_known = serde_json::to_vec(&previous.files[&known_key]).unwrap();
+        write_rows(
+            &root.join("sessions/new.jsonl"),
+            &member(UNRELATED, "n-1", 70, 70),
+        );
+        let (index, scan) = retained_dependency_page(&root, previous.clone(), RETAINED_AT, &[]);
+        assert!(
+            scan.snapshots
+                .iter()
+                .any(|item| item.source_session_id == UNRELATED && item.input_tokens == 70),
+            "healthy new sibling is offered despite red dependencies"
+        );
+        let known_updated = scan
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == KNOWN && item.input_tokens == 250);
+        let (index, scan) = settle_dependency_page(&previous, index, scan);
+        assert_retained_dependency_shape(&index, &scan);
+        let sibling = scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == UNRELATED && item.input_tokens == 70)
+            .unwrap()
+            .snapshot_fingerprint
+            .clone();
+        assert_eq!(
+            index.files[&local_index_key(&root.join("sessions/new.jsonl"))]
+                .last_snapshot_fingerprint
+                .as_ref(),
+            Some(&sibling)
+        );
+        if !known_updated {
+            assert_eq!(
+                serde_json::to_vec(&index.files[&known_key]).unwrap(),
+                prior_known,
+                "unoffered prior known body remains unchanged"
+            );
+        }
+        println!("RETAINED_DEPENDENCY_CONTROL sibling_offered=70 common_settled=true server_ack_proved=false known_updated={known_updated}");
+    }
+
+    #[test]
+    fn retained_dependency_incomplete_actual_hint_growth_control() {
+        let (root, previous) = retained_dependency_fixture();
+        append_retained_known_growth(&root);
+        let path = root.join("sessions/a.jsonl");
+        let (index, scan) = retained_dependency_page(
+            &root,
+            previous.clone(),
+            RETAINED_AT,
+            std::slice::from_ref(&path),
+        );
+        assert!(
+            scan.snapshots
+                .iter()
+                .any(|item| item.source_session_id == KNOWN && item.input_tokens == 250),
+            "the actual path hint admits the normal grown native body"
+        );
+        let (index, scan) = settle_dependency_page(&previous, index, scan);
+        assert_retained_dependency_shape(&index, &scan);
+        let fingerprint = scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == KNOWN && item.input_tokens == 250)
+            .unwrap()
+            .snapshot_fingerprint
+            .clone();
+        assert_eq!(
+            index.files[&local_index_key(&path)]
+                .last_snapshot_fingerprint
+                .as_ref(),
+            Some(&fingerprint)
+        );
+        println!("RETAINED_DEPENDENCY_CONTROL actual_hint=true offered=250 common_settled=true server_ack_proved=false");
+    }
+
+    #[test]
+    fn retained_dependency_incomplete_no_hint_growth_liveness_baseline() {
+        let (root, mut index) = retained_dependency_fixture();
+        append_retained_known_growth(&root);
+        let key = local_index_key(&root.join("sessions/a.jsonl"));
+        let previous_body = serde_json::to_vec(&index.files[&key]).unwrap();
+        let initial_context = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone();
+        let initial_window = index.traversal.as_ref().unwrap().census_window_end.clone();
+        let mut saw_growth = false;
+        // Finite ordinary passes, not an invented production convergence bound.
+        for collected_at in [
+            "2026-10-07T00:00:01Z",
+            "2026-10-07T01:00:02Z",
+            "2026-10-07T02:00:03Z",
+        ] {
+            assert!(
+                rfc3339_unix_seconds(collected_at).unwrap()
+                    - rfc3339_unix_seconds(RETAINED_AT).unwrap()
+                    > UNHEALTHY_SCAN_RETRY_MAX_SECONDS
+            );
+            let previous = index.clone();
+            let (next, scan) = retained_dependency_page(&root, index, collected_at, &[]);
+            saw_growth |= scan
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == KNOWN && item.input_tokens == 250);
+            let scanned = scan.scanned_file_count;
+            let (next, scan) = settle_dependency_page(&previous, next, scan);
+            println!("RETAINED_DEPENDENCY_BASELINE collected_at={collected_at} scanned={scanned} grown_body_offered={saw_growth} census_complete={}", scan.census_complete);
+            if saw_growth {
+                // An unexpected real wake is success, not a reason to force red.
+                break;
+            }
+            assert_retained_dependency_shape(&next, &scan);
+            let retained = next.traversal.as_ref().unwrap();
+            assert_eq!(retained.context_fingerprint, initial_context);
+            assert_eq!(retained.census_window_end, initial_window);
+            assert_eq!(
+                serde_json::to_vec(&next.files[&key]).unwrap(),
+                previous_body
+            );
+            index = next;
+        }
+        assert!(
+            saw_growth,
+            "LIVENESS_BASELINE: prerequisites held, but no grown body was offered in three ordinary no-hint passes past the unhealthy retry horizon; per-pass scanned counts distinguish missing selection from another gate, and this is not an infinite-execution or server-ACK claim"
+        );
+    }
     #[test]
     fn retained_generation_admits_new_rollout_without_holding_known_update() {
         let (root, settled) = retained_red_generation(member(KNOWN, "k-1", 100, 100));
