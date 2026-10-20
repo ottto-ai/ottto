@@ -285,6 +285,10 @@ impl FileCodexAccountSlotSettingsStore {
             sign_in: None,
         };
         persisted.sign_in_baseline = None;
+        // A new setup, not a reconnect: a finished reconnect's flags must not
+        // carry over to a slot that has no binding yet.
+        persisted.setup_preserves_accepted_binding = false;
+        persisted.verifying_pinned_workspace = false;
         self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
     }
@@ -366,16 +370,21 @@ impl FileCodexAccountSlotSettingsStore {
                 "That Codex account and workspace already has a durable connection.".to_string(),
             ));
         }
+        if existing_slot.is_none()
+            && persisted.managed_slot_ids.len() >= MAX_MANAGED_CODEX_ACCOUNT_SLOTS
+        {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "Codex account-slot capacity has been reached".to_string(),
+            ));
+        }
+        // An open setup that ended before adoption may still hold its
+        // reservation; this setup replaces it, as `prepare_open_account` does.
+        self.discard_pending_open_slot(&mut persisted)?;
         let (slot_id, home) = if let Some((slot_id, _)) = existing_slot {
             let home = self.slot_home(&slot_id)?;
             write_codex_home_config(&home, None)?;
             (slot_id, home)
         } else {
-            if persisted.managed_slot_ids.len() >= MAX_MANAGED_CODEX_ACCOUNT_SLOTS {
-                return Err(CodexAccountSlotSettingsError::Invalid(
-                    "Codex account-slot capacity has been reached".to_string(),
-                ));
-            }
             let slot_id = generate_opaque_slot_id()?;
             ensure_managed_directory(&self.managed_accounts_root()?)?;
             let slot_root = self.slot_root_unchecked(&slot_id)?;
@@ -491,6 +500,9 @@ impl FileCodexAccountSlotSettingsStore {
             ));
         }
         let home = self.slot_home(slot_id)?;
+        // An open setup that ended before adoption may still hold its
+        // reservation; the reconnect replaces it, as `prepare_open_account` does.
+        self.discard_pending_open_slot(&mut persisted)?;
         persisted.setup_operation = CodexAccountSetupOperationV1 {
             state: CodexAccountSetupOperationStateV1::WaitingForUserLogin,
             operation_id: Some(operation_id),
@@ -2221,6 +2233,267 @@ mod tests {
             )
             .expect_err("second concurrent setup");
         assert!(format!("{error}").contains("already active"));
+    }
+
+    /// Connect one workspace, then run a reconnect of it to `complete`.
+    /// Returns the reconnected slot id.
+    fn complete_a_reconnect(store: &FileCodexAccountSlotSettingsStore) -> String {
+        let first = format!("codex_setup_{}", "1".repeat(32));
+        let reconnect = format!("codex_setup_{}", "2".repeat(32));
+        let (account, workspace) = ("d".repeat(64), "e".repeat(64));
+        let status = store
+            .prepare_managed_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                first.clone(),
+                account.clone(),
+                workspace.clone(),
+            )
+            .expect("prepare");
+        let slot_id = status.managed_slots[0].slot_id.clone();
+        for operation in [&first, &reconnect] {
+            if operation == &reconnect {
+                store
+                    .begin_reconnect(
+                        CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                        reconnect.clone(),
+                        &slot_id,
+                        account.clone(),
+                        workspace.clone(),
+                    )
+                    .expect("begin reconnect");
+            }
+            store
+                .finish_validation(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    operation,
+                    account.clone(),
+                    workspace.clone(),
+                    "raw-workspace-reconnected",
+                    false,
+                )
+                .expect("pin");
+            let done = store
+                .complete_pinned_verification(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    operation,
+                    &account,
+                    &workspace,
+                )
+                .expect("complete");
+            assert_eq!(
+                done.setup_operation.state,
+                CodexAccountSetupOperationStateV1::Complete
+            );
+        }
+        slot_id
+    }
+
+    fn slot_dirs(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root.join(CODEX_MANAGED_ACCOUNTS_DIR_NAME))
+            .map(|entries| {
+                entries
+                    .map(|entry| {
+                        entry
+                            .expect("entry")
+                            .file_name()
+                            .into_string()
+                            .expect("utf8")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn open_prepare_after_a_finished_reconnect_starts_a_new_setup() {
+        let (root, store) = test_store("open-after-reconnect");
+        let reconnected = complete_a_reconnect(&store);
+
+        let status = store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP.to_string(),
+            )
+            .expect("open prepare after a finished reconnect");
+
+        assert_eq!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+        );
+        assert_ne!(status.setup_operation.slot_id, Some(reconnected.clone()));
+        let persisted = store.read_persisted().expect("persisted");
+        assert!(!persisted.setup_preserves_accepted_binding);
+        assert!(!persisted.verifying_pinned_workspace);
+        let bindings = store.registered_bindings().expect("bindings");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].slot_id, reconnected);
+        assert!(bindings[0].accepted, "the reconnected slot stays connected");
+
+        // The open setup adopts a new workspace as a new, unaccepted binding.
+        store
+            .finish_validation(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP,
+                "f".repeat(64),
+                "0".repeat(64),
+                "raw-workspace-new",
+                false,
+            )
+            .expect("adopt");
+        let adopted = store.registered_bindings().expect("bindings");
+        assert_eq!(adopted.len(), 2);
+        assert!(adopted
+            .iter()
+            .any(|binding| binding.slot_id != reconnected && !binding.accepted));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_prepare_after_a_finished_reconnect_starts_a_new_setup() {
+        // `codex_account_prepare` and `codex_account_prepare_target` both
+        // start through `prepare_managed_account`.
+        let (root, store) = test_store("managed-after-reconnect");
+        let reconnected = complete_a_reconnect(&store);
+
+        store
+            .prepare_managed_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                format!("codex_setup_{}", "3".repeat(32)),
+                "4".repeat(64),
+                "5".repeat(64),
+            )
+            .expect("managed prepare after a finished reconnect");
+
+        let persisted = store.read_persisted().expect("persisted");
+        assert!(!persisted.setup_preserves_accepted_binding);
+        let bindings = store.registered_bindings().expect("bindings");
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings
+            .iter()
+            .any(|binding| binding.slot_id == reconnected && binding.accepted));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_left_by_a_finished_reconnect_load_and_allow_an_open_prepare() {
+        // The file shape a finished reconnect left behind before this fix:
+        // the reconnect flag still set on a completed operation.
+        let (root, store) = test_store("stale-reconnect-flag");
+        let slot_id = format!("codex_slot_{}", "9".repeat(32));
+        let body = serde_json::json!({
+            "schema_version": CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+            "managed_slot_ids": [slot_id],
+            "managed_bindings": {
+                slot_id.clone(): {
+                    "account_identifier_hash": "d".repeat(64),
+                    "workspace_identifier_hash": "e".repeat(64),
+                    "accepted": true
+                }
+            },
+            "deleting_managed_slot_ids": [],
+            "setup_operation": {
+                "state": "complete",
+                "operation_id": format!("codex_setup_{}", "2".repeat(32)),
+                "slot_id": slot_id,
+                "expected_account_identifier_hash": "d".repeat(64),
+                "expected_workspace_identifier_hash": "e".repeat(64),
+                "account_identifier_hash": "d".repeat(64),
+                "workspace_identifier_hash": "e".repeat(64),
+                "message": "Codex limits will remain available for this exact account and workspace.",
+                "sign_in": {
+                    "phase": "done",
+                    "outcome": "complete",
+                    "started_at": "2026-10-16T10:00:00Z",
+                    "deadline_at": "2026-10-16T10:15:00Z"
+                }
+            },
+            "setup_preserves_accepted_binding": true,
+            "verifying_pinned_workspace": false
+        });
+        fs::write(
+            &store.path,
+            serde_json::to_vec_pretty(&body).expect("serialize"),
+        )
+        .expect("write fixture");
+
+        let loaded = store.load().expect("stale reconnect flag still loads");
+        assert_eq!(
+            loaded.setup_operation.state,
+            CodexAccountSetupOperationStateV1::Complete
+        );
+        let status = store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP.to_string(),
+            )
+            .expect("open prepare on the stale file");
+        assert_ne!(status.setup_operation.slot_id, Some(slot_id.clone()));
+        let bindings = store.registered_bindings().expect("bindings");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].slot_id, slot_id);
+        assert!(bindings[0].accepted);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_open_setup_does_not_block_a_managed_prepare_or_reconnect() {
+        let (root, store) = test_store("failed-open-then-setup");
+        let reconnected = complete_a_reconnect(&store);
+        let managed_op = format!("codex_setup_{}", "6".repeat(32));
+        let reconnect_op = format!("codex_setup_{}", "7".repeat(32));
+
+        for next in ["managed", "reconnect"] {
+            let pending = store
+                .prepare_open_account(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    OPEN_OP.to_string(),
+                )
+                .expect("open prepare")
+                .setup_operation
+                .slot_id
+                .expect("reserved open slot");
+            store
+                .fail_validation(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    OPEN_OP,
+                    "identity read failed",
+                )
+                .expect("fail open setup");
+
+            let started = if next == "managed" {
+                store.prepare_managed_account(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    managed_op.clone(),
+                    "8".repeat(64),
+                    "9".repeat(64),
+                )
+            } else {
+                store.begin_reconnect(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    reconnect_op.clone(),
+                    &reconnected,
+                    "d".repeat(64),
+                    "e".repeat(64),
+                )
+            };
+            let started = started.unwrap_or_else(|error| panic!("{next}: {error}"));
+            assert_ne!(started.setup_operation.slot_id, Some(pending.clone()));
+            assert!(
+                !slot_dirs(&root).contains(&pending),
+                "{next}: reservation released"
+            );
+            let operation = started.setup_operation.operation_id.expect("operation");
+            store
+                .stop_waiting(CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION, &operation)
+                .expect("stop");
+        }
+        let bindings = store.registered_bindings().expect("bindings");
+        assert!(bindings
+            .iter()
+            .any(|binding| binding.slot_id == reconnected && binding.accepted));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_store(label: &str) -> (PathBuf, FileCodexAccountSlotSettingsStore) {

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 724,
-  "content_sha256": "30074b5e6abfd02648c8a65cda6fa7ee64eb9f99cd3fdf7dadc1df3df4cf6254",
+  "content_sha256": "67ae7bd28454c6bd671850aaf4970e94c6523f731c34f55eab7b4d9e5ffbc85d",
   "files": [
     {
       "executable": false,
@@ -545,8 +545,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/codex_account_slots.rs",
-      "sha256": "a9e06d7d68397fa7250240e7deec36622a63c2fdfe61d5d84925b46b32c38a3c",
-      "size_bytes": 120145
+      "sha256": "94c5860e4af61029f99f5a8510dcb2a2b257e77e9ad5a957226c9de1ffb13f43",
+      "size_bytes": 131265
     },
     {
       "executable": false,
@@ -937,8 +937,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "1faec7201424fc363880e71f548ec0841caed35f6c67acc5df3789e8e3ebc42f",
-      "size_bytes": 1360800
+      "sha256": "7e0e96e4d857168e99d7a3f5edd246c28887d16a51cb20b66ee97f6170e3f312",
+      "size_bytes": 1361457
     },
     {
       "executable": false,
@@ -5071,7 +5071,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T15:11:36+00:00",
+  "generated_at": "2026-10-20T21:49:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 725,
   "public_roots": [
@@ -5110,5 +5110,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "344b47cd06ede83f2aa8608c6133ab5b59690b45"
+  "source_commit": "3c611bd57e1728c1e8917301b88c6f21a07f0798"
 }
