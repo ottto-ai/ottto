@@ -1,8 +1,8 @@
 //! Local-only, content-free witnesses of actual traversal decisions.
 //! No paths, identities, arbitrary strings, persisted fields or extra scans.
 use super::{
-    rfc3339_unix_seconds, CensusGates, ScanIndex, ScanTraversalCheckpoint, ScanTraversalCounts,
-    SnapshotSource,
+    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
+    ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource,
 };
 use serde::Serialize;
 
@@ -41,12 +41,19 @@ pub(super) struct Starting {
     new_retry_attempt: u8,
     pub(super) stale_pending_families: usize,
     pub(super) rearmed_index_files: usize,
+    disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
 impl Starting {
     /// Called only AFTER the existing resume/backoff early return. Thus a
     /// retained matching traversal reached the real terminal-unhealthy retry.
-    pub(super) fn capture(index: &ScanIndex, now: &str, matches: bool, attempt: u8) -> Self {
+    pub(super) fn capture(
+        source: SnapshotSource,
+        index: &ScanIndex,
+        now: &str,
+        matches: bool,
+        attempt: u8,
+    ) -> Self {
         let previous = index.traversal.as_ref().map(|t| Previous {
             window_unix_seconds: rfc3339_unix_seconds(&t.census_window_end),
             pending_directories: t.pending_directories.len(),
@@ -59,6 +66,7 @@ impl Starting {
             counts: t.counts.clone(),
         });
         Self {
+            disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
             event: "starting",
             reason: match (previous.is_some(), matches) {
                 (false, _) => StartReason::NoRetainedTraversal,
@@ -107,6 +115,7 @@ pub(super) fn retiring(
         raw_census_complete: bool,
         gates: CensusGates,
         counts: &'a ScanTraversalCounts,
+        disappearance_process_totals_v1: disappearance_diagnostics::Totals,
     }
     let reason = if raw_complete {
         if gates.clean_followup {
@@ -129,6 +138,7 @@ pub(super) fn retiring(
             raw_census_complete: raw_complete,
             gates,
             counts: &traversal.counts,
+            disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
         },
     );
 }
@@ -157,6 +167,22 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0]["counts"]["reason"], "no_retained_traversal");
         assert_eq!(first[0]["counts"]["index_generation"], 37);
+        assert_eq!(
+            first[0]["counts"]["disappearance_process_totals_v1"]["version"],
+            1
+        );
+        assert_eq!(
+            first[0]["counts"]["disappearance_process_totals_v1"]["scope"],
+            "process_lifetime_not_window"
+        );
+        assert_eq!(
+            first[0]["counts"]["disappearance_process_totals_v1"]["counts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(first[0]["counts"]["disappearance_process_totals_v1"]["overflowed"].is_boolean());
         assert_eq!(
             first[0]["counts"]["window_unix_seconds"],
             rfc3339_unix_seconds(T0).unwrap()
@@ -296,5 +322,173 @@ mod tests {
         assert_eq!(retired["counts"]["raw_census_complete"], true);
         assert_eq!(retired["counts"]["gates"]["clean_followup"], true);
         assert_eq!(retired["counts"]["gates"]["census_complete"], false);
+    }
+
+    #[test]
+    fn process_snapshot_is_diagnostic_only_and_restored_counts_have_no_backfill() {
+        let mut index = ScanIndex::default();
+        start(&mut index, T0, BACKFILL_WINDOW_DAYS);
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .counts
+            .disappeared_file_count = 7;
+        let saved = serde_json::to_vec(&index).unwrap();
+        let restored: ScanIndex = serde_json::from_slice(&saved).unwrap();
+        let manifest_before =
+            serde_json::to_vec(&restored.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS))
+                .unwrap();
+        let ((starting, rows), events) = disappearance_diagnostics::observe(|| {
+            capture(|| {
+                let starting = Starting::capture(SnapshotSource::Pi, &restored, T1, true, 1);
+                starting.emit(SnapshotSource::Pi);
+                starting
+            })
+        });
+        assert_eq!(
+            events, [[0; 4]; 3],
+            "restoring/copying/emitting is not a producer"
+        );
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), saved);
+        assert_eq!(
+            serde_json::to_vec(&restored.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS))
+                .unwrap(),
+            manifest_before
+        );
+        assert_eq!(starting.previous.unwrap().counts.disappeared_file_count, 7);
+        assert!(!String::from_utf8(saved)
+            .unwrap()
+            .contains("disappearance_process_totals_v1"));
+        assert!(!String::from_utf8(manifest_before)
+            .unwrap()
+            .contains("disappearance_process_totals_v1"));
+        let mut old_row = rows[0].clone();
+        assert!(old_row["counts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("disappearance_process_totals_v1")
+            .is_some());
+        // Absence is preserved, never deserialized into invented zero reasons.
+        let old_row: Value =
+            serde_json::from_str(&serde_json::to_string(&old_row).unwrap()).unwrap();
+        assert!(old_row["counts"]
+            .get("disappearance_process_totals_v1")
+            .is_none());
+        // Neither a first snapshot nor restored aggregate 7 can establish its
+        // historical causes. No global-zero/delta assertion would be valid here.
+    }
+
+    fn max_traversal_counts() -> ScanTraversalCounts {
+        let mut value = serde_json::to_value(ScanTraversalCounts::default()).unwrap();
+        for (name, value) in value.as_object_mut().unwrap() {
+            if let Some(object) = value.as_object_mut() {
+                for counter in object.get_mut("counts").unwrap().as_array_mut().unwrap() {
+                    *counter = json!(u64::MAX);
+                }
+            } else {
+                *value = if name.ends_with("dropped_usage_record_count") {
+                    json!(u64::MAX)
+                } else {
+                    json!(usize::MAX)
+                };
+            }
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn assert_complete_max_row(mut row: Value) {
+        // Start/retire use the real Rust emitter above. Widen wrapper integers
+        // and process totals here without modifying process-global counters.
+        row["process_id"] = json!(u32::MAX);
+        row["observation"]["observed_unix_ms"] = json!(u64::MAX);
+        row["counts"]["window_unix_seconds"] = json!(u64::MAX);
+        row["counts"]["disappearance_process_totals_v1"] =
+            serde_json::to_value(disappearance_diagnostics::Totals::maximum()).unwrap();
+        let totals = &row["counts"]["disappearance_process_totals_v1"];
+        assert_eq!(
+            totals,
+            &json!({"version":1,"scope":"process_lifetime_not_window",
+            "counts":[u64::MAX,u64::MAX,u64::MAX,u64::MAX],"overflowed":true})
+        );
+        assert_eq!(totals.as_object().unwrap().len(), 4);
+        assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+        for field in [
+            "shared_process_cpu_delta_us",
+            "process_lifetime_max_rss_bytes",
+            "process_lifetime_max_rss_before_bytes",
+        ] {
+            assert!(row["observation"][field].is_null());
+        }
+        // false is one byte longer, even though true is the sticky-wrap case.
+        for overflowed in [false, true] {
+            row["counts"]["disappearance_process_totals_v1"]["overflowed"] = json!(overflowed);
+            let json = serde_json::to_string(&row).unwrap();
+            let complete_line = format!("ottto-service: local_resources {json}\n");
+            assert!(
+                complete_line.len() <= 4096,
+                "complete maximum-width row: {} bytes",
+                complete_line.len()
+            );
+            for forbidden in [
+                "private-session",
+                "private-body-witness",
+                "/not-logged/",
+                "source_file_fingerprint",
+            ] {
+                assert!(!complete_line.contains(forbidden));
+            }
+        }
+        // This measures payload, not String additional capacity or allocator peak.
+    }
+
+    #[test]
+    fn complete_transition_rows_serialize_with_maximum_integers_within_budget() {
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            let mut index = ScanIndex::default();
+            ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
+            index.generation = u64::MAX;
+            let traversal = index.traversal.as_mut().unwrap();
+            traversal.counts = max_traversal_counts();
+            let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
+            starting.context_matches = false; // longest boolean spelling
+            starting.prior_unsettled_upload = false;
+            starting.retry_due = Some(false);
+            starting.stale_pending_families = usize::MAX;
+            starting.rearmed_index_files = usize::MAX;
+            starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
+            let previous = starting.previous.as_mut().unwrap();
+            previous.window_unix_seconds = Some(u64::MAX);
+            previous.pending_directories = usize::MAX;
+            previous.pending_candidates = usize::MAX;
+            previous.retry_attempt = u8::MAX;
+            previous.retry_not_before_unix_seconds = Some(u64::MAX);
+            previous.watcher_overflow = false;
+            previous.retryable_problems = false;
+            previous.unsettled_residue = false;
+            let (_, rows) = capture(|| starting.emit(source));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["source"], source.api_slug());
+            assert_complete_max_row(rows[0].clone());
+            let (_, rows) = capture(|| {
+                retiring(
+                    source,
+                    u64::MAX,
+                    index.traversal.as_ref().unwrap(),
+                    true,
+                    CensusGates {
+                        clean_followup: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["source"], source.api_slug());
+            assert_complete_max_row(rows[0].clone());
+        }
     }
 }

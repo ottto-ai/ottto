@@ -261,14 +261,18 @@ fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
         home.event(&format!("{n:08x}-2222-4333-8444-555555555555"), CONTROLLER);
     }
     let mut steps = 0;
-    let result = loop {
+    let (result, disappearance_events) = disappearance_diagnostics::observe(|| loop {
         steps += 1;
         assert!(steps < 10000);
         match state.step(Some(&context)) {
             OwnedSourceScanStep::Pending(next) => state = next,
             OwnedSourceScanStep::Complete { scan, .. } => break scan,
         }
-    };
+    });
+    assert_eq!(
+        disappearance_events, [[0; 4]; 3],
+        "unchanged physical preflight must not record a witness change"
+    );
     assert!(
         steps > 4,
         "changed directory lookup yields through multiple pages"
