@@ -227,6 +227,11 @@ struct ApcFixture {
     next_sequence: std::cell::Cell<u64>,
     page_files: std::cell::Cell<usize>,
     cutoff: std::cell::Cell<Option<&'static str>>,
+    /// Opt-in baseline for the production BASE finish's moving native receipt.
+    /// Old APC tests keep their original collector and fold unchanged.
+    retain_native_terminal: std::cell::Cell<bool>,
+    native_terminal_seen: std::cell::Cell<bool>,
+    census_before_fold: std::cell::Cell<bool>,
 }
 
 impl ApcFixture {
@@ -253,6 +258,9 @@ impl ApcFixture {
             next_sequence: std::cell::Cell::new(1),
             page_files: std::cell::Cell::new(APC_PAGE_FILES),
             cutoff: std::cell::Cell::new(None),
+            retain_native_terminal: std::cell::Cell::new(false),
+            native_terminal_seen: std::cell::Cell::new(false),
+            census_before_fold: std::cell::Cell::new(false),
         };
         for (session, path) in [
             (
@@ -453,22 +461,77 @@ impl ApcFixture {
             EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
         );
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
-            std::slice::from_ref(&self.root),
-            &mut index,
-            collected_at,
-            183,
-            self.page_files.get(),
-            &self.support,
-        )
-        .expect("scan bounded Claude page");
+        let (mut scan, mut native_completion) = if self.retain_native_terminal.get() {
+            let mut state = crate::snapshots::OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&self.root),
+                index,
+                collected_at,
+                183,
+                self.page_files.get(),
+                true,
+                Some(&self.support),
+                &[],
+                false,
+                true,
+            );
+            state.enable_native_comparison();
+            loop {
+                if state.native_comparison_ready() {
+                    // The same BASE continuation used without a controller.
+                    state.resume_native_comparison_base();
+                }
+                match state.step(None) {
+                    crate::snapshots::OwnedSourceScanStep::Pending(next) => state = next,
+                    crate::snapshots::OwnedSourceScanStep::Complete {
+                        index: completed,
+                        scan,
+                        terminal_native_traversal,
+                    } => {
+                        index = completed;
+                        self.native_terminal_seen
+                            .set(terminal_native_traversal.is_some());
+                        break (
+                            scan,
+                            crate::snapshots::claude_native_comparison::Completion::base(
+                                terminal_native_traversal,
+                            ),
+                        );
+                    }
+                }
+            }
+        } else {
+            self.native_terminal_seen.set(false);
+            let scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
+                std::slice::from_ref(&self.root),
+                &mut index,
+                collected_at,
+                183,
+                self.page_files.get(),
+                &self.support,
+            )
+            .expect("scan bounded Claude page");
+            (scan, None)
+        };
+        self.census_before_fold.set(scan.census_complete);
         let parsed = scan
             .snapshots
             .iter()
             .map(|item| item.source_session_id.clone())
             .collect();
-        let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        let (mut disposition, _, _) = if self.retain_native_terminal.get() {
+            apply_claude_local_evidence_to_scan_with_comparison(
+                &self.support,
+                &mut scan,
+                &mut index,
+                None,
+                None,
+                native_completion.as_mut(),
+                None,
+            )
+        } else {
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
+        };
         self.stamp_owners(&mut scan);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -2476,3 +2539,5 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
         }
     }
 }
+
+include!("authority_retry_binding_baseline_test.rs");
