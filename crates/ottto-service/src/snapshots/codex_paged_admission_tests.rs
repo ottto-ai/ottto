@@ -1080,20 +1080,29 @@ fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
         assert_eq!(c.jobs_started, 1, "one cursor read, no requeue loop: {c:?}");
         // R2-M2: the cost is per change. A second priority tail on the
         // certified file requeues again and costs a second whole cursor read.
+        // The file is read again on the first page that selects it.
         row.fixture.append(SESSION, &priority_line(26));
-        let next = 1 + certified.pages;
-        let before = counters(&row.cache);
-        let (index, again, stats) = page(
-            &row.fixture,
-            certified.index,
-            Some(&row.cache),
-            &collected_at(next),
-        );
-        assert_eq!(stats.tail, 1, "{stats:?}");
-        assert_eq!(stats.priority_replays, 0, "no in-page full replay");
-        assert!(again.snapshots.is_empty());
-        assert_eq!(counters(&row.cache).deferred, before.deferred + 1);
-        let recertified = page_until_certified(&row.fixture, index, &row.cache, next + 1);
+        let mut number = 1 + certified.pages;
+        let mut index = certified.index;
+        let mut seen = Vec::new();
+        loop {
+            let before = counters(&row.cache);
+            let (next, again, stats) =
+                page(&row.fixture, index, Some(&row.cache), &collected_at(number));
+            index = next;
+            number += 1;
+            seen.push(stats);
+            if stats.full + stats.tail == 0 {
+                assert!(seen.len() < 4, "never selected again: {seen:?}");
+                continue;
+            }
+            assert_eq!(stats.tail, 1, "{seen:?}");
+            assert_eq!(stats.priority_replays, 0, "no in-page full replay");
+            assert!(again.snapshots.is_empty());
+            assert_eq!(counters(&row.cache).deferred, before.deferred + 1);
+            break;
+        }
+        let recertified = page_until_certified(&row.fixture, index, &row.cache, number);
         assert_eq!(
             fingerprints(&recertified.scan),
             oracle(&row.fixture, &recertified.collected_at)
@@ -1119,45 +1128,58 @@ fn o7_replay_over_the_unpaged_limit_requeues_through_the_backstop() {
     assert!(pending(&row.index, &row.fixture.file(SESSION)));
 }
 
-// F-T7 reopen failure (M1): the O7 reopen of a `Bounded` over-limit file
-// fails for a reason other than size (the path is gone; the tail was read
-// through its held descriptor). It is a read failure (`OpenRead`), as on
-// main, never `oversized`.
+// F-T7 reopen failure (M1), unit level: the O7 reopen is
+// `open_candidate_file_admitted` under the stored admission, and its error
+// arm counts oversized only if `unpaged_size_refused`. On a `Bounded`
+// over-limit candidate a failed reopen (here the path is gone) is never a
+// size refusal, although its identify-time length is over the limit: it is
+// `OpenRead`, as on main. A scan-level row cannot reach this arm: a path
+// failure before the tail also fails the sampled acquisition's header read
+// (`reduction_dependencies`), and no seam sits between the tail and O7.
 #[test]
-fn o7_reopen_failure_on_a_bounded_over_limit_file_is_an_open_read() {
-    if !layout() {
-        return;
-    }
-    let fixture = Root::new(&[(SESSION, 24)]);
+fn o7_reopen_failure_on_a_bounded_over_limit_file_is_not_oversized() {
+    let fixture = Root::new(&[(SESSION, 8)]);
     let path = fixture.file(SESSION);
-    let key = local_index_key(&path);
-    let tail = priority_line(25);
-    let after_tail = fixture.len(SESSION) + tail.len() as u64;
-    let cache = Arc::new(SharedCache::default());
-    with_test_unpaged_limit(after_tail - 1, || {
-        with_test_limits(1024, after_tail, 64, || {
-            let (index, first, stats) = page(&fixture, ScanIndex::default(), Some(&cache), NOW);
-            assert_eq!(stats.full, 1);
-            assert!(!first.snapshots.is_empty());
-            assert!(cache.retained_checkpoint(&key).is_some(), "precondition");
-            fixture.append(SESSION, &tail);
-            let before = counters(&cache);
-            let gone = path.clone();
-            let (_, scan, stats) = with_codex_before_parse(
-                move |opened| {
-                    if opened == gone.as_path() {
-                        fs::remove_file(opened).unwrap();
-                    }
-                },
-                || page(&fixture, index, Some(&cache), NOW),
-            );
-            assert_eq!(stats.tail, 1, "{stats:?}");
-            assert_eq!(stats.priority_replays, 0);
-            assert!(scan.snapshots.is_empty());
-            assert_eq!(scan.oversized_file_count, 0, "{scan:?}");
-            assert_eq!(open_read_unreadable(&scan), 1, "{scan:?}");
-            assert_eq!(counters(&cache).deferred, before.deferred);
-        })
+    let len = fixture.len(SESSION);
+    with_test_unpaged_limit(len - 1, || {
+        // Present: the `Bounded` reopen takes no size cap; `Unpaged` is the
+        // size refusal.
+        let mut present = candidate_at(&path);
+        assert!(open_candidate_file_admitted(
+            SnapshotSource::Codex,
+            &mut present,
+            ReadAdmission::Bounded
+        )
+        .is_ok());
+        let mut unpaged = candidate_at(&path);
+        let refused = open_candidate_file_admitted(
+            SnapshotSource::Codex,
+            &mut unpaged,
+            ReadAdmission::Unpaged,
+        )
+        .unwrap_err();
+        assert!(unpaged_size_refused(
+            SnapshotSource::Codex,
+            ReadAdmission::Unpaged,
+            &refused,
+            unpaged.size_bytes
+        ));
+        // Gone: the stale identify-time length is over the limit, yet the
+        // failure is not a size refusal under either admission.
+        fs::remove_file(&path).unwrap();
+        for admission in [ReadAdmission::Bounded, ReadAdmission::Unpaged] {
+            let mut stale = present.clone();
+            assert_eq!(stale.size_bytes, len);
+            let error = open_candidate_file_admitted(SnapshotSource::Codex, &mut stale, admission)
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            assert!(!unpaged_size_refused(
+                SnapshotSource::Codex,
+                admission,
+                &error,
+                stale.size_bytes
+            ));
+        }
     });
 }
 
