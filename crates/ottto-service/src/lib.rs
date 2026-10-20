@@ -61,6 +61,7 @@ pub mod unix_socket;
 pub mod upload_receipts;
 pub mod xpc_mach;
 
+use crate::control::TerminalRefreshRejection;
 use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};
 use ottto_core::{
     compiled_release_version, default_connection_api_base_url, default_support_dir, empty_status,
@@ -1470,25 +1471,39 @@ impl LocalDaemon {
         Ok(())
     }
 
-    /// Record that Ottto rejected this Mac's setup-run credentials for an
-    /// agent read (`ottto costs`, `sessions`, `context`, ...) even after the
-    /// single device-secret refresh. Uploads use the separate relay device
-    /// credential and keep working, so this only makes the setup-run and
-    /// token states honest and adds a Warning; it never blocks source trust.
+    /// Record that an agent read (`ottto costs`, `sessions`, `context`, ...)
+    /// ended in an authoritative terminal answer from the device-secret
+    /// refresh: Ottto ended the setup run, or no longer accepts this Mac's
+    /// device credential. An ended run only makes the setup-run and token
+    /// states honest and adds a Warning: uploads use the device credential
+    /// and keep working. A refused device credential marks the device
+    /// inactive, which untrusts sources the way a rejected upload does.
     /// Recorded on transition only, so repeated failing reads stay bounded.
     /// `binding` is the setup-run binding the read started with; an outcome
     /// that arrives after the binding was replaced describes the old run and
     /// is dropped.
-    pub fn record_setup_run_read_rejected(
+    pub(crate) fn record_setup_run_read_rejected(
         &self,
         binding: &LocalConnectionBinding,
+        rejection: TerminalRefreshRejection,
     ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
         if !state.binds_setup_run(binding)
-            || latest_setup_run_read_rejection(&state.local_health_events).is_some()
+            || latest_setup_run_read_rejection(&state.local_health_events)
+                .is_some_and(|current| current.rejection == rejection)
         {
             return Ok(());
         }
+        let (code, message) = match rejection {
+            TerminalRefreshRejection::SetupRunEnded => (
+                SETUP_RUN_ENDED_READ_REJECTION,
+                "Ottto ended this Mac's setup run; agent reads stop until it reconnects",
+            ),
+            TerminalRefreshRejection::DeviceRejected => (
+                DEVICE_REJECTED_READ_REJECTION,
+                "Ottto refused this Mac's device credential for agent reads",
+            ),
+        };
         push_local_health_event(
             &mut state,
             "SetupRunReadRejected",
@@ -1496,7 +1511,8 @@ impl LocalDaemon {
             LocalHealthAuthority::Backend,
             serde_json::json!({
                 "kind": "setup_run_read_rejected",
-                "message": "Ottto rejected this Mac's setup run for agent reads",
+                "rejection": code,
+                "message": message,
                 "current": true
             }),
         );
@@ -1505,7 +1521,7 @@ impl LocalDaemon {
 
     /// Clear a recorded setup-run read rejection after a successful read
     /// that started with the current `binding`.
-    pub fn record_setup_run_read_accepted(
+    pub(crate) fn record_setup_run_read_accepted(
         &self,
         binding: &LocalConnectionBinding,
     ) -> Result<(), LocalApiError> {
@@ -2470,18 +2486,35 @@ fn clear_setup_run_read_rejection(state: &mut DaemonState) {
     );
 }
 
-/// The `observed_at` of the latest setup-run read rejection, if the most
-/// recent rejection/recovery event says it is still current.
-fn latest_setup_run_read_rejection(events: &[LocalHealthEventV1]) -> Option<String> {
-    events
+const SETUP_RUN_ENDED_READ_REJECTION: &str = "setup_run_ended";
+const DEVICE_REJECTED_READ_REJECTION: &str = "device_rejected";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupRunReadRejection {
+    observed_at: String,
+    rejection: TerminalRefreshRejection,
+}
+
+/// The latest setup-run read rejection, if the most recent
+/// rejection/recovery event says it is still current.
+fn latest_setup_run_read_rejection(events: &[LocalHealthEventV1]) -> Option<SetupRunReadRejection> {
+    let event = events
         .iter()
         .filter(|event| {
             event.event_type == "SetupRunReadRejected"
                 || event.event_type == "SetupRunReadRecovered"
         })
         .max_by_key(|event| event.sequence)
-        .filter(|event| event.event_type == "SetupRunReadRejected")
-        .map(|event| event.observed_at.clone())
+        .filter(|event| event.event_type == "SetupRunReadRejected")?;
+    let rejection = match event.payload.get("rejection")?.as_str()? {
+        SETUP_RUN_ENDED_READ_REJECTION => TerminalRefreshRejection::SetupRunEnded,
+        DEVICE_REJECTED_READ_REJECTION => TerminalRefreshRejection::DeviceRejected,
+        _ => return None,
+    };
+    Some(SetupRunReadRejection {
+        observed_at: event.observed_at.clone(),
+        rejection,
+    })
 }
 
 fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV1 {
@@ -2520,13 +2553,23 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
         setup_token_state = LocalSetupTokenState::RefreshRequired;
     }
     // The connected flag alone says nothing about whether Ottto still accepts
-    // the setup run. After a read was rejected even with a fresh device-secret
-    // refresh, report the run as rejected instead of `complete`/`valid`.
-    if matches!(state, LocalHealthAccountState::Connected)
-        && latest_setup_run_read_rejection(&status.local_health_events).is_some()
-    {
-        setup_run_state = LocalSetupRunState::Rejected;
-        setup_token_state = LocalSetupTokenState::Expired;
+    // the setup run. After a read ended in a terminal device-secret refresh
+    // answer, report what Ottto said instead of `complete`/`valid`. A refused
+    // device credential does not say the run ended, so it is never `expired`.
+    let read_rejection = matches!(state, LocalHealthAccountState::Connected)
+        .then(|| latest_setup_run_read_rejection(&status.local_health_events))
+        .flatten()
+        .map(|current| current.rejection);
+    match read_rejection {
+        Some(TerminalRefreshRejection::SetupRunEnded) => {
+            setup_run_state = LocalSetupRunState::Rejected;
+            setup_token_state = LocalSetupTokenState::Expired;
+        }
+        Some(TerminalRefreshRejection::DeviceRejected) => {
+            setup_run_state = LocalSetupRunState::Unknown;
+            setup_token_state = LocalSetupTokenState::RefreshRequired;
+        }
+        None => {}
     }
     let device_state = match latest_upload.as_ref() {
         Some(LatestLocalHealthUpload::AuthRejected { .. }) => LocalDeviceState::Inactive,
@@ -2538,6 +2581,11 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
             LocalDeviceState::StaleHeartbeat
         }
         _ => LocalDeviceState::Active,
+    };
+    let device_state = if read_rejection == Some(TerminalRefreshRejection::DeviceRejected) {
+        LocalDeviceState::Inactive
+    } else {
+        device_state
     };
     LocalHealthAccountV1 {
         state,
@@ -2804,15 +2852,25 @@ fn local_health_blockers_for_status(
             "restart ottto-service (or restore its DNS resolution); usage snapshot sync is stalled while other uploads succeed",
         ));
     }
-    if account.setup_run_state == LocalSetupRunState::Rejected {
-        if let Some(observed_at) = latest_setup_run_read_rejection(&status.local_health_events) {
+    if account.state == LocalHealthAccountState::Connected {
+        if let Some(current) = latest_setup_run_read_rejection(&status.local_health_events) {
+            let (code, clear_condition) = match current.rejection {
+                TerminalRefreshRejection::SetupRunEnded => (
+                    "setup_run_rejected",
+                    "run `ottto login` to reconnect this Mac and restore agent reads",
+                ),
+                TerminalRefreshRejection::DeviceRejected => (
+                    "device_credential_rejected",
+                    "Ottto refused this Mac's device credential; run `ottto login` to reconnect this Mac",
+                ),
+            };
             blockers.push(blocker(
-                "setup_run_rejected",
+                code,
                 LocalHealthSeverity::Warning,
                 "setup",
                 LocalHealthAuthority::Backend,
-                &observed_at,
-                "reconnect this Mac from the Ottto Apps page to restore agent reads; uploads continue",
+                &current.observed_at,
+                clear_condition,
             ));
         }
     }
@@ -5898,10 +5956,10 @@ mod tests {
         .is_none());
 
         daemon
-            .record_setup_run_read_rejected(&run)
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
             .expect("record rejected read");
         daemon
-            .record_setup_run_read_rejected(&run)
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
             .expect("record repeated rejected read");
         let status = daemon.status(TOKEN).expect("status");
         assert_eq!(
@@ -5953,6 +6011,67 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.code == "setup_run_rejected"));
+
+        // A refused device credential does not say the run ended: never
+        // `expired`, the device is inactive, and the blocker says so.
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::DeviceRejected)
+            .expect("record device rejection");
+        let device_rejected = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            device_rejected.account.state,
+            LocalHealthAccountState::Connected
+        );
+        assert_eq!(
+            device_rejected.account.setup_run_state,
+            LocalSetupRunState::Unknown
+        );
+        assert_eq!(
+            device_rejected.account.setup_token_state,
+            LocalSetupTokenState::RefreshRequired
+        );
+        assert_eq!(
+            device_rejected.account.device_state,
+            LocalDeviceState::Inactive
+        );
+        assert!(device_rejected
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "device_credential_rejected"));
+        assert!(!device_rejected
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "setup_run_rejected"));
+        let reported =
+            serde_json::to_string(&(&device_rejected.account, &device_rejected.blockers))
+                .expect("serialize health");
+        assert!(
+            !reported.to_ascii_lowercase().contains("expired"),
+            "{reported}"
+        );
+
+        // A later ended-run answer for the same binding is a new transition.
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record ended run");
+        let ended = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(ended.account.setup_run_state, LocalSetupRunState::Rejected);
+        assert_eq!(
+            ended.account.setup_token_state,
+            LocalSetupTokenState::Expired
+        );
+        assert!(!ended
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "device_credential_rejected"));
     }
 
     #[test]
@@ -5970,7 +6089,7 @@ mod tests {
             .with_connection(Some(old_run.clone()));
 
         daemon
-            .record_setup_run_read_rejected(&old_run)
+            .record_setup_run_read_rejected(&old_run, TerminalRefreshRejection::SetupRunEnded)
             .expect("record rejected read");
         daemon
             .bind_setup_run_for_authorized_client(old_run.clone())
@@ -5987,7 +6106,7 @@ mod tests {
             "a replacement run is not the rejected run"
         );
         daemon
-            .record_setup_run_read_rejected(&old_run)
+            .record_setup_run_read_rejected(&old_run, TerminalRefreshRejection::SetupRunEnded)
             .expect("late outcome from a read of the old run");
         assert!(
             !rejected(&daemon),
@@ -5995,7 +6114,7 @@ mod tests {
         );
 
         daemon
-            .record_setup_run_read_rejected(&new_run)
+            .record_setup_run_read_rejected(&new_run, TerminalRefreshRejection::SetupRunEnded)
             .expect("record rejected read");
         assert!(rejected(&daemon));
         assert!(daemon
@@ -6007,7 +6126,7 @@ mod tests {
             .bind_setup_run_for_authorized_client(new_run.clone())
             .expect("bind run again");
         daemon
-            .record_setup_run_read_rejected(&new_run)
+            .record_setup_run_read_rejected(&new_run, TerminalRefreshRejection::SetupRunEnded)
             .expect("record rejected read");
         daemon
             .reset_account_for_authorized_client()
