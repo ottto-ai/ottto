@@ -38,9 +38,14 @@ Candidate 77feae8d passed carried-refusal and actual next-cycle admission, plus
 retryable/status controls. Its remaining fixture failure incorrectly assumed
 absent optional paired sidecars invalidate a complete native request census.
 That assumption is superseded, not a production defect: the explicit no-sidecar
-control expects native admission, while a malformed physical transcript line
-supplies the actual unclean-census negative. Production gates are unchanged.
-Corrected candidate CI and independent review must pass before intake.
+control expects native admission, while a separate malformed physical transcript
+supplies the actual unclean-census negative while preserving the healthy body. Production gates are unchanged.
+The next fixture reached a genuinely incomplete census but incorrectly forced
+one specific malformed count before finish. That count assumption is superseded;
+terminal loss counters must equal the actual selected scan. The separate damaged
+transcript leaves the healthy root available for a real permanent response, and
+the actual finish must still refuse admission. Corrected candidate CI and
+independent review must pass before intake.
 
 This repairs a demonstrated source exit discrepancy. It does not establish the
 cause of installed scan bursts, healthy request coverage, a memory leak, or

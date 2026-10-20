@@ -156,16 +156,13 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
     if matches!(outcome, FinishOutcome::PermanentUncleanCensus) {
         // A real parse loss makes the native census unclean. Missing optional
         // sidecars alone does not invalidate this root's native request census.
-        let transcript = fixture
+        // Keep the healthy root available for an actual permanent response;
+        // a separate damaged transcript prevents a complete native census.
+        let broken = fixture
             .home
             .join(".claude/projects/-synthetic-repo")
-            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(transcript)
-            .unwrap()
-            .write_all(b"{\n")
-            .unwrap();
+            .join("2448a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        std::fs::write(broken, b"{\n").unwrap();
     }
     let client = SnapshotApiClient::new(server.url.clone());
     let daemon = test_daemon("otm_test");
@@ -206,10 +203,15 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
         let unclean = matches!(outcome, FinishOutcome::PermanentUncleanCensus);
         assert_eq!(scan.census_complete, !unclean);
-        assert_eq!(scan.malformed_json_line_count, usize::from(unclean));
+        let selected_losses = [
+            scan.malformed_json_line_count,
+            scan.invalid_utf8_line_count,
+            scan.unreadable_path_count,
+            scan.disappeared_file_count,
+        ];
         assert_eq!(
             scan.scanned_file_count,
-            usize::from(cycle < 2),
+            if unclean { 2 } else { usize::from(cycle < 2) },
             "actual native read, then ordinary quiet page"
         );
         if cycle == 0 {
@@ -279,10 +281,20 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             }
         );
         let retained_valid = daemon.native_comparison.retained_valid_for_test();
-        assert_eq!(
-            terminal[cycle]["last_malformed_json_line_count"],
-            usize::from(unclean)
-        );
+        for (key, expected) in [
+            "last_malformed_json_line_count",
+            "last_invalid_utf8_line_count",
+            "last_unreadable_path_count",
+            "last_disappeared_file_count",
+        ]
+        .into_iter()
+        .zip(selected_losses)
+        {
+            assert_eq!(
+                terminal[cycle][key], expected,
+                "terminal disclosure must equal the real selected scan, not a fixture assumption"
+            );
+        }
         assert_eq!(terminal[cycle]["last_census_complete"], !unclean);
         if cycle > 0 || !matches!(outcome, FinishOutcome::Permanent) {
             assert_eq!(retained_valid, expected_valid,
