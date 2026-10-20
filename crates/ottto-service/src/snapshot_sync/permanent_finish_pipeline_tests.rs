@@ -62,7 +62,17 @@ impl FinishServer {
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
                     assert!(!items.is_empty());
                     bodies.lock().unwrap().extend(items.iter().cloned());
-                    let permanent = !matches!(outcome, FinishOutcome::Retryable);
+                    let retryable = matches!(outcome, FinishOutcome::Retryable);
+                    let references = items
+                        .iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "source_session_id":item["source_session_id"],
+                                "snapshot_fingerprint":item["snapshot_fingerprint"],
+                                "occurrence_count":1
+                            })
+                        })
+                        .collect::<Vec<_>>();
                     let rejected = items
                         .iter()
                         .map(|item| {
@@ -70,14 +80,16 @@ impl FinishServer {
                                 "source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],
                                 "reason":"invalid","detail":"synthetic finish refusal",
-                                "permanent":permanent,"occurrence_count":1
+                                "permanent":true,"occurrence_count":1
                             })
                         })
                         .collect::<Vec<_>>();
                     serde_json::json!({"accepted":0,"sessions_reconciled":0,"session_ids":[],
                         "disabled":false,"disabled_reason":null,
                         "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],
-                        "unchanged_entities":[],"conflict_entities":[],"rejected_entities":rejected})
+                        "unchanged_entities":[],
+                        "conflict_entities":if retryable { references } else { Vec::new() },
+                        "rejected_entities":if retryable { Vec::new() } else { rejected }})
                 } else {
                     if value["report_kind"] == "scan_status" {
                         statuses.lock().unwrap().push(value.clone());
