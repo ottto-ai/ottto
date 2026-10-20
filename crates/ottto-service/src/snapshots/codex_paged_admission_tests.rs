@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "019fa333-4444-7555-8666-777777777777";
 const SESSION_B: &str = "019fa333-4444-7555-8666-888888888888";
-const OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 /// Identity samples: at most the first and the last 4 KiB.
 const IDENTITY_BYTES: u64 = 2 * FILE_CONTENT_SAMPLE_BYTES as u64;
 /// The most a sparse fixture may allocate on disk.
@@ -333,7 +332,7 @@ fn over_limit_codex_rollout_is_discovered_and_refused_once_at_the_unpaged_open()
     sparse(
         &path,
         MAX_CODEX_JSONL_FILE_BYTES + 1,
-        &[(0, &meta_line(SESSION))],
+        &[(0, meta_line(SESSION).as_slice())],
     );
     reset_counters();
     let mut index = ScanIndex::default();
@@ -466,7 +465,7 @@ fn snapshot_audit_v5_discloses_an_over_limit_codex_file_on_every_pass() {
     sparse(
         &path,
         MAX_CODEX_JSONL_FILE_BYTES + 1,
-        &[(0, &meta_line(SESSION))],
+        &[(0, meta_line(SESSION).as_slice())],
     );
     for pass in 0..2 {
         reset_counters();
@@ -607,7 +606,7 @@ fn production_boundary_on_sparse_files() {
     sparse(
         &path,
         MAX_CODEX_JSONL_FILE_BYTES,
-        &[(0, &meta_line(SESSION))],
+        &[(0, meta_line(SESSION).as_slice())],
     );
     reset_counters();
     assert_eq!(
@@ -619,7 +618,7 @@ fn production_boundary_on_sparse_files() {
     sparse(
         &path,
         MAX_CODEX_JSONL_FILE_BYTES + 1,
-        &[(0, &meta_line(SESSION))],
+        &[(0, meta_line(SESSION).as_slice())],
     );
     reset_counters();
     let refused = open(ReadAdmission::Unpaged).unwrap_err();
@@ -648,7 +647,7 @@ fn production_boundary_on_sparse_files() {
     sparse(
         &path,
         MAX_CODEX_JSONL_FILE_BYTES,
-        &[(0, &meta_line(SESSION))],
+        &[(0, meta_line(SESSION).as_slice())],
     );
     let at_limit = codex_parent_open_match(
         CodexParentCensus::new(&roots, &paths),
@@ -682,7 +681,10 @@ fn offsets_above_four_gib_on_a_sparse_file() {
     sparse(
         &path,
         len,
-        &[(0, &meta_line(SESSION)), (marker, b"fc1-high-offset")],
+        &[
+            (0, meta_line(SESSION).as_slice()),
+            (marker, b"fc1-high-offset".as_slice()),
+        ],
     );
     // F-T6a: the identity tail sample covers the bytes above 2^32.
     let identity = || {
@@ -1167,6 +1169,26 @@ fn cursor_job_growing_past_the_unpaged_limit_certifies() {
             assert!(!certified.scan.snapshots.is_empty());
             let c = counters(&cache);
             assert_eq!((c.jobs_invalidated, c.jobs_lost), (0, 0), "{c:?}");
+            // F-T12: the certified prefix stops at the frozen extent; with no
+            // audit due, the next read tails only the appended bytes.
+            let key = local_index_key(&fixture.file(SESSION));
+            let sealed = cache
+                .retained_checkpoint(&key)
+                .expect("certificate")
+                .sealed_offset();
+            assert!(sealed <= start + 1024 && sealed < fixture.len(SESSION));
+            let (_, tailed, stats) =
+                page(&fixture, certified.index, Some(&cache), &collected_at(80));
+            assert_eq!((stats.full, stats.tail), (0, 1), "{stats:?}");
+            assert!(!tailed.snapshots.is_empty());
+            assert_eq!(
+                cache
+                    .retained_checkpoint(&key)
+                    .expect("tail retained")
+                    .sealed_offset(),
+                fixture.len(SESSION)
+            );
+            assert_eq!(counters(&cache).jobs_started, 1);
         })
     });
 }
@@ -1391,6 +1413,450 @@ fn outlived_unchanged_cursor_read_pins_the_audit_loop_until_ad1() {
             let checkpoint = cache.retained_checkpoint(&key).expect("certificate");
             assert!(checkpoint.audit_debt().is_some(), "AD-1 flips this");
             assert!(index.files[&key].audit_obligation(now).is_some());
+        })
+    });
+}
+
+// F-T12 control: more than 256 distinct usage turns are not retainable
+// (P1-RETAIN): after the certified read nothing is retained, so the next
+// change is a full read again.
+#[test]
+fn over_limit_file_with_257_usage_turns_is_not_retained() {
+    if !layout() {
+        return;
+    }
+    let dir = Dir::new("turns");
+    let root = dir.0.join("home/.codex/sessions");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!("rollout-2026-10-07T10-00-00-{SESSION}.jsonl"));
+    let mut records = vec![json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": SESSION}})];
+    for n in 1..=257_u64 {
+        records.push(turn_record("2026-10-07T10:10:00Z", &format!("turn-{n}")));
+        records.push(usage_record(
+            "2026-10-07T10:10:01Z",
+            (10 * n, 5 * n, n, 0),
+            (10, 5, 1, 0),
+        ));
+    }
+    fs::write(&path, jsonl(&records)).unwrap();
+    let fixture = Root { _dir: dir, root };
+    let key = local_index_key(&path);
+    let cache = Arc::new(SharedCache::default());
+    let len = fs::metadata(&path).unwrap().len();
+    with_test_unpaged_limit(len - 1, || {
+        with_test_limits(16 * 1024, 4096, 64, || {
+            let certified = page_until_certified(&fixture, ScanIndex::default(), &cache, 0);
+            assert!(!certified.scan.snapshots.is_empty());
+            assert!(cache.retained_checkpoint(&key).is_none(), "not retainable");
+            let started = counters(&cache).jobs_started;
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&jsonl(&[usage_record(
+                "2026-10-07T10:20:00Z",
+                (3000, 1500, 300, 0),
+                (10, 5, 1, 0),
+            )]))
+            .unwrap();
+            let (_, _, stats) = page(&fixture, certified.index, Some(&cache), &collected_at(90));
+            assert_eq!(stats.tail, 0, "{stats:?}");
+            assert_eq!(
+                counters(&cache).jobs_started,
+                started + 1,
+                "a full cursor read"
+            );
+        })
+    });
+}
+
+fn turn_record(at: &str, turn: &str) -> Value {
+    json!({"timestamp": at, "type": "turn_context",
+        "payload": {"turn_id": turn, "model": "gpt-5.6-sol"}})
+}
+
+fn usage_record(at: &str, total: (u64, u64, u64, u64), last: (u64, u64, u64, u64)) -> Value {
+    let usage = |(input, cached, output, reasoning): (u64, u64, u64, u64)| {
+        json!({"input_tokens": input, "cached_input_tokens": cached,
+            "output_tokens": output, "reasoning_output_tokens": reasoning})
+    };
+    json!({"timestamp": at, "type": "event_msg", "payload": {"type": "token_count",
+        "info": {"total_token_usage": usage(total), "last_token_usage": usage(last),
+            "model": "gpt-5.6-sol"}}})
+}
+
+fn jsonl(records: &[Value]) -> Vec<u8> {
+    records.iter().cloned().flat_map(codex_line).collect()
+}
+
+const PARENT: &str = "019fa333-4444-7555-8666-aaaaaaaaaaaa";
+const CHILD: &str = "019fa333-4444-7555-8666-bbbbbbbbbbbb";
+
+/// A parent rollout P (two turns with usage: a complete ledger) and a fork C
+/// of P that copies P's first turn, then owns its own turn and usage.
+struct ForkHome {
+    fixture: Root,
+}
+
+impl ForkHome {
+    fn new() -> Self {
+        let home = Self {
+            fixture: Root::new(&[]),
+        };
+        fs::write(home.fixture.file(PARENT), jsonl(&Self::parent())).unwrap();
+        let parent = Self::parent();
+        let child = vec![
+            json!({"timestamp": "2026-10-07T08:20:00Z", "type": "session_meta",
+            "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}}),
+            parent[1].clone(),
+            parent[2].clone(),
+            turn_record("2026-10-07T08:20:01Z", "child-turn-1"),
+            usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
+        ];
+        fs::write(home.fixture.file(CHILD), jsonl(&child)).unwrap();
+        home
+    }
+
+    fn parent() -> Vec<Value> {
+        vec![
+            json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
+                "payload": {"id": PARENT, "thread_source": "user"}}),
+            turn_record("2026-10-07T08:00:01Z", "parent-turn-1"),
+            usage_record("2026-10-07T08:00:02Z", (100, 80, 10, 2), (100, 80, 10, 2)),
+            turn_record("2026-10-07T08:30:01Z", "parent-turn-2"),
+            usage_record("2026-10-07T08:30:02Z", (160, 125, 18, 4), (60, 45, 8, 2)),
+            // A third turn keeps P longer than C, so a limit between them
+            // refuses only P.
+            turn_record("2026-10-07T08:40:01Z", "parent-turn-3"),
+            usage_record("2026-10-07T08:40:02Z", (220, 170, 26, 6), (60, 45, 8, 2)),
+        ]
+    }
+
+    /// One page of census generation `n`.
+    fn generation(
+        &self,
+        index: ScanIndex,
+        cache: Option<&Arc<SharedCache>>,
+        n: u64,
+    ) -> (ScanIndex, SourceScanResult) {
+        let mut index = index;
+        index.traversal = None;
+        let (index, scan, _) = page(&self.fixture, index, cache, &collected_at(n));
+        (index, scan)
+    }
+
+    fn parent_ledger(index: &ScanIndex) -> Option<String> {
+        index
+            .codex_parent_ownership_ledgers
+            .get(PARENT)
+            .filter(|ledger| ledger.scan_complete)
+            .map(|ledger| ledger.opened_object_identity.clone())
+    }
+}
+
+fn parent_causes(
+    scan: &SourceScanResult,
+) -> [u64; crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES] {
+    scan.local_codex_diagnostics
+        .as_ref()
+        .expect("Codex diagnostics")
+        .parent_unresolvable
+        .counts()
+}
+
+fn child_usage(scan: &SourceScanResult) -> bool {
+    scan.snapshots
+        .iter()
+        .any(|snapshot| snapshot.source_session_id == CHILD)
+}
+
+// F-T10: on a paged scan an over-limit parent is no `Oversize` witness: it
+// is cursor-read, its ledger validates and the child resolves.
+#[test]
+fn paged_scan_reads_an_over_limit_parent_and_resolves_its_child() {
+    if !layout() {
+        return;
+    }
+    let home = ForkHome::new();
+    let parent_len = home.fixture.len(PARENT);
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(parent_len - 1, || {
+        with_test_limits(256, 256, 64, || {
+            let mut index = ScanIndex::default();
+            for n in 0..48 {
+                let (next, scan) = home.generation(index, Some(&cache), n);
+                index = next;
+                let causes = parent_causes(&scan);
+                assert_eq!(
+                    causes[CodexParentUnresolvable::Oversize.index()],
+                    0,
+                    "no Oversize witness on a paged scan: {causes:?}"
+                );
+                assert_eq!(scan.oversized_file_count, 0);
+                if ForkHome::parent_ledger(&index).is_some() && child_usage(&scan) {
+                    return;
+                }
+            }
+            panic!("the child did not resolve: {:?}", counters(&cache));
+        })
+    });
+}
+
+// F-T10: unsampled, with no ledger, the over-limit parent is `Oversize` as
+// today; with a valid persisted ledger, the ledger wins and the child
+// resolves while the parent itself is refused at its unpaged open.
+#[test]
+fn unsampled_parent_over_the_limit_is_oversize_unless_its_ledger_is_valid() {
+    let home = ForkHome::new();
+    let parent_len = home.fixture.len(PARENT);
+    assert!(home.fixture.len(CHILD) < parent_len - 1);
+    let (_, held) = with_test_unpaged_limit(parent_len - 1, || {
+        home.generation(ScanIndex::default(), None, 0)
+    });
+    let causes = parent_causes(&held);
+    assert_eq!(
+        causes[CodexParentUnresolvable::Oversize.index()],
+        1,
+        "{causes:?}"
+    );
+    assert!(!child_usage(&held));
+    // Settle the ledger with no limit, then change the child.
+    let mut index = ScanIndex::default();
+    let mut settled = false;
+    for n in 1..6 {
+        let (next, scan) = home.generation(index, None, n);
+        index = next;
+        if ForkHome::parent_ledger(&index).is_some() && child_usage(&scan) {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "the ledger settled");
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(home.fixture.file(CHILD))
+        .unwrap();
+    file.write_all(&jsonl(&[usage_record(
+        "2026-10-07T08:40:02Z",
+        (150, 110, 16, 3),
+        (20, 10, 2, 0),
+    )]))
+    .unwrap();
+    reset_counters();
+    let (index, scan) =
+        with_test_unpaged_limit(parent_len - 1, || home.generation(index, None, 10));
+    let causes = parent_causes(&scan);
+    assert_eq!(
+        causes,
+        [0; crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES]
+    );
+    assert!(child_usage(&scan), "the ledger resolves the child");
+    assert_eq!(
+        scan.oversized_file_count, 1,
+        "the parent itself is not read"
+    );
+    assert!(ForkHome::parent_ledger(&index).is_some());
+}
+
+// F-T11: under an unpaged scan an over-limit parent is an `Oversize`
+// witness; once it shrinks below the limit, the witness drops and the child
+// resolves on a retry.
+#[test]
+fn shrunk_parent_drops_its_oversize_witness() {
+    if !layout() {
+        return;
+    }
+    let home = ForkHome::new();
+    let short = home.fixture.len(PARENT);
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(home.fixture.file(PARENT))
+        .unwrap();
+    file.write_all(&jsonl(&[
+        turn_record("2026-10-07T09:00:01Z", "parent-grown"),
+        usage_record("2026-10-07T09:00:02Z", (200, 150, 20, 4), (40, 25, 2, 0)),
+    ]))
+    .unwrap();
+    drop(file);
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(short, || {
+        with_test_forced_routing(None, Some(ReadAdmission::Unpaged), || {
+            let (index, held) = home.generation(ScanIndex::default(), Some(&cache), 0);
+            let causes = parent_causes(&held);
+            assert_eq!(
+                causes[CodexParentUnresolvable::Oversize.index()],
+                1,
+                "{causes:?}"
+            );
+            fs::write(home.fixture.file(PARENT), jsonl(&ForkHome::parent())).unwrap();
+            let mut index = index;
+            for n in 1..4 {
+                let (next, scan) = home.generation(index, Some(&cache), n);
+                index = next;
+                if child_usage(&scan) {
+                    let causes = parent_causes(&scan);
+                    assert_eq!(causes[CodexParentUnresolvable::Oversize.index()], 0);
+                    return;
+                }
+            }
+            panic!("the child did not resolve after the parent shrank");
+        })
+    });
+}
+
+/// Rewrites `len` bytes at `offset` in place (same size, same object).
+fn edit_in_place(path: &Path, offset: u64, bytes: &[u8]) {
+    let file = OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all_at(bytes, offset).unwrap();
+}
+
+// F-T13: in-place equal-size edits during an over-limit job invalidate it
+// and publish nothing; the third consecutive one ends as `MemberChanged`. A
+// replaced object then starts from 0 and publishes.
+#[test]
+fn edits_during_an_over_limit_job_invalidate_then_end_as_member_changed() {
+    if !layout() {
+        return;
+    }
+    let fixture = Root::new(&[(SESSION, 80)]);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(4096, || {
+        with_test_limits(2048, 1024, 64, || {
+            let mut index = ScanIndex::default();
+            // The header's timestamp seconds: "10:00:00Z" -> "10:00:0nZ".
+            let header = meta_line(SESSION);
+            let at = header
+                .windows(9)
+                .position(|window| window == b"10:00:00Z")
+                .unwrap() as u64
+                + 7;
+            for (number, digit) in [b"1", b"2", b"3"].into_iter().enumerate() {
+                let (next, scan, _) =
+                    page(&fixture, index, Some(&cache), &collected_at(number as u64));
+                index = next;
+                assert!(scan.snapshots.is_empty(), "{:?}", counters(&cache));
+                edit_in_place(&path, at, digit);
+            }
+            for number in 3..8 {
+                let (next, scan, _) = page(&fixture, index, Some(&cache), &collected_at(number));
+                index = next;
+                assert!(scan.snapshots.is_empty());
+                if counters(&cache).jobs_member_changed == 1 {
+                    break;
+                }
+            }
+            let c = counters(&cache);
+            assert_eq!(c.jobs_member_changed, 1, "{c:?}");
+            assert!(c.jobs_invalidated >= 2, "{c:?}");
+            assert_eq!(c.jobs_certified, 0);
+            // A replaced object (new inode) starts from 0.
+            let replacement = path.with_extension("tmp");
+            fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+            let started = c.jobs_started;
+            let certified = page_until_certified(&fixture, index, &cache, 20);
+            assert!(counters(&cache).jobs_started > started);
+            assert_eq!(
+                fingerprints(&certified.scan),
+                oracle(&fixture, &certified.collected_at)
+            );
+        })
+    });
+}
+
+// F-T15: a scan object dropped mid-page returns its intact over-limit job to
+// the slot; the job resumes without a restart and certifies once.
+#[test]
+fn dropped_scan_frame_returns_the_over_limit_job() {
+    if !layout() {
+        return;
+    }
+    let fixture = Root::new(&[(SESSION, 40)]);
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(4096, || {
+        with_test_limits(2048, 4096, 64, || {
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&fixture.root),
+                ScanIndex::default(),
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("fc1-fixture".into()));
+            for _ in 0..10_000 {
+                if scan
+                    .active_file
+                    .as_ref()
+                    .is_some_and(|active| active.cursor.is_some())
+                {
+                    break;
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { .. } => panic!("the job never started"),
+                }
+            }
+            assert!(!cache.cursor_slot_free(), "the frame holds the job");
+            drop(scan);
+            let c = counters(&cache);
+            assert_eq!((c.jobs_frame_returned, c.jobs_lost), (1, 0), "{c:?}");
+            assert_eq!(cache.cursor_reserved(), 0);
+            let certified = page_until_certified(&fixture, ScanIndex::default(), &cache, 1);
+            assert!(!certified.scan.snapshots.is_empty());
+            let c = counters(&cache);
+            assert_eq!(c.jobs_started, 1, "{c:?}");
+            assert!(c.jobs_resumed > 0);
+        })
+    });
+}
+
+// F-T20: a file just over the singleton budget waits behind an in-flight
+// over-limit job for at most that job's remaining pages: deferred once per
+// page, never by rotation, one waiter, and it starts on the job's final page
+// or the page after it.
+#[test]
+fn a_waiter_starts_within_one_page_of_the_jobs_end() {
+    if !layout() {
+        return;
+    }
+    let fixture = Root::new(&[(SESSION, 60), (SESSION_B, 5)]);
+    assert!(fixture.len(SESSION_B) > 1024);
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(4096, || {
+        with_test_limits(2048, 1024, 64, || {
+            let mut index = ScanIndex::default();
+            let mut final_page = None;
+            let mut waiter_start = None;
+            for number in 0..64 {
+                let before = counters(&cache);
+                let (next, _, _) = page(&fixture, index, Some(&cache), &collected_at(number));
+                index = next;
+                let after = counters(&cache);
+                if number > 0 && after.jobs_certified == 0 {
+                    assert_eq!(after.deferred, before.deferred + 1, "page {number}");
+                    assert_eq!(cache.rotation_waiters_for_test(), 1, "page {number}");
+                }
+                assert_eq!(after.deferred_rotation, 0);
+                if final_page.is_none() && after.jobs_certified == 1 {
+                    final_page = Some(number);
+                }
+                if waiter_start.is_none() && after.jobs_started == 2 {
+                    waiter_start = Some(number);
+                }
+                if after.jobs_certified == 2 {
+                    break;
+                }
+            }
+            let (final_page, waiter_start) = (final_page.unwrap(), waiter_start.unwrap());
+            assert!(
+                (final_page..=final_page + 1).contains(&waiter_start),
+                "final {final_page}, waiter {waiter_start}"
+            );
         })
     });
 }

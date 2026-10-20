@@ -27804,6 +27804,8 @@ fn resolve_configured_scan_root(
 /// symlink, capture its stable object identity and a bounded content witness,
 /// then rewind it for the parser. Discovery metadata is never trusted as the
 /// parse identity: a replacement between enumeration and open is reparsed.
+/// Production opens name their admission (`open_candidate_file_admitted`).
+#[cfg(test)]
 fn open_candidate_file(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
