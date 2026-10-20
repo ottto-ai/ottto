@@ -1705,7 +1705,7 @@ mod tests {
             bytes.extend_from_slice(
                 format!("{{\"row\":{row},\"tag\":\"{tag}\",\"pad\":\"").as_bytes(),
             );
-            bytes.extend(std::iter::repeat_n(b'a', SAMPLE_BYTES));
+            bytes.extend_from_slice(&[b'a'; SAMPLE_BYTES]);
             bytes.extend_from_slice(b"\"}\n");
         }
         bytes

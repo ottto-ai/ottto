@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 723,
-  "content_sha256": "553ea64e14a8ec0b4c769f60d61b70abaed65836ef8e1c842619bc6ce270192c",
+  "content_sha256": "64b1c03f31806da3ed9b7f4e0cf885c62246161121ba31c0448c0321356da66c",
   "files": [
     {
       "executable": false,
@@ -1630,8 +1630,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_acquisition.rs",
-      "sha256": "4f4ac004895336da136487fe7f1dba2b6b8cea7bba23f872fea971675c57bd46",
-      "size_bytes": 79636
+      "sha256": "d9d9c2f7f950266fdc77f86cf436e5928104768c02f3a2846804ebb678c73f9f",
+      "size_bytes": 79629
     },
     {
       "executable": false,
