@@ -15031,9 +15031,15 @@ impl OwnedSourceScan {
                 }
             }
         }
-        let copy_budget = self.sampled_copy_budget();
+        let (copy_budget, measured_resident) = self.sampled_copy_parts();
         if copy_budget == 0 {
-            self.release_sampled_cache_for_copy_refusal();
+            // L-A1: the resident bound from this same walk, before any parse
+            // progress, admission or await; never carried to another step.
+            sampled_scan::release_cache_for_copy_refusal(
+                self.sampling.as_ref(),
+                self.active_file.as_deref(),
+                measured_resident,
+            );
         }
         let Self {
             mut native_comparison,

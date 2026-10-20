@@ -1273,6 +1273,212 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
     }
 }
 
+/// A cached production scan object, stepped by the caller.
+fn cached_scan(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: &Arc<sampled_scan::SharedCache>,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> OwnedSourceScan {
+    let mut scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("mixed-files".into()));
+    setup(&mut scan);
+    scan
+}
+/// Steps `scan` until `stop` holds between two steps.
+fn step_until(
+    mut scan: OwnedSourceScan,
+    mut stop: impl FnMut(&mut OwnedSourceScan) -> bool,
+) -> OwnedSourceScan {
+    for _ in 0..10_000 {
+        if stop(&mut scan) {
+            return scan;
+        }
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { .. } => panic!("the scan completed first"),
+        }
+    }
+    panic!("the scan did not reach the expected step");
+}
+
+/// L-A1 guard matrix: the copy-refusal release called directly on the real
+/// step-start shape of an unsampled native read, and on a borrowed Tail.
+#[test]
+fn sampled_unsampled_native_refusal_guard_matrix() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let release = |scan: &OwnedSourceScan, measured: Option<usize>| {
+        observe(|| {
+            sampled_scan::release_cache_for_copy_refusal(
+                scan.sampling.as_ref(),
+                scan.active_file.as_deref(),
+                measured,
+            )
+        })
+        .1
+    };
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let small = ScanFixture::new(source);
+        let large = ScanFixture::new(source);
+        let small_key = local_index_key(&small.file.0);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        small.file.append(&usage(source, 100, 0, "fixture-model"));
+        production_scan(
+            &small,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        assert!(
+            cache.retained_checkpoint(&small_key).is_some(),
+            "precondition: the unrelated reduction is resident {source:?}"
+        );
+        append_unretainable_rows(&large, source);
+        let mut measured = None;
+        let mut scan = step_until(
+            cached_scan(
+                &large,
+                source,
+                ScanIndex::default(),
+                &cache,
+                incomplete_sidecar_census,
+            ),
+            |scan| {
+                if scan.active_file.is_none() {
+                    return false;
+                }
+                let (budget, resident) = scan.sampled_copy_parts();
+                measured = resident;
+                budget == 0
+            },
+        );
+        let active = scan.active_file.as_deref().unwrap();
+        assert!(
+            active.sampling.is_none()
+                && active.cursor.is_none()
+                && active.group.is_none()
+                && active.aliases.is_empty()
+                && active.applied_receipts.is_empty()
+                && active.parser.reader.acquisition.is_none(),
+            "precondition: an unsampled native read {source:?}"
+        );
+        assert!(
+            measured.is_some(),
+            "precondition: this step measured the residents {source:?}"
+        );
+        let reserved = cache.cursor_reserved();
+
+        // Exempt and measured: no clear, no new copy budget.
+        let counts = release(&scan, measured);
+        assert_eq!(
+            (
+                counts.clear_other_active,
+                counts.clear_full_resident_bound_unknown,
+                counts.clear_metadata_unsupported,
+                counts.clear_no_active,
+                counts.clear_entries_released,
+            ),
+            (0, 0, 0, 0, 0),
+            "{source:?}"
+        );
+        assert!(
+            cache.retained_checkpoint(&small_key).is_some(),
+            "{source:?}"
+        );
+        assert_eq!(
+            scan.sampled_copy_parts(),
+            (0, measured),
+            "residents stay bounded and the copy budget stays zero {source:?}"
+        );
+        assert_eq!(cache.cursor_reserved(), reserved, "{source:?}");
+
+        // Any structural miss keeps ClearOtherActive, even when measured.
+        let candidate = scan.active_file.as_deref().unwrap().candidate.clone();
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.aliases.push(candidate);
+        let counts = release(&scan, measured);
+        assert_eq!(counts.clear_other_active, 1, "alias {source:?}");
+        assert_eq!(counts.clear_entries_released, 1, "{source:?}");
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.aliases.clear();
+        active.applied_receipts.insert(String::new(), None);
+        assert_eq!(
+            release(&scan, measured).clear_other_active,
+            1,
+            "receipt {source:?}"
+        );
+        scan.active_file
+            .as_deref_mut()
+            .unwrap()
+            .applied_receipts
+            .clear();
+
+        // An unknown resident bound keeps the clear, recorded as such.
+        let counts = release(&scan, None);
+        assert_eq!(counts.clear_full_resident_bound_unknown, 1, "{source:?}");
+        assert_eq!(counts.clear_other_active, 0, "{source:?}");
+        // The no-argument wrapper supplies no measurement: conservative.
+        let (_, counts) = observe(|| scan.release_sampled_cache_for_copy_refusal());
+        assert_eq!(counts.clear_full_resident_bound_unknown, 1, "{source:?}");
+        assert_eq!(counts.clear_other_active, 0, "{source:?}");
+        // Unsupported audit metadata keeps its clear.
+        scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
+        let counts = release(&scan, measured);
+        assert_eq!(counts.clear_metadata_unsupported, 1, "{source:?}");
+        assert_eq!(counts.clear_other_active, 0, "{source:?}");
+        drop(scan);
+
+        // A Tail active borrows the taken reduction: ClearOtherActive.
+        let tail = ScanFixture::new(source);
+        let tail_cache = Arc::new(sampled_scan::SharedCache::default());
+        tail.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (tail_index, _, _) = production_scan(
+            &tail,
+            source,
+            ScanIndex::default(),
+            Some(tail_cache.clone()),
+            "mixed-files",
+        );
+        tail.file.append(&usage(source, 140, 1, "fixture-model"));
+        let mut scan = step_until(
+            cached_scan(&tail, source, tail_index, &tail_cache, |_| {}),
+            |scan| scan.active_file.is_some(),
+        );
+        assert!(
+            matches!(
+                scan.active_file
+                    .as_deref()
+                    .and_then(|active| active.sampling.as_ref())
+                    .map(|sampling| sampling.mode),
+                Some(ReadMode::Tail)
+            ),
+            "precondition: a Tail active {source:?}"
+        );
+        let (_, measured) = scan.sampled_copy_parts();
+        assert!(measured.is_some(), "{source:?}");
+        let counts = release(&scan, measured);
+        assert_eq!(counts.clear_other_active, 1, "Tail {source:?}");
+        assert_eq!(counts.clear_full_resident_bound_unknown, 0, "{source:?}");
+    }
+}
+
 #[test]
 fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() {
     if !crate::heap_layout_bound::layout_supported() {
