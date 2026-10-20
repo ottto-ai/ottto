@@ -31182,6 +31182,9 @@ mod tests {
     }
     mod p12_usage_original_tests {
         include!("snapshots/p12_usage_original_tests.rs");
+        mod statemissing_baseline_fold_tests {
+            include!("snapshots/statemissing_baseline_fold_tests.rs");
+        }
     }
 
     mod giant_row_measurement_tests {

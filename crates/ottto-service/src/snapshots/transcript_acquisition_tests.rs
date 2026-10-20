@@ -1914,3 +1914,6 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
         assert_eq!(production_body(source, tail), production_body(source, full));
     }
 }
+
+#[path = "statemissing_baseline_retention_tests.rs"]
+mod statemissing_baseline_retention_tests;
