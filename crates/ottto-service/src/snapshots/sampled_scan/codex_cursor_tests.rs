@@ -543,6 +543,8 @@ fn disclosure() -> Disclosure {
         state_only_blocked_session_ids: vec![SESSION.into()],
         diagnostic_reason: FileReason::OwnershipIncomplete,
         parsed_snapshot_count: 0,
+        held: HeldCounts::default(),
+        parent_ref: None,
     }
 }
 
@@ -554,6 +556,8 @@ fn strict(reason: DebtReason) -> Disclosure {
         state_only_blocked_session_ids: vec![SESSION.into()],
         diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
+        held: HeldCounts::default(),
+        parent_ref: None,
     }
 }
 
@@ -728,31 +732,52 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     assert!(LiveWitness::read(&file, 10_000).is_none());
     let live = LiveWitness::read(&file, 8).unwrap();
     let stamp = OpenStamp::capture(&file).unwrap();
-    let parent = Some(("parent".to_owned(), Some("ledger-1".to_owned())));
+    let parent = Some(ParentDep {
+        id: "parent".into(),
+        ledger: Some("ledger-1".into()),
+        current: Some("p-1".into()),
+    });
+    let now = |ledger: &str, current: &str| ParentNow {
+        ledger: Some(ledger.into()),
+        current: Some(current.into()),
+    };
+    let now_1 = now("ledger-1", "p-1");
     let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
     assert_eq!(entry.parent_ref(), Some("parent"));
+    assert!(entry.matches("digest", &file, Some(&now_1), "").is_some());
+    assert!(entry.matches("other", &file, Some(&now_1), "").is_none());
+    // PR-1 L4: a changed ledger and, separately, a changed parent object
+    // each miss.
     assert!(entry
-        .matches("digest", &file, Some("ledger-1".into()), "")
-        .is_some());
-    assert!(entry
-        .matches("other", &file, Some("ledger-1".into()), "")
+        .matches("digest", &file, Some(&now("ledger-2", "p-1")), "")
         .is_none());
     assert!(entry
-        .matches("digest", &file, Some("ledger-2".into()), "")
+        .matches("digest", &file, Some(&now("ledger-1", "p-2")), "")
+        .is_none());
+    assert!(entry
+        .matches(
+            "digest",
+            &file,
+            Some(&ParentNow {
+                ledger: Some("ledger-1".into()),
+                current: None,
+            }),
+            ""
+        )
         .is_none());
     assert!(entry.matches("digest", &file, None, "").is_none());
     // Growth past the refused offset cannot cure the hold: still a hit, and
     // the hit returns the grown stamp for the entry to keep.
     temp.append(b"{\"n\":3}\n");
     let grown = entry
-        .matches("digest", &file, Some("ledger-1".into()), "")
+        .matches("digest", &file, Some(&now_1), "")
         .expect("growth is a hit");
     assert!(grown.extent > entry.stamp.extent);
     let mut refreshed = entry.clone();
     refreshed.stamp = grown;
     // No timer: an entry whose evidence is unchanged keeps matching.
     assert!(refreshed
-        .matches("digest", &file, Some("ledger-1".into()), "")
+        .matches("digest", &file, Some(&now_1), "")
         .is_some());
     // A same-length stamp change (an in-place write elsewhere) wakes it.
     OpenOptions::new()
@@ -762,13 +787,11 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
         .unwrap();
     assert!(refreshed
-        .matches("digest", &file, Some("ledger-1".into()), "")
+        .matches("digest", &file, Some(&now_1), "")
         .is_none());
     // A rewritten prefix is a miss (re-read).
     fs::write(&temp.0, b"{\"n\":9}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
-    assert!(entry
-        .matches("digest", &file, Some("ledger-1".into()), "")
-        .is_none());
+    assert!(entry.matches("digest", &file, Some(&now_1), "").is_none());
 }
 
 #[test]
@@ -2969,9 +2992,9 @@ fn created_usage(scan: &SourceScanResult) -> Vec<(u64, u64)> {
 }
 
 /// #635 (a), #631 review L1: a projection ahead of the flushed rollout holds
-/// the created thread as `AmbiguousFork`. A held prefix with usage drops it
-/// and is never memoized; a usage-free prefix (header, first task and turn
-/// context, flushed before the first `token_count`) is, on its exact stamp.
+/// the created thread as `AmbiguousFork`. A usage-free prefix (header, first
+/// task and turn context, flushed before the first `token_count`) is
+/// memoized on its exact stamp.
 /// While unchanged it is a memo hit (not re-read); once the append that
 /// cures it lands, the next generation reads the appended bytes and admits
 /// the thread once, with its full usage. An unchanged generation after
@@ -3100,10 +3123,10 @@ fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
 
 /// #635 R2-L2: a lagging projection catches up with an unchanged file. The
 /// file is ahead of its projection, so the sidecar binds nothing and the
-/// created thread is held as `AmbiguousFork`. It holds usage, so the hold is
-/// not memoized (pre-existing: a held file with dropped usage is re-read in
-/// full every generation); the projection change alone cures it, and the
-/// thread is admitted once with its full usage.
+/// created thread is held as `AmbiguousFork`. It holds usage and is
+/// memoized (PR-1's wider gate); the projection change misses it, the
+/// change alone cures it, and the thread is admitted once with its full
+/// usage.
 #[test]
 fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     let home = CreatedThreadHome::new(10, false);
@@ -3118,7 +3141,7 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(
         counter(&cache, |c| c.memo_records),
-        0,
+        1,
         "{}",
         counters(&cache)
     );
@@ -3522,7 +3545,254 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
         "{}",
         counters(&cache)
     );
-    // Its usage-free cure publishes nothing, so the warm index keeps the
-    // block a cold parse never sets.
-    assert_oracle(&home, &cache, &index, &cured, 2, true, &[ORPHAN]);
+    // SB-T1 (L-SB): its usage-free cure publishes nothing, but the re-read
+    // no longer blocks it and no other key holds it, so the warm index
+    // releases it, as a cold parse never sets it.
+    assert!(!index.codex_state_only_blocked_session_ids.contains(ORPHAN));
+    assert_oracle(&home, &cache, &index, &cured, 2, true, &[]);
+}
+
+/// Every census count a held file's fresh parse adds and a memo hit replays
+/// (C-4), plus `scanned_session_count`.
+fn replayed_census(scan: &SourceScanResult) -> Vec<(&'static str, u64)> {
+    vec![
+        ("over_line_cap", scan.over_line_cap_count as u64),
+        (
+            "recognized_usage_drop",
+            scan.recognized_usage_drop_count as u64,
+        ),
+        ("dropped_usage_record", scan.dropped_usage_record_count),
+        (
+            "ownership_incomplete",
+            scan.ownership_incomplete_file_count as u64,
+        ),
+        (
+            "zero_snapshot_usage_evidence",
+            scan.zero_snapshot_usage_evidence_count as u64,
+        ),
+        (
+            "terminal_over_line_cap",
+            scan.terminal_over_line_cap_count as u64,
+        ),
+        (
+            "terminal_recognized_usage_drop",
+            scan.terminal_recognized_usage_drop_count as u64,
+        ),
+        (
+            "terminal_dropped_usage_record",
+            scan.terminal_dropped_usage_record_count,
+        ),
+        ("malformed_json_line", scan.malformed_json_line_count as u64),
+        ("scanned_session", scan.scanned_session_count as u64),
+        (
+            "residue_index_keys",
+            scan.census_residue_index_key_count as u64,
+        ),
+        (
+            "residue_blocked_sessions",
+            scan.census_residue_blocked_session_count as u64,
+        ),
+    ]
+}
+
+/// The memo key the fixture's held file is stored under.
+fn stored_memo_key(home: &CreatedThreadHome, cache: &SharedCache) -> String {
+    let scope = Scope("cursor-fixture".into());
+    [home.path.clone(), fs::canonicalize(&home.path).unwrap()]
+        .iter()
+        .map(|path| memo_key(&scope, &local_index_key(path)))
+        .find(|key| cache.memo_lookup(key).is_some())
+        .expect("stored entry")
+}
+
+/// PR-1 replay and gate. A usage-bearing held fork (the full body with
+/// `forked_from_id` and no trusted parent) is now memoized.
+/// - T1/C-T3: an unchanged generation hits at zero transcript bytes and
+///   discloses exactly what a cold full parse does: every replayed census
+///   count, `scanned_session_count` and the blocked set. The before-parse
+///   seam never runs for a hit.
+/// - T20 (R1-M1): an entry forced to `own_ledger(true)` for an owed parent
+///   is bypassed (counted `memo_miss_other`) and the file is parsed again.
+/// - T18: growth with every other input unchanged is counted as an
+///   exact-stamp miss with the grown extent, then re-read equal to cold.
+#[test]
+fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
+    use crate::local_resource_diagnostics::codex_memo_lifecycle;
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let parsed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PathBuf>::new()));
+    let hook = {
+        let parsed = std::rc::Rc::clone(&parsed);
+        move |path: &Path| parsed.borrow_mut().push(path.to_path_buf())
+    };
+    let (index, held) = crate::snapshots::with_codex_before_parse(hook.clone(), || {
+        home.generation(ScanIndex::default(), &cache, 0)
+    });
+    assert_eq!(parsed.borrow().len(), 1, "{}", counters(&cache));
+    assert!(created_usage(&held).is_empty(), "{}", counters(&cache));
+    assert!(held.recognized_usage_drop_count > 0, "usage-bearing hold");
+    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        1,
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(replayed_census(&held), replayed_census(&home.oracle(0).1));
+    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+
+    let ((index, quiet), counts) = codex_memo_lifecycle::observe(|| {
+        crate::snapshots::with_codex_before_parse(hook.clone(), || {
+            home.generation(index, &cache, 1)
+        })
+    });
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(parsed.borrow().len(), 1, "a hit is never parsed");
+    assert_eq!(
+        counts.memo_hit_estimated_avoided_parser_bytes,
+        fs::metadata(&home.path).unwrap().len()
+    );
+    assert_eq!(replayed_census(&quiet), replayed_census(&home.oracle(1).1));
+    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
+
+    // T20: the owed-parent bypass.
+    let key = stored_memo_key(&home, &cache);
+    let forced = cache.memo_lookup(&key).unwrap().own_ledger(true);
+    assert!(forced.has_own_ledger());
+    cache.memo_record(key.clone(), forced);
+    let mut index = index;
+    index.codex_parent_ownership_refs.insert(CREATED.to_owned());
+    let records = counter(&cache, |c| c.memo_records);
+    let ((mut index, _), counts) = codex_memo_lifecycle::observe(|| {
+        crate::snapshots::with_codex_before_parse(hook.clone(), || {
+            home.generation(index, &cache, 2)
+        })
+    });
+    assert_eq!(counts.memo_miss_other, 1, "{counts:?}");
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
+    assert_eq!(parsed.borrow().len(), 2, "bypassed: parsed again");
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        records + 1,
+        "{}",
+        counters(&cache)
+    );
+    assert!(!cache.memo_lookup(&key).unwrap().has_own_ledger());
+    index.codex_parent_ownership_refs.remove(CREATED);
+
+    // T18: growth alone.
+    let extra = codex_line(json!({
+        "timestamp": bounded_rfc3339_millis(home.base_ms + 7_000).unwrap(),
+        "type": "turn_context",
+        "payload": {"turn_id": "grown-turn", "model": "gpt-5.6-sol"},
+        "ordinal": 10,
+    }));
+    OpenOptions::new()
+        .append(true)
+        .open(&home.path)
+        .unwrap()
+        .write_all(&extra)
+        .unwrap();
+    let ((index, grown), counts) =
+        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 3));
+    assert_eq!(
+        (
+            counts.memo_miss_exact_stamp,
+            counts.memo_miss_exact_stamp_bytes,
+            counts.memo_miss_other,
+            counts.memo_hit_estimated_avoided_parser_bytes,
+        ),
+        (1, fs::metadata(&home.path).unwrap().len(), 0, 0),
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(replayed_census(&grown), replayed_census(&home.oracle(3).1));
+    assert_oracle(&home, &cache, &index, &grown, 3, true, &[]);
+}
+
+/// L-SB site 3 (the one writer): a settleable disclosure replaces the key's
+/// attribution and releases what it no longer blocks; a strict one keeps
+/// the prior attribution and adds its owner (R1-M2). A replayed disclosure
+/// adds the held line and drop totals and re-requests its parent.
+#[test]
+fn one_writer_attributes_and_replays_held_totals() {
+    let candidate = CandidateFile {
+        scan_root: PathBuf::from("/synthetic/sessions"),
+        path: PathBuf::from(format!(
+            "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
+        )),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: "revision".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let key = local_index_key(&candidate.path);
+    let mut index = ScanIndex::default();
+    let mut census = ScanCensus::default();
+    let mut disclose = |disclosure: &Disclosure, index: &mut ScanIndex| {
+        let mut residue = BTreeSet::new();
+        let mut residue_blocked = BTreeSet::new();
+        let mut blocked = BTreeSet::new();
+        let mut pending = Vec::new();
+        disclose_terminal_codex_debt(
+            disclosure,
+            &candidate,
+            (None, None),
+            index,
+            DisclosureTargets {
+                census: &mut census,
+                residue_index_keys: &mut residue,
+                residue_blocked_session_ids: &mut residue_blocked,
+                codex_state_only_blocked_session_ids: &mut blocked,
+                pending_finalization: &mut pending,
+            },
+        );
+    };
+    let mut held = disclosure();
+    held.state_only_blocked_session_ids = vec![SESSION.into(), SESSION_B.into()];
+    held.held = HeldCounts {
+        over_line_cap: 2,
+        recognized_usage_drop: 3,
+        dropped_usage_record: 4,
+        terminal_line_loss: 2,
+    };
+    held.parent_ref = Some("019fa111-2222-7333-8444-777777777777".into());
+    disclose(&held, &mut index);
+    assert_eq!(
+        index.codex_state_only_blocked_by_file[&key],
+        BTreeSet::from([SESSION.to_owned(), SESSION_B.to_owned()])
+    );
+    assert!(index
+        .codex_parent_ownership_refs
+        .contains("019fa111-2222-7333-8444-777777777777"));
+    // A strict disclosure keeps the prior attribution and adds.
+    let mut owner = strict(DebtReason::JoinStateBound);
+    owner.state_only_blocked_session_ids = vec!["019fa111-2222-7333-8444-888888888888".into()];
+    disclose(&owner, &mut index);
+    assert_eq!(index.codex_state_only_blocked_by_file[&key].len(), 3);
+    // A shrinking settleable replay releases what it no longer blocks.
+    disclose(&disclosure(), &mut index);
+    assert_eq!(
+        index.codex_state_only_blocked_by_file[&key],
+        BTreeSet::from([SESSION.to_owned()])
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(SESSION));
+    assert!(!index
+        .codex_state_only_blocked_session_ids
+        .contains(SESSION_B));
+    // Only the first (settleable, replayed) disclosure added totals.
+    assert_eq!(
+        (
+            census.over_line_cap_count,
+            census.recognized_usage_drop_count,
+            census.dropped_usage_record_count,
+            census.terminal_over_line_cap_count,
+            census.terminal_recognized_usage_drop_count,
+            census.terminal_dropped_usage_record_count,
+        ),
+        (2, 3, 4, 2, 2, 2)
+    );
 }

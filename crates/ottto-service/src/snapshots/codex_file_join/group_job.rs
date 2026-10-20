@@ -106,6 +106,8 @@ pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosur
         state_only_blocked_session_ids: vec![owner.to_owned()],
         diagnostic_reason: FileReason::OwnershipIncomplete,
         parsed_snapshot_count: 0,
+        held: cursor::HeldCounts::default(),
+        parent_ref: None,
     }
 }
 
@@ -119,6 +121,8 @@ fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
         state_only_blocked_session_ids: vec![owner.to_owned()],
         diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
+        held: cursor::HeldCounts::default(),
+        parent_ref: None,
     }
 }
 

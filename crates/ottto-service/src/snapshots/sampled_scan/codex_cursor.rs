@@ -2535,11 +2535,17 @@ impl SharedCache {
             if cursor.memo.insert(key, entry) {
                 cursor.counters.memo_records += 1;
             }
+            // `insert` changes the map either way (insert, evict, or remove).
+            cursor.memo.publish_resident();
         });
     }
 
     pub(in crate::snapshots) fn memo_forget(&self, key: &str) {
-        self.with_cursor(|cursor| cursor.memo.remove(key));
+        self.with_cursor(|cursor| {
+            if cursor.memo.remove(key) {
+                cursor.memo.publish_resident();
+            }
+        });
     }
 }
 
@@ -3249,10 +3255,45 @@ pub(in crate::snapshots) struct Disclosure {
     pub(in crate::snapshots) state_only_blocked_session_ids: Vec<String>,
     pub(in crate::snapshots) diagnostic_reason: FileReason,
     pub(in crate::snapshots) parsed_snapshot_count: usize,
+    /// The fresh held parse's line and drop totals, replayed on a hit.
+    pub(in crate::snapshots) held: HeldCounts,
+    /// The parse's parent request, replayed on a hit (same 256 rule).
+    pub(in crate::snapshots) parent_ref: Option<String>,
 }
 crate::heap_layout_bound::fields!(Disclosure; reason, ownership_incomplete_file_count,
     zero_snapshot_usage_evidence, state_only_blocked_session_ids, diagnostic_reason,
-    parsed_snapshot_count);
+    parsed_snapshot_count, held, parent_ref);
+
+/// PR-1: the line and drop totals a fresh held parse adds to the census,
+/// replayed on a hit. All inline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct HeldCounts {
+    pub(in crate::snapshots) over_line_cap: usize,
+    pub(in crate::snapshots) recognized_usage_drop: usize,
+    pub(in crate::snapshots) dropped_usage_record: u64,
+    /// `ParsedJsonlFile::terminal_line_loss_count`.
+    pub(in crate::snapshots) terminal_line_loss: usize,
+}
+crate::heap_layout_bound::fields!(HeldCounts; over_line_cap, recognized_usage_drop,
+    dropped_usage_record, terminal_line_loss);
+
+/// PR-1: what the held classification depended on in its parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct ParentDep {
+    pub(in crate::snapshots) id: String,
+    /// The ledger identity the classification used (`None`: none was used).
+    pub(in crate::snapshots) ledger: Option<String>,
+    /// The parent's opened identity at record time: the identity the
+    /// after-parse fence just proved when a ledger was used, else the probe.
+    pub(in crate::snapshots) current: Option<String>,
+}
+crate::heap_layout_bound::fields!(ParentDep; id, ledger, current);
+
+/// The parent's state at lookup: the index ledger identity and the probe.
+pub(in crate::snapshots) struct ParentNow {
+    pub(in crate::snapshots) ledger: Option<String>,
+    pub(in crate::snapshots) current: Option<String>,
+}
 
 /// Strict debt of a job that ended without a publishable result
 /// (`JoinStateBound`, `MemberChanged`): its owner is blocked, the prior body
@@ -3271,6 +3312,8 @@ fn strict_disclosure(
         state_only_blocked_session_ids: owner.into_iter().collect(),
         diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
+        held: HeldCounts::default(),
+        parent_ref: None,
     }
 }
 
@@ -3294,28 +3337,32 @@ pub(in crate::snapshots) struct MemoEntry {
     live: Option<LiveWitness>,
     /// The held file's stamp when recorded or last matched.
     stamp: OpenStamp,
-    /// Parent ref and its ledger identity: a new or changed parent ledger
-    /// is peer evidence that can cure an ambiguous-fork hold.
-    parent: Option<(String, Option<String>)>,
+    /// Parent ref, the ledger identity used, and the parent's opened
+    /// identity: a new or changed parent ledger or parent object is peer
+    /// evidence that can change the hold.
+    parent: Option<ParentDep>,
     /// `sidecar_fingerprint` when recorded, for holds sidecar evidence can
     /// cure (`sidecar_wakes`).
     sidecar: Option<String>,
     /// The hold may be cured by the file catching up with its sidecar
     /// extent (`growth_may_cure`): only the exact recorded stamp is a hit.
     exact_stamp: bool,
+    /// This parse produced a `scan_complete` ledger of its own, so a re-read
+    /// as a referenced parent would insert it.
+    own_ledger: bool,
     disclosure: Disclosure,
     used: u64,
     charge: usize,
 }
 crate::heap_layout_bound::fields!(MemoEntry; digest, live, stamp, parent, sidecar, exact_stamp,
-    disclosure, used, charge);
+    own_ledger, disclosure, used, charge);
 
 impl MemoEntry {
     pub(in crate::snapshots) fn new(
         digest: String,
         live: LiveWitness,
         stamp: OpenStamp,
-        parent: Option<(String, Option<String>)>,
+        parent: Option<ParentDep>,
         sidecar: Option<String>,
         disclosure: Disclosure,
     ) -> Self {
@@ -3328,7 +3375,7 @@ impl MemoEntry {
         digest: String,
         live: Option<LiveWitness>,
         stamp: OpenStamp,
-        parent: Option<(String, Option<String>)>,
+        parent: Option<ParentDep>,
         sidecar: Option<String>,
         disclosure: Disclosure,
     ) -> Self {
@@ -3339,6 +3386,7 @@ impl MemoEntry {
             parent,
             sidecar,
             exact_stamp: false,
+            own_ledger: false,
             disclosure,
             used: 0,
             charge: 0,
@@ -3351,23 +3399,55 @@ impl MemoEntry {
         self
     }
 
+    /// This parse produced a `scan_complete` ledger of its own. Always
+    /// false for an ownership-incomplete parse today (its ledger is cleared);
+    /// a guard should that change.
+    pub(in crate::snapshots) fn own_ledger(mut self, own_ledger: bool) -> Self {
+        self.own_ledger = own_ledger;
+        self
+    }
+
+    pub(in crate::snapshots) fn has_own_ledger(&self) -> bool {
+        self.own_ledger
+    }
+
     pub(in crate::snapshots) fn disclosure(&self) -> &Disclosure {
         &self.disclosure
     }
 
     pub(in crate::snapshots) fn parent_ref(&self) -> Option<&str> {
-        self.parent.as_ref().map(|(parent, _)| parent.as_str())
+        self.parent.as_ref().map(|dep| dep.id.as_str())
     }
 
-    /// Every wake dependency is unchanged, the held file only grew or is
-    /// untouched since its stamp, and the live witness still holds at the
-    /// refused offset. Growth past that offset is a hit. Returns the current
-    /// stamp on a hit.
+    /// Every wake dependency except the stamp holds.
+    fn dependencies_hold(
+        &self,
+        digest: &str,
+        file: &File,
+        parent_now: Option<&ParentNow>,
+        sidecar_now: &str,
+    ) -> bool {
+        self.digest == digest
+            && self.parent.as_ref().map_or(true, |dep| {
+                parent_now.is_some_and(|now| dep.ledger == now.ledger && dep.current == now.current)
+            })
+            && self
+                .sidecar
+                .as_deref()
+                .map_or(true, |sidecar| sidecar == sidecar_now)
+            && self.live.as_ref().map_or(true, |live| {
+                LiveWitness::read(file, live.offset).as_ref() == Some(live)
+            })
+    }
+
+    /// Every wake dependency is unchanged, the held file is untouched since
+    /// its stamp (or only grew, for a non-exact group entry), and the live
+    /// witness still holds. Returns the current stamp on a hit.
     pub(in crate::snapshots) fn matches(
         &self,
         digest: &str,
         file: &File,
-        parent_ledger: Option<String>,
+        parent_now: Option<&ParentNow>,
         sidecar_now: &str,
     ) -> Option<OpenStamp> {
         let now = OpenStamp::capture(file).ok()?;
@@ -3376,20 +3456,25 @@ impl MemoEntry {
         } else {
             self.stamp.append_compatible(&now)
         };
-        (self.digest == digest
-            && stamp_holds
-            && self
-                .parent
-                .as_ref()
-                .map_or(true, |(_, ledger)| *ledger == parent_ledger)
-            && self
-                .sidecar
-                .as_deref()
-                .map_or(true, |sidecar| sidecar == sidecar_now)
-            && self.live.as_ref().map_or(true, |live| {
-                LiveWitness::read(file, live.offset).as_ref() == Some(live)
-            }))
-        .then_some(now)
+        (stamp_holds && self.dependencies_hold(digest, file, parent_now, sidecar_now))
+            .then_some(now)
+    }
+
+    /// L-2: an exact entry whose file only grew while every other wake input
+    /// held (the re-read a counted tail would save): the current extent.
+    pub(in crate::snapshots) fn grew_past_exact(
+        &self,
+        digest: &str,
+        file: &File,
+        parent_now: Option<&ParentNow>,
+        sidecar_now: &str,
+    ) -> Option<u64> {
+        let now = OpenStamp::capture(file).ok()?;
+        (self.exact_stamp
+            && now != self.stamp
+            && self.stamp.append_compatible(&now)
+            && self.dependencies_hold(digest, file, parent_now, sidecar_now))
+        .then(|| now.extent())
     }
 }
 
@@ -3446,8 +3531,19 @@ impl SingletonMemo {
         }
     }
 
-    fn remove(&mut self, key: &str) {
-        self.entries.remove(key);
+    fn remove(&mut self, key: &str) -> bool {
+        self.entries.remove(key).is_some()
+    }
+
+    /// L-2 gauge: the memo's measured bytes (the per-entry charges). O(entries
+    /// <= MEMO_ENTRIES), under the cursor lock already held. The entry count
+    /// is `CodexCursorRetained.memo_entries`.
+    fn publish_resident(&self) {
+        let bytes = self
+            .entries
+            .values()
+            .fold(0_u64, |sum, entry| sum.saturating_add(entry.charge as u64));
+        crate::local_resource_diagnostics::codex_memo_lifecycle::set_resident(bytes);
     }
 }
 
@@ -3472,7 +3568,7 @@ pub(in crate::snapshots) fn memo_digest(
 ) -> Option<String> {
     let stamp = OpenStamp::capture(file).ok()?;
     Some(sha256_hex(&[
-        "codex_singleton_memo:v2",
+        "codex_singleton_memo:v3",
         CODEX_JOIN_PROOF_VERSION,
         SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
@@ -3484,6 +3580,20 @@ pub(in crate::snapshots) fn memo_digest(
             .as_deref()
             .unwrap_or("none"),
         counting,
+        // PR-1: the tier receipt configures the parse
+        // (`configure_tier_replay`), contents included.
+        &{
+            let (receipt, required) = crate::snapshots::codex_file_join::receipt_state(
+                index.files.get(&local_index_key(&candidate.path)),
+            );
+            let receipt = receipt.map_or_else(
+                || "none".to_owned(),
+                |receipt| {
+                    serde_json::to_string(&receipt).unwrap_or_else(|_| "unserializable".to_owned())
+                },
+            );
+            format!("receipt:{required}:{receipt}")
+        },
         dependencies,
         // Class 7: an identity conflict on a candidate changes the blocked
         // ids of any hold, sidecar-woken or not.
@@ -3581,6 +3691,19 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
             .codex_state_only_blocked_session_ids
             .insert(session_id);
     }
+    // L-SB: a settleable disclosure is this key's whole latest parse; a
+    // strict one keeps the prior body, so it keeps the prior attribution
+    // plus its owner.
+    let blocked = disclosure
+        .state_only_blocked_session_ids
+        .iter()
+        .map(|session_id| resolve_codex_identity(session_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    if settleable {
+        index.attribute_codex_blocked(&index_key, blocked);
+    } else {
+        index.extend_codex_blocked_attribution(&index_key, blocked);
+    }
     targets.pending_finalization.push(PendingIndexFinalization {
         sampled_audit_verified: false,
         codex_pending_recovery: index
@@ -3601,6 +3724,34 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
             disclosure.ownership_incomplete_file_count;
         targets.census.zero_snapshot_usage_evidence_count +=
             usize::from(disclosure.zero_snapshot_usage_evidence);
+        // PR-1: the fresh finish's line and drop totals.
+        let held = &disclosure.held;
+        targets.census.over_line_cap_count += held.over_line_cap;
+        targets.census.recognized_usage_drop_count += held.recognized_usage_drop;
+        targets.census.dropped_usage_record_count = targets
+            .census
+            .dropped_usage_record_count
+            .saturating_add(held.dropped_usage_record);
+        if held.terminal_line_loss > 0 {
+            let loss = held.terminal_line_loss;
+            targets.census.terminal_over_line_cap_count = targets
+                .census
+                .terminal_over_line_cap_count
+                .saturating_add(loss);
+            targets.census.terminal_recognized_usage_drop_count = targets
+                .census
+                .terminal_recognized_usage_drop_count
+                .saturating_add(loss);
+            targets.census.terminal_dropped_usage_record_count = targets
+                .census
+                .terminal_dropped_usage_record_count
+                .saturating_add(loss as u64);
+        }
+        // PR-1: a memo hit is this child's parent request too (refs are
+        // cleared on index reset).
+        if let Some(parent) = disclosure.parent_ref.as_deref() {
+            index.record_codex_parent_ref(parent);
+        }
     } else {
         targets
             .census
