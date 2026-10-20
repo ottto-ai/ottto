@@ -702,13 +702,13 @@ pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) join_terminal_debt: [u64; codex_file_join::JOIN_REFUSALS],
     /// PR-P (RAM/test only; not in the diagnostics projection, no export):
     /// parent witnesses refused at admission, forgotten by a feasible
-    /// mandatory admission (one per witness), dropped with a namespace past
+    /// mandatory admission (one per witness), new namespaces refused past
     /// `ROTATION_KEYS`, restart slots evicted past `ROTATION_KEYS`, and match
     /// marks refused. Production sees their effects only through the census
     /// `parent_unresolvable` counts and `parent_restarts_in_scope`.
     pub(in crate::snapshots) parent_witness_refused: u64,
     pub(in crate::snapshots) parent_witness_evicted: u64,
-    pub(in crate::snapshots) parent_namespace_evicted: u64,
+    pub(in crate::snapshots) parent_namespace_refused: u64,
     pub(in crate::snapshots) parent_restart_slot_evicted: u64,
     pub(in crate::snapshots) parent_match_unmarked: u64,
 }
@@ -720,7 +720,7 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
     audit_overdue_max_age_seconds, sealed_fragment_withheld, eof_record_applied,
     jobs_unavailable_ended, memo_hits, memo_records, parked_hits, groups_started,
     group_memo_hits, join_in_progress_members, groups_fenced, probe_bound, join_terminal_debt,
-    parent_witness_refused, parent_witness_evicted, parent_namespace_evicted,
+    parent_witness_refused, parent_witness_evicted, parent_namespace_refused,
     parent_restart_slot_evicted, parent_match_unmarked);
 
 /// A `JoinStateBound` file waits here until its object or reduction
@@ -888,7 +888,8 @@ impl HeapLayoutBound for ParentWitnesses {
 }
 
 /// PR-P per-namespace witnesses; RAM only. Never stale-pruned: bounded at
-/// `ROTATION_KEYS` entries by LRU on `touched`, charged, and released early
+/// `ROTATION_KEYS` entries (an optional admission for a new namespace past
+/// them is refused, `parent_namespace_full`), charged, and released early
 /// only by a feasible mandatory admission under memory pressure
 /// (`admit_locked`), in bounded batches. The restart counters live apart
 /// (`ParentRestarts`).
@@ -988,7 +989,13 @@ pub(in crate::snapshots) const PARENT_RESTART_BUDGET: u64 = 2;
 
 /// A namespace's parent state, cloned out under the cursor lock.
 pub(in crate::snapshots) struct ParentState {
+    /// The restart count deciding the budget; a poisoned cursor reads it
+    /// spent (fail closed).
     pub(in crate::snapshots) restarts: u64,
+    /// N1: `restarts` was observed in the table. False on a poisoned cursor,
+    /// whose fail-closed `restarts` is a decision, not a count: the
+    /// diagnostics then omit `parent_restarts_in_scope`.
+    pub(in crate::snapshots) restarts_observed: bool,
     pub(in crate::snapshots) matched: Option<(String, u64)>,
     pub(in crate::snapshots) witnesses: Vec<(String, ParentWitness)>,
 }
@@ -2271,11 +2278,19 @@ fn parent_entry_charge(exists: bool, namespace: &str, scope: &str) -> Option<usi
         >()?)
 }
 
+/// PR-P (N2): whether `namespace` would be a new entry past `ROTATION_KEYS`.
+/// Every caller is an optional admission and refuses it before admitting
+/// anything (`parent_namespace_refused`): the retained namespaces and their
+/// witnesses are never evicted for a newcomer (the count bound, not the memory
+/// valve). The newcomer's parents stay owed (re-read, fail-closed). An entry
+/// of another scope is not new: it is replaced in place.
+fn parent_namespace_full(cursor: &CursorState, namespace: &str) -> bool {
+    cursor.parents.len() >= ROTATION_KEYS && !cursor.parents.contains_key(namespace)
+}
+
 /// PR-P: the namespace's entry after admission: an entry of another scope is
-/// dropped, and a new one past `ROTATION_KEYS` first forgets the least
-/// recently touched entry (`parent_namespace_evicted`; the count bound, not
-/// the memory valve). The admitted charge covered the new entry; the evicted
-/// one is freed here, under the lock that counted it.
+/// dropped and replaced. None for a new namespace past `ROTATION_KEYS`
+/// (`parent_namespace_full`, which the caller checked before admitting).
 fn parent_entry<'a>(
     cursor: &'a mut CursorState,
     exists: bool,
@@ -2284,18 +2299,10 @@ fn parent_entry<'a>(
     page: u64,
 ) -> Option<&'a mut NamespaceParents> {
     if !exists {
-        cursor.parents.remove(namespace);
-        if cursor.parents.len() >= ROTATION_KEYS {
-            if let Some(oldest) = cursor.parents.values().map(|entry| entry.touched).min() {
-                let mut first = true;
-                cursor.parents.retain(|_, entry| {
-                    let victim = first && entry.touched == oldest;
-                    first &= !victim;
-                    !victim
-                });
-                cursor.counters.parent_namespace_evicted += 1;
-            }
+        if parent_namespace_full(cursor, namespace) {
+            return None;
         }
+        cursor.parents.remove(namespace);
         cursor.parents.insert(
             exact_copy(namespace),
             NamespaceParents {
@@ -2640,7 +2647,8 @@ impl SharedCache {
     /// Touches the (namespace, scope) restart slot and the witness entry; an
     /// entry of another scope is dropped (its witnesses are lost and
     /// revalidated fail-closed). Never inserts into `parents`. A poisoned
-    /// cursor reports the budget spent and nothing witnessed (fail closed).
+    /// cursor reports the budget spent and nothing witnessed (fail closed),
+    /// with the count unobserved (N1).
     pub(in crate::snapshots) fn parent_state(&self, namespace: &Scope, scope: &str) -> ParentState {
         self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
@@ -2663,6 +2671,7 @@ impl SharedCache {
                     entry.touched = page;
                     ParentState {
                         restarts,
+                        restarts_observed: true,
                         matched: entry.matched.clone(),
                         witnesses: entry
                             .witnesses
@@ -2674,6 +2683,7 @@ impl SharedCache {
                 }
                 None => ParentState {
                     restarts,
+                    restarts_observed: true,
                     matched: None,
                     witnesses: Vec::new(),
                 },
@@ -2681,6 +2691,7 @@ impl SharedCache {
         })
         .unwrap_or(ParentState {
             restarts: PARENT_RESTART_BUDGET,
+            restarts_observed: false,
             matched: None,
             witnesses: Vec::new(),
         })
@@ -2694,9 +2705,10 @@ impl SharedCache {
     /// node, key, scope and empty-map root. Construction is checked against it. Unsupported
     /// layout or no room: refused (`parent_witness_refused`), nothing kept.
     /// The count bound is separate: a witness for a new namespace past
-    /// `ROTATION_KEYS` (the 65th) drops the least recently touched
-    /// namespace's entry with all its witnesses (`parent_namespace_evicted`);
-    /// those parents are revalidated fail-closed on their next match.
+    /// `ROTATION_KEYS` (the 65th) is refused before admission
+    /// (`parent_namespace_refused`, also `parent_witness_refused`); the 64
+    /// retained namespaces keep their witnesses, and the newcomer's parent
+    /// stays owed.
     pub(in crate::snapshots) fn witness_parent(
         &self,
         namespace: &Scope,
@@ -2722,6 +2734,11 @@ impl SharedCache {
         };
         let admitted = self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
+            if parent_namespace_full(cursor, &namespace.0) {
+                cursor.counters.parent_namespace_refused += 1;
+                cursor.counters.parent_witness_refused += 1;
+                return false;
+            }
             let exists = cursor
                 .parents
                 .get(&namespace.0)
@@ -2815,8 +2832,9 @@ impl SharedCache {
     }
 
     /// PR-P: marks the namespace matched for this traversal, admitted like
-    /// `witness_parent` (the copied end, plus a new entry). A refusal leaves
-    /// it unmarked, so the next page re-matches (`parent_match_unmarked`).
+    /// `witness_parent` (the copied end, plus a new entry; a new namespace
+    /// past `ROTATION_KEYS` is refused the same way). A refusal leaves it
+    /// unmarked, so the next page re-matches (`parent_match_unmarked`).
     pub(in crate::snapshots) fn mark_parents_matched(
         &self,
         namespace: &Scope,
@@ -2832,6 +2850,11 @@ impl SharedCache {
         };
         self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
+            if parent_namespace_full(cursor, &namespace.0) {
+                cursor.counters.parent_namespace_refused += 1;
+                cursor.counters.parent_match_unmarked += 1;
+                return;
+            }
             let exists = cursor
                 .parents
                 .get(&namespace.0)
@@ -2858,8 +2881,13 @@ impl SharedCache {
 
     /// PR-P: one parent-resolution restart of (namespace, scope); returns the
     /// new count. Inline table: never refused, no heap. A poisoned cursor
-    /// reports the budget spent.
-    pub(in crate::snapshots) fn note_parent_restart(&self, namespace: &Scope, scope: &str) -> u64 {
+    /// counts nothing and returns None (N1: an unknown count, never the
+    /// budget reported as observed).
+    pub(in crate::snapshots) fn note_parent_restart(
+        &self,
+        namespace: &Scope,
+        scope: &str,
+    ) -> Option<u64> {
         self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
             let (slot, evicted) = cursor
@@ -2872,7 +2900,6 @@ impl SharedCache {
             }
             restarts
         })
-        .unwrap_or(PARENT_RESTART_BUDGET)
     }
 
     /// §d.1.3: B blocked `owner` for a queued group of `members`. The exact

@@ -794,9 +794,10 @@ pub(crate) struct CodexScanDiagnostics {
     /// PR-P: the scope's parent-resolution restart budget consumed, only when
     /// this page established it (its step-start pass or a restart ran).
     /// Omitted, never a fabricated 0, on discovery pages or without a shared
-    /// cache. A budget counter, not a count of actual restarts: an evicted
-    /// slot re-enters spent and a poisoned cursor reports the budget
-    /// (`Some(2)`), so it may read 2 (or exceed it after re-entry) with fewer
+    /// cache, and omitted when the cursor is poisoned (N1: the scan still
+    /// treats the budget as spent, but the count is unknown). A budget
+    /// counter, not a count of actual restarts: an evicted slot re-enters
+    /// spent, so it may read 2 (or exceed it after re-entry) with fewer
     /// restarts run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_restarts_in_scope: Option<u64>,

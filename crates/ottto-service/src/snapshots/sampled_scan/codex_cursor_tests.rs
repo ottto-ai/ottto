@@ -6055,7 +6055,7 @@ fn evicted_restart_slot_reenters_spent() {
     let cache = SharedCache::default();
     let first = Scope("namespace-00".into());
     assert_eq!(cache.parent_state(&first, "scope").restarts, 0);
-    assert_eq!(cache.note_parent_restart(&first, "scope"), 1);
+    assert_eq!(cache.note_parent_restart(&first, "scope"), Some(1));
     for n in 1..ROTATION_KEYS {
         cache.with_cursor(|cursor| cursor.rotation.page += 1);
         let namespace = Scope(format!("namespace-{n:02}"));
@@ -6086,7 +6086,7 @@ fn evicted_restart_slot_reenters_spent() {
     }
     assert_eq!(
         cache.note_parent_restart(&first, "scope"),
-        PARENT_RESTART_BUDGET + 1,
+        Some(PARENT_RESTART_BUDGET + 1),
         "counted, never reset"
     );
     assert!(cache
@@ -6155,7 +6155,7 @@ fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
     }
     assert!(cache.cursor_resident() < STATE_BYTES);
     assert!(cache.with_cursor(|cursor| cursor.parents.len()).unwrap() <= ROTATION_KEYS);
-    assert!(counter(&cache, |c| c.parent_namespace_evicted) > 0);
+    assert!(counter(&cache, |c| c.parent_namespace_refused) > 0);
     let credit = cache
         .cursor_reserve(STATE_BYTES - empty - floor)
         .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
@@ -6166,6 +6166,109 @@ fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
     credit.refund();
     assert_eq!(cache.cursor_reserved(), 0);
     assert_eq!(cache.cursor_resident(), empty);
+}
+
+/// #643 intake ruling (a), N2: an optional witness or match mark for a new
+/// 65th namespace is refused before admission and changes nothing retained:
+/// the 64 namespaces keep their entries, witnesses and marks, and the
+/// newcomer gets no settling witness and no match mark, so step start applies
+/// nothing to it and its parent stays owed (re-read, fail-closed). An existing
+/// namespace's update and a mandatory admission's eviction are unchanged.
+#[test]
+fn optional_65th_namespace_is_refused_and_the_retained_64_are_kept() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = retained_floor(&cache);
+    let empty = cache.cursor_resident();
+    let namespace = |n: usize| Scope(format!("namespace-{n:02}"));
+    for n in 0..ROTATION_KEYS {
+        cache.with_cursor(|cursor| cursor.rotation.page += 1);
+        assert!(cache.witness_parent(&namespace(n), "scope", PARENT, absent_witness()));
+        cache.mark_parents_matched(&namespace(n), "scope", "window-end", 0);
+    }
+    let retained = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| {
+                cursor
+                    .parents
+                    .iter()
+                    .map(|(key, entry)| {
+                        (
+                            key.clone(),
+                            entry.scope.clone(),
+                            entry.touched,
+                            entry.matched.clone(),
+                            entry
+                                .witnesses
+                                .entries
+                                .iter()
+                                .map(|(parent, (witness, charge))| {
+                                    (parent.clone(), witness.clone(), *charge)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+    };
+    let before = retained(&cache);
+    assert_eq!(before.len(), ROTATION_KEYS);
+    let resident = cache.cursor_resident();
+    let newcomer = namespace(ROTATION_KEYS);
+    cache.with_cursor(|cursor| cursor.rotation.page += 1);
+    assert!(!cache.witness_parent(&newcomer, "scope", PARENT, absent_witness()));
+    cache.mark_parents_matched(&newcomer, "scope", "window-end", 0);
+    assert_eq!(retained(&cache), before, "the retained 64 are unchanged");
+    assert_eq!(cache.cursor_resident(), resident);
+    assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
+    assert_eq!(counter(&cache, |c| c.parent_witness_refused), 1);
+    assert_eq!(counter(&cache, |c| c.parent_match_unmarked), 1);
+    let state = cache.parent_state(&newcomer, "scope");
+    assert!(
+        state.witnesses.is_empty() && state.matched.is_none(),
+        "the overflow stays owed"
+    );
+    // An existing namespace still takes an update past the count bound.
+    assert!(cache.witness_parent(&namespace(0), "scope", "another-parent", absent_witness()));
+    assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
+    // A mandatory admission still forgets witnesses for its room.
+    let credit = cache
+        .cursor_reserve(STATE_BYTES - empty - floor)
+        .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
+    assert!(cache
+        .with_cursor(|cursor| cursor.parents.is_empty())
+        .unwrap());
+    credit.refund();
+}
+
+/// #643 intake N1: a poisoned cursor keeps the fail-closed restart decision
+/// (the budget reads spent) but reports the count as unknown, so the
+/// diagnostics omit `parent_restarts_in_scope` instead of reporting the
+/// budget as an observed `Some(2)`.
+#[test]
+fn poisoned_cursor_spends_the_budget_but_reports_no_restart_count() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let cache = SharedCache::default();
+    let namespace = Scope("namespace".into());
+    let state = cache.parent_state(&namespace, "scope");
+    assert!(state.restarts_observed);
+    assert_eq!(state.restarts, 0);
+    assert_eq!(cache.note_parent_restart(&namespace, "scope"), Some(1));
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        cache.with_cursor(|_| panic!("poison the cursor"));
+    }));
+    assert!(unwound.is_err());
+    assert!(!cursor_held(), "reset on unwind");
+    let state = cache.parent_state(&namespace, "scope");
+    assert!(!state.restarts_observed, "unknown, not observed");
+    assert!(
+        state.restarts >= PARENT_RESTART_BUDGET,
+        "fail closed: the budget reads spent"
+    );
+    assert_eq!(cache.note_parent_restart(&namespace, "scope"), None);
 }
 
 /// P-T30 (R2-L2): the witness store's walk costs a fixed number of visits

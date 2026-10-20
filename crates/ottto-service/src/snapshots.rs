@@ -13148,8 +13148,9 @@ pub(in crate::snapshots) struct CodexParentIdentities {
     /// PR-P: the scope's restart count, established on this page by the
     /// step-start pass (`ParentState.restarts`) or by the restart hunk
     /// (`note_parent_restart`'s return). `None` when neither ran on this page
-    /// (a discovery page, or no shared cache): the diagnostics then omit
-    /// `parent_restarts_in_scope` instead of reporting a fabricated 0.
+    /// (a discovery page, or no shared cache) or the cursor was poisoned
+    /// (N1): the diagnostics then omit `parent_restarts_in_scope` instead of
+    /// reporting a fabricated count.
     parent_restarts: Option<u64>,
 }
 
@@ -13529,7 +13530,9 @@ fn codex_parent_step_start(
     let scope = cursor::group_scope(index);
     let state = context.cache.parent_state(&context.namespace, &scope);
     identities.restart_budget_spent = state.restarts >= cursor::PARENT_RESTART_BUDGET;
-    identities.parent_restarts = Some(state.restarts);
+    // N1: a poisoned cursor decides the budget spent above but reports no
+    // count.
+    identities.parent_restarts = state.restarts_observed.then_some(state.restarts);
     let census = identities.census(index);
     let end = traversal.census_window_end.as_str();
     let matched = state
@@ -17499,12 +17502,13 @@ impl OwnedSourceScan {
                 if parent_resolution_restart {
                     if let Some(context) = sampling.as_ref() {
                         // Inline table: never refused. The new count is what
-                        // this page's diagnostics report.
+                        // this page's diagnostics report; a poisoned cursor
+                        // reports none (N1).
                         codex_parent_identities.parent_restarts =
-                            Some(context.cache.note_parent_restart(
+                            context.cache.note_parent_restart(
                                 &context.namespace,
                                 &sampled_scan::codex_cursor::group_scope(index),
-                            ));
+                            );
                     }
                 }
                 let raw_census_complete = traversal_discovery_done
