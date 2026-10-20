@@ -46,6 +46,7 @@ mod context_curve;
 mod session_start;
 pub(crate) use session_start::OpeningFileCandidate;
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
+mod disappearance_diagnostics;
 #[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]
@@ -17856,7 +17857,11 @@ impl OwnedSourceScan {
                 // A quarantined candidate changed after the family prepass. Do not
                 // parse a mixed family or refresh its retry record; keep this
                 // generation non-terminal and retry the new exact object together.
-                census.disappeared_file_count += 1;
+                disappearance_diagnostics::increment(
+                    &mut census.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Cause::PreflightFingerprintChanged,
+                );
                 pending!();
             }
             // The preflight fences physical/sidecar identity. Local launcher facts
@@ -17911,7 +17916,11 @@ impl OwnedSourceScan {
                 // Comparison requires this exact frozen object and sidecars.
                 // The ordinary path may reparse replacements, but a target
                 // cannot silently claim that it compared the frozen revision.
-                census.disappeared_file_count += 1;
+                disappearance_diagnostics::increment(
+                    &mut census.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Cause::ComparisonTargetRevisionChanged,
+                );
                 pending!();
             }
             let comparison_target = target_match == Some(true);
@@ -25896,6 +25905,7 @@ fn ensure_bounded_traversal(
     // prior traversal does not explain why it was removed; the retirement
     // record, when available, supplies that independent witness.
     let mut transition = traversal_transition::Starting::capture(
+        source,
         index,
         collected_at,
         prior_traversal_context_matches,
@@ -25963,7 +25973,7 @@ fn ensure_bounded_traversal(
             let problems_before = census
                 .unreadable_path_count
                 .saturating_add(census.disappeared_file_count);
-            let resolved = resolve_configured_scan_root(root, &mut census);
+            let resolved = resolve_configured_scan_root(source, root, &mut census);
             let problems_after = census
                 .unreadable_path_count
                 .saturating_add(census.disappeared_file_count);
@@ -26039,11 +26049,19 @@ fn ensure_bounded_traversal(
             index.known_configured_scan_roots.insert(root_key.clone());
         }
         if index.known_configured_scan_roots.contains(&root_key) && !resolver_reported_problem {
-            census.disappeared_file_count += 1;
+            disappearance_diagnostics::increment(
+                &mut census.disappeared_file_count,
+                source,
+                disappearance_diagnostics::Cause::RootResolutionUnresolved,
+            );
         }
     }
     if !index.legacy_unresolved_root_file_witnesses.is_empty() && !missing_root_reported_problem {
-        census.disappeared_file_count += 1;
+        disappearance_diagnostics::increment(
+            &mut census.disappeared_file_count,
+            source,
+            disappearance_diagnostics::Cause::RootResolutionUnresolved,
+        );
     }
     let counts = ScanTraversalCounts {
         directory_entry_cap_exceeded_count: census.directory_entry_cap_exceeded_count,
@@ -26450,7 +26468,11 @@ fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                traversal.counts.disappeared_file_count += 1;
+                disappearance_diagnostics::increment(
+                    &mut traversal.counts.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Cause::NotFound,
+                );
                 continue;
             }
             Err(_) => {
@@ -26548,7 +26570,11 @@ fn advance_bounded_directory_traversal_with_budget(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    traversal.counts.disappeared_file_count += 1;
+                    disappearance_diagnostics::increment(
+                        &mut traversal.counts.disappeared_file_count,
+                        source,
+                        disappearance_diagnostics::Cause::NotFound,
+                    );
                     continue;
                 }
                 Err(_) => {
@@ -26619,7 +26645,11 @@ fn candidate_from_traversal_path(
                     .removed_index_keys
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
-                census.disappeared_file_count += 1;
+                disappearance_diagnostics::increment(
+                    &mut census.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Cause::NotFound,
+                );
             }
             return None;
         }
@@ -26809,7 +26839,11 @@ fn collect_recent_jsonl_files(
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                census.disappeared_file_count += 1;
+                disappearance_diagnostics::increment(
+                    &mut census.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Cause::NotFound,
+                );
                 continue;
             }
             Err(_) => {
@@ -26918,7 +26952,11 @@ fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
 /// but every descendant remains subject to the component-wise `O_NOFOLLOW`
 /// open below. Canonicalizing once also prevents the discovered path and the
 /// later root-relative open from disagreeing about which root was trusted.
-fn resolve_configured_scan_root(root: &Path, census: &mut ScanCensus) -> Option<PathBuf> {
+fn resolve_configured_scan_root(
+    source: SnapshotSource,
+    root: &Path,
+    census: &mut ScanCensus,
+) -> Option<PathBuf> {
     let configured = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
@@ -26936,7 +26974,11 @@ fn resolve_configured_scan_root(root: &Path, census: &mut ScanCensus) -> Option<
     let resolved = match fs::canonicalize(root) {
         Ok(resolved) => resolved,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            census.disappeared_file_count += 1;
+            disappearance_diagnostics::increment(
+                &mut census.disappeared_file_count,
+                source,
+                disappearance_diagnostics::Cause::NotFound,
+            );
             return None;
         }
         Err(_) => {
@@ -26948,7 +26990,11 @@ fn resolve_configured_scan_root(root: &Path, census: &mut ScanCensus) -> Option<
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Some(resolved),
         Ok(_) => None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            census.disappeared_file_count += 1;
+            disappearance_diagnostics::increment(
+                &mut census.disappeared_file_count,
+                source,
+                disappearance_diagnostics::Cause::NotFound,
+            );
             None
         }
         Err(_) => {
@@ -26993,7 +27039,11 @@ fn open_and_identify_scan_candidate(
     let opened_file = match open_candidate_file(source, &mut candidate) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            census.disappeared_file_count += 1;
+            disappearance_diagnostics::increment(
+                &mut census.disappeared_file_count,
+                source,
+                disappearance_diagnostics::Cause::NotFound,
+            );
             return None;
         }
         Err(error)
@@ -36999,14 +37049,17 @@ mod tests {
         let parent = temp_dir("late-scan-root-parent");
         let root = parent.join("sessions-created-later");
         let mut index = ScanIndex::default();
-        let absent = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-31T00:00:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("missing optional root is complete-empty");
+        let (absent, disappearance_events) = disappearance_diagnostics::observe(|| {
+            scan_source_roots(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-31T00:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("missing optional root is complete-empty")
+        });
+        assert_eq!(disappearance_events, [[0; 4], [0; 4], [0, 0, 0, 0]]);
         assert!(absent.census_complete);
         assert!(index.known_configured_scan_roots.is_empty());
 
@@ -37054,15 +37107,24 @@ mod tests {
         assert!(first.census_complete);
         assert_eq!(index.files.len(), 1);
 
+        let authoritative_files = serde_json::to_vec(&index.files).unwrap();
         fs::remove_dir_all(&root).expect("temporarily remove configured root");
-        let missing = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-31T00:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("missing root is a source-local red witness");
+        let (missing, disappearance_events) = disappearance_diagnostics::observe(|| {
+            scan_source_roots(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-31T00:05:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("missing root is a source-local red witness")
+        });
+        assert_eq!(disappearance_events, [[0; 4], [0; 4], [0, 1, 0, 0]]);
+        assert_eq!(
+            serde_json::to_vec(&index.files).unwrap(),
+            authoritative_files,
+            "missing-root diagnostics preserve prior authoritative entries byte-for-byte"
+        );
         assert!(!missing.census_complete);
         assert_eq!(missing.disappeared_file_count, 1);
         assert_eq!(index.files.len(), 1, "prior entities remain authoritative");
@@ -37103,14 +37165,23 @@ mod tests {
         assert!(serialized.get("known_configured_scan_roots").is_none());
         let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness index");
 
-        let scan = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut upgraded,
-            "2026-07-31T00:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("upgrade inference remains source-local");
+        let authoritative_files = serde_json::to_vec(&upgraded.files).unwrap();
+        let (scan, disappearance_events) = disappearance_diagnostics::observe(|| {
+            scan_source_roots(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut upgraded,
+                "2026-07-31T00:05:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("upgrade inference remains source-local")
+        });
+        assert_eq!(disappearance_events, [[0; 4], [0; 4], [0, 1, 0, 0]]);
+        assert_eq!(
+            serde_json::to_vec(&upgraded.files).unwrap(),
+            authoritative_files,
+            "missing-root diagnostics preserve prior authoritative entries byte-for-byte"
+        );
 
         assert!(!scan.census_complete);
         assert_eq!(scan.disappeared_file_count, 1);
@@ -37158,14 +37229,23 @@ mod tests {
             .expect("write pre-witness symlink index");
         let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness symlink index");
 
-        let missing = scan_source_roots(
-            SnapshotSource::Pi,
-            &roots,
-            &mut upgraded,
-            "2026-07-31T00:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("unresolved legacy symlink remains source-local");
+        let authoritative_files = serde_json::to_vec(&upgraded.files).unwrap();
+        let (missing, disappearance_events) = disappearance_diagnostics::observe(|| {
+            scan_source_roots(
+                SnapshotSource::Pi,
+                &roots,
+                &mut upgraded,
+                "2026-07-31T00:05:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("unresolved legacy symlink remains source-local")
+        });
+        assert_eq!(disappearance_events, [[0; 4], [0; 4], [0, 1, 0, 0]]);
+        assert_eq!(
+            serde_json::to_vec(&upgraded.files).unwrap(),
+            authoritative_files,
+            "missing-root diagnostics preserve prior authoritative entries byte-for-byte"
+        );
 
         assert!(!missing.census_complete);
         assert_eq!(missing.disappeared_file_count, 1);

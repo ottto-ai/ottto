@@ -1311,7 +1311,10 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
     assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
     let bytes = fs::read(&fixture.paths[0]).unwrap();
     fs::remove_file(&fixture.paths[0]).unwrap(); // after frozen selection, before safe open
-    let (index, scan) = SelectionFixture::run(native);
+    let ((index, scan), producer_events) =
+        disappearance_diagnostics::observe(|| SelectionFixture::run(native));
+    assert_eq!(producer_events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
+    assert_eq!(scan.disappeared_file_count, 1);
     assert!(scan.disappeared_file_count + scan.unreadable_path_count > 0);
     scope.defer_after_native("family", &scan);
     assert_eq!(scope.counts().unavailable, 1);
@@ -1320,7 +1323,19 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
         !scope.allowed("family"),
         "fallback revokes reuse, never converts failed read to success"
     );
-    let saved = fixture.checkpoint(&index, &scan);
+    let body_before = serde_json::to_vec(&scan.snapshots).unwrap();
+    let (saved, copy_events) =
+        disappearance_diagnostics::observe(|| fixture.checkpoint(&index, &scan));
+    assert_eq!(
+        copy_events, [[0; 4]; 3],
+        "partial checkpoint must not record producers again"
+    );
+    assert_eq!(serde_json::to_vec(&scan.snapshots).unwrap(), body_before);
+    let saved_bytes = fs::read(&fixture.index_path).unwrap();
+    assert_eq!(saved_bytes, serde_json::to_vec_pretty(&saved).unwrap());
+    assert!(!String::from_utf8(saved_bytes.clone())
+        .unwrap()
+        .contains("disappearance_process_totals_v1"));
     assert!(saved.files[&local_index_key(&fixture.paths[0])]
         .source_file_fingerprint
         .is_empty());
@@ -1331,7 +1346,14 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
     fs::write(&fixture.paths[0], bytes).unwrap();
     drop(scope);
     let restarted = envelope_selection_experiment::Scope::restart();
-    let reloaded = ScanIndex::load(&fixture.index_path).unwrap();
+    let (reloaded, reload_events) = disappearance_diagnostics::observe(|| {
+        let loaded = ScanIndex::load(&fixture.index_path).unwrap();
+        let _ = disappearance_diagnostics::snapshot(SnapshotSource::ClaudeCode);
+        loaded
+    });
+    assert_eq!(reload_events, [[0; 4]; 3]);
+    assert_eq!(serde_json::to_vec_pretty(&reloaded).unwrap(), saved_bytes);
+    assert_eq!(fs::read(&fixture.index_path).unwrap(), saved_bytes);
     let retry = fixture.prepare(reloaded, 1);
     assert_eq!(retry.identified_candidates[0].path, fixture.paths[0]);
     let (_, scan) = SelectionFixture::run(retry);
@@ -2418,7 +2440,47 @@ fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
     let replacement = fixture.dir.join("replacement.tmp");
     fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
     fs::rename(&replacement, &path).unwrap();
-    let mut state = pause_native_comparison(state);
+    let base_bodies = state
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                serde_json::to_vec(item).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let target_key = local_index_key(&path);
+    let target_entry = serde_json::to_vec(&state.index.files[&target_key]).unwrap();
+    let file_limit = state.file_limit;
+    let sidecar_complete = state.sidecar_census_complete;
+    let (mut state, disappearance_events) =
+        disappearance_diagnostics::observe(|| pause_native_comparison(state));
+    assert_eq!(
+        disappearance_events,
+        [[0; 4], [0, 0, 0, 1], [0; 4]],
+        "a real reopened replacement reaches the frozen revision comparison"
+    );
+    assert_eq!(
+        serde_json::to_vec(&state.index.files[&target_key]).unwrap(),
+        target_entry,
+        "a mismatched target cannot refresh the frozen index entry"
+    );
+    assert_eq!(state.file_limit, file_limit);
+    assert_eq!(state.sidecar_census_complete, sidecar_complete);
+    for (session, bytes) in base_bodies {
+        let retained = state
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == session)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(retained).unwrap(),
+            bytes,
+            "target failure preserves already parsed native bodies"
+        );
+    }
+
     assert!(
         state.census.disappeared_file_count + state.census.unreadable_path_count > 0,
         "the existing safe open must reject a replaced frozen object"
@@ -2866,8 +2928,48 @@ fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
     let replacement = fixture.dir.join("controller-replacement.tmp");
     fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
-    fs::rename(replacement, path).unwrap();
-    let mut state = pause_native_comparison(state);
+    fs::rename(replacement, &path).unwrap();
+    let base_bodies = state
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                serde_json::to_vec(item).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let target_key = local_index_key(&path);
+    let target_entry = serde_json::to_vec(&state.index.files[&target_key]).unwrap();
+    let file_limit = state.file_limit;
+    let sidecar_complete = state.sidecar_census_complete;
+    let (mut state, disappearance_events) =
+        disappearance_diagnostics::observe(|| pause_native_comparison(state));
+    assert_eq!(
+        disappearance_events,
+        [[0; 4], [0, 0, 0, 1], [0; 4]],
+        "a real reopened replacement reaches the frozen revision comparison"
+    );
+    assert_eq!(
+        serde_json::to_vec(&state.index.files[&target_key]).unwrap(),
+        target_entry,
+        "a mismatched target cannot refresh the frozen index entry"
+    );
+    assert_eq!(state.file_limit, file_limit);
+    assert_eq!(state.sidecar_census_complete, sidecar_complete);
+    for (session, bytes) in base_bodies {
+        let retained = state
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == session)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(retained).unwrap(),
+            bytes,
+            "target failure preserves already parsed native bodies"
+        );
+    }
+
     assert!(!controller.advance(&mut state, true));
     assert!(
         state

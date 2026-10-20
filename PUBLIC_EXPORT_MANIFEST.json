@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 720,
-  "content_sha256": "9fd375c464d2cdd030660601014ad71e3dd8a7886ddab9333b3f6d171eb5227e",
+  "candidate_file_count": 722,
+  "content_sha256": "af9da204a3a7a5d5c93b14d6ea32575e7b934ae7f52d37b680de84585152d900",
   "files": [
     {
       "executable": false,
@@ -1301,8 +1301,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "6f8a3681eb7aeaf2e50f5d9fe9d99af8d7edae1e5523ee0a9cddf08f026e2143",
-      "size_bytes": 2902687
+      "sha256": "bdfdf04866faf0132429487dd6b540b8b21d68411ec7d215451e7399c88cf402",
+      "size_bytes": 2906260
     },
     {
       "executable": false,
@@ -1482,6 +1482,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/disappearance_diagnostics.rs",
+      "sha256": "8d8fbf0b7735c541ee8191d754d95ebb96e1904374bc605e830ffcdb95b4d49b",
+      "size_bytes": 19127
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/envelope_selection_experiment.rs",
       "sha256": "22f30f015b1fc043cb70bf73fab0631de50064a8e05aae8ba89c67aa0d38257c",
       "size_bytes": 10345
@@ -1504,8 +1511,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/launcher_recognition_tests.rs",
-      "sha256": "d97777c86c3cc1c5a7e7f039e8e84bc1646b001d545b8676b09bbf1503948c68",
-      "size_bytes": 28089
+      "sha256": "7eb2d5a66c0b7c44618ef8e317feeb3e22501fd95fbb99960e7c62b4fcb4ad77",
+      "size_bytes": 28290
     },
     {
       "executable": false,
@@ -1532,8 +1539,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "fb49fbcdc0d45ef0e4e5444b4376548c12cabd2f49741c470a33cabceca8b5f6",
-      "size_bytes": 172399
+      "sha256": "597b5868c322d74682577abe200589b29182dde5efe819075f6f96c71821cc9b",
+      "size_bytes": 176325
     },
     {
       "executable": false,
@@ -1588,8 +1595,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/traversal_transition.rs",
-      "sha256": "0cee4f4082527ef0d8d38fc08a125cb5858097f3f1c8e4f4828f960702695420",
-      "size_bytes": 11100
+      "sha256": "a17ef9ff6e5ab0d48ed1ddb031d716b764574fd35617105e0c00fc2f75c0e27f",
+      "size_bytes": 19469
     },
     {
       "executable": false,
@@ -3277,6 +3284,13 @@
       "path": "docs/session-2026-10-19-retained-cache-lifecycle.md",
       "sha256": "b0a030fe780592407e0b9ea233fe9e8ef041c4a5994ddda2ae07fd85305fd135",
       "size_bytes": 2797
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-20-disappearance-reason-diagnostics.md",
+      "sha256": "dd95e5cefff11b39414156e2ce0b5759c3fce7e3fe40b101d9b3645e04b3d98e",
+      "size_bytes": 3299
     },
     {
       "executable": false,
@@ -5043,9 +5057,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T13:45:09+00:00",
+  "generated_at": "2026-10-20T15:11:36+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 721,
+  "output_file_count": 723,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5082,5 +5096,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d73631ebb1798ee18a6875e6d27f61d585bc40c8"
+  "source_commit": "344b47cd06ede83f2aa8608c6133ab5b59690b45"
 }
