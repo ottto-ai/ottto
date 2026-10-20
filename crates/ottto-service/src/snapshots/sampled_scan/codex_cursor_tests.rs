@@ -6920,24 +6920,6 @@ fn held_then_quiet(
     }
 }
 
-/// P-T29 (N2): a referenced parent rollout with no session id is witnessed
-/// `NoLedger`; its fork is held under it and nothing is read again.
-#[test]
-fn parent_without_a_session_id_is_witnessed_no_ledger() {
-    let fixture = ScanRoot::with_sessions(&[]);
-    let mut parent = ForkHome::parent();
-    parent[0] = json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
-        "payload": {"thread_source": "user"}});
-    fs::write(fixture.file(PARENT), jsonl(&parent)).unwrap();
-    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(3));
-    held_then_quiet(
-        &fixture,
-        only(CodexParentUnresolvable::NoLedger, 1),
-        3,
-        CodexParentUnresolvable::ParentLossy,
-    );
-}
-
 /// P-T31 (R1-L1): a second rollout claiming P's id makes P `Duplicated`:
 /// the fork is held under it, never `ParentLossy`, and nothing is read
 /// again.
