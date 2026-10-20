@@ -30,7 +30,11 @@ as reported usage:
   full corrective census instead of persisting partial authority on overflow.
   Any invalid or occurrence-cap-crossing family fences posture globally because
   its discarded request hashes could duplicate another family; only a later
-  complete, fully valid below-cap census may clear that fence.
+  complete, fully valid below-cap census may clear that fence. While it is
+  closed, a member whose own Claude Code API and trace evidence assigns it
+  every counted request keeps only its first/peak/last and owned compaction
+  scalars; curves, cache observations and session-start openings stay fenced
+  (`session-2026-10-20-claude-posture-member-waiver.md`).
   On every valid complete census, persisted owners are first intersected with
   the current indexed family members, so deletion, retention expiry, or root
   removal re-arms a surviving owner once instead of tombstoning it forever.
@@ -95,7 +99,8 @@ Rebasing onto public main composed the bounded duplicate-owner witness with the
 newer durable usage-authority quarantine. A stale pending family from a prior
 census is ignored by duplicate validation only while its quarantine is bounded
 and bound to the exact retained witness. Current-window invalid evidence,
-unbound stale state, and witness-cap overflow still fence all Claude posture.
+unbound stale state, and witness-cap overflow still fence Claude posture,
+apart from the member-owned scalar waiver above.
 This prevents a valid retrying family from globally suppressing unrelated
 sessions without weakening the fail-closed boundary. Duplicate reconciliation
 also re-arms every current member containing a changed request hash, including
