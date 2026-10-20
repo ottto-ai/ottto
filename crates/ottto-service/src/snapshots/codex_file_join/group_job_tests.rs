@@ -2361,6 +2361,26 @@ fn join_release_keeps_the_paused_group_owner() {
             "the paused group kept {name}'s claim"
         );
     }
+    // Tail control (delta L-a): once the foreign job goes stale (K10: 16
+    // cursor pages) this namespace's resume evicts it, and the next clean
+    // walk releases the same claims. So the provenance named `root`'s
+    // members all along, and only the paused arm kept it.
+    let owned = |index: &ScanIndex, name: &str| {
+        claims(index, &session_key(&root, name)).is_some_and(|owners| owners.contains(OWNER))
+    };
+    let mut index = index;
+    for _ in 0..24 {
+        index.traversal = None;
+        let (next, _) = sampled(&root, index, 10, &cache);
+        index = next;
+        if !owned(&index, "a.jsonl") {
+            break;
+        }
+    }
+    assert_eq!(cache.cursor_group_owner(), None, "{:?}", counters(&cache));
+    for name in ["a.jsonl", "b.jsonl"] {
+        assert!(!owned(&index, name), "released once the job left: {name}");
+    }
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(paged).unwrap();
 }
