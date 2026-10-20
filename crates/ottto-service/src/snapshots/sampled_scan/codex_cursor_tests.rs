@@ -7109,29 +7109,38 @@ fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
     );
 }
 
-/// P-T34's duplicate-copy leg: two copies of a lossy P are both read and
-/// recorded with terminal dispositions before C exists. C sorts first, so it
-/// requests P before either copy is skipped; event (c)'s probe of each copy
-/// is `Duplicated`, so neither copy is witnessed `ParentLossy` (in RAM or
-/// in any count). The next match witnesses P `Duplicated`, C is held under
-/// it, and nothing is read again.
+/// P-T34's duplicate-copy leg: a lossy P is read once and recorded with a
+/// terminal disposition. Then C (sorted first) and a second rollout named
+/// with P's id appear together. That rollout's header is another session,
+/// so the join inventory (grouped by header id) does not hold P, while the
+/// census (by path id) sees P twice: when C requests P, the skipped P
+/// reaches event (c), whose probe is `Duplicated`, so P is never witnessed
+/// `ParentLossy` (in RAM or in any count). The next match witnesses P
+/// `Duplicated`, C is held under it, and nothing is read again. (Identical
+/// copies are a join `CandidateCopy` refusal before any parse, so they
+/// never reach event (c).)
 #[test]
 fn duplicated_lossy_parent_is_never_witnessed_parent_lossy() {
+    const OTHER_HEADER: &str = "019fa111-2222-7333-8444-444444444444";
     let fixture = ScanRoot::with_sessions(&[]);
     fs::write(fixture.file(PARENT), jsonl(&ForkHome::parent())).unwrap();
     append_oversized_line(&fixture.file(PARENT));
-    fs::copy(fixture.file(PARENT), rollout_at(&fixture, PARENT, "11")).unwrap();
     let cache = Arc::new(SharedCache::default());
     let mut index = ScanIndex::default();
     for n in 0..2 {
         index = fixture_generation(&fixture, &cache, index, n).0;
     }
-    assert_eq!(
-        index.terminal_jsonl_dispositions.len(),
-        2,
+    assert!(
+        index
+            .terminal_jsonl_dispositions
+            .contains_key(&local_index_key(&fixture.file(PARENT))),
         "{}",
         counters(&cache)
     );
+    let mut second = ForkHome::parent();
+    second[0] = json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
+        "payload": {"id": OTHER_HEADER, "thread_source": "user"}});
+    fs::write(rollout_at(&fixture, PARENT, "11"), jsonl(&second)).unwrap();
     let mut records = vec![json!({"timestamp": "2026-10-07T08:20:00Z",
         "type": "session_meta",
         "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}})];
