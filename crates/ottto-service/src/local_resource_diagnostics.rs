@@ -5,6 +5,7 @@ use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cache_lifecycle;
+pub(crate) mod codex_memo_lifecycle;
 
 const SCHEMA_VERSION: u8 = 2;
 
@@ -16,6 +17,19 @@ pub(crate) fn cache_lifecycle_totals() {
         "unknown",
         &cache_lifecycle::snapshot(),
     );
+}
+
+/// Cumulative shared-process Codex memo totals (L-2): lifetime counters plus
+/// one resident gauge, NOT events attributed to the finishing page/source.
+/// Codex scans only.
+pub(crate) fn codex_memo_lifecycle_totals(source: &str) {
+    if source == "codex" {
+        traversal_point(
+            "process_codex_memo_lifecycle_totals",
+            "codex",
+            &codex_memo_lifecycle::snapshot(),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -1118,6 +1132,37 @@ mod tests {
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
+    }
+
+    #[test]
+    fn codex_memo_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_codex_memo_lifecycle_totals",
+                "codex",
+                &codex_memo_lifecycle::Record::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_codex_memo_lifecycle_totals");
+        assert_eq!(record["source"], "codex");
+        assert_eq!(
+            record["counts"]["memo_hit_estimated_avoided_parser_bytes"],
+            u64::MAX
+        );
+        assert_eq!(record["counts"]["memo_miss_exact_stamp_bytes"], u64::MAX);
+        assert_eq!(record["counts"]["memo_resident_bytes"], u64::MAX);
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        let width = serde_json::to_string(record).unwrap().len();
+        println!("CODEX_MEMO_LIFECYCLE_MAX_WIDTH bytes={width}");
+        assert!(width < 2048);
+        let (_, actual) = capture(|| codex_memo_lifecycle_totals("codex"));
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+        let (_, none) = capture(|| codex_memo_lifecycle_totals("claude_code"));
+        assert!(none.is_empty());
     }
 
     #[test]
