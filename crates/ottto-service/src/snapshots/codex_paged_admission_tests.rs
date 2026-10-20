@@ -1628,8 +1628,7 @@ fn paged_scan_reads_an_over_limit_parent_and_resolves_its_child() {
 // unpaged open and its child stays held. Parent witnesses (and so the
 // `Oversize` cause) come only from the sampled parent pass
 // (`codex_parent_step_start`), as on main, so no cause is recorded here.
-// With a valid persisted ledger, the ledger wins and the child resolves
-// while the parent itself is still refused at its unpaged open.
+// A valid persisted ledger survives the refusal and still validates.
 #[test]
 fn unsampled_parent_over_the_limit_holds_its_child_unless_its_ledger_is_valid() {
     let home = ForkHome::new();
@@ -1661,30 +1660,41 @@ fn unsampled_parent_over_the_limit_holds_its_child_unless_its_ledger_is_valid() 
         }
     }
     assert!(settled, "the ledger settled");
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(home.fixture.file(CHILD))
-        .unwrap();
-    file.write_all(&jsonl(&[usage_record(
-        "2026-10-07T08:40:02Z",
-        (150, 110, 16, 3),
-        (20, 10, 2, 0),
-    )]))
-    .unwrap();
-    reset_counters();
+    // Over the limit again: the parent is still refused at its unpaged open,
+    // and the refusal keeps its persisted ledger.
     let (index, scan) =
         with_test_unpaged_limit(parent_len - 1, || home.generation(index, None, 10));
-    let causes = parent_causes(&scan);
-    assert_eq!(
-        causes,
-        [0; crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES]
-    );
-    assert!(child_usage(&scan), "the ledger resolves the child");
     assert_eq!(
         scan.oversized_file_count, 1,
         "the parent itself is not read"
     );
+    assert_eq!(
+        parent_causes(&scan),
+        [0; crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES]
+    );
     assert!(ForkHome::parent_ledger(&index).is_some());
+    // F3: ledger validation is identity-only, so the persisted ledger of the
+    // over-limit parent validates, while the unpaged parent view of the same
+    // descriptor is still an `Oversize` witness. (A fresh traversal validates
+    // ledgers before discovery fills its census, so the scan-level child
+    // resolution is covered by the paged row above, not here.)
+    let roots = vec![home.fixture.root.clone()];
+    let key = local_index_key(&home.fixture.file(PARENT));
+    let paths = BTreeSet::from([key.clone()]);
+    with_test_unpaged_limit(parent_len - 1, || {
+        let validated = validated_codex_parent_ownership_ledgers(
+            &index,
+            CodexParentCensus::new(&roots, &paths),
+        );
+        assert!(validated.contains_key(&resolve_codex_identity(PARENT)));
+        assert!(matches!(
+            codex_parent_open_match(
+                CodexParentCensus::new(&roots, &paths),
+                CodexCensusMatch::One(key.as_str()),
+            ),
+            Err(CodexParentUnresolvable::Oversize)
+        ));
+    });
 }
 
 // F-T11: under an unpaged scan an over-limit parent is an `Oversize`
