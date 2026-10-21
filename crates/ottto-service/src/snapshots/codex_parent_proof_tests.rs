@@ -1059,3 +1059,264 @@ fn replay_ends_the_namespace_ledger_generation_so_c14_restores_nothing() {
         assert_eq!(ledger.get(&ledger_key(other)).unwrap().tag, LedgerTag::Live);
     }
 }
+
+/// U1a-2a sync-6 (Q1 grant): the pass's replay runs for every source; only
+/// an actual reset of a Codex index ends that index's ledger generation. No
+/// pending replay, or a repeated same-generation replay, ends nothing, not
+/// even an entry charged since; another namespace is never touched.
+#[test]
+fn sync6_replays_every_source_and_mirrors_only_a_codex_reset() {
+    use crate::snapshots::sampled_scan::side_ledger::{
+        namespace_of, parent_of, LedgerEntry, LedgerKey, LedgerTag,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let key = "/s/sync6.jsonl";
+    let path = Path::new("/idx/sync6.json");
+    let other = Path::new("/idx/sync6-other.json");
+    let ledger_key = |index_path: &Path, ino: u64| LedgerKey {
+        ns: namespace_of(index_path),
+        p: parent_of(key),
+        dev: 1,
+        ino,
+    };
+    let charge = |cache: &sampled_scan::SharedCache, index_path: &Path, ino: u64| {
+        cache
+            .side_ledger()
+            .charge(
+                ledger_key(index_path, ino),
+                LedgerEntry::of_request(&side_request(ino)),
+                1_792_540_800,
+            )
+            .unwrap();
+    };
+    let entry = |cache: &sampled_scan::SharedCache, index_path: &Path, ino: u64| {
+        cache
+            .side_ledger()
+            .get(&ledger_key(index_path, ino))
+            .copied()
+    };
+    for source in [
+        SnapshotSource::Codex,
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Pi,
+    ] {
+        let ended = if source == SnapshotSource::Codex {
+            LedgerTag::Gone
+        } else {
+            LedgerTag::Live
+        };
+        let cache = sampled_scan::SharedCache::default();
+        charge(&cache, path, 7);
+        charge(&cache, other, 7);
+        let mut index = ScanIndex::default();
+        index
+            .codex_parent_side_requests
+            .insert(key.into(), side_request(7));
+        let replay = |index: &mut ScanIndex, pending: bool, generation: &str| {
+            prepare_historical_replay_with_side(
+                index,
+                pending,
+                generation.into(),
+                source,
+                &cache,
+                path,
+            )
+        };
+
+        // No replay pending: nothing runs.
+        assert!(!replay(&mut index, false, "g1"));
+        assert_eq!(index.historical_replay_generation, None);
+        assert_eq!(index.codex_parent_side_requests.len(), 1);
+        assert_eq!(entry(&cache, path, 7).unwrap().tag, LedgerTag::Live);
+
+        // The replay runs for every source; only a Codex reset is mirrored.
+        assert!(replay(&mut index, true, "g1"), "{source:?}");
+        assert_eq!(index.historical_replay_generation.as_deref(), Some("g1"));
+        assert!(index.codex_parent_side_requests.is_empty(), "{source:?}");
+        assert_eq!(entry(&cache, path, 7).unwrap().tag, ended, "{source:?}");
+        assert_eq!(entry(&cache, other, 7).unwrap().tag, LedgerTag::Live);
+
+        // Charged since: a repeated same-generation replay ends nothing.
+        charge(&cache, path, 9);
+        let since = entry(&cache, path, 9);
+        assert!(!replay(&mut index, true, "g1"), "{source:?}");
+        assert_eq!(entry(&cache, path, 9), since, "{source:?}");
+        assert_eq!(entry(&cache, other, 7).unwrap().tag, LedgerTag::Live);
+
+        // A new generation is a new replay.
+        assert!(replay(&mut index, true, "g2"), "{source:?}");
+        assert_eq!(entry(&cache, path, 9).unwrap().tag, ended, "{source:?}");
+        assert_eq!(entry(&cache, other, 7).unwrap().tag, LedgerTag::Live);
+    }
+}
+
+/// U1a-2a sync-6 (Q1 grant) custody, on a real index file. After a Codex
+/// replay ends the pre-replay entry, the save fails: the reloaded pre-replay
+/// index hydrates nothing old (the replay re-runs: its generation never
+/// reached disk). A save callback in flight for the pre-replay slot
+/// incarnation lands on the slot's next incarnation and proves nothing. A
+/// repeated replay retires nothing of the new generation, and another
+/// namespace is never touched.
+#[test]
+fn sync6_after_a_replay_a_failed_save_or_stale_slot_restores_nothing_old_and_retires_nothing_new() {
+    use crate::snapshots::sampled_scan::side_ledger::{
+        namespace_of, parent_of, LedgerEntry, LedgerKey, LedgerTag,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const GENERATION: &str = "codex:sync6-custody:g1";
+    let key = "/s/sync6-custody.jsonl";
+    let path = temp_index_path("sync6-custody");
+    let other = Path::new("/idx/sync6-custody-other.json");
+    let ledger_key = |index_path: &Path, ino: u64| LedgerKey {
+        ns: namespace_of(index_path),
+        p: parent_of(key),
+        dev: 1,
+        ino,
+    };
+    let cache = sampled_scan::SharedCache::default();
+    let charge = |index_path: &Path, ino: u64| {
+        cache
+            .side_ledger()
+            .charge(
+                ledger_key(index_path, ino),
+                LedgerEntry::of_request(&side_request(ino)),
+                1_792_540_800,
+            )
+            .unwrap();
+    };
+    let tag = |index_path: &Path, ino: u64| {
+        cache
+            .side_ledger()
+            .get(&ledger_key(index_path, ino))
+            .map(|entry| entry.tag)
+    };
+    // The pass's replay, pending exactly as `sync` derives it.
+    let replay = |index: &mut ScanIndex| {
+        let pending = index.historical_replay_generation.as_deref() != Some(GENERATION);
+        prepare_historical_replay_with_side(
+            index,
+            pending,
+            GENERATION.into(),
+            SnapshotSource::Codex,
+            &cache,
+            &path,
+        )
+    };
+    let requested = |index: &ScanIndex| {
+        index
+            .codex_parent_side_requests
+            .get(key)
+            .map(|request| request.dev_ino)
+    };
+    let mut disk = ScanIndex::default();
+    disk.files
+        .insert(key.into(), super::tests::manifest_index_entry(Some(key)));
+    disk.save(&path).unwrap();
+    // A pre-replay entry the file does not hold yet, and another namespace's.
+    charge(&path, 7);
+    charge(other, 7);
+
+    // Pass 1: C14 hydrates it; the replay ends it; the save fails.
+    let mut index = ScanIndex::load(&path).unwrap();
+    begin_codex_side_pass(&cache, &path, &mut index);
+    assert_eq!(requested(&index), Some((1, 7)));
+    assert!(replay(&mut index));
+    assert_eq!(requested(&index), None);
+    assert_eq!(tag(&path, 7), Some(LedgerTag::Gone));
+    let stale = codex_side_save_mark(&cache, &path);
+    drop(index);
+
+    // Eight other namespaces' passes replace this index's gate slot.
+    for fill in 0..8 {
+        begin_codex_side_pass(
+            &cache,
+            Path::new(&format!("/idx/sync6-custody-fill-{fill}.json")),
+            &mut ScanIndex::default(),
+        );
+    }
+
+    // Pass 2, on the reloaded pre-replay file: nothing old is current.
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert_eq!(index.historical_replay_generation, None);
+    let pass = begin_codex_side_pass(&cache, &path, &mut index);
+    assert!(pass.gate.side_allowed, "a fresh slot incarnation");
+    assert_eq!(requested(&index), None, "no pre-replay entry hydrated");
+    assert_eq!(tag(&path, 7), None, "the ended generation is pruned");
+    assert!(replay(&mut index), "the replay re-runs");
+    // The save fails again, and pass 1's callback lands late.
+    drop(index);
+    note_codex_side_pass_saved(&cache, &path, true, stale);
+
+    // Pass 3: the stale incarnation's callback proved no save.
+    let mut index = ScanIndex::load(&path).unwrap();
+    let pass = begin_codex_side_pass(&cache, &path, &mut index);
+    assert!(!pass.gate.side_allowed, "the stale callback moved nothing");
+    assert!(replay(&mut index));
+    // The replay pass indexes P again; G7 writes its request and entry.
+    index
+        .files
+        .insert(key.into(), super::tests::manifest_index_entry(Some(key)));
+    index
+        .codex_parent_side_requests
+        .insert(key.into(), side_request(9));
+    charge(&path, 9);
+    let mark = codex_side_save_mark(&cache, &path);
+    index.save(&path).unwrap();
+    note_codex_side_pass_saved(&cache, &path, true, mark);
+
+    // Pass 4: the replay is held; a repeated one retires nothing new.
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        index.historical_replay_generation.as_deref(),
+        Some(GENERATION)
+    );
+    let pass = begin_codex_side_pass(&cache, &path, &mut index);
+    assert!(pass.gate.side_allowed, "the fresh save is proven");
+    assert_eq!(requested(&index), Some((1, 9)));
+    charge(&path, 11);
+    assert!(!prepare_historical_replay_with_side(
+        &mut index,
+        true,
+        GENERATION.into(),
+        SnapshotSource::Codex,
+        &cache,
+        &path,
+    ));
+    assert_eq!(requested(&index), Some((1, 9)));
+    assert_eq!(tag(&path, 11), Some(LedgerTag::Live));
+    assert_eq!(tag(other, 7), Some(LedgerTag::Live));
+}
+
+/// U1a-2a row 35 (disclosed review item): a poisoned `MINTED` lock is
+/// recovered on the next use, uncounted, with its memo intact; a failed save
+/// after first use (nothing reaches the file) keeps the incarnation and the
+/// seq high-water, so the reloaded, unchanged file reuses the nonce and its
+/// next owe never repeats a seq.
+#[test]
+fn minted_poison_recovers_and_a_failed_save_keeps_the_incarnation_and_seq() {
+    let cause = CodexParentUnresolvable::DeferredRef.index() as u8;
+    let path = temp_index_path("mint-poison");
+    ScanIndex::default().save(&path).unwrap();
+    let mut first = ScanIndex::load(&path).unwrap();
+    let nonce = first.codex_proof_incarnation_in_use().to_owned();
+    assert!(first.owe_codex_parent_proof("/c/a", OWE_P, cause, OwedOrigin::Child, false));
+    assert_eq!(first.codex_parent_proof_seq, 1);
+    drop(first);
+
+    let poisoner = std::thread::spawn(|| {
+        let _held = minted_proof_incarnations();
+        panic!("poison MINTED (expected by this test)");
+    });
+    assert!(poisoner.join().is_err(), "the holder panicked");
+
+    let mut reloaded = ScanIndex::load(&path).unwrap();
+    assert!(!MINTED_PROOF_INCARNATIONS.is_poisoned(), "recovered");
+    assert!(reloaded.codex_proof_index_incarnation.is_empty());
+    assert_eq!(reloaded.codex_proof_incarnation_in_use(), nonce);
+    assert!(reloaded.owe_codex_parent_proof("/c/a", OWE_P, cause, OwedOrigin::Child, false));
+    assert_eq!(reloaded.codex_parent_proof_seq, 2, "seq never repeats");
+}

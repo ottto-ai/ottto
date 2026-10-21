@@ -4851,9 +4851,16 @@ fn prepare_sync_source(
         .intersection(&legacy_reconciliation_pending)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if historical_replay_pending {
-        index.prepare_historical_replay(replay_generation.clone());
-    }
+    // U1a-2a sync-6: under this pass's sync lock, after C14 and before the
+    // scan is built.
+    crate::snapshots::prepare_historical_replay_with_side(
+        &mut index,
+        historical_replay_pending,
+        replay_generation.clone(),
+        source,
+        &daemon.transcript_cache,
+        &index_path,
+    );
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.

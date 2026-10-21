@@ -2389,6 +2389,11 @@ pub(in crate::snapshots) fn codex_parent_side_live(
 
 /// U1a-2a: what one Codex pass carries from C14: its side-ledger namespace
 /// (the destination index file) and its outage gate.
+///
+/// TODO(U1a-2a G7 / side due; `stage1/c14c15-answer.md` §2): the side due
+/// and G7 must exclude Stage 1 continuation pages (due only when
+/// `gate.side_allowed` and the page is not a continuation). The
+/// continuation hook is the Stage 1 lease's, not added here.
 #[cfg_attr(not(test), allow(dead_code))] // first readers are the side due and G7
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CodexSidePass {
@@ -2423,11 +2428,32 @@ pub(crate) fn begin_codex_side_pass(
 /// request and proof entry, so this index's side-ledger entries end their
 /// generation (`Gone`) in the same step; the next C14 hydrate then restores
 /// none of them.
-#[allow(dead_code)] // first caller is the replay call site in `sync` (pending clearance)
 pub(crate) fn note_codex_side_replay(cache: &sampled_scan::SharedCache, index_path: &Path) {
     cache
         .side_ledger()
         .end_generation(sampled_scan::side_ledger::namespace_of(index_path), None);
+}
+
+/// U1a-2a sync-6: the pass's historical replay. `prepare_historical_replay`
+/// runs for every source whenever a replay is pending (the source test can
+/// never skip it); only an actual reset of a Codex index is mirrored into
+/// its side ledger. Bookkeeping for an already-authorized replay, never a
+/// replay trigger. Call under `SNAPSHOT_SYNC_LOCK`, after C14 and before
+/// the scan is built; it holds only the side ledger's leaf lock. True when
+/// the replay reset the index.
+pub(crate) fn prepare_historical_replay_with_side(
+    index: &mut ScanIndex,
+    pending: bool,
+    generation: String,
+    source: SnapshotSource,
+    cache: &sampled_scan::SharedCache,
+    index_path: &Path,
+) -> bool {
+    let reset = pending && index.prepare_historical_replay(generation);
+    if reset && source == SnapshotSource::Codex {
+        note_codex_side_replay(cache, index_path);
+    }
+    reset
 }
 
 /// U1a-2a D5′ (C15), Codex only: the side ledger's save mark for this index,

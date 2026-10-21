@@ -380,6 +380,46 @@ impl PrefixSeal {
             ReadMode::Full(reason) => Err(reason),
         }
     }
+
+    /// U1a-2a fence, Q-U28 only: whether the held FD's head and boundary
+    /// windows still hash to this seal's samples. It exists for a same-size,
+    /// ctime-only change, which `admits` refuses as `SameSizeEdit` before it
+    /// reads any sample. It reads at most the seal's two windows of
+    /// `sample_len` (≤ 2 · `SAMPLE_BYTES`) through the shared reader, at the
+    /// offsets `admits` uses. A seal whose samples are invalid, an offset
+    /// that does not compute, and a short or failed read are all `false`.
+    ///
+    /// **Seek position.** The reader seeks. This restores the FD's position
+    /// before returning, so a cursor on the same FD continues where it was.
+    /// If the position cannot be read or restored, the result is `false`.
+    ///
+    /// Equal samples are not whole-file equality, not an audit and not an
+    /// admission. The caller keeps its object, extent, scope and freshness
+    /// fences, and `admits` / `append_compatible` still decide admission.
+    pub(crate) fn samples_match(&self, file: &mut File) -> bool {
+        let sealed = self.stamp.length;
+        let len = self.sample_len as usize;
+        if u64::from(self.sample_len) != sealed.min(SAMPLE_BYTES as u64)
+            || !digest_shaped(&self.head_sha256)
+            || !digest_shaped(&self.boundary_sha256)
+        {
+            return false;
+        }
+        let Some(boundary) = sealed.checked_sub(u64::from(self.sample_len)) else {
+            return false;
+        };
+        let Ok(position) = file.stream_position() else {
+            return false;
+        };
+        let mut read = 0;
+        let matched = [(0, &self.head_sha256), (boundary, &self.boundary_sha256)]
+            .into_iter()
+            .all(|(offset, expected)| {
+                read_sample(file, offset, len, &mut read)
+                    .is_ok_and(|bytes| sha256_hex(&bytes) == *expected)
+            });
+        file.seek(SeekFrom::Start(position)).is_ok() && matched
+    }
 }
 
 /// Why a multi-page read's sealed prefix `[0, s)` was not certified.
@@ -2243,6 +2283,76 @@ mod tests {
                 Err(FullReason::InvalidCheckpoint),
                 "{field} = {value}"
             );
+        }
+    }
+
+    /// U1a-2a Q-U28: `samples_match` is true for a ctime-only change (which
+    /// `admits` still refuses as `SameSizeEdit`), false for a head or a
+    /// boundary edit, a truncation and an invalid seal sample, and it leaves
+    /// the FD's position where it was, so a reader on that FD continues
+    /// correctly, on every path.
+    #[test]
+    fn prefix_seal_samples_match_only_the_sealed_windows_and_keep_the_position() {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        let bytes = wide_rows("q-u28");
+        assert!(bytes.len() > 2 * SAMPLE_BYTES);
+        let check = |f: &Fixture, seal: &PrefixSeal| {
+            let mut file = f.open();
+            file.seek(SeekFrom::Start(123)).unwrap();
+            let matched = seal.samples_match(&mut file);
+            assert_eq!(file.stream_position().unwrap(), 123, "position kept");
+            let mut next = [0_u8; 16];
+            file.read_exact(&mut next).unwrap();
+            let mut expected = [0_u8; 16];
+            f.open().read_exact_at(&mut expected, 123).unwrap();
+            assert_eq!(next, expected, "a reader on the FD continues correctly");
+            matched
+        };
+
+        // ctime only: same bytes, so the samples match; admission is
+        // unchanged (`SameSizeEdit`).
+        let f = Fixture::new(&bytes);
+        let seal = initial(&f, 1000).seal(1000);
+        assert!(check(&f, &seal));
+        // Past the filesystem's ctime granularity.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mode = fs::metadata(&f.0).unwrap().permissions().mode();
+        fs::set_permissions(&f.0, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+        assert_eq!(
+            seal.admits(&mut f.open(), &scope(), 1100, false),
+            Err(FullReason::SameSizeEdit)
+        );
+        assert!(check(&f, &seal), "ctime-only change");
+
+        // A head edit and a boundary edit, both at the same size.
+        for at in [0, bytes.len() as u64 - 2] {
+            let f = Fixture::new(&bytes);
+            let seal = initial(&f, 1000).seal(1000);
+            f.open().write_all_at(b"#", at).unwrap();
+            assert!(!check(&f, &seal), "edit at {at}");
+        }
+
+        // Truncation past the boundary window: a short read.
+        let f = Fixture::new(&bytes);
+        let seal = initial(&f, 1000).seal(1000);
+        f.open().set_len(bytes.len() as u64 - 1).unwrap();
+        assert!(!check(&f, &seal), "truncated");
+
+        // Invalid seal samples.
+        let f = Fixture::new(&bytes);
+        let good = serde_json::to_value(initial(&f, 1000).seal(1000)).unwrap();
+        let digest = good["head_sha256"].as_str().unwrap().to_string();
+        let tampered: [(&str, serde_json::Value); 4] = [
+            ("sample_len", serde_json::json!(u32::MAX)),
+            ("sample_len", serde_json::json!(SAMPLE_BYTES - 1)),
+            ("head_sha256", serde_json::json!(digest[..63])),
+            ("boundary_sha256", serde_json::json!(digest.to_uppercase())),
+        ];
+        for (field, value) in tampered {
+            let mut seal = good.clone();
+            seal[field] = value.clone();
+            let seal: PrefixSeal = serde_json::from_value(seal).unwrap();
+            assert!(!check(&f, &seal), "{field} = {value}");
         }
     }
 
