@@ -1731,11 +1731,16 @@ struct ForkHome {
 
 impl ForkHome {
     fn new() -> Self {
+        Self::with_parent(Self::parent())
+    }
+
+    /// The same fork, with `parent` as P's records (`parent[1..3]` is the
+    /// turn the child copies).
+    fn with_parent(parent: Vec<Value>) -> Self {
         let home = Self {
             fixture: Root::new(&[]),
         };
-        fs::write(home.fixture.file(PARENT), jsonl(&Self::parent())).unwrap();
-        let parent = Self::parent();
+        fs::write(home.fixture.file(PARENT), jsonl(&parent)).unwrap();
         let child = vec![
             json!({"timestamp": "2026-10-07T08:20:00Z", "type": "session_meta",
             "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}}),
@@ -1761,6 +1766,27 @@ impl ForkHome {
             turn_record("2026-10-07T08:40:01Z", "parent-turn-3"),
             usage_record("2026-10-07T08:40:02Z", (220, 170, 26, 6), (60, 45, 8, 2)),
         ]
+    }
+
+    /// P with one turn and `usages` consistent cumulative usage records:
+    /// `usages + 1` ownership signatures (the turn and each distinct total).
+    fn parent_with_usages(usages: u64) -> Vec<Value> {
+        let mut parent = Self::parent()[..3].to_vec();
+        for n in 2..=usages {
+            let second = 2 + n;
+            let at = format!(
+                "2026-10-07T{:02}:{:02}:{:02}Z",
+                8 + second / 3600,
+                second / 60 % 60,
+                second % 60
+            );
+            parent.push(usage_record(
+                &at,
+                (100 * n, 80 * n, 10 * n, 2 * n),
+                (100, 80, 10, 2),
+            ));
+        }
+        parent
     }
 
     /// One page of census generation `n`.
@@ -1849,6 +1875,43 @@ fn paged_scan_reads_an_over_limit_parent_and_resolves_its_child() {
                 }
             }
             panic!("the child did not resolve: {:?}", counters(&cache));
+        })
+    });
+}
+
+// F-T10 `LedgerCapped` (delta-656 §6): on a paged scan an over-limit parent
+// is admitted and cursor-read, but a parent with more than 4096 ownership
+// signatures still has no usable ledger: the child is held under
+// `LedgerCapped`, never `Oversize`, and nothing is counted oversized.
+#[test]
+fn paged_over_limit_parent_past_the_signature_cap_is_ledger_capped() {
+    if !layout() {
+        return;
+    }
+    let usages = MAX_CODEX_PARENT_LEDGER_SIGNATURES as u64;
+    let home = ForkHome::with_parent(ForkHome::parent_with_usages(usages));
+    let parent_len = home.fixture.len(PARENT);
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(parent_len - 1, || {
+        with_test_limits(64 * 1024, 64 * 1024, 64, || {
+            let mut index = ScanIndex::default();
+            for n in 0..96 {
+                let (next, scan) = home.generation(index, Some(&cache), n);
+                index = next;
+                let causes = parent_causes(&scan);
+                assert_eq!(
+                    causes[CodexParentUnresolvable::Oversize.index()],
+                    0,
+                    "{causes:?}"
+                );
+                assert_eq!(scan.oversized_file_count, 0);
+                assert!(!child_usage(&scan), "the child stays held");
+                if causes[CodexParentUnresolvable::LedgerCapped.index()] > 0 {
+                    assert!(ForkHome::parent_ledger(&index).is_none());
+                    return;
+                }
+            }
+            panic!("no LedgerCapped witness: {:?}", counters(&cache));
         })
     });
 }
