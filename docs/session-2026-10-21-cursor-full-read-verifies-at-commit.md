@@ -48,8 +48,9 @@ no detection guarantee. Timestamp granularity (coarse mtime/ctime clocks,
 network attribute caches, writes to dirty shared mappings) is the same
 exposure `Unchanged` already accepts.
 
-Diagnostics: `audit_overdue` now counts only grown overdue completions.
-A slow audit stays visible in `completion_overdue_seconds`, which is measured
+Diagnostics: `audit_overdue` no longer counts stable outlived completions; it
+counts only grown or partial (withheld or EOF-applied final record) overdue
+completions. A slow audit stays visible in `completion_overdue_seconds`, which is measured
 against the deadline that selected the file. `audits_completed` and the audit
 comparison now include stable outlived audits.
 
@@ -66,7 +67,8 @@ Tests (synthetic times and scaled page budgets only):
   adds its stable twin, which verifies at commit like an uninterrupted read.
 - A scan-level test runs a cursor job that outlives `I` on an unchanged file
   (with no marker, and with a seeded past-due marker): it certifies at commit,
-  clears the marker and records no overdue audit. With an append mid-read the
+  clears the marker and records no overdue audit; each job's read reason
+  (`StateMissing`, or `AuditDue` for a due marker) is asserted. With an append mid-read the
   grown case stays overdue with a due marker, and the next generation's
   stable audit converges. In later generations past `commit + I` the scheduler
   decision is `Skip` and no acquisition is selected (no `Unchanged`, no read).
@@ -74,6 +76,8 @@ Tests (synthetic times and scaled page budgets only):
 - The lossy cursor test gains a `stable` case: the unchanged lossy file
   publishes uncertified, keeps its deadline, and is re-read in full in each of
   three later generations.
-- A sparse-file unit test seals a checkpoint past 2^32 bytes and checks that
-  `prepare` tails from that exact offset with two sample windows read, and
-  that one edited boundary byte below it refuses as `BoundaryChanged`.
+- A sparse-file unit test seals a checkpoint whose boundary window starts
+  above 2^32 bytes and checks that `prepare` tails from that exact offset
+  with two sample windows read, and that one edited boundary byte below it
+  refuses as `BoundaryChanged`. A sample offset narrowed to 32 bits would
+  read the head region instead and refuse the same way.

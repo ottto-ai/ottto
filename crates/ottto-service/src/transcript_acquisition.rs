@@ -2747,31 +2747,38 @@ mod tests {
     }
 
     /// F-T6c: a checkpoint sealed past 2^32 tails from its exact 64-bit
-    /// offset. The file is sparse and the checkpoint a struct literal, so no
-    /// 4 GiB is read or written. Narrowing the offset to 32 bits would sample
-    /// the head region and refuse as `BoundaryChanged`, which the edited
-    /// boundary control pins.
+    /// offset. Both the sealed offset and the boundary window's start lie
+    /// above 2^32, so a `u32` narrowing of the sample offset would land at
+    /// 256, in the `h` head region, and refuse the tail as `BoundaryChanged`;
+    /// the edited boundary byte below `s` pins that refusal. The file is
+    /// sparse and the checkpoint a struct literal, so no 4 GiB is written.
     #[test]
     fn tail_samples_use_the_full_offset_past_four_gibibytes() {
         use std::os::unix::fs::FileExt;
         const SPARSE_ALLOCATED_BYTES: u64 = 64 * 1024;
-        let sealed: u64 = (1 << 32) + 256;
         let window = SAMPLE_BYTES as u64;
+        // The boundary window starts at 2^32 + 256.
+        let sealed: u64 = (1 << 32) + window + 256;
+        let allocated =
+            |file: &File| std::os::unix::fs::MetadataExt::blocks(&file.metadata().unwrap()) * 512;
         let mut head = vec![b'h'; SAMPLE_BYTES - 1];
         head.push(b'\n');
         let mut boundary = vec![b'b'; SAMPLE_BYTES - 1];
         boundary.push(b'\n');
         let f = Fixture::new(&head);
         let mut file = f.open();
-        file.write_all_at(&boundary, sealed - window).unwrap();
+        // Probe sparseness before any write past the head, so a filesystem
+        // without holes refuses here instead of materializing 4 GiB.
         file.set_len(sealed).unwrap();
+        assert!(
+            allocated(&file) <= SPARSE_ALLOCATED_BYTES,
+            "filesystem lacks sparse support ({} bytes allocated)",
+            allocated(&file)
+        );
+        file.write_all_at(&boundary, sealed - window).unwrap();
         let stamp = FileStamp::capture(file.metadata().unwrap()).unwrap();
         file.set_len(sealed + window).unwrap();
-        let allocated = std::os::unix::fs::MetadataExt::blocks(&file.metadata().unwrap()) * 512;
-        assert!(
-            allocated <= SPARSE_ALLOCATED_BYTES,
-            "filesystem lacks sparse support ({allocated} bytes allocated)"
-        );
+        assert!(allocated(&file) <= SPARSE_ALLOCATED_BYTES);
         let now = 1000;
         let checkpoint = Checkpoint {
             stamp,

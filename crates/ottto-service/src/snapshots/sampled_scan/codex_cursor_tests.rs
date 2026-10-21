@@ -2298,8 +2298,8 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
 
 /// Pages one cursor job to its certified end, `I/2` apart, from census
 /// generation `page_number + 1`. With `append_mid_read`, the file grows
-/// after the job's first page. Returns the index and the clock at the job's
-/// open and at its commit.
+/// after the job's first page. Returns the index, the clock at the job's
+/// open and at its commit, and the opening page's full reads by reason.
 fn certify_job(
     fixture: &ScanRoot,
     cache: &Arc<SharedCache>,
@@ -2308,7 +2308,7 @@ fn certify_job(
     now: &mut u64,
     page_number: &mut u64,
     append_mid_read: bool,
-) -> (ScanIndex, u64, u64) {
+) -> (ScanIndex, u64, u64, [usize; 11]) {
     let step = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2;
     let certified = counter(cache, |c| c.jobs_certified);
     let mut opened = None;
@@ -2317,20 +2317,23 @@ fn certify_job(
         clock.set(*now);
         *page_number += 1;
         let started = counter(cache, |c| c.jobs_started);
-        let (next, scan, _) = page_at(
+        let (next, scan, selections) = page_selections(
             fixture,
             index,
             Some(Arc::clone(cache)),
             "cursor-fixture",
             &collected_at(*page_number),
+            |_| {},
+            10_000,
         );
         index = next;
         if counter(cache, |c| c.jobs_started) > started {
-            opened = Some(*now);
+            opened = Some((*now, selections.full_reasons));
         }
         if counter(cache, |c| c.jobs_certified) > certified {
             assert!(!scan.snapshots.is_empty(), "the certified read publishes");
-            return (index, opened.expect("a cursor job opened"), *now);
+            let (opened, reasons) = opened.expect("a cursor job opened");
+            return (index, opened, *now, reasons);
         }
         assert!(scan.snapshots.is_empty(), "a paused job publishes nothing");
         if !appended && opened.is_some() {
@@ -2404,7 +2407,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
         // retained (`tail_eof_record_adding_first_priority_tier_…`).
         with_test_limits(2048, 8192, 64, || {
             let mut page_number = 0;
-            let (next, opened, committed) = certify_job(
+            let (next, opened, committed, reasons) = certify_job(
                 &fixture,
                 &cache,
                 index,
@@ -2414,6 +2417,12 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 case == "grown",
             );
             index = next;
+            let reason = if case == "due marker" {
+                FullReason::AuditDue
+            } else {
+                FullReason::StateMissing
+            };
+            assert_eq!(reasons[reason.slot()], 1, "{case}: {reasons:?}");
             assert!(
                 committed >= opened + interval,
                 "{case}: the read outlived I"
@@ -2429,7 +2438,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                     Some(opened + interval),
                     "{case}: due marker"
                 );
-                let (next, opened, committed) = certify_job(
+                let (next, opened, committed, reasons) = certify_job(
                     &fixture,
                     &cache,
                     index,
@@ -2439,6 +2448,12 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                     false,
                 );
                 index = next;
+                // The due marker selects a stable `Full(AuditDue)` read.
+                assert_eq!(
+                    reasons[FullReason::AuditDue.slot()],
+                    1,
+                    "{case}: {reasons:?}"
+                );
                 assert!(committed >= opened + interval, "{case}: audit outlived I");
                 jobs = 2;
             }
@@ -2474,7 +2489,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                     "cursor-fixture",
                     &collected_at(page_number),
                     |_| {},
-                    usize::MAX,
+                    10_000,
                 );
                 index = next;
                 assert!(scan.snapshots.is_empty(), "{case}: skipped");
@@ -2494,7 +2509,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 "cursor-fixture",
                 &collected_at(page_number),
                 |_| {},
-                usize::MAX,
+                10_000,
             );
             assert_eq!(selections.modes, (1, 0), "{case}: a full read");
             assert_eq!(
