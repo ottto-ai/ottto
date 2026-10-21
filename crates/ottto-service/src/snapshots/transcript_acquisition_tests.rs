@@ -533,11 +533,13 @@ fn lineage_fixture(values: &[Value]) -> Fixture {
     .unwrap();
     fixture
 }
+/// Codex token totals: input, cached input, output, reasoning output.
+type LineageUsage = (u64, u64, u64, u64);
 fn lineage_tokens(
     second: u64,
     ordinal: Option<u64>,
-    total: (u64, u64, u64, u64),
-    last: (u64, u64, u64, u64),
+    total: LineageUsage,
+    last: LineageUsage,
 ) -> Value {
     let mut value = json!({"timestamp":format!("2026-10-07T10:00:{second:02}Z"), "type":"event_msg",
         "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
@@ -549,7 +551,7 @@ fn lineage_tokens(
     value
 }
 /// Appended owned usage after a fixture whose last total is (140, 110, 18, 3).
-const LINEAGE_APPENDS: [((u64, u64, u64, u64), (u64, u64, u64, u64)); 2] = [
+const LINEAGE_APPENDS: [(LineageUsage, LineageUsage); 2] = [
     ((200, 150, 30, 5), (60, 40, 12, 2)),
     ((230, 170, 35, 6), (30, 20, 5, 1)),
 ];
@@ -648,15 +650,14 @@ fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
             assert!(!accumulator.codex_created_thread_native_only, "{case}");
             assert!(!accumulator.codex_parent_ledger_consulted, "{case}");
         }
-        let mut next_ordinal = values.len() as u64;
         for (step, (total, last)) in LINEAGE_APPENDS.into_iter().enumerate() {
+            let next_ordinal = (values.len() + step) as u64;
             fixture.append(&lineage_tokens(
                 10 + step as u64,
                 ordinals.then_some(next_ordinal),
                 total,
                 last,
             ));
-            next_ordinal += 1;
             let (next, mode, _, body) = acquire(&fixture, source, retained, 101 + step as u64);
             assert_eq!(mode, ReadMode::Tail, "{case}: append {step}");
             assert_eq!(body, oracle(&fixture, source), "{case}: append {step}");
