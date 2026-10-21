@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 733,
-  "content_sha256": "c89f488aafca656d02527c6c7370a7328835494380e7200b14dbe09b7e60cfff",
+  "content_sha256": "9ae8fde2d463c82b9667775ebecc68e78e3ed913e0cbdf81bb24676bacd59c8e",
   "files": [
     {
       "executable": false,
@@ -1287,8 +1287,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs",
-      "sha256": "d3c94f9174608eee0d25aa3d322d6f122af50566780adcfb98b8c26465769312",
-      "size_bytes": 46674
+      "sha256": "ad32bca49229b886b071b37cf1004b7de0980003995d3b14b7a6ea555cca2dfa",
+      "size_bytes": 47296
     },
     {
       "executable": false,
