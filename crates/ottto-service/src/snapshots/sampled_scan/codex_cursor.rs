@@ -1237,6 +1237,16 @@ pub(in crate::snapshots) struct Publication {
     /// E1 applied this read's withheld final record.
     eof_applied: bool,
 }
+impl Publication {
+    /// Whether E1 applied the withheld final record, so the reduction is not
+    /// the reduction through the certified prefix. Read before
+    /// `cursor_published` consumes the publication; `eof_applied(job)` is not
+    /// valid after `finish_job`.
+    #[cfg_attr(not(test), allow(dead_code))] // first production caller is main's P1 side writer
+    pub(in crate::snapshots) fn eof_applied(&self) -> bool {
+        self.eof_applied
+    }
+}
 
 /// A completed attempt on a file that did not grow withheld an unterminated
 /// record after `offset` (N2). The sealed completion never counts it, so the

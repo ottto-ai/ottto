@@ -20184,6 +20184,9 @@ impl OwnedSourceScan {
                     crate::local_resource_diagnostics::codex_memo_lifecycle_totals(
                         source.api_slug(),
                     );
+                    crate::local_resource_diagnostics::codex_side_lifecycle_totals(
+                        source.api_slug(),
+                    );
                 }
                 resource_probe.collection(
                     source.api_slug(),

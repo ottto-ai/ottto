@@ -6374,6 +6374,7 @@ fn hopeless_admission_evicts_nothing() {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
+                unsealed: false,
             },
             0,
         );
@@ -6449,6 +6450,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
+                unsealed: false,
             }
         };
         // Control: without a claim the copy fits.
@@ -6991,6 +6993,7 @@ fn witness_admission() -> WitnessAdmission {
         sampled_jsonl::CompletedNativeAcquisition {
             checkpoint: copy.checkpoint,
             reduction: Some(copy.state),
+            unsealed: false,
         },
         0,
     );
