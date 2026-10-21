@@ -83,7 +83,7 @@ impl Host for FakeHost<'_> {
         self.0.destination.get()
     }
     fn cadence<T>(&mut self, apply: impl FnOnce(&mut SourceCadence) -> T) -> Option<T> {
-        Some(apply(&mut *self.0.cadence.borrow_mut()))
+        Some(apply(&mut self.0.cadence.borrow_mut()))
     }
 }
 
