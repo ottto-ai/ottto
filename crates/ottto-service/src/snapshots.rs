@@ -58295,11 +58295,11 @@ mod tests {
     #[test]
     fn codex_parser_extracts_team_subscription_product_distinct_from_pro() {
         let path = temp_file("codex-team-plan");
-        // Team plan fixture mirrors rons's empirical 2026-05-27 Singular session.
+        // Team plan fixture mirrors rons's empirical 2026-05-27 Acme session.
         fs::write(
             &path,
             concat!(
-                "{\"timestamp\":\"2026-05-27T14:34:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-codex-team-singular\",\"model_provider\":\"openai\"}}\n",
+                "{\"timestamp\":\"2026-05-27T14:34:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-codex-team-acme\",\"model_provider\":\"openai\"}}\n",
                 "{\"timestamp\":\"2026-05-27T14:35:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":18,\"request_count\":1},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"team\",\"primary\":{\"used_percent\":2.0,\"window_minutes\":300,\"resets_at\":1779898136},\"secondary\":{\"used_percent\":16.0,\"window_minutes\":10080,\"resets_at\":1780484936}}}}\n"
             ),
         )

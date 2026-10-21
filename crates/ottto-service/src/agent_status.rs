@@ -25173,8 +25173,8 @@ for line in sys.stdin:
             "raw-workspace-binding",
             serde_json::json!([
                 {"id": "raw-org-personal", "title": "Personal", "is_default": true},
-                {"id": "raw-org-singular", "title": "Singular", "is_default": false},
-                {"id": "raw-org-deprecated", "title": "Singular Deprecated", "is_default": false}
+                {"id": "raw-org-acme", "title": "Acme", "is_default": false},
+                {"id": "raw-org-deprecated", "title": "Acme Deprecated", "is_default": false}
             ]),
         );
         let evidence =
@@ -25210,7 +25210,7 @@ for line in sys.stdin:
             coverage
                 .targets
                 .iter()
-                .all(|target| target.workspace_label.as_deref() != Some("Singular Deprecated")),
+                .all(|target| target.workspace_label.as_deref() != Some("Acme Deprecated")),
             "a platform org the owner cannot sign into must never be offered"
         );
     }
@@ -25220,8 +25220,8 @@ for line in sys.stdin:
         let token = codex_split_identity_token(
             "raw-workspace-binding",
             serde_json::json!([
-                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
-                {"id": "raw-org-deprecated", "title": "Singular Deprecated", "is_default": false},
+                {"id": "raw-org-acme", "title": "Acme", "is_default": true},
+                {"id": "raw-org-deprecated", "title": "Acme Deprecated", "is_default": false},
                 {"id": "raw-org-personal", "title": "Personal", "is_default": false}
             ]),
         );
@@ -25251,7 +25251,7 @@ for line in sys.stdin:
             connected.durability,
             CodexAccountTargetDurabilityV1::Durable
         );
-        assert_eq!(connected.workspace_label.as_deref(), Some("Singular"));
+        assert_eq!(connected.workspace_label.as_deref(), Some("Acme"));
         assert_eq!(
             connected.subscription_product.as_deref(),
             Some("chatgpt_pro")
@@ -25268,7 +25268,7 @@ for line in sys.stdin:
         let token = codex_split_identity_token(
             "raw-workspace-binding",
             serde_json::json!([
-                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
+                {"id": "raw-org-acme", "title": "Acme", "is_default": true},
                 {"id": "raw-org-team", "title": "Team", "is_default": false, "plan_type": "business"}
             ]),
         );
@@ -25293,10 +25293,7 @@ for line in sys.stdin:
             derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
 
         assert_eq!(coverage.targets.len(), 1);
-        assert_eq!(
-            coverage.targets[0].workspace_label.as_deref(),
-            Some("Singular")
-        );
+        assert_eq!(coverage.targets[0].workspace_label.as_deref(), Some("Acme"));
         assert!(coverage
             .targets
             .iter()
@@ -25518,11 +25515,11 @@ for line in sys.stdin:
         let token = codex_workspace_target_token(serde_json::json!([
             {"id": "raw-workspace-default", "title": "Personal", "is_default": true}
         ]));
-        let singular_token = codex_workspace_target_token_for(
+        let acme_token = codex_workspace_target_token_for(
             "raw-account-456",
-            "raw-workspace-singular",
+            "raw-workspace-acme",
             serde_json::json!([
-                {"id": "raw-workspace-singular", "title": "Singular", "is_default": true}
+                {"id": "raw-workspace-acme", "title": "Acme", "is_default": true}
             ]),
         );
         let evidence =
@@ -25540,35 +25537,34 @@ for line in sys.stdin:
             5,
         );
         candidate.workspace_targets = evidence;
-        let singular_account_hash =
+        let acme_account_hash =
             billing_identity_hash("openai", "account", "raw-account-456").expect("account hash");
-        let singular_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-singular")
+        let acme_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-acme")
                 .expect("workspace hash");
-        let mut singular = codex_candidate_for_test(
-            "codex_slot_singular",
+        let mut acme = codex_candidate_for_test(
+            "codex_slot_acme",
             CodexAccountSlotOwnershipV1::Managed,
-            &singular_account_hash,
-            &singular_workspace_hash,
+            &acme_account_hash,
+            &acme_workspace_hash,
             5,
         );
-        singular.workspace_targets =
-            codex_workspace_target_evidence_from_id_token(&singular_token, "2026-08-27T00:00:00Z")
+        acme.workspace_targets =
+            codex_workspace_target_evidence_from_id_token(&acme_token, "2026-08-27T00:00:00Z")
                 .expect("target evidence");
         let mut status = empty_codex_accounts_status();
-        status.target_coverage =
-            derive_codex_account_target_coverage(&status, &[candidate, singular]);
+        status.target_coverage = derive_codex_account_target_coverage(&status, &[candidate, acme]);
 
         let wire = serde_json::to_string(&status).expect("serialize Codex account status");
         assert!(wire.contains("Personal"));
-        assert!(wire.contains("Singular"));
+        assert!(wire.contains("Acme"));
         // Raw provider identifiers and credential material never appear, whatever
         // else the payload carries.
         for forbidden in [
             "raw-account-123",
             "raw-account-456",
             "raw-workspace-default",
-            "raw-workspace-singular",
+            "raw-workspace-acme",
             "raw-secret-signature",
         ] {
             assert!(
@@ -27556,7 +27552,7 @@ for line in sys.stdin:
             "apiProvider": "firstParty",
             "email": email,
             "orgId": org_id,
-            "orgName": "Singular",
+            "orgName": "Acme",
             "subscriptionType": "team"
         }))
     }
@@ -27566,7 +27562,7 @@ for line in sys.stdin:
         let parsed = parse_claude_cli_oauth_account(&serde_json::json!({
             "oauthAccount": {
                 "accountUuid": "acct-1",
-                "emailAddress": "ron.s@singular.net",
+                "emailAddress": "team.member@example.com",
                 "organizationUuid": "org-1",
                 "organizationType": "claude_team",
                 "seatTier": "premium",
@@ -27577,7 +27573,10 @@ for line in sys.stdin:
         .expect("oauthAccount parsed");
 
         assert_eq!(parsed.account_uuid.as_deref(), Some("acct-1"));
-        assert_eq!(parsed.email_address.as_deref(), Some("ron.s@singular.net"));
+        assert_eq!(
+            parsed.email_address.as_deref(),
+            Some("team.member@example.com")
+        );
         assert_eq!(parsed.organization_uuid.as_deref(), Some("org-1"));
         assert_eq!(parsed.organization_type.as_deref(), Some("claude_team"));
         assert_eq!(parsed.seat_tier.as_deref(), Some("premium"));
@@ -27594,12 +27593,12 @@ for line in sys.stdin:
         // the uuid rides `~/.claude.json` `oauthAccount`. The stamped hash must
         // be the exact `billing_identity_hash` the quota windows carry so plan
         // and quota evidence converge on one billing identity.
-        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut account = team_auth_account("team.member@example.com", "org-1");
         assert!(account.account_id.is_none());
         assert!(account.account_identifier_hash.is_none());
         let oauth = ClaudeCliOauthAccount {
             account_uuid: Some("acct-1".to_string()),
-            email_address: Some("ron.s@singular.net".to_string()),
+            email_address: Some("team.member@example.com".to_string()),
             organization_uuid: Some("org-1".to_string()),
             ..ClaudeCliOauthAccount::default()
         };
@@ -27684,13 +27683,13 @@ for line in sys.stdin:
         let snapshots = vec![
             current,
             claude_account_snapshot(
-                "ronshub88@gmail.com",
+                "personal.member@example.com",
                 "claude_max_20x",
                 "hash-personal",
                 "org-personal",
             ),
             claude_account_snapshot(
-                "ron.s@singular.net",
+                "team.member@example.com",
                 "claude_team_premium",
                 "hash-team",
                 "org-team",
@@ -27717,8 +27716,12 @@ for line in sys.stdin:
             described,
             vec![
                 ("ron@ottto.net", "claude_max_20x", Some(true)),
-                ("ronshub88@gmail.com", "claude_max_20x", Some(false)),
-                ("ron.s@singular.net", "claude_team_premium", Some(false)),
+                ("personal.member@example.com", "claude_max_20x", Some(false)),
+                (
+                    "team.member@example.com",
+                    "claude_team_premium",
+                    Some(false)
+                ),
             ]
         );
     }
@@ -27762,13 +27765,13 @@ for line in sys.stdin:
         );
         let snapshots = vec![
             claude_account_snapshot(
-                "ron.s@singular.net",
+                "team.member@example.com",
                 "claude_max_20x",
                 "hash-one",
                 "org-personal",
             ),
             claude_account_snapshot(
-                "ron.s@singular.net",
+                "team.member@example.com",
                 "claude_team_premium",
                 "hash-one",
                 "org-team",
@@ -27834,7 +27837,7 @@ for line in sys.stdin:
     fn claude_cli_account_identity_refuses_mismatched_metadata() {
         // `~/.claude.json` lagging behind an account switch must never stamp a
         // different account's uuid onto the signed-in account.
-        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut account = team_auth_account("team.member@example.com", "org-1");
         let stale_email = ClaudeCliOauthAccount {
             account_uuid: Some("acct-other".to_string()),
             email_address: Some("someone.else@example.com".to_string()),
@@ -27860,7 +27863,7 @@ for line in sys.stdin:
         account.account_id = Some("acct-auth-status".to_string());
         let conflicting = ClaudeCliOauthAccount {
             account_uuid: Some("acct-other".to_string()),
-            email_address: Some("ron.s@singular.net".to_string()),
+            email_address: Some("team.member@example.com".to_string()),
             organization_uuid: Some("org-1".to_string()),
             ..ClaudeCliOauthAccount::default()
         };
@@ -27873,19 +27876,19 @@ for line in sys.stdin:
 
         // No account uuid in the metadata: nothing to stamp.
         let uuid_less = ClaudeCliOauthAccount {
-            email_address: Some("ron.s@singular.net".to_string()),
+            email_address: Some("team.member@example.com".to_string()),
             ..ClaudeCliOauthAccount::default()
         };
-        let mut fresh = team_auth_account("ron.s@singular.net", "org-1");
+        let mut fresh = team_auth_account("team.member@example.com", "org-1");
         assert!(!stamp_claude_cli_account_identity(&mut fresh, &uuid_less));
         assert!(fresh.account_identifier_hash.is_none());
     }
 
     #[test]
     fn claude_team_seat_tier_refines_premium_from_seat_tier() {
-        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut account = team_auth_account("team.member@example.com", "org-1");
         let oauth = ClaudeCliOauthAccount {
-            email_address: Some("ron.s@singular.net".to_string()),
+            email_address: Some("team.member@example.com".to_string()),
             organization_uuid: Some("org-1".to_string()),
             organization_type: Some("claude_team".to_string()),
             seat_tier: Some("premium".to_string()),
@@ -27904,9 +27907,9 @@ for line in sys.stdin:
 
     #[test]
     fn claude_team_seat_tier_refines_premium_from_user_rate_limit_tier() {
-        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut account = team_auth_account("team.member@example.com", "org-1");
         let oauth = ClaudeCliOauthAccount {
-            email_address: Some("ron.s@singular.net".to_string()),
+            email_address: Some("team.member@example.com".to_string()),
             user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
             ..ClaudeCliOauthAccount::default()
         };
@@ -27919,7 +27922,7 @@ for line in sys.stdin:
 
     #[test]
     fn claude_team_seat_tier_refines_standard_from_seat_tier() {
-        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut account = team_auth_account("team.member@example.com", "org-1");
         let oauth = ClaudeCliOauthAccount {
             seat_tier: Some("standard".to_string()),
             ..ClaudeCliOauthAccount::default()
@@ -27937,9 +27940,9 @@ for line in sys.stdin:
 
     #[test]
     fn claude_team_seat_tier_leaves_generic_team_without_explicit_signal() {
-        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut account = team_auth_account("team.member@example.com", "org-1");
         let oauth = ClaudeCliOauthAccount {
-            email_address: Some("ron.s@singular.net".to_string()),
+            email_address: Some("team.member@example.com".to_string()),
             organization_type: Some("claude_team".to_string()),
             ..ClaudeCliOauthAccount::default()
         };
@@ -27953,7 +27956,7 @@ for line in sys.stdin:
     fn claude_team_seat_tier_ignores_mismatched_account_metadata() {
         // `~/.claude.json` lagging behind an account switch must not leak a
         // different account's seat tier onto the signed-in account.
-        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut account = team_auth_account("team.member@example.com", "org-1");
         let oauth = ClaudeCliOauthAccount {
             email_address: Some("someone.else@example.com".to_string()),
             seat_tier: Some("premium".to_string()),
@@ -27984,7 +27987,7 @@ for line in sys.stdin:
 
         // A stale non-team organizationType blocks refinement even when the
         // auth status says team.
-        let mut team_account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut team_account = team_auth_account("team.member@example.com", "org-1");
         let stale_oauth = ClaudeCliOauthAccount {
             organization_type: Some("claude_max".to_string()),
             seat_tier: Some("premium".to_string()),
@@ -28862,7 +28865,7 @@ for line in sys.stdin:
     #[test]
     fn claude_max_tier_ignores_non_max_plans_and_orgs() {
         // Team plan: the max refinement never fires.
-        let mut team_account = team_auth_account("ron.s@singular.net", "org-1");
+        let mut team_account = team_auth_account("team.member@example.com", "org-1");
         let oauth = ClaudeCliOauthAccount {
             organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
             ..ClaudeCliOauthAccount::default()
@@ -28904,7 +28907,7 @@ for line in sys.stdin:
         let current_code = root
             .join("claude-code-sessions")
             .join("desktop-account-current")
-            .join("singular-org-bucket");
+            .join("acme-org-bucket");
         std::fs::create_dir_all(&current_code).expect("create current code bucket");
         std::fs::write(
             current_code.join("local_current.json"),
@@ -28930,9 +28933,9 @@ for line in sys.stdin:
             r#"{
               "cliSessionId": "identity-cli-session",
               "lastActivityAt": "2026-07-06T10:00:00Z",
-              "emailAddress": "ron.s@singular.net",
+              "emailAddress": "team.member@example.com",
               "accountName": "Ron",
-              "organizationName": "Singular",
+              "organizationName": "Acme",
               "subscriptionType": "team",
               "initialMessage": "must not be persisted"
             }"#,
@@ -28956,7 +28959,7 @@ for line in sys.stdin:
         std::fs::create_dir_all(&old_identity).expect("create old identity bucket");
         std::fs::write(
             old_identity.join("local_identity.json"),
-            r#"{"emailAddress":"ronshub88@gmail.com"}"#,
+            r#"{"emailAddress":"personal.member@example.com"}"#,
         )
         .expect("write old identity metadata");
 
@@ -28974,18 +28977,18 @@ for line in sys.stdin:
         );
         assert_eq!(current.auth_mode.as_deref(), Some("claude_desktop"));
         assert_eq!(current.billing_channel.as_deref(), Some("subscription"));
-        assert_eq!(current.account_label.as_deref(), Some("ron.s@singular.net"));
-        assert_eq!(current.organization_label.as_deref(), Some("Singular"));
+        assert_eq!(
+            current.account_label.as_deref(),
+            Some("team.member@example.com")
+        );
+        assert_eq!(current.organization_label.as_deref(), Some("Acme"));
         assert_eq!(current.plan_type.as_deref(), Some("team"));
         assert_eq!(current.subscription_product.as_deref(), Some("claude_team"));
         assert_eq!(
             current.account_id.as_deref(),
             Some("desktop-account-current")
         );
-        assert_eq!(
-            current.organization_id.as_deref(),
-            Some("singular-org-bucket")
-        );
+        assert_eq!(current.organization_id.as_deref(), Some("acme-org-bucket"));
         assert_eq!(
             current.source_session_id.as_deref(),
             Some("current-cli-session")
@@ -29003,7 +29006,9 @@ for line in sys.stdin:
 
         let old = observations
             .iter()
-            .find(|observation| observation.account_label.as_deref() == Some("ronshub88@gmail.com"))
+            .find(|observation| {
+                observation.account_label.as_deref() == Some("personal.member@example.com")
+            })
             .expect("old desktop observation");
         assert_eq!(old.is_current, Some(false));
 
@@ -33733,8 +33738,8 @@ for line in sys.stdin:
         let default = candidate(
             "default",
             ClaudeSnapshotSlotClass::Default,
-            "singular-account",
-            "singular-org",
+            "acme-account",
+            "acme-org",
             96,
         );
         let registered = candidate(
@@ -33753,8 +33758,8 @@ for line in sys.stdin:
         let distinct_default = candidate(
             "default",
             ClaudeSnapshotSlotClass::Default,
-            "singular-account",
-            "singular-org",
+            "acme-account",
+            "acme-org",
             12,
         );
         let distinct_registered = candidate(
@@ -33787,8 +33792,8 @@ for line in sys.stdin:
             "default".to_string(),
             ClaudeConfigSlotCollectionStatusV1 {
                 state: ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
-                account_identifier_hash: Some("singular-account".to_string()),
-                organization_identifier_hash: Some("singular-org".to_string()),
+                account_identifier_hash: Some("acme-account".to_string()),
+                organization_identifier_hash: Some("acme-org".to_string()),
                 quota_snapshot: Some(stale_copy),
                 ..Default::default()
             },

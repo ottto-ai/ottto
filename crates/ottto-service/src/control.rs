@@ -16296,7 +16296,7 @@ mod tests {
                     account_identifier_hash: Some(account_hash.clone()),
                     workspace_identifier_hash: Some(workspace_hash.clone()),
                     account_label: "Codex account".to_string(),
-                    workspace_label: Some("Singular".to_string()),
+                    workspace_label: Some("Acme".to_string()),
                     subscription_product: None,
                     durability: ottto_protocol::CodexAccountTargetDurabilityV1::ObservedOnly,
                     is_current: false,
