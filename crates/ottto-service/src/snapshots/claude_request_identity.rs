@@ -33,6 +33,48 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
 
+/// The contract a sync cycle builds Claude bodies under: the full collector
+/// token, which names its version, under a permit, and `""` without one.
+#[cfg(not(test))]
+pub(crate) const fn cycle_contract(permitted: bool) -> &'static str {
+    if permitted {
+        COLLECTOR
+    } else {
+        ""
+    }
+}
+
+// Exercise future collector versions through the real scan/fold/tag pipeline
+// without changing the released collector or other tests' contract.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CYCLE_CONTRACT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn cycle_contract(permitted: bool) -> &'static str {
+    if permitted {
+        TEST_CYCLE_CONTRACT.with(|contract| contract.get().unwrap_or(COLLECTOR))
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_cycle_contract_for_test<T>(
+    contract: &'static str,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<&'static str>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CYCLE_CONTRACT.with(|contract| contract.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_CYCLE_CONTRACT.with(|current| current.replace(Some(contract))));
+    run()
+}
+
 /// Compiled on. Each cycle still emits only under that cycle's exact cohort
 /// hint token (`emission_permit`); without it the body is today's.
 pub(crate) const EMISSION_ENABLED: bool = true;
@@ -707,6 +749,10 @@ pub(crate) fn apply_grouped(
     let refusals = lost.max(1).saturating_add(prior_refusals);
     strip(item);
     item.provenance.collector = COLLECTOR.to_string();
+    #[cfg(test)]
+    {
+        item.provenance.collector = cycle_contract(true).to_owned();
+    }
     item.request_identity_refusals = refusals;
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     Ok(Tagged::Fallback {
@@ -802,6 +848,10 @@ fn install(
         }
     }
     item.provenance.collector = COLLECTOR.to_string();
+    #[cfg(test)]
+    {
+        item.provenance.collector = cycle_contract(true).to_owned();
+    }
 }
 
 fn set_row(

@@ -6184,6 +6184,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
+    pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
 }
 
 struct PreparedTraceRead {
@@ -6876,6 +6877,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .count();
     stats.duplicate_census = disposition.duplicate_census;
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
+        census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),
+        ..disposition.first_proof_hold
+    };
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
         // a previously proven usage authority. Keep the census non-terminal
@@ -18795,6 +18800,9 @@ mod tests {
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
+        mod proof_rearm_idempotence_pipeline_tests {
+            include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
+        }
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");

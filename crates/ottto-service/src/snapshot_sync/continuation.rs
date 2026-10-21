@@ -48,8 +48,8 @@ pub(super) const PACING: ContinuationPacing = ContinuationPacing {
 
 /// A page whose measured work exceeds this is read as contention (a loaded
 /// machine, a slow disk or a long lock wait): the next page waits for the
-/// ordinary cadence instead. It is also the page's own deadline, so a page
-/// never holds `SNAPSHOT_SYNC_LOCK` much longer than this.
+/// ordinary cadence instead. It is also the page's cooperative deadline; an
+/// in-progress record, finalization and scheduling can overrun it.
 pub(super) const CONTENTION_WORK: Duration = Duration::from_secs(20);
 
 /// c22's cursor binding for one paused attempt (hunk A: namespace, rotation
