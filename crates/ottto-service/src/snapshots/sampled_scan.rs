@@ -4,7 +4,7 @@ use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
 use crate::transcript_acquisition::{ReadMode, Scope};
-use crate::transcript_cache::{TranscriptCache, CACHE_BYTES, CACHE_ENTRIES};
+use crate::transcript_cache::{Release, TranscriptCache, CACHE_BYTES, CACHE_ENTRIES, ENTRY_BYTES};
 
 // The existing owner enforces aggregate parked/optional-send overlap. The
 // separate 1MiB reserve covers bounded marker strings in existing index copies
@@ -64,6 +64,36 @@ impl SharedCache {
         } else {
             record(Event::ClearPoisonedLock);
         }
+    }
+    /// M1: evict retained copies in victim order until they fit the state
+    /// budget beside the cursor state and `pinned` bytes, measured under
+    /// blocking locks in the one order (retained, then cursor). Usually it
+    /// evicts nothing. False, with nothing evicted: the retained lock is
+    /// poisoned, the cursor state is unbounded or poisoned, or even an empty
+    /// cache would not fit. Evicted copies drop under the retained lock, as
+    /// `clear` drops them; no guard or credit drops there, so nothing relocks.
+    pub(super) fn release_to_fit(&self, pinned: usize) -> bool {
+        let Ok(mut retained) = self.retained() else {
+            return false;
+        };
+        let floor = crate::heap_layout_bound::bound(&RetainedCache::default(), STATE_BYTES);
+        STATE_BYTES
+            .checked_sub(self.cursor_resident())
+            .and_then(|room| room.checked_sub(pinned))
+            .filter(|limit| floor.is_some_and(|floor| floor <= *limit))
+            .is_some_and(|limit| retained.release_until_for(limit, Release::CopyRefusal))
+    }
+    /// M1 Path A: `release_to_fit`, evicting only retained copies ranked
+    /// strictly below `rank`, and only where evicting them makes room;
+    /// otherwise nothing (`TranscriptCache::release_older_until`).
+    pub(super) fn release_older_to_fit(&self, pinned: usize, rank: (i64, i64)) -> bool {
+        let Ok(mut retained) = self.retained() else {
+            return false;
+        };
+        STATE_BYTES
+            .checked_sub(self.cursor_resident())
+            .and_then(|room| room.checked_sub(pinned))
+            .is_some_and(|limit| retained.release_older_until(limit, rank))
     }
     pub(super) fn take(
         &self,
@@ -250,8 +280,8 @@ impl OwnedSourceScan {
         }
         self
     }
-    /// The conservative release: no resident measurement is supplied, so an
-    /// unsampled native active still clears (L-A1).
+    /// The conservative release: no measurement is supplied, so every shape
+    /// but a measured full native baseline still clears (L-A1).
     #[cfg(test)]
     pub(crate) fn release_sampled_cache_for_copy_refusal(&self) {
         release_cache_for_copy_refusal(self.sampling.as_ref(), self.active_file.as_deref(), None);
@@ -261,11 +291,17 @@ impl OwnedSourceScan {
     /// frames still use their existing aggregate 32MiB allocation/lifetime gate.
     #[cfg(test)]
     pub(super) fn sampled_copy_budget(&mut self) -> usize {
-        self.sampled_copy_parts().0
+        self.sampled_copy_step().0
     }
     /// The copy budget and the resident bound measured by the same walk.
+    #[cfg(test)]
     pub(super) fn sampled_copy_parts(&mut self) -> (usize, Option<usize>) {
-        copy_budget_parts(
+        let (budget, step) = self.sampled_copy_step();
+        (budget, step.resident)
+    }
+    /// The copy budget and what the same walk measured (`StepMeasure`).
+    pub(super) fn sampled_copy_step(&mut self) -> (usize, StepMeasure) {
+        copy_budget_step(
             self.sampling.as_ref(),
             self.active_file.as_deref_mut(),
             false,
@@ -292,50 +328,271 @@ fn owns_no_optimization_state(active: &OwnedActiveFile) -> bool {
             .map_or(true, |replay| replay.join.is_none())
 }
 
-/// The copy-refusal release for `sampling` beside `active`.
-/// `measured_resident` is the resident bound from this same step's budget
-/// walk, used only for this decision; `None` keeps the conservative release.
+/// Whether a refusal beside `active` fits the residents to the active's
+/// optional charge: not a full native read and not an unsampled one, whose
+/// refusal treats their native state as baseline and never uses the charge.
+fn refusal_charges_active(active: &OwnedActiveFile) -> bool {
+    !active
+        .sampling
+        .as_ref()
+        .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
+        && !owns_no_optimization_state(active)
+}
+
+/// What one step's budget walk measured, for that step's refusal decision
+/// only; never carried to another step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct StepMeasure {
+    /// The resident bound (`None`: not measured, e.g. a contended
+    /// `try_lock`, the visit cap, or over the state budget).
+    pub(super) resident: Option<usize>,
+    /// The active file's optional charge (`None`: unknown, e.g. it exceeds
+    /// the state budget). The walk less the reader's line buffer: a full read
+    /// of the same line holds that buffer too, so it is native baseline
+    /// (#641, #654), not optional memory. Where the per-step walk hit the
+    /// visit cap, the byte walk's (`completed_bound`) charge instead.
+    pub(super) active: Option<usize>,
+    /// The active's charge in this step's copy budget: its whole walk, line
+    /// buffer included (`None`: none, so the budget is zero).
+    pub(super) used: Option<usize>,
+}
+impl StepMeasure {
+    /// The active's per-step walk hit the visit cap, so its optional charge
+    /// came from the byte walk and the copy budget stays zero (M1 F1).
+    fn visit_limited(&self) -> bool {
+        self.active.is_some() && self.used.is_none()
+    }
+}
+
+/// The conservative copy-refusal release, given at most a resident bound and
+/// no active charge (L-A1): any active other than a measured native baseline
+/// read still clears. `None` supplies no measurement: nothing is re-measured.
+/// Production never reaches either branch this way: its step start always
+/// supplies a `StepMeasure` with the active's charge (`release_cache_to_fit`).
+/// Rows that pass `None`, or a non-exempt active, pin a non-production branch.
+#[cfg(test)]
 pub(super) fn release_cache_for_copy_refusal(
     sampling: Option<&Context>,
     active: Option<&OwnedActiveFile>,
     measured_resident: Option<usize>,
 ) {
-    if let Some(context) = sampling {
-        // A full parser's native accumulator is the unchanged synchronous
-        // baseline. Its local layout refusal forbids optional copies, but
-        // does not invalidate other already bounded resident reductions.
-        // Acquisition/path scratch still uses the separate 1MiB reserve.
-        // Borrowed tail state, unsupported audit metadata and an unbounded
-        // resident graph retain the existing conservative release behavior.
-        let native_full_baseline = active.is_some_and(|active| {
-            active
-                .sampling
-                .as_ref()
-                .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
-        });
-        if native_full_baseline && context.audit_metadata_supported {
-            if crate::heap_layout_bound::bound(context, STATE_BYTES).is_some() {
-                return;
-            }
-            record(Event::ClearFullResidentBoundUnknown);
-        } else if !context.audit_metadata_supported {
-            record(Event::ClearMetadataUnsupported);
-        } else if active.is_none() {
-            record(Event::ClearNoActive);
-        } else if active.is_some_and(owns_no_optimization_state) {
-            // Like a full parser, an unsampled native read is the unchanged
-            // synchronous baseline and retains nothing, so its refusal does
-            // not invalidate residents this step measured as bounded. This
-            // is not a combined native-plus-cache bound.
-            if measured_resident.is_some_and(|resident| resident <= STATE_BYTES) {
-                return;
-            }
-            record(Event::ClearFullResidentBoundUnknown);
-        } else {
-            record(Event::ClearOtherActive);
+    release_for_copy_refusal(
+        sampling,
+        active,
+        measured_resident.map(|resident| StepMeasure {
+            resident: Some(resident),
+            active: None,
+            used: None,
+        }),
+    );
+}
+
+/// M1: the copy-refusal release for `sampling` beside `active`, decided on
+/// this step's own walk (`step`).
+pub(super) fn release_cache_to_fit(
+    sampling: Option<&Context>,
+    active: Option<&OwnedActiveFile>,
+    step: StepMeasure,
+) {
+    release_for_copy_refusal(sampling, active, Some(step));
+}
+
+/// A zero copy budget forbids an optional copy beside the active. It does
+/// not by itself mean the residents overflow: the budget is half of what is
+/// left, so it is zero whenever the cache is merely full. M1 releases
+/// retained copies only where optional memory (residents, cursor state and
+/// the active's optional charge) really exceeds the state budget, and then
+/// only as many as the overflow needs, in victim order. The whole cache is
+/// cleared only where the charge to fit is unknown or cannot fit beside an
+/// empty cache; each such clear is counted by its cause. A sampled tail then
+/// makes room for its own copy from older entries only (`admit_tail_copy`).
+/// `step` `None` is a caller with no step measurement: the conservative
+/// release.
+fn release_for_copy_refusal(
+    sampling: Option<&Context>,
+    active: Option<&OwnedActiveFile>,
+    step: Option<StepMeasure>,
+) {
+    let Some(context) = sampling else {
+        return;
+    };
+    // A full parser's native accumulator is the unchanged synchronous
+    // baseline. Its local layout refusal forbids optional copies, but
+    // does not invalidate other already bounded resident reductions.
+    // Acquisition/path scratch still uses the separate 1MiB reserve.
+    // Borrowed tail state and unsupported audit metadata keep a release.
+    let native_full_baseline = active.is_some_and(|active| {
+        active
+            .sampling
+            .as_ref()
+            .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
+    });
+    // The optional charge the residents must fit beside, and the clear's
+    // cause where it cannot be fitted (no charge: clear).
+    let (charge, cause) = if !context.audit_metadata_supported {
+        (None, Event::ClearMetadataUnsupported)
+    } else if native_full_baseline {
+        if crate::heap_layout_bound::bound(context, STATE_BYTES).is_some() {
+            return;
         }
-        context.cache.clear();
+        (step.map(|_| 0), Event::ClearFullResidentBoundUnknown)
+    } else if active.is_none() {
+        (step.map(|_| 0), Event::ClearNoActive)
+    } else if active.is_some_and(owns_no_optimization_state) {
+        // Like a full parser, an unsampled native read is the unchanged
+        // synchronous baseline and retains nothing, so its refusal does
+        // not invalidate residents this step measured as bounded. This
+        // is not a combined native-plus-cache bound.
+        if step
+            .and_then(|step| step.resident)
+            .is_some_and(|resident| resident <= STATE_BYTES)
+        {
+            return;
+        }
+        (step.map(|_| 0), Event::ClearFullResidentBoundUnknown)
+    } else {
+        if step.is_some_and(|step| step.visit_limited()) {
+            record(Event::CopyRefusalWalkVisitLimit);
+        }
+        (step.and_then(|step| step.active), Event::ClearOtherActive)
+    };
+    if let Some(charge) = charge {
+        if fit_residents(context, step.and_then(|step| step.resident), charge) {
+            if let (Some(active), Some(step), Event::ClearOtherActive) = (active, step, cause) {
+                admit_tail_copy(context, active, step, charge);
+            }
+            return;
+        }
     }
+    record(cause);
+    context.cache.clear();
+}
+
+/// Fit the residents beside `charge` within the state budget, evicting only
+/// what a real overflow needs. False where they cannot fit even emptied.
+fn fit_residents(context: &Context, resident: Option<usize>, charge: usize) -> bool {
+    // This step's walk already shows the residents fit beside the charge: a
+    // merely full cache. Nothing is released.
+    if resident
+        .and_then(|resident| resident.checked_add(charge))
+        .is_some_and(|total| total <= STATE_BYTES)
+    {
+        record(Event::CopyRefusalKept);
+        return true;
+    }
+    // An unknown resident (contention, the visit cap, a real overflow) is
+    // measured again under blocking locks before anything is evicted.
+    if resident.is_none() {
+        record(Event::CopyRefusalRemeasured);
+    }
+    context_overhead(context)
+        .and_then(|overhead| overhead.checked_add(charge))
+        .is_some_and(|pinned| context.cache.release_to_fit(pinned))
+}
+
+/// M1 Path A (review §3c, owner-accepted): at a zero-budget step of a
+/// sampled tail, make room for its own copy by evicting, in victim order,
+/// only entries ranked strictly older than the tailed file, and only where
+/// that makes the copy fit; otherwise nothing. Main's wipe evicted every such
+/// entry; a newer entry never yields to an older tail (G3). The room is the
+/// next step's copy budget: the active's whole walk plus twice its optional
+/// charge, which over-approximates the copy (`retain_reduction` takes half
+/// the remainder). The tail's growth after this step is not foreseen, and a
+/// zero-budget completion step has already fixed its own budget.
+fn admit_tail_copy(context: &Context, active: &OwnedActiveFile, step: StepMeasure, charge: usize) {
+    let tail = active
+        .sampling
+        .as_ref()
+        .is_some_and(|sampling| sampling.mode == ReadMode::Tail);
+    if !tail || codex_cursor::byte_charged(active) || charge > ENTRY_BYTES {
+        return;
+    }
+    let pinned = step
+        .used
+        .zip(context_overhead(context))
+        .and_then(|(used, overhead)| {
+            overhead
+                .checked_add(used)?
+                .checked_add(charge.checked_mul(2)?)
+        });
+    if let Some(pinned) = pinned {
+        context
+            .cache
+            .release_older_to_fit(pinned, tail_rank(&active.candidate));
+    }
+}
+
+/// The tailed file's eviction rank as its re-admission records it: its
+/// modification time, clipped to now (`TranscriptCache` clips at admission).
+fn tail_rank(candidate: &CandidateFile) -> (i64, i64) {
+    let nanos = candidate.modified_unix_nanos;
+    let modified = (
+        i64::try_from(nanos / 1_000_000_000).unwrap_or(i64::MAX),
+        i64::try_from(nanos % 1_000_000_000).unwrap_or_default(),
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    modified.min((
+        i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+        i64::from(now.subsec_nanos()),
+    ))
+}
+
+/// `context`'s charge outside its shared cache's two locked states, as
+/// `bound(context)` counts it, plus those states' inline layouts, which their
+/// own bounds count again: a few hundred bytes over, never under.
+fn context_overhead(context: &Context) -> Option<usize> {
+    use crate::heap_layout_bound::bound;
+    use std::mem::{align_of, size_of};
+    // Exhaustive destructuring: a new owned field must be charged here too.
+    let Context {
+        cache: _,
+        namespace,
+        audit_metadata_supported: _,
+        audit_slots: _,
+        full_files: _,
+        tail_files: _,
+        unchanged_files: _,
+        native_bytes: _,
+        sample_bytes: _,
+        full_reasons: _,
+        priority_replays: _,
+        audits_started: _,
+        audits_completed: _,
+        start_overdue_seconds: _,
+        completion_overdue_seconds: _,
+        admission,
+    } = context;
+    // The shared cache's `Arc` payload charge.
+    let shared = size_of::<SharedCache>()
+        .checked_add(align_of::<SharedCache>())?
+        .checked_add(2 * size_of::<usize>())?;
+    size_of::<Context>()
+        .checked_add(shared)?
+        .checked_add(bound(namespace, STATE_BYTES)?)?
+        .checked_add(bound(admission, STATE_BYTES)?)
+}
+
+/// Whether `context_overhead` plus the two locked states covers
+/// `bound(context)` (tests only).
+#[cfg(test)]
+pub(super) fn context_overhead_covers(context: &Context) -> bool {
+    use crate::heap_layout_bound::bound;
+    let Some(whole) = bound(context, STATE_BYTES) else {
+        return false;
+    };
+    let Ok(retained) = context.cache.retained() else {
+        return false;
+    };
+    bound(&*retained, STATE_BYTES)
+        .zip(context_overhead(context))
+        .and_then(|(retained, overhead)| {
+            retained
+                .checked_add(overhead)?
+                .checked_add(context.cache.cursor_resident())
+        })
+        .is_some_and(|parts| parts >= whole)
 }
 
 /// A completing cursor job's exact copy budget (E3), with the same
@@ -344,9 +601,9 @@ pub(super) fn completion_copy_budget(
     sampling: Option<&Context>,
     active: &mut OwnedActiveFile,
 ) -> usize {
-    let budget = copy_budget_parts(sampling, Some(&mut *active), true).0;
+    let (budget, step) = copy_budget_step(sampling, Some(&mut *active), true);
     if budget == 0 {
-        release_cache_for_copy_refusal(sampling, Some(&*active), None);
+        release_cache_to_fit(sampling, Some(&*active), step);
     }
     budget
 }
@@ -359,31 +616,49 @@ pub(super) fn completion_copy_budget(
 /// at the next walk, at most every `CHARGE_REFRESH_BYTES`); `completing`
 /// walks exactly, once, on the step that consumes the budget.
 /// This accounting is amortized across the job, not completion-only.
-/// Also returns the resident bound this walk measured (`None` on the early
-/// returns), for the same step's refusal decision only.
-pub(super) fn copy_budget_parts(
+/// Also returns what this walk measured (`StepMeasure`), for the same
+/// step's refusal decision only.
+pub(super) fn copy_budget_step(
     sampling: Option<&Context>,
     active: Option<&mut OwnedActiveFile>,
     completing: bool,
-) -> (usize, Option<usize>) {
+) -> (usize, StepMeasure) {
     let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
-        return (0, None);
+        return (0, StepMeasure::default());
     };
-    let Some(resident) = crate::heap_layout_bound::bound(context, STATE_BYTES) else {
-        return (0, None);
+    let resident = crate::heap_layout_bound::bound(context, STATE_BYTES);
+    let remaining = resident.and_then(|resident| STATE_BYTES.checked_sub(resident));
+    let Some(active) = active else {
+        let budget = remaining.map_or(0, |remaining| remaining / 2);
+        return (
+            budget,
+            StepMeasure {
+                resident,
+                active: None,
+                used: None,
+            },
+        );
     };
-    let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
-        return (0, None);
+    let consumed = active.parser.reader.consumed_bytes();
+    let buffer = active.parser.reader.buf.capacity();
+    let estimate = (!completing)
+        .then(|| codex_cursor::job_charge_estimate(active, consumed, buffer))
+        .flatten();
+    let byte_charged = codex_cursor::byte_charged(active);
+    // Every active is walked to the whole state budget, a non-byte-charged
+    // one past its line buffer, so a refusal knows its real optional charge
+    // (M1; F2 for a byte-charged job). The budget below is unchanged: it
+    // still charges the walk against the measured remainder.
+    let limit = if byte_charged {
+        STATE_BYTES
+    } else {
+        STATE_BYTES.saturating_add(buffer)
     };
-    let active = active.map_or(Some(0), |active| {
-        let consumed = active.parser.reader.consumed_bytes();
-        let buffer = active.parser.reader.buf.capacity();
-        let estimate = (!completing)
-            .then(|| codex_cursor::job_charge_estimate(active, consumed, buffer))
-            .flatten();
-        if let Some(estimate) = estimate {
-            return Some(estimate);
-        }
+    // (the budget's charge, the refusal's optional charge)
+    let (used, optional) = if let Some(estimate) = estimate {
+        // The E3 estimate is charged whole, its buffer growth included.
+        (Some(estimate), Some(estimate))
+    } else {
         // These native source-wide inputs predate the optimization, are
         // refreshed on reuse, and are absent from every retained copy.
         // All active owned parser/acquisition/path/receipt state stays charged.
@@ -395,26 +670,53 @@ pub(super) fn copy_budget_parts(
             .and_then(|group| group.take_tee_inputs());
         // The walk charges the file itself, as before it was boxed.
         let file: &OwnedActiveFile = active;
-        let byte_charged = codex_cursor::byte_charged(file);
         let bound = if byte_charged {
-            crate::heap_layout_bound::completed_bound(file, remaining)
+            crate::heap_layout_bound::completed_bound(file, limit)
         } else {
-            crate::heap_layout_bound::bound(file, remaining)
+            crate::heap_layout_bound::bound(file, limit)
+        };
+        // F1: a per-step walk over the visit cap (a long Codex tail's usage
+        // hours, keep R2 §2.2) takes the visit-robust byte walk for the
+        // refusal's charge only; the copy budget stays zero. It runs only on
+        // the steps of such an active, never for a shape whose refusal does
+        // not use the charge.
+        let visit_limited = if !byte_charged && bound.is_none() && refusal_charges_active(file) {
+            crate::heap_layout_bound::completed_bound(file, limit)
+        } else {
+            None
         };
         active.parser.restore_live_reduction_inputs(inputs);
         if let Some(group) = active.group.as_mut() {
             group.restore_tee_inputs(tee_inputs);
         }
         if byte_charged {
+            // The real walk, so the E3 estimate stays usable for the next
+            // refusal (F2); `usize::MAX` only where the job alone exceeds
+            // the state budget.
             codex_cursor::record_job_charge(active, bound.unwrap_or(usize::MAX), consumed, buffer);
+            (bound, bound)
+        } else {
+            (
+                bound,
+                bound
+                    .or(visit_limited)
+                    .map(|bound| bound.saturating_sub(buffer)),
+            )
         }
-        bound
-    });
-    let budget = active
-        .and_then(|used| remaining.checked_sub(used))
+    };
+    let budget = remaining
+        .zip(used)
+        .and_then(|(remaining, used)| remaining.checked_sub(used))
         .map(|remaining| remaining / 2)
         .unwrap_or(0);
-    (budget, Some(resident))
+    (
+        budget,
+        StepMeasure {
+            resident,
+            active: optional,
+            used,
+        },
+    )
 }
 
 #[cfg(test)]

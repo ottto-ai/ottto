@@ -3095,6 +3095,7 @@ fn empty_codex_accounts_status() -> CodexAccountsStatusV1 {
             remaining_slots: ottto_core::MAX_CODEX_ACCOUNT_SLOTS.saturating_sub(1),
         },
         daemon_sign_in_supported: None,
+        background_quota_refresh: None,
     }
 }
 
@@ -3328,6 +3329,18 @@ fn collect_codex_status_for_home(
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
             snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                 "codex_quota_not_read_yet",
+                AgentDiagnosticSeverity::Info,
+                failure.message,
+            ));
+        }
+        Err(failure)
+            if failure.message == codex_saved_quota::CODEX_QUOTA_BACKGROUND_REFRESH_OFF =>
+        {
+            // The same, while background limit refresh is off: nothing reads
+            // it until the owner asks. Not a failed read.
+            snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                "codex_quota_background_refresh_off",
                 AgentDiagnosticSeverity::Info,
                 failure.message,
             ));
@@ -11373,6 +11386,21 @@ fn collect_claude_oauth_usage_unstamped(
             current_unix_seconds(),
         );
     }
+    // "Background limit refresh" off: the daemon's own passes read no
+    // account, the default login included. Only an explicit refresh and setup
+    // checks call the provider; stored readings are served and age as usual.
+    if !explicit_refresh_due && claude_background_read_withheld() {
+        drop(token);
+        let result = match exact_stale_fallback {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => Err(CLAUDE_BACKGROUND_REFRESH_OFF_MESSAGE.to_string()),
+        };
+        return ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
+            "claude_oauth_usage_check_suppressed",
+            "Background limit refresh is off: no provider request was made, and any served readings are last-known local readings.",
+            now,
+        );
+    }
     // A status read for the app serves the stored reading: only the daemon's
     // own passes, an explicit refresh and setup checks call the provider. The
     // daemon's next pass reads a due account.
@@ -12468,6 +12496,33 @@ pub(crate) fn with_claude_pass<T>(
 /// Whether this thread's collection serves stored Claude readings only.
 pub(crate) fn claude_pass_saved_only() -> bool {
     CLAUDE_PASS.with(|pass| pass.get().is_some_and(|pass| pass.saved_only))
+}
+
+const CLAUDE_BACKGROUND_REFRESH_OFF_MESSAGE: &str =
+    "Claude quota for this account has no stored reading, and background limit refresh is off; use Refresh limits to read it now.";
+
+/// Whether this read is a background one that "Background limit refresh"
+/// (the Claude upkeep consent) withholds: it runs in a collection pass of the
+/// status lane (the daemon's schedule, or an app's status request) while the
+/// switch is off, and its caller is not a setup check. Reads outside a pass
+/// (setup and account checks, a standalone collection) and an explicit
+/// refresh, which the caller checks first, are never withheld. Unreadable
+/// settings count as off, as for the sign-in renewal.
+fn claude_background_read_withheld() -> bool {
+    use crate::provider_calls::Trigger;
+    if CLAUDE_PASS.with(|pass| pass.get().is_none())
+        || matches!(
+            crate::provider_calls::current_trigger(),
+            Some(Trigger::Setup | Trigger::ExplicitRefresh)
+        )
+    {
+        return false;
+    }
+    !FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .is_ok_and(|status| {
+            status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
+        })
 }
 
 /// A pass longer than this no longer anchors its reads' spacing.
@@ -22885,6 +22940,99 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// "Background limit refresh" off: the schedule reads no Codex home and
+    /// a never-read home says why. A person's Refresh and the setup check's
+    /// provider read still read; switching it on resumes the schedule.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_background_refresh_off_stops_the_schedule_but_not_refresh_or_setup() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, home, _guards) = synthetic_default_codex_install("background-refresh-off");
+        let support = root.join("support");
+        // The settings writer keeps its lock in a private support dir.
+        std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o700))
+            .expect("private support dir");
+        codex_saved_quota::forget_running_homes();
+        let settings = ottto_core::FileCodexAccountSlotSettingsStore::default();
+        let off = settings
+            .set_quota_refresh_consent(1, false)
+            .expect("turn off");
+        assert_eq!(
+            off.background_quota_refresh,
+            Some(ottto_protocol::CodexQuotaRefreshConsentState::ConsentRequired)
+        );
+        let before = codex_app_server_runs();
+        let now = current_unix_seconds();
+
+        // Never read, due at once: the schedule reads nothing, and the status
+        // says background refresh is off instead of "reads it shortly".
+        assert_eq!(codex_saved_quota::scheduled_round(&support, now), 0);
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 24 * 60 * 60),
+            0
+        );
+        assert_eq!(codex_app_server_runs(), before);
+        assert_eq!(
+            codex_saved_quota::serve_saved(&home, CodexHomeTrust::ProviderDefault, now)
+                .err()
+                .map(|failure| failure.message),
+            Some(codex_saved_quota::CODEX_QUOTA_BACKGROUND_REFRESH_OFF.to_string())
+        );
+        let candidate = collect_codex_home_candidate(
+            default_codex_slot(&home),
+            "2026-08-26T00:00:00Z",
+            "2026-08-26T00:15:00Z",
+            CodexQuotaRead::Saved,
+        );
+        assert!(candidate
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_quota_background_refresh_off"));
+        assert_eq!(codex_app_server_runs(), before);
+
+        // A person's Refresh reads.
+        let refreshed = refresh_codex_quota_now(0);
+        assert_eq!((refreshed.read, refreshed.rate_limited), (1, 0));
+        assert_eq!(codex_app_server_runs(), before + 1);
+        // The setup check's provider read reads too.
+        collect_codex_usage_for_home(
+            &home,
+            CodexHomeTrust::ProviderDefault,
+            CodexQuotaRead::Provider,
+        )
+        .expect("setup read");
+        assert_eq!(codex_app_server_runs(), before + 2);
+        // Still nothing scheduled, however late.
+        let now = current_unix_seconds();
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 24 * 60 * 60),
+            0
+        );
+        assert_eq!(codex_app_server_runs(), before + 2);
+
+        // On again: the next due read runs.
+        settings
+            .set_quota_refresh_consent(1, true)
+            .expect("turn on");
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 15 * 60 + 1),
+            1
+        );
+        assert_eq!(codex_app_server_runs(), before + 3);
+
+        let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .ok()
+            .flatten()
+            .and_then(|credentials| codex_credential_claimed_binding(&credentials));
+        if let Some(binding) = binding {
+            codex_credit_grants::forget_binding_cadence(&binding);
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// An older app's status refresh stands in for Refresh with a 5-minute
     /// gap: one read per home, then the saved copy, even for the one-minute
     /// Refresh, until the home's last read is 5 minutes old.
@@ -31688,6 +31836,7 @@ for line in sys.stdin:
             browser_auth_supported: None,
             auth_code_entry_supported: None,
             retained_provisional_login_count: None,
+            consent_covers_limit_reads: None,
         }
     }
 
@@ -33799,6 +33948,7 @@ for line in sys.stdin:
             browser_auth_supported: None,
             auth_code_entry_supported: None,
             retained_provisional_login_count: None,
+            consent_covers_limit_reads: None,
         };
 
         for switched_to in [0, 1, 4, 2, 0] {

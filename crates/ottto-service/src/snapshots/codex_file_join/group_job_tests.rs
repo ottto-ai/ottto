@@ -1427,6 +1427,121 @@ fn group_with_legacy_tee_is_byte_charged() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// M1 review F2: a byte-charged group job whose real charge overflows the
+/// state budget beside full residents is walked to the whole state budget,
+/// so its refusal evicts to fit on that charge: one entry for an overflow
+/// below one entry's charge, never a wipe-all clear. Its E3 record is that
+/// walk, not `usize::MAX`, so the next step's estimate opens the budget and
+/// nothing is released again.
+///
+/// Red at round 1 (66e5315c): the walk stopped at the remaining room,
+/// recorded `usize::MAX` and cleared every filler (`ClearOtherActive`).
+#[test]
+fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests as policy;
+    let (root, inventory) = fixture();
+    let previous = legacy_index(&inventory, None);
+    let mut boot = GroupBoot::new(inventory.groups().into_values().next().unwrap(), &previous);
+    loop {
+        match boot.step(None, &previous) {
+            Boot::Pending => {}
+            Boot::Ready => break,
+            _ => panic!("the legacy group boots"),
+        }
+    }
+    let metadata = CodexTitleMetadata::default();
+    let mut job = boot
+        .into_job(JobInputs {
+            metadata: &metadata,
+            traces: None,
+            ledgers: None,
+            artifacts: false,
+            context_curve: false,
+            index: &previous,
+        })
+        .unwrap();
+    let no_scope = |_: &CandidateFile| None;
+    let inputs = StepInputs {
+        metadata: &metadata,
+        attribution: None,
+        artifacts: false,
+        context_curve: false,
+        live_scope: &no_scope,
+    };
+    assert!(matches!(
+        step_group(&mut job, &inputs),
+        GroupStep::Read(Ok(false))
+    ));
+    // The job's own state grows by bytes past the room the fillers leave.
+    job.parser
+        .accumulator
+        .provider_skills
+        .extend((0..4800).map(|n| format!("group-{n:05}-{}", "x".repeat(1000))));
+    let (cache, filler_charge) = policy::filled_cache();
+    let mut owned = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        &[root.join("sessions")],
+        previous,
+        "2026-10-06T23:00:00Z",
+        7,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
+    *owned.active_file = Some(job);
+    let (budget, step) = owned.sampled_copy_step();
+    let walked = owned
+        .active_file
+        .as_ref()
+        .and_then(|active| active.group.as_ref())
+        .and_then(|group| group.walked);
+    let receipt =
+        format!("budget={budget} step={step:?} walked={walked:?} filler_charge={filler_charge}");
+    eprintln!("CACHE_POLICY test=M1_group_overflow {receipt}");
+    assert_eq!(
+        budget, 0,
+        "precondition: the group overflows the room; {receipt}"
+    );
+    assert!(
+        step.active.is_some() && walked.map(|(charge, _, _)| charge) == step.active,
+        "F2: the real walk is the refusal's charge and the E3 record; {receipt}"
+    );
+    let overflow = step
+        .resident
+        .zip(step.active)
+        .map(|(resident, active)| (resident + active).saturating_sub(policy::POLICY_STATE_BYTES));
+    assert!(
+        overflow.is_some_and(|overflow| overflow > 0 && overflow < filler_charge),
+        "precondition: an overflow below one entry; {receipt}"
+    );
+    let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        sampled_scan::release_cache_to_fit(
+            owned.sampling.as_ref(),
+            owned.active_file.as_deref(),
+            step,
+        )
+    });
+    assert_eq!(
+        policy::wipe_clears(&counts),
+        0,
+        "F2: a wipe-all clear; {counts:?}"
+    );
+    assert_eq!(counts.copy_refusal_entries_evicted, 1, "{counts:?}");
+    assert_eq!(policy::fillers_resident(&cache), policy::FILLERS - 1);
+    assert!(
+        owned.sampled_copy_budget() > 0,
+        "F2: the next step's E3 estimate keeps the budget shut"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn proof_charge_uses_proven_btree_fill() {
     if !crate::heap_layout_bound::layout_supported() {
