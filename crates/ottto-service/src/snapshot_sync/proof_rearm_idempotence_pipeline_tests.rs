@@ -1270,14 +1270,128 @@ fn c1a_residual_dormant_family_change_receipt() {
     }
 }
 
+fn c1a_family_bodies(
+    pages: &[RearmPage],
+) -> BTreeMap<String, (&RearmPage, crate::snapshots::SnapshotItem)> {
+    let family = rearm_family_sessions();
+    pages
+        .iter()
+        .flat_map(|page| {
+            page.scan
+                .snapshots
+                .iter()
+                .filter(|item| family.contains(&item.source_session_id))
+                .map(move |item| (item.source_session_id.clone(), (page, item.clone())))
+        })
+        .collect()
+}
+
+/// Synthetic identity on every family request, installed before any scan so
+/// neither transition can rely on a sidecar change to select the family.
+fn c1a_add_family_request_identity(fixture: &RearmFixture) {
+    use sha2::{Digest, Sha256};
+    let path = fixture.sidecar_path("claude-code-effort");
+    let rows = std::fs::read_to_string(&path)
+        .expect("read synthetic API sidecar")
+        .lines()
+        .map(|line| {
+            let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+                serde_json::from_str(line).expect("synthetic API row");
+            row.account_identity_checked = true;
+            row.account_identifier_hash = Some("a".repeat(64));
+            row.request_identity = Some(
+                serde_json::from_value(serde_json::json!({
+                    "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+                    "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":"a".repeat(64)},
+                    "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":"d".repeat(64)},
+                }))
+                .unwrap(),
+            );
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            serde_json::to_string(&row).unwrap() + "\n"
+        })
+        .collect::<String>();
+    std::fs::write(path, rows).expect("write synthetic identity rows");
+}
+
+fn c1a_assert_family_emitted_and_tagged(
+    pages: &[RearmPage],
+    collector: &str,
+    previous: &BTreeMap<String, crate::snapshots::SnapshotItem>,
+) {
+    let bodies = c1a_family_bodies(pages);
+    assert_eq!(bodies.len(), rearm_family_sessions().len());
+    for (session, (page, item)) in bodies {
+        assert_eq!(item.provenance.collector, collector, "{session}");
+        assert_ne!(
+            item.snapshot_fingerprint, previous[&session].snapshot_fingerprint,
+            "{session}: new contract must change the accepted body"
+        );
+        assert!(
+            page.offered.contains(&item.snapshot_fingerprint),
+            "{session}: re-emitted"
+        );
+        assert!(
+            page.uploaded.contains(&item.snapshot_fingerprint),
+            "{session}: acknowledged"
+        );
+        assert!(
+            page.index
+                .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint),
+            "{session}: durable accepted body"
+        );
+        assert!(
+            !item.request_evidence.is_empty(),
+            "{session}: identity evidence"
+        );
+        assert_eq!(item.request_identity_refusals, 0, "{session}");
+        assert!(
+            !item.model_usage.is_empty() && !item.usage_buckets.is_empty(),
+            "{session}"
+        );
+        for row in item
+            .model_usage
+            .iter()
+            .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+        {
+            assert_eq!(
+                row.account_identifier_hash.as_deref(),
+                Some("a".repeat(64).as_str()),
+                "{session}: login tag"
+            );
+            let evidence = &item.request_evidence[usize::from(
+                row.evidence_ref
+                    .expect("every usage row has an identity tag"),
+            )];
+            assert_eq!(
+                evidence.identity_basis,
+                crate::snapshots::claude_request_identity::TELEMETRY,
+                "{session}"
+            );
+            assert_eq!(
+                evidence.provider_workspace_hash.as_deref(),
+                Some("d".repeat(64).as_str()),
+                "{session}: org tag"
+            );
+        }
+    }
+    assert_eq!(
+        c1a_window(pages).family_offered,
+        rearm_family_sessions().len()
+    );
+}
+
 /// X(b) off→on, re-emission (SI condition 4): the bodies built while no
 /// contract was permitted carry the legacy collector. After the contract
 /// turns on, the latch re-arms the skipped family at the next terminal, and
 /// the window after that re-emits every family body under contract 5: each
 /// is offered and acknowledged, carries the contract-5 collector token, and
-/// differs from its contract-off body. The fixture's API rows carry no
-/// account identity, so the usage rows stay untagged; row identity on a
-/// re-read family is `c1a_late_identity_row_reselects_and_tags_skipped_family`.
+/// differs from its contract-off body. Every usage row links to its own
+/// telemetry identity, present before the permit changes.
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
@@ -1285,28 +1399,14 @@ fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    fn family_bodies(
-        pages: &[RearmPage],
-    ) -> BTreeMap<String, (&RearmPage, crate::snapshots::SnapshotItem)> {
-        let family = rearm_family_sessions();
-        pages
-            .iter()
-            .flat_map(|page| {
-                page.scan
-                    .snapshots
-                    .iter()
-                    .filter(|item| family.contains(&item.source_session_id))
-                    .map(move |item| (item.source_session_id.clone(), (page, item.clone())))
-            })
-            .collect()
-    }
     let family = rearm_family_sessions();
     let collector = crate::snapshots::claude_request_identity::COLLECTOR;
     let mut fixture = c1a_fixture("c1a-contract-off-to-on-reemits");
+    c1a_add_family_request_identity(&fixture);
     fixture.request_identity = false;
     fixture.owned_base_preparation = true;
     let closing = c1a_generation(&fixture, "fix", (8, 0));
-    let off_bodies = family_bodies(&closing)
+    let off_bodies = c1a_family_bodies(&closing)
         .into_iter()
         .map(|(session, (_, item))| (session, item))
         .collect::<BTreeMap<_, _>>();
@@ -1333,7 +1433,7 @@ fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
     );
     assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
     let reread = c1a_generation(&fixture, "fix", (8, 40));
-    let on_bodies = family_bodies(&reread);
+    let on_bodies = c1a_family_bodies(&reread);
     assert_eq!(
         on_bodies.keys().collect::<Vec<_>>(),
         off_bodies.keys().collect::<Vec<_>>(),
@@ -1357,7 +1457,142 @@ fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
             "{session}: acknowledged"
         );
     }
-    assert_eq!(c1a_window(&reread).family_offered, family.len());
+    c1a_assert_family_emitted_and_tagged(&reread, collector, &off_bodies);
+}
+
+/// X(b) v1→v2: only the collector token changes. A v2→v1→v2 flip inside
+/// the first traversal keeps the latch even though its terminal sees v2.
+/// Only the next complete traversal, wholly under v2, clears it after
+/// re-arming every Claude file. The next window re-emits all family bodies
+/// with v2 provenance and contract-5 row tags, rather than deduping the v1 body.
+#[test]
+#[serial(source_manifests)]
+fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
+    use crate::snapshots::claude_request_identity::with_cycle_contract_for_test;
+    if !c1a_layout_supported("c1a_contract_v1_to_v2_reemits") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    const V1: &str = "claude_code_jsonl:own_request_identity_rows:v1";
+    const V2: &str = "claude_code_jsonl:own_request_identity_rows:v2";
+    let fixture = c1a_fixture("c1a-contract-v1-to-v2-reemits");
+    c1a_add_family_request_identity(&fixture);
+    let family = rearm_family_sessions();
+    let closing = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (8, 0)));
+    let v1_bodies = c1a_family_bodies(&closing)
+        .into_iter()
+        .map(|(session, (_, item))| {
+            assert_eq!(item.provenance.collector, V1);
+            assert!(!item.request_evidence.is_empty());
+            (session, item)
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(v1_bodies.len(), family.len());
+    let reproved = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (8, 10)));
+    assert_eq!(c1a_window(&reproved).debt, 0, "the skip is active");
+    let quiet = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (8, 20)));
+    assert_eq!(c1a_window(&quiet).family_reads, 0);
+    assert_eq!(c1a_latch(&fixture), (Some(V1.to_owned()), false));
+    let transcript_bytes = std::iter::once(None)
+        .chain(REARM_AGENTS.iter().map(|agent| Some(*agent)))
+        .map(|agent| {
+            let path = fixture.member_path(agent);
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let api_bytes = std::fs::read(fixture.sidecar_path("claude-code-effort")).unwrap();
+
+    let mut changed = Vec::new();
+    for number in 0..C1A_MAX_PAGES {
+        let contract = if number == 1 { V1 } else { V2 };
+        let page = with_cycle_contract_for_test(contract, || {
+            fixture.page(
+                &format!("2026-08-02T08:{:02}:00Z", 30 + number),
+                RearmUpload::Accept,
+            )
+        });
+        let ended = !page.index.scan_traversal_in_progress_for_test();
+        assert!(
+            c1a_latch(&fixture).1,
+            "a changing or incomplete traversal cannot clear the latch"
+        );
+        if number == 0 {
+            assert!(!ended && !page.scan.census_complete);
+            assert_eq!(c1a_latch(&fixture), (Some(V2.to_owned()), true));
+        } else {
+            assert_eq!(
+                c1a_latch(&fixture),
+                (Some(C1A_MID_TRAVERSAL.to_owned()), true)
+            );
+        }
+        changed.push(page);
+        if ended {
+            break;
+        }
+    }
+    assert!(changed.len() >= 3);
+    assert!(!changed
+        .last()
+        .unwrap()
+        .index
+        .scan_traversal_in_progress_for_test());
+    let changed_window = c1a_window(&changed);
+    assert!(changed_window.census_complete);
+    assert!(
+        !changed_window.full_rearm,
+        "no scheduled full re-arm masks the latch"
+    );
+    assert_eq!(
+        changed_window.family_reads, 0,
+        "unchanged family remains unread until re-armed"
+    );
+
+    let mut stable = Vec::new();
+    with_cycle_contract_for_test(V2, || {
+        for number in 0..C1A_MAX_PAGES {
+            let page = fixture.page(
+                &format!("2026-08-02T08:{:02}:00Z", 40 + number),
+                RearmUpload::Accept,
+            );
+            let ended = !page.index.scan_traversal_in_progress_for_test();
+            assert_eq!(c1a_latch(&fixture), (Some(V2.to_owned()), !ended));
+            if ended {
+                assert!(page.scan.census_complete && page.fully_settled);
+                for (key, entry) in &page.index.files {
+                    assert!(
+                        entry.source_file_fingerprint.is_empty(),
+                        "every Claude file is re-armed: {key}"
+                    );
+                }
+            } else {
+                assert!(!page.scan.census_complete);
+            }
+            stable.push(page);
+            if ended {
+                break;
+            }
+        }
+    });
+    let stable_window = c1a_window(&stable);
+    assert!(stable_window.census_complete && !stable_window.full_rearm);
+    assert_eq!(
+        stable_window.debt,
+        family.len(),
+        "clearing terminal skips no family member"
+    );
+    assert_eq!(c1a_latch(&fixture), (Some(V2.to_owned()), false));
+    let reread = with_cycle_contract_for_test(V2, || c1a_generation(&fixture, "v2", (8, 50)));
+    assert_eq!(c1a_window(&reread).family_reads, family.len());
+    c1a_assert_family_emitted_and_tagged(&reread, V2, &v1_bodies);
+    for (path, before) in transcript_bytes {
+        assert_eq!(std::fs::read(path).unwrap(), before, "unchanged transcript");
+    }
+    assert_eq!(
+        std::fs::read(fixture.sidecar_path("claude-code-effort")).unwrap(),
+        api_bytes,
+        "unchanged identity input"
+    );
 }
 
 const C1A_SUCCESSOR: &str = "e5555555-5555-4555-8555-555555555555";
