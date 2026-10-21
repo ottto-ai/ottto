@@ -1652,10 +1652,10 @@ fn claude_fresh_start_census_step(
         }
     };
     // Withdrawals re-arm every admissible revision, not only `Emitted`: an
-    // `Emitted` witness needs an `accepted` ACK this process saw, but the
-    // server may also hold the numbers after a lost response, an `unchanged`
-    // answer, a ledger-suppressed retry or a lost index save. Each such
-    // re-arm is spent by the transition (`Revoked`, or the cleared map).
+    // `Emitted` witness needs a stored ACK this process saw, but the server
+    // may also hold the numbers after a lost response, a ledger-suppressed
+    // retry or a lost index save. Each such re-arm is spent by the
+    // transition (`Revoked`, or the cleared map).
     if !enabled {
         for (member, witness) in census.iter() {
             if witness.state.admissible() {

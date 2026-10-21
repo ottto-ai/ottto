@@ -150,7 +150,7 @@ impl FreshStartPipeline {
     ) {
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
-            &[self.transcripts.clone()],
+            std::slice::from_ref(&self.transcripts),
             &mut self.index,
             collected_at,
             183,
