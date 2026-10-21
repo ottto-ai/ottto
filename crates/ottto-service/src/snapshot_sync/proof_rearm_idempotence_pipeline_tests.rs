@@ -1269,3 +1269,305 @@ fn c1a_residual_dormant_family_change_receipt() {
         .unwrap();
     }
 }
+
+/// X(b) off→on, re-emission (SI condition 4): the bodies built while no
+/// contract was permitted carry the legacy collector. After the contract
+/// turns on, the latch re-arms the skipped family at the next terminal, and
+/// the window after that re-emits every family body under contract 5: each
+/// is offered and acknowledged, carries the contract-5 collector token, and
+/// differs from its contract-off body. The fixture's API rows carry no
+/// account identity, so the usage rows stay untagged; row identity on a
+/// re-read family is `c1a_late_identity_row_reselects_and_tags_skipped_family`.
+#[test]
+#[serial(source_manifests)]
+fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
+    if !c1a_layout_supported("c1a_contract_off_to_on_reemits") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    fn family_bodies(
+        pages: &[RearmPage],
+    ) -> BTreeMap<String, (&RearmPage, crate::snapshots::SnapshotItem)> {
+        let family = rearm_family_sessions();
+        pages
+            .iter()
+            .flat_map(|page| {
+                page.scan
+                    .snapshots
+                    .iter()
+                    .filter(|item| family.contains(&item.source_session_id))
+                    .map(move |item| (item.source_session_id.clone(), (page, item.clone())))
+            })
+            .collect()
+    }
+    let family = rearm_family_sessions();
+    let collector = crate::snapshots::claude_request_identity::COLLECTOR;
+    let mut fixture = c1a_fixture("c1a-contract-off-to-on-reemits");
+    fixture.request_identity = false;
+    fixture.owned_base_preparation = true;
+    let closing = c1a_generation(&fixture, "fix", (8, 0));
+    let off_bodies = family_bodies(&closing)
+        .into_iter()
+        .map(|(session, (_, item))| (session, item))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(off_bodies.len(), family.len(), "every member is read");
+    for (session, item) in &off_bodies {
+        assert_ne!(
+            item.provenance.collector, collector,
+            "{session}: no contract-5 body without a permit"
+        );
+        assert!(item.request_evidence.is_empty(), "{session}");
+    }
+    let reproved = c1a_window(&c1a_generation(&fixture, "fix", (8, 10)));
+    assert_eq!(reproved.debt, 0, "the skip is active");
+    assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
+    let quiet = c1a_window(&c1a_generation(&fixture, "fix", (8, 20)));
+    assert_eq!(quiet.family_reads, 0);
+    fixture.request_identity = true;
+    let changed = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
+    assert_eq!(changed.family_reads, 0, "nothing re-selected the family");
+    assert_eq!(
+        changed.debt,
+        family.len(),
+        "the latch re-arms the skipped family"
+    );
+    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
+    let reread = c1a_generation(&fixture, "fix", (8, 40));
+    let on_bodies = family_bodies(&reread);
+    assert_eq!(
+        on_bodies.keys().collect::<Vec<_>>(),
+        off_bodies.keys().collect::<Vec<_>>(),
+        "every member is re-read under the new contract"
+    );
+    for (session, (page, item)) in &on_bodies {
+        assert_eq!(
+            item.provenance.collector, collector,
+            "{session}: the re-read body is built under contract 5"
+        );
+        assert_ne!(
+            item.snapshot_fingerprint, off_bodies[session].snapshot_fingerprint,
+            "{session}: the contract-5 body is a new body"
+        );
+        assert!(
+            page.offered.contains(&item.snapshot_fingerprint),
+            "{session}: re-emitted"
+        );
+        assert!(
+            page.uploaded.contains(&item.snapshot_fingerprint),
+            "{session}: acknowledged"
+        );
+    }
+    assert_eq!(c1a_window(&reread).family_offered, family.len());
+}
+
+const C1A_SUCCESSOR: &str = "e5555555-5555-4555-8555-555555555555";
+
+/// A new legacy copied-prefix successor (a fork or takeover written without
+/// `forkedFrom`): its transcript copies the family root's first request, then
+/// makes one request of its own, which only its own sidecars report.
+fn c1a_add_copied_prefix_successor(fixture: &RearmFixture) {
+    let path = fixture
+        .root
+        .join("zz-import")
+        .join("nested")
+        .join(format!("{C1A_SUCCESSOR}.jsonl"));
+    RearmFixture::append(
+        &path,
+        &rearm_transcript_line(C1A_SUCCESSOR, None, "req_root_1", 0),
+    );
+    native_comparison_add_import(fixture, C1A_SUCCESSOR, "req_successor_1");
+}
+
+/// Count-only state of the successor after one generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct C1aSuccessorWindow {
+    window: C1aWindow,
+    successor_read: bool,
+    successor_proven: bool,
+    successor_rearmed: bool,
+    full_rearm_deferred_until: Option<u64>,
+    census_unix_seconds: u64,
+    hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+}
+
+fn c1a_successor_generation(
+    fixture: &RearmFixture,
+    arm: &str,
+    clock: (u32, usize),
+) -> C1aSuccessorWindow {
+    let pages = c1a_generation(fixture, arm, clock);
+    let hold = crate::snapshots::claude_first_proof_hold_for_test();
+    let last = pages.last().expect("terminal page");
+    let successor_key = format!("{C1A_SUCCESSOR}.jsonl");
+    let window = C1aSuccessorWindow {
+        window: c1a_window(&pages),
+        successor_read: rearm_parsed(&pages).contains(C1A_SUCCESSOR),
+        successor_proven: last
+            .index
+            .claude_usage_family_witness_digest_for_test(C1A_SUCCESSOR)
+            .is_some(),
+        successor_rearmed: last.index.files.iter().any(|(key, entry)| {
+            key.ends_with(successor_key.as_str()) && entry.source_file_fingerprint.is_empty()
+        }),
+        full_rearm_deferred_until: last.duplicate_census.full_rearm_deferred_until,
+        census_unix_seconds: time::OffsetDateTime::parse(
+            &last.scan.census_window_end,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("census window end")
+        .unix_timestamp() as u64,
+        hold,
+    };
+    writeln!(
+        std::io::stderr().lock(),
+        "C1A_PROOF_REARM successor case={} arm={arm} successor_read={} successor_proven={} successor_rearmed={} full_rearm_deferred_until={:?} hold={}",
+        fixture.case,
+        window.successor_read,
+        window.successor_proven,
+        window.successor_rearmed,
+        window.full_rearm_deferred_until,
+        serde_json::to_string(&window.hold).unwrap(),
+    )
+    .unwrap();
+    window
+}
+
+/// SOURCE F1 receipt, real pipeline: the skip leaves owner family O unread,
+/// and a new copied-prefix successor of O appears. The successor can derive
+/// its legacy exclusion only in a window that also reads O, so while O stays
+/// skipped it stays unproven, and the first-proof hold counter names it with
+/// its age bucket. The closed-fence full re-arm still runs when due, re-arms
+/// every family file (O and the successor), and the next window proves the
+/// successor. BASE re-reads O in the window the successor appears and proves
+/// it at once.
+#[test]
+#[serial(source_manifests)]
+fn c1a_dormant_owner_copied_prefix_successor_proves_after_full_rearm() {
+    use crate::snapshots::ClaudeFirstProofHoldAge;
+    if !c1a_layout_supported("c1a_dormant_owner_successor") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let family = rearm_family_sessions().len();
+    let run = |fixture: &RearmFixture, arm: &str| {
+        let (_, reproved) = c1a_close_and_reprove(fixture, arm);
+        c1a_add_copied_prefix_successor(fixture);
+        let appeared = c1a_successor_generation(fixture, arm, (8, 20));
+        let held = c1a_successor_generation(fixture, arm, (8, 30));
+        c1a_full_rearm_due(fixture);
+        let rearm = c1a_successor_generation(fixture, arm, (8, 40));
+        let proof = c1a_successor_generation(fixture, arm, (8, 50));
+        (reproved, [appeared, held, rearm, proof])
+    };
+    let fixture = c1a_fixture("c1a-dormant-owner-successor");
+    let (reproved, [appeared, held, rearm, proof]) = run(&fixture, "fix");
+    let base = c1a_fixture("c1a-dormant-owner-successor-base");
+    let (_, [base_appeared, ..]) = {
+        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
+        run(&base, "base")
+    };
+    for window in [&appeared, &held, &rearm, &proof, &base_appeared] {
+        assert!(window.window.census_complete, "{window:?}");
+        assert!(
+            window.window.fence_before && window.window.fence_after,
+            "the fence stays closed: {window:?}"
+        );
+    }
+    // Preconditions: the skip was active, so O is dormant when the
+    // successor appears; BASE re-reads O there and proves the successor.
+    assert_eq!(reproved.debt, 0, "the skip is active");
+    assert_eq!(appeared.window.family_reads, 0, "O is dormant");
+    assert!(appeared.successor_read, "the successor is read");
+    assert_eq!(base_appeared.window.family_reads, family);
+    assert!(base_appeared.successor_read && base_appeared.successor_proven);
+    assert_eq!(
+        base_appeared.hold,
+        crate::snapshots::ClaudeFirstProofHoldCounts::default(),
+        "BASE holds nothing"
+    );
+    // Held while O is skipped, and counted with its age bucket (its own
+    // request is 07:00:01, under two hours before the census).
+    assert!(!appeared.successor_proven, "unproven while O is skipped");
+    assert_eq!(appeared.hold.dormant_owner_successor_family_count, 1);
+    assert_eq!(
+        appeared.hold.oldest_dormant_owner_successor_age,
+        Some(ClaudeFirstProofHoldAge::From1hTo6h)
+    );
+    assert_eq!(held.window.family_reads, 0, "O is still dormant");
+    assert!(!held.window.full_rearm, "no full re-arm is due yet");
+    assert!(!held.successor_proven, "still held");
+    // The daily closed-fence full re-arm is intact: it runs when due,
+    // re-arms every family file including the successor's, and sets the
+    // next deadline no more than a day ahead.
+    assert!(rearm.window.full_rearm, "the due full re-arm runs");
+    assert_eq!(rearm.window.debt, family, "it re-arms O");
+    assert!(rearm.successor_rearmed, "it re-arms the successor");
+    let deadline = rearm
+        .full_rearm_deferred_until
+        .expect("the next full re-arm deadline");
+    assert!(
+        deadline > rearm.census_unix_seconds && deadline <= rearm.census_unix_seconds + 86_400,
+        "the next full re-arm is due within a day: {rearm:?}"
+    );
+    // The window after the full re-arm reads O and the successor together
+    // and proves the successor; nothing is held any more.
+    assert_eq!(proof.window.family_reads, family);
+    assert!(proof.successor_read, "the successor is re-read");
+    assert!(proof.successor_proven, "proved after the full re-arm");
+    assert_eq!(proof.hold.dormant_owner_successor_family_count, 0);
+    assert_eq!(proof.hold.oldest_dormant_owner_successor_age, None);
+}
+
+/// The first-proof hold row is content-free and fixed width, and its age
+/// buckets split at one, six and twenty-four hours.
+#[test]
+fn c1a_first_proof_hold_counts_encoding_is_bounded() {
+    use crate::snapshots::{ClaudeFirstProofHoldAge as Age, ClaudeFirstProofHoldCounts};
+    for (seconds, age) in [
+        (None, Age::Unknown),
+        (Some(0), Age::Under1h),
+        (Some(3_599), Age::Under1h),
+        (Some(3_600), Age::From1hTo6h),
+        (Some(21_599), Age::From1hTo6h),
+        (Some(21_600), Age::From6hTo24h),
+        (Some(86_399), Age::From6hTo24h),
+        (Some(86_400), Age::Over24h),
+        (Some(u64::MAX), Age::Over24h),
+    ] {
+        assert_eq!(Age::from_seconds(seconds), age, "{seconds:?}");
+    }
+    for (age, name) in [
+        (Age::Under1h, "under_1h"),
+        (Age::From1hTo6h, "1h_to_6h"),
+        (Age::From6hTo24h, "6h_to_24h"),
+        (Age::Over24h, "over_24h"),
+        (Age::Unknown, "unknown"),
+    ] {
+        assert_eq!(serde_json::to_value(age).unwrap(), serde_json::json!(name));
+        let max = ClaudeFirstProofHoldCounts {
+            dormant_owner_successor_family_count: usize::MAX,
+            oldest_dormant_owner_successor_age: Some(age),
+            census_withheld_retry_pending_family_count: usize::MAX,
+        };
+        let encoded = serde_json::to_string(&max).unwrap();
+        assert!(encoded.len() <= 176, "{} bytes", encoded.len());
+        let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
+            first_proof_hold: max,
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&stats).unwrap();
+        let mut without = serde_json::to_value(&stats).unwrap();
+        let nested = without
+            .as_object_mut()
+            .unwrap()
+            .remove("first_proof_hold")
+            .expect("nested counters");
+        assert_eq!(nested, serde_json::to_value(max).unwrap());
+        let baseline = serde_json::to_string(&without).unwrap();
+        assert!(
+            line.len() - baseline.len() <= 176 + r#","first_proof_hold":"#.len(),
+            "line grew by {} bytes",
+            line.len() - baseline.len()
+        );
+    }
+}

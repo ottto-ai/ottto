@@ -98,6 +98,26 @@ An unsupported layout or a refused price keeps the old re-arm for the whole
 terminal. That fallback is counted content-free in
 `CLAUDE_UNCHANGED_PROOF_BUDGET_FALLBACKS`.
 
+## Diagnostics
+
+The Claude local-evidence counts line (`ClaudeLocalEvidenceStats`) gains one
+content-free row, `first_proof_hold`. It is never a decision input:
+- `dormant_owner_successor_family_count`: at a complete terminal with healthy
+  reports, unproven families read in this window whose root occurrences
+  include a request that current API and trace evidence assigns to a
+  different witnessed root with no current pending. A root the skip left
+  unread looks like that. Such a successor counts only in a window that reads
+  it.
+- `oldest_dormant_owner_successor_age`: `under_1h`, `1h_to_6h`, `6h_to_24h`,
+  `over_24h` or `unknown`, for the oldest such family. The age is an upper
+  bound on the hold: the census end minus the family's earliest reported
+  request.
+- `census_withheld_retry_pending_family_count`: Claude families in
+  RetryPending on this page. While it is non-zero, census completion is
+  withheld for the whole Claude source.
+
+The encoded row is at most 176 bytes.
+
 ## Tests
 
 The tests are in `snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs`. They run on the
@@ -119,7 +139,16 @@ a BASE arm that refuses the budget:
   the changed witness keeps the re-arm, and liveness equals BASE;
 - late API row between windows: both arms hold the family identically;
 - a receipt-only disclosure of the dormant-window residual: a late row
-  diverges from BASE, and member growth holds both arms.
+  diverges from BASE, and member growth holds both arms;
+- contract off→on re-emission: after the latch re-arm, every family body is
+  re-read, built under the contract-5 collector, and offered and
+  acknowledged as a new body;
+- dormant owner plus a new copied-prefix successor: the successor stays
+  unproven while the owner is skipped and is counted with its age bucket.
+  The due closed-fence full re-arm still runs, re-arms the owner and the
+  successor, and sets the next deadline within a day. The next window proves
+  the successor. BASE proves it in the window it appears;
+- the first-proof hold row's width and age buckets.
 
 No local tests or builds were run. Results are CI-only.
 
@@ -145,6 +174,22 @@ No local tests or builds were run. Results are CI-only.
     which promotes stale evidence to currentness, or a traversal change that
     reads such a family on the terminal page. Neither is in this slice.
   - The receipt test records both arms.
+- **Copied-prefix successor of a dormant owner.** A new fork, `/branch` or
+  takeover successor whose copied prefix belongs to a family the skip left
+  unread cannot derive its legacy exclusion in that window: the derivation
+  needs the owner's root sequence in the same window's pending. It stays
+  unproven, priced from its transcript, until a window reads both. That is at
+  the latest the window after the closed-fence full re-arm, at most
+  86,400 s later. SOURCE accepted this under amendment 1. The receipt test
+  pins it, and `first_proof_hold` counts it. A narrowed owner-root pull
+  (re-arm a witnessed owner's root when an unproven current family's
+  occurrences hit its requests) is a tracked follow-up.
+- **RetryPending withholds the whole census.** While any Claude family is in
+  RetryPending, as the late-row residual above causes, census completion is
+  withheld for the whole Claude source, not just that family. No terminal
+  fold runs in that time, so there is no first proof or re-proof for any
+  other family and no fence decision. This is BASE's existing mechanism.
+  `census_withheld_retry_pending_family_count` counts it.
 - **Closed-fence reopen with other unread files.** When an unrelated
   unchanged file is also unobserved, neither arm reopens before the
   closed-fence full re-arm. The late-copy test checks that both arms reopen in

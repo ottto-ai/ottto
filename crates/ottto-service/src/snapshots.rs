@@ -2952,6 +2952,7 @@ pub(crate) struct ClaudeAuthorityRecordForTest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeUsageAuthorityDisposition {
     pub(crate) duplicate_census: ClaudeDuplicateCensusCounts,
+    pub(crate) first_proof_hold: ClaudeFirstProofHoldCounts,
     quarantined_source_session_ids: BTreeSet<String>,
     /// The account-deferred subset of `quarantined_source_session_ids`. Upload
     /// retention still uses the union; this only classifies settlement.
@@ -3319,6 +3320,53 @@ pub struct ClaudeDuplicateCensusCounts {
     pub full_rearm: bool,
     pub rearm_attempt: u8,
     pub full_rearm_deferred_until: Option<u64>,
+}
+
+/// Content-free first-proof hold counters for one Claude fold, never a
+/// decision input. At a complete terminal with healthy reports, a held
+/// successor is an unproven family read in this census window whose root
+/// occurrences include a request that current API and trace evidence assigns
+/// to a different witnessed root with no current pending: a root the
+/// unchanged-proof check left unread looks like that. Such a copied-prefix
+/// successor derives its legacy exclusion only in a window that also reads
+/// its owner, at the latest after the closed-fence full re-arm. A successor
+/// counts only in a window that reads it. Its age is an upper bound on how
+/// long it has been held: the census end minus the family's earliest
+/// reported request. The sync loop fills in the RetryPending family count;
+/// while it is non-zero, census completion is withheld for the whole Claude
+/// source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeFirstProofHoldCounts {
+    pub dormant_owner_successor_family_count: usize,
+    pub oldest_dormant_owner_successor_age: Option<ClaudeFirstProofHoldAge>,
+    pub census_withheld_retry_pending_family_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ClaudeFirstProofHoldAge {
+    #[serde(rename = "under_1h")]
+    Under1h,
+    #[serde(rename = "1h_to_6h")]
+    From1hTo6h,
+    #[serde(rename = "6h_to_24h")]
+    From6hTo24h,
+    #[serde(rename = "over_24h")]
+    Over24h,
+    /// No held successor had a parsable reported request time.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl ClaudeFirstProofHoldAge {
+    pub(crate) fn from_seconds(age: Option<u64>) -> Self {
+        match age {
+            None => Self::Unknown,
+            Some(age) if age < 3_600 => Self::Under1h,
+            Some(age) if age < 6 * 3_600 => Self::From1hTo6h,
+            Some(age) if age < 24 * 3_600 => Self::From6hTo24h,
+            Some(_) => Self::Over24h,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5596,6 +5644,16 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         } else {
             None
         };
+        if let Some(request_owners) = legacy_request_owners.as_ref() {
+            disposition.first_proof_hold = claude_dormant_owner_successors(
+                index,
+                &proven,
+                &complete_families,
+                census_window_end,
+                request_owners,
+                api_report,
+            );
+        }
         let mut rearm = crate::local_resource_diagnostics::NativeRearm {
             negative_keys: negative_keys.len(),
             ..Default::default()
@@ -5763,6 +5821,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     }
     duplicate_census.fence_after = index.claude_duplicate_request_witness_overflowed;
     disposition.duplicate_census = duplicate_census;
+    #[cfg(test)]
+    CLAUDE_FIRST_PROOF_HOLD_FOR_TEST.with(|cell| cell.set(disposition.first_proof_hold));
     disposition
 }
 
@@ -6275,6 +6335,81 @@ fn claude_unchanged_proof_roots<'p>(
                 });
     }
     Some(roots)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_FIRST_PROOF_HOLD_FOR_TEST: std::cell::Cell<ClaudeFirstProofHoldCounts> =
+        std::cell::Cell::new(ClaudeFirstProofHoldCounts::default());
+}
+
+/// The first-proof hold counters of this thread's latest Claude fold.
+#[cfg(test)]
+pub(crate) fn claude_first_proof_hold_for_test() -> ClaudeFirstProofHoldCounts {
+    CLAUDE_FIRST_PROOF_HOLD_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// Count the held successors of one complete terminal (see
+/// `ClaudeFirstProofHoldCounts`) and bucket the oldest one's age. Count only:
+/// it borrows the terminal's state and allocates nothing.
+fn claude_dormant_owner_successors(
+    index: &ScanIndex,
+    proven: &BTreeMap<String, ProvenClaudeUsageFamily>,
+    complete_families: &BTreeMap<String, BTreeSet<String>>,
+    census_window_end: &str,
+    request_owners: &BTreeMap<String, ClaudeLegacyRequestOwner>,
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+) -> ClaudeFirstProofHoldCounts {
+    let dormant_witnessed_root = |root_session_id: &str| {
+        index
+            .claude_usage_family_witnesses
+            .contains_key(root_session_id)
+            && !index
+                .claude_usage_family_pending
+                .get(root_session_id)
+                .is_some_and(|pending| pending.census_window_end == census_window_end)
+    };
+    let census_unix_seconds = rfc3339_unix_seconds(census_window_end);
+    let mut counts = ClaudeFirstProofHoldCounts::default();
+    let mut oldest_age_seconds = None::<u64>;
+    for (root_session_id, pending) in &index.claude_usage_family_pending {
+        if proven.contains_key(root_session_id)
+            || !complete_families.contains_key(root_session_id)
+            || pending.invalid
+            || pending.census_window_end != census_window_end
+        {
+            continue;
+        }
+        let Some(occurrences) = pending.member_occurrences.get(root_session_id) else {
+            continue;
+        };
+        let held = occurrences.keys().any(|request_hash| {
+            request_owners.get(request_hash).is_some_and(|owner| {
+                owner.root_session_id != *root_session_id
+                    && dormant_witnessed_root(&owner.root_session_id)
+            })
+        });
+        if !held {
+            continue;
+        }
+        counts.dormant_owner_successor_family_count = counts
+            .dormant_owner_successor_family_count
+            .saturating_add(1);
+        let earliest_request = api_report.evidence.get(root_session_id).and_then(|rows| {
+            rows.iter()
+                .filter_map(|row| rfc3339_unix_seconds(&row.observed_at))
+                .min()
+        });
+        if let (Some(now), Some(earliest_request)) = (census_unix_seconds, earliest_request) {
+            let age = now.saturating_sub(earliest_request);
+            oldest_age_seconds = Some(oldest_age_seconds.map_or(age, |oldest| oldest.max(age)));
+        }
+    }
+    if counts.dormant_owner_successor_family_count > 0 {
+        counts.oldest_dormant_owner_successor_age =
+            Some(ClaudeFirstProofHoldAge::from_seconds(oldest_age_seconds));
+    }
+    counts
 }
 
 /// Whether witnessed families this window did not read are all that keep a
