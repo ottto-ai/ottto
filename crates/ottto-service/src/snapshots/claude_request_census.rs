@@ -310,10 +310,7 @@ impl Serialize for ClaudeRequestCensusShadowState {
 /// MAX_RAW_BYTES. Draining necessarily remains linear in the input bytes.
 /// The token scanner never converts a number or copies an unbounded string.
 pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<ScanIndex> {
-    let mut reader = CensusRead::new(reader);
-    let mut index: ScanIndex = serde_json::from_reader(&mut reader)?;
-    reader.invalidate_duplicates(&mut index);
-    Ok(index)
+    CensusRead::new(reader).decode()
 }
 
 pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
@@ -387,6 +384,10 @@ struct CensusRead<R> {
     shadow_key: bool,
     shadow_state: bool,
     capture: bool,
+    #[cfg(test)]
+    read_calls: usize,
+    #[cfg(test)]
+    next_calls: usize,
 }
 
 impl<R: std::io::Read> CensusRead<R> {
@@ -409,7 +410,19 @@ impl<R: std::io::Read> CensusRead<R> {
             shadow_key: false,
             shadow_state: false,
             capture: false,
+            #[cfg(test)]
+            read_calls: 0,
+            #[cfg(test)]
+            next_calls: 0,
         }
+    }
+
+    fn decode(&mut self) -> serde_json::Result<ScanIndex> {
+        // Serde's io::Bytes uses BufReader's buffered read_byte specialization.
+        // Buffering only the underlying file would still call our Read per byte.
+        let mut index = serde_json::from_reader(std::io::BufReader::new(&mut *self))?;
+        self.invalidate_duplicates(&mut index);
+        Ok(index)
     }
 
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
@@ -526,20 +539,22 @@ impl<R: std::io::Read> CensusRead<R> {
         // conversion and wrong-token errors. Only canonical, finite tokens
         // leave this reader. JSON syntax outside the optional field is intact.
         Ok(if self.shadow_state {
-            serde_json::to_vec(
-                &serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
-                    .unwrap_or_default(),
-            )
-            .expect("shadow serialization")
+            let state = serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
+                .unwrap_or_default();
+            drop(bytes);
+            serde_json::to_vec(&state).expect("shadow serialization")
         } else {
-            serde_json::to_vec(
-                &serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default(),
-            )
-            .expect("census serialization")
+            let census = serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default();
+            drop(bytes);
+            serde_json::to_vec(&census).expect("census serialization")
         })
     }
 
     fn next(&mut self) -> std::io::Result<Option<u8>> {
+        #[cfg(test)]
+        {
+            self.next_calls += 1;
+        }
         use std::io::Read;
         let mut byte = [0];
         if self.output.read(&mut byte)? != 0 {
@@ -614,12 +629,49 @@ impl<R: std::io::Read> CensusRead<R> {
 
 impl<R: std::io::Read> std::io::Read for CensusRead<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        #[cfg(test)]
+        {
+            self.read_calls += 1;
+        }
         let mut written = 0;
-        for slot in out {
+        while written < out.len() {
+            // Canonical evidence and rewritten root keys need no further scan.
+            let copied = std::io::Read::read(&mut self.output, &mut out[written..])?;
+            if copied != 0 {
+                written += copied;
+                continue;
+            }
+            if !self.capture
+                && self.replay.is_none()
+                && !self.escaped
+                // Every top-level sequence value must visit next(), even a
+                // scalar with no structural byte, to recognize census slots.
+                && !(self.root_array && self.depth == 1 && !self.quoted)
+            {
+                let bytes = self.reader.fill_buf()?;
+                let limit = bytes.len().min(out.len() - written);
+                let run = bytes[..limit]
+                    .iter()
+                    .position(|&byte| {
+                        if self.quoted {
+                            matches!(byte, b'"' | b'\\')
+                        } else {
+                            matches!(byte, b'"' | b'{' | b'}' | b'[' | b']' | b':' | b',')
+                        }
+                    })
+                    .unwrap_or(limit);
+                if run != 0 {
+                    out[written..written + run].copy_from_slice(&bytes[..run]);
+                    self.reader.consume(run);
+                    written += run;
+                    continue;
+                }
+            }
             let Some(byte) = self.next()? else {
                 break;
             };
-            *slot = byte;
+            out[written] = byte;
             written += 1;
         }
         Ok(written)
@@ -1872,5 +1924,78 @@ impl ScanIndex {
             "bounded_sweep_unsettled": self.bounded_sweep_had_unsettled_upload,
             "traversal_active": self.traversal.is_some(),
         })
+    }
+}
+
+#[cfg(test)]
+mod reader_regression_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn census_index_decode_uses_buffered_reads_and_structural_steps() {
+        let mut index = ScanIndex::default();
+        // Real persisted index data: 4 MiB of long strings, plus escaped quotes,
+        // backslashes and punctuation that must stay inside the string state.
+        let padding = "x".repeat(8192);
+        for row in 0..512 {
+            index
+                .confirmed_empty_files
+                .insert(format!("synthetic/{row}/{padding}/\"escaped\\path,:[{{}}]"));
+        }
+        for bytes in [
+            serde_json::to_vec(&index).expect("compact index"),
+            serde_json::to_vec_pretty(&index).expect("pretty index"),
+        ] {
+            assert!(bytes.len() > 4 * 1024 * 1024);
+            let tokens = bytes
+                .iter()
+                .filter(|&&byte| {
+                    matches!(byte, b'"' | b'\\' | b'{' | b'}' | b'[' | b']' | b':' | b',')
+                })
+                .count();
+            let mut reader = CensusRead::new(bytes.as_slice());
+            // This is the production decoder, including its Serde buffering.
+            let decoded = reader.decode().expect("decode synthetic index");
+            assert_eq!(decoded.confirmed_empty_files, index.confirmed_empty_files);
+            assert!(reader.read_calls <= bytes.len() / 8192 + 4);
+            // Counters catch a per-byte scanner even if Read itself is buffered.
+            assert!(reader.next_calls <= 4 * tokens + 128);
+            assert!(reader.next_calls < bytes.len() / 64);
+        }
+    }
+
+    #[test]
+    fn census_bulk_reads_preserve_quotes_and_buffer_boundaries() {
+        let long_key = "k".repeat(300);
+        let padding = "x".repeat(8191);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            (long_key): [format!("{padding}\\\"{{}}[],:"), 12.345, true, null],
+            "claude_request_census_shadow": {"o": true, "f": 7},
+            "ordinary": "trailing",
+        }))
+        .expect("synthetic bytes");
+        // Keep the original byte scanner as a reference for normalization.
+        let expected = {
+            let mut reader = CensusRead::new(bytes.as_slice());
+            let mut output = Vec::new();
+            while let Some(byte) = reader.next().expect("reference byte") {
+                output.push(byte);
+            }
+            output
+        };
+        for size in [1, 2, 7, 8191, 8192, 8193] {
+            let mut reader = CensusRead::new(bytes.as_slice());
+            let mut output = Vec::new();
+            let mut buffer = vec![0; size];
+            loop {
+                let read = reader.read(&mut buffer).expect("chunk");
+                if read == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..read]);
+            }
+            assert_eq!(output, expected, "read buffer size {size}");
+        }
     }
 }
