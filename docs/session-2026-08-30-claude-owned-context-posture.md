@@ -23,7 +23,10 @@ as reported usage:
   revalidates its occurrence fingerprints and external owners;
 - missing/deleted/out-of-window predecessor evidence is not treated as a fresh
   session. First/peak/last context and compaction scalars are omitted until
-  ownership is proven.
+  ownership is proven. An inactive census-verified fresh start, default off,
+  would admit only those scalars for a root transcript that passes a copy
+  signature and a complete accepted census, keeping local provenance
+  (`session-2026-10-21-claude-census-verified-fresh-start.md`).
 - cross-session provider request duplicates remain fail-closed across bounded
   census pages. The local scan index retains only domain-separated session-id
   hashes keyed by request-id hash, caps that owner set at 250,000, and forces a

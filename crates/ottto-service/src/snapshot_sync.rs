@@ -6513,6 +6513,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
     let mut identity_unhealthy_roots = BTreeSet::new();
+    // Slice 2c: admissible roots whose telemetry is settled this pass, either
+    // both sidecars confirmed absent by the existing check or both read
+    // completely below. Unknown, unreadable, present or unpaired is neither.
+    // Bounded by the funded witness map; empty and never consulted while off.
+    let mut fresh_start_telemetry_roots = BTreeSet::new();
     let usage_roots = usage_roots
         .into_iter()
         .filter(|session_id| {
@@ -6527,11 +6532,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 )
                 .is_empty();
             // Contract 5 must tell absent evidence from failed evidence.
-            if !paired
-                && emission_permitted
-                && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
-            {
-                identity_unhealthy_roots.insert(session_id.clone());
+            if !paired && emission_permitted {
+                // The existing absence check only; 2c adds no stat or read.
+                if !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id) {
+                    identity_unhealthy_roots.insert(session_id.clone());
+                } else if crate::snapshots::claude_fresh_start_root_admissible(index, session_id) {
+                    fresh_start_telemetry_roots.insert(session_id.clone());
+                }
             }
             paired
         })
@@ -6570,6 +6577,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             continue;
         }
         stats.complete_sidecar_root_count += 1;
+        if crate::snapshots::claude_fresh_start_root_admissible(index, &root_session_id) {
+            fresh_start_telemetry_roots.insert(root_session_id.clone());
+        }
         let api_request_ids = api
             .evidence
             .get(&root_session_id)
@@ -6625,6 +6635,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             .or_else(|| {
                 lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
             }),
+        &fresh_start_telemetry_roots,
     );
     if let Some(fallback) = comparison
         .as_deref()

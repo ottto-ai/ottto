@@ -55,6 +55,12 @@ impl<'a> FoldView<'a> {
             lease: Some(lease),
         }
     }
+    /// A native completion or negative view may be followed by a selected
+    /// fallback that withdraws `transcript_ownership_complete` after the fold,
+    /// so slice 2c never verifies in such a fold.
+    pub(super) fn carries_native_completion(&self) -> bool {
+        self.native_window.is_some() || self.negatives.is_some()
+    }
     pub(super) fn native_census_complete(&self, scan: &SourceScanResult) -> bool {
         self.native_window.is_some_and(|window| {
             scan.source == SnapshotSource::ClaudeCode
@@ -746,6 +752,27 @@ impl NativePhase {
                     index.claude_owned_start_census.len().checked_add(1)?,
                     1,
                     &mut cost,
+                )?;
+            }
+            // Slice 2c: the parse-time candidate witness may insert one root
+            // key with its fingerprint and revision. Refused here, the parse is
+            // not finalized and no witness is written.
+            if claude_census_verified_fresh_start_enabled()
+                && claude_index_path_member_ref(&candidate.path).is_some_and(|identity| {
+                    identity.subagent_stem.is_none()
+                        && !index.claude_fresh_start_census.contains_key(identity.root)
+                })
+            {
+                settlement::restore_tree_insert_peak::<String, ClaudeFreshStartCensusWitness>(
+                    index.claude_fresh_start_census.len().checked_add(1)?,
+                    1,
+                    &mut cost,
+                )?;
+                cost.add(
+                    path.len()
+                        .checked_add(revision.len())?
+                        .checked_add(CLAUDE_CODE_SNAPSHOT_PARSER_VERSION.len())?
+                        .checked_add(1 + CLAUDE_FRESH_START_DERIVATION_REVISION.len())?,
                 )?;
             }
             if parsed.terminal_loss().is_some() {

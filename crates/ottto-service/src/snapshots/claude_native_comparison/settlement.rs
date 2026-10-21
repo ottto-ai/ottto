@@ -1098,6 +1098,18 @@ impl SelectedFallback {
             }
             if let Some(identity) = claude_index_path_member_ref(Path::new(key)) {
                 let (_, member) = identity.into_owned();
+                if let Some(value) = previous.claude_fresh_start_census.get(&member) {
+                    restore_tree_insert_peak::<String, ClaudeFreshStartCensusWitness>(
+                        index.claude_fresh_start_census.len().checked_add(keys)?,
+                        1,
+                        &mut cost,
+                    )?;
+                    cost.add(key.len())?;
+                    cost.add(heap_layout_bound::completed_bound(
+                        value,
+                        crate::source_rotation::PARKED_BUDGET,
+                    )?)?;
+                }
                 if let Some(value) = previous.claude_owned_start_census.get(&member) {
                     restore_tree_insert_peak::<String, ClaudeOwnedStartCensusWitness>(
                         index.claude_owned_start_census.len().checked_add(keys)?,
@@ -1281,6 +1293,16 @@ impl SelectedFallback {
                 }
             }
             if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
+                match previous.claude_fresh_start_census.get(&member) {
+                    Some(value) => {
+                        index
+                            .claude_fresh_start_census
+                            .insert(member.clone(), value.clone());
+                    }
+                    None => {
+                        index.claude_fresh_start_census.remove(&member);
+                    }
+                }
                 match previous.claude_owned_start_census.get(&member) {
                     Some(value) => {
                         index
