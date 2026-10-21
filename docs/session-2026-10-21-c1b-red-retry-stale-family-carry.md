@@ -77,6 +77,15 @@ ordinary path (the held path below). A content-free counter and a fixed-text
 log line record each hold. A content-free counter and a fixed-text log
 line record each cancellation.
 
+The cancel builds no scratch collection: it counts the family's other
+members by borrowing, then prices what it allocates (any growth of the
+traversal's candidate queue, charged as its old and new buffers together,
+and each queued entry's cloned scan root and member path) against the same
+parked budget, and reserves that growth, before its first mutation. An
+unsupported layout, an overflow, a refused price or a failed reservation
+cancels nothing: the carry stays whole and the family takes the ordinary
+path, counted content-free with a fixed-text log line.
+
 No persisted field, schema, cap or constant changes. The traversal-start row
 gains two counters, `carried_pending_families` and `carried_index_files`; an
 extra fixed-text log line reports the same counts.
@@ -107,6 +116,10 @@ replace the equivalent inline checks in C1a's unchanged-proof check.
   liveness and witness equal BASE's; the same change found on the page that
   ends the walk, where the family takes the held path; and the
   removed-member held path.
+- Round 3 adds: an admitted cancel (the passed member is re-armed and queued
+  once at the front of the traversal), the cancel price at its budget
+  boundaries, and a refused cancel on a full candidate queue that leaves the
+  index, the carry and the queue untouched and is counted once.
 
 ## Residual risks
 

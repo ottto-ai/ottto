@@ -799,3 +799,200 @@ fn c1b_carry_scratch_admission_follows_the_supported_layout() {
         );
     }
 }
+
+const CARRY_SCAN_ROOT: &str = "/carry/projects";
+
+/// A carried retry start, then a later page of that window on which the
+/// carried family's root file is about to be parsed: its subagent member was
+/// already passed (observed under the scan root, not pending) and `queued`
+/// unrelated candidates, at least one, are still pending, so the walk has not
+/// ended. The queue is filled to its capacity, so queueing the passed member
+/// must grow it.
+fn carry_cancel_index(queued: usize) -> ScanIndex {
+    let mut index = carry_index();
+    carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    let traversal = index.traversal.as_mut().expect("the retry traversal");
+    assert_eq!(traversal.census_window_end, CARRY_RETRY);
+    traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
+    traversal.observed_index_keys.extend(carry_family_keys());
+    let mut pending = VecDeque::with_capacity(queued.max(1));
+    while pending.is_empty() || pending.len() < pending.capacity() {
+        pending.push_back(ScanTraversalPath {
+            scan_root: PathBuf::new(),
+            path: PathBuf::new(),
+            census_member: true,
+            watcher_hint: false,
+        });
+    }
+    traversal.pending_candidates = pending;
+    index
+}
+
+fn carry_cancel(index: &mut ScanIndex) {
+    let [root_key, _] = carry_family_keys();
+    cancel_claude_family_carry_for_member_parse(
+        index,
+        CARRY_RETRY,
+        Path::new(&root_key),
+        &[],
+        &VecDeque::new(),
+    );
+}
+
+/// R1, admitted: a parse of a carried family's member on a non-terminal page
+/// prices the cancel under the parked budget, then clears the other member's
+/// revision and queues it, once, at the front of the traversal. The parsed
+/// member keeps its revision for the caller; nothing is refused or held.
+#[test]
+fn c1b_admitted_carry_cancellation_rearms_and_queues_the_passed_member() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut index = carry_cancel_index(1);
+    let before = index.clone();
+    let queued = before.traversal.as_ref().unwrap().pending_candidates.len();
+    let cancellations = claude_stale_family_carry_cancellations_for_test();
+    let refusals = claude_stale_family_carry_cancellation_refusals_for_test();
+    let holds = claude_stale_family_carry_terminal_holds_for_test();
+    carry_cancel(&mut index);
+    assert_eq!(
+        claude_stale_family_carry_cancellations_for_test(),
+        cancellations + 1
+    );
+    assert_eq!(
+        claude_stale_family_carry_cancellation_refusals_for_test(),
+        refusals
+    );
+    assert_eq!(claude_stale_family_carry_terminal_holds_for_test(), holds);
+    let [root_key, agent_key] = carry_family_keys();
+    assert_eq!(
+        index.files[&root_key].source_file_fingerprint,
+        before.files[&root_key].source_file_fingerprint
+    );
+    assert!(!before.files[&agent_key].source_file_fingerprint.is_empty());
+    assert!(index.files[&agent_key].source_file_fingerprint.is_empty());
+    for key in [
+        carry_key(CARRY_OTHER, None),
+        carry_key(CARRY_UNWITNESSED, None),
+    ] {
+        assert_eq!(
+            index.files[&key].source_file_fingerprint,
+            before.files[&key].source_file_fingerprint
+        );
+    }
+    let pending = &index.traversal.as_ref().unwrap().pending_candidates;
+    assert_eq!(pending.len(), queued + 1);
+    assert_eq!(
+        pending.front(),
+        Some(&ScanTraversalPath {
+            scan_root: PathBuf::from(CARRY_SCAN_ROOT),
+            path: PathBuf::from(&agent_key),
+            census_member: true,
+            watcher_hint: false,
+        })
+    );
+    // The family is no longer carried, so a second parse cancels nothing.
+    carry_cancel(&mut index);
+    assert_eq!(
+        claude_stale_family_carry_cancellations_for_test(),
+        cancellations + 1
+    );
+    assert_eq!(
+        index.traversal.as_ref().unwrap().pending_candidates.len(),
+        queued + 1
+    );
+}
+
+/// R1, price boundary: queueing grows the candidate queue only beyond its
+/// spare capacity, charged as the old and the new buffer at once, and the
+/// queued paths are charged at their byte lengths, all under the 8 MiB parked
+/// budget. Each boundary is admitted at the budget and refused one byte or
+/// one slot past it; an overflow is refused.
+#[test]
+fn c1b_carry_cancellation_price_admits_up_to_the_parked_budget() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let budget = crate::source_rotation::PARKED_BUDGET;
+    let slot = std::mem::size_of::<ScanTraversalPath>();
+    assert!(claude_family_carry_cancellation_admitted(0, 0, 0, 0));
+    assert!(claude_family_carry_cancellation_admitted(
+        0,
+        0,
+        1,
+        budget - slot
+    ));
+    assert!(!claude_family_carry_cancellation_admitted(
+        0,
+        0,
+        1,
+        budget - slot + 1
+    ));
+    // Spare capacity is free; a full queue charges both buffers.
+    assert!(claude_family_carry_cancellation_admitted(3, 4, 1, budget));
+    assert!(!claude_family_carry_cancellation_admitted(4, 4, 1, budget));
+    let full = (budget / slot - 1) / 2;
+    assert!(claude_family_carry_cancellation_admitted(full, full, 1, 0));
+    assert!(!claude_family_carry_cancellation_admitted(
+        full + 1,
+        full + 1,
+        1,
+        0
+    ));
+    assert!(!claude_family_carry_cancellation_admitted(
+        usize::MAX,
+        0,
+        1,
+        0
+    ));
+    assert!(!claude_family_carry_cancellation_admitted(
+        0,
+        0,
+        0,
+        usize::MAX
+    ));
+}
+
+/// R1, refused: when queueing the passed member would grow a full candidate
+/// queue past the parked budget, the cancel is refused before it allocates or
+/// mutates anything. The carry stays whole (no revision cleared, the queue
+/// untouched, the pending and witness unchanged), so the family takes the
+/// ordinary path, and the refusal is counted once.
+#[test]
+fn c1b_refused_carry_cancellation_keeps_the_carry_whole() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let slot = std::mem::size_of::<ScanTraversalPath>();
+    let mut index = carry_cancel_index(crate::source_rotation::PARKED_BUDGET / slot / 2 + 1);
+    let take_queue = |index: &mut ScanIndex| {
+        std::mem::take(&mut index.traversal.as_mut().unwrap().pending_candidates)
+    };
+    let queue = take_queue(&mut index);
+    let (queued, capacity) = (queue.len(), queue.capacity());
+    assert_eq!(queued, capacity, "the queue is full");
+    let before = serde_json::to_value(&index).unwrap();
+    index.traversal.as_mut().unwrap().pending_candidates = queue;
+    let cancellations = claude_stale_family_carry_cancellations_for_test();
+    let refusals = claude_stale_family_carry_cancellation_refusals_for_test();
+    let holds = claude_stale_family_carry_terminal_holds_for_test();
+    carry_cancel(&mut index);
+    assert_eq!(
+        claude_stale_family_carry_cancellation_refusals_for_test(),
+        refusals + 1
+    );
+    assert_eq!(
+        claude_stale_family_carry_cancellations_for_test(),
+        cancellations
+    );
+    assert_eq!(claude_stale_family_carry_terminal_holds_for_test(), holds);
+    let queue = take_queue(&mut index);
+    assert_eq!((queue.len(), queue.capacity()), (queued, capacity));
+    assert!(queue
+        .iter()
+        .all(|pending| pending.path.as_os_str().is_empty()));
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    for key in carry_family_keys() {
+        assert!(!index.files[&key].source_file_fingerprint.is_empty());
+    }
+}

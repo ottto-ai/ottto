@@ -3572,11 +3572,18 @@ static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS: std::sync::atomic::AtomicUsize =
 static CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Content-free count of carry cancellations refused under their scratch
+/// budget, so the carry stays and the family takes the ordinary path.
+static CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 thread_local! {
     static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS_FOR_TEST: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS_FOR_TEST: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -3588,6 +3595,11 @@ pub(crate) fn claude_stale_family_carry_cancellations_for_test() -> usize {
 #[cfg(test)]
 pub(crate) fn claude_stale_family_carry_terminal_holds_for_test() -> usize {
     CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn claude_stale_family_carry_cancellation_refusals_for_test() -> usize {
+    CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// SOURCE B9 liveness: a member of a family this red retry carried is about to
@@ -3607,7 +3619,11 @@ pub(crate) fn claude_stale_family_carry_terminal_holds_for_test() -> usize {
 /// walk, queueing a passed member would end this page without its terminal
 /// fold, which demotes the changed member's revision before the family can be
 /// re-proved; there the carry stays and the family takes the ordinary path
-/// (SOURCE B9's held path), counted content-free.
+/// (SOURCE B9's held path), counted content-free. Elsewhere the cancel counts
+/// its members by borrowing, then prices and reserves its queue growth and
+/// queued paths before its first mutation; a refusal likewise keeps the
+/// carry on the ordinary path, counted content-free, and never cancels it
+/// partially.
 fn cancel_claude_family_carry_for_member_parse(
     index: &mut ScanIndex,
     census_window_end: &str,
@@ -3646,55 +3662,47 @@ fn cancel_claude_family_carry_for_member_parse(
         return;
     }
     let member_key = local_index_key(member_path);
-    let mut others = Vec::new();
-    for (index_key, entry) in &index.files {
-        if *index_key == member_key
-            || !claude_index_path_member_ref(Path::new(index_key))
+    let is_other = |index_key: &str| {
+        index_key != member_key
+            && claude_index_path_member_ref(Path::new(index_key))
                 .is_some_and(|other| other.root == root_session_id)
-        {
+    };
+    // Count, borrowing only: no scratch collection is built for the cancel.
+    let mut others = 0_usize;
+    for (index_key, entry) in &index.files {
+        if !is_other(index_key) {
             continue;
         }
         if entry.source_file_fingerprint.is_empty() {
             return;
         }
-        others.push(index_key.clone());
+        others = others.saturating_add(1);
     }
-    if others.is_empty() {
+    if others == 0 {
         return;
     }
-    let mut passed = Vec::new();
+    let mut passed = 0_usize;
+    let mut requeues = 0_usize;
+    let mut requeue_path_bytes = 0_usize;
     let mut walk_done = false;
     if let Some(traversal) = index.traversal.as_ref() {
         walk_done =
             traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty();
-        for index_key in &others {
-            let path = Path::new(index_key.as_str());
-            if !traversal.observed_index_keys.contains(index_key)
-                || page.iter().any(|candidate| candidate.path == path)
-                || traversal
-                    .pending_candidates
-                    .iter()
-                    .any(|pending| pending.path == path)
-            {
+        for index_key in index.files.keys().filter(|index_key| is_other(index_key)) {
+            let Some(scan_root) = claude_family_carry_passed_member(traversal, page, index_key)
+            else {
                 continue;
+            };
+            passed = passed.saturating_add(1);
+            if let Some(scan_root) = scan_root {
+                requeues = requeues.saturating_add(1);
+                requeue_path_bytes = requeue_path_bytes
+                    .saturating_add(scan_root.as_os_str().len())
+                    .saturating_add(index_key.len());
             }
-            passed.push(
-                traversal
-                    .scan_roots
-                    .iter()
-                    .filter(|root| path.starts_with(root))
-                    .max_by_key(|root| root.components().count())
-                    .cloned()
-                    .map(|scan_root| ScanTraversalPath {
-                        scan_root,
-                        path: path.to_path_buf(),
-                        census_member: true,
-                        watcher_hint: false,
-                    }),
-            );
         }
     }
-    if walk_done && !passed.is_empty() {
+    if walk_done && passed > 0 {
         CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS_FOR_TEST
@@ -3706,16 +3714,65 @@ fn cancel_claude_family_carry_for_member_parse(
         );
         return;
     }
-    for index_key in &others {
-        if let Some(entry) = index.files.get_mut(index_key) {
-            entry.source_file_fingerprint.clear();
+    // Price, then reserve, before the first mutation: a refusal or a failed
+    // reservation leaves the carry and the traversal untouched, so the family
+    // takes the ordinary path, never a partially cancelled carry.
+    let (queue_len, queue_capacity) = index.traversal.as_ref().map_or((0, 0), |traversal| {
+        (
+            traversal.pending_candidates.len(),
+            traversal.pending_candidates.capacity(),
+        )
+    });
+    let mut admitted = claude_family_carry_cancellation_admitted(
+        queue_len,
+        queue_capacity,
+        requeues,
+        requeue_path_bytes,
+    );
+    if admitted {
+        if let Some(traversal) = index.traversal.as_mut() {
+            admitted = traversal
+                .pending_candidates
+                .try_reserve_exact(requeues)
+                .is_ok();
         }
+    }
+    if !admitted {
+        CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS_FOR_TEST
+            .with(|cell| cell.set(cell.get().saturating_add(1)));
+        eprintln!(
+            "local snapshot census kept a stale Claude family carry: cancelling it was not \
+             admitted under its scratch budget; the family takes the ordinary path"
+        );
+        return;
     }
     let mut requeued = 0_usize;
     if let Some(traversal) = index.traversal.as_mut() {
-        for pending in passed.into_iter().flatten() {
+        for index_key in index.files.keys().filter(|index_key| is_other(index_key)) {
+            if requeued == requeues {
+                break;
+            }
+            let Some(Some(scan_root)) =
+                claude_family_carry_passed_member(traversal, page, index_key)
+            else {
+                continue;
+            };
+            let pending = ScanTraversalPath {
+                scan_root: scan_root.clone(),
+                path: PathBuf::from(index_key),
+                census_member: true,
+                watcher_hint: false,
+            };
             traversal.pending_candidates.push_front(pending);
             requeued += 1;
+        }
+    }
+    for (index_key, entry) in &mut index.files {
+        if is_other(index_key) {
+            entry.source_file_fingerprint.clear();
         }
     }
     CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3724,10 +3781,71 @@ fn cancel_claude_family_carry_for_member_parse(
         .with(|cell| cell.set(cell.get().saturating_add(1)));
     eprintln!(
         "local snapshot census cancelled a stale Claude family carry: a member is parsed in the \
-         retry window; {} indexed file(s) re-armed, {} queued again in this window",
-        others.len(),
-        requeued
+         retry window; {others} indexed file(s) re-armed, {requeued} queued again in this \
+         window"
     );
+}
+
+/// A member of a carried family that the walk already passed: observed, and
+/// neither on this page nor still pending in the traversal. Yields the
+/// deepest scan root containing it, which is `None` when no root does (such
+/// a member is passed but cannot be queued again).
+fn claude_family_carry_passed_member<'t>(
+    traversal: &'t ScanTraversalCheckpoint,
+    page: &VecDeque<CandidateFile>,
+    index_key: &str,
+) -> Option<Option<&'t PathBuf>> {
+    let path = Path::new(index_key);
+    if !traversal.observed_index_keys.contains(index_key)
+        || page.iter().any(|candidate| candidate.path == path)
+        || traversal
+            .pending_candidates
+            .iter()
+            .any(|pending| pending.path == path)
+    {
+        return None;
+    }
+    Some(
+        traversal
+            .scan_roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count()),
+    )
+}
+
+/// Price what cancelling a carry allocates, before it allocates, against the
+/// existing parked overlap budget. Queueing `requeues` passed members grows
+/// the traversal's candidate queue only beyond its spare capacity; that growth
+/// is charged as the old and the new buffer live at once, at the exact
+/// element size. Each queued entry owns a cloned scan root and a member path,
+/// charged at their exact byte lengths. Nothing else is allocated: the cancel
+/// counts and clears in place. An unsupported layout, an overflow or a
+/// refused price keeps the carry.
+fn claude_family_carry_cancellation_admitted(
+    queue_len: usize,
+    queue_capacity: usize,
+    requeues: usize,
+    requeue_path_bytes: usize,
+) -> bool {
+    if !crate::heap_layout_bound::layout_supported() {
+        return false;
+    }
+    let Some(needed) = queue_len.checked_add(requeues) else {
+        return false;
+    };
+    let growth_bytes = if needed <= queue_capacity {
+        Some(0)
+    } else {
+        queue_capacity
+            .checked_add(needed)
+            .and_then(|slots| slots.checked_mul(std::mem::size_of::<ScanTraversalPath>()))
+    };
+    let Some(growth_bytes) = growth_bytes else {
+        return false;
+    };
+    let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+    cost.add(growth_bytes).is_some() && cost.add(requeue_path_bytes).is_some()
 }
 
 /// A demoted revision cannot progress within a traversal only while its family
