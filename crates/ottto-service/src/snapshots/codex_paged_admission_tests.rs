@@ -1085,9 +1085,9 @@ fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
         );
         let c = counters(&row.cache);
         assert_eq!(c.jobs_started, 1, "one cursor read, no requeue loop: {c:?}");
-        // R2-M2, the second change. The first priority publication left a
-        // tier receipt, so the entry has protected history and is never
-        // sampled again (`allow_sample` requires `!protected`, as on main):
+        // R2-M2, the second change. The first completed priority read
+        // captured a tier receipt, so the entry has protected history and is
+        // never sampled again (`allow_sample` requires `!protected`, as on main):
         // the next change is a Full read, not a second O7 tail. On a file
         // over the singleton budget that is a whole cursor read, which main
         // already paid for protected files; only the first priority tail's

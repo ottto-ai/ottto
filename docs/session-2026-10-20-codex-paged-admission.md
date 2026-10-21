@@ -31,6 +31,9 @@ refusal excluded files that the cursor could read.
   discovery fills the census, so in that run the ledger does not resolve the
   child (existing census ordering, unchanged). The ledger helps where the
   census exists at validation: a resumed traversal, or a sampled scan.
+- **Parent ledger cap.** A paged scan admits and cursor-reads an over-limit
+  parent, but a parent past the 4096-signature cap still has no usable
+  ledger: its child is held under `LedgerCapped`, never `Oversize`.
 - **One runtime refusal** (`refuse_unpaged_overrun`), at every point where a
   non-cursor read starts:
   - R-a: the main-loop read;
@@ -87,10 +90,12 @@ keys CI printed. Only then were the keys written to
 O7 needs no flag: a build that contains this change behaves this way.
 
 **Once per file, at its first priority tail.** O7 fires on every tail that
-parses priority-tier usage. But the first priority publication leaves a tier
-receipt on the file's index entry, so its history is protected
-(`codex_history_is_protected`), and protected files are never sampled again
-(`allow_sample` requires `!protected`, unchanged from main). Every later
+parses priority-tier usage. But the first completed priority read captures a
+tier receipt and a protected owner on the file's index entry (before upload
+settlement), so its history is protected (`codex_history_is_protected`), and
+protected files are never sampled again (`allow_sample` requires
+`!protected`, unchanged from main). A replaced or rotated object starts a new
+lifecycle with a Full read, which never goes through O7. Every later
 change is therefore a Full read, and a Full read of a file over 64 MiB was
 already a cursor read on main. So for an existing file of 65 MiB to 2 GiB,
 FC1 moves one read, the first priority tail's in-page replay, to the cursor:
@@ -116,15 +121,32 @@ cursor-slot-starvation residual below.
 
 **Plus the generation fence (K7).** A file whose cursor attempt already
 completed in the current census generation is `Fenced`: its next large read
-waits for the next generation. A generation is one bounded traversal
-(`census_token`: context fingerprint and census window). It completes only
-when no directory or candidate is pending, and deferred or in-progress large
-files stay pending. So the fence lasts the rest of the current traversal:
-at least one page, at most the remaining pages of every large read still
-pending in it (the sum of `ceil(Fj / 64 MiB)` over those files). Then come
-the file's own `ceil(L / 64 MiB)` pages in the next generation. With no
-other large read pending, the traversal ends with the file's own attempt and
-there is no fence.
+waits for the next generation. The fence is not specific to FC1:
+`cursor_plan` fences every large read after an attempt in the generation,
+including main's Full reads of protected files. A generation is one bounded
+traversal (`census_token`: context fingerprint and census window). It
+retires only when no directory or candidate is pending (deferred and
+in-progress large files stay pending), the raw census is complete, no legacy
+join baseline remains, and no protected entry awaits finalization; a restart
+(hints or parent resolution) ends it early. So the fence lasts the rest of
+the current traversal. Its dominant term is the remaining pages of every
+large read still pending in it (the sum of `ceil(Fj / 64 MiB)` over those
+files), plus the remaining discovery, small-file and finalization pages.
+Then come the file's own `ceil(L / 64 MiB)` pages in the next generation.
+With no other work pending, the traversal ends with the file's own attempt
+and there is no fence.
+
+**After AD-1 (#659).** AD-1 does not change any figure above. It changes what
+follows a file's last change. The audit interval is one hour, so a cursor
+read of more than about 12 pages at the 5-minute cadence (a file over about
+768 MiB) outlives it. Before AD-1, such a read of an unchanged file staged
+audit debt and was read in full again every generation, so a large quiescent
+file kept paying whole reads with no change at all. After AD-1 a stable
+outlived read verifies at commit: a quiescent file needs at most one more
+whole read after its last change, then it is skipped (F-T19(a)). A read
+during which the file grows still stages its debt (F-T19(b)), so an active
+protected session over 2 GiB can be read back to back while it keeps
+changing; that is the per-change cost above, not an extra one.
 
 The bytes read are the same as before; they are spread over pages instead of
 one page of up to 2 GiB. This is a material publication-latency cost for a
@@ -134,8 +156,9 @@ price of never reading more than the singleton budget in one page.
 
 ## Residuals (unchanged by this change)
 
-- P1-AUDIT-DUTY: a full read that outlives the audit interval stages its
-  debt again (pinned by F-T19(a) until AD-1).
+- P1-AUDIT-DUTY, as left by AD-1 (#659): a read that outlives the audit
+  interval verifies at commit when the file was stable (F-T19(a)); a grown,
+  partial or lossy read still stages its debt (F-T19(b)).
 - P1-RETAIN: retention limits and eviction.
 - Lossy reads and N2.
 - Restart, memory pressure and unsupported layouts. A scan with an
@@ -144,9 +167,12 @@ price of never reading more than the singleton budget in one page.
 - Cursor slot starvation. FC1 adds to its standing load (see the latency section).
 - A non-paged group member that grows past the unpaged limit after identify
   ends the job as strict debt; it is not counted in `oversized_file_count`.
-- `ta::sample_at` above 2^32 (the audit sample a `Full(AuditDue)` read takes
-  on a file over 4 GiB) has no test here: the function is private to
-  `transcript_acquisition` (F-T6c).
+- F-T21 (retained eviction under state pressure) is not a row here: FC1 does
+  not change eviction, the paused charge or the state budget. It stays a
+  P1-RETAIN test.
+
+`ta::sample_at` above 2^32 (F-T6c) is covered by AD-1 (#659)'s sparse-file
+unit test in `transcript_acquisition`.
 
 Scaled tests prove the routing. They do not prove real throughput above
 2 GiB.
