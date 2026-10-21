@@ -26,6 +26,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
+#[cfg(test)]
+mod cache_policy_tests;
 pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_identity;
 #[cfg(test)]
