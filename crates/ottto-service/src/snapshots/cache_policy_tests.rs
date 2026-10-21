@@ -760,3 +760,77 @@ fn cache_policy_m1_refusal_decision_matrix_evicts_the_minimum() {
         "(g) {counts:?}"
     );
 }
+
+/// M1 counters (review F7) and the overhead bound the release fits against.
+/// A merely full cache and a blocking re-measure are counted. An overflow's
+/// evictions and charged bytes are counted under the copy refusal, never as a
+/// cursor reservation. `context_overhead` never undercounts `bound(context)`.
+/// Lands with the fix: the counters do not exist on main.
+#[test]
+fn cache_policy_m1_counts_copy_refusal_releases_by_cause() {
+    if unexecuted("M1_counters") {
+        return;
+    }
+    use sampled_scan::StepMeasure;
+    let full = full_cache_with_retained_file(false);
+    let scan = tail_active(&full);
+    let context = scan.sampling.as_ref().unwrap();
+    assert!(
+        sampled_scan::context_overhead_covers(context),
+        "the context overhead undercounts the context"
+    );
+    let release = |step: StepMeasure| {
+        observe(|| {
+            sampled_scan::release_cache_to_fit(Some(context), scan.active_file.as_deref(), step)
+        })
+        .1
+    };
+    let resident = crate::heap_layout_bound::bound(context, POLICY_STATE_BYTES)
+        .expect("precondition: bounded residents");
+    let room = POLICY_STATE_BYTES - resident;
+
+    let counts = release(StepMeasure {
+        resident: Some(resident),
+        active: Some(room),
+    });
+    assert_eq!(
+        (
+            counts.copy_refusal_kept,
+            counts.copy_refusal_remeasured,
+            counts.copy_refusal_entries_evicted,
+            counts.copy_refusal_bytes_released,
+        ),
+        (1, 0, 0, 0),
+        "a merely full cache"
+    );
+
+    let counts = release(StepMeasure {
+        resident: None,
+        active: Some(room / 2),
+    });
+    assert_eq!(
+        (
+            counts.copy_refusal_kept,
+            counts.copy_refusal_remeasured,
+            counts.copy_refusal_entries_evicted,
+        ),
+        (0, 1, 0),
+        "a blocking re-measure"
+    );
+
+    let before = optional_resident(&full.cache);
+    let counts = release(StepMeasure {
+        resident: Some(resident),
+        active: Some(room + 1),
+    });
+    let freed = before - optional_resident(&full.cache);
+    assert_eq!(counts.copy_refusal_entries_evicted, 1, "{counts:?}");
+    assert_eq!(counts.cursor_reservation_entries_evicted, 0, "{counts:?}");
+    assert_eq!(wipe_clears(&counts), 0, "{counts:?}");
+    assert!(
+        counts.copy_refusal_bytes_released > 0
+            && counts.copy_refusal_bytes_released <= freed as u64,
+        "released bytes {} of {freed} freed",
+        counts.copy_refusal_bytes_released
+    );
+}

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 733,
-  "content_sha256": "20031ac90e77ecc773fcba0f2b3671751813a9753f751de84ce50334b411cafc",
+  "content_sha256": "a513b0e4eb852915b87367d81a4237cbe829eb14f86d202f0715f2da68175444",
   "files": [
     {
       "executable": false,
@@ -1035,8 +1035,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics/cache_lifecycle.rs",
-      "sha256": "e247c09468dbbd7c129eede2934ca0351acbe4d096b5d34238467ec694120a05",
-      "size_bytes": 4047
+      "sha256": "16b99ad9d4d5dec1fa5c51445eaa85346f83d3db55d3256735dbf483fec490c7",
+      "size_bytes": 4259
     },
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5ed0e7d0ce91e882123b7d68f9dd1639dcbb26e08536ebcd76bc50e1db388242",
-      "size_bytes": 2936247
+      "sha256": "434b2d7eee5ef7524c41fa9dd4093a1c39f4b364e5c1448c8f9ae6187ebeb58e",
+      "size_bytes": 2936263
     },
     {
       "executable": false,
@@ -1350,8 +1350,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/cache_policy_tests.rs",
-      "sha256": "8dc09a09cf54fdea7ae2b3b3cc954e86ecae4371a4c59b432a7dd30c856a75d9",
-      "size_bytes": 28030
+      "sha256": "8aac18905de570608e1d49be6a60ee1a096b3c8566c1d076ca73d1513ca7efaf",
+      "size_bytes": 30559
     },
     {
       "executable": false,
@@ -1581,8 +1581,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "78dcefa5fafc354864589d5980c1fbcb4cfd343b0c80b0bc11759d586129c5c2",
-      "size_bytes": 23160
+      "sha256": "0e46e7c630ee57a175eb23679049dd1f93ac7efd06ef1c06b0ccb5bb2fbd988e",
+      "size_bytes": 29999
     },
     {
       "executable": false,
@@ -1658,8 +1658,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_cache.rs",
-      "sha256": "7d167236d2771a237b717ee3acf714dff1093ed2b6dcca78550d8dc285f844b9",
-      "size_bytes": 24436
+      "sha256": "efe601df8550c4d8a52e66472decc00e4b37418c33212b3a5786dc21544b74f0",
+      "size_bytes": 25335
     },
     {
       "executable": false,
@@ -3366,8 +3366,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-m1-cache-evict-to-fit.md",
-      "sha256": "9e8e74bf8fba7e9df2cc4a5f4cd7e39a311784d78c83e36b572dd892fc2e803f",
-      "size_bytes": 2030
+      "sha256": "c8a54b5d8538da058a4fff1cbab19a63168330552fe6f95293a5d6444c54d059",
+      "size_bytes": 4720
     },
     {
       "executable": false,
@@ -5134,7 +5134,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T10:13:20+00:00",
+  "generated_at": "2026-10-21T10:18:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 734,
   "public_roots": [
@@ -5173,5 +5173,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "42225f9bfcad6269b9f09cce6016349cc1cff63d"
+  "source_commit": "c350325b9776dc8877209d13439565b1be54ab89"
 }

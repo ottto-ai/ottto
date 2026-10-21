@@ -59,6 +59,16 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     }
 }
 
+/// Why `release_until_for` evicts; each cause keeps its own content-free
+/// counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Release {
+    /// Room for a paused cursor job's admission (K6).
+    CursorReservation,
+    /// A copy refusal fitting the residents beside the active file (M1).
+    CopyRefusal,
+}
+
 /// One common admission/eviction mechanism for compatible native states. Uses
 /// the existing fail-closed layout accounting, including strings, maps and Arc
 /// payloads; it never estimates memory from the source file's size.
@@ -123,6 +133,10 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// used) until the resident state fits `limit`. False when even an empty
     /// cache does not fit. The cursor makes room for a paused job this way.
     pub(crate) fn release_until(&mut self, limit: usize) -> bool {
+        self.release_until_for(limit, Release::CursorReservation)
+    }
+    /// `release_until`, counting each eviction under `cause`.
+    pub(crate) fn release_until_for(&mut self, limit: usize, cause: Release) -> bool {
         loop {
             if heap_layout_bound::bound(self, limit).is_some() {
                 return true;
@@ -135,8 +149,16 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             else {
                 return false;
             };
-            self.entries.remove(&victim);
-            record(Event::CursorReservationEntriesEvicted);
+            let Some(entry) = self.entries.remove(&victim) else {
+                return false;
+            };
+            match cause {
+                Release::CursorReservation => record(Event::CursorReservationEntriesEvicted),
+                Release::CopyRefusal => {
+                    record(Event::CopyRefusalEntriesEvicted);
+                    add(Event::CopyRefusalBytesReleased, entry.heap_bytes as u64);
+                }
+            }
         }
     }
     /// Sealed offset of a retained entry without taking it, so a page budget

@@ -15393,14 +15393,15 @@ impl OwnedSourceScan {
                 }
             }
         }
-        let (copy_budget, measured_resident) = self.sampled_copy_parts();
+        let (copy_budget, step_measure) = self.sampled_copy_step();
         if copy_budget == 0 {
-            // L-A1: the resident bound from this same walk, before any parse
-            // progress, admission or await; never carried to another step.
-            sampled_scan::release_cache_for_copy_refusal(
+            // L-A1, M1: the resident bound and active charge from this same
+            // walk, before any parse progress, admission or await; never
+            // carried to another step.
+            sampled_scan::release_cache_to_fit(
                 self.sampling.as_ref(),
                 self.active_file.as_deref(),
-                measured_resident,
+                step_measure,
             );
         }
         let Self {
