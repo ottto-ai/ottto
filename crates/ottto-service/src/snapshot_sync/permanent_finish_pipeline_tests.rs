@@ -4,6 +4,7 @@ use super::*;
 
 #[derive(Clone, Copy, Debug)]
 enum FinishOutcome {
+    Accept,
     Permanent,
     Retryable,
     PermanentStatusFailure,
@@ -85,12 +86,36 @@ impl FinishServer {
                             })
                         })
                         .collect::<Vec<_>>();
-                    serde_json::json!({"accepted":0,"sessions_reconciled":0,"session_ids":[],
+                    if matches!(outcome, FinishOutcome::Accept) {
+                        let entities = items.iter().map(|item| {
+                            assert!(item.get("cache_observations").is_none());
+                            assert!(item.get("context_curve").is_none());
+                            let mut payload = serde_json::Map::new();
+                            for key in ["session_account_evidence", "tool_usage", "tool_usage_truncated"] {
+                                if let Some(value) = item.get(key) { payload.insert(key.into(), value.clone()); }
+                            }
+                            let exclusive = item.get("usage_accounting_contract").and_then(|v| v.as_str())
+                                == Some("session_exclusive_reported_usage:v1");
+                            let version = item.get("session_account_evidence").is_some()
+                                .then_some(if exclusive { 8u64 } else { 7u64 });
+                            let digest = format!("{:x}", Sha256::digest(
+                                crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()));
+                            serde_json::json!({"source_session_id":item["source_session_id"],
+                                "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
+                                "body_witness_version":version,"body_witness_digest":version.map(|_|digest)})
+                        }).collect::<Vec<_>>();
+                        serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                            "session_ids":[],"disabled":false,"disabled_reason":null,
+                            "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":entities,
+                            "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]})
+                    } else {
+                        serde_json::json!({"accepted":0,"sessions_reconciled":0,"session_ids":[],
                         "disabled":false,"disabled_reason":null,
                         "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],
                         "unchanged_entities":[],
                         "conflict_entities":if retryable { references } else { Vec::new() },
                         "rejected_entities":if retryable { Vec::new() } else { rejected }})
+                    }
                 } else {
                     if value["report_kind"] == "scan_status" {
                         statuses.lock().unwrap().push(value.clone());
@@ -347,4 +372,9 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
+}
+
+// Same real finish fixture; the new tests own only a test-thread observer.
+pub(crate) mod prior_index_lifetime_tests {
+    include!("prior_index_lifetime_tests.rs");
 }

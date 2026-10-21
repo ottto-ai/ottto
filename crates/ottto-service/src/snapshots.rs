@@ -1025,6 +1025,222 @@ fn rebuild_claude_context_posture(
         (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
 }
 
+/// Visible negative evidence against the Claude posture member waiver, built
+/// only while the global census fence is closed. It is local to one fold and
+/// read only: never persisted, never merged into the duplicate witness, and
+/// bounded by the requests of this page's waiver candidates (one entry per
+/// candidate request, never one per matching owner or row).
+#[derive(Default)]
+struct ClaudePostureWaiverEvidence<'r> {
+    /// Candidate request hashes that retained, non-invalid family pending of
+    /// any window assigns to more than one (root, member) owner.
+    visible_dupes: BTreeSet<String>,
+    /// Candidate request ids reported by loaded local API or trace evidence,
+    /// with the one reporting root or a marker that several roots report it.
+    /// Keys and roots borrow the loaded reports.
+    foreign_otel: BTreeMap<&'r str, ClaudeReportedRequestRoot<'r>>,
+}
+
+enum ClaudeReportedRequestRoot<'r> {
+    One(&'r str),
+    Several,
+}
+
+/// Build the waiver evidence, or refuse before allocating anything when the
+/// candidates carry more requests than `max_candidate_requests`. Candidates
+/// are members of current, valid family pending, which the Mac-wide pending
+/// occurrence cap already bounds, so the refusal is a guard on that
+/// invariant; a refused fold keeps the strict rule for every candidate.
+fn claude_posture_waiver_evidence<'s, 'r>(
+    candidates: impl Iterator<Item = &'s SnapshotItem> + Clone,
+    max_candidate_requests: usize,
+    index: &ScanIndex,
+    api_report: &'r crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &'r crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) -> Option<ClaudePostureWaiverEvidence<'r>> {
+    let candidate_request_count = candidates
+        .clone()
+        .map(|item| item.claude_usage_request_ids.len())
+        .fold(0_usize, usize::saturating_add);
+    if candidate_request_count > max_candidate_requests {
+        return None;
+    }
+    if candidate_request_count == 0 {
+        return Some(ClaudePostureWaiverEvidence::default());
+    }
+    let candidate_request_ids = candidates
+        .flat_map(|item| item.claude_usage_request_ids.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let candidate_request_hashes = candidate_request_ids
+        .iter()
+        .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
+        .collect::<BTreeSet<_>>();
+    // An invalid family has erased its evidence; it stays unknown, never
+    // unique. Any family that still shows a candidate request under another
+    // owner keeps every peer that shares it fail closed.
+    // `None` once a second owner is seen: the request is shared, and no more
+    // owners need to be retained.
+    let mut owners = BTreeMap::<&str, Option<(&str, &str)>>::new();
+    for (root_session_id, pending) in &index.claude_usage_family_pending {
+        if pending.invalid {
+            continue;
+        }
+        let member_hashes = pending
+            .member_request_id_hashes
+            .iter()
+            .flat_map(|(member, hashes)| hashes.iter().map(move |hash| (member, hash)))
+            .chain(
+                pending
+                    .member_occurrences
+                    .iter()
+                    .flat_map(|(member, occurrences)| {
+                        occurrences.keys().map(move |hash| (member, hash))
+                    }),
+            );
+        for (member, request_hash) in member_hashes {
+            if !candidate_request_hashes.contains(request_hash) {
+                continue;
+            }
+            let owner = (root_session_id.as_str(), member.as_str());
+            let first = owners.entry(request_hash.as_str()).or_insert(Some(owner));
+            if first.is_some_and(|first| first != owner) {
+                *first = None;
+            }
+        }
+    }
+    let visible_dupes = owners
+        .into_iter()
+        .filter(|(_, owner)| owner.is_none())
+        .map(|(request_hash, _)| request_hash.to_string())
+        .collect();
+    let api_rows = api_report.evidence.iter().flat_map(|(root, rows)| {
+        rows.iter().map(move |row| {
+            (
+                root.as_str(),
+                row.session_id.as_str(),
+                row.request_id.as_str(),
+            )
+        })
+    });
+    let trace_rows = trace_report.evidence.iter().flat_map(|(root, rows)| {
+        rows.iter().map(move |row| {
+            (
+                root.as_str(),
+                row.session_id.as_str(),
+                row.request_id.as_str(),
+            )
+        })
+    });
+    let mut foreign_otel = BTreeMap::<&'r str, ClaudeReportedRequestRoot<'r>>::new();
+    for (root, session_id, request_id) in api_rows.chain(trace_rows) {
+        if !candidate_request_ids.contains(request_id) {
+            continue;
+        }
+        let reported = foreign_otel
+            .entry(request_id)
+            .or_insert(ClaudeReportedRequestRoot::One(root));
+        if matches!(reported, ClaudeReportedRequestRoot::One(first) if *first != root || *first != session_id)
+        {
+            *reported = ClaudeReportedRequestRoot::Several;
+        }
+    }
+    Some(ClaudePostureWaiverEvidence {
+        visible_dupes,
+        foreign_otel,
+    })
+}
+
+/// Inputs shared by every withheld item's posture admission in one fold.
+struct ClaudePostureFence<'a> {
+    closed: bool,
+    reports_healthy: bool,
+    census_window_end: &'a str,
+    own_pending: Option<&'a ClaudeUsageFamilyPending>,
+    duplicated_request_hashes: &'a BTreeSet<String>,
+    /// `None` when the evidence was refused at its allocation bound.
+    evidence: Option<&'a ClaudePostureWaiverEvidence<'a>>,
+}
+
+/// Classify an item the strict posture rule withheld, and admit the member
+/// waiver only for exact per-member provider ownership. Uniqueness is never
+/// proof here: the waiver needs this call's session-exclusive contract with no
+/// legacy exclusion, complete request identity, this item's own family valid
+/// in the current window, and no known, visible or reported duplicate.
+fn claude_withheld_posture_admission(
+    item: &SnapshotItem,
+    root_session_id: &str,
+    excluded_request_hashes: &BTreeSet<String>,
+    fence: ClaudePostureFence<'_>,
+) -> ClaudePostureAdmission {
+    let exclusive_contract =
+        item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1");
+    if !(item.claude_context_curve_owned_start_proven
+        || !excluded_request_hashes.is_empty()
+        || exclusive_contract)
+    {
+        return ClaudePostureAdmission::WithheldNoContract;
+    }
+    if !fence.closed {
+        // With an open fence the strict rule withholds a proven start only for
+        // a known duplicate.
+        return ClaudePostureAdmission::WithheldDuplicate;
+    }
+    if !fence.reports_healthy || !exclusive_contract || !excluded_request_hashes.is_empty() {
+        return ClaudePostureAdmission::WithheldGlobalCensus;
+    }
+    if !item.claude_context_curve_identity_complete
+        || item.claude_usage_occurrences.is_empty()
+        || item.claude_usage_occurrences.len() != item.claude_usage_request_ids.len()
+    {
+        return ClaudePostureAdmission::WithheldIdentity;
+    }
+    let request_hashes = item
+        .claude_usage_request_ids
+        .iter()
+        .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
+        .collect::<BTreeSet<_>>();
+    if request_hashes
+        .iter()
+        .any(|request_hash| fence.duplicated_request_hashes.contains(request_hash))
+    {
+        return ClaudePostureAdmission::WithheldDuplicate;
+    }
+    // Defense in depth: this fold accumulated the item into its own pending,
+    // which resets a stale window to the current one and invalidates the
+    // family on a changed request set. These checks also hold when the
+    // pending came from earlier native observations.
+    let own_family_current_valid = fence.own_pending.is_some_and(|pending| {
+        !pending.invalid
+            && pending.census_window_end == fence.census_window_end
+            && pending
+                .member_request_id_hashes
+                .get(&item.source_session_id)
+                == Some(&request_hashes)
+    });
+    if !own_family_current_valid {
+        return ClaudePostureAdmission::WithheldOwnFamily;
+    }
+    let Some(evidence) = fence.evidence else {
+        return ClaudePostureAdmission::WithheldEvidenceBound;
+    };
+    let visibly_shared = request_hashes
+        .iter()
+        .any(|request_hash| evidence.visible_dupes.contains(request_hash));
+    let reported_elsewhere = item.claude_usage_request_ids.iter().any(|request_id| {
+        evidence
+            .foreign_otel
+            .get(request_id.as_str())
+            .is_some_and(|reported| match reported {
+                ClaudeReportedRequestRoot::One(root) => *root != root_session_id,
+                ClaudeReportedRequestRoot::Several => true,
+            })
+    });
+    if visibly_shared || reported_elsewhere {
+        return ClaudePostureAdmission::WithheldDuplicate;
+    }
+    ClaudePostureAdmission::MemberWaiver
+}
+
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the
 // file COUNT and an mtime window, but the per-file/-line byte lengths were
 // previously unbounded: a transcript whose monitored tool output embeds a huge
@@ -2731,6 +2947,62 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// authority quarantine excuses nothing. Taken before the census prunes
     /// this window's pending; never a census, fence or upload input.
     pub(crate) transcript_ownership_complete: bool,
+    /// Why each folded item kept or lost its Claude posture scalars. Kept for
+    /// tests only: never built in a release fold, never serialized, and never
+    /// an index, account, identity, audit or upload input.
+    #[cfg(test)]
+    pub(crate) posture_admissions: BTreeMap<String, ClaudePostureAdmission>,
+}
+
+/// The rule that admitted or withheld one Claude item's first/peak/last
+/// context and compaction scalars in the ownership fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudePostureAdmission {
+    /// Owned start proven and no unresolved duplicate (the unchanged rule).
+    Strict,
+    /// The global census fence is closed, but this member's own Claude Code
+    /// telemetry assigns it every counted request (scalars only).
+    MemberWaiver,
+    /// No explicit fork boundary, exact copied prefix or provider ledger.
+    WithheldNoContract,
+    /// The global census fence is closed and the member waiver does not apply
+    /// to this ownership proof (explicit or legacy-prefix start only).
+    WithheldGlobalCensus,
+    /// The member's own family pending is invalid, stale or not this item's.
+    WithheldOwnFamily,
+    /// A request is visibly shared with another owner or reported under
+    /// another root.
+    WithheldDuplicate,
+    /// A response lacks one unique request id, or no response was counted.
+    WithheldIdentity,
+    /// The fold's waiver candidates exceeded the evidence allocation bound,
+    /// so the strict rule applies.
+    WithheldEvidenceBound,
+}
+
+#[cfg(test)]
+impl ClaudePostureAdmission {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::MemberWaiver => "member_waiver",
+            Self::WithheldNoContract => "withheld_no_contract",
+            Self::WithheldGlobalCensus => "withheld_global_census",
+            Self::WithheldOwnFamily => "withheld_own_family",
+            Self::WithheldDuplicate => "withheld_duplicate",
+            Self::WithheldIdentity => "withheld_identity",
+            Self::WithheldEvidenceBound => "withheld_evidence_bound",
+        }
+    }
+}
+
+#[cfg(test)]
+impl ClaudeUsageAuthorityDisposition {
+    pub(crate) fn posture_admission(&self, source_session_id: &str) -> Option<&'static str> {
+        self.posture_admissions
+            .get(source_session_id)
+            .map(|admission| admission.as_str())
+    }
 }
 
 impl ClaudeUsageAuthorityDisposition {
@@ -4633,6 +4905,53 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             }
         }
     }
+    // An invalid or stale family can hide a copied request, so the global
+    // fence below withholds posture from every session it cannot clear. That
+    // hidden evidence can only be negative. A member whose own Claude Code
+    // telemetry assigns it every counted request does not rely on uniqueness,
+    // so it may keep its scalar tuple while no visible evidence contradicts it.
+    let global_posture_fence =
+        duplicate_census_invalid || index.claude_duplicate_request_witness_overflowed;
+    // `usage_accounting_contract` was reset and set by the rebuild above, in
+    // this call, so the waiver never reads a persisted contract flag.
+    let posture_waiver_evidence = if global_posture_fence {
+        claude_posture_waiver_evidence(
+            snapshots.iter().filter(|item| {
+                let root_session_id = claude_snapshot_family_root_ref(item);
+                item.usage_accounting_contract.as_deref()
+                    == Some("session_exclusive_reported_usage:v1")
+                    && item.claude_context_curve_identity_complete
+                    && index
+                        .claude_usage_family_pending
+                        .get(root_session_id)
+                        .is_some_and(|pending| {
+                            !pending.invalid
+                                && pending.census_window_end == census_window_end
+                                && pending
+                                    .member_request_id_hashes
+                                    .contains_key(&item.source_session_id)
+                        })
+                    && !proven
+                        .get(root_session_id)
+                        .or_else(|| reconstructed.get(root_session_id))
+                        .and_then(|family| {
+                            family
+                                .witness
+                                .legacy_excluded_request_id_hashes
+                                .get(&item.source_session_id)
+                        })
+                        .is_some_and(|excluded| !excluded.is_empty())
+            }),
+            max_pending_occurrences,
+            index,
+            api_report,
+            trace_report,
+        )
+    } else {
+        Some(ClaudePostureWaiverEvidence::default())
+    };
+    #[cfg(test)]
+    let mut posture_admissions = BTreeMap::new();
     for item in snapshots.iter_mut() {
         let root_session_id = claude_snapshot_family_root(item);
         let family = proven
@@ -4659,8 +4978,47 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 == Some("session_exclusive_reported_usage:v1");
         let explicit_owned_start = item.claude_context_curve_owned_start_proven;
         let posture_owned = (explicit_owned_start || provider_owned_start) && !unresolved_duplicate;
+        let posture_admission = if posture_owned {
+            ClaudePostureAdmission::Strict
+        } else {
+            claude_withheld_posture_admission(
+                item,
+                &root_session_id,
+                &excluded_request_hashes,
+                ClaudePostureFence {
+                    closed: global_posture_fence,
+                    reports_healthy,
+                    census_window_end,
+                    own_pending: index.claude_usage_family_pending.get(&root_session_id),
+                    duplicated_request_hashes: &duplicated_request_hashes,
+                    evidence: posture_waiver_evidence.as_ref(),
+                },
+            )
+        };
+        #[cfg(test)]
+        posture_admissions.insert(item.source_session_id.clone(), posture_admission);
 
-        if !posture_owned {
+        if posture_admission == ClaudePostureAdmission::MemberWaiver {
+            // Scalars only: cache observations and the curve below still read
+            // the strict `posture_owned`. Every occurrence is assigned to this
+            // member, but a compaction counts only after its first owned
+            // response, so a boundary copied at the head stays excluded.
+            let mut owned_occurrences = item
+                .claude_usage_occurrences
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            owned_occurrences.sort_by_key(|occurrence| occurrence.sequence);
+            let first_owned_sequence = owned_occurrences
+                .first()
+                .map(|occurrence| occurrence.sequence);
+            item.session_start = item
+                .session_start
+                .take()
+                .and_then(|start| (*start).inherited())
+                .map(Box::new);
+            rebuild_claude_context_posture(item, &owned_occurrences, first_owned_sequence);
+        } else if !posture_owned {
             // A raw top-level transcript can be a Fable/takeover successor
             // with a copied, unmarked prefix. Until the predecessor or an
             // exclusive provider ledger proves where ownership starts, no
@@ -4889,6 +5247,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
 
     let mut disposition = ClaudeUsageAuthorityDisposition {
         request_groupings,
+        #[cfg(test)]
+        posture_admissions,
         ..ClaudeUsageAuthorityDisposition::default()
     };
     let mut demoting_members_by_root = BTreeMap::<String, BTreeSet<String>>::new();
@@ -31196,6 +31556,9 @@ mod tests {
     mod authority_proof_correction_tests {
         include!("snapshots/authority_proof_correction_tests.rs");
     }
+    mod claude_posture_member_waiver_tests {
+        include!("snapshots/claude_posture_member_waiver_tests.rs");
+    }
     use super::*;
     use base64::Engine as _;
 
@@ -44662,8 +45025,12 @@ mod tests {
             local_index_key(&hidden_copy_path),
             manifest_index_entry(None),
         );
+        let expected_child_start = items[1]
+            .session_start
+            .clone()
+            .and_then(|start| (*start).inherited());
 
-        apply_claude_reported_usage_with_index(
+        let disposition = apply_claude_reported_usage_with_index(
             &mut items,
             &api_report,
             &trace_report,
@@ -44684,7 +45051,42 @@ mod tests {
                 .as_ref()
                 .map(|curve| curve.coverage.as_str()),
             Some("ownership_unresolved"),
-            "an invalid peer family can hide a copied request, so posture must stay closed"
+            "an invalid peer family can hide a copied request, so the curve stays closed"
+        );
+        // The hidden family is the copier: telemetry assigns req_5 to the
+        // child, so the child keeps its member-owned scalars (only).
+        assert_eq!(
+            disposition.posture_admission(&child.source_session_id),
+            Some("member_waiver")
+        );
+        assert_eq!(
+            (
+                child.first_turn_context_tokens,
+                child.peak_context_fill_tokens,
+                child.last_turn_context_tokens,
+                child.compaction_count,
+            ),
+            (Some(10), Some(10), Some(10), Some(0))
+        );
+        assert_eq!(
+            child.session_start.as_deref(),
+            expected_child_start.as_ref()
+        );
+        assert!(child.cache_observations.is_none());
+        let hidden_copy = &items[2];
+        assert_eq!(hidden_copy.usage_accounting_contract, None);
+        assert_eq!(
+            disposition.posture_admission(hidden_copy_id),
+            Some("withheld_no_contract")
+        );
+        assert_eq!(
+            (
+                hidden_copy.first_turn_context_tokens,
+                hidden_copy.peak_context_fill_tokens,
+                hidden_copy.last_turn_context_tokens,
+                hidden_copy.compaction_count,
+            ),
+            (None, None, None, None)
         );
         assert!(index.claude_duplicate_request_witness_overflowed);
         assert!(!index
@@ -44719,11 +45121,13 @@ mod tests {
             None,
         );
         let counts = disposition.duplicate_census;
-        // The counters (and contract 5's ownership qualification, read beside
-        // them) are the only disposition output of these report-free folds,
-        // and they never reach persisted index or emitted item bytes.
+        // The counters (and contract 5's ownership qualification and the
+        // audit's posture admissions, read beside them) are the only
+        // disposition output of these report-free folds, and they never reach
+        // persisted index or emitted item bytes.
         disposition.duplicate_census = ClaudeDuplicateCensusCounts::default();
         disposition.transcript_ownership_complete = false;
+        disposition.posture_admissions.clear();
         assert_eq!(disposition, ClaudeUsageAuthorityDisposition::default());
         let index_json = serde_json::to_string(&index).expect("serialize index");
         let items_json = serde_json::to_string(&items).expect("serialize items");
@@ -59442,11 +59846,13 @@ mod tests {
             "native own creator"
         );
 
-        // Created threads are forks to the sampled tail cache, so an admitted
-        // parentless file is never tail-retained: each change is a full re-parse.
-        // A tail resume would otherwise reuse the bound thread-history extent.
-        // Every other reduction conjunct holds, so `codex_is_fork` alone is the
-        // gate; a change that retains created threads must fail here.
+        // Created threads are never tail-retained, so an admitted parentless
+        // file is a full re-parse on each change. A tail resume would otherwise
+        // reuse the bound thread-history extent. Every other reduction conjunct
+        // holds; a fork is admitted only with an in-file boundary and without
+        // the native-only flag, so only clearing `codex_is_fork` (today's
+        // class) admits this copy. A change that retains created threads must
+        // fail here.
         let root = temp_dir("codex-parentless-not-retained");
         let path = root.join(format!("rollout-{PARENTLESS_CHILD}.jsonl"));
         let body = jsonl_body(&values);
@@ -59539,6 +59945,193 @@ mod tests {
             |_, _| {},
         );
         assert_parentless_held(&parsed, "appended header", PARENTLESS_CHILD);
+    }
+
+    /// P1-RETAIN-3: the tail-cache lineage lift admits only forks whose
+    /// ownership boundary came from in-file header fields. A parented created
+    /// thread, a ledger-resolved ordinary fork and a pre-trigger legacy
+    /// subagent stay unretained even where every other reduction conjunct holds.
+    #[test]
+    fn codex_lineage_lift_keeps_created_ledger_and_pre_trigger_forks_unretained() {
+        fn reduced(
+            path: &Path,
+            metadata: &CodexTitleMetadata,
+            ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
+        ) -> SnapshotAccumulator {
+            let mut parser = OwnedJsonlParser::new(
+                File::open(path).expect("open lineage fixture"),
+                path,
+                SnapshotSource::Codex,
+                apply_codex_line,
+                Some(metadata),
+                None,
+                Some(Arc::new(Mutex::new(ledgers))),
+                true,
+                true,
+            )
+            .expect("lineage parser");
+            // A sampled full read observes priority turns, as `prepare_acquisition` does.
+            parser.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
+            while !parser.step().expect("step lineage parser") {}
+            parser.accumulator.clone()
+        }
+        fn ledger_for(
+            parent_id: &str,
+            parent: &[Value],
+        ) -> BTreeMap<String, CodexParentOwnershipLedger> {
+            BTreeMap::from([(
+                parent_id.to_string(),
+                CodexParentOwnershipLedger {
+                    signatures: parent
+                        .iter()
+                        .filter_map(codex_ownership_signature)
+                        .collect(),
+                    scan_complete: true,
+                    opened_object_identity: String::new(),
+                    unresolvable: None,
+                },
+            )])
+        }
+
+        // A provider-created thread with a trusted parent: complete native
+        // accounting, but native-only and outside the in-file boundaries.
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let child = vec![
+            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","history_base":{"cursor":"external"},"source":"vscode","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}}),
+            json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"01a03e99-5000-7000-8000-000000000001","trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
+            json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":"01a03e99-5000-7000-8000-000000000001","model":"gpt-5.6-sol"}}),
+            json!({"timestamp":"2026-08-02T08:20:02Z","ordinal":3,"type":"compacted","payload":{"replacement_history":[]}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:03Z",
+                Some(4),
+                (12, 8, 2, 1),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+        let root = temp_dir("codex-lineage-lift-created-thread");
+        let path = root.join(format!("rollout-{child_id}.jsonl"));
+        fs::write(&path, jsonl_body(&child)).expect("write created-thread fixture");
+        let mut metadata = CodexTitleMetadata::default();
+        metadata.state_created_threads.insert(child_id.to_string());
+        metadata
+            .spawn_parents
+            .insert(child_id.to_string(), parent_id.to_string());
+        metadata.state_threads.insert(
+            child_id.to_string(),
+            CodexStateThread {
+                tokens_used: 1,
+                created_at: Some("2026-08-02T08:20:00Z".to_string()),
+                ..CodexStateThread::default()
+            },
+        );
+        let created = reduced(&path, &metadata, ledger_for(parent_id, &parent));
+        assert_eq!(
+            created.codex_ownership_boundary,
+            CodexOwnershipBoundary::NativeCreatedThread
+        );
+        assert!(created.codex_is_fork && created.codex_created_thread_native_only);
+        assert!(created.codex_parent_session_ref.is_some());
+        assert!(created.codex_usage_accounting_complete());
+        assert!(!sampled_scan::compatible_reduction(&created));
+        // Each exclusion holds on its own: a cleared native-only flag leaves
+        // the created boundary, and an in-file boundary keeps the flag.
+        let mut flag_cleared = created.clone();
+        flag_cleared.codex_created_thread_native_only = false;
+        assert!(!sampled_scan::compatible_reduction(&flag_cleared));
+        let mut in_file_boundary = created.clone();
+        in_file_boundary.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
+        assert!(in_file_boundary.codex_usage_accounting_complete());
+        assert!(!sampled_scan::compatible_reduction(&in_file_boundary));
+        let _ = fs::remove_dir_all(root);
+
+        // An ordinary fork whose AllLocal boundary came from a parent ledger.
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"legacy-parent","thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-1","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+            json!({"timestamp":"2026-08-02T08:10:01Z","type":"turn_context","payload":{"turn_id":"parent-late-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:10:02Z",
+                None,
+                (160, 120, 18, 4),
+                Some((60, 40, 8, 2)),
+            ),
+        ];
+        let path = write_codex_test_values(
+            "codex-lineage-lift-ledger-fork",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"legacy-child","forked_from_id":"legacy-parent","thread_source":"user","source":"cli"}}),
+                parent[0].clone(),
+                parent[1].clone(),
+                parent[2].clone(),
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"timestamp":"2026-08-02T08:20:02Z","type":"turn_context","payload":{"turn_id":"child-first-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:03Z",
+                    None,
+                    (130, 100, 15, 3),
+                    Some((30, 20, 5, 1)),
+                ),
+            ],
+        );
+        let ledger_fork = reduced(
+            &path,
+            &CodexTitleMetadata::default(),
+            ledger_for("legacy-parent", &parent),
+        );
+        assert_eq!(
+            ledger_fork.codex_ownership_boundary,
+            CodexOwnershipBoundary::AllLocal
+        );
+        assert!(ledger_fork.codex_is_fork && ledger_fork.codex_parent_ledger_consulted);
+        assert!(!ledger_fork.codex_created_thread_native_only);
+        assert!(ledger_fork.codex_usage_accounting_complete());
+        assert!(!sampled_scan::compatible_reduction(&ledger_fork));
+        // The ledger read is the only excluding conjunct here.
+        let mut no_ledger = ledger_fork.clone();
+        no_ledger.codex_parent_ledger_consulted = false;
+        assert!(sampled_scan::compatible_reduction(&no_ledger));
+        let _ = fs::remove_file(path);
+
+        // A legacy subagent before its trigger turn has no local boundary yet.
+        let path = write_codex_test_values(
+            "codex-lineage-lift-pre-trigger",
+            &[
+                json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"child-pre-trigger","forked_from_id":"root","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}}}),
+                codex_test_token_line(
+                    "2026-08-02T06:00:01Z",
+                    None,
+                    (1_000, 800, 100, 20),
+                    Some((1_000, 800, 100, 20)),
+                ),
+            ],
+        );
+        let pre_trigger = reduced(&path, &CodexTitleMetadata::default(), BTreeMap::new());
+        assert_eq!(
+            pre_trigger.codex_ownership_boundary,
+            CodexOwnershipBoundary::AwaitingLegacyTrigger
+        );
+        assert!(pre_trigger.codex_is_fork);
+        // Excluded by the accounting conjunct; the boundary is not in-file either.
+        assert!(!pre_trigger.codex_usage_accounting_complete());
+        assert!(!sampled_scan::compatible_reduction(&pre_trigger));
+        let _ = fs::remove_file(path);
     }
 
     #[test]

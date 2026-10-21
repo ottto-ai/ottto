@@ -2766,7 +2766,7 @@ fn validate_cloud_session_scan_receipt(
 }
 
 pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
+    crate::retry_tls::agent_builder()
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
         .timeout_read(read_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
@@ -2851,7 +2851,7 @@ fn cloud_session_deadline_agent(timeout: Duration) -> Result<(ureq::Agent, Durat
     if dns_timeout.is_zero() || request_timeout.is_zero() {
         return Err(anyhow!("cloud-session request deadline is too small"));
     }
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::retry_tls::agent_builder()
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT.min(request_timeout))
         .timeout_read(request_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT.min(request_timeout))

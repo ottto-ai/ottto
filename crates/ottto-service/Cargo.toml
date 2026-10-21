@@ -26,6 +26,7 @@ ottto-protocol = { path = "../ottto-protocol" }
 plist.workspace = true
 prost.workspace = true
 rusqlite.workspace = true
+rustls.workspace = true
 security-framework.workspace = true
 security-framework-sys.workspace = true
 serde.workspace = true

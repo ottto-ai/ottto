@@ -95,7 +95,8 @@ fn transport_result(transport: &ureq::Transport) -> CallResult {
     if timed_out {
         return CallResult::Timeout;
     }
-    CallResult::Error(match transport.kind() {
+    // Typed: a TLS setup failure keeps the category ureq gave it before.
+    CallResult::Error(match crate::retry_tls::transport_kind(transport) {
         ureq::ErrorKind::Dns => "dns_error",
         ureq::ErrorKind::ConnectionFailed => "connect_error",
         ureq::ErrorKind::Io => "io_error",

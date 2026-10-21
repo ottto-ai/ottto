@@ -11467,7 +11467,8 @@ fn collect_claude_oauth_usage_unstamped(
             Ok(response) => Err(ureq::Error::Status(status, response)),
             Err(error) => Err(error),
         },
-        None => ureq::get(&endpoint)
+        None => crate::retry_tls::agent()
+            .get(&endpoint)
             .set("Accept", "application/json")
             .set("Content-Type", "application/json")
             .set("Authorization", &authorization)
@@ -16723,7 +16724,8 @@ fn collect_codex_oauth_usage_at(
         .as_deref()
         .ok_or_else(|| "Codex OAuth access token was not available.".to_string())?;
     let authorization = format!("Bearer {access_token}");
-    let mut request = ureq::get("https://chatgpt.com/backend-api/wham/usage")
+    let mut request = crate::retry_tls::agent()
+        .get("https://chatgpt.com/backend-api/wham/usage")
         .set("Accept", "application/json")
         .set("Authorization", &authorization)
         .timeout(COMMAND_TIMEOUT);
