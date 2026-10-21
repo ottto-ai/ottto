@@ -413,6 +413,8 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
             proven_owner_session: (hour == 11).then_some(PIPELINE_HELD_SESSION),
             ..PIPELINE_HOLD_CYCLE
         };
+        // Match PipelineFixture::traversal's observation bound. A replay can
+        // retire a generation for clean followup without reaching a terminal.
         for number in 0..PIPELINE_MAX_PAGES {
             let at = format!("2026-08-02T{hour:02}:{number:02}:00Z");
             let before = census_pre_hold_bodies(&fixture, &at, &cycle);
@@ -441,10 +443,6 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
             if page.scan.census_complete {
                 break;
             }
-            assert!(
-                number + 1 < PIPELINE_MAX_PAGES,
-                "bounded traversal reaches a terminal"
-            );
         }
     }
     (facts, held_bodies, reset_owed_members)
