@@ -67,8 +67,8 @@ still selected by the ordinary fingerprint comparison and re-read. Any parse
 of a carried family's member (changed, new, or selected by another gate)
 before any other member of that family is parsed in the window cancels the
 carry: every other member's revision is cleared, and members the walk already
-passed are queued again at the front of the traversal, so a later bounded
-page of the same window reads them and the whole family is co-observed in
+passed are queued again in the carry's replay buffer, from which a later
+bounded page of the same window selects them first and the whole family is co-observed in
 that window as BASE's re-arm observes it. The page file limit is unchanged.
 On the page that ends the walk, queueing a passed member would end that page
 without its terminal fold, which demotes the changed revision before the
@@ -77,28 +77,46 @@ ordinary path (the held path below). A content-free counter and a fixed-text
 log line record each hold. A content-free counter and a fixed-text log
 line record each cancellation.
 
-The carry funds each family's worst-case cancellation when it is admitted:
-queueing every indexed member of the family again, one queue slot each plus a
-cloned scan root and a member path no longer than its index key, priced as
-growth of the start's empty candidate queue against the same parked budget.
-Families are funded cumulatively in root order. One whose worst case does not
-fit beside those already funded is not carried and keeps BASE's re-arm,
-counted content-free with a fixed-text log line; a later, smaller family may
-still fit. The funding map is part of the carry check's priced scratch.
+The carry funds each family's worst-case cancellation when it is admitted,
+in one dedicated replay buffer, never the candidate queue. The worst case
+queues every indexed member of the family again: one buffer slot each plus a
+cloned scan root and a member path no longer than its index key. Slots are
+charged twice, because a page that resumes the traversal reserves the buffer
+again while the loaded copy of its queued entries is still live. Families are
+priced cumulatively in root order against the parked budget before anything
+is allocated. One whose worst case does not fit beside those already funded
+is not carried and keeps BASE's re-arm, counted content-free with a
+fixed-text log line; a later, smaller family may still fit. The start then
+reserves the buffer for the funded total; should that reservation fail, no
+family is carried. The funding map is part of the carry check's priced
+scratch.
 
-The cancel builds no scratch collection: it counts the family's other
-members by borrowing, confirms it draws no more than the worst case the carry
-funded, and reserves its queue growth before its first mutation, so it is
-never refused. The queue's existing entries move with its buffer when it
-grows, as on every discovery push; the funding covers what the cancel adds.
-Should a defensive check find the funding missing or the reservation fail
-(not expected), it debug-asserts and re-arms the family's other members as
-BASE does, without queueing them, counted content-free; it never keeps the
-carry.
+The carried roots and the buffer are kept on the scan index
+(`claude_stale_family_carry`, omitted when empty) and replaced by every
+traversal start. A saved and loaded buffer has no spare capacity, so each
+page that resumes the traversal re-derives the still-carried families' worst
+case from the index and reserves the buffer again, priced the same way,
+before it selects anything. If that fails, the still-carried families are
+uncarried: every member's revision is cleared, as BASE's start clears it.
+When the walk has not passed any of their members yet, that is BASE in place.
+When it has, the traversal starts again, so the uncarry precedes every pass
+of the new walk. Each uncarried family is counted content-free with a
+fixed-text log line.
 
-No persisted field, schema, cap or constant changes. The traversal-start row
-gains two counters, `carried_pending_families` and `carried_index_files`; an
-extra fixed-text log line reports the same counts.
+The cancel builds no scratch collection and allocates no slot: it counts the
+family's members by borrowing and pushes the passed ones into the capacity
+reserved for that family. Page selection drains the buffer ahead of the
+ordinary census candidates, within the unchanged page file limit, and a
+traversal is not finished while the buffer holds entries. Should a defensive
+check find the funding missing (not expected), the cancel debug-asserts and
+takes the defensive reset: every member's revision is cleared, the parsed
+one's included, and every passed member is queued into the buffer. The reset
+is counted content-free and never keeps the carry.
+
+The scan index gains one optional field, `claude_stale_family_carry`, written
+only while a carry is live; no schema version, cap or constant changes. The
+traversal-start row gains two counters, `carried_pending_families` and
+`carried_index_files`; an extra fixed-text log line reports the same counts.
 
 Shared with C1a (#663): `claude_index_file_body_accepted`,
 `claude_accepted_ledger_is_current` and `claude_usage_family_witness_legacy_free`
@@ -138,6 +156,17 @@ replace the equivalent inline checks in C1a's unchanged-proof check.
   byte for byte; and the walk-ending-page change with the family unfunded,
   whose every window, proof, heads and witness equal a real BASE arm's
   through the fold.
+- Round 5, an owner-authorized replacement of a PR-local test: round 4's
+  backlog test asserted queueing into the candidate queue, which the
+  dedicated replay buffer replaces. It is replaced by an admitted cancel
+  behind a large unrelated backlog that consumes only the funded buffer (the
+  candidate queue and the buffer keep their length and capacity), the same
+  after a save, load and resumed page, a refused re-funding at that reload
+  that uncarries to an index equal to a real BASE arm's apart from the
+  compacted pending, the same refusal after a passed member restarting the
+  traversal, and the defensive reset called directly. The round-3 admitted
+  cancel test now expects the buffer instead of the queue, and the funding
+  boundary's worst case counts two slots per member.
 
 ## Residual risks
 

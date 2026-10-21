@@ -807,7 +807,7 @@ const CARRY_SCAN_ROOT: &str = "/carry/projects";
 /// already passed (observed under the scan root, not pending) and `queued`
 /// unrelated candidates, at least one, are still pending, so the walk has not
 /// ended. The queue is filled to its capacity, so queueing the passed member
-/// must grow it.
+/// there would grow it.
 fn carry_cancel_index(queued: usize) -> ScanIndex {
     let mut index = carry_index();
     carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
@@ -815,7 +815,14 @@ fn carry_cancel_index(queued: usize) -> ScanIndex {
     assert_eq!(traversal.census_window_end, CARRY_RETRY);
     traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
     traversal.observed_index_keys.extend(carry_family_keys());
-    let mut pending = VecDeque::with_capacity(queued.max(1));
+    traversal.pending_candidates = VecDeque::with_capacity(queued.max(1));
+    carry_fill_queue(&mut index);
+    index
+}
+
+/// Fill the candidate queue to its capacity with unrelated candidates.
+fn carry_fill_queue(index: &mut ScanIndex) {
+    let pending = &mut index.traversal.as_mut().unwrap().pending_candidates;
     while pending.is_empty() || pending.len() < pending.capacity() {
         pending.push_back(ScanTraversalPath {
             scan_root: PathBuf::new(),
@@ -824,8 +831,6 @@ fn carry_cancel_index(queued: usize) -> ScanIndex {
             watcher_hint: false,
         });
     }
-    traversal.pending_candidates = pending;
-    index
 }
 
 fn carry_cancel(index: &mut ScanIndex) {
@@ -840,9 +845,9 @@ fn carry_cancel(index: &mut ScanIndex) {
 }
 
 /// R1, admitted: a parse of a carried family's member on a non-terminal page
-/// prices the cancel under the parked budget, then clears the other member's
-/// revision and queues it, once, at the front of the traversal. The parsed
-/// member keeps its revision for the caller; nothing is refused or held.
+/// clears the other member's revision and queues it, once, into the replay
+/// buffer the carry funded, never into the candidate queue. The parsed member
+/// keeps its revision for the caller; nothing is refused or held.
 #[test]
 fn c1b_admitted_carry_cancellation_rearms_and_queues_the_passed_member() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -880,16 +885,13 @@ fn c1b_admitted_carry_cancellation_rearms_and_queues_the_passed_member() {
             before.files[&key].source_file_fingerprint
         );
     }
-    let pending = &index.traversal.as_ref().unwrap().pending_candidates;
-    assert_eq!(pending.len(), queued + 1);
     assert_eq!(
-        pending.front(),
-        Some(&ScanTraversalPath {
-            scan_root: PathBuf::from(CARRY_SCAN_ROOT),
-            path: PathBuf::from(&agent_key),
-            census_member: true,
-            watcher_hint: false,
-        })
+        index.traversal.as_ref().unwrap().pending_candidates.len(),
+        queued
+    );
+    assert_eq!(
+        index.claude_stale_family_carry.replay,
+        vec![carry_replayed(&agent_key)]
     );
     // The family is no longer carried, so a second parse cancels nothing.
     carry_cancel(&mut index);
@@ -897,10 +899,17 @@ fn c1b_admitted_carry_cancellation_rearms_and_queues_the_passed_member() {
         claude_stale_family_carry_cancellations_for_test(),
         cancellations + 1
     );
-    assert_eq!(
-        index.traversal.as_ref().unwrap().pending_candidates.len(),
-        queued + 1
-    );
+    assert_eq!(index.claude_stale_family_carry.replay.len(), 1);
+}
+
+/// The replay entry a cancel queues for a passed member.
+fn carry_replayed(key: &str) -> ScanTraversalPath {
+    ScanTraversalPath {
+        scan_root: PathBuf::from(CARRY_SCAN_ROOT),
+        path: PathBuf::from(key),
+        census_member: true,
+        watcher_hint: false,
+    }
 }
 
 /// R1, price boundary: queueing grows the candidate queue only beyond its
@@ -953,40 +962,44 @@ fn c1b_carry_cancellation_price_admits_up_to_the_parked_budget() {
     ));
 }
 
-/// R1, funded: the carry funded this cancel's worst case when it was
-/// admitted, so a parse on a non-terminal page cancels it even behind a full
-/// candidate backlog whose growth, priced then, would exceed the parked
-/// budget (the round-3 refusal). The other member is re-armed and queued once
-/// at the front; nothing is refused or held.
-#[test]
-fn c1b_funded_carry_cancellation_is_not_refused_behind_a_large_backlog() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let slot = std::mem::size_of::<ScanTraversalPath>();
-    let mut index = carry_cancel_index(crate::source_rotation::PARKED_BUDGET / slot / 2 + 1);
-    let [root_key, agent_key] = carry_family_keys();
-    let (queued, capacity) = {
-        let queue = &index.traversal.as_ref().unwrap().pending_candidates;
-        (queue.len(), queue.capacity())
-    };
-    assert_eq!(queued, capacity, "the queue is full");
-    let requeue_bytes = CARRY_SCAN_ROOT.len() + agent_key.len();
-    assert!(
-        !claude_family_carry_cancellation_admitted(queued, capacity, 1, requeue_bytes),
-        "pricing the backlog at the cancel refuses it"
+const CARRY_RESUME: &str = "2026-08-02T07:25:00Z";
+
+/// A page of the retry window resuming its traversal after a save and load.
+fn carry_reload(index: ScanIndex) -> ScanIndex {
+    serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap()
+}
+
+fn carry_resume(index: &mut ScanIndex) {
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        index,
+        CARRY_RESUME,
+        BACKFILL_WINDOW_DAYS,
     );
-    assert!(claude_family_carry_cancellation_admitted(
-        0,
-        0,
-        2,
-        2 * (root_key.len() + agent_key.len())
-    ));
+}
+
+/// A carried family's cancel behind a full candidate backlog: the passed
+/// member goes only into the replay buffer the carry funded. Neither the
+/// candidate queue nor that buffer is reallocated, and nothing is refused or
+/// held.
+fn carry_assert_cancel_uses_only_the_funded_buffer(index: &mut ScanIndex) {
+    let [root_key, agent_key] = carry_family_keys();
+    let traversal = index.traversal.as_ref().unwrap();
+    assert_eq!(traversal.census_window_end, CARRY_RETRY);
+    let queue = &traversal.pending_candidates;
+    let (queued, queue_capacity) = (queue.len(), queue.capacity());
+    assert_eq!(queued, queue_capacity, "the queue is full");
+    let carry = &index.claude_stale_family_carry;
+    assert_eq!(carry.roots, BTreeSet::from([CARRY_ROOT.to_string()]));
+    assert!(carry.replay.is_empty());
+    let replay_capacity = carry.replay.capacity();
+    assert!(replay_capacity >= 2, "both members' replay is reserved");
     let before = index.clone();
     let cancellations = claude_stale_family_carry_cancellations_for_test();
     let refusals = claude_stale_family_carry_cancellation_refusals_for_test();
     let holds = claude_stale_family_carry_terminal_holds_for_test();
-    carry_cancel(&mut index);
+    carry_cancel(index);
     assert_eq!(
         claude_stale_family_carry_cancellations_for_test(),
         cancellations + 1
@@ -1001,26 +1014,70 @@ fn c1b_funded_carry_cancellation_is_not_refused_behind_a_large_backlog() {
         before.files[&root_key].source_file_fingerprint
     );
     assert!(index.files[&agent_key].source_file_fingerprint.is_empty());
-    let pending = &index.traversal.as_ref().unwrap().pending_candidates;
-    assert_eq!(pending.len(), queued + 1);
+    let queue = &index.traversal.as_ref().unwrap().pending_candidates;
     assert_eq!(
-        pending.front(),
-        Some(&ScanTraversalPath {
-            scan_root: PathBuf::from(CARRY_SCAN_ROOT),
-            path: PathBuf::from(&agent_key),
-            census_member: true,
-            watcher_hint: false,
-        })
+        (queue.len(), queue.capacity()),
+        (queued, queue_capacity),
+        "the candidate queue is untouched"
     );
+    assert!(queue
+        .iter()
+        .eq(before.traversal.as_ref().unwrap().pending_candidates.iter()));
+    let carry = &index.claude_stale_family_carry;
+    assert_eq!(carry.replay, vec![carry_replayed(&agent_key)]);
+    assert_eq!(
+        carry.replay.capacity(),
+        replay_capacity,
+        "the funded buffer did not grow"
+    );
+    assert!(carry.roots.is_empty(), "the family left the carry");
+}
+
+/// R1, funded buffer: behind a full candidate backlog whose growth alone
+/// would exceed the parked budget, a parse of a carried family's member on a
+/// non-terminal page cancels the carry from the buffer the start funded.
+#[test]
+fn c1b_carry_cancellation_behind_a_large_backlog_uses_only_the_funded_buffer() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let slot = std::mem::size_of::<ScanTraversalPath>();
+    let mut index = carry_cancel_index(crate::source_rotation::PARKED_BUDGET / slot / 2 + 1);
+    carry_assert_cancel_uses_only_the_funded_buffer(&mut index);
+}
+
+/// R1, after a reload: a saved and loaded buffer keeps no spare capacity, so
+/// the page that resumes the traversal reserves it again before it selects
+/// anything, and the same cancel behind the same backlog still uses only
+/// that buffer.
+#[test]
+fn c1b_carry_cancellation_after_a_reload_uses_only_the_refunded_buffer() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let slot = std::mem::size_of::<ScanTraversalPath>();
+    let mut index = carry_reload(carry_cancel_index(
+        crate::source_rotation::PARKED_BUDGET / slot / 2 + 1,
+    ));
+    assert_eq!(index.claude_stale_family_carry.replay.capacity(), 0);
+    carry_fill_queue(&mut index);
+    let uncarries = claude_stale_family_carry_refund_uncarries_for_test();
+    carry_resume(&mut index);
+    assert_eq!(
+        claude_stale_family_carry_refund_uncarries_for_test(),
+        uncarries
+    );
+    carry_assert_cancel_uses_only_the_funded_buffer(&mut index);
 }
 
 const CARRY_SECOND_WITNESSED: &str = "d4444444-4444-4444-8444-444444444444";
 
 /// A carried family's funded worst case: every indexed member queued again,
-/// one slot each plus a scan root and a member path no longer than its key.
+/// two buffer slots each (a reload re-reserves the buffer beside its loaded
+/// copy) plus a scan root and a member path no longer than its key.
 fn carry_worst_case(keys: &[String]) -> usize {
     keys.iter()
-        .map(|key| std::mem::size_of::<ScanTraversalPath>() + 2 * key.len())
+        .map(|key| 2 * std::mem::size_of::<ScanTraversalPath>() + 2 * key.len())
         .sum()
 }
 
@@ -1092,4 +1149,163 @@ fn c1b_unfunded_carry_keeps_the_base_start() {
         serde_json::to_value(&base).unwrap(),
         "the index is BASE's"
     );
+}
+
+/// The retry start in a fix or a BASE arm, resumed by a later page after a
+/// save and load. The walk has queued an unrelated candidate and, unless
+/// `passed`, has not reached the carried family yet.
+fn carry_resumed_index(base: bool, passed: bool) -> ScanIndex {
+    let mut index = carry_index();
+    {
+        let _base = base.then(KeepStaleClaudeFamilyRearmForTest::new);
+        carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    }
+    let traversal = index.traversal.as_mut().expect("the retry traversal");
+    traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
+    if passed {
+        traversal.observed_index_keys.extend(carry_family_keys());
+    }
+    traversal.pending_candidates.push_back(ScanTraversalPath {
+        scan_root: PathBuf::new(),
+        path: PathBuf::new(),
+        census_member: true,
+        watcher_hint: false,
+    });
+    carry_reload(index)
+}
+
+/// R1, re-funding refused at a reload before the walk passed any member: the
+/// family is uncarried in place, every member's revision cleared, and the
+/// index equals a real BASE arm resumed the same way, apart from the carried
+/// pending the start compacted, which credits no evidence and which this
+/// window's reads replace. Counted once.
+#[test]
+fn c1b_unfunded_replay_at_a_reload_uncarries_to_the_base_start() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let uncarries = claude_stale_family_carry_refund_uncarries_for_test();
+    let mut fix = carry_resumed_index(false, false);
+    assert_eq!(
+        fix.claude_stale_family_carry.roots,
+        BTreeSet::from([CARRY_ROOT.to_string()])
+    );
+    for key in carry_family_keys() {
+        assert!(!fix.files[&key].source_file_fingerprint.is_empty());
+    }
+    {
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+        carry_resume(&mut fix);
+    }
+    let mut base = carry_resumed_index(true, false);
+    carry_resume(&mut base);
+    assert_eq!(
+        claude_stale_family_carry_refund_uncarries_for_test(),
+        uncarries + 1
+    );
+    assert_eq!(
+        fix.traversal.as_ref().unwrap().census_window_end,
+        CARRY_RETRY,
+        "uncarried in place, before any member is passed"
+    );
+    assert!(fix.claude_stale_family_carry.is_empty());
+    for key in carry_family_keys() {
+        assert!(fix.files[&key].source_file_fingerprint.is_empty());
+    }
+    assert!(fix.claude_usage_family_pending[CARRY_ROOT]
+        .member_occurrences
+        .is_empty());
+    let mut fix_value = serde_json::to_value(&fix).unwrap();
+    let mut base_value = serde_json::to_value(&base).unwrap();
+    for value in [&mut fix_value, &mut base_value] {
+        value["claude_usage_family_pending"]
+            .as_object_mut()
+            .unwrap()
+            .remove(CARRY_ROOT);
+    }
+    assert_eq!(fix_value, base_value, "the index is BASE's");
+}
+
+/// R1, re-funding refused at a reload after the walk passed a carried member:
+/// uncarrying in place would leave that member unread in this window, so the
+/// traversal starts again with the family re-armed and nothing carried, and
+/// the uncarry precedes every pass of the new walk.
+#[test]
+fn c1b_unfunded_replay_after_a_passed_member_restarts_the_traversal() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let uncarries = claude_stale_family_carry_refund_uncarries_for_test();
+    let mut index = carry_resumed_index(false, true);
+    {
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+        carry_resume(&mut index);
+    }
+    assert_eq!(
+        claude_stale_family_carry_refund_uncarries_for_test(),
+        uncarries + 1
+    );
+    let traversal = index.traversal.as_ref().expect("a new traversal");
+    assert_eq!(traversal.census_window_end, CARRY_RESUME, "a fresh start");
+    assert!(traversal.observed_index_keys.is_empty());
+    assert!(index.claude_stale_family_carry.is_empty());
+    for key in carry_family_keys() {
+        assert!(index.files[&key].source_file_fingerprint.is_empty());
+    }
+}
+
+/// R2, defensive reset: factored out of the cancel, whose debug assertion
+/// rules it out. It re-arms every member, the parsed one included, queues the
+/// passed member into the funded replay buffer without growing it or the
+/// candidate queue, drops the family from the carry and is counted. The
+/// family is then no longer carried, so a later parse cancels nothing.
+#[test]
+fn c1b_defensive_carry_reset_rearms_every_member_and_replays_the_passed_one() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut index = carry_cancel_index(1);
+    let [root_key, agent_key] = carry_family_keys();
+    let before = index.clone();
+    let queue = &before.traversal.as_ref().unwrap().pending_candidates;
+    let (queued, queue_capacity) = (queue.len(), queue.capacity());
+    let replay_capacity = index.claude_stale_family_carry.replay.capacity();
+    let cancellations = claude_stale_family_carry_cancellations_for_test();
+    let refusals = claude_stale_family_carry_cancellation_refusals_for_test();
+    claude_family_carry_defensive_reset(&mut index, CARRY_ROOT, &root_key, &VecDeque::new());
+    assert_eq!(
+        claude_stale_family_carry_cancellation_refusals_for_test(),
+        refusals + 1
+    );
+    for key in carry_family_keys() {
+        assert!(
+            index.files[&key].source_file_fingerprint.is_empty(),
+            "{key} is re-armed"
+        );
+    }
+    for key in [
+        carry_key(CARRY_OTHER, None),
+        carry_key(CARRY_UNWITNESSED, None),
+    ] {
+        assert_eq!(
+            index.files[&key].source_file_fingerprint,
+            before.files[&key].source_file_fingerprint
+        );
+    }
+    let queue = &index.traversal.as_ref().unwrap().pending_candidates;
+    assert_eq!((queue.len(), queue.capacity()), (queued, queue_capacity));
+    let carry = &index.claude_stale_family_carry;
+    assert_eq!(carry.replay, vec![carry_replayed(&agent_key)]);
+    assert_eq!(carry.replay.capacity(), replay_capacity);
+    assert!(carry.roots.is_empty());
+    carry_cancel(&mut index);
+    assert_eq!(
+        claude_stale_family_carry_cancellations_for_test(),
+        cancellations
+    );
+    assert_eq!(
+        claude_stale_family_carry_cancellation_refusals_for_test(),
+        refusals + 1
+    );
+    assert_eq!(index.claude_stale_family_carry.replay.len(), 1);
 }

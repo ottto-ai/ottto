@@ -1967,6 +1967,30 @@ struct ScanTraversalPath {
     watcher_hint: bool,
 }
 
+/// C1b: the stale Claude families a red-retry traversal start carried instead
+/// of re-arming them, and the one replay buffer that start funded for their
+/// cancellations. `replay` is reserved at the start for every carried
+/// family's worst case (all its indexed members) and re-reserved when a page
+/// resumes the traversal, because a saved and loaded buffer keeps no spare
+/// capacity. A cancellation only pushes into that reserved capacity; page
+/// selection drains it within the page's file limit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ClaudeStaleFamilyCarry {
+    /// Carried roots not yet cancelled or uncarried.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    roots: BTreeSet<String>,
+    /// Passed members a cancellation queued again in this window.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    replay: Vec<ScanTraversalPath>,
+}
+
+impl ClaudeStaleFamilyCarry {
+    fn is_empty(&self) -> bool {
+        self.roots.is_empty() && self.replay.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct ScanTraversalCounts {
@@ -2493,6 +2517,11 @@ pub struct ScanIndex {
     /// this finite queue without an O(all paths) tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     traversal: Option<ScanTraversalCheckpoint>,
+    /// C1b: the stale Claude families the current traversal's start carried,
+    /// with the replay buffer it funded for their cancellations. Every
+    /// traversal start replaces it.
+    #[serde(default, skip_serializing_if = "ClaudeStaleFamilyCarry::is_empty")]
+    claude_stale_family_carry: ClaudeStaleFamilyCarry,
     /// Residue named by the last completed census, see `ScanResidueWitness`.
     /// Absent while the last completed census was clean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2610,6 +2639,7 @@ impl Default for ScanIndex {
             resume_census_window_end: None,
             bounded_sweep_had_unsettled_upload: false,
             traversal: None,
+            claude_stale_family_carry: ClaudeStaleFamilyCarry::default(),
             scan_residue_witness: None,
             historical_replay_generation: None,
             context_curve_capability_enabled: false,
@@ -3412,17 +3442,18 @@ fn claude_stale_family_carry_scratch_admitted(
 /// passes the witness tripwire and shares no request with another family's
 /// pending, and every member file committed, accepted and not account-held. Unwitnessed and invalid families keep the re-arm. Nothing
 /// is carried unless the check's scratch is admitted first, and a family is
-/// carried only once its worst-case cancellation is funded. Pure apart from
-/// those content-free counts: the caller compacts what this returns.
-fn claude_fence_closed_retry_carried_roots(
+/// carried only once its worst-case cancellation is funded; the returned
+/// carry holds the replay buffer reserved for those cancellations. Pure apart
+/// from those content-free counts: the caller compacts what this returns.
+fn claude_fence_closed_retry_carry(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
     same_context_retry: bool,
     prior_unsettled_upload: bool,
-) -> BTreeSet<String> {
+) -> ClaudeStaleFamilyCarry {
     #[cfg(test)]
     if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
-        return BTreeSet::new();
+        return ClaudeStaleFamilyCarry::default();
     }
     if !same_context_retry
         || prior_unsettled_upload
@@ -3433,7 +3464,7 @@ fn claude_fence_closed_retry_carried_roots(
         || !claude_accepted_ledger_is_current(index)
         || index.upload_context_fingerprint != index.active_upload_context_fingerprint
     {
-        return BTreeSet::new();
+        return ClaudeStaleFamilyCarry::default();
     }
     let legacy_witness_count = index
         .claude_usage_family_witnesses
@@ -3449,7 +3480,7 @@ fn claude_fence_closed_retry_carried_roots(
         eprintln!(
             "local snapshot census kept every stale Claude family re-arm: the carry check was not admitted under its scratch budget"
         );
-        return BTreeSet::new();
+        return ClaudeStaleFamilyCarry::default();
     }
     let quarantine_preserves = |root_session_id: &str| {
         index
@@ -3495,7 +3526,7 @@ fn claude_fence_closed_retry_carried_roots(
                 .is_some_and(|pending| !pending.invalid)
         })
     {
-        return BTreeSet::new();
+        return ClaudeStaleFamilyCarry::default();
     }
     let mut legacy_witnesses = Vec::with_capacity(legacy_witness_count);
     legacy_witnesses.extend(
@@ -3579,8 +3610,11 @@ fn claude_fence_closed_retry_carried_roots(
         }
     }
     carried.retain(|root_session_id| !shared_owners.contains(root_session_id));
-    fund_claude_family_carry_cancellations(index, &mut carried);
-    carried
+    let replay = fund_claude_family_carry_cancellations(index, &mut carried);
+    ClaudeStaleFamilyCarry {
+        roots: carried,
+        replay,
+    }
 }
 
 /// Content-free count of families a red retry start did not carry because
@@ -3625,20 +3659,27 @@ pub(crate) fn claude_stale_family_carry_unfunded_families_for_test() -> usize {
 }
 
 /// Fund, when the carry is admitted, the worst-case cancellation of every
-/// carried family, so a later member parse can always cancel it. That worst
-/// case queues every indexed member of the family again (a new member's parse
-/// leaves none of them out): one queue slot each, and a cloned scan root plus
-/// a member path each, where the scan root is a component prefix of the
-/// member path and so no longer than its index key. All of it is charged as
-/// growth of the traversal's candidate queue as it is at the start, which is
-/// empty, through the same price the cancel's own check uses. Families are
-/// funded cumulatively in root order; one whose worst case does not fit
-/// beside those already funded is not carried, keeps BASE's re-arm and is
-/// counted content-free, while a later, smaller family may still fit. The
+/// carried family, and reserve the one replay buffer those cancellations draw
+/// on, so a later member parse can always cancel a carry without allocating a
+/// slot. That worst case queues every indexed member of the family again (a
+/// new member's parse leaves none of them out): one buffer slot each, and a
+/// cloned scan root plus a member path each, where the scan root is a
+/// component prefix of the member path and so no longer than its index key.
+/// The slots are charged twice: a page that resumes the traversal reserves the
+/// buffer again while the loaded copy of the entries already queued is still
+/// live, the old and the new buffer at once. Families are funded cumulatively
+/// in root order, all before the buffer is allocated; one whose worst case
+/// does not fit beside those already funded is not carried, keeps BASE's
+/// re-arm and is counted content-free, while a later, smaller family may still
+/// fit. Should the funded reservation itself fail, no family is carried. The
 /// map's scratch is priced by the carry check's admission.
-fn fund_claude_family_carry_cancellations(index: &ScanIndex, carried: &mut BTreeSet<String>) {
+fn fund_claude_family_carry_cancellations(
+    index: &ScanIndex,
+    carried: &mut BTreeSet<String>,
+) -> Vec<ScanTraversalPath> {
+    let mut replay = Vec::<ScanTraversalPath>::new();
     if carried.is_empty() {
-        return;
+        return replay;
     }
     let mut worst_cases = BTreeMap::<&str, (usize, usize)>::new();
     for index_key in index.files.keys() {
@@ -3663,7 +3704,9 @@ fn fund_claude_family_carry_cancellations(index: &ScanIndex, carried: &mut BTree
             .checked_add(requeues)
             .zip(funded_path_bytes.checked_add(path_bytes))
             .filter(|&(requeues, path_bytes)| {
-                claude_family_carry_cancellation_admitted(0, 0, requeues, path_bytes)
+                requeues.checked_mul(2).is_some_and(|slots| {
+                    claude_family_carry_cancellation_admitted(0, 0, slots, path_bytes)
+                })
             });
         let Some((requeues, path_bytes)) = funded else {
             unfunded += 1;
@@ -3673,8 +3716,12 @@ fn fund_claude_family_carry_cancellations(index: &ScanIndex, carried: &mut BTree
         funded_path_bytes = path_bytes;
         true
     });
+    if !carried.is_empty() && replay.try_reserve_exact(funded_requeues).is_err() {
+        unfunded = unfunded.saturating_add(carried.len());
+        carried.clear();
+    }
     if unfunded == 0 {
-        return;
+        return replay;
     }
     CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES
         .fetch_add(unfunded, std::sync::atomic::Ordering::Relaxed);
@@ -3685,6 +3732,101 @@ fn fund_claude_family_carry_cancellations(index: &ScanIndex, carried: &mut BTree
         "local snapshot census kept {unfunded} stale Claude family re-arm(s): the carry could \
          not fund cancelling them under its parked budget"
     );
+    replay
+}
+
+/// Content-free count of carried families a resumed page uncarried because
+/// it could not fund their replay buffer again.
+static CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn claude_stale_family_carry_refund_uncarries_for_test() -> usize {
+    CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// Fund the carry's replay buffer again as a page resumes its traversal,
+/// before that page selects anything: a saved and loaded buffer keeps no
+/// spare capacity. It is reserved for the entries already queued plus every
+/// still-carried family's worst case, re-derived from the index as the start
+/// derived it, and priced with the loaded buffer live beside the new one when
+/// it must grow; that never exceeds what the start funded. Should the price or
+/// the reservation fail, every still-carried family is uncarried: each of its
+/// members' revisions is cleared, as BASE's start re-arm clears them, and it
+/// leaves the carry. That is BASE exactly while the walk has passed none of
+/// its members. Returns false when the walk had passed one, so the caller
+/// starts the traversal again and the uncarry precedes every pass.
+fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
+    let roots = &index.claude_stale_family_carry.roots;
+    if roots.is_empty() {
+        return true;
+    }
+    let (mut requeues, mut path_bytes) = (0_usize, 0_usize);
+    for index_key in index.files.keys() {
+        if claude_index_path_member_ref(Path::new(index_key))
+            .is_some_and(|member| roots.contains(member.root))
+        {
+            requeues = requeues.saturating_add(1);
+            path_bytes = path_bytes.saturating_add(index_key.len().saturating_mul(2));
+        }
+    }
+    let replay = &mut index.claude_stale_family_carry.replay;
+    if claude_family_carry_cancellation_admitted(
+        replay.len(),
+        replay.capacity(),
+        requeues,
+        path_bytes,
+    ) && replay.try_reserve_exact(requeues).is_ok()
+    {
+        return true;
+    }
+    let carry = &index.claude_stale_family_carry;
+    let passed = index.traversal.as_ref().is_some_and(|traversal| {
+        index.files.keys().any(|index_key| {
+            claude_index_path_member_ref(Path::new(index_key))
+                .is_some_and(|member| carry.roots.contains(member.root))
+                && claude_family_carry_passed_member(
+                    traversal,
+                    &carry.replay,
+                    &VecDeque::new(),
+                    index_key,
+                )
+                .is_some()
+        })
+    });
+    let roots = std::mem::take(&mut index.claude_stale_family_carry.roots);
+    let mut rearmed = 0_usize;
+    for (index_key, entry) in &mut index.files {
+        if claude_index_path_member_ref(Path::new(index_key))
+            .is_some_and(|member| roots.contains(member.root))
+            && !entry.source_file_fingerprint.is_empty()
+        {
+            entry.source_file_fingerprint.clear();
+            rearmed += 1;
+        }
+    }
+    CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES
+        .fetch_add(roots.len(), std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES_FOR_TEST
+        .with(|cell| cell.set(cell.get().saturating_add(roots.len())));
+    eprintln!(
+        "local snapshot census uncarried {} stale Claude family/families: their replay could \
+         not be funded again; {rearmed} indexed file(s) re-armed{}",
+        roots.len(),
+        if passed {
+            ", and the traversal starts again"
+        } else {
+            ""
+        }
+    );
+    !passed
 }
 
 /// Content-free count of carried families whose carry a member parse
@@ -3698,10 +3840,9 @@ static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS: std::sync::atomic::AtomicUsize =
 static CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Content-free count of carry cancellations whose carry-time funding a
-/// defensive check found missing, so the cancel re-armed the family's other
-/// members without queueing any; the carry never stays. Not expected: the
-/// carry funded every cancel it admitted.
+/// Content-free count of carry cancellations that found their carry-time
+/// funding missing and took the defensive reset; the carry never stays. Not
+/// expected: the carry funded every cancel it admitted.
 static CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -3731,28 +3872,28 @@ pub(crate) fn claude_stale_family_carry_cancellation_refusals_for_test() -> usiz
 }
 
 /// SOURCE B9 liveness: a member of a family this red retry carried is about to
-/// be parsed (it changed, is new, or another gate selected it) while no member
-/// of that family has been parsed in this window yet, so its pending is still
-/// the compacted entry from an older window. Cancel the carry so the family is
+/// be parsed (it changed, is new, or another gate selected it) while the
+/// family is still in the carry and no member of it has been parsed in this
+/// window yet, so its pending is still the compacted entry from an older
+/// window. Cancel the carry so the family is
 /// co-observed in this window as BASE's whole re-arm observes it: clear every
 /// other indexed member's retained revision, and queue every member the walk
-/// already passed at the front of this traversal, so a later bounded page of
-/// the same census window reads it (a page that would have been terminal is
-/// then not). Members still queued on this page or the traversal, or not yet
-/// discovered, are read later in this window by their cleared revision. A
-/// family qualifies only while it is witnessed, no member of it was parsed
-/// earlier on this page and every other indexed member still retains its
-/// revision (a re-armed family's members do not), so the carry is cancelled
-/// at most once and no member is read twice for it. On the page that ends the
-/// walk, queueing a passed member would end this page without its terminal
-/// fold, which demotes the changed member's revision before the family can be
-/// re-proved; there the carry stays and the family takes the ordinary path
-/// (SOURCE B9's held path), counted content-free. Elsewhere the cancel counts
-/// its members by borrowing and draws on the funding the carry admitted for
-/// it, then reserves its queue growth before its first mutation, so it is
-/// never refused. Should a defensive check find that funding missing or the
-/// reservation fail, it debug-asserts and re-arms the family's other members
-/// as BASE does, without queueing them; it never keeps the carry.
+/// already passed into the carry's replay buffer, which a later bounded page
+/// of the same census window selects from (a page that would have been
+/// terminal is then not). Members still queued on this page or the traversal,
+/// or not yet discovered, are read later in this window by their cleared
+/// revision. A family qualifies only while it is witnessed, no member of it
+/// was parsed earlier on this page and every other indexed member still
+/// retains its revision (a re-armed family's members do not), so the carry is
+/// cancelled at most once and no member is read twice for it. On the page
+/// that ends the walk, queueing a passed member would end this page without
+/// its terminal fold, which demotes the changed member's revision before the
+/// family can be re-proved; there the carry stays and the family takes the
+/// ordinary path (SOURCE B9's held path), counted content-free. Elsewhere the
+/// cancel counts its members by borrowing and queues into the capacity the
+/// carry reserved for this family, so it allocates no slot and never touches
+/// the candidate queue. Should a defensive check find that funding missing,
+/// it debug-asserts and takes the defensive reset; it never keeps the carry.
 fn cancel_claude_family_carry_for_member_parse(
     index: &mut ScanIndex,
     census_window_end: &str,
@@ -3765,22 +3906,26 @@ fn cancel_claude_family_carry_for_member_parse(
     };
     let root_session_id = member.root;
     let carried = index
-        .claude_usage_family_pending
-        .get(root_session_id)
-        .zip(index.claude_usage_family_witnesses.get(root_session_id))
-        .is_some_and(|(pending, witness)| {
-            pending.census_window_end != census_window_end
-                && !pending.invalid
-                && pending.member_occurrences.is_empty()
-                && pending
-                    .member_request_id_hashes
-                    .values()
-                    .all(BTreeSet::is_empty)
-                && witness
-                    .member_request_id_fingerprints
-                    .keys()
-                    .eq(pending.member_request_id_hashes.keys())
-        })
+        .claude_stale_family_carry
+        .roots
+        .contains(root_session_id)
+        && index
+            .claude_usage_family_pending
+            .get(root_session_id)
+            .zip(index.claude_usage_family_witnesses.get(root_session_id))
+            .is_some_and(|(pending, witness)| {
+                pending.census_window_end != census_window_end
+                    && !pending.invalid
+                    && pending.member_occurrences.is_empty()
+                    && pending
+                        .member_request_id_hashes
+                        .values()
+                        .all(BTreeSet::is_empty)
+                    && witness
+                        .member_request_id_fingerprints
+                        .keys()
+                        .eq(pending.member_request_id_hashes.keys())
+            })
         && !index
             .claude_usage_authority_quarantine
             .contains_key(root_session_id)
@@ -3813,9 +3958,7 @@ fn cancel_claude_family_carry_for_member_parse(
         return;
     }
     // The family's worst case as the carry funded it: every indexed member.
-    let mut members = others;
     if index.files.contains_key(&member_key) {
-        members = members.saturating_add(1);
         member_key_bytes = member_key_bytes.saturating_add(member_key.len());
     }
     let funded_path_bytes = member_key_bytes.saturating_mul(2);
@@ -3824,10 +3967,13 @@ fn cancel_claude_family_carry_for_member_parse(
     let mut requeue_path_bytes = 0_usize;
     let mut walk_done = false;
     if let Some(traversal) = index.traversal.as_ref() {
-        walk_done =
-            traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty();
+        let replay = &index.claude_stale_family_carry.replay;
+        walk_done = traversal.pending_directories.is_empty()
+            && traversal.pending_candidates.is_empty()
+            && replay.is_empty();
         for index_key in index.files.keys().filter(|index_key| is_other(index_key)) {
-            let Some(scan_root) = claude_family_carry_passed_member(traversal, page, index_key)
+            let Some(scan_root) =
+                claude_family_carry_passed_member(traversal, replay, page, index_key)
             else {
                 continue;
             };
@@ -3852,88 +3998,124 @@ fn cancel_claude_family_carry_for_member_parse(
         );
         return;
     }
-    // The carry funded this cancel's worst case under the parked budget when
-    // it was admitted, so the cancel is never refused. The defensive checks
-    // confirm it draws no more than that worst case, then reserve its queue
-    // growth before the first mutation. The queue's existing entries move
-    // with its buffer when it grows, as on every discovery push; the funding
-    // covers the slots and paths the cancel adds.
-    let mut funded = requeues <= members
-        && requeue_path_bytes <= funded_path_bytes
-        && claude_family_carry_cancellation_admitted(0, 0, members, funded_path_bytes);
-    if funded {
-        if let Some(traversal) = index.traversal.as_mut() {
-            funded = traversal
-                .pending_candidates
-                .try_reserve_exact(requeues)
-                .is_ok();
-        }
-    }
+    // The carry reserved this family's worst case in the replay buffer at its
+    // start, and every resumed page reserved it again, so the passed members
+    // fit in its spare capacity. Nothing here allocates a slot.
+    let replay = &index.claude_stale_family_carry.replay;
+    let funded =
+        requeues <= replay.capacity() - replay.len() && requeue_path_bytes <= funded_path_bytes;
     debug_assert!(
         funded,
-        "a carried family's cancellation was funded at carry time"
+        "a carried family's cancellation draws on the replay buffer its carry funded"
     );
     if !funded {
-        // BASE's re-arm, without the queueing the funding was for: never the carry.
-        for (index_key, entry) in &mut index.files {
-            if is_other(index_key) {
-                entry.source_file_fingerprint.clear();
-            }
-        }
-        CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        #[cfg(test)]
-        CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS_FOR_TEST
-            .with(|cell| cell.set(cell.get().saturating_add(1)));
-        eprintln!(
-            "local snapshot census cancelled a stale Claude family carry without its funding: \
-             {others} indexed file(s) re-armed, none queued again in this window"
-        );
+        claude_family_carry_defensive_reset(index, root_session_id, &member_key, page);
         return;
     }
-    let mut requeued = 0_usize;
-    if let Some(traversal) = index.traversal.as_mut() {
-        for index_key in index.files.keys().filter(|index_key| is_other(index_key)) {
-            if requeued == requeues {
-                break;
-            }
-            let Some(Some(scan_root)) =
-                claude_family_carry_passed_member(traversal, page, index_key)
-            else {
-                continue;
-            };
-            let pending = ScanTraversalPath {
-                scan_root: scan_root.clone(),
-                path: PathBuf::from(index_key),
-                census_member: true,
-                watcher_hint: false,
-            };
-            traversal.pending_candidates.push_front(pending);
-            requeued += 1;
-        }
-    }
-    for (index_key, entry) in &mut index.files {
-        if is_other(index_key) {
-            entry.source_file_fingerprint.clear();
-        }
-    }
+    let (rearmed, requeued) =
+        replay_and_rearm_claude_family(index, root_session_id, &member_key, page, false);
     CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS_FOR_TEST
         .with(|cell| cell.set(cell.get().saturating_add(1)));
     eprintln!(
         "local snapshot census cancelled a stale Claude family carry: a member is parsed in the \
-         retry window; {others} indexed file(s) re-armed, {requeued} queued again in this \
+         retry window; {rearmed} indexed file(s) re-armed, {requeued} queued again in this \
          window"
     );
 }
 
+/// The defensive reset, taken only when a cancel finds its carry-time funding
+/// missing, which debug builds assert never happens: BASE's whole re-arm for
+/// the family. Every indexed member's revision is cleared, the parsed one's
+/// included, every member the walk already passed is queued into the replay
+/// buffer the carry sized for it, and the family leaves the carry. Should a
+/// broken invariant leave that buffer short, the queueing grows it rather than
+/// lose a member's read in this window.
+fn claude_family_carry_defensive_reset(
+    index: &mut ScanIndex,
+    root_session_id: &str,
+    parsed_key: &str,
+    page: &VecDeque<CandidateFile>,
+) {
+    let (rearmed, requeued) =
+        replay_and_rearm_claude_family(index, root_session_id, parsed_key, page, true);
+    CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS_FOR_TEST
+        .with(|cell| cell.set(cell.get().saturating_add(1)));
+    eprintln!(
+        "local snapshot census reset a stale Claude family carry without its funding: \
+         {rearmed} indexed file(s) re-armed, {requeued} queued again in this window"
+    );
+}
+
+/// Cancel a carried family's carry as BASE's whole re-arm observes it: queue
+/// every member the walk already passed, other than the parsed one, into the
+/// carry's replay buffer, clear the retained revision of every indexed member
+/// (the parsed one's only when `rearm_parsed`), and drop the family from the
+/// carry. Returns the re-armed and the queued counts.
+fn replay_and_rearm_claude_family(
+    index: &mut ScanIndex,
+    root_session_id: &str,
+    parsed_key: &str,
+    page: &VecDeque<CandidateFile>,
+    rearm_parsed: bool,
+) -> (usize, usize) {
+    let in_family = |index_key: &str| {
+        claude_index_path_member_ref(Path::new(index_key))
+            .is_some_and(|member| member.root == root_session_id)
+    };
+    let mut queued = 0_usize;
+    if let Some(traversal) = index.traversal.as_ref() {
+        let replay = &mut index.claude_stale_family_carry.replay;
+        let already_queued = replay.len();
+        for index_key in index.files.keys() {
+            if index_key.as_str() == parsed_key || !in_family(index_key) {
+                continue;
+            }
+            let Some(Some(scan_root)) = claude_family_carry_passed_member(
+                traversal,
+                &replay[..already_queued],
+                page,
+                index_key,
+            ) else {
+                continue;
+            };
+            replay.push(ScanTraversalPath {
+                scan_root: scan_root.clone(),
+                path: PathBuf::from(index_key),
+                census_member: true,
+                watcher_hint: false,
+            });
+            queued += 1;
+        }
+    }
+    let mut rearmed = 0_usize;
+    for (index_key, entry) in &mut index.files {
+        if (rearm_parsed || index_key.as_str() != parsed_key)
+            && in_family(index_key)
+            && !entry.source_file_fingerprint.is_empty()
+        {
+            entry.source_file_fingerprint.clear();
+            rearmed += 1;
+        }
+    }
+    index
+        .claude_stale_family_carry
+        .roots
+        .remove(root_session_id);
+    (rearmed, queued)
+}
+
 /// A member of a carried family that the walk already passed: observed, and
-/// neither on this page nor still pending in the traversal. Yields the
-/// deepest scan root containing it, which is `None` when no root does (such
-/// a member is passed but cannot be queued again).
+/// neither on this page nor still pending in the traversal or the carry's
+/// replay buffer. Yields the deepest scan root containing it, which is `None`
+/// when no root does (such a member is passed but cannot be queued again).
 fn claude_family_carry_passed_member<'t>(
     traversal: &'t ScanTraversalCheckpoint,
+    replay: &[ScanTraversalPath],
     page: &VecDeque<CandidateFile>,
     index_key: &str,
 ) -> Option<Option<&'t PathBuf>> {
@@ -3943,6 +4125,7 @@ fn claude_family_carry_passed_member<'t>(
         || traversal
             .pending_candidates
             .iter()
+            .chain(replay)
             .any(|pending| pending.path == path)
     {
         return None;
@@ -3957,14 +4140,13 @@ fn claude_family_carry_passed_member<'t>(
 }
 
 /// Price queueing `requeues` members with `requeue_path_bytes` of owned paths
-/// against the existing parked overlap budget. Queueing grows the traversal's
-/// candidate queue only beyond its spare capacity; that growth is charged as
-/// the old and the new buffer live at once, at the exact element size. Each
-/// queued entry owns a cloned scan root and a member path, charged at their
-/// byte lengths. The carry funds each family's worst-case cancellation with
-/// it against the queue at the start, which is empty, and the cancel checks
-/// its family's worst case with it again. An unsupported layout, an overflow
-/// or a refused price is not funded.
+/// against the existing parked overlap budget. Queueing grows a buffer only
+/// beyond its spare capacity; that growth is charged as the old and the new
+/// buffer live at once, at the exact element size. Each queued entry owns a
+/// cloned scan root and a member path, charged at their byte lengths. The
+/// carry funds its replay buffer with it at the start, which is empty, and a
+/// resumed page prices reserving that buffer again with it. An unsupported
+/// layout, an overflow or a refused price is not funded.
 fn claude_family_carry_cancellation_admitted(
     queue_len: usize,
     queue_capacity: usize,
@@ -16420,10 +16602,11 @@ impl OwnedSourceScan {
         // Watcher freshness must not starve the durable census when callers use a
         // small page size. Production reserves almost the whole 10k page already,
         // but the explicit slot also makes liveness independent of that ratio.
-        let ordinary_census_pending = traversal
-            .pending_candidates
-            .iter()
-            .any(|candidate| candidate.census_member && !candidate.watcher_hint);
+        let ordinary_census_pending = !index.claude_stale_family_carry.replay.is_empty()
+            || traversal
+                .pending_candidates
+                .iter()
+                .any(|candidate| candidate.census_member && !candidate.watcher_hint);
         let selection_limit =
             if source == SnapshotSource::Codex && !traversal.pending_directories.is_empty() {
                 0
@@ -16508,6 +16691,15 @@ impl OwnedSourceScan {
                 pending_paths.push(candidate);
             }
         }
+        // C1b: members a carry cancellation queued again, drained from the
+        // replay buffer the carry funded, ahead of the ordinary census
+        // candidates and within the same page limit. Draining keeps the
+        // buffer's capacity.
+        let carry_replay = &mut index.claude_stale_family_carry.replay;
+        let replayed = selection_limit
+            .saturating_sub(pending_paths.len())
+            .min(carry_replay.len());
+        pending_paths.extend(carry_replay.drain(..replayed));
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal
                 .pending_candidates
@@ -16684,6 +16876,10 @@ impl OwnedSourceScan {
                     .pending_candidates
                     .retain(|pending| !missing_family_paths.contains(&pending.path));
             }
+            index
+                .claude_stale_family_carry
+                .replay
+                .retain(|pending| !missing_family_paths.contains(&pending.path));
             for path in missing_family_paths {
                 let Some(scan_root) = scan_roots
                     .iter()
@@ -19279,10 +19475,11 @@ impl OwnedSourceScan {
                         index.remove_file_entry(index_key);
                     }
                 }
-                let traversal_discovery_done = index.traversal.as_ref().is_some_and(|traversal| {
-                    traversal.pending_directories.is_empty()
-                        && traversal.pending_candidates.is_empty()
-                });
+                let traversal_discovery_done =
+                    index.traversal.as_ref().is_some_and(|traversal| {
+                        traversal.pending_directories.is_empty()
+                            && traversal.pending_candidates.is_empty()
+                    }) && index.claude_stale_family_carry.replay.is_empty();
                 if traversal_discovery_done {
                     if source == SnapshotSource::Codex {
                         let missing = index
@@ -19450,12 +19647,14 @@ impl OwnedSourceScan {
                             .saturating_add(traversal.pending_directories.len())
                             .saturating_add(usize::from(reconciliation_pending))
                     })
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .saturating_add(index.claude_stale_family_carry.replay.len());
                 let skipped_file_count_due_to_limit = index
                     .traversal
                     .as_ref()
                     .map(|traversal| traversal.pending_candidates.len())
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .saturating_add(index.claude_stale_family_carry.replay.len());
                 let restart_after_hints =
                     traversal_discovery_done && traversal_healthy && !clean_frozen_generation;
                 let terminal_unhealthy = traversal_discovery_done && !traversal_healthy;
@@ -27809,6 +28008,7 @@ fn ensure_bounded_traversal(
     {
         let terminal_unhealthy = traversal.pending_directories.is_empty()
             && traversal.pending_candidates.is_empty()
+            && index.claude_stale_family_carry.replay.is_empty()
             && traversal.counts.has_errors();
         // What clears the latch: a generation that completes drops the
         // traversal, and a changed scan context takes the `else` branch below;
@@ -27832,14 +28032,24 @@ fn ensure_bounded_traversal(
             // bounded by the per-tick traversal limits.
             None => true,
         };
-        if !terminal_unhealthy || !retry_due {
-            return;
-        }
-        traversal
-            .unhealthy_retry_attempt
-            .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS)
+        (terminal_unhealthy && retry_due).then(|| {
+            traversal
+                .unhealthy_retry_attempt
+                .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS)
+        })
     } else {
-        0
+        Some(0)
+    };
+    let Some(retry_attempt) = retry_attempt else {
+        // This page resumes the traversal. Before it selects anything, the
+        // carry's replay buffer is funded again; a carry that cannot be is
+        // uncarried, and if the walk already passed one of its members the
+        // traversal starts again so the uncarry precedes every pass.
+        if !refund_claude_stale_family_carry(index) {
+            index.traversal = None;
+            ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+        }
+        return;
     };
 
     // Capture only fixed counters before the existing reset/rearm. A missing
@@ -27861,6 +28071,8 @@ fn ensure_bounded_traversal(
     // new partial settlement stamps the marker again before persistence.
     let prior_unsettled_upload = index.bounded_sweep_had_unsettled_upload;
     index.bounded_sweep_had_unsettled_upload = false;
+    // A carry belongs to the traversal that started it; this start replaces it.
+    index.claude_stale_family_carry = ClaudeStaleFamilyCarry::default();
 
     if source == SnapshotSource::ClaudeCode {
         // Partial settlement can retain request evidence from an older census
@@ -27889,13 +28101,14 @@ fn ensure_bounded_traversal(
             })
             .map(|(root, _)| root.clone())
             .collect::<BTreeSet<_>>();
-        let carried_roots = claude_fence_closed_retry_carried_roots(
+        let carry = claude_fence_closed_retry_carry(
             index,
             &stale_pending_roots,
             prior_traversal_context_matches,
             prior_unsettled_upload,
         );
-        for root_session_id in &carried_roots {
+        let carried_roots = &carry.roots;
+        for root_session_id in carried_roots {
             if let Some(pending) = index.claude_usage_family_pending.get_mut(root_session_id) {
                 pending.member_occurrences.clear();
                 pending
@@ -27942,6 +28155,7 @@ fn ensure_bounded_traversal(
         transition.rearmed_index_files = rearmed_file_count;
         transition.carried_pending_families = carried_roots.len();
         transition.carried_index_files = carried_file_count;
+        index.claude_stale_family_carry = carry;
     }
     transition.emit(source);
 
@@ -30124,11 +30338,12 @@ impl ScanIndex {
             // bounded added latency, not a stall - the traversal is still advanced
             // by `ensure_bounded_traversal` - and the ledger stays open meanwhile,
             // which is the safe state.
-            let traversal_is_terminal_unhealthy = self.traversal.as_ref().is_some_and(|t| {
-                t.pending_directories.is_empty()
-                    && t.pending_candidates.is_empty()
-                    && t.counts.has_errors()
-            });
+            let traversal_is_terminal_unhealthy =
+                self.traversal.as_ref().is_some_and(|t| {
+                    t.pending_directories.is_empty()
+                        && t.pending_candidates.is_empty()
+                        && t.counts.has_errors()
+                }) && self.claude_stale_family_carry.replay.is_empty();
             if traversal_is_terminal_unhealthy {
                 self.traversal = None;
             }
@@ -30296,7 +30511,8 @@ impl ScanIndex {
                 t.pending_directories.is_empty()
                     && t.pending_candidates.is_empty()
                     && t.counts.has_errors()
-            }) {
+            }) && self.claude_stale_family_carry.replay.is_empty()
+            {
                 self.traversal = None;
             }
             self.bounded_sweep_had_unsettled_upload = true;
@@ -31487,6 +31703,7 @@ impl ScanIndex {
             resume_census_window_end: self.resume_census_window_end.clone(),
             bounded_sweep_had_unsettled_upload: self.bounded_sweep_had_unsettled_upload,
             traversal: self.traversal.clone(),
+            claude_stale_family_carry: self.claude_stale_family_carry.clone(),
             scan_residue_witness: self.scan_residue_witness.clone(),
             historical_replay_generation: self.historical_replay_generation.clone(),
             context_curve_capability_enabled: previous.context_curve_capability_enabled,
@@ -68248,12 +68465,13 @@ crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verifi
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
+crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; roots, replay);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids, codex_inventory_hold);
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
