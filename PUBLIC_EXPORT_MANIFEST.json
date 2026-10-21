@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 725,
-  "content_sha256": "bb1dce8e27929b52e3208d0990f7a94a5e2f056fe08e0e74c63882afd6c6b25a",
+  "candidate_file_count": 727,
+  "content_sha256": "a02f8fbccb67c21247798586aedd54aa8af1d22faef647d74677a2fd84b97026",
   "files": [
     {
       "executable": false,
@@ -1140,8 +1140,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_allocation_probe.rs",
-      "sha256": "8ae9bbb57a59b7741b04d6cdc6a54afc9b51527341846703de6bb5c009cb027a",
-      "size_bytes": 20339
+      "sha256": "ca170fcd3cc4dec4944636b83ce7b58a91d2b5d1cba727329ade8bf04fb8cd86",
+      "size_bytes": 21248
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "83dd714a622b1e9a601c544dbfc6d6c540f5fc17c3e1834fce6ae8d127b5f719",
-      "size_bytes": 842213
+      "sha256": "10926107abe6af1a1d5267bd97c676953974bfacd53e562fd759af889cbd03d4",
+      "size_bytes": 843577
     },
     {
       "executable": false,
@@ -1273,8 +1273,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/permanent_finish_pipeline_tests.rs",
-      "sha256": "9abcd63c02f38431731b14d60150f80b5d15f92b1b83afb81e1697832c84f8cf",
-      "size_bytes": 15155
+      "sha256": "1106ba45e7c133819a52b7aa24023c643c48ac8cf439902e6239f9a89f6a0a0e",
+      "size_bytes": 17295
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync/prior_index_lifetime_tests.rs",
+      "sha256": "26eb25efa3f61b0180d0d134031a677edeccf812b8531620193d986b549dfad5",
+      "size_bytes": 15016
     },
     {
       "executable": false,
@@ -3288,6 +3295,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-20-claude-prior-index-lifetime.md",
+      "sha256": "be36bf98331d9ddc464d7a1e3577ec34d2017b4eaf69807085b3d75890487f43",
+      "size_bytes": 1781
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-20-disappearance-reason-diagnostics.md",
       "sha256": "dd95e5cefff11b39414156e2ce0b5759c3fce7e3fe40b101d9b3645e04b3d98e",
       "size_bytes": 3299
@@ -5078,9 +5092,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T03:48:25+00:00",
+  "generated_at": "2026-10-21T06:00:51+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 726,
+  "output_file_count": 728,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5117,5 +5131,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c8cf68ccc9dd331fdb818bc8d3b2c53cedf9e638"
+  "source_commit": "3a67fe826d681e6550b4ed2078018b5835f71141"
 }
