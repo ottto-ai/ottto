@@ -110,7 +110,8 @@ impl TlsConnector for DeadlineTls {
     }
 }
 
-// The connect step and stream below are adapted from ureq 2.12.1 src/rtls.rs
+// The client config above, the connect step and the stream below are adapted
+// from ureq 2.12.1 src/rtls.rs
 // (https://github.com/algesten/ureq), Copyright (c) 2019 Martin Algesten,
 // licensed MIT OR Apache-2.0; see NOTICE. Only error construction differs:
 // ureq's `ErrorKind::msg` and `Error::src` are crate-private, so each failure
@@ -562,9 +563,17 @@ mod tests {
         roots.add(certificate.clone()).unwrap();
         client_config(roots)
     }
+    fn serve(
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+        connections: usize,
+    ) -> (u16, std::thread::JoinHandle<Vec<bool>>) {
+        serve_on("127.0.0.1:0", certificate, key, connections)
+    }
     /// Serve `connections` loopback TLS connections with one tiny response
     /// each; report whether each connection completed a request.
-    fn serve(
+    fn serve_on(
+        address: &str,
         certificate: rustls::pki_types::CertificateDer<'static>,
         key: rustls::pki_types::PrivateKeyDer<'static>,
         connections: usize,
@@ -579,7 +588,7 @@ mod tests {
             .with_single_cert(vec![certificate], key)
             .unwrap(),
         );
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = std::net::TcpListener::bind(address).unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let mut served = Vec::new();
@@ -679,12 +688,13 @@ mod tests {
     #[test]
     fn trusted_host_is_accepted_by_name_and_by_ip() {
         let certificates = Certificates::new("trusted");
-        let (certificate, key) = certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1");
+        let (certificate, key) =
+            certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1,IP:::1");
         let tls = Arc::new(WebPkiTls {
             config: trusting(&certificate),
         });
         let agent = ureq::AgentBuilder::new().tls_connector(tls).build();
-        let (port, server) = serve(certificate, key, 2);
+        let (port, server) = serve(certificate.clone(), key.clone_key(), 2);
         for host in ["localhost", "127.0.0.1"] {
             let response = agent
                 .get(&format!("https://{host}:{port}/"))
@@ -693,6 +703,12 @@ mod tests {
             assert_eq!(response.into_string().unwrap(), "ok", "{host}");
         }
         assert_eq!(server.join().unwrap(), vec![true, true]);
+        // ureq hands the connector the bracketed literal `[::1]`; the strip
+        // must leave an IPv6 server name that the certificate's IP SAN meets.
+        let (port, server) = serve_on("[::1]:0", certificate, key, 1);
+        let response = agent.get(&format!("https://[::1]:{port}/")).call().unwrap();
+        assert_eq!(response.into_string().unwrap(), "ok");
+        assert_eq!(server.join().unwrap(), vec![true]);
     }
 
     #[test]
@@ -735,6 +751,34 @@ mod tests {
             assert_eq!(kind_of(&error), Some(ureq::ErrorKind::ConnectionFailed));
             assert_eq!(server.join().unwrap(), vec![false], "{case}");
         }
+    }
+
+    #[test]
+    fn deadline_connector_keeps_production_webpki_trust() {
+        let certificates = Certificates::new("deadline-webpki");
+        let (certificate, key) = certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1");
+        let (port, server) = serve(certificate, key, 1);
+        let before = connects();
+        // No `with_test_config`: the deadline connector's own production
+        // config must refuse a synthetic issuer like the default connector.
+        let error = ureq::AgentBuilder::new()
+            .tls_connector(connector(Instant::now() + Duration::from_secs(10)))
+            .build()
+            .get(&format!("https://localhost:{port}/"))
+            .call()
+            .unwrap_err();
+        assert_eq!(connects(), before + 1);
+        assert!(
+            matches!(
+                rustls_cause(&error),
+                Some(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer
+                ))
+            ),
+            "{error}"
+        );
+        assert_eq!(kind_of(&error), Some(ureq::ErrorKind::ConnectionFailed));
+        assert_eq!(server.join().unwrap(), vec![false]);
     }
 
     #[test]
@@ -846,43 +890,167 @@ mod tests {
         assert!(error.to_string().contains("parsing 'not a host name'"));
     }
 
+    #[derive(Clone, Copy)]
+    enum Scope {
+        Production,
+        TestModule,
+        // A file compiled only inside a test module through `include!`.
+        IncludedTestFile,
+    }
+    /// One permitted line holding a guarded token: exact file, exact trimmed
+    /// line, scope and occurrence count. `{u}` stands for `ureq::` and `{x}`
+    /// for nothing, so these lists never match themselves.
+    struct Allowed {
+        file: &'static str,
+        line: &'static str,
+        scope: Scope,
+        count: usize,
+        // Text the same builder chain must hold before `.build()`.
+        chain: Option<&'static str>,
+    }
+    const ALLOWED: &[Allowed] = &[
+        // Production: the shared connector, its config, and the bounded
+        // snapshot agent's deadline connector.
+        Allowed {
+            file: "src/retry_tls.rs",
+            line: "{u}AgentBuilder::new().tls_connector(default_connector())",
+            scope: Scope::Production,
+            count: 1,
+            chain: None,
+        },
+        Allowed {
+            file: "src/retry_tls.rs",
+            line: ".with_root_{x}certificates(roots)",
+            scope: Scope::Production,
+            count: 1,
+            chain: None,
+        },
+        Allowed {
+            file: "src/snapshot_client.rs",
+            line: "let agent = {u}AgentBuilder::new()",
+            scope: Scope::Production,
+            count: 1,
+            chain: Some(".tls_connector(connector)"),
+        },
+        // Tests: plain-HTTP agents and synthetic-trust fixtures.
+        Allowed {
+            file: "src/net_resilience.rs",
+            line: "let agent = {u}AgentBuilder::new().resolver(resolver).build();",
+            scope: Scope::TestModule,
+            count: 1,
+            chain: None,
+        },
+        Allowed {
+            file: "src/net_resilience.rs",
+            line: "let error = {u}agent()",
+            scope: Scope::TestModule,
+            count: 1,
+            chain: None,
+        },
+        Allowed {
+            file: "src/snapshot_client.rs",
+            line: "let agent = {u}AgentBuilder::new().resolver(resolver).build();",
+            scope: Scope::TestModule,
+            count: 1,
+            chain: None,
+        },
+        Allowed {
+            file: "src/provider_calls.rs",
+            line: "let refused = {u}get(\"http://127.0.0.1:9/\")",
+            scope: Scope::TestModule,
+            count: 1,
+            chain: None,
+        },
+        Allowed {
+            file: "src/retry_tls.rs",
+            line: "let agent = {u}AgentBuilder::new().tls_connector(tls).build();",
+            scope: Scope::TestModule,
+            count: 2,
+            chain: None,
+        },
+        Allowed {
+            file: "src/retry_tls.rs",
+            line: "let error = {u}AgentBuilder::new()",
+            scope: Scope::TestModule,
+            count: 1,
+            chain: Some(".tls_connector(connector(Instant::now() + Duration::from_secs(10)))"),
+        },
+        Allowed {
+            file: "src/retry_tls.rs",
+            line: "{u}AgentBuilder::new()",
+            scope: Scope::TestModule,
+            count: 2,
+            chain: Some(".tls_connector(connector(Instant::now() + Duration::from_"),
+        },
+        Allowed {
+            file: "src/retry_allocation_native_tests.rs",
+            line: ".with_root_{x}certificates(roots)",
+            scope: Scope::IncludedTestFile,
+            count: 1,
+            chain: None,
+        },
+    ];
+    // Constructors and shortcuts that would install ureq's own TLS default.
+    const BYPASSES: &[&str] = &[
+        "{u}get(",
+        "{u}post(",
+        "{u}put(",
+        "{u}patch(",
+        "{u}delete(",
+        "{u}head(",
+        "{u}request(",
+        "{u}request_url(",
+        "{u}agent(",
+        "{u}builder(",
+        "{u}Agent::new(",
+        "{u}Agent::default(",
+        "{u}AgentBuilder::default(",
+        "{u}AgentBuilder::new(",
+    ];
+    // rustls policy overrides: verifiers, root sources, ALPN, SNI,
+    // resumption, early data, client certificates and key logs.
+    const OVERRIDES: &[&str] = &[
+        ".danger{x}ous()",
+        "ServerCert{x}Verifier",
+        "certificate_{x}verifier",
+        "native_{x}certs",
+        "native_{x}tls::",
+        "platform_{x}verifier",
+        "alpn_{x}protocols",
+        "enable_{x}sni",
+        "key_{x}log",
+        ".resump{x}tion",
+        "early_{x}data",
+        "client_auth_{x}cert",
+        "with_root_{x}certificates(",
+    ];
+    fn expand(text: &str) -> String {
+        text.replace("{u}", "ureq::").replace("{x}", "")
+    }
+    /// A builder chain from its first line through `.build()`, at most 12 lines.
+    fn builder_chain(rest: &str) -> &str {
+        let lines = rest
+            .match_indices('\n')
+            .nth(11)
+            .map_or(rest.len(), |(at, _)| at);
+        let end = rest[..lines]
+            .find(".build()")
+            .map_or(lines, |at| at + ".build()".len());
+        &rest[..end]
+    }
+    /// Whether a trimmed line imports ureq items, at any visibility, or
+    /// declares the crate.
+    fn imports_ureq(trimmed: &str) -> bool {
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        words.windows(2).any(|pair| {
+            matches!(pair[0], "use" | "crate")
+                && pair[1].trim_start_matches("::").starts_with("ureq")
+        })
+    }
+
     #[test]
     fn every_production_ureq_agent_uses_the_configured_connector() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // Plain-HTTP agents inside test modules, by file and exact line.
-        // `{u}` keeps this list from matching itself.
-        const TEST_ONLY: &[(&str, &str)] = &[
-            (
-                "src/net_resilience.rs",
-                "let agent = {u}AgentBuilder::new().resolver(resolver).build();",
-            ),
-            ("src/net_resilience.rs", "let error = {u}agent()"),
-            (
-                "src/snapshot_client.rs",
-                "let agent = {u}AgentBuilder::new().resolver(resolver).build();",
-            ),
-            (
-                "src/provider_calls.rs",
-                "let refused = {u}get(\"http://127.0.0.1:9/\")",
-            ),
-        ];
-        // Constructors and shortcuts that install ureq's own default TLS.
-        const BYPASSES: &[&str] = &[
-            "get(",
-            "post(",
-            "put(",
-            "patch(",
-            "delete(",
-            "head(",
-            "request(",
-            "request_url(",
-            "agent(",
-            "builder(",
-            "Agent::new(",
-            "Agent::default(",
-            "AgentBuilder::default(",
-            "AgentBuilder::new(",
-        ];
         let mut files = vec![root.join("build.rs")];
         let mut pending = vec![root.join("src"), root.join("tests")];
         while let Some(dir) = pending.pop() {
@@ -896,7 +1064,7 @@ mod tests {
             }
         }
         assert!(files.len() > 50, "source inventory looks truncated");
-        let mut seen = vec![0; TEST_ONLY.len()];
+        let mut seen = vec![0; ALLOWED.len()];
         for path in files {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
@@ -912,58 +1080,81 @@ mod tests {
                 let start = offset;
                 offset += line.len();
                 let trimmed = line.trim();
-                if trimmed.starts_with("use ureq")
+                if imports_ureq(trimmed)
                     && !(file == "src/retry_tls.rs"
                         && trimmed == "use ureq::{ReadWrite, TlsConnector};")
                 {
                     panic!("{file}:{}: import ureq items by path: {trimmed}", index + 1);
                 }
-                for bypass in BYPASSES {
-                    let bypass = format!("ureq::{bypass}");
-                    if !line.contains(&bypass) {
-                        continue;
-                    }
-                    // A builder may stay when the same chain installs a connector.
-                    if bypass.ends_with("AgentBuilder::new(")
-                        && configures_connector(&text[start..])
-                    {
-                        continue;
-                    }
-                    let exception = TEST_ONLY.iter().position(|(owner, exact)| {
-                        *owner == file && exact.replace("{u}", "ureq::") == trimmed
-                    });
-                    match exception {
-                        Some(exception) if tests_start.is_some_and(|tests| start > tests) => {
-                            seen[exception] += 1;
+                if !BYPASSES
+                    .iter()
+                    .chain(OVERRIDES)
+                    .any(|token| line.contains(&expand(token)))
+                {
+                    continue;
+                }
+                let in_tests = tests_start.is_some_and(|tests| start > tests);
+                let allowed = ALLOWED.iter().position(|allowed| {
+                    allowed.file == file
+                        && expand(allowed.line) == trimmed
+                        && match allowed.scope {
+                            Scope::Production => !in_tests,
+                            Scope::TestModule => in_tests,
+                            Scope::IncludedTestFile => true,
                         }
-                        _ => panic!(
-                            "{file}:{}: ureq agent bypasses retry_tls's connector: {trimmed}",
-                            index + 1
-                        ),
-                    }
+                        && match allowed.chain {
+                            None => true,
+                            Some(chain) => builder_chain(&text[start..]).contains(chain),
+                        }
+                });
+                match allowed {
+                    Some(allowed) => seen[allowed] += 1,
+                    None => panic!(
+                        "{file}:{}: ureq agent or rustls policy bypasses retry_tls: {trimmed}",
+                        index + 1
+                    ),
                 }
             }
         }
-        assert_eq!(seen, vec![1; TEST_ONLY.len()], "stale test-only exception");
-    }
-    fn configures_connector(chain: &str) -> bool {
-        let end = [chain.find(".build()"), chain.find("\n}")]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(chain.len());
-        chain[..end].contains(".tls_connector(")
+        for (allowed, seen) in ALLOWED.iter().zip(seen) {
+            assert_eq!(
+                seen,
+                allowed.count,
+                "{}: {}",
+                allowed.file,
+                expand(allowed.line)
+            );
+        }
+        let read = |file: &str| std::fs::read_to_string(root.join(file)).unwrap();
+        // The bounded snapshot agent's `connector` is the deadline connector.
+        let snapshot = read("src/snapshot_client.rs");
+        assert_eq!(snapshot.matches("let connector =").count(), 1);
+        assert_eq!(
+            snapshot
+                .matches("let connector = crate::retry_tls::connector(deadline);")
+                .count(),
+            1
+        );
+        // The included fixture file compiles only inside a test module.
+        let sync = read("src/snapshot_sync.rs");
+        let include = sync
+            .find("include!(\"retry_live_native_tests.rs\");")
+            .unwrap();
+        assert!(sync
+            .find("\n#[cfg(test)]\nmod tests {")
+            .is_some_and(|tests| tests < include));
+        assert!(read("src/retry_live_native_tests.rs")
+            .contains("include!(\"retry_allocation_native_tests.rs\");"));
     }
 
-    #[test]
-    fn locked_graph_carries_only_patched_tls_roots() {
-        // CI builds with --locked, so this lockfile is the resolved graph.
+    type LockedPackage = (String, String, Vec<String>);
+    /// Name, version and dependency list of every package in a lockfile.
+    fn locked_packages(relative: &str) -> Vec<LockedPackage> {
         let lock = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative),
         )
         .unwrap();
-        let packages: Vec<(String, String, Vec<String>)> = lock
-            .split("[[package]]")
+        lock.split("[[package]]")
             .skip(1)
             .map(|block| {
                 let field = |key: &str| {
@@ -988,7 +1179,14 @@ mod tests {
                     .collect();
                 (field("name"), field("version"), dependencies)
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn locked_graph_carries_only_patched_tls_roots() {
+        // CI builds both workspaces with --locked, so these lockfiles are the
+        // resolved graphs.
+        let packages = locked_packages("../../Cargo.lock");
         let versions = |name: &str| -> Vec<Vec<u64>> {
             packages
                 .iter()
@@ -1035,5 +1233,20 @@ mod tests {
             .map(|(name, _, _)| name.as_str())
             .collect();
         assert_eq!(dependents, ["ottto-service"]);
+        // The connector workspace carries no TLS stack at all.
+        let connector_tls: Vec<String> = locked_packages("../Cargo.lock")
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .filter(|name| {
+                name == "ureq"
+                    || name.starts_with("rustls")
+                    || name.starts_with("webpki")
+                    || name.starts_with("aws-lc")
+                    || name.starts_with("native-tls")
+                    || name.starts_with("openssl")
+                    || name == "ring"
+            })
+            .collect();
+        assert!(connector_tls.is_empty(), "{connector_tls:?}");
     }
 }

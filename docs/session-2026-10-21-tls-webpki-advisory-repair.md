@@ -30,14 +30,31 @@ I/O kind. One delta is visible: transport messages for TLS setup failures now
 start with `Network Error:` instead of `Connection Failed:` or `Dns Failed:`.
 The step message and its cause are unchanged.
 
+With ureq's `tls` feature off, `AgentBuilder::new()` first installs ureq's
+no-TLS placeholder, then `tls_connector` replaces it. Each agent construction
+therefore makes one extra transient 16-byte allocation. Agents built per call
+(the former shortcuts and the per-request deadline agents) pay it once per
+request. Pooled agents pay it once. The connect path allocates as before.
+
 CI covers the change with synthetic loopback certificates only:
-- the default agent refuses an unknown issuer through the shared connector;
-- a trusted host succeeds by name and by IP;
+- the default agent and the deadline connector, each with its production trust
+  config, refuse an unknown issuer through the shared connect step;
+- a trusted host succeeds by name, by IPv4 address and by bracketed IPv6
+  literal;
 - wrong-host and untrusted certificates are refused;
 - the deadline agent succeeds, and bounds a stalled handshake as a timeout;
 - the category mapping holds for every connector step.
 
-A source inventory test fails on any `ureq` shortcut or builder that does not
-install the connector. It allows only four exact plain-HTTP lines in test
-modules. A lockfile test pins the resolved TLS graph, which CI's `--locked`
-builds and the advisory audit verify.
+A source inventory test pins every guarded line by file, exact text, scope and
+count:
+- each `ureq` shortcut and constructor, including the connector argument of
+  each connected builder chain;
+- `ureq` imports and re-exports at any visibility;
+- rustls policy overrides: custom verifiers, native or platform roots, ALPN,
+  SNI, resumption, early data, client certificates, key logs and root-store
+  sources.
+
+Any new occurrence fails it. A lockfile test pins the resolved TLS graph of
+both workspaces; CI's `--locked` builds and the advisory audit check the
+lockfiles themselves. The native TLS retry allocation audits remain
+`#[ignore]`, as before this change, so CI compiles them but does not run them.
