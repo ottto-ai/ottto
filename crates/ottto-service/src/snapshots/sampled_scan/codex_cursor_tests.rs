@@ -1040,15 +1040,51 @@ fn page_steps(
     tweak: impl Fn(&mut OwnedSourceScan),
     max_steps: usize,
 ) -> (ScanIndex, SourceScanResult, Modes) {
+    let (index, scan, selections) = page_selections(
+        fixture,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        tweak,
+        max_steps,
+    );
+    (index, scan, selections.modes)
+}
+
+/// Every read-mode selection one page made: `Modes`, acquisition
+/// `Unchanged` selections, and full reads by reason (`FullReason::slot`).
+/// A file the scheduler skips is in none of them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Selections {
+    modes: Modes,
+    unchanged: usize,
+    full_reasons: [usize; 11],
+}
+
+/// `page_steps` that also reports `Selections`.
+fn page_selections(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: Option<Arc<SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    tweak: impl Fn(&mut OwnedSourceScan),
+    max_steps: usize,
+) -> (ScanIndex, SourceScanResult, Selections) {
     let mut scan = codex_scan(fixture, index, collected_at);
     tweak(&mut scan);
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
     }
-    let mut modes = (0, 0);
+    let mut selections = Selections::default();
     for _ in 0..max_steps {
         if let Some(context) = scan.sampling.as_ref() {
-            modes = (context.full_files, context.tail_files);
+            selections = Selections {
+                modes: (context.full_files, context.tail_files),
+                unchanged: context.unchanged_files,
+                full_reasons: context.full_reasons,
+            };
         }
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
@@ -1068,7 +1104,7 @@ fn page_steps(
                     .map(|snapshot| snapshot.snapshot_fingerprint.clone())
                     .collect();
                 index.record_accepted_snapshot_fingerprints(&accepted);
-                return (index, scan, modes);
+                return (index, scan, selections);
             }
         }
     }
@@ -2260,6 +2296,217 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
     }
 }
 
+/// Pages one cursor job to its certified end, `I/2` apart, from census
+/// generation `page_number + 1`. With `append_mid_read`, the file grows
+/// after the job's first page. Returns the index and the clock at the job's
+/// open and at its commit.
+fn certify_job(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    mut index: ScanIndex,
+    clock: &TestClock,
+    now: &mut u64,
+    page_number: &mut u64,
+    append_mid_read: bool,
+) -> (ScanIndex, u64, u64) {
+    let step = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2;
+    let certified = counter(cache, |c| c.jobs_certified);
+    let mut opened = None;
+    let mut appended = !append_mid_read;
+    for _ in 0..64 {
+        clock.set(*now);
+        *page_number += 1;
+        let started = counter(cache, |c| c.jobs_started);
+        let (next, scan, _) = page_at(
+            fixture,
+            index,
+            Some(Arc::clone(cache)),
+            "cursor-fixture",
+            &collected_at(*page_number),
+        );
+        index = next;
+        if counter(cache, |c| c.jobs_started) > started {
+            opened = Some(*now);
+        }
+        if counter(cache, |c| c.jobs_certified) > certified {
+            assert!(!scan.snapshots.is_empty(), "the certified read publishes");
+            return (index, opened.expect("a cursor job opened"), *now);
+        }
+        assert!(scan.snapshots.is_empty(), "a paused job publishes nothing");
+        if !appended && opened.is_some() {
+            fixture.append(SESSION, &token_line(41));
+            appended = true;
+        }
+        *now += step;
+    }
+    panic!("the cursor job did not certify: {}", counters(cache));
+}
+
+/// The candidate an unchanged file presents to the scheduler: its own index
+/// entry's facts.
+fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
+    let path = fixture.file(SESSION);
+    let entry = &index.files[&local_index_key(&path)];
+    CandidateFile {
+        scan_root: fixture.root.clone(),
+        path,
+        size_bytes: entry.size_bytes,
+        modified_unix_seconds: entry.modified_unix_seconds,
+        modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
+        source_file_fingerprint: entry.source_file_fingerprint.clone(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    }
+}
+
+/// AD-1 at scan level (AD-T6, AD-T7). A quiescent singleton larger than the
+/// page budget is read by a cursor job that outlives the audit interval
+/// (`I/2` per page). Its complete read of the unchanged object verifies at
+/// commit: no overdue audit, no marker (a seeded past-due one is cleared),
+/// and the retained copy is verified at the commit clock. `grown` (AD-T7):
+/// an append after the job's first page keeps the grown arm (overdue, due
+/// marker); the next generation's audit of the now stable file converges.
+///
+/// Selection semantics after convergence: in later census generations, past
+/// `commit + I`, the scheduler skips the file (`Skip`: same fingerprint, no
+/// marker), so no acquisition opens it: neither `Unchanged` nor `AuditDue`
+/// is selected. This is not "an unchanged file never needs an audit": the
+/// retained copy's horizon runs from the commit, so the next change after
+/// `commit + I` is read in full as `AuditDue`, not tailed.
+#[test]
+fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    let interval = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
+    for case in ["unmarked", "due marker", "grown"] {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let mut now = 1_900_000_000_u64;
+        clock.set(now);
+        let mut index = ScanIndex::default();
+        if case == "due marker" {
+            // A recorded entry (read in page) that owes an audit already due.
+            index = page(
+                &fixture,
+                ScanIndex::default(),
+                Some(Arc::new(SharedCache::default())),
+            )
+            .0;
+            let entry = index.files.get_mut(&key).unwrap();
+            entry.set_unverified_deadline(now - 1);
+            assert!(entry.audit_requires_full(now));
+        }
+        let cache = Arc::new(SharedCache::default());
+        // The limits under which this fixture's certified cursor read is
+        // retained (`tail_eof_record_adding_first_priority_tier_…`).
+        with_test_limits(2048, 8192, 64, || {
+            let mut page_number = 0;
+            let (next, opened, committed) = certify_job(
+                &fixture,
+                &cache,
+                index,
+                &clock,
+                &mut now,
+                &mut page_number,
+                case == "grown",
+            );
+            index = next;
+            assert!(
+                committed >= opened + interval,
+                "{case}: the read outlived I"
+            );
+            let mut jobs = 1;
+            if case == "grown" {
+                // AD-T7: the grown arm, as before AD-1.
+                assert_eq!(counter(&cache, |c| c.audit_overdue), 1, "{case}");
+                let retained = cache.retained_checkpoint(&key).expect("grown prefix");
+                assert_eq!(retained.last_full_verified(), opened, "{case}");
+                assert_eq!(
+                    index.files[&key].unverified_deadline(),
+                    Some(opened + interval),
+                    "{case}: due marker"
+                );
+                let (next, opened, committed) = certify_job(
+                    &fixture,
+                    &cache,
+                    index,
+                    &clock,
+                    &mut now,
+                    &mut page_number,
+                    false,
+                );
+                index = next;
+                assert!(committed >= opened + interval, "{case}: audit outlived I");
+                jobs = 2;
+            }
+            let committed = now;
+            assert_eq!(counter(&cache, |c| c.jobs_certified), jobs, "{case}");
+            assert_eq!(counter(&cache, |c| c.jobs_started), jobs, "{case}");
+            let overdue = u64::from(case == "grown");
+            assert_eq!(counter(&cache, |c| c.audit_overdue), overdue, "{case}");
+            assert!(
+                !index.files[&key].has_unverified_source(),
+                "{case}: verified, no marker"
+            );
+            let retained = cache.retained_checkpoint(&key).expect("complete copy");
+            assert_eq!(retained.last_full_verified(), committed, "{case}");
+            assert_eq!(retained.audit_debt(), None, "{case}");
+            assert_eq!(retained.sealed_offset(), fixture.len(SESSION), "{case}");
+            // Later generations past `commit + I`: the scheduler's `Skip`.
+            for _ in 0..3 {
+                now += interval + 1;
+                clock.set(now);
+                page_number += 1;
+                let candidate = unchanged_candidate(&fixture, &index);
+                assert_eq!(candidate.size_bytes, fixture.len(SESSION));
+                assert_eq!(
+                    index.candidate_decision_with_reason_at(&candidate, now),
+                    (CandidateDecision::Skip, None),
+                    "{case}"
+                );
+                let (next, scan, selections) = page_selections(
+                    &fixture,
+                    index,
+                    Some(Arc::clone(&cache)),
+                    "cursor-fixture",
+                    &collected_at(page_number),
+                    |_| {},
+                    usize::MAX,
+                );
+                index = next;
+                assert!(scan.snapshots.is_empty(), "{case}: skipped");
+                assert_eq!(selections.modes, (0, 0), "{case}: no read");
+                assert_eq!(selections.unchanged, 0, "{case}: not an acquisition");
+            }
+            assert_eq!(counter(&cache, |c| c.jobs_started), jobs, "{case}");
+            // What `+I` still means: the next change, after `commit + I`, is
+            // a full audit read of the retained copy, not a tail.
+            assert!(now >= committed + interval);
+            fixture.append(SESSION, &token_line(90));
+            page_number += 1;
+            let (_, _, selections) = page_selections(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(page_number),
+                |_| {},
+                usize::MAX,
+            );
+            assert_eq!(selections.modes, (1, 0), "{case}: a full read");
+            assert_eq!(
+                selections.full_reasons[FullReason::AuditDue.slot()],
+                1,
+                "{case}: {selections:?}"
+            );
+            assert_eq!(counter(&cache, |c| c.jobs_started), jobs + 1, "{case}");
+        });
+    }
+}
+
 /// R1-H1 (#606 final review): a tail-mode cursor job whose genuine-EOF
 /// record (E1) introduces the file's first priority tier goes through the
 /// protected-tier full replay before anything publishes, as main's trailing
@@ -2409,18 +2656,25 @@ fn grown_unterminated_last_record_stays_withheld() {
 /// (terminal salvage loss main publishes; a malformed line is retryable and
 /// main publishes nothing). Controls: a replaced path or a shrunk file
 /// publishes nothing from that attempt.
+///
+/// `stable` (AD-1's named lossy-stable residual control, design §3.2): the
+/// same lossy job on an unchanged file refuses as `Lossy` before AD-1's
+/// verify-at-commit arm. It publishes uncertified, keeps its due marker, and
+/// is re-read in full every later census generation (one cursor job each,
+/// never certified). Disclosed residual: lossy keeps its obligation.
 #[test]
 fn lossy_grown_job_publishes_uncertified_through_same_object_identity() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let clock = TestClock;
+    let interval = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
     let now = 1_900_000_000_u64;
     let due = now + 100;
     let mut overlong = br#"{"timestamp":"2026-10-07T10:30:00Z","type":"event_msg","payload":{"type":"agent_message","message":""#.to_vec();
     overlong.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
     overlong.extend_from_slice(b"\"}}\n");
-    for case in ["grow", "replace", "shrink"] {
+    for case in ["grow", "replace", "shrink", "stable"] {
         clock.set(now);
         let fixture = ScanRoot::new(20);
         fixture.append(SESSION, &overlong);
@@ -2467,6 +2721,7 @@ fn lossy_grown_job_publishes_uncertified_through_same_object_identity() {
             );
             match case {
                 "grow" => fixture.append(SESSION, &token_line(42)),
+                "stable" => {}
                 "replace" => {
                     let replacement = path.with_extension("replacement");
                     fs::copy(&path, &replacement).unwrap();
@@ -2486,7 +2741,9 @@ fn lossy_grown_job_publishes_uncertified_through_same_object_identity() {
                     .unwrap(),
             }
             let ended = |cache: &SharedCache| match case {
-                "grow" => counter(cache, |c| c.jobs_uncertified + c.jobs_finish_failed) > 0,
+                "grow" | "stable" => {
+                    counter(cache, |c| c.jobs_uncertified + c.jobs_finish_failed) > 0
+                }
                 "replace" => counter(cache, |c| c.jobs_unavailable_ended) > 0,
                 _ => counter(cache, |c| c.jobs_invalidated) > 0,
             };
@@ -2515,19 +2772,68 @@ fn lossy_grown_job_publishes_uncertified_through_same_object_identity() {
             assert_eq!(counter(&cache, |c| c.jobs_finish_failed), 0, "{case}");
             assert_eq!(counter(&cache, |c| c.jobs_certified), 0, "{case}");
             assert!(cache.retained_checkpoint(&key).is_none(), "{case}: no copy");
-            if case != "grow" {
+            if case != "grow" && case != "stable" {
                 assert!(ending.snapshots.is_empty(), "{case}: nothing published");
                 assert_eq!(counter(&cache, |c| c.jobs_uncertified), 0, "{case}");
                 return;
             }
-            assert_eq!(counter(&cache, |c| c.jobs_uncertified), 1);
-            assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0);
+            assert_eq!(counter(&cache, |c| c.jobs_uncertified), 1, "{case}");
+            assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0, "{case}");
             assert_eq!(
                 fingerprints(&ending),
                 fingerprints(&main),
-                "main's semantic output for the object read"
+                "{case}: main's semantic output for the object read"
             );
-            assert_eq!(deadline(&index), Some(due), "original debt and age kept");
+            assert_eq!(
+                deadline(&index),
+                Some(due),
+                "{case}: original debt and age kept"
+            );
+            if case != "stable" {
+                return;
+            }
+            // Later generations past the due marker: every one re-reads the
+            // unchanged file in full and keeps the deadline (no AD-1 clear).
+            let mut later = due;
+            let mut page_number = 0;
+            for generation in 1..=3 {
+                later += interval + 1;
+                clock.set(later);
+                let started = counter(&cache, |c| c.jobs_started);
+                let uncertified = counter(&cache, |c| c.jobs_uncertified);
+                let mut reread = false;
+                for _ in 0..64 {
+                    page_number += 1;
+                    let (next, _, _) = page_steps(
+                        &fixture,
+                        index,
+                        Some(Arc::clone(&cache)),
+                        "cursor-fixture",
+                        &collected_at(page_number),
+                        |_| {},
+                        10_000,
+                    );
+                    index = next;
+                    if counter(&cache, |c| c.jobs_uncertified) > uncertified {
+                        reread = true;
+                        break;
+                    }
+                }
+                assert!(reread, "generation {generation}: {}", counters(&cache));
+                assert_eq!(
+                    counter(&cache, |c| c.jobs_started),
+                    started + 1,
+                    "generation {generation}: one full re-read"
+                );
+                assert_eq!(counter(&cache, |c| c.jobs_certified), 0);
+                assert_eq!(counter(&cache, |c| c.jobs_finish_failed), 0);
+                assert!(cache.retained_checkpoint(&key).is_none(), "no copy");
+                assert_eq!(
+                    deadline(&index),
+                    Some(due),
+                    "generation {generation}: the deadline never moves"
+                );
+            }
         });
     }
 }

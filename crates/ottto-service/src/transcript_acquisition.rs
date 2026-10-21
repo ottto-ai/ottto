@@ -300,8 +300,9 @@ impl PrefixSeal {
     }
 
     /// Whether this seal was minted already outlived: it carries staged debt
-    /// that was due when it was sealed (`commit_sealed_prefix` of a full read
-    /// that outlived the audit interval).
+    /// that was due when it was sealed (`commit_sealed_prefix` of a grown or
+    /// partial full read that outlived the audit interval; a complete read of
+    /// an unchanged object verifies at commit, AD-1).
     pub(crate) fn outlived(&self) -> bool {
         self.audit_debt_unix_seconds
             .is_some_and(|due| due <= self.sealed_unix_seconds)
@@ -847,8 +848,18 @@ impl ReadPlan {
     /// the source may have grown. `s` is the end of the last complete record
     /// at or below the frozen length; an unfinished record after it is never
     /// certified. The checkpoint records `length = s` and verification time
-    /// `started` (when this read opened, never completion), so appended
-    /// bytes stay unread and the deadline is never reset by a slow read.
+    /// `started` (when this read opened), so appended bytes stay unread and a
+    /// slow read of a grown object never resets the deadline.
+    ///
+    /// AD-1: a Full read verifies at commit (`now`, no debt) instead when the
+    /// plan's opening stamp (restored by `unpark` for a resumed read) still
+    /// equals the held FD's full stamp, the sealed prefix is the whole opened
+    /// length, every byte was consumed and the clock did not regress
+    /// (`now >= started`). No write the stamp can see reached the object
+    /// while it was read: the trust `commit_after_native_completion` and
+    /// `Unchanged` already use. A grown, partial or clock-regressed read keeps
+    /// `started`. This is not a new detection guarantee: a forward clock jump
+    /// is caught by `ClockChanged` only while the retained checkpoint survives.
     ///
     /// `path_same_object` is the caller's `stat(path)` dev/ino equality with
     /// the held FD; no bytes are read from the reopened path. Samples are
@@ -912,6 +923,18 @@ impl ReadPlan {
             return Err(PrefixRefusal::Lossy);
         }
         let (verified, audit_debt) = match self.mode {
+            // AD-1: a complete Full read of an object no write the stamp can
+            // see reached (the exact opening stamp on the held FD, the whole
+            // length sealed and consumed) is verified when it commits. A
+            // grown, partial or clock-regressed read keeps the start below.
+            ReadMode::Full(_)
+                if current == self.stamp
+                    && sealed == self.stamp.length
+                    && consumed == self.stamp.length
+                    && now >= started =>
+            {
+                (now, None)
+            }
             ReadMode::Full(_) => {
                 let due = started.saturating_add(AUDIT_INTERVAL_SECONDS);
                 // A read that outlived the interval completes already due:
@@ -1051,7 +1074,9 @@ impl ParkedPlan {
 pub(crate) struct Unparked {
     pub(crate) plan: ReadPlan,
     /// The parked `started`, restored exactly: a resumed read, full or
-    /// tail, commits with it, so a park never resets the audit deadline.
+    /// tail, commits with it, so a park never resets the audit deadline. A
+    /// complete Full read of an unchanged object still verifies at commit
+    /// (AD-1).
     pub(crate) started: u64,
     /// Sample bytes `unpark` re-read from the held FD. They are not in
     /// `plan.metrics()`, whose guard count was charged before parking and is
@@ -1608,6 +1633,19 @@ mod tests {
             100,
         );
         assert_eq!(mode, ReadMode::Full(FullReason::ClockChanged));
+        // AD-T3: a multi-page read whose clock stepped back keeps its start
+        // even on an unchanged object, so the next read fails closed.
+        let stable = Fixture::new(b"one\n");
+        let (mut file, plan, frozen) = sealed_read(&stable, 1000);
+        let regressed = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 1000, 900, false, frozen)
+            .unwrap();
+        assert_eq!(regressed.last_full_verified(), 1000);
+        assert_eq!(regressed.audit_debt(), None);
+        assert_eq!(
+            run(&stable, Some(&regressed), None, 950).0,
+            ReadMode::Full(FullReason::ClockChanged)
+        );
     }
 
     /// A cursor-style read: freeze at open, consume complete records up to the
@@ -1639,6 +1677,24 @@ mod tests {
         let (mode, next, _) = run(&f, Some(&cp), None, 1000);
         assert_eq!(mode, ReadMode::Tail);
         assert_eq!(next.sealed_offset(), frozen + 6);
+        // AD-T2: the same read of an unchanged source verifies at commit, in
+        // time too, so the horizon is measured from the commit, not the start.
+        let stable = Fixture::new(b"one\ntwo\n");
+        let (mut file, plan, frozen) = sealed_read(&stable, 100);
+        let cp = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, 200, false, frozen)
+            .unwrap();
+        assert_eq!(cp.last_full_verified(), 200);
+        assert_eq!(cp.audit_debt(), None);
+        stable.append(b"three\n");
+        assert_eq!(
+            run(&stable, Some(&cp), None, 100 + AUDIT_INTERVAL_SECONDS).0,
+            ReadMode::Tail
+        );
+        assert_eq!(
+            run(&stable, Some(&cp), None, 200 + AUDIT_INTERVAL_SECONDS).0,
+            ReadMode::Full(FullReason::AuditDue)
+        );
     }
 
     #[test]
@@ -1649,6 +1705,27 @@ mod tests {
             .commit_sealed_prefix(&mut file, true, &scope(), 100, 200, false, frozen)
             .unwrap();
         assert_eq!(cp.sealed_offset(), 8);
+        // AD-T4(a): the object is unchanged but only partly sealed (`s < L`),
+        // so it is not AD-1's complete read: it keeps the start, and an
+        // outlived read keeps its debt; the fragment bytes stay owed.
+        assert_eq!(cp.last_full_verified(), 100);
+        let late = 100 + AUDIT_INTERVAL_SECONDS;
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        let partial = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, late, false, frozen)
+            .unwrap();
+        assert_eq!(partial.sealed_offset(), 8);
+        assert_eq!(partial.last_full_verified(), 100);
+        assert_eq!(partial.audit_debt().unwrap().due_unix_seconds, late);
+        // AD-T4(b), synthetic (unreachable in production, where `s <=
+        // consumed`): a complete seal with a short `consumed` keeps the start.
+        let whole = Fixture::new(b"one\ntwo\n");
+        let (mut file, plan, frozen) = sealed_read(&whole, 100);
+        let short = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, late, false, frozen - 1)
+            .unwrap();
+        assert_eq!(short.last_full_verified(), 100);
+        assert_eq!(short.audit_debt().unwrap().due_unix_seconds, late);
         // Unchanged source: the index skips it by its open-time fingerprint;
         // a completed fragment changes the length and tails from s.
         f.append(b"ial\n");
@@ -1810,17 +1887,45 @@ mod tests {
         );
         assert_eq!(refusal.unwrap_err(), PrefixRefusal::Dependency);
         assert!(identity.is_none(), "not the sole refusal");
-        // A read that outlived the interval certifies at its start and stays due.
-        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        // AD-T4(c): a lossy read refuses before AD-1's arm, even when it is
+        // stable, complete and outlived: lossy keeps its obligation.
         let late = 100 + AUDIT_INTERVAL_SECONDS;
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        assert_eq!(
+            plan.commit_sealed_prefix(&mut file, true, &scope(), 100, late, true, frozen)
+                .unwrap_err(),
+            PrefixRefusal::Lossy
+        );
+        // AD-T1: a stable, complete read that outlived the interval verifies
+        // at commit; the horizon then runs from the commit.
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
         let cp = plan
             .commit_sealed_prefix(&mut file, true, &scope(), 100, late, false, frozen)
             .unwrap();
-        assert_eq!(cp.last_full_verified(), 100);
-        assert_eq!(cp.audit_debt().unwrap().due_unix_seconds, late);
-        f.append(b"three\n");
+        assert_eq!(cp.last_full_verified(), late);
+        assert_eq!(cp.audit_debt(), None);
+        assert_eq!(run(&f, Some(&cp), None, late + 1).0, ReadMode::Unchanged);
+        // W1: a read that outlived the interval while the source grew
+        // certifies at its start and stays due.
+        let g = Fixture::new(b"one\ntwo\n");
+        let (mut file, plan, frozen) = sealed_read(&g, 100);
+        g.append(b"three\n");
+        let grown = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, late, false, frozen)
+            .unwrap();
+        assert_eq!(grown.last_full_verified(), 100);
+        assert_eq!(grown.audit_debt().unwrap().due_unix_seconds, late);
         assert_eq!(
-            run(&f, Some(&cp), cp.audit_debt(), late + 1).0,
+            run(&g, Some(&grown), grown.audit_debt(), late + 1).0,
+            ReadMode::Full(FullReason::AuditDue)
+        );
+        // AD-T1 continued: after an append, the stable read's checkpoint
+        // tails until `late + I` and is audited from then on.
+        f.append(b"three\n");
+        let horizon = late + AUDIT_INTERVAL_SECONDS;
+        assert_eq!(run(&f, Some(&cp), None, horizon - 1).0, ReadMode::Tail);
+        assert_eq!(
+            run(&f, Some(&cp), None, horizon).0,
             ReadMode::Full(FullReason::AuditDue)
         );
     }
@@ -2181,15 +2286,31 @@ mod tests {
             late_minted.admits(&mut f.open(), &scope(), horizon, true),
             Err(FullReason::AuditDue)
         );
-        // An outlived full read stages its debt at commit.
+        // An outlived read of an unchanged object verifies at commit (AD-1):
+        // its seal is neither outlived nor in debt, and admits it unchanged
+        // whether or not the use is its publication.
         let (mut file, plan, frozen) = sealed_read(&f, 100);
         let late = 100 + AUDIT_INTERVAL_SECONDS;
+        let stable = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 100, late, false, frozen)
+            .unwrap();
+        let seal = stable.seal(late);
+        assert!(!seal.outlived() && !seal.has_debt());
+        for publication in [false, true] {
+            assert_eq!(
+                seal.admits(&mut f.open(), &scope(), late + 1, publication),
+                Ok(0),
+                "publication {publication}"
+            );
+        }
+        // An outlived read of a grown object stages its debt at commit.
+        let (mut file, plan, frozen) = sealed_read(&f, 100);
+        f.append(b"four\n");
         let outlived = plan
             .commit_sealed_prefix(&mut file, true, &scope(), 100, late, false, frozen)
             .unwrap();
         let seal = outlived.seal(late);
         assert!(seal.outlived());
-        f.append(b"four\n");
         assert_eq!(
             seal.admits(&mut f.open(), &scope(), late + 1, false),
             Err(FullReason::AuditDue)
@@ -2443,10 +2564,9 @@ mod tests {
         let bytes = wide_rows("park");
         let f = Fixture::new(&bytes);
         let (plan, consumed) = partial_read(&f, 2, 7);
-        let uninterrupted = {
-            let (control, _) = partial_read(&f, 2, 7);
-            finish_read(&f, control, consumed, 100, 200)
-        };
+        // The control opens with the same frozen stamp and finishes after
+        // the append below, so both reads commit a grown object (AD-1).
+        let (control, _) = partial_read(&f, 2, 7);
         let parked = plan.park(100);
         assert!(parked.pending_record.is_some());
         assert_eq!(parked.stamp(), &plan.stamp);
@@ -2461,6 +2581,7 @@ mod tests {
         assert_eq!(decoded, parked);
         drop(plan);
         f.append(b"appended\n");
+        let uninterrupted = finish_read(&f, control, consumed, 100, 200);
         let mut held = f.open();
         let unparked = ReadPlan::unpark(&mut held, &decoded, None).unwrap();
         assert_eq!(unparked.plan.park(unparked.started), parked);
@@ -2471,6 +2592,20 @@ mod tests {
             finish_read(&f, unparked.plan, consumed, unparked.started, 200),
             uninterrupted
         );
+        // AD-T5: the stable twin. A parked read of an unchanged object
+        // unparks with the parked opening stamp and verifies at commit, like
+        // an uninterrupted control (the U1a-3 persisted-resume case).
+        let stable = Fixture::new(&wide_rows("stable"));
+        let (plan, consumed) = partial_read(&stable, 2, 7);
+        let (control, _) = partial_read(&stable, 2, 7);
+        let json = serde_json::to_string(&plan.park(100)).unwrap();
+        drop(plan);
+        let decoded: ParkedPlan = serde_json::from_str(&json).unwrap();
+        let unparked = ReadPlan::unpark(&mut stable.open(), &decoded, None).unwrap();
+        let resumed = finish_read(&stable, unparked.plan, consumed, unparked.started, 200);
+        assert_eq!(resumed.verified_unix_seconds, 200);
+        assert!(!resumed.has_debt() && !resumed.outlived());
+        assert_eq!(resumed, finish_read(&stable, control, consumed, 100, 200));
 
         type Mutate = fn(&Fixture, &[u8]) -> Option<Fixture>;
         type Refusal = (&'static str, Mutate, FullReason);
@@ -2609,5 +2744,56 @@ mod tests {
                 "case {case}"
             );
         }
+    }
+
+    /// F-T6c: a checkpoint sealed past 2^32 tails from its exact 64-bit
+    /// offset. The file is sparse and the checkpoint a struct literal, so no
+    /// 4 GiB is read or written. Narrowing the offset to 32 bits would sample
+    /// the head region and refuse as `BoundaryChanged`, which the edited
+    /// boundary control pins.
+    #[test]
+    fn tail_samples_use_the_full_offset_past_four_gibibytes() {
+        use std::os::unix::fs::FileExt;
+        const SPARSE_ALLOCATED_BYTES: u64 = 64 * 1024;
+        let sealed: u64 = (1 << 32) + 256;
+        let window = SAMPLE_BYTES as u64;
+        let mut head = vec![b'h'; SAMPLE_BYTES - 1];
+        head.push(b'\n');
+        let mut boundary = vec![b'b'; SAMPLE_BYTES - 1];
+        boundary.push(b'\n');
+        let f = Fixture::new(&head);
+        let mut file = f.open();
+        file.write_all_at(&boundary, sealed - window).unwrap();
+        file.set_len(sealed).unwrap();
+        let stamp = FileStamp::capture(file.metadata().unwrap()).unwrap();
+        file.set_len(sealed + window).unwrap();
+        let allocated = std::os::unix::fs::MetadataExt::blocks(&file.metadata().unwrap()) * 512;
+        assert!(
+            allocated <= SPARSE_ALLOCATED_BYTES,
+            "filesystem lacks sparse support ({allocated} bytes allocated)"
+        );
+        let now = 1000;
+        let checkpoint = Checkpoint {
+            stamp,
+            scope: scope(),
+            samples: Samples {
+                sealed_offset: sealed,
+                head,
+                boundary: boundary.clone(),
+            },
+            last_full_verified_unix_seconds: now,
+            audit_debt: None,
+        };
+        let mut count = 0;
+        assert!(sample_at(&mut file, sealed - window, &boundary, &mut count).unwrap());
+        assert_eq!(count, SAMPLE_BYTES);
+        let plan = ReadPlan::prepare(&mut file, Some(&checkpoint), &scope(), None, now).unwrap();
+        assert_eq!(plan.mode(), ReadMode::Tail);
+        assert_eq!(plan.start_offset(), sealed);
+        assert_eq!(plan.guard_bytes_read(), 2 * SAMPLE_BYTES);
+        // Control: one edited boundary byte just below `s` refuses the tail.
+        file.write_all_at(b"X", sealed - 1).unwrap();
+        let plan = ReadPlan::prepare(&mut file, Some(&checkpoint), &scope(), None, now).unwrap();
+        assert_eq!(plan.mode(), ReadMode::Full(FullReason::BoundaryChanged));
     }
 }
