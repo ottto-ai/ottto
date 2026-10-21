@@ -45,11 +45,15 @@ struct C1bWindow {
     start: Option<C1bStart>,
 }
 
+/// RetryPending, red, census complete, census invalid, fence before and
+/// after, full re-arm and retained proof.
+type C1bLiveness = (bool, bool, bool, bool, bool, bool, bool, bool);
+
 impl C1bWindow {
     /// What a family's liveness depends on: RetryPending, red or complete
     /// terminals, the duplicate census's validity, the fence and the retained
     /// proof.
-    fn liveness(&self) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
+    fn liveness(&self) -> C1bLiveness {
         (
             self.retry_pending,
             self.red,
@@ -230,7 +234,7 @@ fn c1b_base_red_chain(case: &'static str, between: impl FnOnce(&RearmFixture)) -
     c1b_red_chain(case, "base", between)
 }
 
-fn c1b_liveness(run: &C1bRun) -> Vec<(bool, bool, bool, bool, bool, bool, bool, bool)> {
+fn c1b_liveness(run: &C1bRun) -> Vec<C1bLiveness> {
     run.windows.iter().map(C1bWindow::liveness).collect()
 }
 
