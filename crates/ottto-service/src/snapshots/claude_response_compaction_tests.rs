@@ -638,3 +638,162 @@ fn claude_realistic_600_response_session_tails_with_full_read_parity() {
         .any(|row| row["selector_sources"].get("region_mode").is_some()));
     assert_eq!(modes, (0, 1, 0), "the 600-response session did not tail");
 }
+
+fn selector(fields: &[(&str, &str, &str)]) -> SelectorCapture {
+    let mut selector = SelectorCapture::default();
+    for (field, value, source) in fields {
+        selector.insert(field, (*value).to_string(), source);
+    }
+    selector
+}
+
+/// Every retained record decodes to exactly the record the unchanged merge
+/// consumed before compaction, across each redundancy the encoding drops:
+/// request-slot strings (consistent or not), text shared with the first
+/// record, `\u{1f}` inside ids, empty strings, observed and default costs,
+/// interned and overflowed selectors with equal context but different
+/// sources, malformed or equal timestamps and tool-use maps.
+#[test]
+fn claude_compact_records_decode_exactly() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let text = |options: &[Option<&str>], pick: usize| options[pick].map(str::to_string);
+    let models = [None, Some(MODEL), Some("claude-opus-4-8"), Some("")];
+    let efforts = [None, Some("high"), Some("low")];
+    let request_ids = [None, Some("req_a"), Some("req\u{1f}b"), Some("")];
+    let timestamps = [
+        None,
+        Some("2026-10-06T10:00:01Z"),
+        Some("2026-10-06T10:00:01.000Z"),
+        Some("not a time"),
+        Some("2026-10-06T10:00:00Z"),
+    ];
+    let pool = [
+        SelectorCapture::default(),
+        selector(&[("speed_mode", "standard", "speed")]),
+        selector(&[("speed_mode", "standard", "message.usage.speed")]),
+        selector(&[
+            ("service_tier", "standard", "message.usage.service_tier"),
+            ("speed_mode", "fast", "speed"),
+        ]),
+    ];
+    let mut table = ClaudeSelectorTable::default();
+    // Leave two free slots so later distinct selectors overflow inline.
+    for filler in 0..62 {
+        let filler = selector(&[("region_mode", format!("r{filler}").as_str(), "region")]);
+        assert!(matches!(
+            table.intern(filler),
+            CompactClaudeSelector::Interned(_)
+        ));
+    }
+    let mut inline = 0;
+    for response in 0..400 {
+        let mut expected = Vec::new();
+        let mut observation: Option<ClaudeResponseObservation> = None;
+        for physical_sequence in 0..1 + next(6) {
+            let model = text(&models, next(models.len()));
+            let reasoning_effort = text(&efforts, next(efforts.len()));
+            let request_id = text(&request_ids, next(request_ids.len()));
+            let timestamp = text(&timestamps, next(timestamps.len()));
+            let mut usage = UsageTotals {
+                input_tokens: next(50) as u64,
+                output_tokens: next(500) as u64,
+                cache_read_tokens: next(90_000) as u64,
+                cache_creation_1h_tokens: next(3) as u64,
+                request_count: 1,
+                ..UsageTotals::default()
+            };
+            if next(5) == 0 {
+                usage.costs = UsageCosts {
+                    observed: true,
+                    reported: next(2) == 0,
+                    total: Some(next(1_000) as u128),
+                    ..UsageCosts::default()
+                };
+            }
+            let token = |value: usize| (value % 3 != 0).then_some(value as u64);
+            let mut cache_slot = RequestSlot {
+                request_ref: request_id.clone().unwrap_or_default(),
+                occurred_at: timestamp.clone().unwrap_or_default(),
+                model: model.clone(),
+                effort: reasoning_effort.clone(),
+                prompt_tokens: token(next(900)),
+                cache_read_tokens: token(next(900)),
+                cache_creation_tokens: token(next(900)),
+                uncached_tokens: token(next(900)),
+                output_tokens: token(next(900)),
+            };
+            match next(8) {
+                0 => cache_slot.request_ref = "req_elsewhere".into(),
+                1 => cache_slot.model = None,
+                _ => {}
+            }
+            let selector = if next(9) == 0 {
+                selector(&[("region_mode", format!("late{response}").as_str(), "region")])
+            } else {
+                pool[next(pool.len())].clone()
+            };
+            let tool_uses = (0..next(3))
+                .map(|tool| {
+                    (
+                        format!("toolu_{response}_{tool}"),
+                        format!("Tool{}", next(2)),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let computed_effective_input_context = (next(2) == 0).then_some(next(99_999) as u64);
+            expected.push(ClaudeResponseRecord {
+                cache_slot: cache_slot.clone(),
+                physical_sequence: physical_sequence as u64,
+                usage: usage.clone(),
+                model: model.clone(),
+                selector: selector.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                request_id: request_id.clone(),
+                timestamp: timestamp.clone(),
+                computed_effective_input_context,
+                tool_uses: tool_uses.clone(),
+            });
+            let interned = table.intern(selector);
+            inline += usize::from(matches!(interned, CompactClaudeSelector::Inline(_)));
+            match observation.as_mut() {
+                None => {
+                    observation = Some(ClaudeResponseObservation::new(
+                        response as u64,
+                        usage,
+                        model,
+                        interned,
+                        reasoning_effort,
+                        request_id,
+                        timestamp,
+                        None,
+                        computed_effective_input_context,
+                        tool_uses,
+                        cache_slot,
+                    ));
+                }
+                Some(observation) => assert!(observation.push(
+                    usage,
+                    model,
+                    interned,
+                    reasoning_effort,
+                    request_id,
+                    timestamp,
+                    computed_effective_input_context,
+                    tool_uses,
+                    cache_slot,
+                )),
+            }
+        }
+        let observation = observation.expect("at least one record");
+        let decoded =
+            claude_response_records::decode_records(observation.records.into_vec(), &table);
+        assert_eq!(decoded, Some(expected), "response {response}");
+    }
+    assert!(inline > 0, "no selector overflowed the interned table");
+}

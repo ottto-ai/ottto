@@ -43,6 +43,7 @@ mod codex_file_join;
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
 #[cfg(test)]
 mod claude_response_compaction_tests;
+mod claude_response_records;
 #[cfg(test)]
 mod claude_thinking_tokens_tests;
 mod codex_usage_occurrence;
@@ -66,6 +67,9 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+use claude_response_records::{
+    ClaudeResponseBook, ClaudeSelectorTable, CompactClaudeResponseRecord, CompactClaudeSelector,
+};
 use codex_compressed_input::OpenedInput;
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 
@@ -8982,8 +8986,10 @@ impl SelectorCapture {
 /// One physical Claude transcript observation for a provider response. Claude
 /// can append an earlier progressive content-block observation after a later
 /// one, so response-local observations are retained until the file is complete
-/// and then ordered by their provider timestamps.
-#[derive(Debug, Clone)]
+/// and then ordered by their provider timestamps. They are retained in the
+/// compact form of `claude_response_records` and decoded back to this form
+/// before resolution.
+#[derive(Debug, Clone, PartialEq)]
 struct ClaudeResponseRecord {
     cache_slot: RequestSlot,
     physical_sequence: u64,
@@ -9011,11 +9017,11 @@ const MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE: usize = 65_536;
 struct ClaudeResponseObservation {
     sequence: u64,
     preceding_user_timestamp: Option<String>,
-    records: crate::owned_heap::OwnedVec<ClaudeResponseRecord>,
+    records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
     record_limit_exceeded: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct ResolvedClaudeResponse {
     cache_slot: RequestSlot,
     sequence: u64,
@@ -9053,7 +9059,7 @@ impl ClaudeResponseObservation {
         sequence: u64,
         usage: UsageTotals,
         model: Option<String>,
-        selector: SelectorCapture,
+        selector: impl Into<CompactClaudeSelector>,
         reasoning_effort: Option<String>,
         request_id: Option<String>,
         timestamp: Option<String>,
@@ -9065,18 +9071,19 @@ impl ClaudeResponseObservation {
         Self {
             sequence,
             preceding_user_timestamp,
-            records: vec![ClaudeResponseRecord {
-                cache_slot,
-                physical_sequence: 0,
+            records: vec![CompactClaudeResponseRecord::encode(
+                None,
+                0,
                 usage,
                 model,
-                selector,
+                selector.into(),
                 reasoning_effort,
                 request_id,
                 timestamp,
                 computed_effective_input_context,
                 tool_uses,
-            }]
+                cache_slot,
+            )]
             .into(),
             record_limit_exceeded: false,
         }
@@ -9087,7 +9094,7 @@ impl ClaudeResponseObservation {
         &mut self,
         usage: UsageTotals,
         model: Option<String>,
-        selector: SelectorCapture,
+        selector: impl Into<CompactClaudeSelector>,
         reasoning_effort: Option<String>,
         request_id: Option<String>,
         timestamp: Option<String>,
@@ -9099,27 +9106,40 @@ impl ClaudeResponseObservation {
             self.record_limit_exceeded = true;
             return false;
         }
-        let physical_sequence = self.records.len() as u64;
-        self.records.push(ClaudeResponseRecord {
-            cache_slot,
+        let Ok(physical_sequence) = u16::try_from(self.records.len()) else {
+            self.record_limit_exceeded = true;
+            return false;
+        };
+        let record = CompactClaudeResponseRecord::encode(
+            self.records.first(),
             physical_sequence,
             usage,
             model,
-            selector,
+            selector.into(),
             reasoning_effort,
             request_id,
             timestamp,
             computed_effective_input_context,
             tool_uses,
-        });
+            cache_slot,
+        );
+        self.records.push(record);
         true
     }
 
+    /// Test shim for an observation built without a file's selector table:
+    /// its selectors are inline, so the empty table decodes them exactly.
+    #[cfg(test)]
     fn resolve(self) -> Option<ResolvedClaudeResponse> {
+        self.resolve_with(&ClaudeSelectorTable::default())
+    }
+
+    fn resolve_with(self, selectors: &ClaudeSelectorTable) -> Option<ResolvedClaudeResponse> {
         if self.record_limit_exceeded {
             return None;
         }
-        let mut records = self.records.into_vec();
+        let mut records =
+            claude_response_records::decode_records(self.records.into_vec(), selectors)?;
         // Provider time is authoritative only when it proves a complete order
         // for this response. Mixed valid/missing timestamps retain physical
         // append order, preserving the conservative legacy behavior instead
@@ -10579,8 +10599,10 @@ struct SnapshotAccumulator {
     // The value records whether the completion event (and its capability) was
     // seen. Like `activity_call_tools`, entries end at `function_call_output`.
     activity_mcp_call_ids: BTreeMap<String, bool>,
-    activity_capability_buckets: BTreeMap<(String, String, String), u64>,
-    seen_claude_capability_tool_uses: BTreeSet<String>,
+    // Owned summaries: a long tool-heavy session must not make every retained
+    // walk cost one visit per bucket or per tool use.
+    activity_capability_buckets: crate::owned_heap::OwnedMap<(String, String, String), u64>,
+    seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
     activity_skills: BTreeSet<String>,
     // A SKILL.md reference whose skill could not be named (`cat SKILL.md`,
     // `skills/*/SKILL.md`). The session then keeps the v1 capability marker:
@@ -10617,7 +10639,7 @@ struct SnapshotAccumulator {
     // posture, or request count enter the session projection. The map is local
     // to one complete transcript parse; its key format also provides the seam
     // for a future scan-level legacy-fork ownership ledger.
-    claude_responses: crate::owned_heap::OwnedMap<String, ClaudeResponseObservation>,
+    claude_responses: ClaudeResponseBook,
     claude_response_sequence: u64,
     claude_response_record_count: usize,
     // Exact provider response ids for the once-per-response Claude usage rows
@@ -10762,8 +10784,8 @@ impl SnapshotAccumulator {
             activity_mcp_tool_counts: BTreeMap::new(),
             activity_mcp_tool_usage_counts: BTreeMap::new(),
             activity_mcp_call_ids: BTreeMap::new(),
-            activity_capability_buckets: BTreeMap::new(),
-            seen_claude_capability_tool_uses: BTreeSet::new(),
+            activity_capability_buckets: crate::owned_heap::OwnedMap::new(),
+            seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap::new(),
             activity_skills: BTreeSet::new(),
             skill_detector_incomplete: false,
             activity_changed_file_hashes: BTreeSet::new(),
@@ -10783,7 +10805,7 @@ impl SnapshotAccumulator {
             latency_ttft_ms_count: 0,
             latency_duration_ms_max: 0,
             latency_ttft_ms_max: 0,
-            claude_responses: crate::owned_heap::OwnedMap::new(),
+            claude_responses: ClaudeResponseBook::default(),
             claude_response_sequence: 0,
             claude_response_record_count: 0,
             claude_usage_request_ids: BTreeSet::new(),
@@ -11653,14 +11675,16 @@ impl SnapshotAccumulator {
         let Some((bucket_start, _)) = timestamp.and_then(activity_bucket_from_timestamp) else {
             return;
         };
-        *self
-            .activity_capability_buckets
-            .entry((
-                bucket_start,
-                capability_id.to_string(),
-                raw_origin.to_string(),
-            ))
-            .or_default() += 1;
+        let key = (
+            bucket_start,
+            capability_id.to_string(),
+            raw_origin.to_string(),
+        );
+        if let Some(mut count) = self.activity_capability_buckets.get_mut(&key) {
+            *count += 1;
+        } else {
+            self.activity_capability_buckets.insert(key, 1);
+        }
     }
 
     fn activity_summary(&self) -> Option<SnapshotActivitySummary> {
@@ -11849,6 +11873,7 @@ impl SnapshotAccumulator {
             }
             return;
         }
+        let selector = self.claude_responses.selectors.intern(selector);
         if let Some(mut existing) = self.claude_responses.get_mut(&key) {
             if existing.push(
                 usage,
@@ -11869,7 +11894,7 @@ impl SnapshotAccumulator {
         let sequence = self.claude_response_sequence;
         self.claude_response_sequence = self.claude_response_sequence.saturating_add(1);
         self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
-        self.claude_responses.insert(
+        let inserted = self.claude_responses.insert(
             key,
             ClaudeResponseObservation::new(
                 sequence,
@@ -11885,19 +11910,20 @@ impl SnapshotAccumulator {
                 cache_slot,
             ),
         );
+        if !inserted {
+            self.note_dropped_usage();
+        }
     }
 
     /// Resolve every Claude response in transcript order, then admit its final
     /// cumulative usage exactly once. Conflicting provider records are dropped
     /// and make the enclosing file retryable through the existing diagnostics.
     fn finalize_claude_responses(&mut self) {
-        let mut responses = std::mem::take(&mut self.claude_responses)
-            .into_values()
-            .collect::<Vec<_>>();
+        let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
-            let Some(mut response) = response.resolve() else {
+            let Some(mut response) = response.resolve_with(&selectors) else {
                 self.note_dropped_usage();
                 continue;
             };
@@ -23248,9 +23274,10 @@ fn note_claude_capability_calls(
         };
         let occurrence = string_at(block, &["id"])
             .unwrap_or_else(|| format!("{name}:{}", timestamp.unwrap_or_default()));
-        if !accumulator
+        if accumulator
             .seen_claude_capability_tool_uses
-            .insert(occurrence)
+            .insert(occurrence, ())
+            .is_some()
         {
             continue;
         }
@@ -66321,7 +66348,6 @@ crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, 
 crate::heap_layout_bound::fields!(ClaudeDuplicateRequestOwner; root_session_id_hash, source_session_id_hash);
 crate::heap_layout_bound::fields!(ClaudeOwnedStartCensusWitness; marker_source_file_fingerprint, verified_source_file_fingerprint, emitted_source_file_fingerprint);
 crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded);
-crate::heap_layout_bound::fields!(ClaudeResponseRecord; cache_slot, physical_sequence, usage, model, selector, reasoning_effort, request_id, timestamp, computed_effective_input_context, tool_uses);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, effective_input_context);

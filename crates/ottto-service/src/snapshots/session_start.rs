@@ -2880,10 +2880,9 @@ mod tests {
                     .cloned()
                     .collect::<Vec<_>>();
                 responses.sort_by_key(|response| response.sequence);
-                for response in responses
-                    .into_iter()
-                    .filter_map(|response| response.resolve())
-                {
+                for response in responses.into_iter().filter_map(|response| {
+                    response.resolve_with(&parser.claude_responses.selectors)
+                }) {
                     shadow.note_claude_response(
                         response.sequence,
                         &response.usage,
