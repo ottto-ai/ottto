@@ -2412,10 +2412,37 @@ pub(crate) fn begin_codex_side_pass(
     index: &mut ScanIndex,
 ) -> CodexSidePass {
     let ns = sampled_scan::side_ledger::namespace_of(index_path);
-    let gate = cache
-        .side_ledger()
-        .begin_index_pass(ns, sampled_scan::now_seconds(), index);
+    let mut ledger = cache.side_ledger();
+    let gate = ledger.begin_index_pass(ns, sampled_scan::now_seconds(), index);
+    let ledger_entries = ledger.len();
+    drop(ledger);
+    note_codex_side_gauges(index, ledger_entries);
     CodexSidePass { ns, gate }
+}
+
+/// U1a-2a (lease §5.1 gauges): the last measured side state, at C14 (the
+/// pass's index as loaded and hydrated; the ledger length read under the
+/// lock C14 already holds). Bytes are each item's key and value heap bound,
+/// summed (0 when the layout is unsupported). Last-measured state only.
+fn note_codex_side_gauges(index: &ScanIndex, ledger_entries: usize) {
+    fn bytes<V: crate::heap_layout_bound::HeapLayoutBound>(map: &BTreeMap<String, V>) -> u64 {
+        map.iter()
+            .map(|(key, value)| {
+                crate::heap_layout_bound::bound(key, usize::MAX)
+                    .zip(crate::heap_layout_bound::bound(value, usize::MAX))
+                    .map_or(0, |(key, value)| key.saturating_add(value) as u64)
+            })
+            .fold(0, u64::saturating_add)
+    }
+    crate::local_resource_diagnostics::codex_side_lifecycle::set_gauges(
+        crate::local_resource_diagnostics::codex_side_lifecycle::Gauges {
+            side_records: index.codex_parent_side.len() as u64,
+            side_record_bytes: bytes(&index.codex_parent_side),
+            side_requests: index.codex_parent_side_requests.len() as u64,
+            side_request_bytes: bytes(&index.codex_parent_side_requests),
+            side_ledger_entries: ledger_entries as u64,
+        },
+    );
 }
 
 /// U1a-2a (row 36), Codex only: a replay that reset this index (its
@@ -17644,6 +17671,57 @@ impl ScanIndex {
     }
 }
 
+impl ScanIndex {
+    /// U1a-2a (cc row 7, gj row 1; rev 3 §1.5, rev 7 §2.3): P's latest parse
+    /// ended as terminal debt (strict cursor debt, a replayed held
+    /// disclosure, a group member's debt). Update only: an existing record
+    /// turns `Held` with the disclosure's lineage and cause, keeping its seal
+    /// and stamp (a held record admits nothing, and a later certified parse
+    /// rewrites both). The rev 18.2 record always carries a seal, so a
+    /// disclosure, which has none, never creates one; an absent record is
+    /// already unknown to the fence. A verdict change takes
+    /// `++codex_parent_side_generation`; the epoch is refreshed only while P
+    /// is live. True when the record changed.
+    pub(in crate::snapshots) fn refresh_codex_parent_side_held(
+        &mut self,
+        p_key: &str,
+        p_ids: &[String],
+        lineage: bool,
+        cause: u8,
+    ) -> bool {
+        let live = codex_parent_side_live(self, p_key, p_ids);
+        let verdict = SideVerdict::Held { lineage, cause };
+        let Some(record) = self.codex_parent_side.get_mut(p_key) else {
+            return false;
+        };
+        let refresh = live && record.referenced_epoch != self.codex_parent_proof_wrap_epoch;
+        if record.verdict == verdict && !refresh {
+            return false;
+        }
+        if record.verdict != verdict {
+            record.verdict = verdict;
+            self.codex_parent_side_generation = self.codex_parent_side_generation.saturating_add(1);
+            record.generation = self.codex_parent_side_generation;
+        }
+        if live {
+            record.referenced_epoch = self.codex_parent_proof_wrap_epoch;
+        }
+        crate::local_resource_diagnostics::codex_side_lifecycle::record(
+            crate::local_resource_diagnostics::codex_side_lifecycle::Event::RecordWritten,
+        );
+        true
+    }
+}
+
+/// U1a-2a (cc row 7): the ids main would look P up by, from P's path alone
+/// (a disclosure carries no header id).
+pub(in crate::snapshots) fn codex_parent_path_ids(path: &Path) -> Vec<String> {
+    codex_session_id_candidates_from_path(path)
+        .iter()
+        .map(|id| resolve_codex_identity(id))
+        .collect()
+}
+
 /// U1a-2a (row 5): the due terms the scan holds for P (rev 16/17 §2.3).
 #[derive(Clone, Copy)]
 pub(in crate::snapshots) struct SideDueTerms {
@@ -20286,6 +20364,10 @@ impl OwnedSourceScan {
                 // U1a-2a (row 39a): a certified job's unsealed bit for P's side
                 // record (row 8), captured before `cursor_published`.
                 let mut cursor_side_unsealed = None;
+                // U1a-2a (row 8, group live member): a certified group job's
+                // side seal for its live member, minted before the checkpoint
+                // is dropped (a group job retains no reduction).
+                let mut cursor_side_group_seal = None;
                 if let Some(context) = sampling.as_ref().filter(|_| active.cursor.is_some()) {
                     let current_scope = sampled_scan::reduction_dependencies(
                         source,
@@ -20344,6 +20426,12 @@ impl OwnedSourceScan {
                             // no reduction (its replay is joined).
                             cursor_side_unsealed =
                                 Some(publication.eof_applied() || fragment.is_some());
+                            if active.group.is_some() {
+                                cursor_side_group_seal = Some(checkpoint.seal_as(
+                                    sampled_scan::now_seconds(),
+                                    &codex_parent_side_scope(),
+                                ));
+                            }
                             cursor_certificate = Some(
                                 Some(checkpoint)
                                     .filter(|_| census_trusted && active.group.is_none()),
@@ -20704,6 +20792,16 @@ impl OwnedSourceScan {
                         )
                         .ok()
                     });
+                // U1a-2a (row 8, group live member): the live member's seal and
+                // held-FD stamp.
+                let side_group_parse = cursor_side_group_seal
+                    .filter(|_| source == SnapshotSource::Codex && !aliases.is_empty())
+                    .zip(
+                        sampled_scan::codex_cursor::OpenStamp::capture(
+                            parser.reader.reader.get_ref(),
+                        )
+                        .ok(),
+                    );
                 let joined_owner = if aliases.is_empty() {
                     None
                 } else {
@@ -20923,11 +21021,28 @@ impl OwnedSourceScan {
                 }
                 codex_parent_resolution_retry_required |=
                     parsed_file.codex_parent_resolution_pending;
-                // U1a-2a (row 8): main's certified parse of P (singleton, or a
-                // P1 job's certified finish) writes P's side record.
-                if let Some((parsed, completed)) =
-                    side_parsed_stamp.zip(completed_acquisition.as_ref())
-                {
+                // U1a-2a (row 8): main's certified parse of P (singleton, a P1
+                // job's certified finish, or a certified group job's live
+                // member) writes P's side record. A group member takes the
+                // joined parse's verdict: the join publishes only a complete
+                // union, so a held union holds every member.
+                let side_seal = side_parsed_stamp
+                    .zip(completed_acquisition.as_ref())
+                    .map(|(parsed, completed)| {
+                        (
+                            completed
+                                .checkpoint
+                                .seal_as(sampled_scan::now_seconds(), &codex_parent_side_scope()),
+                            parsed,
+                            cursor_side_unsealed.unwrap_or(completed.unsealed),
+                        )
+                    })
+                    .or_else(|| {
+                        side_group_parse.map(|(seal, parsed)| {
+                            (seal, parsed, cursor_side_unsealed.unwrap_or(true))
+                        })
+                    });
+                if let Some((seal, parsed, unsealed)) = side_seal {
                     let p_ids = parsed_file
                         .codex_parent_ownership_ledger
                         .as_ref()
@@ -20947,12 +21062,10 @@ impl OwnedSourceScan {
                         &local_index_key(&candidate.path),
                         &p_ids,
                         SideMainParse {
-                            seal: completed
-                                .checkpoint
-                                .seal_as(sampled_scan::now_seconds(), &codex_parent_side_scope()),
+                            seal,
                             parsed,
                             verdict: codex_parent_side_verdict(&parsed_file),
-                            unsealed: cursor_side_unsealed.unwrap_or(completed.unsealed),
+                            unsealed,
                         },
                         side,
                     );

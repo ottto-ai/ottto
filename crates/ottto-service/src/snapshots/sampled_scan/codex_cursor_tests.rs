@@ -8406,3 +8406,362 @@ fn duplicate_after_an_admitted_ledger_holds_the_fork_duplicated() {
         CodexParentUnresolvable::ParentLossy,
     );
 }
+
+// ---------------------------------------------------------------------------
+// U1a-2a cc rows 1–5, 8 and ss-6: the proof holder (dormant until the proof
+// hook; driven directly here).
+
+fn proof_job(namespace: &str, path: &str, incarnation: &str, bytes: usize) -> Box<ProofJob> {
+    Box::new(ProofJob {
+        namespace: namespace.to_owned(),
+        index_path: PathBuf::from(path),
+        incarnation: incarnation.to_owned(),
+        entries: vec![("k".repeat(bytes), 1)],
+        next_row_end: 0,
+        touched_page: 0,
+    })
+}
+
+fn proof_charge(job: &ProofJob) -> usize {
+    crate::heap_layout_bound::bound(job, STATE_BYTES).unwrap()
+}
+
+/// Suspend `job` through a lease, as the proof hook will.
+fn suspend(cache: &Arc<SharedCache>, job: Box<ProofJob>) -> bool {
+    ProofLease::new(cache, job).suspend()
+}
+
+fn proof_drops(counts: crate::local_resource_diagnostics::codex_side_lifecycle::Counts) -> u64 {
+    counts.side_proof_drops
+}
+
+fn next_page(cache: &SharedCache) {
+    PageBudget::default().note_page(cache);
+}
+
+/// cc rows 1–2: a suspended proof is charged exactly its walked bound, and
+/// `Admitter::Proof` admits only into free room: one byte short is refused
+/// (the job is dropped, counted) and nothing else is released.
+#[test]
+fn proof_suspend_takes_free_room_only_and_charges_its_walk() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = admission_floor(&cache);
+    let empty = cache.cursor_resident();
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+    let charge = proof_charge(&job);
+    let (suspended, counts) =
+        observe(|| with_test_state_budget(empty + charge + floor - 1, || suspend(&cache, job)));
+    assert!(!suspended);
+    assert_eq!(proof_drops(counts), 1);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!(cache.cursor_resident(), empty);
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+    let (suspended, counts) =
+        observe(|| with_test_state_budget(empty + charge + floor, || suspend(&cache, job)));
+    assert!(suspended);
+    assert_eq!(proof_drops(counts), 0);
+    assert_eq!(
+        cache.proof_suspended_for_test(),
+        Some(("ns-a".to_owned(), charge))
+    );
+    assert_eq!(cache.cursor_resident(), empty + charge);
+    assert_eq!(cache.cursor_resident_for_main(), empty);
+    // A second suspend while the holder is taken is refused and counted.
+    let (suspended, counts) = observe(|| suspend(&cache, proof_job("ns-b", "/idx/b.json", "i", 8)));
+    assert!(!suspended);
+    assert_eq!(proof_drops(counts), 1);
+    assert_eq!(
+        cache.proof_suspended_for_test(),
+        Some(("ns-a".to_owned(), charge))
+    );
+}
+
+/// cc row 2: main decides as if no proof existed. An optional main charge
+/// that fits only without the proof is admitted, exactly as with no proof,
+/// and the proof is dropped first (counted); with room for both it stays.
+#[test]
+fn main_admission_measures_without_the_proof_and_drops_it_first() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let three = join_members(&["a.jsonl", "bb.jsonl", "rollout-ccc.jsonl"]);
+    let charge = join_charge(JOIN_OWNER, &three);
+    // Control: no proof, budget with exactly the join's room.
+    let control = Arc::new(SharedCache::default());
+    let floor = admission_floor(&control);
+    let empty = control.cursor_resident();
+    with_test_state_budget(empty + charge + floor, || {
+        control.record_join_owner(JOIN_OWNER, &three);
+    });
+    assert_eq!(join_entry(&control, JOIN_OWNER), Some(joined(&three)));
+    // Treated: a suspended proof sits in the same room.
+    let cache = Arc::new(SharedCache::default());
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 2048);
+    let proof = proof_charge(&job);
+    assert!(suspend(&cache, job));
+    let (_, counts) = observe(|| {
+        with_test_state_budget(empty + charge + floor, || {
+            cache.record_join_owner(JOIN_OWNER, &three);
+        })
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert_eq!(cache.proof_suspended_for_test(), None, "dropped first");
+    assert_eq!(proof_drops(counts), 1);
+    assert_eq!(cache.cursor_resident(), control.cursor_resident());
+    // Room for both: the proof stays.
+    let cache = Arc::new(SharedCache::default());
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 2048)
+    ));
+    let (_, counts) = observe(|| {
+        with_test_state_budget(empty + charge + proof + floor, || {
+            cache.record_join_owner(JOIN_OWNER, &three);
+        })
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert!(cache.proof_suspended_for_test().is_some());
+    assert_eq!(proof_drops(counts), 0);
+    assert_eq!(cache.cursor_resident(), empty + charge + proof);
+}
+
+/// cc row 2: mandatory-main progress. A paused job's mandatory claim that
+/// fits only without the proof is granted as with no proof; the proof goes.
+#[test]
+fn a_mandatory_claim_is_never_refused_for_a_proof() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = admission_floor(&cache);
+    let empty = cache.cursor_resident();
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 2048)
+    ));
+    let claim = 4096;
+    let credit = with_test_state_budget(empty + claim + floor, || cache.cursor_reserve(claim));
+    let credit = credit.expect("granted as with no proof");
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!(cache.cursor_resident(), empty + claim);
+    credit.refund();
+    assert_eq!(cache.cursor_resident(), empty);
+    assert_eq!(cache.cursor_reserved(), 0);
+}
+
+/// cc rows 1, 5: the hook's claim. Another index's job is busy until it is
+/// `NAMESPACE_STALE_PAGES` cursor pages old, then dropped (counted); this
+/// index's job comes out with its pages touched; the same index under a new
+/// incarnation drops it (counted); a dropped lease loses its job (counted).
+#[test]
+fn proof_take_is_mine_busy_stale_or_mismatched() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let ns_a = Scope("ns-a".to_owned());
+    let ns_b = Scope("ns-b".to_owned());
+    let (a, b) = (Path::new("/idx/a.json"), Path::new("/idx/b.json"));
+    let cache = Arc::new(SharedCache::default());
+    assert!(matches!(
+        cache.proof_take(&ns_a, a, "inc-1"),
+        ProofTake::Free
+    ));
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
+    ));
+    for _ in 0..NAMESPACE_STALE_PAGES - 1 {
+        next_page(&cache);
+        assert!(matches!(
+            cache.proof_take(&ns_b, b, "inc-9"),
+            ProofTake::Busy
+        ));
+    }
+    // The same namespace with another index path is another index.
+    assert!(matches!(
+        cache.proof_take(&ns_a, b, "inc-1"),
+        ProofTake::Busy
+    ));
+    let ProofTake::Mine(mut lease) = cache.proof_take(&ns_a, a, "inc-1") else {
+        panic!("this index's own job");
+    };
+    assert_eq!(lease.job().touched_page, NAMESPACE_STALE_PAGES - 1);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert!(lease.suspend());
+    for _ in 0..NAMESPACE_STALE_PAGES {
+        next_page(&cache);
+    }
+    let (take, counts) = observe(|| cache.proof_take(&ns_b, b, "inc-9"));
+    assert!(matches!(take, ProofTake::Free));
+    assert_eq!(proof_drops(counts), 1, "stale");
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    // A new incarnation of the same index never resumes the old job.
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
+    ));
+    let (take, counts) = observe(|| cache.proof_take(&ns_a, a, "inc-2"));
+    assert!(matches!(take, ProofTake::Free));
+    assert_eq!(proof_drops(counts), 1, "mismatch");
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    // A lease dropped holding its job loses it; `finish` does not count.
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
+    ));
+    let ProofTake::Mine(lease) = cache.proof_take(&ns_a, a, "inc-1") else {
+        panic!("mine");
+    };
+    let ((), counts) = observe(|| drop(lease));
+    assert_eq!(proof_drops(counts), 1);
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
+    ));
+    let ProofTake::Mine(lease) = cache.proof_take(&ns_a, a, "inc-1") else {
+        panic!("mine");
+    };
+    let ((), counts) = observe(|| lease.finish());
+    assert_eq!(proof_drops(counts), 0);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+}
+
+/// cc row 8: a page with due proof work that never reached the hook is
+/// counted once, at the next page's tick; a page that reached it is not,
+/// and nothing is counted while no work is due.
+#[test]
+fn a_due_page_that_missed_the_proof_hook_is_counted_at_the_next_tick() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    let cache = Arc::new(SharedCache::default());
+    next_page(&cache);
+    cache.note_proof_hook(true);
+    let ((), counts) = observe(|| next_page(&cache));
+    assert_eq!(proof_drops(counts), 0, "the hook ran on that page");
+    let ((), counts) = observe(|| next_page(&cache));
+    assert_eq!(proof_drops(counts), 1, "due, hook missed");
+    cache.note_proof_hook(false);
+    let ((), counts) = observe(|| {
+        next_page(&cache);
+        next_page(&cache);
+    });
+    assert_eq!(proof_drops(counts), 0, "nothing due");
+    // One tick per scan object, as the page clock.
+    let mut page = PageBudget::default();
+    cache.note_proof_hook(true);
+    page.note_page(&cache);
+    let ((), counts) = observe(|| page.note_page(&cache));
+    assert_eq!(proof_drops(counts), 0);
+}
+
+/// cc row 4: the step needs `PROOF_STEP_HEADROOM_BYTES` beside the context
+/// and the job's walked charge.
+#[test]
+fn proof_step_room_keeps_the_headroom() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let context = super::super::Context {
+        cache: Arc::new(SharedCache::default()),
+        namespace: Scope("ns-a".to_owned()),
+        audit_metadata_supported: true,
+        audit_slots: 0,
+        full_files: 0,
+        tail_files: 0,
+        unchanged_files: 0,
+        native_bytes: 0,
+        sample_bytes: 0,
+        full_reasons: [0; 11],
+        priority_replays: 0,
+        audits_started: 0,
+        audits_completed: 0,
+        start_overdue_seconds: 0,
+        completion_overdue_seconds: 0,
+        admission: Default::default(),
+    };
+    let resident = crate::heap_layout_bound::bound(&context, STATE_BYTES).unwrap();
+    let exact = STATE_BYTES - resident - PROOF_STEP_HEADROOM_BYTES;
+    assert!(proof_step_room(&context, exact));
+    assert!(!proof_step_room(&context, exact + 1));
+    assert!(!proof_step_room(&context, usize::MAX));
+}
+
+/// ss-6: the retained insert reserves main's cursor term, so its decision is
+/// the no-proof one; the proof is retired under the same lock exactly when
+/// the kept copy took its room, and the charged state stays within budget.
+#[test]
+fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let completed = |copy: crate::transcript_cache::Retained<_>| {
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: copy.checkpoint,
+                reduction: Some(copy.state),
+                unsealed: false,
+            }
+        };
+        let copy = cache.take(&key).expect("a certified copy");
+        cache.insert(key.clone(), completed(copy), 0);
+        let with_copy = admission_floor(&cache);
+        let state = cache.cursor_resident();
+        let copy = cache.take(&key).expect("retained");
+        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+        let proof = proof_charge(&job);
+        // Room for the copy and the proof exactly: both stay.
+        let claim = STATE_BYTES - state - with_copy - proof;
+        let credit = cache.cursor_reserve(claim).expect("fits alone");
+        assert!(suspend(&cache, job));
+        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
+        assert!(cache.retained_checkpoint(&key).is_some());
+        assert!(cache.proof_suspended_for_test().is_some());
+        assert_eq!(proof_drops(counts), 0);
+        assert_eq!(
+            admission_floor(&cache) + cache.cursor_resident(),
+            STATE_BYTES
+        );
+        credit.refund();
+        let copy = cache.take(&key).expect("retained");
+        assert!(matches!(
+            cache.proof_take(&Scope("ns-a".to_owned()), Path::new("/idx/a.json"), "inc-1"),
+            ProofTake::Mine(_)
+        ));
+        // One byte more claimed: the copy still fits beside main's state, so
+        // it is kept as with no proof, and the proof is retired.
+        let credit = cache.cursor_reserve(claim + 1).expect("fits alone");
+        assert!(suspend(
+            &cache,
+            proof_job("ns-a", "/idx/a.json", "inc-1", 4096)
+        ));
+        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "the no-proof decision"
+        );
+        assert_eq!(cache.proof_suspended_for_test(), None);
+        assert_eq!(proof_drops(counts), 1);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}

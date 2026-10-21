@@ -53,6 +53,9 @@ pub(in crate::snapshots) const SAMPLE_READ_BYTES: u64 = 2 * SAMPLE_BYTES as u64;
 /// A paused job is stale, and another namespace may evict it, once this many
 /// cursor pages passed without its own namespace resuming it (K10).
 const NAMESPACE_STALE_PAGES: u64 = 16;
+/// U1a-2a (cc row 4, rev 6 §5.1): free room a proof step needs beyond the
+/// scan's walked state and the running job's last walked charge.
+pub(in crate::snapshots) const PROOF_STEP_HEADROOM_BYTES: usize = 1 << 20;
 /// E2: a paused job whose revalidation evidence stays unavailable for this
 /// many consecutive resume pages ends (slot freed, path processed for the
 /// generation with a retryable cause, prior body kept). Small, like
@@ -277,12 +280,37 @@ impl PageBudget {
     /// diagnostics window opens under this same lock (no extra lock).
     pub(in crate::snapshots) fn note_page(&mut self, cache: &SharedCache) {
         if !std::mem::replace(&mut self.page_noted, true) {
+            let mut skipped = false;
             self.window_start = cache.with_cursor(|cursor| {
+                // U1a-2a (cc row 8): the page that just ended had proof work
+                // due but never reached the proof hook.
+                skipped = cursor.proof_due && cursor.proof_hook_page != Some(cursor.rotation.page);
                 cursor.rotation.page = cursor.rotation.page.saturating_add(1);
+                cursor.proof_rotation.page = cursor.rotation.page;
                 Box::new(cursor.counters)
             });
+            if skipped {
+                record_proof_drop();
+            }
         }
     }
+}
+
+/// U1a-2a (cc row 4, rev 6 §5.1): room for one proof step:
+/// `STATE_BYTES − bound(context) − walked_charge ≥ PROOF_STEP_HEADROOM_BYTES`,
+/// the copy-budget computation (`copy_budget_parts`) with the running job's
+/// last walk in place of the active file. `bound(context)` includes the
+/// shared cache (cursor state, retained copies, side ledger). Cycles are
+/// serialized under `SNAPSHOT_SYNC_LOCK`, so it sees every live main state.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) fn proof_step_room(
+    context: &super::Context,
+    walked_charge: usize,
+) -> bool {
+    crate::heap_layout_bound::bound(context, STATE_BYTES)
+        .and_then(|resident| STATE_BYTES.checked_sub(resident))
+        .and_then(|room| room.checked_sub(walked_charge))
+        .is_some_and(|room| room >= PROOF_STEP_HEADROOM_BYTES)
 }
 
 /// Opened-object facts of the held descriptor, captured at job open.
@@ -653,6 +681,225 @@ enum Slot {
     Empty,
     Paused(Box<OwnedActiveFile>),
     ActiveElsewhere { token: u64 },
+}
+
+/// U1a-2a (cc row 1; rev 11 §5.3–§5.4, rev 12 §5.3): a proof job between
+/// steps, RAM only (U1a-3 persists its resume). It is bound to the index it
+/// was started from: a job resumes only for the same namespace, index path
+/// and proof incarnation, and its deltas land only on entries whose `seq`
+/// still matches.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) struct ProofJob {
+    pub(in crate::snapshots) namespace: String,
+    pub(in crate::snapshots) index_path: PathBuf,
+    pub(in crate::snapshots) incarnation: String,
+    /// (child key, entry `seq`) of every entry the job was started for.
+    pub(in crate::snapshots) entries: Vec<(String, u64)>,
+    /// End of the next row a step must reach: a step whose leftover budget
+    /// cannot reach it reads nothing (`proof_pages_no_budget`).
+    pub(in crate::snapshots) next_row_end: u64,
+    /// `rotation.page` at the last suspend or resume: another namespace may
+    /// drop the job once it is `NAMESPACE_STALE_PAGES` old.
+    pub(in crate::snapshots) touched_page: u64,
+}
+crate::heap_layout_bound::fields!(ProofJob; namespace, index_path, incarnation, entries,
+    next_row_end, touched_page);
+
+/// U1a-2a (cc row 1): the one suspended proof job, process-wide. A running
+/// job is out of the holder, in the step's `ProofLease` (charged 0 here);
+/// `Suspended` is charged its walked bound, measured once at suspend.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+#[derive(Default)]
+pub(in crate::snapshots) enum ProofHolder {
+    #[default]
+    None,
+    Suspended {
+        job: Box<ProofJob>,
+        charge: usize,
+    },
+}
+impl ProofHolder {
+    /// The holder's charge in the cursor state's bound.
+    fn charge(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Suspended { charge, .. } => *charge,
+        }
+    }
+}
+impl HeapLayoutBound for ProofHolder {
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // The suspended box was walked once at suspend; nothing mutates it
+        // while it sits here.
+        c.add(self.charge())
+    }
+}
+
+/// U1a-2a (cc row 1): what the proof hook may do with the holder.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) enum ProofTake {
+    /// This index's own suspended job, out of the holder for one step.
+    Mine(ProofLease),
+    /// Nothing is suspended (a stale or mismatched job was just dropped):
+    /// the hook may start a job.
+    Free,
+    /// Another namespace's job is suspended and not stale: no proof work
+    /// starts for this index this page.
+    Busy,
+}
+
+/// U1a-2a (cc row 1, rev 6 §5.1): a proof job taken out of the holder for
+/// one step, charged 0 in the cursor state while it runs (the step checks
+/// `proof_step_room` first). It goes back only through `suspend` (free room
+/// only); `finish` ends it; a lease dropped holding its job loses it,
+/// counted, and its entries stay `Owed`.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) struct ProofLease {
+    cache: Arc<SharedCache>,
+    job: Option<Box<ProofJob>>,
+}
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+impl ProofLease {
+    pub(in crate::snapshots) fn new(cache: &Arc<SharedCache>, job: Box<ProofJob>) -> Self {
+        Self {
+            cache: Arc::clone(cache),
+            job: Some(job),
+        }
+    }
+
+    pub(in crate::snapshots) fn job(&mut self) -> &mut ProofJob {
+        self.job.as_mut().expect("a live proof lease holds its job")
+    }
+
+    /// Back into the holder as `Suspended`, measured now and admitted as
+    /// `Admitter::Proof` (free room only: no retained copy, provenance or
+    /// witness is released for it). Refused, or the holder already taken:
+    /// the job is dropped (counted `side_proof_drops`). True when suspended.
+    pub(in crate::snapshots) fn suspend(mut self) -> bool {
+        let Some(mut job) = self.job.take() else {
+            return false;
+        };
+        let Some(charge) = crate::heap_layout_bound::bound(&*job, STATE_BYTES) else {
+            record_proof_drop();
+            return false;
+        };
+        let Ok(mut retained) = self.cache.retained() else {
+            record_proof_drop();
+            return false;
+        };
+        let refused = self.cache.with_cursor(|cursor| {
+            if !matches!(cursor.proof, ProofHolder::None)
+                || !admit_locked(&mut retained, cursor, charge, false, Admitter::Proof)
+            {
+                return Some(job);
+            }
+            job.touched_page = cursor.rotation.page;
+            cursor.proof = ProofHolder::Suspended { job, charge };
+            None
+        });
+        drop(retained);
+        match refused {
+            Some(None) => true,
+            // Refused (the box is freed here, outside both locks) or the
+            // cursor lock was poisoned.
+            Some(Some(_)) | None => {
+                record_proof_drop();
+                false
+            }
+        }
+    }
+
+    /// The job finished (its deltas are applied or refused): nothing goes
+    /// back to the holder.
+    pub(in crate::snapshots) fn finish(mut self) {
+        self.job = None;
+    }
+}
+impl Drop for ProofLease {
+    fn drop(&mut self) {
+        if self.job.take().is_some() {
+            record_proof_drop();
+        }
+    }
+}
+
+/// U1a-2a (cc rows 1–3, 5, 8): one proof item dropped or one proof page
+/// skipped (`side_proof_drops`, lock-free; never `CodexCursorCounts`).
+fn record_proof_drop() {
+    crate::local_resource_diagnostics::codex_side_lifecycle::record(
+        crate::local_resource_diagnostics::codex_side_lifecycle::Event::ProofDrop,
+    );
+}
+
+/// U1a-2a (cc row 2; rev 10 §5.4, rev 11): who asks for cursor room.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum Admitter {
+    /// Every one of main's admissions. It decides as if no proof existed
+    /// (`state_for_main`), then drops a suspended proof first when the
+    /// admitted charge needs that room.
+    Main,
+    /// A proof job's suspend: free room only. It never releases a retained
+    /// copy, never evicts provenance or witnesses, and never drops anything.
+    Proof,
+}
+
+/// U1a-2a (cc row 2): the cursor state's bound as main measures it,
+/// `bound(cursor) − bound(holder) + bound(ProofHolder::None)`: the
+/// suspended proof's charge is left out (`None` holds nothing). Measured
+/// with the proof's charge added to the limit, so a full state with a
+/// proof still reads main's own part.
+fn state_for_main(cursor: &CursorState) -> Option<usize> {
+    let proof = cursor.proof.charge();
+    crate::heap_layout_bound::bound(cursor, STATE_BYTES.checked_add(proof)?)?
+        .checked_sub(proof)
+        .filter(|state| *state <= STATE_BYTES)
+}
+
+/// U1a-2a (cc row 2): `Admitter::Proof`'s test: `charge` fits beside the
+/// whole cursor state (any suspended proof included) and the retained
+/// copies, inside `admission_budget`. Nothing is released or evicted.
+fn proof_free_room(retained: &super::RetainedCache, cursor: &CursorState, charge: usize) -> bool {
+    use crate::heap_layout_bound::bound;
+    bound(cursor, STATE_BYTES)
+        .zip(bound(retained, STATE_BYTES))
+        .and_then(|(state, resident)| {
+            admission_budget()?
+                .checked_sub(state)?
+                .checked_sub(resident)?
+                .checked_sub(charge)
+        })
+        .is_some()
+}
+
+/// U1a-2a (cc rows 2–3): drop the suspended proof when the full state (the
+/// proof included), the retained copies and `reserve` more bytes do not fit
+/// `budget`: main's admission or insert, which measured without the proof,
+/// needs that room. Under the retained and cursor locks, so nothing spends
+/// the room between the decision and the drop. The box is freed here.
+fn drop_suspended_proof_over(
+    retained: &super::RetainedCache,
+    cursor: &mut CursorState,
+    reserve: usize,
+    budget: Option<usize>,
+) {
+    use crate::heap_layout_bound::bound;
+    if matches!(cursor.proof, ProofHolder::None) {
+        return;
+    }
+    let fits = bound(&*cursor, STATE_BYTES)
+        .zip(bound(retained, STATE_BYTES))
+        .and_then(|(state, resident)| {
+            budget?
+                .checked_sub(state)?
+                .checked_sub(resident)?
+                .checked_sub(reserve)
+        })
+        .is_some();
+    if !fits {
+        cursor.proof = ProofHolder::None;
+        record_proof_drop();
+    }
 }
 
 /// Content-free RAM counters. They reach the scan's one completion log
@@ -1070,6 +1317,15 @@ pub(in crate::snapshots) struct CursorState {
     parents: BTreeMap<String, NamespaceParents>,
     /// PR-P: parent-resolution restart counters (inline, never charged).
     parent_restarts: ParentRestarts,
+    /// U1a-2a (cc row 1): the one suspended proof job, never in `slot`.
+    proof: ProofHolder,
+    /// U1a-2a (cc row 1): proof batches' rotation (the `Rotation` shape;
+    /// its page follows `rotation.page`).
+    proof_rotation: Rotation,
+    /// U1a-2a (cc row 8): the page the proof hook last ran on, and whether
+    /// it found proof work due.
+    proof_hook_page: Option<u64>,
+    proof_due: bool,
 }
 
 impl Default for CursorState {
@@ -1092,6 +1348,10 @@ impl Default for CursorState {
             counters: Counters::default(),
             parents: BTreeMap::new(),
             parent_restarts: ParentRestarts::default(),
+            proof: ProofHolder::None,
+            proof_rotation: Rotation::default(),
+            proof_hook_page: None,
+            proof_due: false,
         }
     }
 }
@@ -1116,6 +1376,10 @@ impl HeapLayoutBound for CursorState {
             counters,
             parents,
             parent_restarts,
+            proof,
+            proof_rotation,
+            proof_hook_page,
+            proof_due,
         } = self;
         // The paused job was walked once when it paused; its charge stays
         // fixed while it sits here because nothing mutates a paused parser.
@@ -1139,7 +1403,12 @@ impl HeapLayoutBound for CursorState {
         counters.heap_bound(c)?;
         // PR-P: witnesses are charged; the restart table is inline.
         parents.heap_bound(c)?;
-        parent_restarts.heap_bound(c)
+        parent_restarts.heap_bound(c)?;
+        // U1a-2a: a suspended proof is charged its walked bound.
+        proof.heap_bound(c)?;
+        proof_rotation.heap_bound(c)?;
+        proof_hook_page.heap_bound(c)?;
+        proof_due.heap_bound(c)
     }
 }
 
@@ -2359,10 +2628,12 @@ fn parent_entry<'a>(
 /// retained cache's own bound (`release_until`'s floor) and, for `mandatory`,
 /// the state without its join provenance and without its parent witnesses
 /// (empty maps; bounds are additive per field). False: no eviction can make
-/// room, so none may run.
+/// room, so none may run. Main's admissions only: the state is
+/// `state_for_main` (U1a-2a cc row 2), since a suspended proof is dropped
+/// whenever the admission needs its room.
 fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> bool {
     use crate::heap_layout_bound::bound;
-    let state = bound(cursor, STATE_BYTES).and_then(|state| {
+    let state = state_for_main(cursor).and_then(|state| {
         if !mandatory {
             return Some(state);
         }
@@ -2405,23 +2676,36 @@ fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> b
 /// `ROTATION_KEYS` + 2 times: once per provenance entry, once per witness
 /// batch (each either covers the shortfall or empties its namespace), and
 /// once more to admit.
+///
+/// U1a-2a (cc row 2): `Admitter::Main` measures `state_for_main`, so every
+/// choice above (which copies go, which provenance or witness is forgotten,
+/// whether the charge fits) is the one main makes with no proof. Once
+/// admitted, a suspended proof whose room the charge needs is dropped, still
+/// under both locks. `Admitter::Proof` (never `mandatory`) admits only into
+/// free room beside the whole state and the retained copies.
 fn admit_locked(
     retained: &mut super::RetainedCache,
     cursor: &mut CursorState,
     charge: usize,
     mandatory: bool,
+    admitter: Admitter,
 ) -> bool {
+    if admitter == Admitter::Proof {
+        debug_assert!(!mandatory, "a proof admission is never mandatory");
+        return !mandatory && proof_free_room(retained, cursor, charge);
+    }
     if !admission_feasible(cursor, charge, mandatory) {
         return false;
     }
     loop {
-        let Some(state) = crate::heap_layout_bound::bound(&*cursor, STATE_BYTES) else {
+        let Some(state) = state_for_main(cursor) else {
             return false;
         };
         let room = admission_budget()
             .and_then(|budget| budget.checked_sub(state))
             .and_then(|room| room.checked_sub(charge));
         if room.is_some_and(|room| retained.release_until(room)) {
+            drop_suspended_proof_over(retained, cursor, charge, admission_budget());
             return true;
         }
         // Even an empty retained cache did not fit beside the state (or the
@@ -2474,7 +2758,7 @@ impl SharedCache {
         let mut retained = self.retained().ok()?;
         let claimed = self
             .with_cursor(|cursor| {
-                if !admit_locked(&mut retained, cursor, charge, true) {
+                if !admit_locked(&mut retained, cursor, charge, true, Admitter::Main) {
                     return None;
                 }
                 cursor.reserved = cursor.reserved.checked_add(charge)?;
@@ -2508,12 +2792,117 @@ impl SharedCache {
     }
 
     /// Everything the cursor state holds (paused job, memo, parked, rotation
-    /// and invalidation records), reserved at insert admission (K6). An
-    /// unbounded state reserves the whole budget.
+    /// and invalidation records, a suspended proof). An unbounded state reads
+    /// as the whole budget. Tests only since U1a-2a ss-6: the insert reserves
+    /// `cursor_resident_for_main`.
+    #[cfg(test)]
     pub(super) fn cursor_resident(&self) -> usize {
         self.with_cursor(|cursor| crate::heap_layout_bound::bound(&*cursor, STATE_BYTES))
             .flatten()
             .unwrap_or(STATE_BYTES)
+    }
+
+    /// U1a-2a (cc row 3, rev 11 §5.4): `cursor_resident` as main measures
+    /// it, without the suspended proof (`state_for_main`). The retained
+    /// insert reserves this, then `drop_suspended_proof_if_over` retires the
+    /// proof if the insert took its room.
+    pub(super) fn cursor_resident_for_main(&self) -> usize {
+        self.with_cursor(|cursor| state_for_main(cursor))
+            .flatten()
+            .unwrap_or(STATE_BYTES)
+    }
+
+    /// U1a-2a (cc row 3, ss-6): after a retained insert that reserved
+    /// `cursor_resident_for_main()`, still under the insert's retained lock:
+    /// drop the suspended proof (freeing its box) if `live_bytes_in`, the
+    /// side ledger's fixed charge, the whole cursor state and the retained
+    /// copies no longer fit `STATE_BYTES`, the retained cache's own limit.
+    /// So the insert's choice never depended on the proof, and the proof is
+    /// gone before the insert returns and anything else spends that room.
+    pub(super) fn drop_suspended_proof_if_over(
+        &self,
+        retained: &super::RetainedCache,
+        live_bytes_in: usize,
+    ) {
+        let budget = STATE_BYTES
+            .checked_sub(live_bytes_in)
+            .and_then(|room| room.checked_sub(super::side_ledger::SIDE_LEDGER_BYTES));
+        self.with_cursor(|cursor| drop_suspended_proof_over(retained, cursor, 0, budget));
+    }
+
+    /// U1a-2a (cc rows 1, 5; rev 11 §5.3, rev 12): the proof hook's claim on
+    /// the holder for index (`namespace`, `index_path`, `incarnation`).
+    /// - This index's own job → `Mine` (out of the holder, touched now).
+    /// - The same namespace and path under another incarnation (the index
+    ///   was replaced or re-minted) → dropped (counted), `Free`.
+    /// - Another index's job → `Busy` while it was touched within
+    ///   `NAMESPACE_STALE_PAGES` cursor pages; else dropped as stale
+    ///   (counted), `Free`.
+    /// - Nothing suspended → `Free`. A poisoned cursor → `Busy`.
+    #[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+    pub(in crate::snapshots) fn proof_take(
+        self: &Arc<Self>,
+        namespace: &Scope,
+        index_path: &Path,
+        incarnation: &str,
+    ) -> ProofTake {
+        enum Claim {
+            Mine(Box<ProofJob>),
+            Free { dropped: bool },
+            Busy,
+        }
+        let claim = self.with_cursor(|cursor| {
+            let page = cursor.rotation.page;
+            let ProofHolder::Suspended { job, .. } = &cursor.proof else {
+                return Claim::Free { dropped: false };
+            };
+            let own = job.namespace == namespace.0 && job.index_path == index_path;
+            let mine = own && job.incarnation == incarnation;
+            let live = page.saturating_sub(job.touched_page) < NAMESPACE_STALE_PAGES;
+            if mine {
+                let ProofHolder::Suspended { mut job, .. } = std::mem::take(&mut cursor.proof)
+                else {
+                    unreachable!("checked suspended holder");
+                };
+                job.touched_page = page;
+                return Claim::Mine(job);
+            }
+            if !own && live {
+                return Claim::Busy;
+            }
+            cursor.proof = ProofHolder::None;
+            Claim::Free { dropped: true }
+        });
+        match claim {
+            Some(Claim::Mine(job)) => ProofTake::Mine(ProofLease::new(self, job)),
+            Some(Claim::Free { dropped }) => {
+                if dropped {
+                    record_proof_drop();
+                }
+                ProofTake::Free
+            }
+            Some(Claim::Busy) | None => ProofTake::Busy,
+        }
+    }
+
+    /// U1a-2a (cc row 8, rev 10 §6.1): the proof hook ran on this page and
+    /// found proof work `due` (or none). `note_page` counts a page with due
+    /// work that never reached the hook.
+    #[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+    pub(in crate::snapshots) fn note_proof_hook(&self, due: bool) {
+        self.with_cursor(|cursor| {
+            cursor.proof_hook_page = Some(cursor.rotation.page);
+            cursor.proof_due = due;
+        });
+    }
+
+    #[cfg(test)]
+    pub(in crate::snapshots) fn proof_suspended_for_test(&self) -> Option<(String, usize)> {
+        self.with_cursor(|cursor| match &cursor.proof {
+            ProofHolder::None => None,
+            ProofHolder::Suspended { job, charge } => Some((job.namespace.clone(), *charge)),
+        })
+        .flatten()
     }
 
     /// Content-free cursor diagnostics for the scan's one completion log
@@ -2789,7 +3178,7 @@ impl SharedCache {
                 return false;
             };
             if !crate::heap_layout_bound::layout_supported()
-                || !admit_locked(&mut retained, cursor, charge, false)
+                || !admit_locked(&mut retained, cursor, charge, false, Admitter::Main)
             {
                 cursor.counters.parent_witness_refused += 1;
                 return false;
@@ -2903,7 +3292,7 @@ impl SharedCache {
                 return;
             };
             if !crate::heap_layout_bound::layout_supported()
-                || !admit_locked(&mut retained, cursor, charge, false)
+                || !admit_locked(&mut retained, cursor, charge, false, Admitter::Main)
             {
                 cursor.counters.parent_match_unmarked += 1;
                 return;
@@ -2980,7 +3369,7 @@ impl SharedCache {
                     return;
                 }
             }
-            if !admit_locked(&mut retained, cursor, charge, false) {
+            if !admit_locked(&mut retained, cursor, charge, false, Admitter::Main) {
                 cursor.join_owners.remove(owner);
                 return;
             }
@@ -4691,6 +5080,16 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
 ) {
     let settleable = disclosure.reason.settleable();
     let index_key = local_index_key(&candidate.path);
+    // U1a-2a (cc row 7): this key's latest parse is debt, so its side record
+    // (if any) is held, under its own lineage cause. Update only.
+    index.refresh_codex_parent_side_held(
+        &index_key,
+        &codex_parent_path_ids(&candidate.path),
+        disclosure.parent_unresolvable.is_some(),
+        disclosure
+            .parent_unresolvable
+            .map_or(CAUSE_NO_EVIDENCE, |cause| cause.index() as u8),
+    );
     if settleable {
         targets.residue_index_keys.insert(index_key.clone());
     }

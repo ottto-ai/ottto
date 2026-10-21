@@ -144,8 +144,13 @@ impl SharedCache {
                 // same constant `heap_bound` adds and cursor admission keeps
                 // (`codex_cursor::admission_budget`, F4b). Slice M order: PR-R,
                 // then M2, extend this reservation; they keep this term.
+                // U1a-2a ss-6: the cursor term is main's (`cursor_resident_for_main`,
+                // no suspended proof), so the insert decides as with no proof;
+                // the proof is then retired under this same lock if the insert
+                // took its room.
+                let live_bytes_in = live_bytes;
                 let live_bytes = live_bytes
-                    .saturating_add(self.cursor_resident())
+                    .saturating_add(self.cursor_resident_for_main())
                     .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
                 cache.insert_reserving(
                     key,
@@ -155,6 +160,7 @@ impl SharedCache {
                     },
                     live_bytes,
                 );
+                self.drop_suspended_proof_if_over(&cache, live_bytes_in);
             } else {
                 record(Event::InsertPoisonedLock);
             }

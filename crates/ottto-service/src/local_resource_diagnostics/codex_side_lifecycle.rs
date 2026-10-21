@@ -106,7 +106,6 @@ pub(crate) fn add(event: Event, amount: u64) {
 pub(crate) fn record(event: Event) {
     add(event, 1);
 }
-#[allow(dead_code)] // first caller (tests included) is the C14 gauge measurement
 pub(crate) fn set_gauges(gauges: Gauges) {
     let Gauges {
         side_records,

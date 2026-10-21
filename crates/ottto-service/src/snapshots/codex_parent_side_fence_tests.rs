@@ -680,3 +680,48 @@ fn main_cures_a_covered_request_into_the_records_stub_and_mirrors_removed() {
         (LedgerTag::Removed, 5555)
     );
 }
+
+/// cc row 7: a terminal disclosure refreshes P's existing record to held
+/// and never creates one. A verdict change takes a new generation; the wrap
+/// epoch follows only while P is live; an unchanged, not-live record is
+/// left alone and nothing is counted.
+#[test]
+fn a_terminal_disclosure_refreshes_an_existing_record_to_held_only() {
+    let parent = Parent::new("disclosed", 9_000);
+    let ids = ["019a0000-0000-7000-8000-00000000000b".to_owned()];
+    let held = SideVerdict::Held {
+        lineage: true,
+        cause: CAUSE_NO_EVIDENCE,
+    };
+    let refresh = |index: &mut ScanIndex| {
+        observe(|| index.refresh_codex_parent_side_held(KEY, &ids, true, CAUSE_NO_EVIDENCE))
+    };
+    // No record: nothing is created, even while live.
+    let mut index = ScanIndex {
+        codex_parent_proof_wrap_epoch: 4,
+        ..ScanIndex::default()
+    };
+    index.codex_parent_ownership_refs.insert(ids[0].clone());
+    let (written, counts) = refresh(&mut index);
+    assert!(!written);
+    assert_eq!(counts, Counts::default());
+    assert!(index.codex_parent_side.is_empty());
+    // Not live: the verdict flips and takes a new generation; the epoch is kept.
+    let mut index = with_record(parent.record(SideVerdict::Settled, now()));
+    index.codex_parent_proof_wrap_epoch = 4;
+    index.codex_parent_side_generation = 1;
+    let (written, counts) = refresh(&mut index);
+    assert!(written);
+    assert_eq!(counts.side_records_written, 1);
+    let record = &index.codex_parent_side[KEY];
+    assert_eq!(record.verdict, held);
+    assert_eq!((record.generation, record.referenced_epoch), (2, 0));
+    // The same verdict, still not live: nothing.
+    assert_eq!(refresh(&mut index), (false, Counts::default()));
+    // Live: the epoch follows; the generation is kept.
+    index.codex_parent_ownership_refs.insert(ids[0].clone());
+    assert!(refresh(&mut index).0);
+    let record = &index.codex_parent_side[KEY];
+    assert_eq!((record.generation, record.referenced_epoch), (2, 4));
+    assert_eq!(refresh(&mut index), (false, Counts::default()));
+}
