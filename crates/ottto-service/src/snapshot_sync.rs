@@ -4816,8 +4816,9 @@ fn finish_sync_source(
         };
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
-                "local snapshot sync: claude local evidence duration_ms={} counts={counts}",
-                evidence_started.elapsed().as_millis()
+                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} counts={counts}",
+                evidence_started.elapsed().as_millis(),
+                crate::snapshots::claude_api_cache_creation_rejection_count()
             );
         }
         actual_native_conjunction =

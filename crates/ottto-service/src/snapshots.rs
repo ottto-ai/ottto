@@ -6738,14 +6738,82 @@ fn serialized_json_digest<T: Serialize + ?Sized>(value: &T, domain: &[u8]) -> Op
     Some(writer.0)
 }
 
+// Counts rejected interpretations, not unique requests: the same row can be
+// checked during proof, account coverage and rebuild. No content or identity is
+// retained, and this diagnostic never participates in an authority decision.
+#[cfg(not(test))]
+static CLAUDE_API_CACHE_CREATION_REJECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_API_CACHE_CREATION_REJECTIONS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+
+fn with_claude_api_cache_creation_rejections<T>(
+    operation: impl FnOnce(&std::sync::atomic::AtomicU64) -> T,
+) -> T {
+    #[cfg(test)]
+    {
+        CLAUDE_API_CACHE_CREATION_REJECTIONS.with(operation)
+    }
+    #[cfg(not(test))]
+    {
+        operation(&CLAUDE_API_CACHE_CREATION_REJECTIONS)
+    }
+}
+
+pub(crate) fn claude_api_cache_creation_rejection_count() -> u64 {
+    with_claude_api_cache_creation_rejections(|counter| {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// New writers repeat the aggregate as a TTL split. Older writers expose only
+/// the aggregate; preserve it without inventing a TTL. Contradictions and
+/// overflow cannot authorize usage, even if their additive value would match.
+fn claude_api_cache_creation(
+    row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
+) -> Option<(u64, u64, u64)> {
+    let interpreted = row
+        .cache_creation_5m_tokens
+        .checked_add(row.cache_creation_1h_tokens)
+        .and_then(|split| {
+            if split == 0 {
+                Some((0, 0, row.cache_creation_tokens))
+            } else if row.cache_creation_tokens == 0 || row.cache_creation_tokens == split {
+                Some((
+                    row.cache_creation_5m_tokens,
+                    row.cache_creation_1h_tokens,
+                    0,
+                ))
+            } else {
+                None
+            }
+        });
+    if interpreted.is_none() {
+        with_claude_api_cache_creation_rejections(|counter| {
+            let _ = counter.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| count.checked_add(1),
+            );
+        });
+    }
+    interpreted
+}
+
 fn claude_api_matches_transcript_occurrence(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
     occurrence: &ClaudeTranscriptUsageOccurrenceWitness,
 ) -> bool {
-    let api_cache_creation = row
-        .cache_creation_tokens
-        .checked_add(row.cache_creation_5m_tokens)
-        .and_then(|value| value.checked_add(row.cache_creation_1h_tokens));
+    let Some(api_cache_creation) =
+        claude_api_cache_creation(row).and_then(|(five_m, one_h, unattributed)| {
+            five_m.checked_add(one_h)?.checked_add(unattributed)
+        })
+    else {
+        return false;
+    };
     let transcript_cache_creation = occurrence
         .cache_creation_5m_tokens
         .checked_add(occurrence.cache_creation_1h_tokens);
@@ -6772,7 +6840,7 @@ fn claude_api_matches_transcript_occurrence(
             row.reasoning_output_tokens,
             occurrence.reasoning_output_tokens,
         )
-        && api_cache_creation == transcript_cache_creation
+        && Some(api_cache_creation) == transcript_cache_creation
         && occurrence
             .model
             .as_deref()
@@ -7278,14 +7346,15 @@ fn claude_account_evidence_covers_snapshot(
             .map(|row| u128::from(value(row)))
             .sum::<u128>()
     };
-    let cache_creation = evidence
-        .iter()
-        .map(|row| {
-            u128::from(row.cache_creation_tokens)
-                + u128::from(row.cache_creation_5m_tokens)
-                + u128::from(row.cache_creation_1h_tokens)
-        })
-        .sum::<u128>();
+    let Some(cache_creation) = evidence.iter().try_fold(0_u128, |total, row| {
+        let (five_m, one_h, unattributed) = claude_api_cache_creation(row)?;
+        total
+            .checked_add(u128::from(five_m))?
+            .checked_add(u128::from(one_h))?
+            .checked_add(u128::from(unattributed))
+    }) else {
+        return false;
+    };
     item.unattributed_total_tokens == 0
         && sum(|row| row.input_tokens) == u128::from(item.input_tokens)
         && sum(|row| row.output_tokens) == u128::from(item.output_tokens)
@@ -7716,6 +7785,10 @@ fn prepare_claude_reported_usage_with_credit<
     let mut cost_complete = true;
 
     for row in row_refs() {
+        let (cache_5m, cache_1h, cache_unattributed) = claude_api_cache_creation(row)?;
+        let api_cache_creation = cache_5m
+            .checked_add(cache_1h)?
+            .checked_add(cache_unattributed)?;
         let cost_picos = row
             .cost_usd_micros
             .map(u128::from)
@@ -7761,10 +7834,6 @@ fn prepare_claude_reported_usage_with_credit<
             .and_then(|occurrence| occurrence.reasoning_effort.clone())
             .or(reported_effort);
         let (mut usage, model, timestamp) = if let Some(occurrence) = occurrence {
-            let api_cache_creation = row
-                .cache_creation_tokens
-                .checked_add(row.cache_creation_5m_tokens)
-                .and_then(|value| value.checked_add(row.cache_creation_1h_tokens));
             let transcript_cache_creation = occurrence
                 .usage
                 .cache_creation_5m_tokens
@@ -7776,7 +7845,7 @@ fn prepare_claude_reported_usage_with_credit<
                     row.reasoning_output_tokens,
                     occurrence.usage.reasoning_output_tokens,
                 )
-                || api_cache_creation != transcript_cache_creation
+                || Some(api_cache_creation) != transcript_cache_creation
                 || occurrence
                     .model
                     .as_deref()
@@ -7801,12 +7870,11 @@ fn prepare_claude_reported_usage_with_credit<
                     input_tokens: row.input_tokens,
                     output_tokens: row.output_tokens,
                     cache_read_tokens: row.cache_read_tokens,
-                    cache_creation_5m_tokens: row.cache_creation_5m_tokens,
-                    cache_creation_1h_tokens: row.cache_creation_1h_tokens,
+                    cache_creation_5m_tokens: cache_5m,
+                    cache_creation_1h_tokens: cache_1h,
                     reasoning_output_tokens: row.reasoning_output_tokens,
-                    // api_request exposes aggregate cache creation only. It is
-                    // exact usage, but not an honest TTL split.
-                    unattributed_total_tokens: row.cache_creation_tokens,
+                    // Aggregate-only writers cannot supply an honest TTL split.
+                    unattributed_total_tokens: cache_unattributed,
                     request_count: 1,
                     costs: UsageCosts::default(),
                 },
@@ -44441,6 +44509,35 @@ mod tests {
     }
 
     #[test]
+    fn claude_cache_split_interpretation_checks_totals_and_counts_rejections() {
+        let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence::default();
+        for (total, five_m, one_h, expected) in [
+            (2014, 2014, 0, Some((2014, 0, 0))),
+            (2014, 0, 2014, Some((0, 2014, 0))),
+            (2014, 1000, 1014, Some((1000, 1014, 0))),
+            (0, 1000, 1014, Some((1000, 1014, 0))),
+            (2014, 0, 0, Some((0, 0, 2014))),
+            (0, 0, 0, Some((0, 0, 0))),
+            (u64::MAX, 0, 0, Some((0, 0, u64::MAX))),
+            (u64::MAX, u64::MAX, 0, Some((u64::MAX, 0, 0))),
+            (2013, 1000, 1014, None),
+            (2015, 1000, 1014, None),
+            (0, u64::MAX, 1, None),
+            (u64::MAX, u64::MAX, u64::MAX, None),
+        ] {
+            row.cache_creation_tokens = total;
+            row.cache_creation_5m_tokens = five_m;
+            row.cache_creation_1h_tokens = one_h;
+            let before = claude_api_cache_creation_rejection_count();
+            assert_eq!(claude_api_cache_creation(&row), expected);
+            assert_eq!(
+                claude_api_cache_creation_rejection_count(),
+                before + u64::from(expected.is_none())
+            );
+        }
+    }
+
+    #[test]
     fn claude_cache_split_matcher_accepts_aggregate_and_split() {
         let (root, parent, items) = cache_split_fixture();
         let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
@@ -44546,7 +44643,12 @@ mod tests {
                 .get("req_cache_split")
                 .unwrap(),
         );
+        let rejections_before = claude_api_cache_creation_rejection_count();
         assert!(!claude_api_matches_transcript_occurrence(&row, &occurrence));
+        assert_eq!(
+            claude_api_cache_creation_rejection_count(),
+            rejections_before + 1
+        );
         assert!(!claude_account_evidence_covers_snapshot(&items[0], &[&row]));
         let mut item = items[0].clone();
         let before = serde_json::to_vec(&item).unwrap();
