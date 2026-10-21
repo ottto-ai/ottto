@@ -55,6 +55,8 @@ mod codex_file_join;
 #[cfg(test)]
 mod codex_parent_proof_tests;
 #[cfg(test)]
+mod codex_parent_proof_use_tests;
+#[cfg(test)]
 mod codex_parent_side_fence_tests;
 #[cfg(test)]
 mod codex_parent_side_read_tests;
@@ -12775,7 +12777,23 @@ struct SnapshotAccumulator {
     // available. The native stream must end at the same ordinal boundary.
     codex_sidecar_projected_next_ordinal: Option<u64>,
     codex_parent_session_ref: Option<String>,
-    codex_parent_signatures: Option<Vec<String>>,
+    codex_parent_signatures: Option<CodexParentPrefix>,
+    /// U1a-2a (D6(a)): the child's chain through the signatures the proof
+    /// arm compared (seeded when the proof arm is chosen).
+    codex_parent_prefix_digest: PrefixDigest,
+    /// U1a-2a: `(m, chain through s_m, owned)` when the proof arm decided.
+    codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
+    /// U1a-2a: this child's proof, P-fenced at parser construction
+    /// (`install_codex_parent_proof`), and its decoded digest.
+    codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
+    /// U1a-2a: the proof the classifier consumed, with main's evidence for
+    /// this child (the witness cause; `None` = none), restored at finish
+    /// when the arm does not decide as the proof says.
+    codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
+    /// U1a-2a: the arm saw `ProofMismatch` (the child's chain differs).
+    codex_parent_proof_mismatch: bool,
+    /// U1a-2a: why the install refused this child's proof (record site).
+    codex_parent_proof_refusal: Option<ProofRefusal>,
     codex_parent_ledger_identity_used: Option<String>,
     /// PR-P: the step-map witness this fork read for its parent.
     codex_parent_unresolvable: Option<CodexParentUnresolvable>,
@@ -12993,6 +13011,12 @@ impl SnapshotAccumulator {
             codex_sidecar_projected_next_ordinal: None,
             codex_parent_session_ref: None,
             codex_parent_signatures: None,
+            codex_parent_prefix_digest: [0; 32],
+            codex_parent_prefix_decided: None,
+            codex_parent_prefix_proof: None,
+            codex_parent_proof_used: None,
+            codex_parent_proof_mismatch: false,
+            codex_parent_proof_refusal: None,
             codex_parent_ledger_identity_used: None,
             codex_parent_unresolvable: None,
             codex_parent_ledger_consulted: false,
@@ -13404,25 +13428,49 @@ impl SnapshotAccumulator {
                     .and_then(|ledgers| ledgers.lock().ok())
                     .and_then(|ledgers| ledgers.get(parent_id).cloned())
             });
-            match evidence {
-                Some(parent_ledger)
+            // U1a-2a (D6(a)): an installed proof for exactly this parent. It
+            // is consulted only after a valid ledger and only beside a
+            // cap-class witness or no witness; with none, this is main.
+            let proof = self
+                .codex_parent_prefix_proof
+                .take()
+                .filter(|(proof, _)| forked_from_id.as_deref() == Some(proof.parent.as_str()));
+            match (evidence, proof) {
+                (Some(parent_ledger), _)
                     if parent_ledger.scan_complete && !parent_ledger.signatures.is_empty() =>
                 {
                     self.codex_parent_ledger_identity_used =
                         Some(parent_ledger.opened_object_identity);
-                    self.codex_parent_signatures = Some(parent_ledger.signatures);
+                    self.codex_parent_signatures =
+                        Some(CodexParentPrefix::Ledger(parent_ledger.signatures));
                     CodexOwnershipBoundary::AwaitingParentPrefix
                 }
-                Some(CodexParentOwnershipLedger {
-                    unresolvable: Some(cause),
-                    ..
-                }) => {
+                (
+                    Some(CodexParentOwnershipLedger {
+                        unresolvable: Some(cause),
+                        ..
+                    }),
+                    proof,
+                ) if !cause.cap() || proof.is_none() => {
                     // PR-P: witnessed unusable or deferred. An empty ledger keeps
                     // the fork absorbing: held and settleable, not pending. The
                     // witness admits nothing; the child stays held.
-                    self.codex_parent_signatures = Some(Vec::new());
+                    self.codex_parent_signatures = Some(CodexParentPrefix::Ledger(Vec::new()));
                     self.codex_parent_unresolvable = Some(cause);
                     CodexOwnershipBoundary::AmbiguousFork
+                }
+                (evidence, Some((proof, digest))) => {
+                    // A cap-class witness or no usable evidence: the proof
+                    // answers P's prefix. Main's reading of that evidence is
+                    // kept so a refusal at finish restores it exactly.
+                    let base = evidence.and_then(|ledger| ledger.unresolvable);
+                    self.codex_parent_prefix_digest = codex_parent_prefix_seed();
+                    self.codex_parent_signatures = Some(CodexParentPrefix::Proof {
+                        matched: proof.matched,
+                        digest,
+                    });
+                    self.codex_parent_proof_used = Some((proof, base));
+                    CodexOwnershipBoundary::AwaitingParentPrefix
                 }
                 _ => {
                     // Missing, partial, or overflowed parent evidence is not a
@@ -13462,27 +13510,49 @@ impl SnapshotAccumulator {
             }
             CodexOwnershipBoundary::AwaitingParentPrefix => {
                 let signature = codex_ownership_signature(value);
-                let expected = self.codex_parent_signatures.as_ref();
-                match signature {
-                    Some(signature)
-                        if expected
-                            .and_then(|values| values.get(self.codex_parent_signature_index))
-                            == Some(&signature) =>
-                    {
+                // U1a-2a (D6(a)): one lookup over the ledger or the proof.
+                // The proof arm chains the child's signatures (the ledger
+                // arm computes nothing new: main exactly).
+                let index = self.codex_parent_signature_index;
+                let at = signature
+                    .as_deref()
+                    .zip(self.codex_parent_signatures.as_ref())
+                    .map(|(signature, expected)| {
+                        let chained = expected.chains().then(|| {
+                            codex_parent_prefix_chain(&self.codex_parent_prefix_digest, signature)
+                        });
+                        (expected.at(index, signature, chained.as_ref()), chained)
+                    });
+                match (signature, at) {
+                    (Some(_), Some((ParentAt::Equal, chained))) => {
+                        if let Some(chained) = chained {
+                            self.codex_parent_prefix_digest = chained;
+                        }
                         self.codex_parent_signature_index += 1;
                         self.codex_legacy_bootstrap_buffer.clear();
                         self.note_inherited_codex_record(value);
                         false
                     }
-                    Some(_) if self.codex_parent_signature_index > 0 => {
+                    (Some(_), Some((ParentAt::ProofMismatch, _))) => {
+                        // The child's prefix is not the one proven: refused
+                        // at finish, never admitted.
+                        self.codex_parent_proof_mismatch = true;
+                        self.codex_legacy_bootstrap_buffer.clear();
+                        self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+                        self.note_inherited_codex_record(value);
+                        false
+                    }
+                    (Some(_), at) if self.codex_parent_signature_index > 0 => {
                         // A syntactically complete parent scan is not proof of
                         // provider-final history: clean newline truncation is
                         // indistinguishable from EOF. Divergence is therefore
                         // authoritative only while a later parent signature is
                         // already observed. Exhausting the ledger fails closed.
-                        if expected
-                            .is_some_and(|values| self.codex_parent_signature_index < values.len())
-                        {
+                        if let Some((ParentAt::Differs, chained)) = at {
+                            if let Some(chained) = chained {
+                                self.codex_parent_prefix_decided =
+                                    Some((index as u64, chained, true));
+                            }
                             self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
                             self.codex_owned_record_seen = true;
                             true
@@ -13494,12 +13564,16 @@ impl SnapshotAccumulator {
                             false
                         }
                     }
-                    Some(_) => {
+                    (Some(_), at) => {
+                        // Index 0: a proven divergence holds (owned: false).
+                        if let Some((ParentAt::Differs, Some(chained))) = at {
+                            self.codex_parent_prefix_decided = Some((0, chained, false));
+                        }
                         self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
                         self.note_inherited_codex_record(value);
                         false
                     }
-                    None => {
+                    (None, _) => {
                         if self.codex_parent_signature_index > 0 {
                             self.buffer_codex_boundary_record(value);
                         }
@@ -13798,6 +13872,35 @@ impl SnapshotAccumulator {
             | CodexOwnershipBoundary::AwaitingParentPrefix
             | CodexOwnershipBoundary::AmbiguousFork => false,
         }
+    }
+
+    /// U1a-2a (D6(a)): an installed proof the arm did not decide on as it
+    /// says (a chain mismatch, the boundary buffer's overflow, or EOF inside
+    /// the proven prefix) is refused: the child ends as main reads it, under
+    /// the evidence main had (`Ledger([])` + witness, or none: pending).
+    /// Every record so far was inherited, as in main's `AmbiguousFork`.
+    fn settle_codex_parent_proof_arm(&mut self) {
+        let Some((proof, base)) = self.codex_parent_proof_used.as_ref() else {
+            return;
+        };
+        let decided = self
+            .codex_parent_prefix_decided
+            .is_some_and(|(matched, _, owned)| matched == proof.matched && owned == proof.owned);
+        if decided {
+            return;
+        }
+        debug_assert!(
+            self.codex_parent_prefix_decided.is_none(),
+            "the proof arm decides only on its own digest"
+        );
+        let base = *base;
+        self.codex_parent_prefix_decided = None;
+        self.codex_parent_signatures = base.map(|_| CodexParentPrefix::Ledger(Vec::new()));
+        self.codex_parent_unresolvable = base;
+        self.codex_parent_signature_index = 0;
+        self.codex_legacy_bootstrap_buffer.clear();
+        self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+        self.codex_parent_proof_refusal = Some(ProofRefusal::Decision);
     }
 
     fn codex_parent_resolution_pending(&self) -> bool {
@@ -15750,7 +15853,6 @@ impl CodexParentUnresolvable {
         Self::ALL.get(usize::from(index)).copied()
     }
     /// U1a: held for want of parent evidence a prefix proof supplies.
-    #[allow(dead_code)] // first production caller is the owe
     pub(in crate::snapshots) fn proof_owed(self) -> bool {
         self.cap() || self.deferred()
     }
@@ -16134,6 +16236,122 @@ fn codex_parent_open(
     codex_parent_open_match(census, found[0]).map(|(_path, identity, file)| (identity, file))
 }
 
+/// U1a-2a (rev 2 §5.2(12)): budgeted mode, where proof work is owed: a
+/// Codex scan with a shared cache on the validated layout.
+fn codex_parent_proofs_enabled(
+    source: SnapshotSource,
+    sampling: Option<&sampled_scan::Context>,
+) -> bool {
+    source == SnapshotSource::Codex
+        && sampling.is_some()
+        && crate::heap_layout_bound::layout_supported()
+}
+
+/// U1a-2a (D6(a), rev 2 §5.2(7)): P's unique, cap-free locate for a proof
+/// use: one census pass, the scan root, no-follow metadata, a regular file,
+/// `open_candidate_beneath_root`, and the opened (dev, ino) equal to the
+/// path's. Returns P's census key (its local index key) and the FD. No
+/// content is read.
+fn codex_parent_locate(
+    census: CodexParentCensus<'_>,
+    session_id: &str,
+) -> Result<(String, File), CodexParentUnresolvable> {
+    use CodexParentUnresolvable::*;
+    let session_id = resolve_codex_identity(session_id);
+    let key = match codex_parent_census_matches(census, &[session_id.as_str()])[0] {
+        CodexCensusMatch::Absent => return Err(Absent),
+        CodexCensusMatch::Duplicated => return Err(Duplicated),
+        CodexCensusMatch::One(key) => key,
+    };
+    let path = PathBuf::from(key);
+    let scan_root = census
+        .scan_roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+        .ok_or(Absent)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| Absent)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(NotRegular);
+    }
+    let candidate = CandidateFile {
+        scan_root,
+        path,
+        size_bytes: metadata.len(),
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: String::new(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let file = open_candidate_beneath_root(&candidate).map_err(|_| Absent)?;
+    let opened = file.metadata().map_err(|_| Absent)?;
+    if !opened.is_file() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return Err(NotRegular);
+    }
+    Ok((key.to_owned(), file))
+}
+
+/// U1a-2a (D6(a); rev 3 §1.4, §5.3): install `candidate`'s `Proven` proof
+/// into its Codex parser at construction, every mode, only on a
+/// frozen-valid census page and only from this pass's own index (its
+/// namespace). Every P-side use check runs here, before any child byte is
+/// parsed: the proof's scope and digest (`installable`), P's unique
+/// cap-free locate, P's settled side record covering the seal
+/// (`codex_parent_side_fence` = `Admitted`) and `PrefixSeal::admits` on that
+/// FD, never as a publication. A refusal installs nothing, so the parse is
+/// main's exactly; it rides to the record site, which settles the entry.
+/// The decision check is at the parser's finish. Returns whether P's FD was
+/// opened (the caller charges the two samples).
+fn install_codex_parent_proof(
+    parser: &mut OwnedJsonlParser,
+    candidate: &CandidateFile,
+    index: &mut ScanIndex,
+    identities: &CodexParentIdentities,
+    side: Option<(&sampled_scan::SharedCache, u128)>,
+    now: u64,
+) -> bool {
+    let key = local_index_key(&candidate.path);
+    let Some(CodexParentProofState::Proven(proof)) = index.codex_parent_prefix_proofs.get(&key)
+    else {
+        return false;
+    };
+    let scope = codex_parent_proof_scope();
+    let Some(digest) = proof.installable(&scope) else {
+        return false;
+    };
+    let proof = proof.clone();
+    let census = identities.census(index);
+    if !census.available {
+        return false;
+    }
+    let located = codex_parent_locate(census, &proof.parent);
+    let refusal = match located {
+        Err(cause) => Some(ProofRefusal::Identity(cause)),
+        Ok((p_key, mut file)) => {
+            let needed = proof.parent_seal.sealed_offset();
+            match index.codex_parent_side_fence(&p_key, &mut file, needed, now, side) {
+                SideFence::Admitted => proof
+                    .parent_seal
+                    .admits(&mut file, &scope, now, false)
+                    .err()
+                    .map(ProofRefusal::Seal),
+                fenced => Some(ProofRefusal::Side(
+                    index.codex_parent_held_wake(&p_key, &file, fenced, needed),
+                )),
+            }
+        }
+    };
+    let opened = !matches!(refusal, Some(ProofRefusal::Identity(_)));
+    match refusal {
+        None => parser.accumulator.codex_parent_prefix_proof = Some((proof, digest)),
+        Some(refusal) => parser.accumulator.codex_parent_proof_refusal = Some(refusal),
+    }
+    opened
+}
+
 #[cfg(test)]
 thread_local! {
     /// B2-T1 seam: runs after a Codex candidate's memo lookup (which probes
@@ -16233,6 +16451,101 @@ pub(in crate::snapshots) type PrefixDigest = [u8; 32];
 /// U1a: the chain's format tag (and its seed).
 #[allow(dead_code)] // first production callers are the proof job and finish
 const CODEX_PARENT_PROOF_FORMAT: &str = "codex_parent_prefix_proof:v1";
+
+/// U1a-2a (D6(a), rev 2 §1.2): the interpretation binding of every proof,
+/// stored in its seal (`PrefixSeal.scope`): a format, parser, scan
+/// identity or join proof version bump refuses as `ScopeChanged`.
+pub(in crate::snapshots) fn codex_parent_proof_scope() -> crate::transcript_acquisition::Scope {
+    crate::transcript_acquisition::Scope(sha256_hex(&[
+        CODEX_PARENT_PROOF_FORMAT,
+        SnapshotSource::Codex.parser_version(),
+        SnapshotSource::Codex.scan_identity_version(),
+        sampled_scan::codex_cursor::CODEX_JOIN_PROOF_VERSION,
+    ]))
+}
+
+/// U1a-2a (D6(a), rev 2 §1.3): where the fork arm reads P's signatures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum CodexParentPrefix {
+    /// A validated step-map ledger: main's arm exactly.
+    Ledger(Vec<String>),
+    /// An installed, P-fenced proof: P's first `matched` signatures are the
+    /// child's, and P's next one differs, for the child whose chain through
+    /// that record is `digest`.
+    Proof { matched: u64, digest: PrefixDigest },
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CodexParentPrefix {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Ledger(values) => {
+                crate::heap_layout_bound::HeapLayoutBound::heap_bound(values, c)
+            }
+            Self::Proof { .. } => c.add(0),
+        }
+    }
+}
+
+/// U1a-2a: what P holds at the child's signature index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentAt {
+    Equal,
+    /// P's signature exists and differs: the arm decides.
+    Differs,
+    /// The ledger has no signature at this index.
+    Exhausted,
+    /// The child's chain through the deciding record is not the proven one.
+    ProofMismatch,
+}
+
+impl CodexParentPrefix {
+    /// The proof arm needs the child's chain through each signature.
+    fn chains(&self) -> bool {
+        matches!(self, Self::Proof { .. })
+    }
+
+    /// P at child signature index `at`. `chained` is the child's chain
+    /// through `signature` (the proof arm only). `Ledger` is main's
+    /// comparison; `Proof` answers `Equal` below `matched` (the digest
+    /// checks those signatures at `matched`) and decides only there.
+    fn at(&self, at: usize, signature: &str, chained: Option<&PrefixDigest>) -> ParentAt {
+        match self {
+            Self::Ledger(values) => match values.get(at) {
+                Some(value) if value == signature => ParentAt::Equal,
+                Some(_) => ParentAt::Differs,
+                None => ParentAt::Exhausted,
+            },
+            Self::Proof { matched, digest } => match (at as u64).cmp(matched) {
+                std::cmp::Ordering::Less => ParentAt::Equal,
+                std::cmp::Ordering::Equal if chained == Some(digest) => ParentAt::Differs,
+                _ => ParentAt::ProofMismatch,
+            },
+        }
+    }
+}
+
+/// U1a-2a (D6(a), rev 3 §3.2): why a child's proof was refused. A refusal
+/// installs nothing (or restores main's evidence), so the parse is main's;
+/// the record site settles the entry from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum ProofRefusal {
+    /// P's unique locate failed: keep the proof (PR-P holds the child).
+    Identity(CodexParentUnresolvable),
+    /// P's side record is held, unknown or stale: the proof is kept for a
+    /// re-fence under this wake (`ProofWake::ParentHeld`).
+    Side(ProofWake),
+    /// `PrefixSeal::admits` refused: remove, re-owe.
+    Seal(crate::transcript_acquisition::FullReason),
+    /// The parse did not decide as the proof says: remove, re-owe.
+    Decision,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ProofRefusal {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Side(wake) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(wake, c),
+            Self::Identity(_) | Self::Seal(_) | Self::Decision => c.add(0),
+        }
+    }
+}
 
 /// U1a: a persisted parent-prefix proof for one fork child (local index
 /// key). Only divergence outcomes are stored. Never authoritative alone:
@@ -16380,7 +16693,6 @@ impl ProofOutcome {
 /// U1a: who owes the proof. `Child`: the child's own proof-owed PR-P cause.
 /// `Lineage`: a P owed by a child's job (P's in-job cause, or
 /// `CAUSE_NO_EVIDENCE`).
-#[allow(dead_code)] // first production caller is the owe
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(in crate::snapshots) enum OwedOrigin {
@@ -16476,7 +16788,6 @@ impl CodexParentProofOwed {
 }
 
 /// U1a: one child's proof state.
-#[allow(dead_code)] // first production callers are the owe and finish
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(in crate::snapshots) enum CodexParentProofState {
@@ -16559,7 +16870,6 @@ fn fold_owed_parent_out(live: &mut BTreeMap<String, u32>, parent: &str) {
 
 /// U1a-2a (row 2, rev 3 §3.2): a record-site transition of one child's
 /// proof entry after the fence.
-#[allow(dead_code)] // first production caller is the record site (rows 8/39a)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum ProofSettle {
     /// The fence admitted the `Proven` entry; `debt` is the seal's staged
@@ -16784,6 +17094,110 @@ impl ScanIndex {
             }
         }
         sweep
+    }
+
+    /// U1a-2a (D6(a), rev 3 §3.2): the record-site transition of a
+    /// singleton's proof entry from its parse, every mode:
+    /// - admitted (used, decided as proven, no refusal) → kept, never a
+    ///   publication;
+    /// - complete otherwise → removed (resolved another way);
+    /// - refused by its seal or its decision → removed (the owe re-proves);
+    /// - refused by P's identity → kept (PR-P holds the child);
+    /// - refused by P's side under a proof-owed cause →
+    ///   `Owed{ParentHeld, kept}` (a pending parse has no cause yet:
+    ///   unchanged until it settles);
+    /// - held under a cause no proof cures → an `Owed` entry is removed;
+    /// - an entry for another parent (or none) → removed.
+    pub(in crate::snapshots) fn settle_codex_parent_proof_use(
+        &mut self,
+        key: &str,
+        parsed: &ParsedJsonlFile,
+    ) {
+        let refusal = parsed.codex_parent_proof_refusal.as_ref();
+        let cause = parsed.codex_parent_unresolvable;
+        let settle = if refusal.is_none()
+            && parsed.codex_parent_proof_used.is_some()
+            && parsed.codex_parent_prefix_decided.is_some()
+        {
+            Some(ProofSettle::Admitted { debt: false })
+        } else if parsed.complete() {
+            Some(ProofSettle::Remove)
+        } else {
+            match refusal {
+                Some(ProofRefusal::Seal(_) | ProofRefusal::Decision) => Some(ProofSettle::Remove),
+                Some(ProofRefusal::Identity(_)) => None,
+                Some(ProofRefusal::Side(wake)) => {
+                    cause
+                        .filter(|cause| cause.proof_owed())
+                        .map(|cause| ProofSettle::ParentHeld {
+                            cause: cause.index() as u8,
+                            wake: wake.clone(),
+                        })
+                }
+                None => cause
+                    .filter(|cause| !cause.proof_owed())
+                    .map(|_| ProofSettle::RemoveOwed),
+            }
+        };
+        if let Some(settle) = settle {
+            self.settle_codex_parent_proof_entry(key, settle);
+        }
+        let parent = parsed
+            .codex_parent_session_ref
+            .as_deref()
+            .map(resolve_codex_identity);
+        let entry_parent = match self.codex_parent_prefix_proofs.get(key) {
+            Some(CodexParentProofState::Proven(proof)) => Some(proof.parent.as_str()),
+            Some(CodexParentProofState::Owed(owed)) => Some(owed.parent.as_str()),
+            None => None,
+        };
+        if entry_parent.is_some_and(|entry_parent| parent.as_deref() != Some(entry_parent)) {
+            self.remove_codex_parent_proof(key);
+        }
+    }
+
+    /// U1a-2a (rev 3 §1.6): the fingerprint of P's own proof-map entry for a
+    /// `ParentHeld` wake: `none`, `owed:{outcome}:{attempts}` or
+    /// `proven:{child_digest}`.
+    pub(in crate::snapshots) fn codex_parent_entry_fingerprint(&self, key: &str) -> String {
+        match self.codex_parent_prefix_proofs.get(key) {
+            None => "none".to_owned(),
+            Some(CodexParentProofState::Owed(owed)) => {
+                format!("owed:{}:{}", owed.outcome, owed.attempts)
+            }
+            Some(CodexParentProofState::Proven(proof)) => format!("proven:{}", proof.child_digest),
+        }
+    }
+
+    /// U1a-2a (D6(a), rev 3 §1.6): the wake of a proof whose P-side fence
+    /// refused (`fenced`) on P's held `file`: P's side generation (0 when
+    /// absent), P's own entry, P's stamp, lineage, and the sealed offset a
+    /// stale record must cover. No stamp: `Backoff`.
+    fn codex_parent_held_wake(
+        &self,
+        p_key: &str,
+        file: &File,
+        fenced: SideFence,
+        needed: u64,
+    ) -> ProofWake {
+        let Ok(parent) = sampled_scan::codex_cursor::OpenStamp::capture(file) else {
+            return ProofWake::Backoff;
+        };
+        ProofWake::ParentHeld {
+            parent_key: p_key.to_owned(),
+            generation: self
+                .codex_parent_side
+                .get(p_key)
+                .map_or(0, |record| record.generation),
+            parent_entry: self.codex_parent_entry_fingerprint(p_key),
+            parent,
+            lineage: matches!(fenced, SideFence::Held { lineage: true, .. }),
+            needed_extent: if matches!(fenced, SideFence::Stale) {
+                needed
+            } else {
+                0
+            },
+        }
     }
 
     /// U1a-2a (row 35): this index's proof incarnation for a use that binds
@@ -20492,6 +20906,24 @@ impl OwnedSourceScan {
                         census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     };
+                    // U1a-2a (D6(a)): the replacement parser gets the same
+                    // P-fenced install (never on a side read).
+                    if source == SnapshotSource::Codex && active.side_origin.is_none() {
+                        let side = sampling
+                            .as_ref()
+                            .zip(codex_side_pass)
+                            .map(|(context, pass)| (&*context.cache, pass.ns));
+                        if install_codex_parent_proof(
+                            &mut parser,
+                            &active.candidate,
+                            index,
+                            &codex_parent_identities,
+                            side,
+                            sampled_scan::now_seconds(),
+                        ) {
+                            codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                        }
+                    }
                     let acquisition = active.sampling.as_mut().expect("sampled acquisition");
                     let debt = index
                         .files
@@ -21202,6 +21634,39 @@ impl OwnedSourceScan {
                     } else if codex_parent_identities.restart_budget_spent {
                         parsed_file
                             .defer_parent_resolution(CodexParentUnresolvable::DeferredRestart);
+                    }
+                }
+                // U1a-2a (D6(a), rev 3 §3.1–§3.2): a singleton settles its
+                // proof entry from this parse in every mode; a budgeted held
+                // singleton whose cause a proof cures owes one. Groups hold
+                // no proof entries.
+                if source == SnapshotSource::Codex {
+                    let key = local_index_key(&candidate.path);
+                    if aliases.is_empty() {
+                        index.settle_codex_parent_proof_use(&key, &parsed_file);
+                        if codex_parent_proofs_enabled(source, sampling.as_ref())
+                            && !parsed_file.complete()
+                        {
+                            if let (Some(cause), Some(parent)) = (
+                                parsed_file
+                                    .codex_parent_unresolvable
+                                    .filter(|cause| cause.proof_owed()),
+                                parsed_file.codex_parent_session_ref.as_deref(),
+                            ) {
+                                index.owe_codex_parent_proof(
+                                    &key,
+                                    &resolve_codex_identity(parent),
+                                    cause.index() as u8,
+                                    OwedOrigin::Child,
+                                    false,
+                                );
+                            }
+                        }
+                    } else {
+                        index.remove_codex_parent_proof(&key);
+                        for member in &aliases {
+                            index.remove_codex_parent_proof(&local_index_key(&member.path));
+                        }
                     }
                 }
                 codex_parent_resolution_retry_required |=
@@ -23259,6 +23724,25 @@ impl OwnedSourceScan {
                     pending!();
                 }
             };
+            // U1a-2a (D6(a)): this child's proof, P-fenced before its parse.
+            // A side read is P's, never a proof consumer.
+            if source == SnapshotSource::Codex && side_origin.is_none() {
+                let side = sampling
+                    .as_ref()
+                    .zip(codex_side_pass)
+                    .map(|(context, pass)| (&*context.cache, pass.ns));
+                if install_codex_parent_proof(
+                    &mut parser,
+                    &candidate,
+                    index,
+                    &codex_parent_identities,
+                    side,
+                    sampled_scan::now_seconds(),
+                ) {
+                    // The fence re-read two samples of P.
+                    codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                }
+            }
             let mut file_sampling = None;
             let mut retained_offset = None;
             // Counted once the page actually reads the file (R2-M3): a fence
@@ -24376,6 +24860,13 @@ struct ParsedJsonlFile {
     codex_parent_ledger_unusable: Option<CodexParentUnresolvable>,
     /// PR-P: this file read a parent ledger (it may record a parent ref).
     codex_parent_ledger_consulted: bool,
+    /// U1a-2a (D6(a)): `(m, chain, owned)` when the proof arm decided as its
+    /// proof says (the only way it is set at finish).
+    codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
+    /// U1a-2a: the proof this parse consumed (admitted iff `decided`).
+    codex_parent_proof_used: Option<CodexParentPrefixProof>,
+    /// U1a-2a: why this child's proof was refused, if it was.
+    codex_parent_proof_refusal: Option<ProofRefusal>,
 }
 
 impl ParsedJsonlFile {
@@ -24396,6 +24887,8 @@ impl ParsedJsonlFile {
         // `DeferredRestart` can be cured (owed, re-read).
         self.codex_parent_ledger_unusable =
             (cause == CodexParentUnresolvable::DeferredRef).then_some(cause);
+        // U1a-2a: a pending parse never admitted a proof.
+        self.codex_parent_prefix_decided = None;
     }
 
     fn complete(&self) -> bool {
@@ -24703,6 +25196,9 @@ impl OwnedJsonlParser {
         {
             accumulator.codex_creator_evidence_conflicted = true;
         }
+        // U1a-2a (D6(a)): the proof's decision check, before any ownership
+        // outcome is read.
+        accumulator.settle_codex_parent_proof_arm();
         let codex_ownership_incomplete =
             source == SnapshotSource::Codex && !accumulator.codex_usage_accounting_complete();
         let codex_parent_resolution_pending =
@@ -24737,6 +25233,12 @@ impl OwnedJsonlParser {
         // lossy or pending file.
         let codex_parent_unresolvable = accumulator.codex_parent_unresolvable;
         let codex_parent_ledger_consulted = accumulator.codex_parent_ledger_consulted;
+        let codex_parent_prefix_decided = accumulator.codex_parent_prefix_decided;
+        let codex_parent_proof_used = accumulator
+            .codex_parent_proof_used
+            .as_ref()
+            .map(|(proof, _)| proof.clone());
+        let codex_parent_proof_refusal = accumulator.codex_parent_proof_refusal.clone();
         let codex_parent_ledger_unusable = {
             use CodexParentUnresolvable::*;
             if source != SnapshotSource::Codex || codex_parent_resolution_pending {
@@ -24849,6 +25351,9 @@ impl OwnedJsonlParser {
             codex_parent_unresolvable,
             codex_parent_ledger_unusable,
             codex_parent_ledger_consulted,
+            codex_parent_prefix_decided,
+            codex_parent_proof_used,
+            codex_parent_proof_refusal,
         })
     }
 }
@@ -73509,7 +74014,8 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
-    codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted);
+    codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
+    codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_only_bytes, body_witness_adoption_deferred, body_witness_adoption_excluded, body_witness_adoption_held_no_list, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass);
@@ -73530,7 +74036,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);

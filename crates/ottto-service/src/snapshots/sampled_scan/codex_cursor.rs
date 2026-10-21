@@ -72,7 +72,8 @@ const ROTATION_KEYS: usize = 64;
 const JOIN_OWNERS: usize = 64;
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
-const CODEX_JOIN_PROOF_VERSION: &str = "codex_join_proof:v2";
+/// U1a-2a (D6(a)): also part of `codex_parent_proof_scope`.
+pub(in crate::snapshots) const CODEX_JOIN_PROOF_VERSION: &str = "codex_join_proof:v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) struct Limits {

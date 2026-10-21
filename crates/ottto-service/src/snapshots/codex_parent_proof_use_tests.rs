@@ -1,0 +1,835 @@
+//! U1a-2a D6(a): proof consumption at `new_source_parser`'s Codex arm,
+//! pinned against BASE (main's parse of the same bytes and evidence): a
+//! refused, missing, mis-scoped or mismatched proof is BASE exactly; only an
+//! admitted proof that decides as it says changes the child. Fixtures are
+//! synthetic bytes; nothing comes from a provider account.
+use super::*;
+use crate::transcript_acquisition::{PrefixSeal, SAMPLE_BYTES};
+use sampled_scan::codex_cursor::OpenStamp;
+use std::os::unix::fs::FileExt;
+
+const PARENT: &str = "019fd6a0-0000-7000-8000-000000000001";
+const CHILD: &str = "019fd6a0-0000-7000-8000-000000000002";
+const OTHER: &str = "019fd6a0-0000-7000-8000-000000000003";
+
+fn temp_root(name: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "ottto-u1a2a-proof-use-{name}-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn rollout(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("rollout-2026-08-02T08-00-00-{id}.jsonl"))
+}
+
+fn write_values(path: &Path, values: &[Value]) {
+    let mut bytes = Vec::new();
+    for value in values {
+        bytes.extend_from_slice(serde_json::to_string(value).unwrap().as_bytes());
+        bytes.push(b'\n');
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+fn turn(timestamp: &str, turn_id: &str) -> Value {
+    json!({"timestamp": timestamp, "type": "turn_context", "payload": {"turn_id": turn_id, "model": "gpt-5.6-sol"}})
+}
+
+fn tokens(timestamp: &str, total: (u64, u64, u64, u64), last: (u64, u64, u64, u64)) -> Value {
+    let usage = |(input, cached, output, reasoning): (u64, u64, u64, u64)| {
+        json!({
+            "input_tokens": input,
+            "cached_input_tokens": cached,
+            "output_tokens": output,
+            "reasoning_output_tokens": reasoning,
+        })
+    };
+    json!({
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": usage(total),
+                "last_token_usage": usage(last),
+                "model": "gpt-5.6-sol",
+            }
+        }
+    })
+}
+
+fn parent_values() -> Vec<Value> {
+    vec![
+        json!({"timestamp": "2026-08-02T08:00:00Z", "type": "session_meta", "payload": {"id": PARENT, "thread_source": "user"}}),
+        turn("2026-08-02T08:00:01Z", "parent-turn"),
+        tokens("2026-08-02T08:00:02Z", (100, 80, 10, 2), (100, 80, 10, 2)),
+        turn("2026-08-02T08:30:01Z", "parent-later"),
+        tokens("2026-08-02T08:30:02Z", (150, 115, 18, 3), (50, 35, 8, 1)),
+    ]
+}
+
+/// A fork of `PARENT` that inherits P's first turn, then diverges.
+fn child_values() -> Vec<Value> {
+    let parent = parent_values();
+    vec![
+        json!({"timestamp": "2026-08-02T08:20:00Z", "type": "session_meta", "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}}),
+        parent[1].clone(),
+        parent[2].clone(),
+        turn("2026-08-02T08:20:01Z", "child-local"),
+        tokens("2026-08-02T08:20:02Z", (115, 92, 13, 3), (15, 12, 3, 1)),
+    ]
+}
+
+fn signatures(values: &[Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(codex_ownership_signature)
+        .collect()
+}
+
+/// The proof of `child` against `parent`: m = the leading signatures the
+/// child shares with P, the chain over the child's s_0..s_m.
+fn proof_of(child: &[Value], parent: &[Value], seal: PrefixSeal) -> CodexParentPrefixProof {
+    let parent = signatures(parent);
+    let child = signatures(&child[1..]);
+    let matched = parent
+        .iter()
+        .zip(&child)
+        .take_while(|(parent, child)| parent == child)
+        .count();
+    let mut digest = codex_parent_prefix_seed();
+    for signature in &child[..=matched] {
+        digest = codex_parent_prefix_chain(&digest, signature);
+    }
+    CodexParentPrefixProof {
+        parent: PARENT.into(),
+        parent_seal: seal,
+        matched: matched as u64,
+        child_digest: codex_digest_hex(&digest),
+        owned: matched > 0,
+        published: false,
+    }
+}
+
+fn installed(proof: &CodexParentPrefixProof) -> (CodexParentPrefixProof, PrefixDigest) {
+    let digest = codex_digest_from_hex(&proof.child_digest).unwrap();
+    (proof.clone(), digest)
+}
+
+/// P's seal as it is now, the way `Checkpoint::seal_as` mints it.
+fn seal_of(file: &File, verified: u64, scope: &str) -> PrefixSeal {
+    let metadata = file.metadata().unwrap();
+    let len = metadata.len();
+    let window = len.min(SAMPLE_BYTES as u64);
+    let digest = |offset: u64| {
+        let mut bytes = vec![0; window as usize];
+        file.read_exact_at(&mut bytes, offset).unwrap();
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    serde_json::from_value(json!({
+        "stamp": {
+            "length": len,
+            "device": metadata.dev(),
+            "inode": metadata.ino(),
+            "modified": [metadata.mtime(), metadata.mtime_nsec()],
+            "changed": [metadata.ctime(), metadata.ctime_nsec()],
+        },
+        "scope": scope,
+        "sample_len": window,
+        "head_sha256": digest(0),
+        "boundary_sha256": digest(len - window),
+        "verified_unix_seconds": verified,
+        "sealed_unix_seconds": verified,
+    }))
+    .unwrap()
+}
+
+/// A placeholder seal for parse-only cases (the parse never reads it).
+fn unused_seal() -> PrefixSeal {
+    let root = temp_root("seal");
+    let path = root.join("p.jsonl");
+    fs::write(&path, b"{}\n").unwrap();
+    seal_of(
+        &File::open(&path).unwrap(),
+        1,
+        &codex_parent_proof_scope().0,
+    )
+}
+
+fn witness(cause: CodexParentUnresolvable) -> BTreeMap<String, CodexParentOwnershipLedger> {
+    BTreeMap::from([(
+        PARENT.to_string(),
+        CodexParentOwnershipLedger {
+            unresolvable: Some(cause),
+            ..Default::default()
+        },
+    )])
+}
+
+fn complete_ledger() -> BTreeMap<String, CodexParentOwnershipLedger> {
+    BTreeMap::from([(
+        PARENT.to_string(),
+        CodexParentOwnershipLedger {
+            signatures: signatures(&parent_values()),
+            scan_complete: true,
+            opened_object_identity: String::new(),
+            unresolvable: None,
+        },
+    )])
+}
+
+fn parse(
+    path: &Path,
+    ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
+    proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
+) -> ParsedJsonlFile {
+    let metadata = CodexTitleMetadata::default();
+    let mut file = File::open(path).unwrap();
+    let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+    let mut parser = OwnedJsonlParser::new(
+        file,
+        path,
+        SnapshotSource::Codex,
+        apply_codex_line,
+        Some(&metadata),
+        None,
+        Some(Arc::new(Mutex::new(ledgers))),
+        true,
+        true,
+    )
+    .unwrap();
+    parser.accumulator.codex_parent_prefix_proof = proof;
+    while !parser.step().unwrap() {}
+    parser
+        .finish(
+            &identity,
+            path,
+            "2026-08-02T09:00:00Z",
+            "fp".to_string(),
+            Some(&metadata),
+            None,
+            None,
+        )
+        .unwrap()
+}
+
+/// Everything main's record site reads from a parse, minus the proof's own
+/// carriers.
+fn view(parsed: &ParsedJsonlFile) -> Value {
+    json!({
+        "snapshots": serde_json::to_value(&parsed.snapshots).unwrap(),
+        "report": format!("{:?}", parsed.report),
+        "complete": parsed.complete(),
+        "pending": parsed.codex_parent_resolution_pending,
+        "ownership_incomplete": parsed.ownership_incomplete_file_count,
+        "recognized_drop": parsed.recognized_usage_drop_count,
+        "dropped": parsed.dropped_usage_record_count,
+        "session_ref": parsed.codex_parent_session_ref,
+        "unresolvable": parsed.codex_parent_unresolvable.map(CodexParentUnresolvable::index),
+        "unusable": parsed.codex_parent_ledger_unusable.map(CodexParentUnresolvable::index),
+        "consulted": parsed.codex_parent_ledger_consulted,
+        "identity_used": parsed.codex_parent_ledger_identity_used,
+    })
+}
+
+/// An admitted proof decides as P's complete ledger would: the same owned
+/// suffix, never main's cap hold. The proof leaves no ledger identity (no
+/// stale-resolution invalidation) and records its decision.
+#[test]
+fn an_admitted_proof_decides_as_the_complete_ledger_would() {
+    let root = temp_root("admit");
+    let child = rollout(&root, CHILD);
+    write_values(&child, &child_values());
+    let proof = proof_of(&child_values(), &parent_values(), unused_seal());
+    assert_eq!((proof.matched, proof.owned), (2, true));
+
+    let base = parse(&child, witness(CodexParentUnresolvable::Oversize), None);
+    assert_eq!(
+        base.codex_parent_unresolvable,
+        Some(CodexParentUnresolvable::Oversize)
+    );
+    assert!(!base.complete());
+    let ledger = parse(&child, complete_ledger(), None);
+    assert!(ledger.complete());
+
+    for evidence in [
+        witness(CodexParentUnresolvable::Oversize),
+        witness(CodexParentUnresolvable::LedgerCapped),
+        BTreeMap::new(),
+    ] {
+        let used = parse(&child, evidence, Some(installed(&proof)));
+        assert_eq!(
+            serde_json::to_value(&used.snapshots).unwrap(),
+            serde_json::to_value(&ledger.snapshots).unwrap()
+        );
+        assert!(used.complete());
+        assert_eq!(used.codex_parent_unresolvable, None);
+        assert_eq!(used.codex_parent_ledger_identity_used, None);
+        assert_eq!(used.codex_parent_proof_used.as_ref(), Some(&proof));
+        assert_eq!(used.codex_parent_proof_refusal, None);
+        assert_eq!(
+            used.codex_parent_prefix_decided,
+            Some((2, codex_digest_from_hex(&proof.child_digest).unwrap(), true))
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A held-at-0 proof holds as main's ledger arm does at index 0.
+#[test]
+fn a_held_at_zero_proof_holds_as_the_ledger_arm_does() {
+    let root = temp_root("zero");
+    let child = rollout(&root, CHILD);
+    let values = {
+        let mut values = child_values();
+        values.drain(1..3);
+        values
+    };
+    write_values(&child, &values);
+    let proof = proof_of(&values, &parent_values(), unused_seal());
+    assert_eq!((proof.matched, proof.owned), (0, false));
+    let ledger = parse(&child, complete_ledger(), None);
+    let used = parse(
+        &child,
+        witness(CodexParentUnresolvable::Oversize),
+        Some(installed(&proof)),
+    );
+    assert_eq!(
+        serde_json::to_value(&used.snapshots).unwrap(),
+        serde_json::to_value(&ledger.snapshots).unwrap()
+    );
+    assert_eq!(used.complete(), ledger.complete());
+    assert_eq!(used.codex_parent_unresolvable, None);
+    assert_eq!(used.codex_parent_proof_refusal, None);
+    assert_eq!(
+        used.codex_parent_prefix_decided
+            .map(|(m, _, owned)| (m, owned)),
+        Some((0, false))
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// D6(a) BASE pins at the arm: a chain mismatch, EOF inside the proven
+/// prefix, a held-at-0 claim the child does not make, and a proof for
+/// another parent are each BASE exactly (main's witness hold, or main's
+/// pending child with no evidence); a non-cap witness never consults a
+/// proof.
+#[test]
+fn a_mismatched_or_undecided_proof_is_base_exactly() {
+    let root = temp_root("mismatch");
+    let child = rollout(&root, CHILD);
+    write_values(&child, &child_values());
+    let good = proof_of(&child_values(), &parent_values(), unused_seal());
+    let wrong_chain = CodexParentPrefixProof {
+        child_digest: codex_digest_hex(&codex_parent_prefix_chain(
+            &codex_parent_prefix_seed(),
+            "x",
+        )),
+        ..good.clone()
+    };
+    let beyond_eof = CodexParentPrefixProof {
+        matched: 9,
+        ..good.clone()
+    };
+    let held_claim = CodexParentPrefixProof {
+        matched: 0,
+        owned: false,
+        child_digest: codex_digest_hex(&codex_parent_prefix_chain(
+            &codex_parent_prefix_seed(),
+            &signatures(&child_values()[3..])[0],
+        )),
+        ..good.clone()
+    };
+    for evidence in [
+        witness(CodexParentUnresolvable::Oversize),
+        witness(CodexParentUnresolvable::LedgerCapped),
+        BTreeMap::new(),
+    ] {
+        let base = parse(&child, evidence.clone(), None);
+        for (name, proof) in [
+            ("chain", &wrong_chain),
+            ("eof", &beyond_eof),
+            ("held", &held_claim),
+        ] {
+            let refused = parse(&child, evidence.clone(), Some(installed(proof)));
+            assert_eq!(view(&refused), view(&base), "{name}");
+            assert_eq!(
+                refused.codex_parent_proof_refusal,
+                Some(ProofRefusal::Decision),
+                "{name}"
+            );
+            assert_eq!(refused.codex_parent_prefix_decided, None, "{name}");
+            assert!(!refused.complete(), "{name}");
+        }
+        let other_parent = CodexParentPrefixProof {
+            parent: OTHER.into(),
+            ..good.clone()
+        };
+        let ignored = parse(&child, evidence.clone(), Some(installed(&other_parent)));
+        assert_eq!(view(&ignored), view(&base));
+        assert_eq!(ignored.codex_parent_proof_used, None);
+        assert_eq!(ignored.codex_parent_proof_refusal, None);
+    }
+    // No evidence: BASE is main's pending child.
+    assert!(parse(&child, BTreeMap::new(), None).codex_parent_resolution_pending);
+    // A non-cap witness never consults the proof.
+    for cause in [
+        CodexParentUnresolvable::Absent,
+        CodexParentUnresolvable::Duplicated,
+        CodexParentUnresolvable::ParentHeld,
+    ] {
+        let base = parse(&child, witness(cause), None);
+        let ignored = parse(&child, witness(cause), Some(installed(&good)));
+        assert_eq!(view(&ignored), view(&base), "{cause:?}");
+        assert_eq!(ignored.codex_parent_proof_used, None);
+    }
+    // A complete ledger wins over the proof.
+    let base = parse(&child, complete_ledger(), None);
+    let ignored = parse(&child, complete_ledger(), Some(installed(&wrong_chain)));
+    assert_eq!(view(&ignored), view(&base));
+    assert_eq!(ignored.codex_parent_proof_used, None);
+    let _ = fs::remove_dir_all(root);
+}
+
+struct Scene {
+    root: PathBuf,
+    parent: PathBuf,
+    child: CandidateFile,
+    index: ScanIndex,
+}
+
+impl Scene {
+    /// P and C on a frozen-valid census, P's side settled and covering, and
+    /// C's `Proven` proof sealed over P as it is now.
+    fn new(name: &str) -> Self {
+        let root = temp_root(name);
+        let parent = rollout(&root, PARENT);
+        write_values(&parent, &parent_values());
+        let child_path = rollout(&root, CHILD);
+        write_values(&child_path, &child_values());
+        let now = sampled_scan::now_seconds();
+        let p_file = File::open(&parent).unwrap();
+        let proof = proof_of(
+            &child_values(),
+            &parent_values(),
+            seal_of(&p_file, now, &codex_parent_proof_scope().0),
+        );
+        let mut index = ScanIndex {
+            traversal: Some(ScanTraversalCheckpoint {
+                context_fingerprint: "proof-use".to_string(),
+                census_window_end: "2026-08-03T00:00:00Z".to_string(),
+                scan_roots: vec![root.clone()],
+                pending_directories: VecDeque::new(),
+                pending_candidates: VecDeque::new(),
+                observed_index_keys: BTreeSet::new(),
+                codex_rollout_paths: BTreeSet::from([
+                    local_index_key(&parent),
+                    local_index_key(&child_path),
+                ]),
+                codex_join_directory_census: None,
+                reconciliation_upper_bound: None,
+                reconciliation_after: None,
+                reconciliation_started: false,
+                watcher_hint_seen: false,
+                codex_parent_resolution_retry_required: false,
+                unhealthy_retry_attempt: 0,
+                unhealthy_retry_not_before_unix_seconds: None,
+                counts: ScanTraversalCounts::default(),
+                residue: ScanTraversalResidue::default(),
+            }),
+            ..ScanIndex::default()
+        };
+        index.codex_parent_prefix_proofs.insert(
+            local_index_key(&child_path),
+            CodexParentProofState::Proven(proof),
+        );
+        let mut scene = Self {
+            root: root.clone(),
+            parent,
+            child: CandidateFile {
+                scan_root: root,
+                path: child_path,
+                size_bytes: 0,
+                modified_unix_seconds: 0,
+                modified_unix_nanos: 0,
+                source_file_fingerprint: String::new(),
+                legacy_source_file_fingerprint: String::new(),
+                legacy_config_reconciliation_required: false,
+                opened_object_identity: String::new(),
+            },
+            index,
+        };
+        scene.settle_side(now);
+        scene
+    }
+
+    fn settle_side(&mut self, now: u64) {
+        let file = File::open(&self.parent).unwrap();
+        self.index.codex_parent_side.insert(
+            local_index_key(&self.parent),
+            CodexParentSide {
+                verdict: SideVerdict::Settled,
+                seal: seal_of(&file, now, &codex_parent_side_scope().0),
+                parsed: OpenStamp::capture(&file).unwrap(),
+                pace: None,
+                generation: 1,
+                referenced_epoch: 0,
+            },
+        );
+    }
+
+    fn key(&self) -> String {
+        local_index_key(&self.child.path)
+    }
+
+    fn proof(&self) -> CodexParentPrefixProof {
+        match self.index.codex_parent_prefix_proofs.get(&self.key()) {
+            Some(CodexParentProofState::Proven(proof)) => proof.clone(),
+            other => panic!("not proven: {other:?}"),
+        }
+    }
+
+    /// One install into a fresh parser: (opened, installed, refusal).
+    fn install(&mut self) -> (bool, Option<CodexParentPrefixProof>, Option<ProofRefusal>) {
+        let identities =
+            CodexParentIdentities::new(SnapshotSource::Codex, self.index.traversal.as_ref());
+        let mut parser = OwnedJsonlParser::new(
+            File::open(&self.child.path).unwrap(),
+            &self.child.path,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            None,
+            None,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let opened = install_codex_parent_proof(
+            &mut parser,
+            &self.child,
+            &mut self.index,
+            &identities,
+            None,
+            sampled_scan::now_seconds(),
+        );
+        (
+            opened,
+            parser
+                .accumulator
+                .codex_parent_prefix_proof
+                .take()
+                .map(|(proof, _)| proof),
+            parser.accumulator.codex_parent_proof_refusal.take(),
+        )
+    }
+}
+
+impl Drop for Scene {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// The install admits only this pass's own `Proven` entry, in scope, on a
+/// unique cap-free locate, a settled covering side record and the seal.
+#[test]
+fn the_install_admits_only_a_fenced_in_scope_proof() {
+    let mut scene = Scene::new("install");
+    let proof = scene.proof();
+    assert_eq!(scene.install(), (true, Some(proof.clone()), None));
+    // No `published` write, no request armed: a use is never a publication.
+    assert_eq!(scene.proof(), proof);
+    assert!(scene.index.codex_parent_side_requests.is_empty());
+}
+
+/// D6(a) BASE pins at the install: missing proof, wrong namespace or scope
+/// (another index, another proof scope, an owed entry), an unavailable
+/// census, an ambiguous parent, an unsettled side and a stale seal each
+/// install nothing, so the parse is main's exactly.
+#[test]
+fn a_missing_foreign_or_refused_proof_installs_nothing() {
+    // Missing proof / wrong namespace: this pass's index holds no entry for
+    // C (the proof lives in another index), or only an owed one.
+    let mut scene = Scene::new("missing");
+    let proof = scene.proof();
+    let key = scene.key();
+    let foreign = std::mem::take(&mut scene.index.codex_parent_prefix_proofs);
+    assert!(foreign.contains_key(&key));
+    assert_eq!(scene.install(), (false, None, None));
+    scene.index.codex_parent_prefix_proofs.insert(
+        key.clone(),
+        CodexParentProofState::Owed(CodexParentProofOwed::new(
+            PARENT.into(),
+            0,
+            CodexParentUnresolvable::Oversize.index() as u8,
+            OwedOrigin::Child,
+        )),
+    );
+    assert_eq!(scene.install(), (false, None, None));
+    // Another proof scope (a parser, identity or format bump).
+    let mut other_scope = proof.clone();
+    other_scope.parent_seal = seal_of(
+        &File::open(&scene.parent).unwrap(),
+        sampled_scan::now_seconds(),
+        &sha256_hex(&["another-proof-scope"]),
+    );
+    scene
+        .index
+        .codex_parent_prefix_proofs
+        .insert(key.clone(), CodexParentProofState::Proven(other_scope));
+    assert_eq!(scene.install(), (false, None, None));
+
+    // An unavailable census (an unfrozen page).
+    let mut scene = Scene::new("census");
+    scene
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_directories
+        .push_back(ScanTraversalPath {
+            scan_root: scene.root.clone(),
+            path: scene.root.join("sub"),
+            census_member: true,
+            watcher_hint: false,
+        });
+    assert_eq!(scene.install(), (false, None, None));
+
+    // An ambiguous parent: two rollouts claim P's id.
+    let mut scene = Scene::new("ambiguous");
+    let twin_dir = scene.root.join("twin");
+    fs::create_dir_all(&twin_dir).unwrap();
+    let twin = rollout(&twin_dir, PARENT);
+    write_values(&twin, &parent_values());
+    scene
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .codex_rollout_paths
+        .insert(local_index_key(&twin));
+    assert_eq!(
+        scene.install(),
+        (
+            false,
+            None,
+            Some(ProofRefusal::Identity(CodexParentUnresolvable::Duplicated))
+        )
+    );
+
+    // P's side unsettled: no record (held or unknown).
+    let mut scene = Scene::new("side");
+    scene.index.codex_parent_side.clear();
+    let (opened, installed, refusal) = scene.install();
+    assert!(opened);
+    assert_eq!(installed, None);
+    assert!(
+        matches!(
+            refusal,
+            Some(ProofRefusal::Side(ProofWake::ParentHeld { .. }))
+        ),
+        "{refusal:?}"
+    );
+
+    // A stale seal: P's head was rewritten after the proof was sealed; P's
+    // side was re-settled over the new bytes, so only the seal refuses.
+    let mut scene = Scene::new("stale");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&scene.parent)
+        .unwrap()
+        .write_all_at(b" ", 0)
+        .unwrap();
+    scene.settle_side(sampled_scan::now_seconds());
+    let (opened, installed, refusal) = scene.install();
+    assert!(opened);
+    assert_eq!(installed, None);
+    assert!(
+        matches!(refusal, Some(ProofRefusal::Seal(_))),
+        "{refusal:?}"
+    );
+}
+
+fn parsed(parent: Option<&str>) -> ParsedJsonlFile {
+    ParsedJsonlFile {
+        snapshots: Vec::new(),
+        report: JsonlReadReport::default(),
+        recognized_usage_drop_count: 0,
+        ownership_incomplete_file_count: 0,
+        zero_snapshot_usage_evidence: false,
+        dropped_usage_record_count: 0,
+        terminal_line_loss_count: 0,
+        state_only_blocked_session_ids: BTreeSet::new(),
+        codex_parent_session_ref: parent.map(str::to_owned),
+        codex_parent_ledger_identity_used: None,
+        codex_parent_resolution_pending: false,
+        codex_parent_ownership_ledger: None,
+        codex_parent_unresolvable: None,
+        codex_parent_ledger_unusable: None,
+        codex_parent_ledger_consulted: true,
+        codex_parent_prefix_decided: None,
+        codex_parent_proof_used: None,
+        codex_parent_proof_refusal: None,
+    }
+}
+
+fn held(cause: CodexParentUnresolvable) -> ParsedJsonlFile {
+    ParsedJsonlFile {
+        ownership_incomplete_file_count: 1,
+        codex_parent_unresolvable: Some(cause),
+        ..parsed(Some(PARENT))
+    }
+}
+
+/// rev 3 §3.2 at the record site, one row per outcome.
+#[test]
+fn the_record_site_settles_the_entry_per_the_table() {
+    let scene = Scene::new("settle");
+    let key = scene.key();
+    let proof = scene.proof();
+    let proven = || {
+        let mut index = ScanIndex::default();
+        index
+            .codex_parent_prefix_proofs
+            .insert(key.clone(), CodexParentProofState::Proven(proof.clone()));
+        index
+    };
+    let state = |index: &ScanIndex| index.codex_parent_prefix_proofs.get(&key).cloned();
+    let wake = ProofWake::Due;
+
+    // Admitted: kept, never a publication.
+    let mut index = proven();
+    index.settle_codex_parent_proof_use(
+        &key,
+        &ParsedJsonlFile {
+            codex_parent_proof_used: Some(proof.clone()),
+            codex_parent_prefix_decided: Some((2, [0; 32], true)),
+            ..parsed(Some(PARENT))
+        },
+    );
+    assert_eq!(
+        state(&index),
+        Some(CodexParentProofState::Proven(proof.clone()))
+    );
+
+    // Seal or decision refused (child held): removed, the owe re-proves.
+    for refusal in [
+        ProofRefusal::Seal(crate::transcript_acquisition::FullReason::Replaced),
+        ProofRefusal::Decision,
+    ] {
+        let mut index = proven();
+        index.settle_codex_parent_proof_use(
+            &key,
+            &ParsedJsonlFile {
+                codex_parent_proof_refusal: Some(refusal),
+                ..held(CodexParentUnresolvable::Oversize)
+            },
+        );
+        assert_eq!(state(&index), None);
+    }
+
+    // Identity refused: kept.
+    let mut index = proven();
+    index.settle_codex_parent_proof_use(
+        &key,
+        &ParsedJsonlFile {
+            codex_parent_proof_refusal: Some(ProofRefusal::Identity(
+                CodexParentUnresolvable::Duplicated,
+            )),
+            ..held(CodexParentUnresolvable::Oversize)
+        },
+    );
+    assert_eq!(
+        state(&index),
+        Some(CodexParentProofState::Proven(proof.clone()))
+    );
+
+    // Side refused under a proof-owed cause: owed, proof kept.
+    let mut index = proven();
+    index.settle_codex_parent_proof_use(
+        &key,
+        &ParsedJsonlFile {
+            codex_parent_proof_refusal: Some(ProofRefusal::Side(wake.clone())),
+            ..held(CodexParentUnresolvable::Oversize)
+        },
+    );
+    match state(&index) {
+        Some(CodexParentProofState::Owed(owed)) => {
+            assert_eq!(owed.kept.as_deref(), Some(&proof));
+            assert_eq!(owed.cause, CodexParentUnresolvable::Oversize.index() as u8);
+            assert_eq!(owed.wake, wake);
+        }
+        other => panic!("not owed: {other:?}"),
+    }
+    // Side refused under a cause no proof cures: kept as it was.
+    let mut index = proven();
+    index.settle_codex_parent_proof_use(
+        &key,
+        &ParsedJsonlFile {
+            codex_parent_proof_refusal: Some(ProofRefusal::Side(wake.clone())),
+            ..held(CodexParentUnresolvable::Absent)
+        },
+    );
+    assert_eq!(
+        state(&index),
+        Some(CodexParentProofState::Proven(proof.clone()))
+    );
+
+    // Complete without the proof (resolved another way): removed, even
+    // beside a refusal.
+    for refusal in [None, Some(ProofRefusal::Side(wake.clone()))] {
+        let mut index = proven();
+        index.settle_codex_parent_proof_use(
+            &key,
+            &ParsedJsonlFile {
+                codex_parent_proof_refusal: refusal,
+                ..parsed(Some(PARENT))
+            },
+        );
+        assert_eq!(state(&index), None);
+    }
+
+    // Held under a cause no proof cures: an owed entry goes, a proven stays.
+    let mut index = ScanIndex::default();
+    assert!(index.owe_codex_parent_proof(
+        &key,
+        PARENT,
+        CodexParentUnresolvable::Oversize.index() as u8,
+        OwedOrigin::Child,
+        false,
+    ));
+    index.settle_codex_parent_proof_use(&key, &held(CodexParentUnresolvable::Absent));
+    assert_eq!(state(&index), None);
+    assert!(index.codex_parent_proof_parents_live.is_empty());
+    let mut index = proven();
+    index.settle_codex_parent_proof_use(&key, &held(CodexParentUnresolvable::Absent));
+    assert_eq!(
+        state(&index),
+        Some(CodexParentProofState::Proven(proof.clone()))
+    );
+
+    // Another parent, or none: removed.
+    for parent in [Some(OTHER), None] {
+        let mut index = proven();
+        index.settle_codex_parent_proof_use(
+            &key,
+            &ParsedJsonlFile {
+                codex_parent_session_ref: parent.map(str::to_owned),
+                ..held(CodexParentUnresolvable::Oversize)
+            },
+        );
+        assert_eq!(state(&index), None, "{parent:?}");
+    }
+}

@@ -20,6 +20,9 @@ fn parsed() -> ParsedJsonlFile {
         codex_parent_unresolvable: None,
         codex_parent_ledger_unusable: None,
         codex_parent_ledger_consulted: false,
+        codex_parent_prefix_decided: None,
+        codex_parent_proof_used: None,
+        codex_parent_proof_refusal: None,
     }
 }
 
