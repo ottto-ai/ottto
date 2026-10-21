@@ -152,7 +152,9 @@ fn census_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usiz
         .iter()
         .find(|(key, _)| key.ends_with(&format!("{terminal_root}.jsonl")))
         .map(|(_, entry)| entry.source_file_fingerprint.clone())
-        .unwrap_or_default();
+        .filter(|revision| revision.len() == 64)
+        // A rearmed entry has no revision; any well-formed one seeds the debt.
+        .unwrap_or_else(|| "c".repeat(64));
     index.insert_unproven_terminal_claude_authority_for_test(terminal_root, &revision);
     index.save(&fixture.index_path).expect("save scan index");
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");

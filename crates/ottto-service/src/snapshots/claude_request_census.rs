@@ -11,8 +11,6 @@
 //! or partially committed key keeps the record of the revision this window
 //! parsed, even when its entry reverts. A #588 selected restore removes the
 //! key's record instead (fail-closed).
-// Tests-first head only: production does not call the census yet.
-#![allow(dead_code)]
 
 use super::{
     claude_index_path_family_member, claude_snapshot_family_root_ref, rfc3339_unix_seconds,
@@ -811,6 +809,7 @@ fn serialized_bytes(census: &ClaudeRequestCensus) -> usize {
 /// Per-key answer for Context 2c and D2's posture seam. D1 computes it only in
 /// tests; nothing in production reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum ClaudeCensusMemberStatus {
     /// The predicate holds, the own record is Exact or Empty from a verified
     /// parse, the own family is not census-unknown, and no hash of the record
@@ -1039,6 +1038,7 @@ impl ClaudeRequestCensusJoin {
             && counts.duplicate_owner_entries <= MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn member_status(
         &self,
         index: &ScanIndex,

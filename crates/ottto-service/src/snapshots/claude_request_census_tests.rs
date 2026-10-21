@@ -1395,15 +1395,15 @@ fn census_records_past_the_budget_become_inert_tombstones() {
 /// per-entry layout `#588` restore pricing reads is unchanged by D1.
 #[test]
 fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
-    // Measured on the tests-first head, before D1 changed anything.
-    const SCAN_INDEX_ENTRY_BYTES_BEFORE_D1: usize = 0;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Measured on the tests-first head (CI layout), before D1 changed anything.
+    const SCAN_INDEX_ENTRY_BYTES_BEFORE_D1: usize = 440;
     assert_eq!(
         std::mem::size_of::<ScanIndexEntry>(),
         SCAN_INDEX_ENTRY_BYTES_BEFORE_D1
     );
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
     let mut index = ScanIndex::default();
     let before = crate::heap_layout_bound::completed_bound(&index, usize::MAX).expect("bound");
     index.claude_request_census_mut_for_test().insert_for_test(

@@ -16893,6 +16893,12 @@ impl OwnedSourceScan {
                 let mut parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
                     Err(_) => {
+                        if source == SnapshotSource::ClaudeCode {
+                            claude_request_census::invalidate_claude_request_census(
+                                index,
+                                &candidate.path,
+                            );
+                        }
                         census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     }
@@ -17416,6 +17422,32 @@ impl OwnedSourceScan {
                                 };
                             }
                         }
+                    }
+                }
+                if source == SnapshotSource::ClaudeCode {
+                    // Slice D1: record only; no decision reads it. A #588
+                    // comparison target prepays no record, so it has none.
+                    if comparison_target {
+                        claude_request_census::invalidate_claude_request_census(
+                            index,
+                            &candidate.path,
+                        );
+                    } else {
+                        claude_request_census::record_claude_request_census(
+                            index,
+                            claude_request_census::ClaudeRequestCensusParse {
+                                path: &candidate.path,
+                                index_key: &index_key,
+                                source_file_fingerprint: &source_file_fingerprint,
+                                census_window_end: &census_window_end,
+                                complete: parse_complete,
+                                lossy: dropped_usage_record_count > 0
+                                    || recognized_usage_drop_count > 0
+                                    || report.over_line_cap_count > 0,
+                                source_verified,
+                            },
+                            &parsed,
+                        );
                     }
                 }
                 if source == SnapshotSource::Codex {
@@ -17955,7 +17987,16 @@ impl OwnedSourceScan {
                 let needs_clean_followup =
                     raw_census_complete && index.bounded_sweep_had_unsettled_upload;
                 let census_complete = raw_census_complete && !needs_clean_followup;
-                let claude_request_census_shadow = None;
+                // Slice D1: prune and measure only, before any fold.
+                let claude_request_census_shadow =
+                    (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
+                        claude_request_census::settle_claude_request_census_terminal(
+                            index,
+                            &traversal_snapshot.observed_index_keys,
+                            &traversal_snapshot.residue.index_keys,
+                            &census_window_end,
+                        )
+                    });
                 let reconciliation_pending = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
@@ -29882,8 +29923,8 @@ impl ScanIndex {
             claude_account_family_pending: self.claude_account_family_pending.clone(),
             claude_usage_family_witnesses: self.claude_usage_family_witnesses.clone(),
             claude_usage_family_pending: self.claude_usage_family_pending.clone(),
-            claude_request_census: ClaudeRequestCensus::default(),
-            claude_request_census_shadow: ClaudeRequestCensusShadowState::default(),
+            claude_request_census: self.claude_request_census.clone(),
+            claude_request_census_shadow: self.claude_request_census_shadow.clone(),
             claude_usage_authority_quarantine: self.claude_usage_authority_quarantine.clone(),
             claude_duplicate_request_owners: self.claude_duplicate_request_owners.clone(),
             claude_duplicate_request_witness_overflowed: self
@@ -30038,6 +30079,7 @@ impl ScanIndex {
         self.confirmed_empty_files.remove(key);
         self.file_snapshot_fingerprints.remove(key);
         self.claude_account_deferred_holds.remove(key);
+        self.claude_request_census.remove(key);
     }
 
     /// Retire terminal JSONL dispositions whose file is no longer indexed.
