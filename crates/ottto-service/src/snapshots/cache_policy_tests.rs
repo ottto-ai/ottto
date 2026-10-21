@@ -19,17 +19,23 @@
 //! Path A evicts nothing there and they pin evict-to-fit alone. F2 (a group
 //! job's overflow) is in `group_job_tests`, which reuses these fillers.
 //!
-//! P1-RETAIN R0 (Q-PR14): every tail here is a sampled Claude Tail singleton
-//! that borrows only its retained reduction (shape F,
-//! `borrows_only_retained_reduction`). Its step start now gets neither
+//! P1-RETAIN R0 (Q-PR14, with the parent's B1 ruling 1): every tail here is
+//! a sampled Claude Tail singleton that borrows only its retained reduction
+//! (shape F, `borrows_only_retained_reduction`). Its step start gets neither
 //! evict-to-fit nor Path A; its only release is at completion, of residents
-//! admitted strictly older than its own admitted hint. The fillers are
-//! admitted after the tailed file, so none is such a candidate. G3 is
-//! unchanged; M1 (i), (ii) and the hot file are restated to "no filler
-//! evicted" (Path A's re-retention and the hot file's no-Full guarantee do
-//! not apply to shape F, disclosed). The decision matrix, the counters and
+//! ranked strictly below its copy's re-admission rank (its source mtime
+//! clipped to now once, the rank its copy is admitted at), not its taken
+//! hint. M1 (i), (ii) and the hot-file model are main's rows, unchanged
+//! (ruling 2): they are the acceptance controls. Their
+//! `cache_policy_r0_diagnostic_m1_*` twins and the regime-B rows
+//! (`cache_policy_r0_regime_b_*`, fillers ranked two days back) are
+//! diagnostics, not acceptance: they print R0's probe and decision. For a
+//! Claude usage tail with `F_prev > C`, Q-PR15's guard still suppresses R0's
+//! release (ruling 5). G3 is unchanged. The decision matrix, the counters and
 //! the visit-limited active pin evict-to-fit on a non-F tail (a comparison
-//! target), each with a shape-F control that releases nothing.
+//! target), each with a shape-F control that releases nothing;
+//! `cache_policy_m1_path_a_admits_a_non_f_tail_from_older_entries_only` pins
+//! Path A itself on a non-F tail.
 //!
 //! The shared cache is `SharedCache::default()`: its retained cache is
 //! `TranscriptCache::with_byte_limit(STATE_BYTES)`, and the copy budget is
@@ -394,7 +400,17 @@ struct FullCache {
 /// `older_tail` pins the tailed file's mtime two days back, below every
 /// filler's rank.
 fn full_cache_with_retained_file(older_tail: bool) -> FullCache {
-    let source = SnapshotSource::ClaudeCode;
+    full_cache_in(SnapshotSource::ClaudeCode, older_tail, None)
+}
+
+/// `full_cache_with_retained_file` for a `source` file, with the fillers'
+/// rank pinned at `fillers_modified` (regime B: older than the tailed file's
+/// taken hint and its re-admission rank).
+fn full_cache_in(
+    source: SnapshotSource,
+    older_tail: bool,
+    fillers_modified: Option<u64>,
+) -> FullCache {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let tailed = ScanFixture::new(source);
     tailed.append(&usage(source, 100, 0, MODEL));
@@ -409,7 +425,7 @@ fn full_cache_with_retained_file(older_tail: bool) -> FullCache {
         "precondition: the first read is retained"
     );
     let before_fill = optional_resident(&cache);
-    insert_fillers(&cache, None);
+    insert_fillers(&cache, fillers_modified);
     assert!(
         cache.retained_checkpoint(&tailed.key()).is_some(),
         "precondition: the fill keeps the tailed entry"
@@ -450,6 +466,8 @@ struct TailBesideFullCache {
     counts: Counts,
     fillers_after: usize,
     tail_retained_after: bool,
+    /// What R0's completion measured and decided (`test_hooks`).
+    r0: String,
 }
 
 /// The tailed file's append for `tail_beside_full_cache`: one long record,
@@ -489,7 +507,14 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
     if older_tail {
         tailed.set_modified(unix_now() - OLD_SECONDS + 1);
     }
+    sampled_scan::test_hooks::clear();
     let (tail, counts) = observe(|| observed_scan(&tailed, source, index, &cache));
+    let r0 = format!(
+        "probe={:?} decisions={:?}",
+        sampled_scan::test_hooks::last_probe(),
+        sampled_scan::test_hooks::decisions()
+    );
+    sampled_scan::test_hooks::clear();
     assert_eq!(
         tail.modes,
         (0, 1, 0),
@@ -510,6 +535,7 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
         tail_retained_after: cache.retained_checkpoint(&tailed.key()).is_some(),
         tail,
         counts,
+        r0,
     }
 }
 
@@ -542,7 +568,7 @@ fn cache_policy_g3_older_candidate_never_evicts_newer_entries() {
         run.fillers_after,
         run.tail_retained_after,
     );
-    eprintln!("CACHE_POLICY test=G3_priority {receipt}");
+    eprintln!("CACHE_POLICY test=G3_priority {receipt} {}", run.r0);
     assert_eq!(
         wipe_clears(&run.counts),
         0,
@@ -554,8 +580,7 @@ fn cache_policy_g3_older_candidate_never_evicts_newer_entries() {
     );
 }
 
-/// M1 test (i), no wipe-all (design §6 row M1; §2 L1), restated for Path A
-/// and then for P1-RETAIN R0 (Q-PR14).
+/// M1 test (i), no wipe-all (design §6 row M1; §2 L1), restated for Path A.
 ///
 /// A full but not overflowing cache: one retained Claude entry plus four
 /// fillers within the state budget. The Claude file's append (one long record,
@@ -565,14 +590,16 @@ fn cache_policy_g3_older_candidate_never_evicts_newer_entries() {
 /// evict-to-fit eviction (`clear_*` 0, `clear_entries_released` 0,
 /// `copy_refusal_entries_evicted` 0).
 ///
-/// The tail is shape F, so its step start runs no Path A (Q-PR14). Its
-/// completion may release only residents admitted strictly older than its
-/// own admitted hint; every filler was admitted after it, so no filler
-/// leaves at all. Whether its own copy is kept is the completion budget's
-/// call and is not pinned here (receipt `tail_retained_after`).
+/// Path A, the intended behavior (owner-accepted; review §3c): every filler is
+/// older than the tailed file, so that zero-budget step evicts the oldest, in
+/// victim order, until the tail's own copy fits its next step's budget beside
+/// that line buffer. The buffer leaves room for two of the four fillers, so
+/// at most two yield, and the tail is re-retained as main's wipe re-retained
+/// it. Round 1 asserted at most one filler lost; it never re-retained the
+/// tail.
 ///
-/// Red on main before M1: `ClearOtherActive` 1 and `clear_entries_released`
-/// 4, so every filler is gone.
+/// Red on main: `ClearOtherActive` 1 and `clear_entries_released` 4, so every
+/// filler is gone.
 #[test]
 fn cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
     if unexecuted("M1_no_wipe") {
@@ -580,8 +607,53 @@ fn cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
     }
     let run = tail_beside_full_cache(false, append_padded_usage);
     let receipt = format!(
-        "state_bytes={POLICY_STATE_BYTES} resident_before={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={} tail_retained_after={}",
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} fillers_after={} tail_retained_after={}",
         run.resident_before,
+        run.tail.tail_zero_budget_steps,
+        run.counts.clear_other_active,
+        run.counts.clear_entries_released,
+        run.counts.copy_refusal_entries_evicted,
+        run.counts.copy_refusal_admission_evicted,
+        run.fillers_after,
+        run.tail_retained_after,
+    );
+    eprintln!("CACHE_POLICY test=M1_no_wipe {receipt}");
+    assert_eq!(
+        run.counts.clear_other_active, 0,
+        "M1: a tail at a zero copy budget wiped the cache; {receipt}"
+    );
+    assert_eq!(
+        run.counts.clear_entries_released, 0,
+        "M1: released entries beside a cache that was not overflowing; {receipt}"
+    );
+    assert_eq!(
+        run.counts.copy_refusal_entries_evicted, 0,
+        "M1: evicted to fit a cache that was not overflowing; {receipt}"
+    );
+    assert!(
+        run.fillers_after + 2 >= FILLERS,
+        "Path A: more than two older fillers lost; {receipt}"
+    );
+    assert!(
+        run.tail_retained_after,
+        "Path A: the older fillers did not make room for the tail's copy; {receipt}"
+    );
+}
+
+/// Diagnostic, not acceptance (parent ruling 2): M1 (i)'s scenario, with R0's
+/// completion probe and decision in its receipt. The acceptance row is main's
+/// `cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing`,
+/// unchanged. Asserts only that nothing is wiped.
+#[test]
+fn cache_policy_r0_diagnostic_m1_full_cache_tail() {
+    if unexecuted("R0_diag_M1_no_wipe") {
+        return;
+    }
+    let run = tail_beside_full_cache(false, append_padded_usage);
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} filler_charge={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={} tail_retained_after={}",
+        run.resident_before,
+        run.filler_charge,
         run.tail.tail_zero_budget_steps,
         run.counts.clear_other_active,
         run.counts.clear_entries_released,
@@ -591,26 +663,8 @@ fn cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
         run.fillers_after,
         run.tail_retained_after,
     );
-    eprintln!("CACHE_POLICY test=M1_no_wipe {receipt}");
-    assert_eq!(
-        wipe_clears(&run.counts),
-        0,
-        "M1: a tail at a zero copy budget wiped the cache; {receipt}"
-    );
-    assert_eq!(
-        run.counts.clear_entries_released, 0,
-        "M1: released entries beside a cache that was not overflowing; {receipt}"
-    );
-    assert_eq!(
-        (
-            run.counts.copy_refusal_entries_evicted,
-            run.counts.copy_refusal_admission_evicted,
-            run.counts.insert_entries_evicted,
-        ),
-        (0, 0, 0),
-        "Q-PR14: a shape-F tail evicted a newer-admitted filler; {receipt}"
-    );
-    assert_eq!(run.fillers_after, FILLERS, "Q-PR14: {receipt}");
+    eprintln!("CACHE_POLICY test=R0_diag_M1_no_wipe {receipt} {}", run.r0);
+    assert_eq!(wipe_clears(&run.counts), 0, "a wipe-all clear; {receipt}");
 }
 
 /// The tailed file's append for M1 (ii): `TAIL_GROWTH_RECORDS` ordinary
@@ -619,23 +673,26 @@ fn append_growth(tailed: &ScanFixture) {
     tailed.append_usage(SnapshotSource::ClaudeCode, 1..1 + TAIL_GROWTH_RECORDS);
 }
 
-/// M1 test (ii), evict only the overflow (design §6 row M1; §2 L1),
-/// restated for P1-RETAIN R0 (Q-PR14).
+/// M1 test (ii), evict only the overflow (design §6 row M1; §2 L1).
 ///
 /// The same full cache, but the tailed file's append is
 /// `TAIL_GROWTH_RECORDS` ordinary responses. The borrowed tail state grows
 /// past the room the fillers leave: a real overflow of the state budget, not
-/// a merely full cache. Desired: no wipe-all clear.
+/// a merely full cache. Desired: no wipe-all clear. The zero-budget step
+/// start evicts in victim order until the tail fits; the grown state stays
+/// below one filler's charge, so that is at most one filler.
 ///
-/// The tail is shape F: its step start fits nothing (no evict-to-fit, no
-/// Path A), so this pre-existing overflow is not resolved at the step and is
-/// disclosed on its own (P1-RETAIN residual (i)). At completion only
-/// residents admitted strictly older than its admitted hint may leave: none
-/// here, so every filler stays and the tail's copy, larger than the room, is
-/// refused.
+/// Restated for Path A, the intended behavior (owner-accepted; review §3c):
+/// the fillers are older than the tailed file, so the same step then evicts
+/// older fillers until the tail's own copy would fit its next step's budget
+/// at that step's charge (its walk plus twice its charge, about three times
+/// the room one filler leaves): two fillers in all, "at most the overflow
+/// plus the copy's admission room". Round 1 expected exactly one. The tail
+/// keeps growing after that step, so its copy may still be refused at
+/// completion; this test pins the eviction bound only.
 ///
-/// Red on main before M1: the zero budget beside the tail records
-/// `ClearOtherActive` and releases every filler.
+/// Red on main: the zero budget beside the tail records `ClearOtherActive`
+/// and releases every filler.
 #[test]
 fn cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry() {
     if unexecuted("M1_tail_growth") {
@@ -667,20 +724,45 @@ fn cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry() {
         "M1: a growing tail cleared entries; {receipt}"
     );
     assert_eq!(
-        (
-            run.counts.copy_refusal_entries_evicted,
-            run.counts.copy_refusal_admission_evicted,
-            run.counts.cursor_reservation_entries_evicted,
-            run.counts.insert_entries_evicted,
-        ),
-        (0, 0, 0, 0),
-        "Q-PR14: a shape-F tail's step start or completion evicted; {receipt}"
+        run.fillers_after,
+        FILLERS - 2,
+        "M1: the overflow and the copy's room did not release exactly two entries; {receipt}"
     );
-    assert_eq!(run.fillers_after, FILLERS, "Q-PR14: {receipt}");
-    assert!(
-        !run.tail_retained_after,
-        "the grown copy is larger than the room; {receipt}"
+    assert_eq!(
+        run.counts.cursor_reservation_entries_evicted, 0,
+        "M1: a copy refusal eviction was counted as a cursor reservation; {receipt}"
     );
+}
+
+/// Diagnostic, not acceptance (parent ruling 2): M1 (ii)'s scenario, with
+/// R0's completion probe and decision in its receipt. The acceptance row is
+/// main's `cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry`,
+/// unchanged. Asserts only that nothing is wiped.
+#[test]
+fn cache_policy_r0_diagnostic_m1_tail_growth() {
+    if unexecuted("R0_diag_M1_tail_growth") {
+        return;
+    }
+    let run = tail_beside_full_cache(false, append_growth);
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} filler_charge={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} cursor_reservation_entries_evicted={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={} tail_retained_after={}",
+        run.resident_before,
+        run.filler_charge,
+        run.tail.tail_zero_budget_steps,
+        run.counts.clear_other_active,
+        run.counts.clear_entries_released,
+        run.counts.cursor_reservation_entries_evicted,
+        run.counts.copy_refusal_entries_evicted,
+        run.counts.copy_refusal_admission_evicted,
+        run.counts.insert_entries_evicted,
+        run.fillers_after,
+        run.tail_retained_after,
+    );
+    eprintln!(
+        "CACHE_POLICY test=R0_diag_M1_tail_growth {receipt} {}",
+        run.r0
+    );
+    assert_eq!(wipe_clears(&run.counts), 0, "a wipe-all clear; {receipt}");
 }
 
 /// A cached scan of the full cache's file, stepped until its append is the
@@ -688,10 +770,16 @@ fn cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry() {
 /// file's mtime two days back after the append, below every filler's rank,
 /// so Path A has no older entry to evict.
 fn tail_active(full: &FullCache, older_tail: bool) -> OwnedSourceScan {
+    tail_active_at(full, older_tail.then(|| unix_now() - OLD_SECONDS + 1))
+}
+
+/// `tail_active`, with the tailed file's mtime set to `modified` after the
+/// append.
+fn tail_active_at(full: &FullCache, modified: Option<u64>) -> OwnedSourceScan {
     let source = SnapshotSource::ClaudeCode;
     full.tailed.append(&usage(source, 140, 1, MODEL));
-    if older_tail {
-        full.tailed.set_modified(unix_now() - OLD_SECONDS + 1);
+    if let Some(modified) = modified {
+        full.tailed.set_modified(modified);
     }
     let mut scan = cached_scan(&full.tailed, source, full.index.clone(), &full.cache);
     for _ in 0..10_000 {
@@ -930,17 +1018,15 @@ fn cache_policy_m1_counts_copy_refusal_releases_by_cause() {
     );
 }
 
-/// M1 Path A, the hot file (review §3b model, regime B), restated for
-/// P1-RETAIN R0 (Q-PR14).
+/// M1 Path A, the hot file (review §3b model, regime B).
 ///
 /// One actively tailing session beside `FILLERS` idle entries that fill the
-/// cache. On each of `HOT_PASSES` passes it gains an append whose long record
-/// leaves a line buffer that meets a zero copy budget. The tail is shape F,
-/// so Path A no longer makes room at its step start, and the fillers were
-/// admitted after it, so its completion has no release candidate: every
-/// filler stays and nothing is wiped. Path A's hot-file guarantee (0 Full
-/// reads) does not apply to shape F; the passes' modes are the receipt's
-/// (disclosed regression), each pass reading the file once.
+/// cache and are older than it. On each of `HOT_PASSES` passes it gains an
+/// append whose long record leaves a line buffer that meets a zero copy
+/// budget. Desired: the hot file is read as a tail on every pass and never
+/// `Full`: 0 Full reads, as main's wipe gave. Evict-to-fit alone (round 1)
+/// refused its copy at the first pass and read it `Full` on every later one.
+/// No wipe-all clear; only older entries yield, at most two.
 #[test]
 fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
     if unexecuted("M1_hot_tail") {
@@ -970,34 +1056,79 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
     let fillers_after = fillers_resident(&cache);
     let retained_after = cache.retained_checkpoint(&tailed.key()).is_some();
     let receipt = format!(
-        "state_bytes={POLICY_STATE_BYTES} resident_before={resident_before} passes={HOT_PASSES} full_reads={full_reads} tails={tails} tail_zero_budget_steps={zero_budget_steps} clear_other_active={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={fillers_after} tail_retained_after={retained_after}",
+        "state_bytes={POLICY_STATE_BYTES} resident_before={resident_before} passes={HOT_PASSES} full_reads={full_reads} tails={tails} tail_zero_budget_steps={zero_budget_steps} clear_other_active={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} fillers_after={fillers_after} tail_retained_after={retained_after}",
         counts.clear_other_active,
         counts.copy_refusal_entries_evicted,
         counts.copy_refusal_admission_evicted,
-        counts.insert_entries_evicted,
     );
     eprintln!("CACHE_POLICY test=M1_hot_tail {receipt}");
     assert!(
         zero_budget_steps >= 1,
         "precondition: a tail step meets a zero copy budget; {receipt}"
     );
-    assert!(tails >= 1, "the first pass reads a tail; {receipt}");
     assert_eq!(
-        full_reads + tails,
-        HOT_PASSES,
-        "each pass reads the file once; {receipt}"
+        full_reads, 0,
+        "Path A: the hot file was read Full; {receipt}"
     );
+    assert_eq!(tails, HOT_PASSES, "every pass reads a tail; {receipt}");
     assert_eq!(wipe_clears(&counts), 0, "a wipe-all clear; {receipt}");
-    assert_eq!(
-        (
-            counts.copy_refusal_entries_evicted,
-            counts.copy_refusal_admission_evicted,
-            counts.insert_entries_evicted,
-        ),
-        (0, 0, 0),
-        "Q-PR14: {receipt}"
+    assert!(
+        fillers_after + 2 >= FILLERS,
+        "Path A: more than two older fillers lost; {receipt}"
     );
-    assert_eq!(fillers_after, FILLERS, "Q-PR14: {receipt}");
+    assert!(retained_after, "the hot file is not retained; {receipt}");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2): the hot-file model's
+/// passes, each with R0's completion probe and decision. The acceptance row
+/// is main's `cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full`,
+/// unchanged. Asserts only that nothing is wiped.
+#[test]
+fn cache_policy_r0_diagnostic_m1_hot_tail() {
+    if unexecuted("R0_diag_M1_hot_tail") {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let FullCache {
+        cache,
+        tailed,
+        index,
+        resident_before,
+        ..
+    } = full_cache_with_retained_file(false);
+    let ((full_reads, tails, zero_budget_steps), counts) = observe(|| {
+        let mut index = index;
+        let (mut full_reads, mut tails, mut zero_budget_steps) = (0, 0, 0);
+        for pass in 0..HOT_PASSES {
+            append_padded_usage_at(&tailed, 1 + pass);
+            sampled_scan::test_hooks::clear();
+            let run = observed_scan(&tailed, source, index, &cache);
+            eprintln!(
+                "CACHE_POLICY test=R0_diag_M1_hot_tail pass={pass} modes={:?} fillers_after={} probe={:?} decisions={:?}",
+                run.modes,
+                fillers_resident(&cache),
+                sampled_scan::test_hooks::last_probe(),
+                sampled_scan::test_hooks::decisions()
+            );
+            sampled_scan::test_hooks::clear();
+            full_reads += run.modes.0;
+            tails += run.modes.1;
+            zero_budget_steps += run.tail_zero_budget_steps;
+            index = run.index;
+        }
+        (full_reads, tails, zero_budget_steps)
+    });
+    let fillers_after = fillers_resident(&cache);
+    let retained_after = cache.retained_checkpoint(&tailed.key()).is_some();
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={resident_before} passes={HOT_PASSES} full_reads={full_reads} tails={tails} tail_zero_budget_steps={zero_budget_steps} clear_other_active={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={fillers_after} tail_retained_after={retained_after}",
+        counts.clear_other_active,
+        counts.copy_refusal_entries_evicted,
+        counts.copy_refusal_admission_evicted,
+        counts.insert_entries_evicted,
+    );
+    eprintln!("CACHE_POLICY test=R0_diag_M1_hot_tail {receipt}");
+    assert_eq!(wipe_clears(&counts), 0, "a wipe-all clear; {receipt}");
 }
 
 /// M1 F1, the visit cap (brief addendum; review §2).
@@ -1182,4 +1313,301 @@ fn cache_policy_m1_exempt_unsampled_read_remeasures_an_unknown_resident() {
     assert_eq!(counts.clear_entries_released, 0, "{counts:?}");
     assert_eq!(counts.copy_refusal_entries_evicted, 0, "{counts:?}");
     assert_eq!(fillers_resident(&cache), FILLERS);
+}
+
+/// R2-B2, M1 Path A's positive pin on a non-F tail (a comparison target), at
+/// unit level on the decision-matrix fixture. Four fillers ranked older than
+/// the tailed file's current mtime fill the cache; one small entry ranks
+/// above it. One step measure whose residents fit beside the active's
+/// optional charge (`CopyRefusalKept`) but not beside the next step's copy
+/// room (`overhead + used + 2·charge`):
+/// - shape F (the Q-PR14 control), the same measure: nothing evicted;
+/// - non-F, the tailed file ranked below every filler: no older entry can
+///   make the room, so nothing is evicted (fit-or-nothing);
+/// - non-F, ranked between the fillers and the newer entry: Path A evicts
+///   exactly one filler (`CopyRefusalAdmissionEvicted` 1), never the newer
+///   entry, and no evict-to-fit (`CopyRefusalEntriesEvicted` 0).
+#[test]
+fn cache_policy_m1_path_a_admits_a_non_f_tail_from_older_entries_only() {
+    if unexecuted("M1_path_a") {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let now = unix_now();
+    let full = full_cache_in(source, false, Some(now - 600));
+    let cache = &full.cache;
+    let newer = ScanFixture::new(source);
+    newer.append(&usage(source, 100, 0, MODEL));
+    newer.set_modified(now - 100);
+    let newer_key = "cache-policy-newer".to_string();
+    let (admitted, counts) = observe(|| {
+        cache
+            .retained()
+            .expect("retained cache lock")
+            .insert(newer_key.clone(), retained_reduction(&newer))
+    });
+    assert!(admitted, "precondition: the newer entry is admitted");
+    assert_eq!(
+        counts.insert_entries_evicted, 0,
+        "precondition: no eviction"
+    );
+    let mut scan = tail_active_at(&full, None);
+    let resident =
+        crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), POLICY_STATE_BYTES)
+            .expect("precondition: bounded residents");
+    let room = POLICY_STATE_BYTES - resident;
+    let charge = 1024;
+    assert!(charge <= room, "precondition: the residents fit the charge");
+    // The residents fit beside `charge`, but the next step's copy room needs
+    // half a filler more than the room left.
+    let step = sampled_scan::StepMeasure {
+        resident: Some(resident),
+        active: Some(charge),
+        used: Some(room + full.filler_charge / 2),
+    };
+    let release = |scan: &OwnedSourceScan| {
+        observe(|| {
+            sampled_scan::release_cache_to_fit(
+                scan.sampling.as_ref(),
+                scan.active_file.as_deref(),
+                step,
+            )
+        })
+        .1
+    };
+    let newer_resident = || cache.retained_checkpoint(&newer_key).is_some();
+    let counts = release(&scan);
+    assert_eq!(counts, Counts::default(), "shape F control");
+    assert_eq!(fillers_resident(cache), FILLERS, "shape F control");
+
+    make_non_f(&mut scan);
+    let set_rank = |scan: &mut OwnedSourceScan, seconds: u64| {
+        let active = scan.active_file.as_deref_mut().expect("the tail active");
+        active.candidate.modified_unix_nanos = seconds * 1_000_000_000;
+    };
+    set_rank(&mut scan, now - 900);
+    let counts = release(&scan);
+    assert_eq!(
+        (
+            counts.copy_refusal_kept,
+            counts.copy_refusal_admission_evicted,
+            counts.copy_refusal_entries_evicted,
+            wipe_clears(&counts),
+        ),
+        (1, 0, 0, 0),
+        "no older entry: fit-or-nothing {counts:?}"
+    );
+    assert_eq!(fillers_resident(cache), FILLERS, "fit-or-nothing");
+
+    set_rank(&mut scan, now - 300);
+    let counts = release(&scan);
+    eprintln!("CACHE_POLICY test=M1_path_a resident={resident} room={room} counts={counts:?}");
+    assert_eq!(
+        (
+            counts.copy_refusal_kept,
+            counts.copy_refusal_admission_evicted,
+            counts.copy_refusal_entries_evicted,
+            counts.cursor_reservation_entries_evicted,
+            wipe_clears(&counts),
+        ),
+        (1, 1, 0, 0, 0),
+        "Path A {counts:?}"
+    );
+    assert_eq!(fillers_resident(cache), FILLERS - 1, "Path A: one filler");
+    assert!(
+        newer_resident(),
+        "Path A: a newer-ranked entry never leaves"
+    );
+}
+
+/// The tailed file's long ignored record: its line buffer meets a zero copy
+/// budget beside the fillers, and no parser reads it as usage.
+fn append_padding(tailed: &ScanFixture) {
+    tailed.append(&json!({
+        "type": "synthetic-padding",
+        "text": "x".repeat(TAIL_PADDING_BYTES),
+    }));
+}
+
+/// One regime-B pass's append: the padding, then a usage record (`usage`)
+/// or nothing more.
+fn hot_append(source: SnapshotSource, tailed: &ScanFixture, id: usize, usage_row: bool) {
+    append_padding(tailed);
+    if usage_row {
+        tailed.append(&usage(source, 140 + id as u64, id, MODEL));
+    }
+}
+
+/// One regime-B pass: its modes, step-start zero budgets, counts, and what
+/// R0's completion measured and decided.
+struct RegimePass {
+    modes: (usize, usize, usize),
+    zero_budget_steps: usize,
+    counts: Counts,
+    probe: sampled_scan::test_hooks::Probe,
+    decisions: Vec<sampled_scan::test_hooks::Decision>,
+    fillers_after: usize,
+    retained_after: bool,
+}
+
+/// The hot-file model in regime B (review §3b): `FILLERS` idle entries
+/// ranked two days back, below the tailed file's taken hint, fill the
+/// cache; the tailed `source` file gains `HOT_PASSES` appends, each read as
+/// one scan. Every pass is printed (`CACHE_POLICY test=R0_regime_b`).
+fn regime_b_hot(source: SnapshotSource, usage_row: bool, label: &str) -> Vec<RegimePass> {
+    let FullCache {
+        cache,
+        tailed,
+        index,
+        resident_before,
+        filler_charge,
+    } = full_cache_in(source, false, Some(unix_now() - OLD_SECONDS));
+    let filler_rank = cache
+        .retained_checkpoint(&filler_key(0))
+        .unwrap()
+        .modified_hint();
+    let tailed_rank = cache
+        .retained_checkpoint(&tailed.key())
+        .unwrap()
+        .modified_hint();
+    assert!(
+        filler_rank < tailed_rank,
+        "precondition: regime B, every filler ranks below the tailed file's taken hint"
+    );
+    let mut index = index;
+    let mut passes = Vec::new();
+    for pass in 0..HOT_PASSES {
+        hot_append(source, &tailed, 1 + pass, usage_row);
+        sampled_scan::test_hooks::clear();
+        let (run, counts) = observe(|| observed_scan(&tailed, source, index, &cache));
+        index = run.index;
+        let record = RegimePass {
+            modes: run.modes,
+            zero_budget_steps: run.tail_zero_budget_steps,
+            counts,
+            probe: sampled_scan::test_hooks::last_probe(),
+            decisions: sampled_scan::test_hooks::decisions(),
+            fillers_after: fillers_resident(&cache),
+            retained_after: cache.retained_checkpoint(&tailed.key()).is_some(),
+        };
+        sampled_scan::test_hooks::clear();
+        eprintln!(
+            "CACHE_POLICY test=R0_regime_b_{label} state_bytes={POLICY_STATE_BYTES} resident_before={resident_before} filler_charge={filler_charge} pass={pass} modes={:?} tail_zero_budget_steps={} copy_refusal_admission_evicted={} copy_refusal_entries_evicted={} cursor_reservation_entries_evicted={} insert_entries_evicted={} retention_finalization_bound_refused={} clears={} fillers_after={} tail_retained_after={} probe={:?} decisions={:?}",
+            record.modes,
+            record.zero_budget_steps,
+            counts.copy_refusal_admission_evicted,
+            counts.copy_refusal_entries_evicted,
+            counts.cursor_reservation_entries_evicted,
+            counts.insert_entries_evicted,
+            counts.retention_finalization_bound_refused,
+            wipe_clears(&counts) + counts.clear_entries_released,
+            record.fillers_after,
+            record.retained_after,
+            record.probe,
+            record.decisions,
+        );
+        passes.push(record);
+    }
+    passes
+}
+
+/// What every regime-B pass must keep, whatever its outcome: one read of the
+/// file, no wipe, no step-start evict-to-fit or cursor reservation, nothing
+/// evicted by the insert, and fillers leaving only by R0's completion
+/// release.
+fn assert_regime_b_invariants(passes: &[RegimePass], label: &str) {
+    let mut fillers = FILLERS;
+    for (pass, record) in passes.iter().enumerate() {
+        let counts = &record.counts;
+        assert_eq!(
+            record.modes.0 + record.modes.1,
+            1,
+            "{label} pass {pass}: one read"
+        );
+        assert_eq!(
+            (
+                wipe_clears(counts),
+                counts.clear_entries_released,
+                counts.copy_refusal_entries_evicted,
+                counts.cursor_reservation_entries_evicted,
+                counts.insert_entries_evicted,
+            ),
+            (0, 0, 0, 0, 0),
+            "{label} pass {pass}"
+        );
+        assert_eq!(
+            fillers - record.fillers_after,
+            counts.copy_refusal_admission_evicted as usize,
+            "{label} pass {pass}: fillers leave only by R0's release"
+        );
+        fillers = record.fillers_after;
+    }
+    assert!(
+        passes[0].zero_budget_steps >= 1,
+        "precondition: {label}: the first tail meets a zero copy budget"
+    );
+}
+
+/// Diagnostic, not acceptance (parent ruling 2). Regime B, Claude, usage
+/// appends: the hot-file model with idle fillers ranked below the tailed
+/// file's taken hint, each pass appending a usage record. The outcome is a
+/// receipt only (`CACHE_POLICY test=R0_regime_b_claude_usage`): where
+/// `F_prev > C` the Q-PR15 guard (kept, ruling 5) suppresses R0's release, so
+/// the copy is kept only if `b_ins ≥ C`.
+#[test]
+fn cache_policy_r0_regime_b_claude_usage_tail_receipt() {
+    if unexecuted("R0_regime_b_claude_usage") {
+        return;
+    }
+    let passes = regime_b_hot(SnapshotSource::ClaudeCode, true, "claude_usage");
+    assert_regime_b_invariants(&passes, "claude usage");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2). Regime B, Claude,
+/// ignored-line appends: R0's completion release replaces Path A. Every pass
+/// reads a tail (0 Full), only fillers ranked below the copy's re-admission
+/// rank leave, each by R0's release, and the copy is retained after every
+/// pass.
+#[test]
+fn cache_policy_r0_regime_b_claude_ignored_tail_is_retained() {
+    if unexecuted("R0_regime_b_claude_ignored") {
+        return;
+    }
+    let passes = regime_b_hot(SnapshotSource::ClaudeCode, false, "claude_ignored");
+    assert_regime_b_invariants(&passes, "claude ignored");
+    assert_regime_b_retained(&passes, "claude ignored");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2). Regime B, Codex, usage
+/// appends: R0's completion release replaces Path A, as for the Claude
+/// ignored-line tail.
+#[test]
+fn cache_policy_r0_regime_b_codex_tail_is_retained() {
+    if unexecuted("R0_regime_b_codex") {
+        return;
+    }
+    let passes = regime_b_hot(SnapshotSource::Codex, true, "codex_usage");
+    assert_regime_b_invariants(&passes, "codex usage");
+    assert_regime_b_retained(&passes, "codex usage");
+}
+
+/// 0 Full reads, a copy kept after every pass, and at least one filler
+/// released by R0 (the room Path A made on main).
+fn assert_regime_b_retained(passes: &[RegimePass], label: &str) {
+    for (pass, record) in passes.iter().enumerate() {
+        assert_eq!(record.modes, (0, 1, 0), "{label} pass {pass}: a tail");
+        assert!(record.retained_after, "{label} pass {pass}: retained");
+    }
+    assert!(
+        matches!(
+            passes[0].decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Deferred { .. }]
+        ),
+        "{label}: the first pass defers a release {:?}",
+        passes[0].decisions
+    );
+    assert!(
+        passes[0].counts.copy_refusal_admission_evicted >= 1,
+        "{label}: R0 released older fillers"
+    );
 }

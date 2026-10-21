@@ -1097,10 +1097,18 @@ fn r0_tail_scaled_cache_inserts_after_the_exact_prefix() {
 /// starts then meet a zero budget and evict nothing (no
 /// `CopyRefusalAdmissionEvicted`, no evict-to-fit, no clear, no cursor
 /// reservation); its completion releases exactly the feasible older prefix,
-/// and the copy is inserted. Not Codex: its cursor's own admissions (K6,
-/// `admit_locked`) release residents in victim order until its charge fits,
-/// which CI measured keeping `remaining` at 915,065 bytes (> A) at every
-/// tighter state budget.
+/// and the copy is inserted. The cache is the default (unscaled) one, so the
+/// "insert adds nothing" check here cannot fail on the insert's own limit;
+/// the scaled insert is pinned by
+/// `r0_tail_scaled_cache_inserts_after_the_exact_prefix`. Claude only, not
+/// cross-source end-to-end proof: Codex is not constructed by this fixture
+/// (its cursor's own K6 admissions, `admit_locked`, release residents in
+/// global victim order until their charge fits, which CI measured keeping
+/// `remaining` at 915,065 bytes, above A, at every tighter state budget). The
+/// Codex shape-F step start is pinned at function level only (the #654 guard
+/// matrix's Tail row). K6 admissions still evict in global order during a
+/// Codex F read (`CursorReservationEntriesEvicted`, main's behaviour); Q-PR14
+/// covers M1's paths only.
 #[test]
 fn r0_shape_f_zero_budget_releases_only_at_completion() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2224,11 +2232,18 @@ fn r0_claude_response_finalization_drop_is_disclosed_h2() {
 /// row calls the same `witness_parent` at `AfterRetain` instead, with a
 /// witness one and a half residents past the room the release left. Its
 /// admission evicts the next oldest resident
-/// (`CursorReservationEntriesEvicted`), oldest first. The insert phase after
-/// it: never the newcomer itself, only a victim-order prefix of the older
-/// residents, the newer resident intact; the copy is admitted, then a later
-/// M1 evict-to-fit (the witness still overflows) releases the last older
-/// resident and the copy, in victim order (`R0_F_INSERT_PHASE`).
+/// (`CursorReservationEntriesEvicted`), oldest first. The cache is scaled to
+/// the calibrated state budget (`scaled_cache`), so its insert enforces the
+/// production limit: beside the grown cursor state its loop evicts in victim
+/// order the last older resident, the copy and the newer resident
+/// (`InsertEntriesEvicted` 3), then refuses with no victim left
+/// (`InsertNoVictimRefused`; the cursor state alone leaves no room), and no
+/// later step evicts (`CopyRefusalEntriesEvicted` unchanged). The whole global
+/// victim order leaves, in order (CI receipt `R0_F_INSERT_PHASE scaled
+/// gone=4 inserted=false newer_resident=false`). On an unscaled cache (the
+/// previous form of this row)
+/// the insert admitted against `STATE_BYTES` and the next step's M1
+/// evict-to-fit removed the same entries instead: a fixture artifact.
 #[test]
 fn r0_cursor_growth_after_release_is_disclosed_f() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2239,7 +2254,11 @@ fn r0_cursor_growth_after_release_is_disclosed_f() {
     let remaining = state_for_need(&probe, freed) - (sampled_scan::state_bytes() - probe.remaining);
     let witnessed = Rc::new(RefCell::new(None));
     let seen = Rc::clone(&witnessed);
-    let (world, run) = calibrated(source, SPEC, &probe, freed, |world| {
+    let spec = Spec {
+        scaled_cache: true,
+        ..SPEC
+    };
+    let (world, run) = calibrated(source, spec, &probe, freed, |world| {
         let cache = Arc::clone(&world.cache);
         let identity = "w".repeat(remaining + freed + freed / 2);
         let hook = move || {
@@ -2273,45 +2292,45 @@ fn r0_cursor_growth_after_release_is_disclosed_f() {
         counts.cursor_reservation_entries_evicted - phase.cursor_reservation_entries_evicted,
         1
     );
-    // The insert phase, after the witness.
+    // The insert phase, after the witness: on the scaled cache the insert
+    // itself enforces the state budget.
     let end = &run.counts;
-    assert_eq!(
-        (end.insert_self_evicted, end.copy_refusal_admission_evicted),
-        (0, phase.copy_refusal_admission_evicted),
-        "(f) insert phase"
-    );
     let final_residents: Victims = victims(&world.cache)
         .into_iter()
         .filter(|(k, _, _)| *k != key(&world.incumbent))
         .collect();
     let gone = run.before.len() - final_residents.len();
-    assert!(
-        (2..=OLDER).contains(&gone) && final_residents == without(&run, &world.older_keys(gone)),
-        "(f) insert phase: an older victim-order prefix only, gone {gone}"
+    eprintln!(
+        "R0_F_INSERT_PHASE scaled gone={gone} inserted={} newer_resident={} counts={end:?}",
+        world.inserted(),
+        resident_keys(&world.cache).contains(&world.newer_key())
     );
-    assert!(
-        resident_keys(&world.cache).contains(&world.newer_key()),
-        "(f)"
+    // Global victim order: the older residents, then the copy, then the
+    // newer resident. All of it leaves, in that order.
+    let mut order = world.older_keys(OLDER);
+    order.push(world.newer_key());
+    assert_eq!(gone, OLDER + 1, "(f) insert phase: every resident leaves");
+    assert_eq!(
+        final_residents,
+        run.before
+            .iter()
+            .filter(|(k, _, _)| !order.contains(k))
+            .cloned()
+            .collect::<Victims>(),
+        "(f) insert phase: the victim order only"
     );
-    // Admitted (`InsertAdmitted`, no insert-loop eviction), the copy is then
-    // released with the last older resident: the witness's cursor state
-    // still overflows the state budget, so a later M1 evict-to-fit
-    // (`CopyRefusalEntriesEvicted`) releases in victim order, the older
-    // resident and then the copy (disclosed, residual (f)).
     assert_eq!(
         (
             end.insert_admitted,
+            end.insert_self_evicted,
+            end.insert_no_victim_refused,
             end.insert_entries_evicted,
+            end.copy_refusal_admission_evicted,
             end.copy_refusal_entries_evicted - counts.copy_refusal_entries_evicted,
-            gone,
             world.inserted(),
         ),
-        (1, 0, 2, OLDER, false),
+        (0, 0, 1, 3, phase.copy_refusal_admission_evicted, 0, false),
         "(f) {end:?}"
-    );
-    eprintln!(
-        "R0_F_INSERT_PHASE gone={gone} inserted={} counts={end:?}",
-        world.inserted()
     );
 }
 
