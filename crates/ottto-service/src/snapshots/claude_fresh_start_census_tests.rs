@@ -58,9 +58,11 @@ impl Fixture {
 /// How the simulated server answers an admitted body (B-F3).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ack {
-    /// An `accepted` entity: the server applied the body.
+    /// An `accepted` entity, or a plain `unchanged` one: the server holds
+    /// the body.
     Applied,
-    /// An `unchanged` entity, a refusal or no ACK at all.
+    /// An `unchanged` entity with the h573 `unchanged_basis` key (not
+    /// stored), a refusal, a ledger-suppressed body or no ACK at all.
     NotApplied,
 }
 
@@ -1425,9 +1427,16 @@ fn only_the_census_predicate_with_a_disjoint_verified_record_verifies() {
     // The predicate is false (Unobserved): not verified.
     let (index, _) = run(true, &both, &|view| view.complete = false);
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
-    // An unverified or tail-derived own record never backs the verdict.
+    // An unverified or tail-derived own record never backs the verdict, even
+    // when the status is `Disjoint`.
     let (index, _) = run(true, &both, &|view| {
         view.unverified_records.insert(FRESH.to_string());
+    });
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
+    assert!(!indexed_fingerprint(&index, &fresh_path).is_empty());
+    // An `Unobserved` member with a verified record does not verify either.
+    let (index, _) = run(true, &both, &|view| {
+        view.unobserved.insert(FRESH.to_string());
     });
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
     assert!(!indexed_fingerprint(&index, &fresh_path).is_empty());
@@ -1451,8 +1460,9 @@ fn only_the_census_predicate_with_a_disjoint_verified_record_verifies() {
         disposition.fresh_start_audit.verified_with_incomplete_records,
         1
     );
-    // Budget overflow (SOURCE known limit): the predicate stays false, no new
-    // verification, and the window is counted.
+    // Budget overflow (SOURCE known limit): even a view that still reports
+    // complete and `Disjoint` gets no new verification, and the window is
+    // counted.
     let (index, disposition) = run(true, &both, &|view| view.budget_exceeded = true);
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
     assert_eq!(disposition.fresh_start_audit.owner_budget_exceeded_windows, 1);
@@ -1590,10 +1600,11 @@ fn the_sticky_witness_binds_to_the_parser_version() {
 
 #[test]
 fn only_a_server_applied_body_marks_the_witness_emitted() {
-    // B-F3: an `unchanged` or refused ACK (for example a contract-less body
-    // against a proven server head, h573) leaves the witness `Verified`. It
-    // is not offered again until the file changes, and a later revocation
-    // owes no withdrawal because the server never applied the numbers.
+    // B-F3: a not-stored ACK (an h573 `unchanged_basis`, for example a
+    // contract-less body dominated by a proven server head) or a refusal
+    // leaves the witness `Verified`. It is not offered again until the file
+    // changes. A later revocation still re-arms it once: a lost response or
+    // a ledger-suppressed retry means the server may hold the numbers.
     let fixture = Fixture::on(&[]);
     let dir = temp_dir("claude-2c-ack");
     let (path, fresh) = parsed(&dir, FRESH, &fresh_lines(FRESH, 0));
@@ -1621,19 +1632,31 @@ fn only_a_server_applied_body_marks_the_witness_emitted() {
         1,
         "counted for the audit follow-up"
     );
-    // A later shared hash revokes without a re-arm: nothing to withdraw.
+    // A later shared hash revokes and re-arms once to withdraw.
     fixture.view(|view| {
         view.shares_hash.insert(FRESH.to_string());
     });
-    fold(
-        &mut [],
-        &rows(&[], &[]),
-        &mut index,
-        true,
-        WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        &[FRESH],
-    );
+    let later_census = |index: &mut ScanIndex| {
+        fold(
+            &mut [],
+            &rows(&[], &[]),
+            index,
+            true,
+            WINDOW,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            &[FRESH],
+        );
+    };
+    later_census(&mut index);
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Revoked));
+    assert!(indexed_fingerprint(&index, &path).is_empty(), "one re-arm");
+    // The re-arm is spent: a revoked revision is never re-armed again.
+    index
+        .files
+        .get_mut(&local_index_key(&path))
+        .expect("indexed")
+        .source_file_fingerprint = format!("{FRESH}-fp");
+    later_census(&mut index);
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Revoked));
     assert!(!indexed_fingerprint(&index, &path).is_empty());
 
@@ -1890,8 +1913,9 @@ fn switched_off_writes_nothing_and_rearms_emitted_revisions_once() {
     drop(fixture);
 
     // SESSION C1: witnesses left by an earlier activation re-arm their
-    // emitted revisions once (so the next body uploads without numbers) and
-    // are dropped; nothing else is re-armed.
+    // admissible revisions once (so the next body uploads without numbers;
+    // a `Verified` server ACK may have been lost) and are dropped; nothing
+    // else is re-armed.
     let fixture = Fixture::with(false, &[]);
     let (fresh_path, fresh) = parsed(&dir, FRESH, &fresh_lines(FRESH, 0));
     let (peer_path, peer) = parsed(&dir, PEER, &fresh_lines(PEER, 0));
@@ -1915,7 +1939,7 @@ fn switched_off_writes_nothing_and_rearms_emitted_revisions_once() {
     }
     assert!(index.claude_fresh_start_census.is_empty());
     assert!(indexed_fingerprint(&index, &fresh_path).is_empty());
-    assert!(!indexed_fingerprint(&index, &peer_path).is_empty());
+    assert!(indexed_fingerprint(&index, &peer_path).is_empty());
     assert!(!indexed_fingerprint(&index, &other_path).is_empty());
     drop(fixture);
     let _ = fs::remove_dir_all(dir);

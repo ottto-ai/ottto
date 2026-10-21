@@ -674,6 +674,35 @@ pub struct SnapshotEntityRef {
     pub head_etag: Option<String>,
     #[serde(default)]
     pub head_challenge: Option<String>,
+    /// h573: present only on an `unchanged_entities` ref of a usage-covered
+    /// settlement ("usage_identical" or "dominated_by_head"), and then the
+    /// server did NOT store this body. Absent elsewhere. Read leniently: any
+    /// present value, unknown or not a string, reads as present.
+    #[serde(default, deserialize_with = "deserialize_unchanged_basis")]
+    pub unchanged_basis: Option<String>,
+}
+
+fn deserialize_unchanged_basis<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Ok(Some(match Value::deserialize(deserializer)? {
+        Value::String(basis) => basis,
+        other => other.to_string(),
+    }))
+}
+
+impl SnapshotBatchResponse {
+    /// Refs whose body the server holds after this ACK: every accepted ref,
+    /// and every unchanged ref without the h573 `unchanged_basis` key (the
+    /// identical body is already stored). An unchanged ref carrying the key
+    /// was not stored.
+    pub(crate) fn stored_entities(&self) -> impl Iterator<Item = &SnapshotEntityRef> {
+        self.accepted_entities.iter().chain(
+            self.unchanged_entities
+                .iter()
+                .filter(|reference| reference.unchanged_basis.is_none()),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -972,6 +1001,7 @@ impl SnapshotBatchResponse {
                 body_witness_digest: None,
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             };
             validate_snapshot_entity_ref(&reference)?;
             if !rejection.permanent {
@@ -3998,6 +4028,7 @@ mod tests {
             body_witness_digest: None,
             head_etag: None,
             head_challenge: None,
+            unchanged_basis: None,
         }
     }
 
@@ -4041,6 +4072,7 @@ mod tests {
                 body_witness_digest: Some(crate::snapshots::snapshot_upload_body_witness(&item)),
                 head_etag: Some("e".repeat(64)),
                 head_challenge: None,
+                unchanged_basis: None,
             }],
         );
         let reference = &ack.accepted_entities[0];
@@ -4541,6 +4573,78 @@ mod tests {
                 ("session", fingerprint.as_str()),
             ])
             .is_err());
+    }
+
+    #[test]
+    fn h573_unchanged_basis_marks_an_unchanged_body_as_not_stored() {
+        // Slice 2c B-F3: a plain `unchanged` ref means the identical body is
+        // stored (applied); any `unchanged_basis` value, known or not, means
+        // the server did not store it. The key never fails the ACK.
+        let fingerprint = |index: usize| format!("{index:064x}");
+        let unchanged = |index: usize, basis: Option<serde_json::Value>| {
+            let mut reference = serde_json::json!({
+                "source_session_id": format!("session-{index}"),
+                "snapshot_fingerprint": fingerprint(index),
+                "occurrence_count": 1
+            });
+            if let Some(basis) = basis {
+                reference["unchanged_basis"] = basis;
+            }
+            reference
+        };
+        let response: SnapshotBatchResponse = serde_json::from_value(serde_json::json!({
+            "accepted": 6,
+            "sessions_reconciled": 0,
+            "session_ids": [],
+            "disabled": false,
+            "disabled_reason": null,
+            "entity_ack_contract": SNAPSHOT_ENTITY_ACK_CONTRACT,
+            "accepted_entities": [{
+                "source_session_id": "session-0",
+                "snapshot_fingerprint": fingerprint(0),
+                "occurrence_count": 1
+            }],
+            "unchanged_entities": [
+                unchanged(1, None),
+                unchanged(2, Some(serde_json::json!("usage_identical"))),
+                unchanged(3, Some(serde_json::json!("dominated_by_head"))),
+                unchanged(4, Some(serde_json::json!("a_future_basis"))),
+                unchanged(5, Some(serde_json::json!(7))),
+            ],
+            "rejected_entities": [],
+            "conflict_entities": []
+        }))
+        .expect("the h573 key never fails the ACK");
+        let identities = (0..6)
+            .map(|index| (format!("session-{index}"), fingerprint(index)))
+            .collect::<Vec<_>>();
+        response
+            .validate_entity_ack_identities(
+                identities
+                    .iter()
+                    .map(|(session, fingerprint)| (session.as_str(), fingerprint.as_str())),
+            )
+            .expect("the h573 key changes no ACK coverage");
+        let bases = response
+            .unchanged_entities
+            .iter()
+            .map(|reference| reference.unchanged_basis.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bases,
+            [
+                None,
+                Some("usage_identical"),
+                Some("dominated_by_head"),
+                Some("a_future_basis"),
+                Some("7"),
+            ]
+        );
+        let stored = response
+            .stored_entities()
+            .map(|reference| reference.source_session_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(stored, ["session-0", "session-1"]);
     }
 
     #[test]

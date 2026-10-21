@@ -40,21 +40,26 @@ revision, and a state.
 - `verified`: a complete, accepted census saw the root's own family complete
   and no duplicate. Verification re-arms the root's file once so the next body
   carries its numbers.
-- `emitted`: the server applied a body with numbers for this revision (an
-  `accepted` entity in the upload ACK). An `unchanged` or refused ACK, a held
-  body or no ACK leaves the witness `verified`, and nothing is offered again
-  until the file changes. This keeps a contract-less body against a proven
-  server head (which the server answers with `unchanged`) from looping.
+- `emitted`: the server holds a body with numbers for this revision: an
+  `accepted` entity in the upload ACK, or a plain `unchanged` one (the
+  identical body is already stored). An `unchanged` entity carrying the
+  `unchanged_basis` key (`usage_identical`, `dominated_by_head` or any other
+  value) was not stored. That, a refusal, a held or ledger-suppressed body,
+  or no ACK leaves the witness `verified`, and nothing is offered again until
+  the file changes. This keeps a contract-less body dominated by a proven
+  server head from looping.
 - `reparse_owed`: an emitted revision was re-parsed and refused for a
   transient reason, so its body went out without numbers. The next accepted
   census re-arms it once and moves it back to `verified`.
 - `refused`: a telemetry verdict (a proven or quarantined family) or a
   telemetry row that contradicts this root. Never re-armed.
-- `revoked`: a duplicate request (persisted owner, visibly shared pending, or
-  the same root id under two indexed paths). An emitted revision is re-armed
-  once so its next body uploads without numbers. A parse that replaces or
-  removes an emitted witness from another path of the same root re-arms the
-  emitted path the same way.
+- `revoked`: a duplicate request (persisted owner, visibly shared pending, a
+  census `SharesHash`, or the same root id under two indexed paths). Any
+  `verified`, `reparse_owed` or `emitted` revision is re-armed once so its
+  next body uploads without numbers: the server may hold numbers whose ACK
+  this process never saw (a lost response, a ledger-suppressed retry, a lost
+  index save). A parse that replaces or removes such a witness from another
+  path of the same root re-arms that path the same way.
 
 Every re-arm is spent by its transition. A `verified` revision is never
 re-armed again, so repeated closed and open windows cannot replay a file. A
@@ -67,8 +72,9 @@ A census window is accepted only by the census disjointness predicate
 predicate exists, the window check is a stub that accepts nothing, so nothing
 verifies. A candidate verifies only when, in a complete census:
 
-- the predicate is true, and the fold carries no native completion or
-  selected fallback and its reports are healthy;
+- the predicate is true, the owner map is within its budget, and the fold
+  carries no native completion or selected fallback and its reports are
+  healthy;
 - the root's own census status is `Disjoint` (only possible while the
   predicate is true);
 - its own census record is `Exact` or `Empty` from a source-verified parse;
@@ -109,8 +115,9 @@ after the first owned response. Cache observations, the context curve,
 refusals are unchanged, and `transcript_ownership_complete` and the duplicate
 census are not affected by this path.
 
-Switching the feature off re-arms every emitted revision once, so its next
-body uploads without numbers, and drops every witness.
+Switching the feature off re-arms every `verified`, `reparse_owed` or
+`emitted` revision once, so its next body uploads without numbers, and drops
+every witness.
 
 ## Resource bounds
 
@@ -133,11 +140,13 @@ body uploads without numbers, and drops every witness.
   of the same root. That happens only on that transition.
 - The settled-telemetry root set holds only roots with a candidate or
   admissible witness, so it is bounded by the witness map. On a fold with a
-  native reservation it is charged to that reservation before allocation and
-  the credit is returned after the fold; on insufficient funds the set stays
-  empty, which refuses 2c for that fold.
+  native reservation it is charged to that reservation before allocation
+  (one full tree node per root plus its key bytes, about 650 bytes per root)
+  and the credit is returned after the fold; on insufficient funds the set
+  stays empty, which refuses 2c for that fold. A fold without a native
+  reservation does not charge it.
 - The upload keeps the fingerprints of this fold's admitted bodies and of
-  those the server applied; both are empty while off.
+  those the server holds; both are empty while off and are not charged.
 - No audit schema change, no scan or parser version bump, no wire field.
 
 ## Limits and open items
@@ -154,8 +163,18 @@ body uploads without numbers, and drops every witness.
   false (no new verification) and the case is counted, but a new duplicate
   of an emitted root can go unseen until a later in-budget complete census,
   which then withholds it.
-- A body the server applied but whose index save was lost to a crash stays
-  `verified`, so a later revocation does not re-arm it.
+- A body the server holds but whose ACK was lost (a crash before the index
+  save, a lost response, a ledger-suppressed retry) stays `verified`; only a
+  later revocation or switch-off withdraws it, at the cost of one extra parse
+  for a revision that may never have emitted.
+- A revocation found in the same fold that admitted a body withdraws it on
+  the next pass: that body still uploads its numbers once.
+- A candidate needs current-window evidence to verify, so a candidate whose
+  file does not change after its census pass (for example a backfill parsed
+  without the contract-5 permit, or any candidate parsed while the predicate
+  is the stub) waits for its next parse.
+- The copy check by shared hashes catches a copy whose source is still
+  present only when the source shows the copied request ids.
 - The settled-telemetry check reuses the existing absence check, which runs
   only when the pass may emit request identity. Without that permit no root
   settles, so an emitted root re-parsed in such a pass loses its numbers

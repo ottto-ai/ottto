@@ -470,8 +470,8 @@ impl Completion {
 
     /// Slice 2c (P4): fund the fold-local settled-telemetry root set from the
     /// same moving reservation before it is allocated. `None` refuses 2c for
-    /// this fold. Without a reservation this fold has no native budget and
-    /// the set keeps its ordinary bound (the funded witness map).
+    /// this fold. Without a reservation this fold has no native budget, so
+    /// the set is bounded only by the witness map cap (unfunded).
     pub(crate) fn fund_fresh_start_roots(
         &mut self,
         roots: usize,
@@ -482,7 +482,9 @@ impl Completion {
         };
         let mut cost =
             crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
-        restore_tree_insert_peak::<String, ()>(roots, roots, &mut cost)?;
+        // A set built by inserts only allocates nodes and keeps them, so one
+        // full node per entry (the map bound) covers its peak.
+        crate::heap_layout_bound::tree_nodes::<String, ()>(roots, &mut cost)?;
         cost.add(key_bytes)?;
         let old_allocated = paid.allocated();
         let old_ceiling = paid.allocation_ceiling();
@@ -500,6 +502,9 @@ impl Completion {
         if let (Some((old_allocated, old_ceiling)), Some(paid)) =
             (credit.paid, self.reservation.as_mut())
         {
+            // The fold only borrows the completion, so nothing else moved the
+            // reservation between funding and this release.
+            debug_assert!(paid.allocated() >= old_allocated);
             paid.record_allocated(old_allocated);
             paid.release_temporary_peak(old_ceiling);
         }

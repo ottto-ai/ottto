@@ -5186,8 +5186,9 @@ fn finish_sync_source(
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     // Slice 2c (B-F3): the bodies this fold built with fresh-start scalars,
-    // and those the server applied (an `accepted` entity, not `unchanged`).
-    // Both stay empty, and nothing is walked, while off.
+    // and those the server holds after its ACK (`accepted`, or a plain
+    // `unchanged` for an identical stored body; an h573 `unchanged_basis`
+    // means not stored). Both stay empty, and nothing is walked, while off.
     let fresh_start_admitted = &claude_authority_disposition.fresh_start_admitted;
     let fresh_start_offered = if fresh_start_admitted.is_empty() {
         BTreeSet::new()
@@ -5252,8 +5253,7 @@ fn finish_sync_source(
             if !fresh_start_offered.is_empty() {
                 fresh_start_applied.extend(
                     response
-                        .accepted_entities
-                        .iter()
+                        .stored_entities()
                         .filter(|entity| fresh_start_offered.contains(&entity.snapshot_fingerprint))
                         .map(|entity| entity.snapshot_fingerprint.clone()),
                 );
@@ -5313,7 +5313,7 @@ fn finish_sync_source(
         if not_applied > 0 {
             eprintln!(
                 "local snapshot sync: {not_applied} census-verified fresh-start body/bodies \
-                 were not applied by the server; their witnesses stay verified, not emitted"
+                 were not stored by the server; their witnesses stay verified, not emitted"
             );
         }
     }
@@ -8951,6 +8951,7 @@ mod tests {
                         body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -9262,6 +9263,7 @@ mod tests {
                         body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     })
                     .collect();
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
@@ -9308,6 +9310,7 @@ mod tests {
                             .then(|| "e".repeat(64)),
                         head_challenge: (item.snapshot_fingerprint == sibling.snapshot_fingerprint)
                             .then(|| "c".repeat(64)),
+                        unchanged_basis: None,
                     };
                     if item.snapshot_fingerprint == sibling.snapshot_fingerprint {
                         response.conflict_entities.push(reference);
@@ -9432,6 +9435,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(&sibling)),
                         head_etag: Some("e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -9631,6 +9635,7 @@ mod tests {
                         )),
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -9823,6 +9828,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: None,
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack(&request)?;
                 Ok(response)
@@ -9904,6 +9910,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: Some("e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -10072,6 +10079,7 @@ mod tests {
                     body_witness_digest: Some(snapshot_upload_body_witness(item)),
                     head_etag: head,
                     head_challenge: None,
+                    unchanged_basis: None,
                 });
             ack.validate_entity_ack_with_head_cas(&request, enforce)?;
             Ok(ack)
@@ -10492,6 +10500,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -10609,6 +10618,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: None,
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack(&request)?;
                 Ok(response)
@@ -10682,6 +10692,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -10731,6 +10742,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -10830,6 +10842,7 @@ mod tests {
                     body_witness_digest: None,
                     head_etag: enforce.then(|| "e".repeat(64)),
                     head_challenge: None,
+                    unchanged_basis: None,
                 };
                 if enforce {
                     response.unchanged_entities.push(reference);
@@ -10913,6 +10926,7 @@ mod tests {
                     body_witness_digest: None,
                     head_etag: None,
                     head_challenge: None,
+                    unchanged_basis: None,
                 };
                 if outcome == "accepted" {
                     response.accepted_entities.push(reference);
@@ -10967,6 +10981,7 @@ mod tests {
                             body_witness_digest: None,
                             head_etag: Some("2".repeat(64)),
                             head_challenge: None,
+                            unchanged_basis: None,
                         });
                     let mut request = request.clone();
                     request.snapshots = items;
@@ -11109,6 +11124,7 @@ mod tests {
                         "66".repeat(32)
                     }),
                     head_challenge: None,
+                    unchanged_basis: None,
                 });
             response.validate_entity_ack(&request).unwrap();
             let mut accepted = 0;
@@ -11188,6 +11204,7 @@ mod tests {
                 body_witness_digest: Some(snapshot_upload_body_witness(&item)),
                 head_etag: Some("e".repeat(64)),
                 head_challenge: None,
+                unchanged_basis: None,
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),
@@ -11585,6 +11602,7 @@ mod tests {
                     body_witness_digest: proof,
                     head_etag: None,
                     head_challenge: None,
+                    unchanged_basis: None,
                 };
                 let response = crate::snapshot_client::SnapshotBatchResponse {
                     accepted: 1,
@@ -11837,6 +11855,7 @@ mod tests {
                         body_witness_digest: None,
                         head_etag: None,
                         head_challenge: None,
+                        unchanged_basis: None,
                     }],
                 })
             },
@@ -12081,6 +12100,7 @@ mod tests {
             body_witness_digest: None,
             head_etag: None,
             head_challenge: None,
+            unchanged_basis: None,
         }
     }
 
@@ -12207,6 +12227,7 @@ mod tests {
                         body_witness_digest: None,
                         head_etag: None,
                         head_challenge: None,
+                        unchanged_basis: None,
                     }],
                     unchanged_entities: Vec::new(),
                     rejected_entities: vec![crate::snapshot_client::SnapshotEntityRejection {
@@ -20082,6 +20103,7 @@ mod tests {
                         body_witness_digest: Some(body.clone()),
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,

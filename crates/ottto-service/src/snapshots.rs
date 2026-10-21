@@ -1427,10 +1427,14 @@ fn record_claude_fresh_start_candidate(
         }
         _ => false,
     };
-    // The fingerprint of an emitted revision this parse replaces: another
-    // indexed path of the same root may still serve its numbers.
+    // The fingerprint of an admitted revision this parse replaces: another
+    // indexed path of the same root may still serve its numbers. A
+    // `Verified` revision counts too, because the server may hold numbers
+    // whose ACK this process never saw.
     let emitted = |witness: &ClaudeFreshStartCensusWitness| {
-        (witness.state == ClaudeFreshStartState::Emitted)
+        witness
+            .state
+            .admissible()
             .then(|| witness.candidate_source_file_fingerprint.clone())
     };
     if !candidate {
@@ -1547,7 +1551,10 @@ impl ClaudeFreshStartCensusView for ClaudeCensusDisjointnessPending {
 struct ClaudeCensusViewForTest {
     complete: bool,
     shares_hash: BTreeSet<String>,
-    /// Members whose own record is unverified, tail-derived or another shape.
+    /// Members the census did not observe (status only).
+    unobserved: BTreeSet<String>,
+    /// Members whose own record is unverified, tail-derived or another shape
+    /// (record only: the status stays independent of it).
     unverified_records: BTreeSet<String>,
     identity_incomplete_or_lossy: bool,
     budget_exceeded: bool,
@@ -1555,13 +1562,15 @@ struct ClaudeCensusViewForTest {
 
 #[cfg(test)]
 impl ClaudeFreshStartCensusView for ClaudeCensusViewForTest {
+    /// Deliberately ignores `budget_exceeded`: the census step must refuse an
+    /// over-budget window on its own.
     fn disjointness_complete(&self) -> bool {
-        self.complete && !self.budget_exceeded
+        self.complete
     }
     fn member_status(&self, member: &str) -> ClaudeCensusMemberStatus {
         if self.shares_hash.contains(member) {
             ClaudeCensusMemberStatus::SharesHash
-        } else if self.disjointness_complete() && !self.unverified_records.contains(member) {
+        } else if self.complete && !self.unobserved.contains(member) {
             ClaudeCensusMemberStatus::Disjoint
         } else {
             ClaudeCensusMemberStatus::Unobserved
@@ -1642,9 +1651,14 @@ fn claude_fresh_start_census_step(
             }
         }
     };
+    // Withdrawals re-arm every admissible revision, not only `Emitted`: an
+    // `Emitted` witness needs an `accepted` ACK this process saw, but the
+    // server may also hold the numbers after a lost response, an `unchanged`
+    // answer, a ledger-suppressed retry or a lost index save. Each such
+    // re-arm is spent by the transition (`Revoked`, or the cleared map).
     if !enabled {
         for (member, witness) in census.iter() {
-            if witness.state == ClaudeFreshStartState::Emitted {
+            if witness.state.admissible() {
                 rearm_member(member, &witness.candidate_source_file_fingerprint);
             }
         }
@@ -1672,7 +1686,9 @@ fn claude_fresh_start_census_step(
     if window.view.owner_budget_exceeded() {
         audit.owner_budget_exceeded_windows = audit.owner_budget_exceeded_windows.saturating_add(1);
     }
-    let window_accepted = window.fold_eligible && window.view.disjointness_complete();
+    let window_accepted = window.fold_eligible
+        && window.view.disjointness_complete()
+        && !window.view.owner_budget_exceeded();
     for (member, witness) in census.iter_mut() {
         let indexed = member_files
             .get(member.as_str())
@@ -1702,9 +1718,7 @@ fn claude_fresh_start_census_step(
                 })
             });
         if duplicate {
-            if witness.state == ClaudeFreshStartState::Emitted
-                || window.admitted.contains(member.as_str())
-            {
+            if witness.state.admissible() || window.admitted.contains(member.as_str()) {
                 rearm_member(member, &witness.candidate_source_file_fingerprint);
             }
             witness.state = ClaudeFreshStartState::Revoked;
@@ -1719,8 +1733,9 @@ fn claude_fresh_start_census_step(
         });
         // SOURCE-rulings-D S1 condition 3(a): an accepted window, own status
         // `Disjoint`, own record `Exact` or `Empty` from a source-verified
-        // parse. A root whose telemetry is not settled in this pass waits for
-        // a later window instead of spending its re-arm (A-F2).
+        // parse. A root whose telemetry is not settled in this pass does not
+        // spend its re-arm (A-F2); a candidate also needs current-window
+        // evidence, so it waits for its next parse.
         let accepted_for_member = window_accepted
             && status == ClaudeCensusMemberStatus::Disjoint
             && window
@@ -3612,7 +3627,8 @@ enum ClaudeFreshStartState {
     /// Verified; an emitted body lost its numbers to a transient refusal, so
     /// the next accepted window owes exactly one corrective parse.
     ReparseOwed,
-    /// A body with numbers was built for this revision.
+    /// The server holds a body with numbers for this revision (an
+    /// `accepted` ACK, or `unchanged` without the h573 `unchanged_basis`).
     Emitted,
     /// Refused for a reason that persists for this revision; never re-armed.
     Refused,
@@ -3643,11 +3659,15 @@ pub(crate) fn claude_fresh_start_root_admissible(index: &ScanIndex, root_session
 }
 
 /// Slice 2c upload settlement (B-F3). A witness becomes `Emitted` only when
-/// the server applied the admitted body: its snapshot fingerprint is in an
-/// `accepted` entity ACK of this cycle. An unchanged or refused ACK, a held
-/// or ledger-suppressed body, or no ACK leaves it `Verified`; it is offered
-/// again only when its fingerprint changes. Returns how many admitted bodies
-/// were not applied (an in-memory audit value). Never runs while off.
+/// the server holds the admitted body after an ACK of this cycle: an
+/// `accepted` entity, or an `unchanged` one without the h573
+/// `unchanged_basis` key (`SnapshotBatchResponse::stored_entities`). An
+/// `unchanged` ACK carrying that key (not stored), a refused ACK, a held or
+/// ledger-suppressed body, or no ACK leaves it `Verified`; it is offered
+/// again only when its fingerprint changes, though a later revocation or
+/// switch-off still re-arms it to withdraw numbers the server may hold.
+/// Returns how many admitted bodies were left short of `Emitted` (an
+/// in-memory audit value). Never runs while off.
 pub(crate) fn settle_claude_fresh_start_emissions(
     index: &mut ScanIndex,
     snapshots: &[SnapshotItem],
@@ -3675,7 +3695,13 @@ pub(crate) fn settle_claude_fresh_start_emissions(
             Some(witness) if applied_snapshot_fingerprints.contains(&item.snapshot_fingerprint) => {
                 witness.state = ClaudeFreshStartState::Emitted;
             }
-            _ => not_applied = not_applied.saturating_add(1),
+            // Only a witness left short of `Emitted` is counted: an already
+            // emitted root answered `unchanged`, or a root revoked in this
+            // fold, is not a body left unapplied.
+            Some(witness) if witness.state != ClaudeFreshStartState::Emitted => {
+                not_applied = not_applied.saturating_add(1);
+            }
+            _ => {}
         }
     }
     CLAUDE_FRESH_START_AUDIT_TOTALS
@@ -18377,7 +18403,7 @@ impl OwnedSourceScan {
                             &source_file_fingerprint,
                             collected_at.as_str(),
                         );
-                        // Rare: an emitted revision was replaced. Re-arm any
+                        // Rare: an admitted revision was replaced. Re-arm any
                         // other path still holding it (a same-id copy under
                         // another root), once, so it uploads without numbers.
                         if let Some(replaced) = replaced {
@@ -52843,6 +52869,7 @@ mod tests {
                     body_witness_digest: digest,
                     head_etag: None,
                     head_challenge: None,
+                    unchanged_basis: None,
                 }],
                 unchanged_entities: Vec::new(),
                 rejected_entities: Vec::new(),
@@ -52913,6 +52940,7 @@ mod tests {
                 body_witness_digest: Some(snapshot_upload_body_witness(&exclusive_item)),
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),
@@ -53350,6 +53378,7 @@ mod tests {
                                 body_witness_digest: proof,
                                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                                 head_challenge: None,
+                                unchanged_basis: None,
                             };
                             crate::snapshot_client::SnapshotBatchResponse {
                                 accepted: 1,
@@ -55079,6 +55108,7 @@ mod tests {
                                 body_witness_digest: proof,
                                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                                 head_challenge: None,
+                                unchanged_basis: None,
                             };
                             crate::snapshot_client::SnapshotBatchResponse {
                                 accepted: 1,
@@ -65296,6 +65326,7 @@ mod tests {
                 body_witness_digest: digest,
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             }],
             unchanged_entities: vec![],
             rejected_entities: vec![],
