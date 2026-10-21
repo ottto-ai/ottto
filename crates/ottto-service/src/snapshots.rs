@@ -55,6 +55,8 @@ mod codex_file_join;
 #[cfg(test)]
 mod codex_parent_proof_tests;
 #[cfg(test)]
+mod codex_parent_side_fence_tests;
+#[cfg(test)]
 mod codex_parent_side_tests;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
@@ -2171,7 +2173,6 @@ struct CodexParentOwnershipLedger {
 #[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
 pub(in crate::snapshots) const CAUSE_NO_EVIDENCE: u8 = 255;
 /// U1a-2a: a side request is evicted at this many charged attempts.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side due
 pub(in crate::snapshots) const SIDE_REQUEST_EVICT_ATTEMPTS: u8 = 7;
 const _: () = assert!(CodexParentUnresolvable::COUNT < CAUSE_NO_EVIDENCE as usize);
 
@@ -2200,7 +2201,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for SideVerdict {
 
 /// U1a-2a: the one side verdict of a parse of P, used by every side writer.
 /// Held iff the parse is not complete in PR-P's raw terms.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
 fn codex_parent_side_verdict(parsed: &ParsedJsonlFile) -> SideVerdict {
     let held = parsed.ownership_incomplete_file_count > 0
         || parsed.codex_parent_resolution_pending
@@ -2246,7 +2246,6 @@ fn codex_parent_side_cause(parsed: &ParsedJsonlFile) -> u8 {
 /// U1a-2a: the scope every side seal is minted and admitted under. It changes
 /// with Codex's parser or scan-identity version, so an older seal refuses
 /// `ScopeChanged`. Independent of the scan's curve/identity `Scope`.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side exit
 fn codex_parent_side_scope() -> crate::transcript_acquisition::Scope {
     crate::transcript_acquisition::Scope(sha256_hex(&[
         "codex_parent_side:v1",
@@ -2264,14 +2263,12 @@ fn codex_parent_over_cap(len: u64) -> bool {
 
 /// U1a-2a: the pacing a covering side record keeps after its request is
 /// removed, so a re-request for the same object inherits it.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::snapshots) struct SidePace {
     pub(in crate::snapshots) not_before_unix_seconds: u64,
     pub(in crate::snapshots) attempts_floor: u8,
 }
 crate::heap_layout_bound::fields!(SidePace; not_before_unix_seconds, attempts_floor);
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
 impl SidePace {
     /// `max(existing, new)` per field: a stub never loosens.
     pub(in crate::snapshots) fn merged(existing: Option<Self>, new: Self) -> Self {
@@ -2347,7 +2344,6 @@ impl SideRequest {
 /// U1a-2a: P's side record, the ScanIndex verdict for an unchanged parent
 /// (design rev 18.1 §2.4, plus rev 9's `generation`/`referenced_epoch`).
 /// Content-free: digests, stamps and scalars only.
-#[allow(dead_code)] // first production callers are the side writers
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::snapshots) struct CodexParentSide {
     pub(in crate::snapshots) verdict: SideVerdict,
@@ -2373,7 +2369,6 @@ crate::heap_layout_bound::fields!(CodexParentSide; verdict, seal, parsed, pace, 
 /// resolved `codex_session_id_candidates_from_path` id), so a header-less
 /// parent known only by its path ids matches. Live when a child's ownership
 /// ref names P, P has a side request, or an owed proof entry names P.
-#[allow(dead_code)] // first production callers are the side writers (row 8)
 pub(in crate::snapshots) fn codex_parent_side_live(
     index: &ScanIndex,
     p_key: &str,
@@ -17177,6 +17172,518 @@ fn release_departed_join_owners(
     });
 }
 
+/// U1a-2a (row 6, design rev 18.2 §2.3–2.4): what the side fence decided for
+/// one child use of P's side record at sealed offset `needed`.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum SideFence {
+    /// P's same-object, settled record covers `needed` and its seal admits
+    /// (`admits(.., &side scope, now, false)` ∧ `append_compatible`).
+    Admitted,
+    /// P is over main's Codex cap: no side record is kept for it.
+    FileCapHeld,
+    /// P could not be stamped, or changed while it was stamped.
+    Unreadable,
+    /// No usable record (none, or a new object consumed it): the request is
+    /// armed.
+    Unknown,
+    /// P's current record is held by P's own debt.
+    Held { lineage: bool, cause: u8 },
+    /// Same object, and the record covers less than `needed`. The request is
+    /// armed when P has grown since; otherwise nothing changes.
+    Stale,
+    /// The seal refused (`AuditDue`, `ClockChanged`, `ScopeChanged`, or a
+    /// ctime-only `SameSizeEdit`): the paced request path took it.
+    Refused(crate::transcript_acquisition::FullReason),
+}
+
+/// U1a-2a fence: why P is a new object for its side state.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SideNewObject {
+    /// Another (dev, ino); the old object's key, if a request named it.
+    Replace(Option<(u64, u64)>),
+    Shrink,
+    Rewrite,
+}
+
+/// U1a-2a fence: P as one held FD sees it now.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
+#[derive(Clone, Copy)]
+struct SideNow {
+    dev_ino: (u64, u64),
+    size: u64,
+    ctime: (i64, i64),
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
+impl SideRequest {
+    /// The fence's created request: `Live`, extents and ctimes at P's
+    /// current stamp.
+    fn created(now: SideNow, needed: u64, attempts: u8, not_before: u64) -> Self {
+        Self {
+            dev_ino: now.dev_ino,
+            needed_extent: needed,
+            state: SideRequestState::Live,
+            state_extent: now.size,
+            state_ctime: now.ctime,
+            attempt_extent: now.size,
+            attempt_ctime: now.ctime,
+            attempts,
+            not_before_unix_seconds: not_before,
+            needed_charge: None,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
+impl ScanIndex {
+    /// U1a-2a (row 6, [ADM]): the side fence for one child use of P's record
+    /// at sealed offset `needed`, on P's held `file` (unix-only), over the
+    /// authoritative view: the current key's ledger entry when it exists and
+    /// fits P (`state_extent ≤ size`), else the loaded request. `side` is the
+    /// pass's ledger and namespace; without it the fence is index-only.
+    ///
+    /// In order: P's cap; the object test (a new object consumes P's record
+    /// and, unless a current-key entry is the request, restarts the request;
+    /// a replace ends the old key's ledger generation); with no record the
+    /// paced request path; a held record; step 5 (coverage); step 6, the one
+    /// admission (`seal.admits(.., &side scope, now, false)` ∧
+    /// `parsed.append_compatible`), and the refusal routing table. Every
+    /// index write of the request is mirrored into an existing ledger entry
+    /// for the key in the same step (only G7 creates entries).
+    pub(in crate::snapshots) fn codex_parent_side_fence(
+        &mut self,
+        p_key: &str,
+        file: &mut File,
+        needed: u64,
+        now: u64,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) -> SideFence {
+        use crate::local_resource_diagnostics::codex_side_lifecycle::{record as count, Event};
+        use crate::transcript_acquisition::FullReason;
+        use sampled_scan::side_ledger::LedgerTag;
+        let Some(at) = side_now(file) else {
+            return SideFence::Unreadable;
+        };
+        if codex_parent_over_cap(at.size) {
+            return SideFence::FileCapHeld;
+        }
+        let entry =
+            side_ledger_entry(side, p_key, at.dev_ino).filter(|e| e.state_extent <= at.size);
+        let mut view = match entry {
+            Some(entry) => entry.request(at.dev_ino),
+            None => self.codex_parent_side_requests.get(p_key).copied(),
+        };
+        let ledger_stub = entry
+            .filter(|entry| entry.tag == LedgerTag::Removed)
+            .map(|entry| entry.stub_not_before);
+
+        // The object test, request side (the current-key entry's own extents
+        // when it is the view).
+        let mut new_object = None;
+        if let Some(request) = view.as_mut() {
+            if request.dev_ino != at.dev_ino {
+                new_object = Some(SideNewObject::Replace(Some(request.dev_ino)));
+            } else if at.size < request.state_extent {
+                new_object = Some(SideNewObject::Shrink);
+            } else if at.size == request.state_extent && at.ctime != request.state_ctime {
+                // Q-U28: a same-size ctime change is a rewrite iff the record's
+                // sealed windows no longer hash to its seal.
+                let samples = self
+                    .codex_parent_side
+                    .get(p_key)
+                    .filter(|record| record.parsed.dev_ino() == at.dev_ino)
+                    .map(|record| record.seal.samples_match(file));
+                match samples {
+                    Some(false) => new_object = Some(SideNewObject::Rewrite),
+                    Some(true) => {
+                        request.state_ctime = at.ctime;
+                        self.write_side_request(p_key, *request, side);
+                    }
+                    // No record: the same object, counted (`ctime_only`).
+                    None => count(Event::Refusal),
+                }
+            }
+        }
+        // The record side: another object, or a shrink below what it parsed.
+        if new_object.is_none() {
+            if let Some(record) = self.codex_parent_side.get(p_key) {
+                if record.parsed.dev_ino() != at.dev_ino {
+                    new_object = Some(SideNewObject::Replace(None));
+                } else if at.size < record.parsed.extent() {
+                    new_object = Some(SideNewObject::Shrink);
+                }
+            }
+        }
+        if let Some(event) = new_object {
+            self.side_new_object(p_key, at, needed, event, entry.is_some(), view, side);
+            return SideFence::Unknown;
+        }
+
+        let Some(record) = self.codex_parent_side.get(p_key) else {
+            self.side_request_path(p_key, at, needed, view, ledger_stub, side, false);
+            return SideFence::Unknown;
+        };
+        let stub = record
+            .pace
+            .map(|pace| pace.not_before_unix_seconds)
+            .into_iter()
+            .chain(ledger_stub)
+            .max();
+        if let SideVerdict::Held { lineage, cause } = record.verdict {
+            return SideFence::Held { lineage, cause };
+        }
+        let grown = at.size > record.parsed.extent();
+        // Step 5: the record covers less than the children need.
+        if record.seal.sealed_offset() < needed {
+            if at.size > record.seal.sealed_offset() {
+                self.side_request_path(p_key, at, needed, view, stub, side, false);
+            }
+            return SideFence::Stale;
+        }
+        // Step 6: the one admission.
+        let parsed = record.parsed.clone();
+        let admitted = record
+            .seal
+            .admits(file, &codex_parent_side_scope(), now, false)
+            .and_then(|_| {
+                let now_stamp = sampled_scan::codex_cursor::OpenStamp::capture(file)
+                    .map_err(|_| FullReason::Replaced)?;
+                if parsed.append_compatible(&now_stamp) {
+                    Ok(())
+                } else {
+                    // Equal length to what was parsed, but changed: Q-U28.
+                    Err(FullReason::SameSizeEdit)
+                }
+            });
+        let reason = match admitted {
+            Ok(()) => return SideFence::Admitted,
+            Err(reason) => reason,
+        };
+        match reason {
+            FullReason::AuditDue | FullReason::ClockChanged | FullReason::ScopeChanged => {}
+            FullReason::SameSizeEdit if self.side_record_samples_match(p_key, file) => {}
+            _ => {
+                if self.side_record_samples_match(p_key, file) {
+                    return SideFence::Stale;
+                }
+                self.side_new_object(
+                    p_key,
+                    at,
+                    needed,
+                    SideNewObject::Rewrite,
+                    entry.is_some(),
+                    view,
+                    side,
+                );
+                return SideFence::Unknown;
+            }
+        }
+        count(Event::Refusal);
+        self.side_request_path(p_key, at, needed, view, stub, side, !grown);
+        SideFence::Refused(reason)
+    }
+
+    fn side_record_samples_match(&self, p_key: &str, file: &mut File) -> bool {
+        self.codex_parent_side
+            .get(p_key)
+            .is_some_and(|record| record.seal.samples_match(file))
+    }
+
+    /// The index write of P's request, mirrored into an existing ledger
+    /// entry for its key in the same step. Writes nothing that is already
+    /// there.
+    fn write_side_request(
+        &mut self,
+        p_key: &str,
+        request: SideRequest,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) {
+        use sampled_scan::side_ledger::LedgerEntry;
+        if self.codex_parent_side_requests.get(p_key) != Some(&request) {
+            self.codex_parent_side_requests
+                .insert(p_key.to_owned(), request);
+        }
+        if let Some((cache, ns)) = side {
+            let key = side_ledger_key(ns, p_key, request.dev_ino);
+            let entry = LedgerEntry::of_request(&request);
+            let mut ledger = cache.side_ledger();
+            // An unchanged projection keeps its stamp (and so its save proof).
+            if ledger
+                .get(&key)
+                .is_some_and(|existing| !entry.same_projection(existing))
+            {
+                ledger.write_existing(&key, entry);
+            }
+        }
+    }
+
+    /// A new-object event: P's record is consumed in the same step. The
+    /// request restarts (`Live{attempts = 0}`) unless the current key's
+    /// ledger entry is the request (no reset); a replace ends the old key's
+    /// ledger generation. Counted as a re-arm.
+    #[allow(clippy::too_many_arguments)]
+    fn side_new_object(
+        &mut self,
+        p_key: &str,
+        at: SideNow,
+        needed: u64,
+        event: SideNewObject,
+        current_entry: bool,
+        view: Option<SideRequest>,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) {
+        use sampled_scan::side_ledger::{LedgerEntry, LedgerTag};
+        self.codex_parent_side.remove(p_key);
+        let request = match view {
+            Some(mut request) if current_entry => {
+                request.needed_extent = request.needed_extent.max(needed);
+                request
+            }
+            _ => SideRequest::created(at, needed, 0, 0),
+        };
+        if let (SideNewObject::Replace(Some(old)), Some((cache, ns))) = (event, side) {
+            let key = side_ledger_key(ns, p_key, old);
+            let mut ledger = cache.side_ledger();
+            if let Some(entry) = ledger.get(&key).copied() {
+                ledger.write_existing(
+                    &key,
+                    LedgerEntry {
+                        tag: LedgerTag::Gone,
+                        ..entry
+                    },
+                );
+            }
+        }
+        self.write_side_request(p_key, request, side);
+        crate::local_resource_diagnostics::codex_side_lifecycle::record(
+            crate::local_resource_diagnostics::codex_side_lifecycle::Event::RequestRearmed,
+        );
+    }
+
+    /// The paced request path on the authoritative view `view`, with the
+    /// same-object stub's `not_before` (`stub`). `non_grown`: a non-grown
+    /// refusal's re-arm table (rev 18.2); otherwise the fence's create and
+    /// growth cure (rev 16). `needed = max(needed, ..)` always. Every write
+    /// goes to both stores.
+    #[allow(clippy::too_many_arguments)]
+    fn side_request_path(
+        &mut self,
+        p_key: &str,
+        at: SideNow,
+        needed: u64,
+        view: Option<SideRequest>,
+        stub: Option<u64>,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+        non_grown: bool,
+    ) {
+        let rearm = |request: &mut SideRequest| {
+            request.state = SideRequestState::Live;
+            request.attempts = SIDE_REQUEST_EVICT_ATTEMPTS - 1;
+        };
+        let (request, changed) = match view {
+            None => (
+                match stub {
+                    Some(not_before) => SideRequest::created(
+                        at,
+                        needed,
+                        SIDE_REQUEST_EVICT_ATTEMPTS - 1,
+                        not_before,
+                    ),
+                    None => SideRequest::created(at, needed, 0, 0),
+                },
+                true,
+            ),
+            Some(mut request) => {
+                request.needed_extent = request.needed_extent.max(needed);
+                let live = request.state == SideRequestState::Live;
+                let worn = live && request.attempts >= SIDE_REQUEST_EVICT_ATTEMPTS;
+                let cure = if non_grown {
+                    match request.state {
+                        SideRequestState::Evicted => true,
+                        SideRequestState::Live => worn,
+                        SideRequestState::Lossy
+                        | SideRequestState::Unsealed
+                        | SideRequestState::Short { .. } => {
+                            (at.ctime, at.size) != (request.attempt_ctime, request.attempt_extent)
+                        }
+                    }
+                } else if live {
+                    worn && at.size > request.attempt_extent
+                } else {
+                    at.size > request.state_extent
+                };
+                if cure {
+                    rearm(&mut request);
+                }
+                (request, cure)
+            }
+        };
+        self.write_side_request(p_key, request, side);
+        // A refusal's re-arm is counted once per state change; the fence's
+        // own create and growth cure are not re-arms (lease §5.2).
+        if non_grown && changed {
+            crate::local_resource_diagnostics::codex_side_lifecycle::record(
+                crate::local_resource_diagnostics::codex_side_lifecycle::Event::RequestRearmed,
+            );
+        }
+    }
+}
+
+/// U1a-2a (row 8): one of main's certified parses of P, as P's side writer
+/// sees it.
+pub(in crate::snapshots) struct SideMainParse {
+    /// `checkpoint.seal_as(commit_now, &side scope)` of main's committed
+    /// checkpoint.
+    pub(in crate::snapshots) seal: crate::transcript_acquisition::PrefixSeal,
+    /// The held FD's stamp, captured at or after the commit (never shorter
+    /// than what was parsed, so `append_compatible` can only refuse more).
+    pub(in crate::snapshots) parsed: sampled_scan::codex_cursor::OpenStamp,
+    pub(in crate::snapshots) verdict: SideVerdict,
+    /// Applied bytes past the sealed offset: a singleton's
+    /// `CompletedNativeAcquisition.unsealed`; a P1 job's captured
+    /// `eof_applied ∨ fragment`.
+    pub(in crate::snapshots) unsealed: bool,
+}
+
+impl ScanIndex {
+    /// U1a-2a (row 8, PROOF): main's writer of P's side record. Unsealed ∧
+    /// settled writes and clears nothing. Otherwise the record is updated
+    /// when it exists, created only while P is live (rev 8), and never
+    /// gated by the ledger. A verdict change, or a create, takes
+    /// `++codex_parent_side_generation`; a create, or an update while live,
+    /// takes the wrap epoch. A same-object request this parse covers is
+    /// cured: removed, with its pacing kept as the record's stub
+    /// (`pace = max(existing, {not_before, 6})`), and an existing ledger
+    /// entry for its key mirrors `Removed`. True when the record was written.
+    pub(in crate::snapshots) fn write_codex_parent_side_from_main(
+        &mut self,
+        p_key: &str,
+        p_ids: &[String],
+        parse: SideMainParse,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) -> bool {
+        use sampled_scan::side_ledger::{LedgerEntry, LedgerTag};
+        if parse.unsealed && parse.verdict == SideVerdict::Settled {
+            return false;
+        }
+        let live = codex_parent_side_live(self, p_key, p_ids);
+        let dev_ino = parse.parsed.dev_ino();
+        // (verdict, generation, epoch, same-object pace) of the record now.
+        let existing = self.codex_parent_side.get(p_key).map(|record| {
+            (
+                record.verdict,
+                record.generation,
+                record.referenced_epoch,
+                record.pace.filter(|_| record.parsed.dev_ino() == dev_ino),
+            )
+        });
+        if existing.is_none() && !live {
+            return false;
+        }
+        let mut pace = existing.and_then(|(.., pace)| pace);
+        let generation = match existing {
+            Some((verdict, generation, ..)) if verdict == parse.verdict => generation,
+            _ => {
+                self.codex_parent_side_generation =
+                    self.codex_parent_side_generation.saturating_add(1);
+                self.codex_parent_side_generation
+            }
+        };
+        let referenced_epoch = match existing {
+            Some((_, _, epoch, _)) if !live => epoch,
+            _ => self.codex_parent_proof_wrap_epoch,
+        };
+        // The cure: the authoritative view of P's request for this object.
+        let entry = side_ledger_entry(side, p_key, dev_ino);
+        let view = match entry {
+            Some(entry) => entry.request(dev_ino),
+            None => self
+                .codex_parent_side_requests
+                .get(p_key)
+                .copied()
+                .filter(|request| request.dev_ino == dev_ino),
+        };
+        if let Some(request) =
+            view.filter(|request| parse.seal.sealed_offset() >= request.needed_extent)
+        {
+            pace = Some(SidePace::merged(
+                pace,
+                SidePace {
+                    not_before_unix_seconds: request.not_before_unix_seconds,
+                    attempts_floor: SIDE_REQUEST_EVICT_ATTEMPTS - 1,
+                },
+            ));
+            self.codex_parent_side_requests.remove(p_key);
+            if let (Some(entry), Some((cache, ns))) = (entry, side) {
+                cache.side_ledger().write_existing(
+                    &side_ledger_key(ns, p_key, dev_ino),
+                    LedgerEntry {
+                        tag: LedgerTag::Removed,
+                        stub_not_before: request.not_before_unix_seconds,
+                        ..entry
+                    },
+                );
+            }
+        }
+        self.codex_parent_side.insert(
+            p_key.to_owned(),
+            CodexParentSide {
+                verdict: parse.verdict,
+                seal: parse.seal,
+                parsed: parse.parsed,
+                pace,
+                generation,
+                referenced_epoch,
+            },
+        );
+        crate::local_resource_diagnostics::codex_side_lifecycle::record(
+            crate::local_resource_diagnostics::codex_side_lifecycle::Event::RecordWritten,
+        );
+        true
+    }
+}
+
+/// U1a-2a fence: P's stamp from one fstat of the held FD, cross-checked
+/// against the `OpenStamp` capture (a change in between is unreadable).
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
+fn side_now(file: &File) -> Option<SideNow> {
+    let metadata = file.metadata().ok()?;
+    let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
+    let at = SideNow {
+        dev_ino: (metadata.dev(), metadata.ino()),
+        size: metadata.len(),
+        ctime: (metadata.ctime(), metadata.ctime_nsec()),
+    };
+    (metadata.is_file() && stamp.dev_ino() == at.dev_ino && stamp.extent() == at.size).then_some(at)
+}
+
+fn side_ledger_key(
+    ns: u128,
+    p_key: &str,
+    dev_ino: (u64, u64),
+) -> sampled_scan::side_ledger::LedgerKey {
+    sampled_scan::side_ledger::LedgerKey {
+        ns,
+        p: sampled_scan::side_ledger::parent_of(p_key),
+        dev: dev_ino.0,
+        ino: dev_ino.1,
+    }
+}
+
+fn side_ledger_entry(
+    side: Option<(&sampled_scan::SharedCache, u128)>,
+    p_key: &str,
+    dev_ino: (u64, u64),
+) -> Option<sampled_scan::side_ledger::LedgerEntry> {
+    let (cache, ns) = side?;
+    cache
+        .side_ledger()
+        .get(&side_ledger_key(ns, p_key, dev_ino))
+        .copied()
+}
+
 fn invalidate_stale_codex_parent_resolution(
     parsed: &mut ParsedJsonlFile,
     identities: &mut CodexParentIdentities,
@@ -19526,6 +20033,9 @@ impl OwnedSourceScan {
                 let mut cursor_certificate = None;
                 let mut cursor_publication = None;
                 let mut cursor_fragment = None;
+                // U1a-2a (row 39a): a certified job's unsealed bit for P's side
+                // record (row 8), captured before `cursor_published`.
+                let mut cursor_side_unsealed = None;
                 if let Some(context) = sampling.as_ref().filter(|_| active.cursor.is_some()) {
                     let current_scope = sampled_scan::reduction_dependencies(
                         source,
@@ -19582,6 +20092,8 @@ impl OwnedSourceScan {
                             // certificate fenced the object, but no checkpoint,
                             // copy or verification is kept. A group job retains
                             // no reduction (its replay is joined).
+                            cursor_side_unsealed =
+                                Some(publication.eof_applied() || fragment.is_some());
                             cursor_certificate = Some(
                                 Some(checkpoint)
                                     .filter(|_| census_trusted && active.group.is_none()),
@@ -19884,6 +20396,17 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
+                // U1a-2a (row 8): the held FD's stamp for P's side record, at or
+                // after the commit.
+                let side_parsed_stamp = completed_acquisition
+                    .as_ref()
+                    .filter(|_| source == SnapshotSource::Codex && aliases.is_empty())
+                    .and_then(|_| {
+                        sampled_scan::codex_cursor::OpenStamp::capture(
+                            parser.reader.reader.get_ref(),
+                        )
+                        .ok()
+                    });
                 let joined_owner = if aliases.is_empty() {
                     None
                 } else {
@@ -20059,6 +20582,40 @@ impl OwnedSourceScan {
                 }
                 codex_parent_resolution_retry_required |=
                     parsed_file.codex_parent_resolution_pending;
+                // U1a-2a (row 8): main's certified parse of P (singleton, or a
+                // P1 job's certified finish) writes P's side record.
+                if let Some((parsed, completed)) =
+                    side_parsed_stamp.zip(completed_acquisition.as_ref())
+                {
+                    let p_ids = parsed_file
+                        .codex_parent_ownership_ledger
+                        .as_ref()
+                        .map(|(session_id, _)| resolve_codex_identity(session_id))
+                        .into_iter()
+                        .chain(
+                            codex_session_id_candidates_from_path(&candidate.path)
+                                .iter()
+                                .map(|id| resolve_codex_identity(id)),
+                        )
+                        .collect::<Vec<_>>();
+                    let side = sampling
+                        .as_ref()
+                        .zip(codex_side_pass)
+                        .map(|(context, pass)| (&*context.cache, pass.ns));
+                    index.write_codex_parent_side_from_main(
+                        &local_index_key(&candidate.path),
+                        &p_ids,
+                        SideMainParse {
+                            seal: completed
+                                .checkpoint
+                                .seal_as(sampled_scan::now_seconds(), &codex_parent_side_scope()),
+                            parsed,
+                            verdict: codex_parent_side_verdict(&parsed_file),
+                            unsealed: cursor_side_unsealed.unwrap_or(completed.unsealed),
+                        },
+                        side,
+                    );
+                }
                 let parse_complete = parsed_file.complete();
                 if !aliases.is_empty() && !parse_complete {
                     // Joining authorizes a complete replacement only. Native

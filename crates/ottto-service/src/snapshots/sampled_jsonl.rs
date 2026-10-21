@@ -47,7 +47,6 @@ pub(super) struct CompletedNativeAcquisition {
     /// row), so the reduction is not the reduction through `checkpoint`. A
     /// cursor certificate does not compute it and reports `true` (fail-closed);
     /// its own bit is the job's `eof_applied` or `fragment`.
-    #[cfg_attr(not(test), allow(dead_code))] // first reader is the side writers
     pub(super) unsealed: bool,
 }
 crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, unsealed);

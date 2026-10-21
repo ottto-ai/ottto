@@ -1258,7 +1258,6 @@ impl Publication {
     /// the reduction through the certified prefix. Read before
     /// `cursor_published` consumes the publication; `eof_applied(job)` is not
     /// valid after `finish_job`.
-    #[allow(dead_code)] // first caller (tests included) is main's P1 side writer
     pub(in crate::snapshots) fn eof_applied(&self) -> bool {
         self.eof_applied
     }
