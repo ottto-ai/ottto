@@ -16401,6 +16401,12 @@ impl OwnedSourceScan {
                         if active.cursor.is_some() {
                             sampled_scan::codex_cursor::dequeue(index, &active.candidate);
                         }
+                        if source == SnapshotSource::ClaudeCode {
+                            claude_request_census::invalidate_claude_request_census(
+                                index,
+                                &active.candidate.path,
+                            );
+                        }
                         census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
                     }
@@ -16424,6 +16430,12 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         Err(()) => {
+                            if source == SnapshotSource::ClaudeCode {
+                                claude_request_census::invalidate_claude_request_census(
+                                    index,
+                                    &active.candidate.path,
+                                );
+                            }
                             census.record_unreadable(UnreadableCause::Reduction, 1);
                             pending!();
                         }
@@ -16840,6 +16852,12 @@ impl OwnedSourceScan {
                                 == candidate.opened_object_identity)
                         },
                     ) {
+                        if source == SnapshotSource::ClaudeCode {
+                            claude_request_census::invalidate_claude_request_census(
+                                index,
+                                &candidate.path,
+                            );
+                        }
                         census.record_unreadable(cause, 1);
                         pending!();
                     }
@@ -16850,6 +16868,12 @@ impl OwnedSourceScan {
                     ) {
                         Ok(completed) => completed,
                         Err(_) => {
+                            if source == SnapshotSource::ClaudeCode {
+                                claude_request_census::invalidate_claude_request_census(
+                                    index,
+                                    &candidate.path,
+                                );
+                            }
                             census.record_unreadable(UnreadableCause::Reduction, 1);
                             pending!();
                         }
@@ -18788,6 +18812,12 @@ impl OwnedSourceScan {
             ) {
                 Ok(parser) => parser,
                 Err(_) => {
+                    if source == SnapshotSource::ClaudeCode {
+                        claude_request_census::invalidate_claude_request_census(
+                            index,
+                            &candidate.path,
+                        );
+                    }
                     census.record_unreadable(UnreadableCause::Reduction, 1);
                     pending!();
                 }
@@ -18923,6 +18953,12 @@ impl OwnedSourceScan {
                             Err(_) => {
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
+                                if source == SnapshotSource::ClaudeCode {
+                                    claude_request_census::invalidate_claude_request_census(
+                                        index,
+                                        &candidate.path,
+                                    );
+                                }
                                 census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();
                             }

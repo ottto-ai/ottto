@@ -110,7 +110,9 @@ No local builds or tests were run. CI on the PR is the verification.
 
 Persisted load and CAS reads cap each optional raw census field at 32 MiB
 before Serde buffers its tokens. Oversized evidence is drained in constant
-space and discarded. Input draining remains linear in the file bytes. Raw
+space and discarded. Fully escaped field names and Serde's positional struct
+form use the same bound; positional slots come from Serde field metadata.
+Input draining remains linear in the file bytes. Raw
 sub-parses isolate numeric overflow and wrong tokens from the enclosing index;
 individual records are limited to 16 MiB plus 1 KiB, 65,536 attempted entries,
 and 32 MiB of interpreted entry bytes, including rejected entries. Known-field
@@ -123,8 +125,9 @@ persisted authority record has a retry deadline, but no creation timestamp from
 which a family's age can be recovered without inventing one.
 
 Construction buffers retain at most 1,048,577 hashes before becoming an inert
-budget tombstone. The terminal join bounds inventory and key sizes before
-allocating workspace, reports `transient_limited` on refusal, and measures its
+budget tombstone. Vector growth is bounded by 16 MiB per construction buffer;
+shrink/conversion can overlap two such buffers. The terminal join bounds inventory and key sizes and checks a conservative
+requested-layout estimate of at most 128 MiB before allocating workspace, reports `transient_limited` on refusal, and measures its
 peak requested layout separately as `transient_peak_bytes`. Ordinary scans
 have no transient admission budget; these shadow limits and measurements do
 not consume the cache-retention `copy_budget` or change its decisions. Native
