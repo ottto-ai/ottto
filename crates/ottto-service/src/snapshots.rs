@@ -17001,6 +17001,7 @@ impl ScanIndex {
     /// - **Record:** live (`codex_parent_side_live`) → takes the wrap epoch;
     ///   else removed when more than 2 wraps stale, P's ledger generation
     ///   ended.
+    ///
     /// No byte of any transcript is read; the transient is ≤ 2 ×
     /// `CODEX_SIDE_SWEEP_KEYS` key clones.
     #[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
