@@ -11680,9 +11680,12 @@ impl SnapshotAccumulator {
             capability_id.to_string(),
             raw_origin.to_string(),
         );
-        if let Some(mut count) = self.activity_capability_buckets.get_mut(&key) {
-            *count += 1;
-        } else {
+        let counted = self
+            .activity_capability_buckets
+            .get_mut(&key)
+            .map(|mut count| *count += 1)
+            .is_some();
+        if !counted {
             self.activity_capability_buckets.insert(key, 1);
         }
     }
