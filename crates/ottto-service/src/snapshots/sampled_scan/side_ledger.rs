@@ -129,11 +129,13 @@ impl LedgerEntry {
         }
     }
 
-    /// The request this entry stands for. `Removed` and `Gone` stand for no
-    /// request.
+    /// The request this entry stands for, with the index's
+    /// `referenced_epoch` (the ledger keeps none). `Removed` and `Gone`
+    /// stand for no request.
     pub(in crate::snapshots) fn request(
         &self,
         dev_ino: (u64, u64),
+        referenced_epoch: u64,
     ) -> Option<crate::snapshots::SideRequest> {
         use crate::snapshots::SideRequestState as State;
         let state = match self.tag {
@@ -158,6 +160,7 @@ impl LedgerEntry {
             not_before_unix_seconds: self.not_before,
             needed_charge: (self.needed_charge > 0)
                 .then(|| usize::try_from(self.needed_charge).unwrap_or(usize::MAX)),
+            referenced_epoch,
         })
     }
 
@@ -575,6 +578,30 @@ impl SideLedger {
         }
     }
 
+    /// D6(b) (row 32): the epoch prune may drop the request `key` names only
+    /// when no charge here is unproven: no entry, or one a successful
+    /// selected save of its slot holds (D5′). An in-flight read's G7 charge
+    /// is unsaved, so its request stays.
+    pub(in crate::snapshots) fn prunable(&self, key: &LedgerKey) -> bool {
+        self.entries
+            .get(key)
+            .map_or(true, |entry| self.saved_covers(key.ns, entry))
+    }
+
+    /// Row 32: `key`'s generation ends (`Gone`, freshly stamped) in the same
+    /// step as the index's removal; nothing without an entry.
+    pub(in crate::snapshots) fn end_key(&mut self, key: &LedgerKey) {
+        if let Some(entry) = self.entries.get(key).copied() {
+            self.write_existing(
+                key,
+                LedgerEntry {
+                    tag: LedgerTag::Gone,
+                    ..entry
+                },
+            );
+        }
+    }
+
     /// C14 prune: drops this namespace's entries that `drop` selects.
     pub(in crate::snapshots) fn prune(
         &mut self,
@@ -725,7 +752,14 @@ impl SideLedger {
                 }
                 _ => entry,
             };
-            if let Some(request) = entry.request((key.dev, key.ino)) {
+            // D6(b): the loaded same-object request's epoch survives the
+            // hydrate; none (a lost save) is 0, unknown, never pruned.
+            let epoch = index
+                .codex_parent_side_requests
+                .get(p_key)
+                .filter(|loaded| loaded.dev_ino == (key.dev, key.ino))
+                .map_or(0, |loaded| loaded.referenced_epoch);
+            if let Some(request) = entry.request((key.dev, key.ino), epoch) {
                 index
                     .codex_parent_side_requests
                     .insert(p_key.clone(), request);
@@ -957,9 +991,18 @@ mod tests {
                 attempts: 3,
                 not_before_unix_seconds: 99,
                 needed_charge: Some(4096),
+                referenced_epoch: 7,
             };
             let entry = LedgerEntry::of_request(&request);
-            assert_eq!(entry.request((3, 4)), Some(request));
+            assert_eq!(entry.request((3, 4), 7), Some(request));
+            // D6(b): the epoch is index-only; the projection ignores it.
+            assert_eq!(
+                LedgerEntry::of_request(&SideRequest {
+                    referenced_epoch: 0,
+                    ..request
+                }),
+                entry
+            );
             assert!(entry.same_projection(&LedgerEntry {
                 wseq: 9,
                 stub_not_before: 9,
@@ -974,13 +1017,13 @@ mod tests {
             tag: LedgerTag::Removed,
             ..entry()
         };
-        assert_eq!(removed.request((1, 1)), None);
+        assert_eq!(removed.request((1, 1), 0), None);
         assert_eq!(
             LedgerEntry {
                 tag: LedgerTag::Gone,
                 ..entry()
             }
-            .request((1, 1)),
+            .request((1, 1), 0),
             None
         );
     }
@@ -1056,7 +1099,7 @@ mod tests {
         // (a) saved.
         index
             .codex_parent_side_requests
-            .insert("/a".into(), live.request((1, 1)).unwrap());
+            .insert("/a".into(), live.request((1, 1), 0).unwrap());
         ledger.entries.insert(at("/a", 1), live);
         // An unsaved charge: the index holds the older attempt count.
         let older = LedgerEntry {
@@ -1065,12 +1108,12 @@ mod tests {
         };
         index
             .codex_parent_side_requests
-            .insert("/b".into(), older.request((1, 2)).unwrap());
+            .insert("/b".into(), older.request((1, 2), 0).unwrap());
         ledger.entries.insert(at("/b", 2), live);
         // (c) the saved request is for another object.
         index
             .codex_parent_side_requests
-            .insert("/c".into(), live.request((1, 30)).unwrap());
+            .insert("/c".into(), live.request((1, 30), 0).unwrap());
         ledger.entries.insert(at("/c", 3), live);
         // (c) Gone and the index agrees; Gone with a saved request.
         let gone = stamped(
@@ -1083,7 +1126,7 @@ mod tests {
         ledger.entries.insert(at("/d", 4), gone);
         index
             .codex_parent_side_requests
-            .insert("/e".into(), live.request((1, 5)).unwrap());
+            .insert("/e".into(), live.request((1, 5), 0).unwrap());
         ledger.entries.insert(at("/e", 5), gone);
         // A lost covering save: no record covers the object.
         ledger.entries.insert(
@@ -1118,9 +1161,9 @@ mod tests {
         assert!(ledger.get(&key(10, 1)).is_some());
 
         let requests = &index.codex_parent_side_requests;
-        assert_eq!(requests.get("/a"), live.request((1, 1)).as_ref());
-        assert_eq!(requests.get("/b"), live.request((1, 2)).as_ref());
-        assert_eq!(requests.get("/c"), live.request((1, 30)).as_ref());
+        assert_eq!(requests.get("/a"), live.request((1, 1), 0).as_ref());
+        assert_eq!(requests.get("/b"), live.request((1, 2), 0).as_ref());
+        assert_eq!(requests.get("/c"), live.request((1, 30), 0).as_ref());
         assert_eq!(requests.get("/d"), None);
         assert_eq!(requests.get("/e"), None);
         let rearmed = requests.get("/f").unwrap();
@@ -1323,7 +1366,7 @@ mod tests {
             ..entry()
         };
         assert!(ledger.charge(key, charged, 100).is_ok());
-        let request = charged.request((key.dev, key.ino)).unwrap();
+        let request = charged.request((key.dev, key.ino), 0).unwrap();
         index.codex_parent_side_requests.insert(P.into(), request);
         request
     }

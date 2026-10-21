@@ -127,6 +127,7 @@ impl Parent {
             attempts,
             not_before_unix_seconds: 4242,
             needed_charge: None,
+            referenced_epoch: 0,
         }
     }
 
@@ -744,4 +745,33 @@ fn a_terminal_disclosure_refreshes_an_existing_record_to_held_only() {
     let record = &index.codex_parent_side[KEY];
     assert_eq!((record.generation, record.referenced_epoch), (2, 4));
     assert_eq!(refresh(&mut index), (false, Counts::default()));
+}
+
+/// D6(b): every fence use is a child's reference to P: the request it arms
+/// takes the wrap epoch, and a later use (no other write) refreshes it.
+/// The ledger projection carries no epoch, so its stamp is kept.
+#[test]
+fn a_fence_use_stamps_the_request_with_the_wrap_epoch() {
+    let mut parent = Parent::new("epoch", 9_000);
+    let now = now();
+    let mut index = ScanIndex {
+        codex_parent_proof_wrap_epoch: 5,
+        ..ScanIndex::default()
+    };
+    assert_eq!(parent.fence(&mut index, 500, now).0, SideFence::Unknown);
+    let armed = index.codex_parent_side_requests[KEY];
+    assert_eq!(armed.referenced_epoch, 5);
+    index.codex_parent_proof_wrap_epoch = 9;
+    assert_eq!(parent.fence(&mut index, 500, now).0, SideFence::Unknown);
+    assert_eq!(
+        index.codex_parent_side_requests[KEY],
+        SideRequest {
+            referenced_epoch: 9,
+            ..armed
+        }
+    );
+    assert_eq!(
+        sampled_scan::side_ledger::LedgerEntry::of_request(&armed),
+        sampled_scan::side_ledger::LedgerEntry::of_request(&index.codex_parent_side_requests[KEY])
+    );
 }

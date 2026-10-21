@@ -35,6 +35,7 @@ fn side_request(state: SideRequestState) -> SideRequest {
         attempts: 2,
         not_before_unix_seconds: 1_792_540_920,
         needed_charge: None,
+        referenced_epoch: 12,
     }
 }
 
@@ -234,9 +235,11 @@ fn side_request_round_trips_and_is_bounded() {
         attempts: u8::MAX,
         not_before_unix_seconds: u64::MAX,
         needed_charge: Some(usize::MAX),
+        referenced_epoch: u64::MAX,
     };
     let text = serde_json::to_string(&extreme).unwrap();
-    assert!(text.len() <= 448, "{} {text}", text.len());
+    // D6(b): `"referenced_epoch":u64::MAX` adds 40 B: 439 → 479 B.
+    assert!(text.len() <= 480, "{} {text}", text.len());
     assert_eq!(serde_json::from_str::<SideRequest>(&text).unwrap(), extreme);
 }
 
@@ -631,6 +634,7 @@ impl ScanIndex {
             attempts: u8::MAX,
             not_before_unix_seconds: u64::MAX,
             needed_charge: None,
+            referenced_epoch: u64::MAX,
         };
         for n in 0..parents {
             let key = format!(
@@ -779,9 +783,11 @@ fn a_dropped_request_never_resets_the_ledger_charge_or_admits() {
     index.files.insert(p_key.into(), file_entry());
     index.save(&path).unwrap();
 
+    // The hydrated request has no loaded epoch: 0, unknown (D6(b)).
     let charged = SideRequest {
         attempts: 3,
         not_before_unix_seconds: 1_792_541_000,
+        referenced_epoch: 0,
         ..side_request(SideRequestState::Live)
     };
     let key = sampled_scan::side_ledger::LedgerKey {
@@ -814,4 +820,279 @@ fn a_dropped_request_never_resets_the_ledger_charge_or_admits() {
         let held = *cache.side_ledger().get(&key).unwrap();
         assert!(held.same_projection(&entry));
     }
+}
+
+/// Row 32 / D6(b) fixtures: P's key carries its session id in its name.
+const SWEPT: &str = "/s/rollout-2026-10-21T05-43-00-0199f0a1-2b3c-7d4e-8f90-000000000001.jsonl";
+
+fn swept_index(wrap: u64) -> ScanIndex {
+    let mut index = ScanIndex {
+        codex_parent_proof_wrap_epoch: wrap,
+        ..ScanIndex::default()
+    };
+    index.files.insert(SWEPT.into(), file_entry());
+    index
+}
+
+fn epoch_request(state: SideRequestState, referenced_epoch: u64) -> SideRequest {
+    SideRequest {
+        referenced_epoch,
+        ..side_request(state)
+    }
+}
+
+/// D6(b): an unset epoch keeps a request's bytes exactly (legacy identity);
+/// a set one adds only its own member, and the request owns no heap.
+#[test]
+fn a_zero_request_epoch_keeps_the_legacy_bytes() {
+    let legacy = epoch_request(SideRequestState::Live, 0);
+    let text = serde_json::to_string(&legacy).unwrap();
+    assert!(!text.contains("referenced_epoch"), "{text}");
+    let decoded = serde_json::from_str::<SideRequest>(&text).unwrap();
+    assert_eq!(decoded, legacy);
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), text);
+    let stamped = serde_json::to_string(&epoch_request(SideRequestState::Live, 12)).unwrap();
+    assert_eq!(
+        stamped.len(),
+        text.len() + r#","referenced_epoch":12"#.len()
+    );
+    // In memory: inline scalars only (≤ 128 B with the epoch).
+    assert!(std::mem::size_of::<SideRequest>() <= 128);
+    if crate::heap_layout_bound::layout_supported() {
+        let mut index = ScanIndex::default();
+        index
+            .codex_parent_side_requests
+            .insert(SWEPT.into(), legacy);
+        let zero = crate::heap_layout_bound::bound(&index, usize::MAX).unwrap();
+        index.codex_parent_side_requests.insert(
+            SWEPT.into(),
+            epoch_request(SideRequestState::Live, u64::MAX),
+        );
+        assert_eq!(
+            crate::heap_layout_bound::bound(&index, usize::MAX).unwrap(),
+            zero,
+            "the epoch's value never changes the walked bound"
+        );
+    }
+}
+
+/// Row 32 / D6(b): a referenced request (child ref or owed proof) and a
+/// live record take the wrap epoch and stay; an unreferenced `Live`
+/// request is pruned only more than 2 completed wraps behind (checked:
+/// an epoch ahead of the clock, or `u64::MAX` arithmetic, never prunes);
+/// an unknown epoch only starts the clock; tombstones are never
+/// epoch-pruned; a stale record goes once nothing keeps it live.
+#[test]
+fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_requests() {
+    let live = SideRequestState::Live;
+    let id = codex_parent_path_ids(Path::new(SWEPT))[0].clone();
+    // A child's ref, and an owed proof naming P, each keep it.
+    for owed in [false, true] {
+        let mut index = swept_index(10);
+        if owed {
+            index.codex_parent_proof_parents_live.insert(id.clone(), 1);
+        } else {
+            index.codex_parent_ownership_refs.insert(id.clone());
+        }
+        index
+            .codex_parent_side_requests
+            .insert(SWEPT.into(), epoch_request(live, 1));
+        index.codex_parent_side.insert(
+            SWEPT.into(),
+            CodexParentSide {
+                referenced_epoch: 1,
+                ..extreme_record()
+            },
+        );
+        assert_eq!(
+            index.sweep_codex_parent_side(true, None),
+            SideSweep::default()
+        );
+        assert_eq!(index.codex_parent_side_requests[SWEPT].referenced_epoch, 10);
+        assert_eq!(index.codex_parent_side[SWEPT].referenced_epoch, 10);
+    }
+    // The boundary, subtractive and checked.
+    for (epoch, wrap, pruned) in [
+        (8, 10, false),
+        (7, 10, true),
+        (11, 10, false),
+        (u64::MAX - 2, u64::MAX, false),
+        (u64::MAX - 3, u64::MAX, true),
+        (u64::MAX, 3, false),
+    ] {
+        let mut index = swept_index(wrap);
+        index
+            .codex_parent_side_requests
+            .insert(SWEPT.into(), epoch_request(live, epoch));
+        let before = serde_json::to_vec(&index).unwrap().len();
+        let sweep = index.sweep_codex_parent_side(true, None);
+        assert_eq!(sweep.requests_pruned, usize::from(pruned), "{epoch} {wrap}");
+        assert_eq!(
+            index.codex_parent_side_requests.contains_key(SWEPT),
+            !pruned
+        );
+        if pruned {
+            // The stale request frees its index bytes.
+            assert!(serde_json::to_vec(&index).unwrap().len() < before);
+        }
+    }
+    assert!(!codex_side_epoch_stale(u64::MAX, 0));
+    assert!(codex_side_epoch_stale(0, 3));
+    // Unknown (0): the first sweep stamps the clock; prune 3 wraps later.
+    let mut index = swept_index(10);
+    index
+        .codex_parent_side_requests
+        .insert(SWEPT.into(), epoch_request(live, 0));
+    assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 0);
+    assert_eq!(index.codex_parent_side_requests[SWEPT].referenced_epoch, 10);
+    index.codex_parent_proof_wrap_epoch = 12;
+    assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 0);
+    index.codex_parent_proof_wrap_epoch = 13;
+    assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 1);
+    // Tombstones keep their pacing: never epoch-pruned.
+    for state in [
+        SideRequestState::Evicted,
+        SideRequestState::Short { covered: 1 },
+        SideRequestState::Lossy,
+        SideRequestState::Unsealed,
+    ] {
+        let mut index = swept_index(10);
+        index
+            .codex_parent_side_requests
+            .insert(SWEPT.into(), epoch_request(state, 1));
+        assert_eq!(
+            index.sweep_codex_parent_side(true, None),
+            SideSweep::default()
+        );
+        assert_eq!(
+            index.codex_parent_side_requests[SWEPT],
+            epoch_request(state, 1)
+        );
+    }
+    // A record beside a request is live; alone and stale, it goes.
+    let mut index = swept_index(10);
+    index
+        .codex_parent_side_requests
+        .insert(SWEPT.into(), epoch_request(SideRequestState::Evicted, 7));
+    index.codex_parent_side.insert(
+        SWEPT.into(),
+        CodexParentSide {
+            referenced_epoch: 7,
+            ..extreme_record()
+        },
+    );
+    assert_eq!(
+        index.sweep_codex_parent_side(true, None),
+        SideSweep::default()
+    );
+    assert_eq!(index.codex_parent_side[SWEPT].referenced_epoch, 10);
+    index.codex_parent_side_requests.clear();
+    index.codex_parent_proof_wrap_epoch = 13;
+    assert_eq!(index.sweep_codex_parent_side(true, None).records_pruned, 1);
+    assert!(index.codex_parent_side.is_empty());
+}
+
+/// Row 32: orphans (key ∉ `files`) go only under a valid census; the
+/// sweep visits at most `CODEX_SIDE_SWEEP_KEYS` keys of records ∪
+/// requests and wraps its cursor after a short visit.
+#[test]
+fn the_side_sweep_drops_orphans_under_a_valid_census_and_wraps_its_cursor() {
+    let orphan = "/s/rollout-orphan.jsonl";
+    let mut index = swept_index(0);
+    index
+        .codex_parent_side_requests
+        .insert(orphan.into(), side_request(SideRequestState::Live));
+    index
+        .codex_parent_side
+        .insert(orphan.into(), extreme_record());
+    assert_eq!(index.sweep_codex_parent_side(false, None).orphans, 0);
+    assert!(index.codex_parent_side_requests.contains_key(orphan));
+    assert_eq!(index.sweep_codex_parent_side(true, None).orphans, 1);
+    assert!(index.codex_parent_side_requests.is_empty());
+    assert!(index.codex_parent_side.is_empty());
+
+    let mut index = swept_index(0);
+    for n in 0..CODEX_SIDE_SWEEP_KEYS + 6 {
+        let key = format!("/s/k{n:03}.jsonl");
+        index.files.insert(key.clone(), file_entry());
+        if n % 2 == 0 {
+            index
+                .codex_parent_side_requests
+                .insert(key, side_request(SideRequestState::Evicted));
+        } else {
+            index.codex_parent_side.insert(key, extreme_record());
+        }
+    }
+    index.sweep_codex_parent_side(true, None);
+    assert_eq!(
+        index.codex_parent_side_cursor.as_deref(),
+        Some(format!("/s/k{:03}.jsonl", CODEX_SIDE_SWEEP_KEYS - 1).as_str())
+    );
+    index.sweep_codex_parent_side(true, None);
+    assert_eq!(index.codex_parent_side_cursor, None, "a short visit wraps");
+}
+
+/// D6(b) custody: an unsaved charge (an in-flight read) keeps its request;
+/// once a selected save proves it, the prune removes the request and ends
+/// its ledger key. A failed later save cannot bring the request back (the
+/// hydrate honors `Gone`), and a restart loads only the saved, charged
+/// pacing, never a fresh budget, which the next sweep prunes again.
+#[test]
+fn the_request_epoch_prune_keeps_unsaved_charges_and_never_resurrects_budget() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use sampled_scan::side_ledger::{parent_of, LedgerEntry, LedgerKey, LedgerTag};
+    let cache = sampled_scan::SharedCache::default();
+    let path = temp_path("epoch-prune");
+    let saved = epoch_request(SideRequestState::Live, 1);
+    let mut index = swept_index(4);
+    index.codex_parent_side_requests.insert(SWEPT.into(), saved);
+    index.save(&path).unwrap();
+    let mut index = ScanIndex::load(&path).unwrap();
+    let pass = begin_codex_side_pass(&cache, &path, &mut index);
+    let side = Some((&cache, pass.ns));
+    let key = LedgerKey {
+        ns: pass.ns,
+        p: parent_of(SWEPT),
+        dev: saved.dev_ino.0,
+        ino: saved.dev_ino.1,
+    };
+    // G7 charges a read in this pass (unsaved).
+    let charged = SideRequest {
+        attempts: saved.attempts + 1,
+        ..saved
+    };
+    assert!(cache
+        .side_ledger()
+        .charge(key, LedgerEntry::of_request(&charged), 1_792_540_900)
+        .is_ok());
+    index
+        .codex_parent_side_requests
+        .insert(SWEPT.into(), charged);
+    assert_eq!(index.sweep_codex_parent_side(true, side).requests_pruned, 0);
+    assert_eq!(index.codex_parent_side_requests[SWEPT], charged);
+    // The pass's selected save succeeds (the mark covers the charge).
+    let mark = codex_side_save_mark(&cache, &path);
+    note_codex_side_pass_saved(&cache, &path, true, mark);
+    assert_eq!(index.sweep_codex_parent_side(true, side).requests_pruned, 1);
+    assert!(index.codex_parent_side_requests.is_empty());
+    assert_eq!(cache.side_ledger().get(&key).unwrap().tag, LedgerTag::Gone);
+    // The next save fails: disk still has the request; the hydrate drops it.
+    let mut reloaded = ScanIndex::load(&path).unwrap();
+    assert!(reloaded.codex_parent_side_requests.contains_key(SWEPT));
+    begin_codex_side_pass(&cache, &path, &mut reloaded);
+    assert!(reloaded.codex_parent_side_requests.is_empty());
+    // A restart: only the saved pacing (never attempts 0), pruned again.
+    let restarted_cache = sampled_scan::SharedCache::default();
+    let mut restarted = ScanIndex::load(&path).unwrap();
+    let pass = begin_codex_side_pass(&restarted_cache, &path, &mut restarted);
+    assert_eq!(restarted.codex_parent_side_requests[SWEPT], saved);
+    assert!(saved.attempts > 0);
+    assert_eq!(
+        restarted
+            .sweep_codex_parent_side(true, Some((&restarted_cache, pass.ns)))
+            .requests_pruned,
+        1
+    );
 }

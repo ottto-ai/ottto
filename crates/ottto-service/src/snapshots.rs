@@ -2331,8 +2331,14 @@ pub(in crate::snapshots) struct SideRequest {
     /// A capacity loss's reservation (U1a-2b). Always `None` for a singleton.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::snapshots) needed_charge: Option<usize>,
+    /// U1a-2a (D6(b)): `codex_parent_proof_wrap_epoch` at the last child
+    /// reference (a fence use) or live sweep visit. 0 is unknown (legacy,
+    /// or armed before the first wrap): the sweep stamps it, never prunes
+    /// it. Index-only: the ledger projection carries no epoch.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(in crate::snapshots) referenced_epoch: u64,
 }
-crate::heap_layout_bound::fields!(SideRequest; dev_ino, needed_extent, state, state_extent, state_ctime, attempt_extent, attempt_ctime, attempts, not_before_unix_seconds, needed_charge);
+crate::heap_layout_bound::fields!(SideRequest; dev_ino, needed_extent, state, state_extent, state_ctime, attempt_extent, attempt_ctime, attempts, not_before_unix_seconds, needed_charge, referenced_epoch);
 impl SideRequest {
     /// The backoff after the `attempts`-th charged attempt: 60 s doubling,
     /// capped at one hour.
@@ -2375,12 +2381,42 @@ pub(in crate::snapshots) fn codex_parent_side_live(
     p_key: &str,
     p_ids: &[String],
 ) -> bool {
+    codex_parent_side_referenced(index, p_ids)
+        || index.codex_parent_side_requests.contains_key(p_key)
+}
+
+/// U1a-2a (row 32, D6(b)): P is referenced by a child: a child's parent
+/// ref or an owed proof names one of `p_ids`. Liveness without P's own
+/// request, which the request epoch prune asks about.
+pub(in crate::snapshots) fn codex_parent_side_referenced(
+    index: &ScanIndex,
+    p_ids: &[String],
+) -> bool {
     p_ids.iter().any(|id| {
         index.codex_parent_ownership_refs.contains(id.as_str())
             || index
                 .codex_parent_proof_parents_live
                 .contains_key(id.as_str())
-    }) || index.codex_parent_side_requests.contains_key(p_key)
+    })
+}
+
+/// U1a-2a (row 32): side keys (records ∪ requests) one sweep visits.
+pub(in crate::snapshots) const CODEX_SIDE_SWEEP_KEYS: usize = 64;
+
+/// U1a-2a (D6(b)): `epoch` is more than two completed wraps behind `wrap`.
+/// Subtractive and checked: an epoch ahead of the clock (a restored or
+/// corrupt index) is never stale, and nothing overflows at `u64::MAX`.
+pub(in crate::snapshots) fn codex_side_epoch_stale(epoch: u64, wrap: u64) -> bool {
+    wrap.checked_sub(epoch).is_some_and(|age| age > 2)
+}
+
+/// U1a-2a (row 32): what one sweep removed.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct SideSweep {
+    pub(in crate::snapshots) orphans: usize,
+    pub(in crate::snapshots) records_pruned: usize,
+    pub(in crate::snapshots) requests_pruned: usize,
 }
 
 /// U1a-2a: what one Codex pass carries from C14: its side-ledger namespace
@@ -16638,6 +16674,118 @@ impl ScanIndex {
         }
     }
 
+    /// U1a-2a (row 32, rev 9/10 §2.3, rev 12 §2.7, D6(b)): the proof hook's
+    /// side sweep, metadata-only. It visits the next
+    /// `CODEX_SIDE_SWEEP_KEYS` keys of records ∪ requests after
+    /// `codex_parent_side_cursor` (key order, wrapping) and, per key:
+    /// - **Orphan** (`census_valid` ∧ key ∉ `files`): every U1a item of the
+    ///   key goes, ledger `Gone` (`drop_codex_proof_items`).
+    /// - **Request:** referenced by a child (path ids, as cc 7) → takes the
+    ///   wrap epoch; epoch 0 (unknown) → takes it too, which starts its
+    ///   clock and never prunes. A `Live` request that is unreferenced,
+    ///   more than 2 wraps stale and holds no unproven ledger charge
+    ///   (`prunable`: active and in-flight charges stay) is removed, its
+    ///   key ledger `Gone`. Tombstones are not epoch-pruned (rev 15 §5;
+    ///   they leave by a cure, the orphan sweep or replay), so no pacing
+    ///   of an unchanged object is reset.
+    /// - **Record:** live (`codex_parent_side_live`) → takes the wrap epoch;
+    ///   else removed when more than 2 wraps stale, P's ledger generation
+    ///   ended.
+    /// No byte of any transcript is read; the transient is ≤ 2 ×
+    /// `CODEX_SIDE_SWEEP_KEYS` key clones.
+    #[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+    pub(in crate::snapshots) fn sweep_codex_parent_side(
+        &mut self,
+        census_valid: bool,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) -> SideSweep {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut sweep = SideSweep::default();
+        let lower = self
+            .codex_parent_side_cursor
+            .take()
+            .map_or(Unbounded, Excluded);
+        let mut keys = self
+            .codex_parent_side
+            .range::<String, _>((lower.clone(), Unbounded))
+            .map(|(key, _)| key)
+            .take(CODEX_SIDE_SWEEP_KEYS)
+            .chain(
+                self.codex_parent_side_requests
+                    .range::<String, _>((lower, Unbounded))
+                    .map(|(key, _)| key)
+                    .take(CODEX_SIDE_SWEEP_KEYS),
+            )
+            .cloned()
+            .collect::<BTreeSet<String>>();
+        while keys.len() > CODEX_SIDE_SWEEP_KEYS {
+            keys.pop_last();
+        }
+        // A short visit reached the end: the next sweep wraps.
+        self.codex_parent_side_cursor = if keys.len() == CODEX_SIDE_SWEEP_KEYS {
+            keys.last().cloned()
+        } else {
+            None
+        };
+        let wrap = self.codex_parent_proof_wrap_epoch;
+        for key in keys {
+            if census_valid && !self.files.contains_key(&key) {
+                self.drop_codex_proof_items(&key, side);
+                sweep.orphans += 1;
+                continue;
+            }
+            let ids = codex_parent_path_ids(Path::new(&key));
+            let referenced = codex_parent_side_referenced(self, &ids);
+            let prune_request = match self.codex_parent_side_requests.get_mut(&key) {
+                Some(request) if referenced || request.referenced_epoch == 0 => {
+                    request.referenced_epoch = wrap;
+                    None
+                }
+                Some(request)
+                    if request.state == SideRequestState::Live
+                        && codex_side_epoch_stale(request.referenced_epoch, wrap) =>
+                {
+                    Some(request.dev_ino)
+                }
+                _ => None,
+            };
+            if let Some(dev_ino) = prune_request {
+                let ledger_key = side.map(|(_, ns)| side_ledger_key(ns, &key, dev_ino));
+                let prunable = side
+                    .zip(ledger_key)
+                    .map_or(true, |((cache, _), ledger_key)| {
+                        cache.side_ledger().prunable(&ledger_key)
+                    });
+                if prunable {
+                    self.codex_parent_side_requests.remove(&key);
+                    if let Some(((cache, _), ledger_key)) = side.zip(ledger_key) {
+                        cache.side_ledger().end_key(&ledger_key);
+                    }
+                    sweep.requests_pruned += 1;
+                }
+            }
+            let live = codex_parent_side_live(self, &key, &ids);
+            let prune_record = match self.codex_parent_side.get_mut(&key) {
+                Some(record) if live => {
+                    record.referenced_epoch = wrap;
+                    false
+                }
+                Some(record) => codex_side_epoch_stale(record.referenced_epoch, wrap),
+                None => false,
+            };
+            if prune_record {
+                self.codex_parent_side.remove(&key);
+                if let Some((cache, ns)) = side {
+                    cache
+                        .side_ledger()
+                        .end_generation(ns, Some(sampled_scan::side_ledger::parent_of(&key)));
+                }
+                sweep.records_pruned += 1;
+            }
+        }
+        sweep
+    }
+
     /// U1a-2a (row 35): this index's proof incarnation for a use that binds
     /// it (an owe's high-water, a proof job). The first use adopts the nonce
     /// `load` minted or reused, so it persists from the next save. `""` for
@@ -17258,6 +17406,7 @@ impl SideRequest {
             attempts,
             not_before_unix_seconds: not_before,
             needed_charge: None,
+            referenced_epoch: 0,
         }
     }
 }
@@ -17278,7 +17427,28 @@ impl ScanIndex {
     /// `parsed.append_compatible`), and the refusal routing table. Every
     /// index write of the request is mirrored into an existing ledger entry
     /// for the key in the same step (only G7 creates entries).
+    ///
+    /// D6(b): a fence is a child's reference to P, so P's request (armed,
+    /// cured or untouched here) then takes the current wrap epoch. That
+    /// write is index-only and leaves the ledger stamp alone.
     pub(in crate::snapshots) fn codex_parent_side_fence(
+        &mut self,
+        p_key: &str,
+        file: &mut File,
+        needed: u64,
+        now: u64,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) -> SideFence {
+        let fenced = self.codex_parent_side_fence_steps(p_key, file, needed, now, side);
+        let epoch = self.codex_parent_proof_wrap_epoch;
+        if let Some(request) = self.codex_parent_side_requests.get_mut(p_key) {
+            request.referenced_epoch = epoch;
+        }
+        fenced
+    }
+
+    /// The fence's steps (`codex_parent_side_fence`).
+    fn codex_parent_side_fence_steps(
         &mut self,
         p_key: &str,
         file: &mut File,
@@ -17298,7 +17468,7 @@ impl ScanIndex {
         let entry =
             side_ledger_entry(side, p_key, at.dev_ino).filter(|e| e.state_extent <= at.size);
         let mut view = match entry {
-            Some(entry) => entry.request(at.dev_ino),
+            Some(entry) => entry.request(at.dev_ino, self.side_request_epoch(p_key)),
             None => self.codex_parent_side_requests.get(p_key).copied(),
         };
         let ledger_stub = entry
@@ -17409,6 +17579,14 @@ impl ScanIndex {
         count(Event::Refusal);
         self.side_request_path(p_key, at, needed, view, stub, side, !grown);
         SideFence::Refused(reason)
+    }
+
+    /// D6(b): the loaded request's epoch, carried onto a ledger projection
+    /// (which has none). No request: 0, unknown.
+    fn side_request_epoch(&self, p_key: &str) -> u64 {
+        self.codex_parent_side_requests
+            .get(p_key)
+            .map_or(0, |request| request.referenced_epoch)
     }
 
     fn side_record_samples_match(&self, p_key: &str, file: &mut File) -> bool {
@@ -17631,7 +17809,7 @@ impl ScanIndex {
         // The cure: the authoritative view of P's request for this object.
         let entry = side_ledger_entry(side, p_key, dev_ino);
         let view = match entry {
-            Some(entry) => entry.request(dev_ino),
+            Some(entry) => entry.request(dev_ino, self.side_request_epoch(p_key)),
             None => self
                 .codex_parent_side_requests
                 .get(p_key)
@@ -17781,7 +17959,7 @@ impl ScanIndex {
         side: Option<(&sampled_scan::SharedCache, u128)>,
     ) -> Option<SideRequest> {
         match side_ledger_entry(side, p_key, dev_ino) {
-            Some(entry) => entry.request(dev_ino),
+            Some(entry) => entry.request(dev_ino, self.side_request_epoch(p_key)),
             None => self
                 .codex_parent_side_requests
                 .get(p_key)
@@ -17814,7 +17992,7 @@ impl ScanIndex {
         let entry =
             side_ledger_entry(side, p_key, at.dev_ino).filter(|e| e.state_extent <= at.size);
         let view = match entry {
-            Some(entry) => entry.request(at.dev_ino),
+            Some(entry) => entry.request(at.dev_ino, self.side_request_epoch(p_key)),
             None => self.codex_parent_side_requests.get(p_key).copied(),
         };
         let Some(mut request) = view else {
