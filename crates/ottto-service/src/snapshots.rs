@@ -3566,15 +3566,28 @@ fn claude_fence_closed_retry_carried_roots(
 static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Content-free count of carried families whose member was parsed on the page
+/// that ends the walk after another member was already passed, so the carry
+/// stays and the family takes the ordinary path (SOURCE B9's held path).
+static CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 thread_local! {
     static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS_FOR_TEST: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn claude_stale_family_carry_cancellations_for_test() -> usize {
     CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn claude_stale_family_carry_terminal_holds_for_test() -> usize {
+    CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// SOURCE B9 liveness: a member of a family this red retry carried is about to
@@ -3590,7 +3603,11 @@ pub(crate) fn claude_stale_family_carry_cancellations_for_test() -> usize {
 /// family qualifies only while it is witnessed, no member of it was parsed
 /// earlier on this page and every other indexed member still retains its
 /// revision (a re-armed family's members do not), so the carry is cancelled
-/// at most once and no member is read twice for it.
+/// at most once and no member is read twice for it. On the page that ends the
+/// walk, queueing a passed member would end this page without its terminal
+/// fold, which demotes the changed member's revision before the family can be
+/// re-proved; there the carry stays and the family takes the ordinary path
+/// (SOURCE B9's held path), counted content-free.
 fn cancel_claude_family_carry_for_member_parse(
     index: &mut ScanIndex,
     census_window_end: &str,
@@ -3645,13 +3662,11 @@ fn cancel_claude_family_carry_for_member_parse(
     if others.is_empty() {
         return;
     }
-    for index_key in &others {
-        if let Some(entry) = index.files.get_mut(index_key) {
-            entry.source_file_fingerprint.clear();
-        }
-    }
-    let mut requeued = 0_usize;
-    if let Some(traversal) = index.traversal.as_mut() {
+    let mut passed = Vec::new();
+    let mut walk_done = false;
+    if let Some(traversal) = index.traversal.as_ref() {
+        walk_done =
+            traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty();
         for index_key in &others {
             let path = Path::new(index_key.as_str());
             if !traversal.observed_index_keys.contains(index_key)
@@ -3663,21 +3678,43 @@ fn cancel_claude_family_carry_for_member_parse(
             {
                 continue;
             }
-            let Some(scan_root) = traversal
-                .scan_roots
-                .iter()
-                .filter(|root| path.starts_with(root))
-                .max_by_key(|root| root.components().count())
-                .cloned()
-            else {
-                continue;
-            };
-            traversal.pending_candidates.push_front(ScanTraversalPath {
-                scan_root,
-                path: path.to_path_buf(),
-                census_member: true,
-                watcher_hint: false,
-            });
+            passed.push(
+                traversal
+                    .scan_roots
+                    .iter()
+                    .filter(|root| path.starts_with(root))
+                    .max_by_key(|root| root.components().count())
+                    .cloned()
+                    .map(|scan_root| ScanTraversalPath {
+                        scan_root,
+                        path: path.to_path_buf(),
+                        census_member: true,
+                        watcher_hint: false,
+                    }),
+            );
+        }
+    }
+    if walk_done && !passed.is_empty() {
+        CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS_FOR_TEST
+            .with(|cell| cell.set(cell.get().saturating_add(1)));
+        eprintln!(
+            "local snapshot census kept a stale Claude family carry: a member is parsed on the \
+             page that ends the walk after another member was passed; the family takes the \
+             ordinary path"
+        );
+        return;
+    }
+    for index_key in &others {
+        if let Some(entry) = index.files.get_mut(index_key) {
+            entry.source_file_fingerprint.clear();
+        }
+    }
+    let mut requeued = 0_usize;
+    if let Some(traversal) = index.traversal.as_mut() {
+        for pending in passed.into_iter().flatten() {
+            traversal.pending_candidates.push_front(pending);
             requeued += 1;
         }
     }

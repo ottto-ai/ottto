@@ -69,9 +69,12 @@ before any other member of that family is parsed in the window cancels the
 carry: every other member's revision is cleared, and members the walk already
 passed are queued again at the front of the traversal, so a later bounded
 page of the same window reads them and the whole family is co-observed in
-that window as BASE's re-arm observes it. When the change is found on the
-page that would have been terminal, that page is no longer terminal: the
-window gains one bounded page. The page file limit is unchanged. A content-free counter and a fixed-text log
+that window as BASE's re-arm observes it. The page file limit is unchanged.
+On the page that ends the walk, queueing a passed member would end that page
+without its terminal fold, which demotes the changed revision before the
+family can be re-proved; there the carry stays and the family takes the
+ordinary path (the held path below). A content-free counter and a fixed-text
+log line record each hold. A content-free counter and a fixed-text log
 line record each cancellation.
 
 No persisted field, schema, cap or constant changes. The traversal-start row
@@ -96,11 +99,14 @@ replace the equivalent inline checks in C1a's unchanged-proof check.
   cases' liveness (RetryPending, red, census complete, census invalid, fence,
   full re-arm, proof) equals BASE in every window.
 - Round 2 adds: the scratch admission (a forced refusal and a 12,000-hash
-  priced refusal both equal BASE byte for byte, and an admitted positive);
-  the reviewed recoverable change (the provider ledger already holds a
-  subagent request, and the transcript gains it with matching usage) on a
-  later page and on the terminal page, each proving as BASE without
-  RetryPending; and the removed-member held path.
+  priced refusal both equal BASE byte for byte, an admitted positive, and
+  admission equal to the supported-layout predicate); the reviewed
+  recoverable change (the provider ledger already holds a subagent request,
+  and the transcript gains it with matching usage) found on a non-terminal
+  page, where the cancel co-observes the family and the proof, RetryPending,
+  liveness and witness equal BASE's; the same change found on the page that
+  ends the walk, where the family takes the held path; and the
+  removed-member held path.
 
 ## Residual risks
 
@@ -121,9 +127,16 @@ replace the equivalent inline checks in C1a's unchanged-proof check.
   globally disabled by `census_invalid`; C1a's independent fence-recovery
   path can still re-arm every family when unread witnessed families are the
   only obstacle.
-- Held path (SOURCE B9): a carried member that changes without being parsed
-  in the window (it is removed, moved, or ages out of the backfill window)
-  does not cancel the carry. The remaining members are not read in that
+- Held path (SOURCE B9), walk-ending page: when a carried family's first
+  member parse in the window falls on the page that ends the walk and
+  another member was already passed, the carry stays. Only that member is
+  read, its pending lacks the others, and the family takes the ordinary path
+  (demotion, RetryPending, forced family reparse). BASE reads the whole
+  family there and, when the changed member's whole family sits on that
+  terminal page, re-proves it without RetryPending.
+- Held path (SOURCE B9), unparsed change: a carried member that changes
+  without being parsed in the window (it is removed, moved, or ages out of
+  the backfill window) does not cancel the carry. The remaining members are not read in that
   window, while BASE re-reads them. They are read again only when a later
   start re-arms the family or one of its members is parsed.
 - A compacted entry keeps no request hashes, so a fork that first copies a

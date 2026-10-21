@@ -458,23 +458,23 @@ fn c1b_repair_and_gain_recorded_request(fixture: &RearmFixture) {
     );
 }
 
-/// Runs the recoverable member change in a fix arm and a BASE arm and checks
-/// that the 08:20 retry proves exactly as BASE: the carry is decided at the
-/// start, the changed member's parse cancels it once, every member is read in
-/// that same healthy window, and the proof, RetryPending, liveness, heads and
-/// witness all equal BASE's.
-fn c1b_assert_recoverable_change_proves_like_base(case: &'static str, page_files: usize) {
+/// The recoverable member change in a fix arm and a BASE arm on pages of
+/// `page_files` files, as (fix, BASE, cancellations, terminal holds) with the
+/// fix arm's counter deltas.
+fn c1b_recoverable_change_arms(
+    case: &'static str,
+    page_files: usize,
+) -> (C1bRun, C1bRun, usize, usize) {
     let cancellations = crate::snapshots::claude_stale_family_carry_cancellations_for_test();
+    let holds = crate::snapshots::claude_stale_family_carry_terminal_holds_for_test();
     let fix = c1b_red_chain_with(
         c1b_recorded_request_fixture(case, page_files),
         "fix",
         c1b_repair_and_gain_recorded_request,
     );
-    assert_eq!(
-        crate::snapshots::claude_stale_family_carry_cancellations_for_test(),
-        cancellations + 1,
-        "the changed member cancels the carry once"
-    );
+    let cancelled =
+        crate::snapshots::claude_stale_family_carry_cancellations_for_test() - cancellations;
+    let held = crate::snapshots::claude_stale_family_carry_terminal_holds_for_test() - holds;
     let base = {
         let _base = crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new();
         c1b_red_chain_with(
@@ -483,58 +483,72 @@ fn c1b_assert_recoverable_change_proves_like_base(case: &'static str, page_files
             c1b_repair_and_gain_recorded_request,
         )
     };
-    let family = rearm_family_sessions().len();
-    let retry = &fix.windows[2];
-    let base_retry = &base.windows[2];
-    // Preconditions on BASE: the healthy retry re-reads the family and
-    // re-proves it with the gained request, without RetryPending.
-    assert!(base_retry.census_complete && !base_retry.red);
-    assert_eq!(base_retry.family_reads, family);
-    assert!(base_retry.proven && !base_retry.retry_pending);
-    assert_ne!(base.witness_after, base.witness_after_red, "BASE re-proves");
-    let start = retry.start.as_ref().expect("a retry start");
-    assert_eq!(start.reason, "terminal_unhealthy_retry");
-    assert_eq!(start.carried_pending_families, Some(1), "carried at start");
-    // FLIPS: without the cancel only the changed member is read, the root's
-    // absence fails the fresh proof and the family turns RetryPending.
-    assert_eq!(retry.family_reads, family, "the family is co-observed");
-    assert_eq!(retry.proven, base_retry.proven);
-    assert_eq!(retry.retry_pending, base_retry.retry_pending);
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
-    assert_eq!(fix.heads_after, base.heads_after);
-    assert_eq!(fix.witness_after, base.witness_after);
+    (fix, base, cancelled, held)
 }
 
-/// SOURCE B9, the reviewed recoverable case: after the red window the first
+/// SOURCE B9, the reviewed recoverable change: after the red window the first
 /// subagent gains a request its provider ledger already recorded, and the red
-/// producer is repaired. The subagent is read on the second page, after the
-/// unchanged root was skipped on the first, so the cancel queues the root
-/// again for a later bounded page of the same window.
+/// producer is repaired. The subagent is read on the second of three pages,
+/// after the unchanged root was skipped on the first, so the changed member's
+/// parse cancels the carry and queues the root again for a later bounded page
+/// of the same window. Every member is read in that window, and the proof,
+/// RetryPending, every window's liveness and the witness equal BASE's. With the family spread over pages, BASE's own re-read also demotes
+/// the changed revision at a non-terminal page, so both arms hold it
+/// RetryPending; the first-page parse cannot change that.
 #[test]
 #[serial(source_manifests)]
-fn c1b_recoverable_member_change_cancels_the_carry_and_proves_like_base() {
+fn c1b_recoverable_member_change_cancels_the_carry_like_base() {
     if !c1a_layout_supported("c1b_recoverable_member_change") {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    c1b_assert_recoverable_change_proves_like_base(
-        "c1b-recoverable-member-change",
-        REARM_PAGE_FILES,
-    );
+    let (fix, base, cancelled, held) =
+        c1b_recoverable_change_arms("c1b-recoverable-member-change", REARM_PAGE_FILES);
+    assert_eq!((cancelled, held), (1, 0), "one cancel, no hold");
+    let family = rearm_family_sessions().len();
+    let retry = &fix.windows[2];
+    let base_retry = &base.windows[2];
+    let start = retry.start.as_ref().expect("a retry start");
+    assert_eq!(start.reason, "terminal_unhealthy_retry");
+    assert_eq!(start.carried_pending_families, Some(1), "carried at start");
+    assert!(!base_retry.red, "the producer is repaired");
+    assert_eq!(base_retry.family_reads, family);
+    // FLIPS: without the cancel only the changed member is read.
+    assert_eq!(retry.family_reads, family, "the family is co-observed");
+    assert_eq!(retry.proven, base_retry.proven);
+    assert_eq!(retry.retry_pending, base_retry.retry_pending);
+    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
+    assert_eq!(fix.witness_after, base.witness_after);
 }
 
-/// The same recoverable change with every window on one page, so the change
-/// is discovered on the page that would have been the healthy terminal. The
-/// cancel queues the already skipped root again, so the window gains one
-/// bounded page instead of ending there, and the family still proves as BASE.
+/// SOURCE B9 held path: the same change with every window on one page, so
+/// the changed member is parsed on the page that ends the walk after the
+/// unchanged root was already passed. BASE reads the whole family on that
+/// terminal page and re-proves it there. Queueing the root would end the page
+/// without its terminal fold, so the carry stays: only the changed member is
+/// read, its pending lacks the root, and the family takes the ordinary path
+/// to RetryPending. This is the remaining divergence from BASE.
 #[test]
 #[serial(source_manifests)]
-fn c1b_member_change_on_the_terminal_page_cancels_the_carry_like_base() {
+fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
     if !c1a_layout_supported("c1b_terminal_page_member_change") {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    c1b_assert_recoverable_change_proves_like_base("c1b-terminal-page-member-change", 64);
+    let (fix, base, cancelled, held) =
+        c1b_recoverable_change_arms("c1b-terminal-page-member-change", 64);
+    assert_eq!((cancelled, held), (0, 1), "one hold, no cancel");
+    let family = rearm_family_sessions().len();
+    let retry = &fix.windows[2];
+    let base_retry = &base.windows[2];
+    // BASE: the healthy terminal page re-reads and re-proves the family.
+    assert!(base_retry.census_complete && !base_retry.red);
+    assert_eq!(base_retry.family_reads, family);
+    assert!(base_retry.proven && !base_retry.retry_pending);
+    let start = retry.start.as_ref().expect("a retry start");
+    assert_eq!(start.carried_pending_families, Some(1), "carried at start");
+    assert_eq!(retry.family_reads, 1, "only the changed member is read");
+    assert!(retry.retry_pending, "the ordinary path holds the family");
 }
 
 /// SOURCE B9 held path, the remaining case: a member that disappears after
