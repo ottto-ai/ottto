@@ -803,3 +803,43 @@ fn money_telemetry_retires_only_under_pressure() {
         Some(quarter as u64)
     );
 }
+
+/// The shadow's reread never reads past its admitted length: a file that
+/// grew past it, or a short one with a torn line, yields no rows at all.
+#[test]
+fn money_reread_is_bounded_by_its_admitted_length() {
+    let tail = MoneyTail::new("money-reread-bound");
+    let session = "reread-session";
+    tail.append(
+        session,
+        &money_api_line(session, "req_1", "2026-08-02T07:00:00Z"),
+    );
+    let len = std::fs::metadata(tail.path(session)).unwrap().len();
+    let rows =
+        crate::claude_local_otel::load_claude_api_rows_within(&tail.support, session, len + 1)
+            .expect("the admitted file reads");
+    assert_eq!(rows.len(), 1);
+    // Grew after its admission stat: refused before any read.
+    tail.append(
+        session,
+        &money_api_line(session, "req_2", "2026-08-02T07:00:01Z"),
+    );
+    assert!(
+        crate::claude_local_otel::load_claude_api_rows_within(&tail.support, session, len + 1)
+            .is_none()
+    );
+    // A torn last line is not fully healthy.
+    let grown = std::fs::metadata(tail.path(session)).unwrap().len();
+    tail.append(session, "{\"truncated");
+    assert!(crate::claude_local_otel::load_claude_api_rows_within(
+        &tail.support,
+        session,
+        grown + 64
+    )
+    .is_none());
+    // Missing is not "no rows" here either: there is nothing to admit.
+    assert!(
+        crate::claude_local_otel::load_claude_api_rows_within(&tail.support, "absent", 1024)
+            .is_none()
+    );
+}
