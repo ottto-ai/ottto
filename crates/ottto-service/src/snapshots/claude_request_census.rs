@@ -258,22 +258,6 @@ impl ClaudeRequestCensusRecord {
         self.message_hashes.as_deref()
     }
 
-    pub(crate) fn shape(&self) -> ClaudeRequestCensusShape {
-        self.shape
-    }
-
-    pub(crate) fn derivation(&self) -> u16 {
-        self.derivation
-    }
-
-    pub(crate) fn unverified(&self) -> bool {
-        self.unverified
-    }
-
-    pub(crate) fn twin(&self) -> bool {
-        self.twin
-    }
-
     pub(crate) fn birth(&self) -> Option<ClaudeRequestBirth> {
         self.birth
     }
@@ -288,10 +272,6 @@ impl ClaudeRequestCensusRecord {
 
     pub(crate) fn tail(&self) -> Option<&ClaudeTelemetryTailState> {
         self.tail.as_ref()
-    }
-
-    pub(crate) fn fingerprint(&self) -> &[u8; 32] {
-        &self.source_file_fingerprint
     }
 
     /// Strict freshness (Sol N6): this record is the current census of the
@@ -458,10 +438,6 @@ impl ClaudeRequestCensus {
 
     pub(crate) fn serialized_total(&self) -> usize {
         self.serialized_total
-    }
-
-    pub(crate) fn ledger_hash_total(&self) -> usize {
-        self.ledger_hash_total
     }
 
     fn charge(&mut self, key: &str, record: &ClaudeRequestCensusRecord, sign: bool) {

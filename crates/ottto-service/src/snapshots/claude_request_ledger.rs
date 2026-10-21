@@ -220,7 +220,7 @@ impl<'a> ClaudeRequestHolders<'a> {
             let scope = holders
                 .iter()
                 .copied()
-                .filter(|key| root_of(*key).is_some_and(|root| telemetry_key(&root) == *claimant))
+                .filter(|key| root_of(key).is_some_and(|root| telemetry_key(&root) == *claimant))
                 .collect::<Vec<_>>();
             if scope.len() <= 1 {
                 return ClaudeRequestVerdict::TelemetryProven;
