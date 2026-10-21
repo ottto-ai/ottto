@@ -30,9 +30,12 @@ pub(super) struct ProofVisit {
 enum WakeOf {
     ParentChanged,
     ChildChanged,
-    Rewritten { parent: bool },
+    Rewritten {
+        parent: bool,
+    },
     Census(String),
-    Held(ProofWake),
+    /// Boxed: the error side of the finish's checks stays small.
+    Held(Box<ProofWake>),
     Backoff,
 }
 
@@ -69,7 +72,7 @@ fn proof_wake(of: &WakeOf, parent: Option<&OpenStamp>, child: Option<&OpenStamp>
                     child,
                 })
         }
-        WakeOf::Held(wake) => wake.clone(),
+        WakeOf::Held(wake) => (**wake).clone(),
         WakeOf::Backoff => ProofWake::Backoff,
     }
 }
@@ -507,7 +510,7 @@ fn finish_codex_proof_job(
             _ => ProofOutcome::ParentHeld,
         };
         let wake = index.codex_parent_held_wake(&p_key, &file, fenced, needed);
-        finish_all(index, outcome, &WakeOf::Held(wake), &job.entries);
+        finish_all(index, outcome, &WakeOf::Held(Box::new(wake)), &job.entries);
         return;
     }
     // Step 6: each child's result.
