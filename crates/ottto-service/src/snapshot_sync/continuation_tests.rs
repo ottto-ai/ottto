@@ -216,7 +216,7 @@ fn run(
 #[test]
 fn the_inert_default_takes_todays_path() {
     assert!(
-        !ENABLED,
+        !std::hint::black_box(ENABLED),
         "Stage 1 stays inert until its integration is approved"
     );
     assert_eq!(production_pending(), None);

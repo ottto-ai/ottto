@@ -2686,7 +2686,7 @@ fn collect_file_activity_for(
         account_switch,
         retry_boundary,
         crate::agent_status::claude_default_account_fingerprint,
-    );
+    )
 }
 
 fn collect_file_activity_with_retry(
