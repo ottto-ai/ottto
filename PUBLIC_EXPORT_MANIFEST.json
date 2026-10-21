@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 730,
-  "content_sha256": "8c9dabcaaa9825290c1fc324a6355f387f7cafab80df71fe6082528a86677903",
+  "candidate_file_count": 732,
+  "content_sha256": "50dce127bbe4d672429949c6b59785f633fd7f4f98e07a3b3bb2374513d322b1",
   "files": [
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "10926107abe6af1a1d5267bd97c676953974bfacd53e562fd759af889cbd03d4",
-      "size_bytes": 843577
+      "sha256": "15cb1983da9e752192a4a340f372362a3f4ee283fbfc5e2eee024eaf25f51758",
+      "size_bytes": 844406
     },
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "eecf0735bc06d5437ee04476850a12fb4754ca613ca0a823f1f6b36d2f8ea214",
-      "size_bytes": 2933570
+      "sha256": "8b74f2c0f84b033d0a73579b6631ca1de1d800c24a64cec7746452c1b1da8abe",
+      "size_bytes": 2971545
     },
     {
       "executable": false,
@@ -1356,9 +1356,16 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_fresh_start_census_tests.rs",
+      "sha256": "d2c19b3ab97193f41ea221bc4ab9f3a9f5806970c6a3b29714af825d73cde48b",
+      "size_bytes": 63477
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison.rs",
-      "sha256": "df3878cff2f6c0bc72aea633fed44ddc2dcb648b1039336e460ec15b81ca639a",
-      "size_bytes": 122740
+      "sha256": "295b3d9c140c4569d9bdc42eb052b4cf5be2564fa5e2972912bf5ef9491716d9",
+      "size_bytes": 124176
     },
     {
       "executable": false,
@@ -1378,8 +1385,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
-      "sha256": "c4c6a22805129de08b9f721cae4c33bee598a6d27b78488e4ea77b41a20b0bae",
-      "size_bytes": 59711
+      "sha256": "95c7bf2673e79376af761d0f4e1f701404216705482960f8267f3940336f93db",
+      "size_bytes": 60725
     },
     {
       "executable": false,
@@ -1546,8 +1553,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/p12_usage_original_tests.rs",
-      "sha256": "458e8f100325dc120972ed90ee1f0b3a9b0787032419830ec2fb1f287b1e09e6",
-      "size_bytes": 22624
+      "sha256": "40336344855d17565b12a1b06ca872f87f9445b79070569242c6b7787e1f1198",
+      "size_bytes": 22654
     },
     {
       "executable": false,
@@ -2344,8 +2351,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-30-claude-owned-context-posture.md",
-      "sha256": "c35e7ada03f56bfbfa91d703b8280cab0842f86a571a7e190efdcf9699007815",
-      "size_bytes": 6356
+      "sha256": "634851052dd4573fbef94839b73f5cfa6830ddd74b4936d236f025d4539eb928",
+      "size_bytes": 6617
     },
     {
       "executable": false,
@@ -3326,6 +3333,13 @@
       "path": "docs/session-2026-10-20-permanent-source-finish.md",
       "sha256": "574cd6b52d2dc5f61cacbd7c4c0ea8fb07627e4872029f812f20e7300fd539eb",
       "size_bytes": 3377
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-21-claude-census-verified-fresh-start.md",
+      "sha256": "255ba60e479a6e5111cb927e3c1b2ca3432033e5be9e34056ee3c380a08bb9df",
+      "size_bytes": 6019
     },
     {
       "executable": false,
@@ -5113,9 +5127,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T07:18:39+00:00",
+  "generated_at": "2026-10-21T08:24:44+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 731,
+  "output_file_count": 733,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5152,5 +5166,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ff0859562f416e974060a16b6305100a71716716"
+  "source_commit": "a5e474b8f98e8b63f0e88ec27a2abc9344da399c"
 }
