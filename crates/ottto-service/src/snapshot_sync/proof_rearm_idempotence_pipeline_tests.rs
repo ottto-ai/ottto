@@ -1071,11 +1071,13 @@ fn c1a_late_copied_import_stays_suppressed_while_skip_active() {
 }
 
 /// Disclosure, not a pass/fail claim on either arm: the liveness residual.
-/// With the skip active, a changed root API row lands after the family's
-/// pages of a multi-page window and before its terminal page. BASE re-read
-/// the family in that window and re-proves it at the terminal; the fix did
-/// not read it, so its next window reconstructs against the earlier witness.
-/// The receipt records both arms' RetryPending state for the report.
+/// With the skip active, the family's root API rows change (account evidence
+/// added) either after the family's pages of a multi-page window and before
+/// its terminal page (`mid_window`), or between two windows
+/// (`between_windows`). Mid-window, BASE re-read the family in that window and
+/// re-proves it at the terminal; the fix did not read it, so its next window
+/// reconstructs against the earlier witness. The receipts record both arms'
+/// RetryPending and census state per window for the report.
 #[test]
 #[serial(source_manifests)]
 fn c1a_residual_late_row_after_family_pages_receipt() {
@@ -1104,37 +1106,45 @@ fn c1a_residual_late_row_after_family_pages_receipt() {
             .collect::<String>();
         std::fs::write(&path, rows).unwrap();
     };
-    let run = |fixture: &RearmFixture, arm: &str| {
+    let run = |fixture: &RearmFixture, arm: &str, mid_window: bool| {
         c1a_close_and_reprove(fixture, arm);
-        let landed = c1a_window(&c1a_generation_with(
-            fixture,
-            arm,
-            (8, 20),
-            None,
-            |number| {
-                if number == 2 {
+        if !mid_window {
+            late_row(fixture);
+        }
+        [(8, 20), (8, 30), (8, 40)].map(|clock| {
+            c1a_window(&c1a_generation_with(fixture, arm, clock, None, |number| {
+                if mid_window && clock == (8, 20) && number == 2 {
                     late_row(fixture);
                 }
-            },
-        ));
-        let next = c1a_window(&c1a_generation(fixture, arm, (8, 30)));
-        let after = c1a_window(&c1a_generation(fixture, arm, (8, 40)));
-        (landed, next, after)
+            }))
+        })
     };
-    let fixture = c1a_fixture("c1a-residual-late-row");
-    let fix = run(&fixture, "fix");
-    let base = c1a_fixture("c1a-residual-late-row-base");
-    let base = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        run(&base, "base")
-    };
-    writeln!(
-        std::io::stderr().lock(),
-        "C1A_PROOF_REARM residual=late_row_after_family_pages fix_retry_pending={:?} base_retry_pending={:?} fix_proven={:?} base_proven={:?}",
-        [fix.0.retry_pending, fix.1.retry_pending, fix.2.retry_pending],
-        [base.0.retry_pending, base.1.retry_pending, base.2.retry_pending],
-        [fix.0.proven, fix.1.proven, fix.2.proven],
-        [base.0.proven, base.1.proven, base.2.proven],
-    )
-    .unwrap();
+    for (timing, mid_window) in [("mid_window", true), ("between_windows", false)] {
+        let fixture = c1a_fixture(if mid_window {
+            "c1a-residual-late-row"
+        } else {
+            "c1a-residual-late-row-between"
+        });
+        let fix = run(&fixture, "fix", mid_window);
+        let base = c1a_fixture(if mid_window {
+            "c1a-residual-late-row-base"
+        } else {
+            "c1a-residual-late-row-between-base"
+        });
+        let base = {
+            let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
+            run(&base, "base", mid_window)
+        };
+        writeln!(
+            std::io::stderr().lock(),
+            "C1A_PROOF_REARM residual=late_row timing={timing} fix_retry_pending={:?} base_retry_pending={:?} fix_census_complete={:?} base_census_complete={:?} fix_family_offered={:?} base_family_offered={:?}",
+            fix.each_ref().map(|window| window.retry_pending),
+            base.each_ref().map(|window| window.retry_pending),
+            fix.each_ref().map(|window| window.census_complete),
+            base.each_ref().map(|window| window.census_complete),
+            fix.each_ref().map(|window| window.family_offered),
+            base.each_ref().map(|window| window.family_offered),
+        )
+        .unwrap();
+    }
 }
