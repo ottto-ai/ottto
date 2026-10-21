@@ -2398,7 +2398,8 @@ fn a_f2_a_stranded_candidate_spends_one_settlement_rearm_only_on_a_permitted_acc
     assert_eq!(state(&machine.index, FRESH), Some(ClaudeFreshStartState::Candidate));
     assert_eq!(disposition.fresh_start_audit.settlement_rearms, 0);
     // Stranded passes whose census does not accept this member spend nothing.
-    let refusals: [(&str, fn(&mut ClaudeCensusViewForTest)); 4] = [
+    type Refusal = fn(&mut ClaudeCensusViewForTest);
+    let refusals: [(&str, Refusal); 4] = [
         ("incomplete", |view| view.complete = false),
         ("unobserved", |view| {
             view.unobserved.insert(FRESH.to_string());
