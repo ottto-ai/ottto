@@ -195,12 +195,12 @@ fn bounded_retry_envelope_probe_charges_child_threads_and_realloc_overlap() {
 
 struct EnvelopeTls {
     _root: RotationRoot,
-    client: std::sync::Arc<ureq::rustls::ClientConfig>,
-    server: std::sync::Arc<ureq::rustls::ServerConfig>,
+    client: std::sync::Arc<rustls::ClientConfig>,
+    server: std::sync::Arc<rustls::ServerConfig>,
 }
 impl EnvelopeTls {
     fn new() -> Self {
-        use ureq::rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::pem::PemObject;
         let root = RotationRoot(test_dir("retry-envelope-tls"));
         std::fs::create_dir_all(&root.0).unwrap();
         std::fs::write(root.0.join("certificate.cnf"), "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=ext\n[dn]\nCN=localhost\n[ext]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n").unwrap();
@@ -229,24 +229,24 @@ impl EnvelopeTls {
             output.status.success(),
             "synthetic certificate generation failed"
         );
-        let certificate = ureq::rustls::pki_types::CertificateDer::from_pem_slice(
+        let certificate = rustls::pki_types::CertificateDer::from_pem_slice(
             &std::fs::read(root.0.join("cert.pem")).unwrap(),
         )
         .unwrap();
-        let key = ureq::rustls::pki_types::PrivateKeyDer::from_pem_slice(
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
             &std::fs::read(root.0.join("key.pem")).unwrap(),
         )
         .unwrap();
-        let mut roots = ureq::rustls::RootCertStore::empty();
+        let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate.clone()).unwrap();
-        let provider = std::sync::Arc::new(ureq::rustls::crypto::ring::default_provider());
-        let client = ureq::rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let server = ureq::rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
             .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![certificate], key)
@@ -275,8 +275,8 @@ impl EnvelopeTls {
                 socket
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
-                let connection = ureq::rustls::ServerConnection::new(config.clone()).unwrap();
-                let mut stream = ureq::rustls::StreamOwned::new(connection, socket);
+                let connection = rustls::ServerConnection::new(config.clone()).unwrap();
+                let mut stream = rustls::StreamOwned::new(connection, socket);
                 let mut request = Vec::new();
                 let mut bytes = [0; 4096];
                 while !http_request_complete(&request) {

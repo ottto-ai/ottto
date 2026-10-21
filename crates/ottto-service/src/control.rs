@@ -7153,7 +7153,8 @@ fn check_update_state() -> UpdateState {
 
     let manifest_url = std::env::var("OTTTO_RELEASE_MANIFEST_URL")
         .unwrap_or_else(|_| default_release_manifest_url(&local_channel));
-    let manifest = ureq::get(&manifest_url)
+    let manifest = crate::retry_tls::agent()
+        .get(&manifest_url)
         .set("Accept", "application/json")
         .timeout(Duration::from_secs(5))
         .call()
@@ -12898,7 +12899,8 @@ fn issue_source_relay_token(
         api_base_url,
         &format!("/api/v1/telemetry/devices/{}/relay-token", device.device_id),
     );
-    let response: RelayTokenApiResponse = ureq::post(&url)
+    let response: RelayTokenApiResponse = crate::retry_tls::agent()
+        .post(&url)
         .set("Accept", "application/json")
         .set("X-Ottto-Device-Secret", &device_secret)
         .timeout(BACKEND_REQUEST_TIMEOUT)
@@ -15828,7 +15830,8 @@ fn backend_post_json_with_timeout<T: DeserializeOwned>(
     headers: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<T, LocalApiError> {
-    let mut request = ureq::post(url)
+    let mut request = crate::retry_tls::agent()
+        .post(url)
         .set("Accept", "application/json")
         .timeout(timeout);
     for (key, value) in headers {
@@ -15861,7 +15864,8 @@ fn backend_get_json_with_timeout<T: DeserializeOwned>(
     headers: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<T, LocalApiError> {
-    let mut request = ureq::get(url)
+    let mut request = crate::retry_tls::agent()
+        .get(url)
         .set("Accept", "application/json")
         .timeout(timeout);
     for (key, value) in headers {
