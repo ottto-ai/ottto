@@ -490,6 +490,27 @@ fn carry_controls() -> Vec<CarryControl> {
                 .insert(hash, BTreeSet::new());
         }
     }));
+    // An unproven fork read in the failed window copied the root's first
+    // request: its legacy exclusion needs the root's sequence in its window.
+    controls.push(carry_control("unproven_fork_copies_a_request", |index| {
+        let root = carry_member(CARRY_ROOT, None);
+        let hash = index.claude_usage_family_pending[CARRY_ROOT].member_request_id_hashes[&root]
+            .first()
+            .unwrap()
+            .clone();
+        let fork = index
+            .claude_usage_family_pending
+            .get_mut(CARRY_UNWITNESSED)
+            .unwrap();
+        fork.member_request_id_hashes
+            .get_mut(CARRY_UNWITNESSED)
+            .unwrap()
+            .insert(hash.clone());
+        fork.member_occurrences
+            .get_mut(CARRY_UNWITNESSED)
+            .unwrap()
+            .insert(hash, carry_occurrence(0, 10));
+    }));
     controls.push(carry_control("owned_start_census", {
         let agent = agent.clone();
         move |index: &mut ScanIndex| {
