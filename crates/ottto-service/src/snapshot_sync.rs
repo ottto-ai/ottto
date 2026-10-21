@@ -4790,6 +4790,7 @@ fn finish_sync_source(
     // labels on the wire.
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    let mut fresh_start_credit = None;
     let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
@@ -4802,7 +4803,7 @@ fn finish_sync_source(
             comparison_completion.as_mut(),
             native_comparison_lease.as_ref(),
         );
-        let (disposition, census_withheld, stats) = match applied {
+        let (disposition, census_withheld, stats, credit) = match applied {
             Ok(applied) => applied,
             Err(reason) => {
                 if let Some(lease) = native_comparison_lease.as_mut() {
@@ -4840,6 +4841,7 @@ fn finish_sync_source(
             });
         }
         claude_authority_disposition = disposition;
+        fresh_start_credit = credit;
         if census_withheld {
             backfill_succeeded = false;
         }
@@ -5188,19 +5190,37 @@ fn finish_sync_source(
     // Slice 2c (B-F3): the bodies this fold built with fresh-start scalars,
     // and those the server holds after its ACK (`accepted`, or a plain
     // `unchanged` for an identical stored body; an h573 `unchanged_basis`
-    // means not stored). Both stay empty, and nothing is walked, while off.
-    let fresh_start_admitted = &claude_authority_disposition.fresh_start_admitted;
-    let fresh_start_offered = if fresh_start_admitted.is_empty() {
-        BTreeSet::new()
+    // means not stored). Both views borrow this cycle's fingerprints; their
+    // nodes were funded with the root sets (P4). More items than funded build
+    // neither view, so no witness is marked `Emitted` (`Verified` stays and
+    // is still withdrawn by a later revocation or switch-off). Both stay
+    // empty, and nothing is walked, while off.
+    let fresh_start_admitted =
+        std::mem::take(&mut claude_authority_disposition.fresh_start_admitted);
+    let fresh_start_items = if fresh_start_admitted.is_empty() {
+        0
     } else {
         scan_result
             .snapshots
             .iter()
             .filter(|snapshot| fresh_start_admitted.contains(&snapshot.source_session_id))
-            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-            .collect::<BTreeSet<_>>()
+            .count()
     };
-    let mut fresh_start_applied = BTreeSet::new();
+    let fresh_start_offered = if fresh_start_items > 0
+        && fresh_start_credit
+            .as_ref()
+            .is_some_and(|credit| fresh_start_items <= credit.upload_items())
+    {
+        scan_result
+            .snapshots
+            .iter()
+            .filter(|snapshot| fresh_start_admitted.contains(&snapshot.source_session_id))
+            .map(|snapshot| snapshot.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut fresh_start_applied = BTreeSet::<&str>::new();
     let mut accepted = 0;
     let upload_result = upload_resumable_batches_with_body_witness_partitioned(
         &scan_result.snapshots,
@@ -5251,12 +5271,11 @@ fn finish_sync_source(
             let response = client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
             response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
             if !fresh_start_offered.is_empty() {
-                fresh_start_applied.extend(
-                    response
-                        .stored_entities()
-                        .filter(|entity| fresh_start_offered.contains(&entity.snapshot_fingerprint))
-                        .map(|entity| entity.snapshot_fingerprint.clone()),
-                );
+                fresh_start_applied.extend(response.stored_entities().filter_map(|entity| {
+                    fresh_start_offered
+                        .get(entity.snapshot_fingerprint.as_str())
+                        .copied()
+                }));
             }
             let request_fingerprints = request
                 .snapshots
@@ -5307,7 +5326,7 @@ fn finish_sync_source(
         let not_applied = crate::snapshots::settle_claude_fresh_start_emissions(
             &mut index,
             &scan_result.snapshots,
-            &claude_authority_disposition.fresh_start_admitted,
+            &fresh_start_admitted,
             &fresh_start_applied,
         );
         if not_applied > 0 {
@@ -5316,6 +5335,16 @@ fn finish_sync_source(
                  were not stored by the server; their witnesses stay verified, not emitted"
             );
         }
+    }
+    // P4: every 2c set of this cycle is gone, so its whole credit returns to
+    // the same reservation; nothing later in this cycle builds a 2c set.
+    drop(fresh_start_applied);
+    drop(fresh_start_offered);
+    drop(fresh_start_admitted);
+    if let (Some(credit), Some(comparison)) =
+        (fresh_start_credit.take(), comparison_completion.as_mut())
+    {
+        comparison.release_fresh_start_roots(credit);
     }
 
     index.log_claude_proof_correction_debt();
@@ -6452,23 +6481,29 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     index: &mut ScanIndex,
     permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     prepared: Option<PreparedClaudeLocalEvidence>,
-    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
+    mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    try_apply_claude_local_evidence_to_scan_with_comparison(
-        support_dir,
-        scan_result,
-        index,
-        permit,
-        prepared,
-        comparison,
-        lease,
-    )
-    .expect("ordinary or logical comparison evidence fixture has no resource refusal")
+    let (disposition, census_withheld, stats, fresh_start_credit) =
+        try_apply_claude_local_evidence_to_scan_with_comparison(
+            support_dir,
+            scan_result,
+            index,
+            permit,
+            prepared,
+            comparison.as_deref_mut(),
+            lease,
+        )
+        .expect("ordinary or logical comparison evidence fixture has no resource refusal");
+    // No upload follows here, so the 2c credit is returned at once.
+    if let (Some(credit), Some(comparison)) = (fresh_start_credit, comparison) {
+        comparison.release_fresh_start_roots(credit);
+    }
+    (disposition, census_withheld, stats)
 }
 
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
@@ -6484,6 +6519,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         crate::snapshots::ClaudeUsageAuthorityDisposition,
         bool,
         ClaudeLocalEvidenceStats,
+        // Slice 2c (P4): the still-charged part of this cycle's 2c credit,
+        // returned to `comparison` after the upload settlement.
+        Option<crate::snapshots::claude_native_comparison::FreshStartRootsCredit>,
     ),
     crate::source_rotation::LocalRefusal,
 > {
@@ -6552,25 +6590,44 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Slice 2c: admissible roots whose telemetry is settled this pass, either
     // both sidecars confirmed absent by the existing check or both read
     // completely below. Unknown, unreadable, present or unpaired is neither.
-    // The set is funded before allocation from the native reservation when
-    // this fold has one; on insufficient funds it stays empty, which refuses
-    // 2c for this fold. Empty and never consulted while off.
-    let fresh_start_credit = if crate::snapshots::claude_census_verified_fresh_start_enabled() {
+    // P4: one aggregate charge on this fold's native reservation funds every
+    // 2c set of the cycle (this set, the admitted set and the upload views)
+    // before any is built. Without a reservation, or without funds, nothing is
+    // settled, so nothing new is admitted, verified or re-armed for
+    // settlement and the strict body stays; withdrawal still runs. Empty and
+    // never consulted while off.
+    let mut fresh_start_credit = if crate::snapshots::claude_census_verified_fresh_start_enabled() {
         let (roots, key_bytes) = usage_roots
             .iter()
             .filter(|root| crate::snapshots::claude_fresh_start_root_admissible(index, root))
             .fold((0_usize, 0_usize), |(roots, bytes), root| {
                 (roots.saturating_add(1), bytes.saturating_add(root.len()))
             });
-        match comparison.as_deref_mut() {
-            Some(comparison) if roots > 0 => comparison.fund_fresh_start_roots(roots, key_bytes),
-            _ => Some(crate::snapshots::claude_native_comparison::FreshStartRootsCredit::default()),
-        }
+        let upload_items = if roots == 0 {
+            0
+        } else {
+            scan_result
+                .snapshots
+                .iter()
+                .filter(|item| {
+                    crate::snapshots::claude_fresh_start_root_admissible(
+                        index,
+                        &item.source_session_id,
+                    )
+                })
+                .count()
+        };
+        comparison.as_deref_mut().and_then(|comparison| {
+            comparison.fund_fresh_start_roots(roots, key_bytes, upload_items)
+        })
     } else {
         None
     };
-    let fresh_start_settles = |index: &ScanIndex, root: &str| {
-        fresh_start_credit.is_some()
+    // Only funded roots enter the set: a zero-work credit funds no insert.
+    let fresh_start_settles = |index: &ScanIndex, root: &str, settled: usize| {
+        fresh_start_credit
+            .as_ref()
+            .is_some_and(|credit| settled < credit.roots())
             && crate::snapshots::claude_fresh_start_root_admissible(index, root)
     };
     let mut fresh_start_telemetry_roots = BTreeSet::new();
@@ -6592,7 +6649,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 // The existing absence check only; 2c adds no stat or read.
                 if !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id) {
                     identity_unhealthy_roots.insert(session_id.clone());
-                } else if fresh_start_settles(index, session_id) {
+                } else if fresh_start_settles(index, session_id, fresh_start_telemetry_roots.len())
+                {
                     fresh_start_telemetry_roots.insert(session_id.clone());
                 }
             }
@@ -6633,7 +6691,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             continue;
         }
         stats.complete_sidecar_root_count += 1;
-        if fresh_start_settles(index, &root_session_id) {
+        if fresh_start_settles(index, &root_session_id, fresh_start_telemetry_roots.len()) {
             fresh_start_telemetry_roots.insert(root_session_id.clone());
         }
         let api_request_ids = api
@@ -6691,11 +6749,20 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             .or_else(|| {
                 lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
             }),
-        &fresh_start_telemetry_roots,
+        crate::snapshots::ClaudeFreshStartPass {
+            telemetry_settled: &fresh_start_telemetry_roots,
+            funded: fresh_start_credit.is_some(),
+            emission_permitted,
+        },
     );
     drop(fresh_start_telemetry_roots);
-    if let (Some(credit), Some(comparison)) = (fresh_start_credit, comparison.as_deref_mut()) {
-        comparison.release_fresh_start_roots(credit);
+    // The admitted set lives on in the disposition until the upload
+    // settlement, so only the settled set's part is returned here; the rest
+    // of the credit moves to the caller with the disposition.
+    if let (Some(credit), Some(comparison)) =
+        (fresh_start_credit.as_mut(), comparison.as_deref_mut())
+    {
+        comparison.release_fresh_start_fold_part(credit);
     }
     if let Some(fallback) = comparison
         .as_deref()
@@ -6793,7 +6860,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
-    Ok((disposition, census_withheld, stats))
+    Ok((disposition, census_withheld, stats, fresh_start_credit))
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -189,11 +189,37 @@ impl NativeCorrection {
     }
 }
 
-/// Slice 2c credit taken from the moving reservation for one fold's
-/// settled-telemetry root set: the allocation and ceiling to restore.
+/// Slice 2c (P4) credit taken from the moving reservation, before any 2c set
+/// is built, as one aggregate charge for every set slice 2c keeps alive in
+/// one cycle: the fold's settled-telemetry roots, the admitted roots, and the
+/// upload's offered and applied fingerprint views (borrowed `&str` entries,
+/// so nodes only). No Clone: each charge is returned exactly once.
 #[derive(Debug, Default)]
 pub(crate) struct FreshStartRootsCredit {
-    paid: Option<(usize, usize)>,
+    /// Entries the settled-telemetry set, and so the admitted set, may hold.
+    roots: usize,
+    /// Entries each upload view may hold.
+    upload_items: usize,
+    /// Charge for the settled-telemetry set, returned after the fold, and how
+    /// far it raised the reservation's ceiling.
+    fold_bytes: usize,
+    fold_raise: usize,
+    /// Charge for the admitted set and both upload views, returned after the
+    /// upload settlement has dropped them, and its ceiling raise.
+    upload_bytes: usize,
+    upload_raise: usize,
+}
+impl FreshStartRootsCredit {
+    pub(crate) fn roots(&self) -> usize {
+        self.roots
+    }
+    pub(crate) fn upload_items(&self) -> usize {
+        self.upload_items
+    }
+    #[cfg(test)]
+    pub(crate) fn upload_bytes_for_test(&self) -> usize {
+        self.upload_bytes
+    }
 }
 
 /// A borrow of the SAME completion reservation and its immutable producer
@@ -468,46 +494,89 @@ impl Completion {
         Ok(())
     }
 
-    /// Slice 2c (P4): fund the fold-local settled-telemetry root set from the
-    /// same moving reservation before it is allocated. `None` refuses 2c for
-    /// this fold. Without a reservation this fold has no native budget, so
-    /// the set is bounded only by the witness map cap (unfunded).
+    /// Slice 2c (P4): fund every 2c set of this cycle from the same moving
+    /// reservation before any is allocated. `roots` admissible roots with
+    /// `key_bytes` of session ids bound the settled-telemetry set and the
+    /// admitted set (admission needs settled telemetry); `upload_items`
+    /// snapshots of those roots bound each upload view. `None` refuses new 2c
+    /// work for this fold, which keeps the strict body: no reservation (no
+    /// native budget, so no funds), or insufficient funds. Withdrawal does not
+    /// depend on it. Zero roots keep a zero-work token that funds no insert.
     pub(crate) fn fund_fresh_start_roots(
         &mut self,
         roots: usize,
         key_bytes: usize,
+        upload_items: usize,
     ) -> Option<FreshStartRootsCredit> {
-        let Some(paid) = self.reservation.as_mut() else {
+        let paid = self.reservation.as_mut()?;
+        if roots == 0 {
             return Some(FreshStartRootsCredit::default());
-        };
-        let mut cost =
-            crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+        }
+        use crate::heap_layout_bound::{tree_nodes, Counter};
         // A set built by inserts only allocates nodes and keeps them, so one
-        // full node per entry (the map bound) covers its peak.
-        crate::heap_layout_bound::tree_nodes::<String, ()>(roots, &mut cost)?;
-        cost.add(key_bytes)?;
-        let old_allocated = paid.allocated();
+        // full node per entry (the map bound) covers its peak. Session ids
+        // are cloned into each root set; the views borrow the scan's
+        // fingerprints.
+        let root_set = |cost: &mut Counter| {
+            tree_nodes::<String, ()>(roots, cost)?;
+            cost.add(key_bytes)
+        };
+        let mut fold = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        root_set(&mut fold)?;
+        let mut upload = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        root_set(&mut upload)?;
+        tree_nodes::<&str, ()>(upload_items, &mut upload)?;
+        tree_nodes::<&str, ()>(upload_items, &mut upload)?;
+        // Grow for the longer-lived part first, so each part knows exactly
+        // how far it raised the ceiling and returns only that.
         let old_ceiling = paid.allocation_ceiling();
-        let owned = old_allocated.checked_add(cost.bytes)?;
+        let upload_owned = paid.allocated().checked_add(upload.bytes)?;
+        let owned = upload_owned.checked_add(fold.bytes)?;
+        if !paid.grow_for(upload_owned) {
+            return None;
+        }
+        let upload_ceiling = paid.allocation_ceiling();
         if !paid.grow_for(owned) || !paid.record_allocated(owned) {
             paid.release_temporary_peak(old_ceiling);
             return None;
         }
         Some(FreshStartRootsCredit {
-            paid: Some((old_allocated, old_ceiling)),
+            roots,
+            upload_items,
+            fold_bytes: fold.bytes,
+            // The ceiling only grows here, so nothing saturates; no early
+            // return may follow the charge.
+            fold_raise: paid.allocation_ceiling().saturating_sub(upload_ceiling),
+            upload_bytes: upload.bytes,
+            upload_raise: upload_ceiling.saturating_sub(old_ceiling),
         })
     }
-    /// Return the root set's credit once the fold has dropped the set.
-    pub(crate) fn release_fresh_start_roots(&mut self, credit: FreshStartRootsCredit) {
-        if let (Some((old_allocated, old_ceiling)), Some(paid)) =
-            (credit.paid, self.reservation.as_mut())
-        {
-            // The fold only borrows the completion, so nothing else moved the
-            // reservation between funding and this release.
-            debug_assert!(paid.allocated() >= old_allocated);
-            paid.record_allocated(old_allocated);
-            paid.release_temporary_peak(old_ceiling);
-        }
+    /// Return the settled-telemetry set's part once the fold has dropped it.
+    /// The admitted set and the upload views stay charged.
+    pub(crate) fn release_fresh_start_fold_part(&mut self, credit: &mut FreshStartRootsCredit) {
+        let bytes = std::mem::take(&mut credit.fold_bytes);
+        let raise = std::mem::take(&mut credit.fold_raise);
+        self.release_fresh_start_charge(bytes, raise);
+    }
+    /// Return the rest of the credit once the upload settlement has dropped
+    /// the admitted set and both views (or the cycle ended without them).
+    pub(crate) fn release_fresh_start_roots(&mut self, mut credit: FreshStartRootsCredit) {
+        self.release_fresh_start_fold_part(&mut credit);
+        self.release_fresh_start_charge(credit.upload_bytes, credit.upload_raise);
+    }
+    fn release_fresh_start_charge(&mut self, bytes: usize, raise: usize) {
+        let Some(paid) = self.reservation.as_mut().filter(|_| bytes > 0) else {
+            return;
+        };
+        // Other owners may move the same reservation between funding and
+        // release (the upload stage runs in between), so return exactly this
+        // charge and its own ceiling raise: their owned storage, recovery and
+        // unused credit stay as they are.
+        debug_assert!(paid.allocated() >= bytes);
+        let ceiling = paid.allocation_ceiling().saturating_sub(raise);
+        let lowered = paid.record_allocated(paid.allocated().saturating_sub(bytes));
+        debug_assert!(lowered);
+        paid.release_temporary_peak(ceiling);
     }
     /// A completion carrying only a moving reservation: no window, fallback
     /// or native terminal, so its fold is an ordinary one paid from `paid`.

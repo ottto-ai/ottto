@@ -1593,6 +1593,31 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Slice 2c inputs the local-evidence step (H5) hands one fold. Every other
+/// fold passes [`ClaudeFreshStartPass::none`]: nothing settled, no funds and
+/// no permit, so it admits, verifies and re-arms nothing new.
+#[derive(Clone, Copy)]
+pub(crate) struct ClaudeFreshStartPass<'a> {
+    /// Roots whose telemetry is settled in this pass.
+    pub(crate) telemetry_settled: &'a BTreeSet<String>,
+    /// This fold's 2c work is funded from its native reservation (P4).
+    pub(crate) funded: bool,
+    /// The cycle holds the contract-5 emission permit.
+    pub(crate) emission_permitted: bool,
+}
+
+static CLAUDE_FRESH_START_NOTHING_SETTLED: BTreeSet<String> = BTreeSet::new();
+
+impl ClaudeFreshStartPass<'static> {
+    pub(crate) fn none() -> Self {
+        Self {
+            telemetry_settled: &CLAUDE_FRESH_START_NOTHING_SETTLED,
+            funded: false,
+            emission_permitted: false,
+        }
+    }
+}
+
 /// Fold-local inputs to one census step.
 struct ClaudeFreshStartWindow<'a> {
     view: &'a dyn ClaudeFreshStartCensusView,
@@ -1605,14 +1630,32 @@ struct ClaudeFreshStartWindow<'a> {
     /// Roots this fold built a body with numbers for. Not yet `Emitted` (the
     /// server has not answered), but a revocation must still withdraw them.
     admitted: &'a BTreeSet<String>,
+    /// The cycle holds the contract-5 emission permit and this fold's 2c work
+    /// is funded from its native reservation (P4): the only pass in which a
+    /// stranded candidate may spend its one settlement re-arm (A-F2).
+    settlement_rearm_permitted: bool,
 }
 
 /// Census-time step for fresh-start witnesses (slice 2c). Runs on a complete
 /// census after the fence update and before pending is released. It reads
 /// census outputs only and writes only witness states; it returns the index
-/// keys owed one corrective parse. Switched off, it re-arms every emitted
+/// keys owed one corrective parse. Switched off, it re-arms every admissible
 /// revision once (so its next body uploads without numbers) and drops all
 /// witnesses.
+///
+/// Settlement re-arm (A-F2): a `Candidate` parsed in a pass that could not
+/// settle it (no permit, no funds, or the H3 stub) has no current-window
+/// evidence afterwards, and an unchanged file is never parsed again. The
+/// first later census that accepts the window, finds the member `Disjoint`
+/// with a source-verified own record, and runs under the permit with funds,
+/// re-arms that exact revision once and records the spend as
+/// `SettlementRearmed`. The spend and the cleared fingerprint are written by
+/// this same fold, so the selected save or `committable_subset` commits both
+/// or neither, a failed save leaks nothing, and a restart reloads either the
+/// unspent candidate or the spent state with its owed parse. A new attempt
+/// needs a new binding (another fingerprint or revision), which only an
+/// ordinary changed-input parse creates. Never while H3 is the false stub,
+/// never per window and never by time.
 #[allow(clippy::too_many_arguments)]
 fn claude_fresh_start_census_step(
     census: &mut BTreeMap<String, ClaudeFreshStartCensusWitness>,
@@ -1734,19 +1777,20 @@ fn claude_fresh_start_census_step(
         // SOURCE-rulings-D S1 condition 3(a): an accepted window, own status
         // `Disjoint`, own record `Exact` or `Empty` from a source-verified
         // parse. A root whose telemetry is not settled in this pass does not
-        // spend its re-arm (A-F2); a candidate also needs current-window
-        // evidence, so it waits for its next parse.
-        let accepted_for_member = window_accepted
+        // spend its verification re-arm; a candidate also needs
+        // current-window evidence, which only a parse gives it.
+        let census_accepts_member = window_accepted
             && status == ClaudeCensusMemberStatus::Disjoint
             && window
                 .view
-                .own_record_source_verified_exact_or_empty(member)
-            && window.telemetry_settled.contains(member.as_str());
+                .own_record_source_verified_exact_or_empty(member);
+        let accepted_for_member =
+            census_accepts_member && window.telemetry_settled.contains(member.as_str());
         // Each re-arm is spent by its transition: verification, or one owed
         // correction after an emitted body lost its numbers. A `Verified`
         // revision is never re-armed again, so repeated closed and open
         // windows cannot replay it.
-        let verifies = witness.state == ClaudeFreshStartState::Candidate
+        let verifies = witness.state.unverified()
             && own_family_complete
             && hashes.is_some_and(|hashes| !hashes.is_empty());
         if accepted_for_member && (verifies || witness.state == ClaudeFreshStartState::ReparseOwed)
@@ -1757,6 +1801,18 @@ fn claude_fresh_start_census_step(
             }
             witness.state = ClaudeFreshStartState::Verified;
             rearm_member(member, &witness.candidate_source_file_fingerprint);
+        } else if witness.state == ClaudeFreshStartState::Candidate
+            && hashes.is_none()
+            && census_accepts_member
+            && window.settlement_rearm_permitted
+        {
+            // A-F2: the stranded candidate's one settlement re-arm. Its next
+            // parse brings current-window evidence and, under the permit,
+            // settled telemetry; whatever that pass decides, this revision is
+            // never re-armed for settlement again.
+            witness.state = ClaudeFreshStartState::SettlementRearmed;
+            rearm_member(member, &witness.candidate_source_file_fingerprint);
+            audit.settlement_rearms = audit.settlement_rearms.saturating_add(1);
         }
     }
     rearm
@@ -3498,6 +3554,13 @@ struct ClaudeOwnedStartCensusWitness {
 /// separate reviewed change. While off, no witness is written, no posture is
 /// admitted and no transcript is re-armed, except that witnesses left by an
 /// earlier activation re-arm their emitted transcripts once and are dropped.
+///
+/// Kill path after activation (SOURCE P3-2): release a build with this const
+/// set back to false, never a rollback to an older binary. The false switch
+/// re-arms every admissible revision once, so its next body withdraws the
+/// numbers, and then drops the map. An older binary ignores and drops this
+/// field on save without withdrawing anything, and a later re-upgrade finds
+/// no witness to withdraw by.
 const CLAUDE_CENSUS_VERIFIED_FRESH_START_ENABLED: bool = false;
 /// A record older than file birth by more than this marks a copy.
 const CLAUDE_COPY_SIGNATURE_TOLERANCE_MS: i64 = 60_000;
@@ -3577,12 +3640,25 @@ pub(crate) fn claude_fresh_start_state_for_test(
         .get(member)
         .map(|witness| match witness.state {
             ClaudeFreshStartState::Candidate => "candidate",
+            ClaudeFreshStartState::SettlementRearmed => "settlement_rearmed",
             ClaudeFreshStartState::Verified => "verified",
             ClaudeFreshStartState::ReparseOwed => "reparse_owed",
             ClaudeFreshStartState::Emitted => "emitted",
             ClaudeFreshStartState::Refused => "refused",
             ClaudeFreshStartState::Revoked => "revoked",
         })
+}
+
+/// Mark the parse-time candidate of `member` verified, as an earlier accepted
+/// census would have. Returns whether a candidate was recorded.
+#[cfg(test)]
+pub(crate) fn claude_fresh_start_verify_for_test(index: &mut ScanIndex, member: &str) -> bool {
+    index
+        .claude_fresh_start_census
+        .get_mut(member)
+        .filter(|witness| witness.state == ClaudeFreshStartState::Candidate)
+        .map(|witness| witness.state = ClaudeFreshStartState::Verified)
+        .is_some()
 }
 
 #[cfg(test)]
@@ -3622,6 +3698,11 @@ struct ClaudeFreshStartCensusWitness {
 enum ClaudeFreshStartState {
     /// Signature passed; not yet verified in an accepted complete census.
     Candidate,
+    /// A `Candidate` whose one settlement re-arm for this exact revision is
+    /// spent (A-F2): an accepted, permitted and funded census found it with
+    /// no current-window evidence, so its file was re-armed once. It verifies
+    /// like a `Candidate` and is never re-armed for settlement again.
+    SettlementRearmed,
     /// Verified, and the one corrective parse for this transition is spent.
     Verified,
     /// Verified; an emitted body lost its numbers to a transient refusal, so
@@ -3641,10 +3722,14 @@ impl ClaudeFreshStartState {
     fn admissible(self) -> bool {
         matches!(self, Self::Verified | Self::ReparseOwed | Self::Emitted)
     }
+    /// Not verified yet, but a census may still verify it.
+    fn unverified(self) -> bool {
+        matches!(self, Self::Candidate | Self::SettlementRearmed)
+    }
 }
 
 /// Whether `root_session_id` holds a current 2c witness that a fold may admit
-/// (`admissible`) or a census may verify (`Candidate`). The sync side settles
+/// (`admissible`) or a census may verify (`unverified`). The sync side settles
 /// telemetry only for these roots, so its set is bounded by the witness map
 /// and funded before allocation. Always false while off.
 pub(crate) fn claude_fresh_start_root_admissible(index: &ScanIndex, root_session_id: &str) -> bool {
@@ -3653,7 +3738,7 @@ pub(crate) fn claude_fresh_start_root_admissible(index: &ScanIndex, root_session
             .claude_fresh_start_census
             .get(root_session_id)
             .is_some_and(|witness| {
-                (witness.state.admissible() || witness.state == ClaudeFreshStartState::Candidate)
+                (witness.state.admissible() || witness.state.unverified())
                     && claude_fresh_start_revision_is_current(&witness.derivation_revision)
             })
 }
@@ -3668,11 +3753,11 @@ pub(crate) fn claude_fresh_start_root_admissible(index: &ScanIndex, root_session
 /// switch-off still re-arms it to withdraw numbers the server may hold.
 /// Returns how many admitted bodies were left short of `Emitted` (an
 /// in-memory audit value). Never runs while off.
-pub(crate) fn settle_claude_fresh_start_emissions(
+pub(crate) fn settle_claude_fresh_start_emissions<T: std::borrow::Borrow<str> + Ord>(
     index: &mut ScanIndex,
     snapshots: &[SnapshotItem],
     admitted: &BTreeSet<String>,
-    applied_snapshot_fingerprints: &BTreeSet<String>,
+    applied_snapshot_fingerprints: &BTreeSet<T>,
 ) -> u64 {
     if admitted.is_empty() || !claude_census_verified_fresh_start_enabled() {
         return 0;
@@ -3692,7 +3777,9 @@ pub(crate) fn settle_claude_fresh_start_emissions(
                     && claude_fresh_start_revision_is_current(&witness.derivation_revision)
             });
         match witness {
-            Some(witness) if applied_snapshot_fingerprints.contains(&item.snapshot_fingerprint) => {
+            Some(witness)
+                if applied_snapshot_fingerprints.contains(item.snapshot_fingerprint.as_str()) =>
+            {
                 witness.state = ClaudeFreshStartState::Emitted;
             }
             // Only a witness left short of `Emitted` is counted: an already
@@ -3711,29 +3798,112 @@ pub(crate) fn settle_claude_fresh_start_emissions(
 }
 
 /// Malformed, wrong-type or over-bound data reads as "not admitted" instead
-/// of failing the whole index load. Older binaries ignore the field.
+/// of failing the whole index load. Older binaries ignore the field. The
+/// entry bound is checked while streaming (SOURCE P3-1): one entry is
+/// materialized at a time, and past the bound the rest of the field is
+/// skipped unmaterialized and the whole map reads as empty.
 fn deserialize_claude_fresh_start_census<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<String, ClaudeFreshStartCensusWitness>, D::Error> {
-    let Some(Value::Object(entries)) = Option::<Value>::deserialize(deserializer)? else {
-        return Ok(BTreeMap::new());
-    };
-    if entries.len() > MAX_CLAUDE_FRESH_START_WITNESSES {
-        return Ok(BTreeMap::new());
+    deserializer.deserialize_any(ClaudeFreshStartCensusVisitor)
+}
+
+struct ClaudeFreshStartCensusVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ClaudeFreshStartCensusVisitor {
+    type Value = BTreeMap<String, ClaudeFreshStartCensusWitness>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded map of fresh-start witnesses")
     }
-    Ok(entries
-        .into_iter()
-        .filter_map(|(member, witness)| {
-            let witness = ClaudeFreshStartCensusWitness::deserialize(witness).ok()?;
-            (!member.is_empty()
-                && member.len() <= MAX_CLAUDE_FRESH_START_FIELD_BYTES
-                && !witness.candidate_source_file_fingerprint.is_empty()
-                && witness.candidate_source_file_fingerprint.len()
-                    <= MAX_CLAUDE_FRESH_START_FIELD_BYTES
-                && witness.derivation_revision.len() <= MAX_CLAUDE_FRESH_START_FIELD_BYTES)
-                .then_some((member, witness))
-        })
-        .collect())
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut entries: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        use serde::de::IgnoredAny;
+        let mut census = BTreeMap::new();
+        let mut read = 0_usize;
+        while read < MAX_CLAUDE_FRESH_START_WITNESSES {
+            let Some(member) = entries.next_key::<String>()? else {
+                return Ok(census);
+            };
+            read += 1;
+            let witness = entries.next_value::<Value>()?;
+            if let Some(witness) = ClaudeFreshStartCensusWitness::deserialize(witness)
+                .ok()
+                .filter(|witness| claude_fresh_start_witness_within_bounds(&member, witness))
+            {
+                census.insert(member, witness);
+            }
+        }
+        if entries.next_key::<IgnoredAny>()?.is_none() {
+            return Ok(census);
+        }
+        // Over the bound: release what was read, skip the rest unread.
+        drop(census);
+        entries.next_value::<IgnoredAny>()?;
+        while entries.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut elements: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        while elements.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, _: &[u8]) -> std::result::Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+}
+
+fn claude_fresh_start_witness_within_bounds(
+    member: &str,
+    witness: &ClaudeFreshStartCensusWitness,
+) -> bool {
+    !member.is_empty()
+        && member.len() <= MAX_CLAUDE_FRESH_START_FIELD_BYTES
+        && !witness.candidate_source_file_fingerprint.is_empty()
+        && witness.candidate_source_file_fingerprint.len() <= MAX_CLAUDE_FRESH_START_FIELD_BYTES
+        && witness.derivation_revision.len() <= MAX_CLAUDE_FRESH_START_FIELD_BYTES
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3835,6 +4005,8 @@ pub(crate) struct ClaudeFreshStartAuditCounts {
     /// Complete census windows, with witnesses present, whose duplicate-owner
     /// map exceeded its budget (no new verification in such a window).
     pub(crate) owner_budget_exceeded_windows: u64,
+    /// Stranded candidates re-armed once for settlement (A-F2).
+    pub(crate) settlement_rearms: u64,
 }
 
 /// Process-lifetime totals of the slice 2c audit values, in memory only. The
@@ -3842,6 +4014,7 @@ pub(crate) struct ClaudeFreshStartAuditCounts {
 pub(crate) struct ClaudeFreshStartAuditTotals {
     pub(crate) verified_with_incomplete_records: std::sync::atomic::AtomicU64,
     pub(crate) owner_budget_exceeded_windows: std::sync::atomic::AtomicU64,
+    pub(crate) settlement_rearms: std::sync::atomic::AtomicU64,
     /// Admitted bodies the server did not apply (unchanged, refused, held or
     /// not offered); their witnesses stay `Verified`.
     pub(crate) admitted_bodies_not_applied: std::sync::atomic::AtomicU64,
@@ -3851,6 +4024,7 @@ pub(crate) static CLAUDE_FRESH_START_AUDIT_TOTALS: ClaudeFreshStartAuditTotals =
     ClaudeFreshStartAuditTotals {
         verified_with_incomplete_records: std::sync::atomic::AtomicU64::new(0),
         owner_budget_exceeded_windows: std::sync::atomic::AtomicU64::new(0),
+        settlement_rearms: std::sync::atomic::AtomicU64::new(0),
         admitted_bodies_not_applied: std::sync::atomic::AtomicU64::new(0),
     };
 
@@ -3861,6 +4035,8 @@ impl ClaudeFreshStartAuditTotals {
             .fetch_add(counts.verified_with_incomplete_records, Relaxed);
         self.owner_budget_exceeded_windows
             .fetch_add(counts.owner_budget_exceeded_windows, Relaxed);
+        self.settlement_rearms
+            .fetch_add(counts.settlement_rearms, Relaxed);
     }
 }
 
@@ -5357,7 +5533,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         &BTreeSet::new(),
         None,
         None,
-        &BTreeSet::new(),
+        ClaudeFreshStartPass::none(),
     )
 }
 
@@ -5425,7 +5601,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
         identity,
         observations,
         None,
-        &BTreeSet::new(),
+        ClaudeFreshStartPass::none(),
     )
 }
 
@@ -5438,7 +5614,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
-    fresh_start_telemetry_roots: &BTreeSet<String>,
+    fresh_start: ClaudeFreshStartPass<'_>,
 ) -> ClaudeUsageAuthorityDisposition {
     // A previous unsettled upload requires a clean followup before manifest /
     // replay settlement, but cannot erase the actual healthy terminal native
@@ -5468,7 +5644,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         &current_files,
         observations,
         comparison,
-        fresh_start_telemetry_roots,
+        fresh_start,
     )
 }
 
@@ -5486,7 +5662,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     current_files: &BTreeSet<String>,
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
-    fresh_start_telemetry_roots: &BTreeSet<String>,
+    fresh_start: ClaudeFreshStartPass<'_>,
 ) -> ClaudeUsageAuthorityDisposition {
     let native_completion_fold = comparison
         .as_ref()
@@ -5957,7 +6133,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                         census_window_end,
                         own_pending: index.claude_usage_family_pending.get(&root_session_id),
                         duplicated_request_hashes: &duplicated_request_hashes,
-                        telemetry_settled: fresh_start_telemetry_roots.contains(&root_session_id),
+                        telemetry_settled: fresh_start.telemetry_settled.contains(&root_session_id),
                         telemetry_verdict: index
                             .claude_usage_family_witnesses
                             .contains_key(&root_session_id)
@@ -6496,8 +6672,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             ClaudeFreshStartWindow {
                 view: fresh_start_view,
                 fold_eligible: !native_completion_fold && reports_healthy,
-                telemetry_settled: fresh_start_telemetry_roots,
+                telemetry_settled: fresh_start.telemetry_settled,
                 admitted: &disposition.fresh_start_admitted,
+                settlement_rearm_permitted: fresh_start.funded && fresh_start.emission_permitted,
             },
             &mut disposition.fresh_start_audit,
         ) {
@@ -67701,7 +67878,7 @@ inline_scan_enum!(CandidateDecision; Self::Skip,Self::Migrate,Self::Parse,Self::
 inline_scan_enum!(ClaudeCompactionKind; Self::LegacySummary,Self::CurrentBoundary);
 inline_scan_enum!(SnapshotQuarantineDisposition; Self::RetryPending,Self::UnprovenTerminal,Self::SupersededTerminal);
 inline_scan_enum!(ClaudeUsageAuthorityQuarantineDisposition; Self::RetryPending,Self::UnprovenTerminal);
-inline_scan_enum!(ClaudeFreshStartState; Self::Candidate,Self::Verified,Self::ReparseOwed,Self::Emitted,Self::Refused,Self::Revoked);
+inline_scan_enum!(ClaudeFreshStartState; Self::Candidate,Self::SettlementRearmed,Self::Verified,Self::ReparseOwed,Self::Emitted,Self::Refused,Self::Revoked);
 inline_scan_enum!(SnapshotSource; Self::Pi,Self::Codex,Self::ClaudeCode);
 inline_scan_enum!(CodexOwnershipBoundary; Self::Undetermined,Self::AllLocal,Self::AwaitingLegacyTrigger,
     Self::AwaitingParentPrefix,Self::Ordinal { start: _ },Self::NativeCreatedThread,Self::AmbiguousFork);

@@ -37,6 +37,9 @@ revision, and a state.
 
 - `candidate`: the signature passed. Appended bytes or a parser or derivation
   upgrade restart here, without numbers.
+- `settlement_rearmed`: a stranded candidate (unsettled telemetry, unchanged
+  file) spent its one settlement re-arm. It verifies like a candidate, and
+  this revision is never re-armed for settlement again.
 - `verified`: a complete, accepted census saw the root's own family complete
   and no duplicate. Verification re-arms the root's file once so the next body
   carries its numbers.
@@ -84,9 +87,16 @@ verifies. A candidate verifies only when, in a complete census:
 
 A `SharesHash` status revokes whenever it is seen, even while the predicate
 is false. `Unobserved` changes nothing for an emitted root and does not
-verify a candidate. A candidate whose telemetry is not settled waits without
-a re-arm; an unchanged file carries no current-window evidence, so it waits
-for its next parse.
+verify a candidate. A candidate whose telemetry is not settled spends no
+verification re-arm. An unchanged file carries no current-window evidence,
+so a stranded candidate gets one settlement re-arm, and only when the pass
+holds the contract-5 permit, the fold is funded, and the census accepts its
+window with a `Disjoint`, source-verified own record. Never under the stub,
+never by time, and once per exact revision (file fingerprint, which includes
+path, size and modification time, plus the parser and 2c revision). The spent
+attempt is the `settlement_rearmed` state, saved with the cleared file
+fingerprint in the same selected save, so a failed save leaks neither and a
+restart neither repeats nor clears it.
 
 ## Admission
 
@@ -138,15 +148,19 @@ every witness.
   copy the witness map like the sibling census maps.
 - Replacing an emitted witness walks the index once to re-arm another path
   of the same root. That happens only on that transition.
-- The settled-telemetry root set holds only roots with a candidate or
-  admissible witness, so it is bounded by the witness map. On a fold with a
-  native reservation it is charged to that reservation before allocation
-  (one full tree node per root plus its key bytes, about 650 bytes per root)
-  and the credit is returned after the fold; on insufficient funds the set
-  stays empty, which refuses 2c for that fold. A fold without a native
-  reservation does not charge it.
-- The upload keeps the fingerprints of this fold's admitted bodies and of
-  those the server holds; both are empty while off and are not charged.
+- Every 2c set is funded by one aggregate charge to the fold's native
+  reservation before any of it is allocated: the settled-telemetry root set
+  and the admitted root set (one full tree node per root plus its key bytes),
+  and the upload views of offered and stored fingerprints (one node per
+  admissible-root item each, borrowing the item's fingerprint, so no clone).
+  The fold part is returned after the fold; the upload part stays with the
+  same completion, which owns the reservation through the upload settlement,
+  and is returned after it. A fold without a native reservation, or without
+  funds, settles no telemetry, so nothing new is verified, admitted or
+  re-armed for settlement and the strict body stays; withdrawal, revocation
+  and ACK handling still run. If the admitted items exceed the funded count,
+  no view is built and the witnesses stay `verified`.
+- Everything is empty and never walked while off.
 - No audit schema change, no scan or parser version bump, no wire field.
 
 ## Limits and open items
@@ -157,8 +171,8 @@ every witness.
   copy shares its requests.
 - Admission and refusal counts are not yet in the local audit. In-memory
   values exist for verifications made while an `IdentityIncomplete` or
-  `Lossy` record exists, for census windows over the owner budget, and for
-  admitted bodies the server did not apply.
+  `Lossy` record exists, for census windows over the owner budget, for
+  settlement re-arms, and for admitted bodies the server did not apply.
 - Over the owner budget the census map is incomplete: the predicate stays
   false (no new verification) and the case is counted, but a new duplicate
   of an emitted root can go unseen until a later in-budget complete census,
@@ -187,3 +201,14 @@ every witness.
 - A historical replay clears every witness, so verification starts again.
 - Enabling the feature, and any historical re-parse it implies, needs a
   separate decision.
+- Activation gates: the real H3 predicate; a real-route positive control for
+  the subagent parent charge (the #588 guard refuses the actual Claude
+  subagent parse shape, which a regression test pins); and an owner charge
+  disposition for ordinary folds, because a fold that carries a native
+  reservation also carries a native completion, which is not verification
+  eligible.
+- Kill path after activation: release a build with the switch set back to
+  false, never a rollback to an older binary. The false switch re-arms every
+  admissible revision once so its next body withdraws the numbers, then drops
+  the map. An older binary ignores and drops the field on save without
+  withdrawing anything.
