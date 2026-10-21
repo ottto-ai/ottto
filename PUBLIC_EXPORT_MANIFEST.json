@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 734,
-  "content_sha256": "2c96bd566c7af7a8d11581ab28deb99c2e085cea6dc7e08b3c617a6cd5a717ce",
+  "content_sha256": "2187c8f6e57be48f2c3205f7b73eadc4b17674a9c87c14a258bb327ca2a4b7be",
   "files": [
     {
       "executable": false,
@@ -3331,8 +3331,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-20-codex-paged-admission.md",
-      "sha256": "3d4e60e5cbeac0f4484b8d605a30b1540e703a079fe117e9def6f8e2352f2a49",
-      "size_bytes": 12869
+      "sha256": "64c048ec968c652eb021e3bd64a917035e1b82d21aa06eb400af4707b59a4ddd",
+      "size_bytes": 12675
     },
     {
       "executable": false,
