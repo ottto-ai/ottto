@@ -522,7 +522,7 @@ fn side_record_is_content_free_and_bounded() {
 }
 
 #[test]
-fn side_records_persist_fail_closed_and_follow_the_index_lifecycle() {
+fn side_records_persist_decode_per_record_and_follow_the_index_lifecycle() {
     // No side state: none of the new keys, so the file is what a pre-2a
     // daemon writes.
     let empty = serde_json::to_value(ScanIndex::default()).unwrap();
@@ -553,15 +553,31 @@ fn side_records_persist_fail_closed_and_follow_the_index_lifecycle() {
         );
     }
 
-    // A malformed record fails the whole load closed: the index is
-    // quarantined and rebuilt, never partly trusted.
+    // Decoded per record (design rev 2 R1-M5, rev 3 §1.7): an undecodable
+    // record is dropped and P has no record (the fence's request path);
+    // every other record and field loads, and the index is not quarantined.
     let mut value = serde_json::to_value(&loaded).unwrap();
+    value["codex_parent_side"]["/q.jsonl"] = value["codex_parent_side"]["/p.jsonl"].clone();
     value["codex_parent_side"]["/p.jsonl"]["parsed"]["modified"] = serde_json::json!([1]);
+    value["codex_parent_side"]["/r.jsonl"] = serde_json::json!({
+        "verdict": { "kind": "newer" },
+    });
     fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-    let rebuilt = ScanIndex::load(&path).unwrap();
-    assert!(rebuilt.codex_parent_side.is_empty());
-    assert_eq!(rebuilt.generation, 0);
-    assert!(!path.exists());
+    let lenient = ScanIndex::load(&path).unwrap();
+    assert!(path.exists());
+    assert_eq!(lenient.generation, loaded.generation);
+    assert_eq!(
+        lenient.codex_parent_side.keys().collect::<Vec<_>>(),
+        ["/q.jsonl"]
+    );
+    assert_eq!(lenient.codex_parent_side["/q.jsonl"], extreme_record());
+    assert_eq!(lenient.codex_parent_side_generation, 3);
+
+    // A non-object field decodes as no records.
+    value["codex_parent_side"] = serde_json::json!([1, 2]);
+    let decoded: ScanIndex = serde_json::from_value(value).unwrap();
+    assert!(decoded.codex_parent_side.is_empty());
+    assert_eq!(decoded.codex_parent_proof_wrap_epoch, 2);
 
     // A partial checkpoint carries the working records and counters.
     let subset =

@@ -2495,8 +2495,13 @@ pub struct ScanIndex {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     codex_parent_side_requests: BTreeMap<String, SideRequest>,
     /// U1a-2a: side records for unchanged parent rollouts, keyed by the
-    /// parent's index key.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// parent's index key. Decoded per entry: an undecodable record is
+    /// dropped (P then has no record), never the index.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_lenient_map"
+    )]
     codex_parent_side: BTreeMap<String, CodexParentSide>,
     /// Index-global and monotone: never reset by replay, so a re-created
     /// record never reuses a generation a waiting child saw.
@@ -2999,6 +3004,24 @@ fn deserialize_codex_protected_owner<'de, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<Option<String>, D::Error> {
     let value = Option::<Value>::deserialize(deserializer)?;
     Ok(value.map(|value| value.as_str().unwrap_or("").to_owned()))
+}
+/// U1a: decode a string-keyed map one entry at a time; entries this binary
+/// cannot decode (unknown tag, newer shape) are dropped. A non-object is an
+/// empty map, so this field can never quarantine the index.
+fn deserialize_lenient_map<'de, D, V>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: serde::de::DeserializeOwned,
+{
+    let Value::Object(raw) = Value::deserialize(deserializer)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(raw
+        .into_iter()
+        .filter_map(|(key, value)| serde_json::from_value(value).ok().map(|value| (key, value)))
+        .collect())
 }
 fn valid_codex_protected_owner(owner: &str) -> bool {
     owner.len() == 64
