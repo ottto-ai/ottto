@@ -72,6 +72,9 @@ fn token(n: u64) -> Vec<u8> {
     )
 }
 
+/// The pass's index file (never opened: only the proof holder binds to it).
+const INDEX_PATH: &str = "/nonexistent/u1a2a-side-read-index.json";
+
 fn pass(side_allowed: bool) -> CodexSidePass {
     CodexSidePass {
         ns: NS,
@@ -79,6 +82,7 @@ fn pass(side_allowed: bool) -> CodexSidePass {
             side_allowed,
             first_in_process: false,
         },
+        index_path: PathBuf::from(INDEX_PATH),
     }
 }
 
@@ -390,9 +394,10 @@ fn the_charge_paces_creates_the_entry_and_counts_a_first_start() {
             side_allowed: true,
             first_in_process: true,
         },
+        index_path: PathBuf::from(INDEX_PATH),
     };
     let (attempts, counts) =
-        observe(|| index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, first));
+        observe(|| index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &first));
     assert_eq!(attempts, Some(4));
     assert_eq!(
         counts.side_requests_rearmed, 1,
@@ -414,7 +419,7 @@ fn the_charge_paces_creates_the_entry_and_counts_a_first_start() {
     // The entry is now the view: a second charge writes it, and is not a
     // first start.
     let (attempts, counts) =
-        observe(|| index.charge_codex_parent_side_read(&fixture.key(), at, 2_000, &cache, first));
+        observe(|| index.charge_codex_parent_side_read(&fixture.key(), at, 2_000, &cache, &first));
     assert_eq!(attempts, Some(5));
     assert_eq!(counts.side_requests_rearmed, 0);
     // A tombstone is never charged, and a refused charge writes nothing.
@@ -425,7 +430,7 @@ fn the_charge_paces_creates_the_entry_and_counts_a_first_start() {
         .codex_parent_side_requests
         .insert(fixture.key(), lossy);
     assert_eq!(
-        index.charge_codex_parent_side_read(&fixture.key(), at, 3_000, &fresh, first),
+        index.charge_codex_parent_side_read(&fixture.key(), at, 3_000, &fresh, &first),
         None
     );
     assert_eq!(index.codex_parent_side_requests[&fixture.key()], lossy);
@@ -441,7 +446,7 @@ fn the_exit_rows_write_the_record_or_the_tombstone_in_both_stores() {
             .codex_parent_side_requests
             .insert(fixture.key(), request_for(&fixture, at.size));
         index
-            .charge_codex_parent_side_read(&fixture.key(), at, 1_000, cache, pass(true))
+            .charge_codex_parent_side_read(&fixture.key(), at, 1_000, cache, &pass(true))
             .expect("charged");
     };
     // Row 5: data loss → `Lossy` at the attempt's extent.

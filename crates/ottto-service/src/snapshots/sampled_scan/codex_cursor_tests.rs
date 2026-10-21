@@ -8419,6 +8419,7 @@ fn proof_job(namespace: &str, path: &str, incarnation: &str, bytes: usize) -> Bo
         entries: vec![("k".repeat(bytes), 1)],
         next_row_end: 0,
         touched_page: 0,
+        readers: None,
     })
 }
 

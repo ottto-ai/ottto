@@ -1029,8 +1029,9 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
 
 /// D6(d): P's row straddling its frozen extent is withheld (the sealed
 /// fragment): never parsed or observed, so it pushes no signature, and the
-/// seal would sit at the last newline. A child that needs that signature is
-/// `ParentExhausted`, not decided past it.
+/// seal would sit at the last newline. A child that diverges exactly there
+/// is `ParentExhausted`, while P's complete ledger (which saw the row) would
+/// decide it: the job never decides on a withheld row.
 #[test]
 fn a_straddling_parent_row_pushes_no_signature() {
     let root = temp_root("job-straddle");
@@ -1046,7 +1047,9 @@ fn a_straddling_parent_row_pushes_no_signature() {
     let mut values = vec![
         json!({"timestamp": "2026-08-02T08:40:00Z", "type": "session_meta", "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}}),
     ];
-    values.extend(parent_rows[1..].iter().cloned());
+    // P's rows 1..=3 (signatures 0..3), then the child's own turn where P
+    // has its withheld row (signature 3).
+    values.extend(parent_rows[1..4].iter().cloned());
     values.extend([
         turn("2026-08-02T08:40:01Z", "child-local"),
         tokens("2026-08-02T08:40:02Z", (160, 120, 20, 4), (10, 5, 2, 1)),
@@ -1062,9 +1065,16 @@ fn a_straddling_parent_row_pushes_no_signature() {
     );
     // Signatures 0..3 only: the straddling row's never entered the window.
     assert_eq!(job.ring.end(), Some(3));
-    // With P's complete ledger (its full parse) main would decide at 4.
+    // With P's complete ledger (its full parse) main decides at 3.
     let ledger = parse(&child, complete_ledger(), None);
     assert!(ledger.complete());
+    assert_eq!(
+        ledger
+            .codex_parent_prefix_decided
+            .map(|(matched, _, owned)| (matched, owned)),
+        None,
+        "the ledger arm records no proof decision"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1130,4 +1140,191 @@ fn the_ring_refuses_past_its_window_and_odd_shapes() {
         .iter()
         .all(|(value, _)| value.capacity() == CODEX_SIGNATURE_HEX_BYTES));
     assert_eq!(ring.entries.capacity(), capacity, "no growth");
+}
+
+// U1a-2a row 31: the proof hook end to end (visit, start, run, finish).
+
+const HOOK_INDEX: &str = "/nonexistent/u1a2a-proof-hook-index.json";
+
+fn hook_context(cache: &Arc<sampled_scan::SharedCache>) -> sampled_scan::Context {
+    sampled_scan::Context {
+        cache: Arc::clone(cache),
+        namespace: crate::transcript_acquisition::Scope("proof-hook".into()),
+        audit_metadata_supported: true,
+        audit_slots: 0,
+        full_files: 0,
+        tail_files: 0,
+        unchanged_files: 0,
+        native_bytes: 0,
+        sample_bytes: 0,
+        full_reasons: [0; 11],
+        priority_replays: 0,
+        audits_started: 0,
+        audits_completed: 0,
+        start_overdue_seconds: 0,
+        completion_overdue_seconds: 0,
+        admission: Default::default(),
+    }
+}
+
+fn hook_pass() -> CodexSidePass {
+    CodexSidePass {
+        ns: sampled_scan::side_ledger::namespace_of(Path::new(HOOK_INDEX)),
+        gate: sampled_scan::side_ledger::GateOpen {
+            side_allowed: true,
+            first_in_process: false,
+        },
+        index_path: PathBuf::from(HOOK_INDEX),
+    }
+}
+
+impl Scene {
+    /// C owed (`Due`) against P under main's cap cause, in a minted index.
+    fn owed(name: &str) -> Self {
+        let mut scene = Self::new(name);
+        let key = scene.key();
+        // Main indexed both (the sweep drops a side record whose P is not).
+        for indexed in [local_index_key(&scene.parent), key.clone()] {
+            let entry = super::tests::manifest_index_entry(Some(indexed.as_str()));
+            scene.index.files.insert(indexed, entry);
+        }
+        scene.index.remove_codex_parent_proof(&key);
+        scene.index.codex_proof_index_incarnation = "u1a2a-hook-incarnation".into();
+        assert!(scene.index.owe_codex_parent_proof(
+            &key,
+            PARENT,
+            CodexParentUnresolvable::Oversize.index() as u8,
+            OwedOrigin::Child,
+            false,
+        ));
+        scene
+    }
+
+    /// One page's proof hook on `page`.
+    fn hook(&mut self, cache: &Arc<sampled_scan::SharedCache>, page: &mut PageBudget) {
+        let identities =
+            CodexParentIdentities::new(SnapshotSource::Codex, self.index.traversal.as_ref());
+        codex_parent_proof_hook::codex_parent_proof_step(
+            &mut self.index,
+            &hook_context(cache),
+            &hook_pass(),
+            &identities,
+            page,
+            sampled_scan::now_seconds(),
+        );
+    }
+
+    fn owed_entry(&self) -> CodexParentProofOwed {
+        match self.index.codex_parent_prefix_proofs.get(&self.key()) {
+            Some(CodexParentProofState::Owed(owed)) => owed.clone(),
+            other => panic!("not owed: {other:?}"),
+        }
+    }
+}
+
+use sampled_scan::codex_cursor::{Limits, PageBudget};
+
+/// The hook proves an owed child in one page: P's ledger-only reader and
+/// C's decision-only reader lockstep to C's decision, the finish seals P
+/// under the proof scope, P's settled side record admits it, and the entry
+/// is `Proven` as the complete ledger decides. Its install then reparses C
+/// exactly as the complete ledger does. Nothing is left in the holder.
+#[test]
+fn the_hook_proves_an_owed_child_end_to_end() {
+    let mut scene = Scene::owed("hook-e2e");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut page = PageBudget::default();
+    scene.hook(&cache, &mut page);
+
+    let proof = scene.proof();
+    assert_eq!(
+        (proof.matched, proof.owned, proof.published),
+        (2, true, false)
+    );
+    assert_eq!(proof.parent, PARENT);
+    let expected = proof_of(&child_values(), &parent_values(), unused_seal());
+    assert_eq!(proof.child_digest, expected.child_digest);
+    assert!(proof.installable(&codex_parent_proof_scope()).is_some());
+    assert_eq!(
+        proof.parent_seal.sealed_offset(),
+        fs::metadata(&scene.parent).unwrap().len()
+    );
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!(scene.index.codex_parent_proof_cursor, Some(scene.key()));
+    assert!(page.singleton_remaining(Limits::current()) < Limits::current().singleton());
+
+    let (opened, installed_proof, refusal) = scene.install();
+    assert!(opened);
+    assert_eq!(refusal, None);
+    assert_eq!(installed_proof.as_ref(), Some(&proof));
+    let used = parse(
+        &scene.child.path,
+        witness(CodexParentUnresolvable::Oversize),
+        Some(installed(&proof)),
+    );
+    let ledger = parse(&scene.child.path, complete_ledger(), None);
+    assert_eq!(view(&used)["snapshots"], view(&ledger)["snapshots"]);
+    assert!(used.complete() && ledger.complete());
+}
+
+/// A page whose leftover covers one step only suspends the job (RAM,
+/// charged in the holder); the next page takes it back as `Mine`,
+/// revalidates its held FDs and P's locate, and finishes it. The entry
+/// stays `Owed` in between.
+#[test]
+fn a_budget_short_page_suspends_and_the_next_page_finishes() {
+    let mut scene = Scene::owed("hook-suspend");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let limits = Limits::current();
+    let mut page = PageBudget::default();
+    // Exactly one step's reserve left: P's first row, then `Budget`.
+    page.charge(false, limits.singleton() - codex_proof_step_reserve());
+    scene.hook(&cache, &mut page);
+    assert_eq!(scene.owed_entry().outcome, 0, "no finished attempt yet");
+    assert!(
+        cache
+            .proof_suspended_for_test()
+            .is_some_and(|(namespace, charge)| namespace == "proof-hook" && charge > 0),
+        "suspended in the holder"
+    );
+
+    let mut next = PageBudget::default();
+    scene.hook(&cache, &mut next);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
+}
+
+/// P that the frozen census cannot resolve refuses the batch as `Identity`
+/// with a `Census` wake; the next visit does not retry it until the census
+/// fingerprint (or C) changes. Then P is back and the job proves C.
+#[test]
+fn an_identity_refusal_waits_for_its_census_wake() {
+    let mut scene = Scene::owed("hook-identity");
+    let parent_key = local_index_key(&scene.parent);
+    let traversal = scene.index.traversal.as_mut().unwrap();
+    traversal.codex_rollout_paths.remove(&parent_key);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    scene.hook(&cache, &mut PageBudget::default());
+    let owed = scene.owed_entry();
+    assert_eq!(owed.outcome, ProofOutcome::Identity as u8);
+    assert_eq!(owed.attempts, 1);
+    assert!(matches!(
+        &owed.wake,
+        ProofWake::Census { matches, .. } if matches == "absent"
+    ));
+
+    // Same census: not due (the wake has not fired), so nothing is retried.
+    scene.hook(&cache, &mut PageBudget::default());
+    assert_eq!(scene.owed_entry(), owed);
+
+    // P is in the census again: the wake fires (past its backoff).
+    let traversal = scene.index.traversal.as_mut().unwrap();
+    traversal.codex_rollout_paths.insert(parent_key);
+    if let Some(CodexParentProofState::Owed(owed)) =
+        scene.index.codex_parent_prefix_proofs.get_mut(&scene.key())
+    {
+        owed.not_before_unix_seconds = 0;
+    }
+    scene.hook(&cache, &mut PageBudget::default());
+    assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
 }

@@ -186,13 +186,15 @@ pub(in crate::snapshots) struct PageBudget {
     disabled_disclosed: bool,
     page_noted: bool,
     resume_claimed: bool,
+    /// U1a-2a (rev 3 §2.4 step 0): the proof hook ran on this scan object.
+    proof_claimed: bool,
     /// Process counters at this scan's page tick: the start of its
     /// diagnostics window (`SharedCache::cursor_diagnostics`). Boxed so the
     /// by-value scan object stays small.
     window_start: Option<Box<Counters>>,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
-    disabled_disclosed, page_noted, resume_claimed, window_start);
+    disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -283,6 +285,12 @@ impl PageBudget {
         !std::mem::replace(&mut self.resume_claimed, true)
     }
 
+    /// U1a-2a (rev 3 §2.4 step 0, rev 11 §6.1): at most one proof hook per
+    /// scan object: true only the first time.
+    pub(in crate::snapshots) fn claim_proof(&mut self) -> bool {
+        !std::mem::replace(&mut self.proof_claimed, true)
+    }
+
     /// Advance the cursor page clock once per scan object (K7, K10). The
     /// diagnostics window opens under this same lock (no extra lock).
     pub(in crate::snapshots) fn note_page(&mut self, cache: &SharedCache, namespace: &Scope) {
@@ -315,7 +323,6 @@ impl PageBudget {
 /// last walk in place of the active file. `bound(context)` includes the
 /// shared cache (cursor state, retained copies, side ledger). Cycles are
 /// serialized under `SNAPSHOT_SYNC_LOCK`, so it sees every live main state.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) fn proof_step_room(
     context: &super::Context,
     walked_charge: usize,
@@ -353,7 +360,7 @@ impl OpenStamp {
     }
 
     /// The object `path` names now, without following a final symlink.
-    fn of_path(path: &Path) -> Option<Self> {
+    pub(in crate::snapshots) fn of_path(path: &Path) -> Option<Self> {
         fs::symlink_metadata(path)
             .ok()
             .map(|metadata| Self::of(&metadata))
@@ -701,7 +708,6 @@ enum Slot {
 /// was started from: a job resumes only for the same namespace, index path
 /// and proof incarnation, and its deltas land only on entries whose `seq`
 /// still matches.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) struct ProofJob {
     pub(in crate::snapshots) namespace: String,
     pub(in crate::snapshots) index_path: PathBuf,
@@ -714,9 +720,12 @@ pub(in crate::snapshots) struct ProofJob {
     /// `rotation.page` at the last suspend or resume: another namespace may
     /// drop the job once it is `NAMESPACE_STALE_PAGES` old.
     pub(in crate::snapshots) touched_page: u64,
+    /// The job's open readers (s row 33): P's and its children's held FDs,
+    /// frozen at open. `None` only for a job with nothing to read.
+    pub(in crate::snapshots) readers: Option<Box<crate::snapshots::CodexProofReaders>>,
 }
 crate::heap_layout_bound::fields!(ProofJob; namespace, index_path, incarnation, entries,
-    next_row_end, touched_page);
+    next_row_end, touched_page, readers);
 
 /// U1a-2a (cc row 1): the one suspended proof job, process-wide. A running
 /// job is out of the holder, in the step's `ProofLease` (charged 0 here);
@@ -749,7 +758,6 @@ impl HeapLayoutBound for ProofHolder {
 }
 
 /// U1a-2a (cc row 1): what the proof hook may do with the holder.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) enum ProofTake {
     /// This index's own suspended job, out of the holder for one step.
     Mine(ProofLease),
@@ -766,12 +774,10 @@ pub(in crate::snapshots) enum ProofTake {
 /// `proof_step_room` first). It goes back only through `suspend` (free room
 /// only); `finish` ends it; a lease dropped holding its job loses it,
 /// counted, and its entries stay `Owed`.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) struct ProofLease {
     cache: Arc<SharedCache>,
     job: Option<Box<ProofJob>>,
 }
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 impl ProofLease {
     pub(in crate::snapshots) fn new(cache: &Arc<SharedCache>, job: Box<ProofJob>) -> Self {
         Self {
@@ -2849,7 +2855,6 @@ impl SharedCache {
     ///   `NAMESPACE_STALE_PAGES` cursor pages; else dropped as stale
     ///   (counted), `Free`.
     /// - Nothing suspended → `Free`. A poisoned cursor → `Busy`.
-    #[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
     pub(in crate::snapshots) fn proof_take(
         self: &Arc<Self>,
         namespace: &Scope,
@@ -2898,7 +2903,6 @@ impl SharedCache {
     /// U1a-2a (cc row 8, rev 10 §6.1): `namespace`'s proof hook ran on this
     /// page and found proof work `due` (or none). `note_page` counts a page
     /// of the same namespace with due work that never reached the hook.
-    #[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
     pub(in crate::snapshots) fn note_proof_hook(&self, namespace: &Scope, due: bool) {
         self.with_cursor(|cursor| {
             if due {

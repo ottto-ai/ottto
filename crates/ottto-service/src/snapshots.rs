@@ -52,6 +52,7 @@ pub use compaction_events::SnapshotCompactionEvent;
 mod codex_counting_v2_tests;
 mod codex_counting_version;
 mod codex_file_join;
+mod codex_parent_proof_hook;
 #[cfg(test)]
 mod codex_parent_proof_tests;
 #[cfg(test)]
@@ -2422,22 +2423,22 @@ pub(in crate::snapshots) struct SideSweep {
 }
 
 /// U1a-2a: what one Codex pass carries from C14: its side-ledger namespace
-/// (the destination index file) and its outage gate.
+/// (the destination index file), its outage gate, and that index file's
+/// path (the proof holder's binding, s row 31).
 ///
 /// TODO(U1a-2a G7 / side due; `stage1/c14c15-answer.md` §2): the side due
 /// and G7 must exclude Stage 1 continuation pages (due only when
 /// `gate.side_allowed` and the page is not a continuation). The
 /// continuation hook is the Stage 1 lease's, not added here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CodexSidePass {
     pub(in crate::snapshots) ns: u128,
     pub(in crate::snapshots) gate: sampled_scan::side_ledger::GateOpen,
+    pub(in crate::snapshots) index_path: PathBuf,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.index_path, c)
     }
 }
 
@@ -2455,7 +2456,11 @@ pub(crate) fn begin_codex_side_pass(
     let ledger_entries = ledger.len();
     drop(ledger);
     note_codex_side_gauges(index, ledger_entries);
-    CodexSidePass { ns, gate }
+    CodexSidePass {
+        ns,
+        gate,
+        index_path: index_path.to_path_buf(),
+    }
 }
 
 /// U1a-2a (lease §5.1 gauges): the last measured side state, at C14 (the
@@ -16408,14 +16413,12 @@ const CODEX_SIGNATURE_HEX_BYTES: usize = 64;
 /// reorders. Its allocation (`CODEX_PROOF_RING_ENTRIES` slots) is made when
 /// the job starts and each string at its fixed length, so a push never
 /// grows the window; a push past it is refused, never a silent loss.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) struct CodexParentRing {
     base: u64,
     entries: VecDeque<(String, u64)>,
 }
 crate::heap_layout_bound::fields!(CodexParentRing; base, entries);
 
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 impl CodexParentRing {
     fn new() -> Self {
         Self {
@@ -16459,7 +16462,6 @@ impl CodexParentRing {
 }
 
 /// U1a-2a (row 33; rev 2 §2.3, rev 3 §2.3): one child's job result.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum ChildResult {
     /// The arm decided (`AllLocal` at m > 0: owned; at 0: held). `at` is
@@ -16491,7 +16493,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for ChildResult {
 /// U1a-2a (row 33, rev 2 §2.2, D6(d)): one reader of a proof job, frozen at
 /// its open extent with the existing extent limit (a straddling row is
 /// withheld as the sealed fragment: never parsed or observed).
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) struct CodexProofReader {
     pub(in crate::snapshots) key: String,
     pub(in crate::snapshots) path: PathBuf,
@@ -16503,7 +16504,6 @@ pub(in crate::snapshots) struct CodexProofReader {
 }
 crate::heap_layout_bound::fields!(CodexProofReader; key, path, stamp_open, parser, done, failed);
 
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 impl CodexProofReader {
     /// P's ledger-only reader: a fresh `Full(StateMissing)` plan under the
     /// proof scope (its `commit_sealed_prefix` is the finish's certificate),
@@ -16598,7 +16598,6 @@ impl CodexProofReader {
 }
 
 /// U1a-2a (row 33): one child of a proof job and its result.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) struct CodexProofChild {
     pub(in crate::snapshots) reader: CodexProofReader,
     pub(in crate::snapshots) result: Option<ChildResult>,
@@ -16608,7 +16607,6 @@ crate::heap_layout_bound::fields!(CodexProofChild; reader, result);
 /// U1a-2a (row 33; rev 2 §2.1, D6(c)): a proof job's readers: P's
 /// ledger-only reader and 1..=4 decision-only children of the same P,
 /// lockstepped through the ring.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) struct CodexProofReaders {
     /// P's resolved session id (every child's `forked_from_id`).
     pub(in crate::snapshots) parent_id: String,
@@ -16623,7 +16621,6 @@ pub(in crate::snapshots) struct CodexProofReaders {
 crate::heap_layout_bound::fields!(CodexProofReaders; parent_id, parent, started, children, ring, consumed);
 
 /// U1a-2a (row 33): how a run within a budget ended.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum CodexProofRun {
     /// Every child has a result and P's reader reached its frozen end (or
@@ -16637,14 +16634,12 @@ pub(in crate::snapshots) enum CodexProofRun {
 /// line and its newline, or one chunk of an overlong skip after its capped
 /// prefix). A step runs only with this much budget left, so a page never
 /// reads past its leftover and no helper peeks ahead.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 pub(in crate::snapshots) fn codex_proof_step_reserve() -> u64 {
     (MAX_JSONL_LINE_BYTES as u64)
         .saturating_add(sampled_scan::codex_cursor::Limits::current().skip_chunk() as u64)
         .saturating_add(1)
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 impl CodexProofReaders {
     pub(in crate::snapshots) fn new(
         parent_id: String,
@@ -16783,7 +16778,6 @@ impl CodexProofReaders {
 
 /// U1a-2a (row 33; rev 2 §2.3, rev 3 §2.3): a child's result from its arm,
 /// once it has one. `None`: still undecided.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 fn codex_proof_child_result(
     child: &CodexProofChild,
     ring: &CodexParentRing,
@@ -18903,7 +18897,7 @@ impl ScanIndex {
         at: SideNow,
         now: u64,
         cache: &sampled_scan::SharedCache,
-        pass: CodexSidePass,
+        pass: &CodexSidePass,
         terms: impl FnOnce() -> SideDueTerms,
     ) -> bool {
         use crate::local_resource_diagnostics::codex_side_lifecycle::{record as count, Event};
@@ -18960,7 +18954,7 @@ impl ScanIndex {
         at: SideNow,
         now: u64,
         cache: &sampled_scan::SharedCache,
-        pass: CodexSidePass,
+        pass: &CodexSidePass,
     ) -> Option<u8> {
         use crate::local_resource_diagnostics::codex_side_lifecycle::{record as count, Event};
         let side = Some((cache, pass.ns));
@@ -21416,7 +21410,7 @@ impl OwnedSourceScan {
                     if source == SnapshotSource::Codex && active.side_origin.is_none() {
                         let side = sampling
                             .as_ref()
-                            .zip(codex_side_pass)
+                            .zip(codex_side_pass.as_ref())
                             .map(|(context, pass)| (&*context.cache, pass.ns));
                         if install_codex_parent_proof(
                             &mut parser,
@@ -22026,7 +22020,7 @@ impl OwnedSourceScan {
                     };
                     let ledger = sampling
                         .as_ref()
-                        .zip(codex_side_pass)
+                        .zip(codex_side_pass.as_ref())
                         .map(|(context, pass)| (&*context.cache, pass.ns));
                     index.finish_codex_parent_side_read(
                         &local_index_key(&candidate.path),
@@ -22215,7 +22209,7 @@ impl OwnedSourceScan {
                         .collect::<Vec<_>>();
                     let side = sampling
                         .as_ref()
-                        .zip(codex_side_pass)
+                        .zip(codex_side_pass.as_ref())
                         .map(|(context, pass)| (&*context.cache, pass.ns));
                     index.write_codex_parent_side_from_main(
                         &local_index_key(&candidate.path),
@@ -22957,6 +22951,22 @@ impl OwnedSourceScan {
                 pending!();
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
+                // U1a-2a (row 31): the proof hook, once per page, after the
+                // page's candidates, on the singleton budget main left.
+                if codex_parent_proofs_enabled(source, sampling.as_ref())
+                    && codex_page.claim_proof()
+                {
+                    if let Some((context, pass)) = sampling.as_ref().zip(codex_side_pass.as_ref()) {
+                        codex_parent_proof_hook::codex_parent_proof_step(
+                            index,
+                            context,
+                            pass,
+                            &codex_parent_identities,
+                            &mut codex_page,
+                            sampled_scan::now_seconds(),
+                        );
+                    }
+                }
                 if native_comparison
                     .as_mut()
                     .is_some_and(|phase| phase.pause_before_finalization())
@@ -23079,7 +23089,7 @@ impl OwnedSourceScan {
                 // U1a-2a (row 30): the side ledger's namespace for this pass.
                 let codex_side_drop = sampling
                     .as_ref()
-                    .zip(codex_side_pass)
+                    .zip(codex_side_pass.as_ref())
                     .map(|(context, pass)| (&*context.cache, pass.ns));
                 for index_key in &census.removed_index_keys {
                     if !index
@@ -23762,7 +23772,7 @@ impl OwnedSourceScan {
                 {
                     if let Some(((context, pass), at)) = sampling
                         .as_ref()
-                        .zip(codex_side_pass)
+                        .zip(codex_side_pass.as_ref())
                         .zip(side_now(&opened_file))
                     {
                         let terms = || SideDueTerms {
@@ -24165,7 +24175,7 @@ impl OwnedSourceScan {
             // is main's Skip (nothing written).
             let mut side_origin = None;
             if let Some(at) = side_plan {
-                let Some((context, pass)) = sampling.as_ref().zip(codex_side_pass) else {
+                let Some((context, pass)) = sampling.as_ref().zip(codex_side_pass.as_ref()) else {
                     pending!();
                 };
                 let Some(attempts) = index.charge_codex_parent_side_read(
@@ -24234,7 +24244,7 @@ impl OwnedSourceScan {
             if source == SnapshotSource::Codex && side_origin.is_none() {
                 let side = sampling
                     .as_ref()
-                    .zip(codex_side_pass)
+                    .zip(codex_side_pass.as_ref())
                     .map(|(context, pass)| (&*context.cache, pass.ns));
                 if install_codex_parent_proof(
                     &mut parser,
@@ -27876,10 +27886,19 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
 
 /// U1a-2a (row 33, rev 4 §4.1): a proof job's parent reader. P is not
 /// classified: only its envelope (its session id, the finish's identity
-/// check) and the row's ownership signature, which the driver moves into
+/// check), its own `forked_from_id`, and the row's ownership signature,
+/// which the driver moves into
 /// the job's ring. A row the reader withholds (a straddling fragment) is
 /// never applied, so it pushes no signature.
 fn apply_codex_ledger_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    // P's own parent (the finish's lineage owe, rev 5 R1-M3), from P's first
+    // header only, as the classifier reads it.
+    if !accumulator.codex_session_meta_seen {
+        if let Some(meta) = codex_session_meta_payload(value) {
+            accumulator.codex_parent_session_ref =
+                resolve_codex_identity_option(codex_identity_at(meta, &["forked_from_id"]));
+        }
+    }
     apply_codex_envelope_line(value, accumulator);
     accumulator.codex_proof_ledger_row = codex_ownership_signature(value);
 }
