@@ -2528,13 +2528,27 @@ impl PermanentRefusalCounts {
 }
 
 /// Terminal state for a cycle that ends with deferred or refused entities.
+///
+/// A settled cycle whose every retained permanent refusal is dominated lost
+/// no usage the backend does not already own. It reports `Success`: each
+/// refused body is still disclosed through its unproven-terminal quarantine
+/// count, so the receipt builder names it as settled `census_residue` under
+/// the backend's admission and in the legacy shape otherwise. No refused body
+/// becomes accepted. Any other refusal, a hold, or a conflict is unchanged.
 fn refused_entity_state(
     permanent: bool,
     refusals: PermanentRefusalCounts,
     upload_fully_settled: bool,
 ) -> CollectorState<'static> {
-    let _ = (refusals.total, refusals.dominated, upload_fully_settled);
-    deferred_entity_state(permanent)
+    if permanent
+        && upload_fully_settled
+        && refusals.total > 0
+        && refusals.dominated == refusals.total
+    {
+        CollectorState::Success
+    } else {
+        deferred_entity_state(permanent)
+    }
 }
 
 #[derive(Debug)]
@@ -6011,6 +6025,15 @@ fn finish_sync_source(
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_count {
+        if resolved_permanent_rejections && permanent_refusals.dominated > 0 {
+            eprintln!(
+                "local snapshot sync retains {} dominated and {} other permanent refusal(s) \
+                 for {}; dominated refusals are settled residue the backend already owns",
+                permanent_refusals.dominated,
+                permanent_refusals.total - permanent_refusals.dominated,
+                source.api_slug()
+            );
+        }
         // The uploader drained its frozen, scan-capped queue before returning
         // `Deferred`, and the index above now owns both accepted siblings and
         // entity quarantine. Surface the conflict only after those

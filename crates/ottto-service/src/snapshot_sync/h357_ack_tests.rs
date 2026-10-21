@@ -1784,8 +1784,9 @@ fn reported_code(state: CollectorState<'static>) -> Option<&'static str> {
     }
 }
 
-/// T1: the M4 shape, 286 authority downgrades and 23 stale older uploads, no
-/// holds. Every refusal is dominated, so the cycle is not a validation error.
+/// T1: a retained list of 286 authority downgrades and 23 stale older
+/// uploads, no holds. Every refusal is dominated, so the cycle is not a
+/// validation error.
 #[test]
 fn dominated_permanent_refusals_are_not_a_backend_validation_error() {
     let mut ledger = progress();
