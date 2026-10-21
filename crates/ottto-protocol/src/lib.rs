@@ -5505,7 +5505,7 @@ mod tests {
                 account_identifier_hash: Some("a".repeat(64)),
                 workspace_identifier_hash: Some("b".repeat(64)),
                 account_label: "Codex account".to_string(),
-                workspace_label: Some("Singular".to_string()),
+                workspace_label: Some("Acme".to_string()),
                 subscription_product: None,
                 durability: CodexAccountTargetDurabilityV1::ObservedOnly,
                 is_current: false,
@@ -5521,7 +5521,7 @@ mod tests {
             blocked_targets: 0,
         };
         let wire = serde_json::to_value(coverage).expect("serialize target coverage");
-        assert_eq!(wire["targets"][0]["workspace_label"], "Singular");
+        assert_eq!(wire["targets"][0]["workspace_label"], "Acme");
         assert_eq!(wire["targets"][0]["connectable"], true);
         let encoded = wire.to_string();
         for forbidden in [
