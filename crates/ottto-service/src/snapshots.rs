@@ -44399,6 +44399,217 @@ mod tests {
         row
     }
 
+    fn cache_split_fixture() -> (PathBuf, String, Vec<SnapshotItem>) {
+        let root = temp_dir("claude-cache-split");
+        let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5".to_string();
+        let path = root.join(format!("{parent}.jsonl"));
+        let record = json!({
+            "timestamp": "2026-08-02T07:00:01Z", "type": "assistant",
+            "sessionId": parent, "requestId": "req_cache_split",
+            "message": {"id": "msg_cache_split", "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 10,
+                    "cache_creation_input_tokens": 2014,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 2014,
+                        "ephemeral_1h_input_tokens": 0}}}
+        });
+        fs::write(&path, format!("{record}\n")).unwrap();
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-02T07:01:00Z",
+            "cache-split-fp".to_string(),
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        (root, parent, items)
+    }
+
+    fn cache_split_api_row(
+        parent: &str,
+        split: bool,
+    ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+        let mut row = complete_api_row(parent, "req_cache_split", 1, 10, 10, 2014);
+        if split {
+            row.cache_creation_5m_tokens = 2014;
+            row.app_version = "2.1.300".to_string();
+        }
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        row
+    }
+
+    #[test]
+    fn claude_cache_split_matcher_accepts_aggregate_and_split() {
+        let (root, parent, items) = cache_split_fixture();
+        let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
+            items[0]
+                .claude_usage_occurrences
+                .get("req_cache_split")
+                .unwrap(),
+        );
+        assert!(claude_api_matches_transcript_occurrence(
+            &cache_split_api_row(&parent, true),
+            &occurrence
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_matcher_preserves_old_aggregate_only() {
+        let (root, parent, items) = cache_split_fixture();
+        let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
+            items[0]
+                .claude_usage_occurrences
+                .get("req_cache_split")
+                .unwrap(),
+        );
+        assert!(claude_api_matches_transcript_occurrence(
+            &cache_split_api_row(&parent, false),
+            &occurrence
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_account_accepts_both_shapes() {
+        let (root, parent, items) = cache_split_fixture();
+        for split in [false, true] {
+            let row = cache_split_api_row(&parent, split);
+            assert!(
+                claude_account_evidence_covers_snapshot(&items[0], &[&row]),
+                "split={split}"
+            );
+            let mut item = items[0].clone();
+            assert!(apply_claude_account_evidence(&mut item, &[row]));
+            assert_eq!(exact_session_account_hash(&item), Some("a".repeat(64)));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_rebuild_telemetry_only_does_not_double_count() {
+        let (root, parent, items) = cache_split_fixture();
+        for split in [false, true] {
+            let mut item = items[0].clone();
+            let owned = cache_split_api_row(&parent, false);
+            let mut auxiliary = cache_split_api_row(&parent, split);
+            auxiliary.request_id = "req_auxiliary".to_string();
+            assert!(rebuild_claude_reported_usage(
+                &mut item,
+                &[owned, auxiliary],
+                &BTreeSet::new(),
+                None
+            ));
+            assert_eq!(
+                item.cache_creation_5m_tokens,
+                if split { 4028 } else { 2014 }
+            );
+            assert_eq!(item.cache_creation_1h_tokens, 0);
+            assert_eq!(item.unattributed_total_tokens, if split { 0 } else { 2014 });
+            assert_eq!(item.request_count, 2);
+            validate_snapshot_item(0, &item).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_rebuild_owned_accepts_both_shapes() {
+        let (root, parent, items) = cache_split_fixture();
+        for split in [false, true] {
+            let mut item = items[0].clone();
+            assert!(rebuild_claude_reported_usage(
+                &mut item,
+                &[cache_split_api_row(&parent, split)],
+                &BTreeSet::new(),
+                None
+            ));
+            assert_eq!(item.cache_creation_5m_tokens, 2014);
+            assert_eq!(item.unattributed_total_tokens, 0);
+            validate_snapshot_item(0, &item).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_inconsistent_row_fails_closed() {
+        let (root, parent, items) = cache_split_fixture();
+        let mut row = cache_split_api_row(&parent, true);
+        row.cache_creation_tokens = 1000;
+        // Make the old additive result equal the transcript to catch silent
+        // acceptance of inconsistent telemetry at every decision boundary.
+        row.cache_creation_5m_tokens = 1014;
+        let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
+            items[0]
+                .claude_usage_occurrences
+                .get("req_cache_split")
+                .unwrap(),
+        );
+        assert!(!claude_api_matches_transcript_occurrence(&row, &occurrence));
+        assert!(!claude_account_evidence_covers_snapshot(&items[0], &[&row]));
+        let mut item = items[0].clone();
+        let before = serde_json::to_vec(&item).unwrap();
+        assert!(!rebuild_claude_reported_usage(
+            &mut item,
+            &[row.clone()],
+            &BTreeSet::new(),
+            None
+        ));
+        assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+        row.request_id = "req_auxiliary".to_string();
+        assert!(!rebuild_claude_reported_usage(
+            &mut item,
+            &[cache_split_api_row(&parent, false), row],
+            &BTreeSet::new(),
+            None
+        ));
+        assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_new_family_proves_at_healthy_terminal() {
+        let (root, parent, mut items) = cache_split_fixture();
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), vec![cache_split_api_row(&parent, true)])]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                parent.clone(),
+                vec![complete_trace_row(&parent, "req_cache_split", "")],
+            )]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert_eq!(
+            items[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert!(index.claude_usage_family_witnesses.contains_key(&parent));
+        assert_eq!(items[0].cache_creation_5m_tokens, 2014);
+        assert_eq!(items[0].unattributed_total_tokens, 0);
+        assert_eq!(
+            items[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        validate_snapshot_item(0, &items[0]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn claude_pending_usage_occurrence_limit_is_replacement_aware() {
         assert_eq!(
