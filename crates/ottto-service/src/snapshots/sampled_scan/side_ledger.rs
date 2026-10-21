@@ -1540,8 +1540,10 @@ mod tests {
             return;
         }
         let ns = 51;
-        let mut ledger = SideLedger::default();
-        ledger.wseq = u32::MAX - 2;
+        let mut ledger = SideLedger {
+            wseq: u32::MAX - 2,
+            ..SideLedger::default()
+        };
         let mut work = index_with_p();
         ledger.begin_index_pass(ns, 100, &mut work);
         let old = pkey(ns, 5);
