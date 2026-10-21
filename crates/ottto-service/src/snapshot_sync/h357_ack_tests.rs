@@ -1764,3 +1764,129 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     assert_eq!(snapshots[0].cache_base_head_etag, Some("e".repeat(64)));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+const DOMINATED_DOWNGRADE: &str = "usage_accounting_authority_downgrade";
+const DOMINATED_STALE: &str = "accepted_log_stale_older_upload";
+
+/// Refuse `count` synthetic bodies with `reason` through the real ledger path.
+fn refuse(ledger: &mut SnapshotUploadProgress, reason: &str, count: usize) {
+    let start = ledger.permanent_rejections.len();
+    for i in start..start + count {
+        ledger.quarantine_permanent_body(&format!("{i:064x}"), &format!("body-{i}"), reason);
+    }
+}
+
+fn reported_code(state: CollectorState<'static>) -> Option<&'static str> {
+    match state {
+        CollectorState::Success => None,
+        CollectorState::Error { code, .. } => Some(code),
+        other => panic!("unexpected refused-entity state {other:?}"),
+    }
+}
+
+/// T1: the M4 shape, 286 authority downgrades and 23 stale older uploads, no
+/// holds. Every refusal is dominated, so the cycle is not a validation error.
+#[test]
+fn dominated_permanent_refusals_are_not_a_backend_validation_error() {
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_DOWNGRADE, 286);
+    refuse(&mut ledger, DOMINATED_STALE, 23);
+    let refusals = PermanentRefusalCounts::of(ledger.permanent_rejections.values());
+    assert_eq!(
+        refusals,
+        PermanentRefusalCounts {
+            total: 309,
+            dominated: 309
+        }
+    );
+    assert_eq!(
+        reported_code(refused_entity_state(true, refusals, true)),
+        None,
+        "dominated refusals report the settled-success state"
+    );
+    assert!(ledger.accepted_fingerprints.is_empty(), "never an ACK");
+}
+
+/// T2: one dominated plus one other permanent reason keeps today's code.
+#[test]
+fn a_non_dominated_permanent_refusal_keeps_backend_validation_error() {
+    for other in [
+        "divergent_duplicate_logical_session",
+        "body_exceeds_max_bytes",
+        "occurred_at_beyond_journal_retention",
+        "invalid",
+    ] {
+        let mut ledger = progress();
+        refuse(&mut ledger, DOMINATED_DOWNGRADE, 1);
+        refuse(&mut ledger, other, 1);
+        let refusals = PermanentRefusalCounts::of(ledger.permanent_rejections.values());
+        assert_eq!(
+            refusals,
+            PermanentRefusalCounts {
+                total: 2,
+                dominated: 1
+            },
+            "{other}"
+        );
+        assert_eq!(
+            reported_code(refused_entity_state(true, refusals, true)),
+            Some("backend_validation_error"),
+            "{other}"
+        );
+    }
+    assert_eq!(
+        reported_code(refused_entity_state(
+            true,
+            PermanentRefusalCounts::default(),
+            true
+        )),
+        Some("backend_validation_error"),
+        "no retained refusal is no evidence of domination"
+    );
+}
+
+/// T3: dominated refusals plus a local hold stay unsettled, and the reported
+/// code is unchanged.
+#[test]
+fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
+    let holds = LocalHoldSettlement {
+        held_entity_count: 1,
+        retry_pending_family_count: 0,
+        held_fingerprints: BTreeSet::from(["f".repeat(64)]),
+        account_deferred_fingerprints: BTreeSet::new(),
+        progress_blocking: false,
+    };
+    let settlement = settle_checkpointed_upload(
+        ScanIndex::default(),
+        &ScanIndex::default(),
+        &ledger,
+        &holds,
+        true,
+    );
+    assert!(!settlement.fully_settled);
+    let refusals = PermanentRefusalCounts::of(ledger.permanent_rejections.values());
+    assert_eq!(
+        reported_code(refused_entity_state(
+            true,
+            refusals,
+            settlement.fully_settled
+        )),
+        Some("backend_validation_error")
+    );
+}
+
+/// T5: a retryable deferral stays `server_error`, whatever the ledger holds.
+#[test]
+fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_STALE, 3);
+    let refusals = PermanentRefusalCounts::of(ledger.permanent_rejections.values());
+    for settled in [true, false] {
+        assert_eq!(
+            reported_code(refused_entity_state(false, refusals, settled)),
+            Some("server_error")
+        );
+    }
+}

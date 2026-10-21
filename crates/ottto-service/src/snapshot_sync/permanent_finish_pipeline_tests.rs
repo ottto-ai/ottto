@@ -10,6 +10,23 @@ enum FinishOutcome {
     PermanentStatusFailure,
     PermanentWithoutSidecars,
     PermanentUncleanCensus,
+    /// Every body is refused for a reason the backend already dominates with
+    /// an accepted record; `admit_residue` is the activity-hint admission of
+    /// `census_residue_status:v1`.
+    Dominated {
+        reason: &'static str,
+        admit_residue: bool,
+    },
+}
+
+impl FinishOutcome {
+    /// The refused body is retained, then two quiet cycles re-disclose it.
+    fn retains_refusal_across_quiet_cycles(self) -> bool {
+        matches!(
+            self,
+            FinishOutcome::Permanent | FinishOutcome::Dominated { .. }
+        )
+    }
 }
 
 struct FinishServer {
@@ -55,10 +72,21 @@ impl FinishServer {
                 let response = if request.contains("/relay-token") {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
-                    serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                    let mut hint = serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
-                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"});
+                    if matches!(
+                        outcome,
+                        FinishOutcome::Dominated {
+                            admit_residue: true,
+                            ..
+                        }
+                    ) {
+                        hint["census_residue_status_contract"] =
+                            crate::snapshot_client::CENSUS_RESIDUE_STATUS_CONTRACT.into();
+                    }
+                    hint
                 } else if request.contains("/agent-status/snapshots") {
                     serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
@@ -75,13 +103,17 @@ impl FinishServer {
                             })
                         })
                         .collect::<Vec<_>>();
+                    let reason = match outcome {
+                        FinishOutcome::Dominated { reason, .. } => reason,
+                        _ => "invalid",
+                    };
                     let rejected = items
                         .iter()
                         .map(|item| {
                             serde_json::json!({
                                 "source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],
-                                "reason":"invalid","detail":"synthetic finish refusal",
+                                "reason":reason,"detail":"synthetic finish refusal",
                                 "permanent":true,"occurrence_count":1
                             })
                         })
@@ -199,7 +231,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
     };
-    let cycles = if matches!(outcome, FinishOutcome::Permanent) {
+    let cycles = if outcome.retains_refusal_across_quiet_cycles() {
         3
     } else {
         1
@@ -299,12 +331,36 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         );
         assert_eq!(
             terminal[cycle]["last_error_code"],
-            if matches!(outcome, FinishOutcome::Retryable) {
-                "server_error"
-            } else {
-                "backend_validation_error"
-            }
+            match outcome {
+                FinishOutcome::Retryable => "server_error",
+                // The refused body is settled unproven-terminal residue; the
+                // server already owns a better or newer record for it.
+                FinishOutcome::Dominated {
+                    admit_residue: true,
+                    ..
+                } => "census_residue",
+                // A backend that predates the admission reads settled residue
+                // only in the legacy shape.
+                FinishOutcome::Dominated {
+                    admit_residue: false,
+                    ..
+                } => "parse_error",
+                _ => "backend_validation_error",
+            },
+            "{outcome:?}, cycle {cycle}"
         );
+        if let FinishOutcome::Dominated { admit_residue, .. } = outcome {
+            assert_eq!(terminal[cycle]["last_census_residue_settled"], true);
+            assert_eq!(terminal[cycle]["last_snapshot_unproven_terminal_count"], 1);
+            assert_eq!(
+                terminal[cycle]["consecutive_failures"],
+                u64::from(!admit_residue)
+            );
+            assert_eq!(
+                terminal[cycle]["last_success_at"].is_string(),
+                admit_residue
+            );
+        }
         let retained_valid = daemon.native_comparison.retained_valid_for_test();
         for (key, expected) in [
             "last_malformed_json_line_count",
@@ -321,12 +377,12 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             );
         }
         assert_eq!(terminal[cycle]["last_census_complete"], !unclean);
-        if cycle > 0 || !matches!(outcome, FinishOutcome::Permanent) {
+        if cycle > 0 || !outcome.retains_refusal_across_quiet_cycles() {
             assert_eq!(retained_valid, expected_valid,
             "{outcome:?}, cycle {cycle}: only an earned native conjunction or actual predecessor permit plus durable settlement and successful status may reach the common lease finalizer");
         }
         writeln!(std::io::stderr().lock(), "permanent_finish_pipeline: outcome={outcome:?} cycle={cycle} selected_save=true refusal_not_accepted=true refusal_debt_retained=true retained_valid={retained_valid}").unwrap();
-        if cycle == 0 && matches!(outcome, FinishOutcome::Permanent) {
+        if cycle == 0 && outcome.retains_refusal_across_quiet_cycles() {
             // Change only the source revision, not usage or its body witness. The
             // normal-window pass must perform its own native parse and retain the
             // original permanent refusal without offering that body again.
@@ -372,6 +428,44 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
+}
+
+/// T1/T6: the page's only permanent refusals are dominated, no holds. The
+/// first refusal and both quiet retained cycles report settled residue, never
+/// `backend_validation_error`, and the native lease outcome is unchanged.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
+    for reason in [
+        "usage_accounting_authority_downgrade",
+        "accepted_log_stale_older_upload",
+    ] {
+        permanent_finish_pipeline(
+            FinishOutcome::Dominated {
+                reason,
+                admit_residue: true,
+            },
+            true,
+        );
+    }
+}
+
+/// T4: a backend that does not admit `census_residue_status:v1` never
+/// receives the `census_residue` code.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
+    permanent_finish_pipeline(
+        FinishOutcome::Dominated {
+            reason: "usage_accounting_authority_downgrade",
+            admit_residue: false,
+        },
+        true,
+    );
 }
 
 // Same real finish fixture; the new tests own only a test-thread observer.

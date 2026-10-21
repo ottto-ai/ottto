@@ -2505,6 +2505,38 @@ fn deferred_entity_state(permanent: bool) -> CollectorState<'static> {
     }
 }
 
+/// Current permanent refusals in the upload ledger. Content-free: counts only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PermanentRefusalCounts {
+    total: usize,
+    /// Refusals the backend already dominates with an accepted record.
+    dominated: usize,
+}
+
+impl PermanentRefusalCounts {
+    fn of<'a>(refusals: impl IntoIterator<Item = &'a PermanentSnapshotRejection>) -> Self {
+        refusals
+            .into_iter()
+            .fold(Self::default(), |mut counts, refusal| {
+                counts.total += 1;
+                if refusal.reason.is_dominated() {
+                    counts.dominated += 1;
+                }
+                counts
+            })
+    }
+}
+
+/// Terminal state for a cycle that ends with deferred or refused entities.
+fn refused_entity_state(
+    permanent: bool,
+    refusals: PermanentRefusalCounts,
+    upload_fully_settled: bool,
+) -> CollectorState<'static> {
+    let _ = (refusals.total, refusals.dominated, upload_fully_settled);
+    deferred_entity_state(permanent)
+}
+
 #[derive(Debug)]
 enum CollectorState<'a> {
     Success,
@@ -5842,6 +5874,10 @@ fn finish_sync_source(
         deferred_entity_count = Some(retained_permanent);
         resolved_permanent_rejections = true;
     }
+    // The whole ledger, before the current-entity prune below: a refusal from
+    // this page that is not current still keeps its reported reason.
+    let permanent_refusals =
+        PermanentRefusalCounts::of(upload_progress.permanent_rejections.values());
     index.finish_legacy_settlement_reconciliation();
     settle_context_curve_replay_state(
         &mut index,
@@ -5998,7 +6034,11 @@ fn finish_sync_source(
                 scan_started_at: terminal_scan_started_at,
                 counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
                     .with_snapshot_terminal_counts(&index),
-                state: deferred_entity_state(resolved_permanent_rejections),
+                state: refused_entity_state(
+                    resolved_permanent_rejections,
+                    permanent_refusals,
+                    upload_fully_settled,
+                ),
             },
             scan_result.codex_counting_v2.as_deref(),
         );
