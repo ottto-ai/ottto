@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
+mod continuation;
 mod rejection_log;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
@@ -2572,29 +2573,92 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 // The cycle cadence itself is unchanged. What the tiers gate is the
                 // expensive part — the local transcript scan and its upload — while
                 // agent-status/quota freshness has an independent source owner.
-                collect_file_activity_for(
-                    SNAPSHOT_SYNC_INTERVAL,
-                    watcher.as_ref(),
-                    &mut account_switch,
-                    |ordinary| {
-                        if !retry.enabled() {
-                            return ordinary;
-                        }
-                        // The native cycle lock also excludes the UI one-shot
-                        // path during a delivery-only turn. This wake never
-                        // starts a provider scan or resets ordinary cadence.
-                        let _guard = SNAPSHOT_SYNC_LOCK
-                            .get_or_init(|| Mutex::new(()))
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner());
-                        retry.boundary(std::iter::empty(), &home, &support_dir, &daemon);
-                        retry.wake_before(ordinary)
+                if !continuation::ENABLED {
+                    collect_file_activity_for(
+                        SNAPSHOT_SYNC_INTERVAL,
+                        watcher.as_ref(),
+                        &mut account_switch,
+                        delivery_wake(&mut retry, &home, &support_dir, &daemon),
+                    );
+                    continue;
+                }
+                // Paced cursor continuation pages run inside the same ordinary
+                // interval; the ordinary cycle keeps its deadline.
+                continuation::wait_for_ordinary_cycle(
+                    &mut ContinuationLoop {
+                        watcher: watcher.as_ref(),
+                        account_switch: &mut account_switch,
+                        retry: &mut retry,
+                        home: &home,
+                        support_dir: &support_dir,
+                        daemon: &daemon,
                     },
+                    SNAPSHOT_SYNC_INTERVAL,
                 );
             }
         })
         .context("spawn local snapshot sync")?;
     Ok(())
+}
+
+/// The delivery-only retry wake inside a cadence wait.
+fn delivery_wake<'a>(
+    retry: &'a mut live_snapshot_retry::LiveRetryOwner,
+    home: &'a Path,
+    support_dir: &'a Path,
+    daemon: &'a LocalDaemon,
+) -> impl FnMut(Instant) -> Instant + 'a {
+    move |ordinary| {
+        if !retry.enabled() {
+            return ordinary;
+        }
+        // The native cycle lock also excludes the UI one-shot
+        // path during a delivery-only turn. This wake never
+        // starts a provider scan or resets ordinary cadence.
+        let _guard = SNAPSHOT_SYNC_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        retry.boundary(std::iter::empty(), home, support_dir, daemon);
+        retry.wake_before(ordinary)
+    }
+}
+
+/// The production loop host for continuation pages: real time, the watcher
+/// wait and the delivery wake, with no network beyond what each already does.
+struct ContinuationLoop<'a> {
+    watcher: Option<&'a crate::snapshot_watcher::SnapshotWatcher>,
+    account_switch: &'a mut ClaudeAccountSwitchProbe,
+    retry: &'a mut live_snapshot_retry::LiveRetryOwner,
+    home: &'a Path,
+    support_dir: &'a Path,
+    daemon: &'a LocalDaemon,
+}
+
+impl continuation::LoopHost for ContinuationLoop<'_> {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+    fn wait(&mut self, wait: Duration) -> bool {
+        collect_file_activity_for(
+            wait,
+            self.watcher,
+            self.account_switch,
+            delivery_wake(self.retry, self.home, self.support_dir, self.daemon),
+        )
+    }
+    fn pending(&mut self) -> Option<(Instant, Duration)> {
+        continuation::production_pending()
+    }
+    fn page(&mut self, deadline: Instant) -> continuation::Outcome {
+        continuation::run_production_page(
+            self.home,
+            self.support_dir,
+            self.daemon,
+            self.retry,
+            deadline,
+        )
+    }
 }
 
 /// Watch every enabled source's transcript roots, if the platform allows it.
@@ -2614,20 +2678,21 @@ fn watch_snapshot_source_roots(home: &Path) -> Option<crate::snapshot_watcher::S
 /// The one exception that ends a wait early is a Claude account switch (see
 /// [`ClaudeAccountSwitchProbe`]): the next cycle then re-reads agent status and
 /// re-attributes active sessions right away instead of up to a full interval
-/// later. The transcript scan itself stays on its cadence.
+/// later. The transcript scan itself stays on its cadence. Returns `true` when
+/// the wait ended early for that reason.
 fn collect_file_activity_for(
     wait: Duration,
     watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
     account_switch: &mut ClaudeAccountSwitchProbe,
     retry_boundary: impl FnMut(Instant) -> Instant,
-) {
+) -> bool {
     collect_file_activity_with_retry(
         wait,
         watcher,
         account_switch,
         retry_boundary,
         crate::agent_status::claude_default_account_fingerprint,
-    );
+    )
 }
 
 fn collect_file_activity_with_retry(
@@ -2636,18 +2701,18 @@ fn collect_file_activity_with_retry(
     account_switch: &mut ClaudeAccountSwitchProbe,
     mut retry_boundary: impl FnMut(Instant) -> Instant,
     mut read_account: impl FnMut() -> Option<String>,
-) {
+) -> bool {
     let deadline = Instant::now() + wait;
     let mut watcher = watcher;
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return;
+            return false;
         }
         let wake = retry_boundary(deadline).min(deadline);
         let now = Instant::now();
         if now >= deadline {
-            return;
+            return false;
         }
         let slice = wake.saturating_duration_since(now).min(CADENCE_WAIT_SLICE);
         match watcher.map(|watcher| watcher.events.recv_timeout(slice)) {
@@ -2669,7 +2734,7 @@ fn collect_file_activity_with_retry(
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
                 cadence.record_file_event(Instant::now())
             });
-            return;
+            return true;
         }
     }
 }
@@ -2957,6 +3022,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Declared after the guard, so it settles before the lock is released.
+    let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -2964,18 +3031,7 @@ fn sync_once_with_retry(
     let account_witness = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
-    let api_base_url = snapshot_api_base_url();
-    let device_label = daemon
-        .machine_for_trusted_client()
-        .ok()
-        .map(|machine| machine.display_name);
-    let account_binding = daemon
-        .account_for_trusted_client()
-        .ok()
-        .map(|account| account.state);
-    let client = SnapshotApiClient::new(api_base_url)
-        .with_receipt_state_dir(support_dir)
-        .with_receipt_context(device_label, account_binding);
+    let client = snapshot_cycle_client(support_dir, daemon);
     let enabled_sources = enabled_snapshot_sources(&device);
 
     if let Some(source) = enabled_sources.first().copied() {
@@ -3035,6 +3091,7 @@ fn sync_once_with_retry(
         transport_cycle: &mut transport_cycle,
         failed_sources: &mut failed_sources,
         started: Instant::now(),
+        codex_started: None,
         account_witness,
         retry,
     };
@@ -3050,7 +3107,65 @@ fn sync_once_with_retry(
             failed_sources.len()
         ));
     }
+    continuation_cycle.succeeded(enabled_sources.contains(&SnapshotSource::Codex));
     Ok(())
+}
+
+/// The cycle's API client, with the receipt state and context every cycle uses.
+fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> SnapshotApiClient {
+    let device_label = daemon
+        .machine_for_trusted_client()
+        .ok()
+        .map(|machine| machine.display_name);
+    let account_binding = daemon
+        .account_for_trusted_client()
+        .ok()
+        .map(|account| account.state);
+    SnapshotApiClient::new(snapshot_api_base_url())
+        .with_receipt_state_dir(support_dir)
+        .with_receipt_context(device_label, account_binding)
+}
+
+/// A continuation job's EOF completion, called with `SNAPSHOT_SYNC_LOCK` held:
+/// the existing authorized completion upload through
+/// [`SnapshotCycleOwner::finish_completed`], the same completion an ordinary
+/// Codex finish runs. Its local inputs are read as `sync_once_with_retry`
+/// reads them. It sends no cycle-start receipt, health upload or activity-hint
+/// request, and it is not a sync cycle, so its transport outcome does not feed
+/// the cycle streak.
+fn complete_continuation_eof(
+    home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    retry: &mut live_snapshot_retry::LiveRetryOwner,
+    completed: (SourcePreparation, ScanIndex, SourceScanResult),
+) -> Result<()> {
+    let (device, device_secret) = load_snapshot_device_credentials()?;
+    let Some(machine_id) = snapshot_machine_id(&device)? else {
+        return Err(anyhow!("machine identity is missing"));
+    };
+    let account_witness = daemon
+        .snapshot_scan_account_witness()
+        .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
+    let client = snapshot_cycle_client(support_dir, daemon);
+    let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
+    let mut failed_sources = Vec::new();
+    SnapshotCycleOwner {
+        client: &client,
+        device: &device,
+        device_secret: &device_secret,
+        machine_id: &machine_id,
+        home,
+        support_dir,
+        daemon,
+        transport_cycle: &mut transport_cycle,
+        failed_sources: &mut failed_sources,
+        started: Instant::now(),
+        codex_started: None,
+        account_witness,
+        retry,
+    }
+    .finish_completed(completed)
 }
 
 #[allow(dead_code)] // Native retained-copy preparation; activation review remains closed.
@@ -3164,7 +3279,46 @@ struct SnapshotCycleOwner<'a> {
     transport_cycle: &'a mut crate::net_resilience::TransportCycleOutcome,
     failed_sources: &'a mut Vec<&'static str>,
     started: Instant,
+    /// When this cycle's Codex preparation began, for a continuation ticket's
+    /// measured work. Only written while continuation pages are enabled.
+    codex_started: Option<Instant>,
 }
+impl SnapshotCycleOwner<'_> {
+    /// One completed source scan: the census fence over the authority and
+    /// destination rechecks, then the unchanged `finish_sync_source`. An
+    /// ordinary finish and a continuation job's EOF completion both run this.
+    fn finish_completed(
+        &mut self,
+        (preparation, index, scan): (SourcePreparation, ScanIndex, SourceScanResult),
+    ) -> Result<()> {
+        use crate::source_rotation::Owner as _;
+        codex_scan_diagnostics::observe_existing_outer_census_fence(
+            preparation.source,
+            self.support_dir,
+            || {
+                self.validate(&preparation)?;
+                ensure_snapshot_destination_current(&preparation.upload_destination_namespace)
+            },
+        )?;
+        let source = preparation.source;
+        finish_sync_source(
+            preparation,
+            index,
+            scan,
+            self.client,
+            self.device,
+            self.device_secret,
+            source,
+            self.machine_id,
+            self.home,
+            self.support_dir,
+            self.daemon,
+            self.transport_cycle,
+            self.retry,
+        )
+    }
+}
+
 impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     type Source = SnapshotSource;
     type Frame = SourcePreparation;
@@ -3174,6 +3328,9 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         source: SnapshotSource,
         remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
+        if continuation::ENABLED && source == SnapshotSource::Codex {
+            self.codex_started = Some(Instant::now());
+        }
         ensure_snapshot_scan_authority(
             self.device,
             source,
@@ -3233,35 +3390,40 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     fn finish(&mut self, mut completed: Self::Completed, remaining: Option<usize>) -> Result<()> {
         completed.0.accept_native_rotation_turn(remaining);
         let source = completed.0.source;
-        crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
-            let (preparation, index, scan) = completed;
-            codex_scan_diagnostics::observe_existing_outer_census_fence(
-                source,
-                self.support_dir,
-                || {
-                    self.validate(&preparation)?;
-                    ensure_snapshot_destination_current(&preparation.upload_destination_namespace)
-                },
-            )?;
-            let source = preparation.source;
-            finish_sync_source(
-                preparation,
-                index,
-                scan,
-                self.client,
-                self.device,
-                self.device_secret,
-                source,
-                self.machine_id,
-                self.home,
-                self.support_dir,
-                self.daemon,
-                self.transport_cycle,
-                self.retry,
-            )
-        })
+        // Read before the scan is consumed; kept only if the finish succeeds.
+        let continuation_ticket =
+            (continuation::ENABLED && source == SnapshotSource::Codex).then(|| {
+                let endpoint = snapshot_api_base_url();
+                let authority = self
+                    .client
+                    .matches_api_base(&endpoint)
+                    .then(|| {
+                        continuation::current_authority(
+                            self.device,
+                            &endpoint,
+                            &self.account_witness,
+                        )
+                    })
+                    .flatten();
+                continuation::ordinary_ticket(
+                    &continuation::NoCursorContinuation,
+                    &completed.2,
+                    &completed.0.upload_destination_namespace,
+                    authority,
+                )
+            });
+        let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
+            self.finish_completed(completed)
+        });
+        if let Some(ticket) = continuation_ticket {
+            continuation::after_ordinary_codex_page(ticket, self.codex_started, finished.is_ok());
+        }
+        finished
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
+        if continuation::ENABLED && source == SnapshotSource::Codex && result.is_err() {
+            continuation::after_ordinary_codex_failure();
+        }
         match result {
             Ok(()) => self.transport_cycle.note_success(),
             Err(error) => {
