@@ -27,7 +27,8 @@ proof, physical membership, account identity or acceptance.
 - R2: a serialized, accepted-unproven index has no witness or pending and
   quiet matching telemetry. Ordinary discovery must enroll and prove it.
   Expected baseline failure: existing backlog receives no retry obligation.
-  The setup uses the real R0 history; discovery gets no new refusal or edit.
+  The setup uses the real R0 history and removes the proposed optional retry
+  envelope to model an older index; discovery gets no new refusal or edit.
 
 The closed fence's existing replay deadline is placed 23 hours after W0.
 Every recovery page asserts full_rearm=false, unchanged upload/replay context,
@@ -51,6 +52,11 @@ over the production occurrence cap; exact ledger mismatch; and late API or
 trace rows selecting both root and children through normal fingerprint retry.
 The cap control expands an actual parsed synthetic observation in memory;
 it does not introduce a test cap or alter production limits.
+
+The content/path control uses a top-level K.jsonl containing identity L and
+asserts the parsed identity before scanning. Subagent identities are explicitly
+re-keyed from paths by the existing parser; changing only a subagent event's
+parent sessionId does not create the intended identity disagreement.
 
 ## Validation and limits
 

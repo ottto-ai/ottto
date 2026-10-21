@@ -285,6 +285,15 @@ mod first_proof_retry_pipeline_tests {
         let _manifests = SourceManifestTestGuard::new();
         let fixture = RearmFixture::new("fpretry-r2");
         failed_growth(&fixture);
+        // Model an index written before first-proof scheduling existed. On
+        // the future implementation this must exercise backlog discovery,
+        // independently of debt created while preparing the W0 history.
+        let mut legacy = state(&fixture);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_first_proof_retry_v1");
+        save_state(&fixture, legacy);
         let serialized = std::fs::read(&fixture.index_path).unwrap();
         let restored: ScanIndex = serde_json::from_slice(&serialized).unwrap();
         assert!(restored
@@ -362,12 +371,34 @@ mod first_proof_retry_pipeline_tests {
                 .contains_key(twin.to_str().unwrap()));
         }
         let fixture = RearmFixture::new("fpretry-content-path");
-        std::fs::write(
-            fixture.member_path(Some(REARM_AGENTS[0])),
-            rearm_transcript_line(REARM_SIBLING, Some(REARM_AGENTS[0]), "req_agent_a_1", 2),
+        // Subagent identity is deliberately re-keyed from its path, so an
+        // event's parent sessionId is not a content/path identity conflict.
+        // Top-level K.jsonl containing L retains parsed identity L: verify
+        // that precondition rather than assuming the parser's identity rule.
+        let path = fixture.member_path(None);
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(REARM_ROOT, REARM_SIBLING);
+        std::fs::write(&path, text).unwrap();
+        let parsed = crate::snapshots::parse_claude_code_jsonl_file(
+            &path,
+            WINDOW,
+            "content-path-control".to_string(),
         )
         .unwrap();
-        assert_no_family_contract(&fixture.generation(8));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].source_session_id, REARM_SIBLING);
+        let pages = fixture.generation(8);
+        assert_no_family_contract(&pages);
+        assert!(
+            pages
+                .last()
+                .unwrap()
+                .index
+                .claude_usage_family_witness_digest_for_test(REARM_SIBLING)
+                .is_none(),
+            "K's physical key cannot stand in for parsed family L"
+        );
     }
 
     /// GREEN control: identity-invalid pending remains fail-closed even with
