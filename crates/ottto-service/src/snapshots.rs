@@ -16914,8 +16914,9 @@ impl OwnedSourceScan {
                 else {
                     continue;
                 };
-                let Some(mut candidate) = candidate_from_traversal_path(
+                let Some(mut candidate) = candidate_from_traversal_path_at(
                     source,
+                    disappearance_diagnostics::Site::CandidateForcedIndex,
                     ScanTraversalPath {
                         scan_root,
                         path,
@@ -28699,10 +28700,10 @@ fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                disappearance_diagnostics::increment(
+                disappearance_diagnostics::not_found(
                     &mut traversal.counts.disappeared_file_count,
                     source,
-                    disappearance_diagnostics::Cause::NotFound,
+                    disappearance_diagnostics::Site::WalkDirectory,
                 );
                 continue;
             }
@@ -28801,10 +28802,10 @@ fn advance_bounded_directory_traversal_with_budget(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    disappearance_diagnostics::increment(
+                    disappearance_diagnostics::not_found(
                         &mut traversal.counts.disappeared_file_count,
                         source,
-                        disappearance_diagnostics::Cause::NotFound,
+                        disappearance_diagnostics::Site::WalkEntry,
                     );
                     continue;
                 }
@@ -28856,8 +28857,41 @@ fn advance_bounded_directory_traversal_with_budget(
     }
 }
 
+/// A Claude transcript that is NotFound while its parent is still a real
+/// directory (not a symlink) was deleted or renamed: no retry can recover it,
+/// so the census settles it as a removal, the same as a watcher remove hint.
+/// A missing, renamed or unmounted parent is not evidence of removal and keeps
+/// the NotFound as loss.
+fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> bool {
+    source == SnapshotSource::ClaudeCode
+        && path
+            .parent()
+            .and_then(|parent| fs::symlink_metadata(parent).ok())
+            .is_some_and(|parent| parent.is_dir() && !parent.file_type().is_symlink())
+}
+
 fn candidate_from_traversal_path(
     source: SnapshotSource,
+    pending: ScanTraversalPath,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+) -> Option<CandidateFile> {
+    candidate_from_traversal_path_at(
+        source,
+        disappearance_diagnostics::Site::CandidateWalk,
+        pending,
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+    )
+}
+
+fn candidate_from_traversal_path_at(
+    source: SnapshotSource,
+    site: disappearance_diagnostics::Site,
     pending: ScanTraversalPath,
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
@@ -28876,11 +28910,20 @@ fn candidate_from_traversal_path(
                     .removed_index_keys
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
-                disappearance_diagnostics::increment(
-                    &mut census.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Cause::NotFound,
-                );
+                if claude_absence_is_removal(source, &pending.path) {
+                    // The same exact retirement as a remove hint, whichever
+                    // order the hint and the queued member arrived in.
+                    disappearance_diagnostics::not_found_removal(source, site);
+                    census
+                        .removed_index_keys
+                        .insert(local_index_key(&pending.path));
+                } else {
+                    disappearance_diagnostics::not_found(
+                        &mut census.disappeared_file_count,
+                        source,
+                        site,
+                    );
+                }
             }
             return None;
         }
@@ -29270,11 +29313,23 @@ fn open_and_identify_scan_candidate(
     let opened_file = match open_candidate_file(source, &mut candidate) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            disappearance_diagnostics::increment(
-                &mut census.disappeared_file_count,
-                source,
-                disappearance_diagnostics::Cause::NotFound,
-            );
+            if claude_absence_is_removal(source, &candidate.path) {
+                // Removed after its candidate stat. Drop this page's
+                // observation too, so the page merge retires the key.
+                disappearance_diagnostics::not_found_removal(
+                    source,
+                    disappearance_diagnostics::Site::Open,
+                );
+                let index_key = local_index_key(&candidate.path);
+                census.observed_index_keys.remove(&index_key);
+                census.removed_index_keys.insert(index_key);
+            } else {
+                disappearance_diagnostics::not_found(
+                    &mut census.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Site::Open,
+                );
+            }
             return None;
         }
         Err(error)

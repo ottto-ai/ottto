@@ -24,6 +24,36 @@ impl Cause {
     }
 }
 
+/// Where a NotFound was observed. Content-free and process-only: it names a
+/// scanner branch, never a path, and is never traversal authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Site {
+    /// A queued directory vanished before it was read.
+    WalkDirectory,
+    /// A directory entry vanished between `readdir` and its `lstat`.
+    WalkEntry,
+    /// A queued census member (walk, hint or replay) vanished before its stat.
+    CandidateWalk,
+    /// A forced Claude family member enumerated from the index vanished.
+    CandidateForcedIndex,
+    /// A selected file vanished before its no-follow open.
+    Open,
+}
+const SITES: usize = 5;
+/// Per site: a NotFound that stayed operational loss, then one settled as removal.
+const OUTCOMES: usize = 2;
+impl Site {
+    fn index(self) -> usize {
+        match self {
+            Self::WalkDirectory => 0,
+            Self::WalkEntry => 1,
+            Self::CandidateWalk => 2,
+            Self::CandidateForcedIndex => 3,
+            Self::Open => 4,
+        }
+    }
+}
+
 fn source_index(source: SnapshotSource) -> usize {
     match source {
         SnapshotSource::Codex => 0,
@@ -34,25 +64,38 @@ fn source_index(source: SnapshotSource) -> usize {
 
 struct Counters {
     counts: [AtomicU64; 4],
+    not_found_sites: [AtomicU64; SITES * OUTCOMES],
     overflowed: AtomicBool,
 }
 impl Counters {
     const fn new() -> Self {
         Self {
             counts: [const { AtomicU64::new(0) }; 4],
+            not_found_sites: [const { AtomicU64::new(0) }; SITES * OUTCOMES],
             overflowed: AtomicBool::new(false),
         }
     }
-    fn record(&self, cause: Cause) {
-        if self.counts[cause.index()].fetch_add(1, Ordering::Relaxed) == u64::MAX {
+    fn bump(&self, counter: &AtomicU64) {
+        if counter.fetch_add(1, Ordering::Relaxed) == u64::MAX {
             self.overflowed.store(true, Ordering::Relaxed);
         }
+    }
+    fn record(&self, cause: Cause) {
+        self.bump(&self.counts[cause.index()]);
+    }
+    fn record_not_found_site(&self, site: Site, removal: bool) {
+        self.bump(&self.not_found_sites[site.index() * OUTCOMES + usize::from(removal)]);
     }
     fn snapshot(&self) -> Totals {
         Totals {
             version: 1,
             scope: "process_lifetime_not_window",
             counts: std::array::from_fn(|i| self.counts[i].load(Ordering::Relaxed)),
+            not_found_sites: std::array::from_fn(|site| {
+                std::array::from_fn(|outcome| {
+                    self.not_found_sites[site * OUTCOMES + outcome].load(Ordering::Relaxed)
+                })
+            }),
             overflowed: self.overflowed.load(Ordering::Relaxed),
         }
     }
@@ -61,18 +104,26 @@ impl Counters {
 static TOTALS: [Counters; 3] = [const { Counters::new() }; 3];
 
 /// Fixed order: NotFound, unresolved root, changed preflight, changed target.
+/// `not_found_sites` splits the walk, candidate and open NotFounds by site in
+/// `Site` order, each `[loss, removal]`; NotFound in `counts` includes both,
+/// and root NotFounds have no site.
 /// The sticky flag invalidates exact intervals; false is not a coherence proof.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Totals {
     version: u8,
     scope: &'static str,
     counts: [u64; 4],
+    not_found_sites: [[u64; OUTCOMES]; SITES],
     overflowed: bool,
 }
 
 pub(super) fn increment(count: &mut usize, source: SnapshotSource, cause: Cause) {
     // Preserve the original arithmetic (including overflow behavior) and order.
     *count += 1;
+    record(source, cause);
+}
+
+fn record(source: SnapshotSource, cause: Cause) {
     TOTALS[source_index(source)].record(cause);
     #[cfg(test)]
     TEST_EVENTS.with(|events| {
@@ -83,13 +134,41 @@ pub(super) fn increment(count: &mut usize, source: SnapshotSource, cause: Cause)
     });
 }
 
+fn record_not_found_site(source: SnapshotSource, site: Site, removal: bool) {
+    TOTALS[source_index(source)].record_not_found_site(site, removal);
+    #[cfg(test)]
+    TEST_SITE_EVENTS.with(|events| {
+        if let Some(mut counts) = events.get() {
+            counts[source_index(source)][site.index()][usize::from(removal)] += 1;
+            events.set(Some(counts));
+        }
+    });
+}
+
+/// A NotFound at `site` that stays operational loss and turns the traversal red.
+pub(super) fn not_found(count: &mut usize, source: SnapshotSource, site: Site) {
+    increment(count, source, Cause::NotFound);
+    record_not_found_site(source, site, false);
+}
+
+/// A NotFound at `site` the scanner settles as a removal. It is recorded in the
+/// process totals only and never increments an operational count.
+pub(super) fn not_found_removal(source: SnapshotSource, site: Site) {
+    record(source, Cause::NotFound);
+    record_not_found_site(source, site, true);
+}
+
 pub(super) fn snapshot(source: SnapshotSource) -> Totals {
     TOTALS[source_index(source)].snapshot()
 }
 
 #[cfg(test)]
+type SiteEvents = [[[u64; OUTCOMES]; SITES]; 3];
+
+#[cfg(test)]
 thread_local! {
     static TEST_EVENTS: std::cell::Cell<Option<[[u64; 4]; 3]>> = const { std::cell::Cell::new(None) };
+    static TEST_SITE_EVENTS: std::cell::Cell<Option<SiteEvents>> = const { std::cell::Cell::new(None) };
 }
 
 /// Observe actual caller-thread producers without global resets or decision hooks.
@@ -108,6 +187,23 @@ pub(super) fn observe<T>(f: impl FnOnce() -> T) -> (T, [[u64; 4]; 3]) {
     (result, counts)
 }
 
+/// The caller-thread NotFound site split, per source, `Site` order, `[loss, removal]`.
+#[cfg(test)]
+pub(super) fn observe_sites<T>(f: impl FnOnce() -> T) -> (T, SiteEvents) {
+    struct Reset(Option<SiteEvents>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SITE_EVENTS.with(|events| events.set(self.0));
+        }
+    }
+    let reset =
+        Reset(TEST_SITE_EVENTS.with(|events| events.replace(Some([[[0; OUTCOMES]; SITES]; 3]))));
+    let result = f();
+    let counts = TEST_SITE_EVENTS.with(|events| events.get().unwrap());
+    drop(reset);
+    (result, counts)
+}
+
 #[cfg(test)]
 impl Totals {
     pub(super) fn maximum() -> Self {
@@ -115,6 +211,7 @@ impl Totals {
             version: 1,
             scope: "process_lifetime_not_window",
             counts: [u64::MAX; 4],
+            not_found_sites: [[u64::MAX; OUTCOMES]; SITES],
             overflowed: true,
         }
     }
@@ -512,15 +609,20 @@ mod tests {
             .iter()
             .any(|pending| pending.path == second_path && pending.census_member));
         fs::remove_file(&second_path).unwrap();
-        let (pages, events) = observe(|| {
-            claude_generation(
-                &mut index,
-                &dir,
-                LATER,
-                1,
-                std::slice::from_ref(&second_path),
-            )
+        let ((pages, events), sites) = observe_sites(|| {
+            observe(|| {
+                claude_generation(
+                    &mut index,
+                    &dir,
+                    LATER,
+                    1,
+                    std::slice::from_ref(&second_path),
+                )
+            })
         });
+        let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
+        expected_sites[1][Site::CandidateWalk.index()] = [0, 1];
+        assert_eq!(sites, expected_sites);
         assert!(
             pages.iter().all(|page| page.disappeared_file_count == 0),
             "a vanished member under its present parent is not loss"
@@ -591,8 +693,12 @@ mod tests {
         let member_key = local_index_key(&fixture.member_path);
         let mut index = fixture.index();
         for at in [NOW, RETRY] {
-            let (pages, events) =
-                observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]));
+            let ((pages, events), sites) = observe_sites(|| {
+                observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]))
+            });
+            let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
+            expected_sites[1][Site::CandidateForcedIndex.index()] = [0, events[1][0]];
+            assert_eq!(sites, expected_sites, "{at}");
             assert!(
                 pages.iter().all(|page| page.disappeared_file_count == 0),
                 "{at}: the forced member's absence beneath its present parent is not loss"
@@ -801,6 +907,82 @@ mod tests {
     }
 
     #[test]
+    fn real_not_found_sites_split_loss_and_removal() {
+        let dir = crate::test_scratch::ScratchDir::new("disappearance-sites");
+        let path = dir.join("session.jsonl");
+        let pending = || ScanTraversalPath {
+            scan_root: dir.to_path_buf(),
+            path: path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        };
+        let mut census = ScanCensus::default();
+        let (_, sites) = observe_sites(|| {
+            for source in [SnapshotSource::Pi, SnapshotSource::ClaudeCode] {
+                assert!(candidate_from_traversal_path(
+                    source,
+                    pending(),
+                    &mut census,
+                    None,
+                    BACKFILL_WINDOW_DAYS,
+                    &BTreeMap::new(),
+                )
+                .is_none());
+                fs::write(&path, b"{}\n").unwrap();
+                let candidate = candidate_from_traversal_path(
+                    source,
+                    pending(),
+                    &mut census,
+                    None,
+                    BACKFILL_WINDOW_DAYS,
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+                fs::remove_file(&path).unwrap();
+                assert!(open_and_identify_scan_candidate(
+                    source,
+                    candidate,
+                    &mut census,
+                    None,
+                    BACKFILL_WINDOW_DAYS,
+                    &BTreeMap::new(),
+                )
+                .is_none());
+            }
+        });
+        let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+        expected[2][Site::CandidateWalk.index()] = [1, 0];
+        expected[2][Site::Open.index()] = [1, 0];
+        expected[1][Site::CandidateWalk.index()] = [0, 1];
+        expected[1][Site::Open.index()] = [0, 1];
+        assert_eq!(sites, expected);
+        assert_eq!(census.disappeared_file_count, 2, "Pi only");
+
+        let root = dir.join("root");
+        fs::create_dir(&root).unwrap();
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        fs::remove_dir(&root).unwrap();
+        let (_, sites) = observe_sites(|| {
+            advance_bounded_directory_traversal(
+                SnapshotSource::ClaudeCode,
+                index.traversal.as_mut().unwrap(),
+                BACKFILL_WINDOW_DAYS,
+                &index.files,
+            )
+        });
+        let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+        expected[1][Site::WalkDirectory.index()] = [1, 0];
+        assert_eq!(sites, expected, "a vanished queued directory stays loss");
+    }
+
+    #[test]
     fn isolated_sources_classes_order_and_sticky_wrap() {
         let totals = [const { Counters::new() }; 3];
         let causes = [
@@ -831,6 +1013,7 @@ mod tests {
                 serde_json::json!({"version":1,
                 "scope":"process_lifetime_not_window",
                 "counts":expected_counts,
+                "not_found_sites":([[0, 0]; SITES]),
                 "overflowed":false})
             );
         }
@@ -841,6 +1024,29 @@ mod tests {
         assert!(counters.snapshot().overflowed);
         counters.record(Cause::ComparisonTargetRevisionChanged);
         assert!(counters.snapshot().overflowed);
+
+        // Site slots are [loss, removal] in Site order and share the sticky flag.
+        let sites = Counters::new();
+        for (site, removal) in [
+            (Site::WalkDirectory, false),
+            (Site::WalkEntry, false),
+            (Site::CandidateWalk, true),
+            (Site::CandidateForcedIndex, true),
+            (Site::Open, false),
+            (Site::Open, true),
+        ] {
+            sites.record_not_found_site(site, removal);
+        }
+        assert_eq!(
+            sites.snapshot().not_found_sites,
+            [[1, 0], [1, 0], [0, 1], [0, 1], [1, 1]]
+        );
+        assert_eq!(sites.snapshot().counts, [0; 4]);
+        assert!(!sites.snapshot().overflowed);
+        sites.not_found_sites[0].store(u64::MAX, Ordering::Relaxed);
+        sites.record_not_found_site(Site::WalkDirectory, false);
+        assert_eq!(sites.snapshot().not_found_sites[0], [0, 0]);
+        assert!(sites.snapshot().overflowed);
 
         // Model the observable between-instructions state of a wrapping writer.
         // Isolated primitive test only: this is NOT a scanner producer fixture.
@@ -858,18 +1064,23 @@ mod tests {
 
     #[test]
     fn fixed_storage_bounds_are_target_layout_checks_not_rss_or_capacity_claims() {
-        assert!(std::mem::size_of_val(&TOTALS) <= 120);
-        assert!(std::mem::size_of::<Totals>() <= 64);
+        assert!(std::mem::size_of_val(&TOTALS) <= 360);
+        assert!(std::mem::size_of::<Totals>() <= 136);
     }
 
     #[test]
     fn all_eleven_producers_and_only_original_operational_increments() {
         let source = include_str!("../snapshots.rs");
-        let pieces: Vec<_> = source
-            .split("disappearance_diagnostics::increment(")
-            .skip(1)
-            .collect();
-        assert_eq!(pieces.len(), 11);
+        let calls = |name: &str| -> Vec<&str> {
+            source
+                .split(&format!("disappearance_diagnostics::{name}("))
+                .skip(1)
+                .map(|piece| piece.split(");").next().unwrap())
+                .collect()
+        };
+        // Eleven operational producers: seven cause increments, then four
+        // NotFound sites that stay loss unless excused.
+        let increments = calls("increment");
         let expected = [
             (
                 "census.disappeared_file_count",
@@ -881,19 +1092,44 @@ mod tests {
             ),
             ("census.disappeared_file_count", "RootResolutionUnresolved"),
             ("census.disappeared_file_count", "RootResolutionUnresolved"),
-            ("traversal.counts.disappeared_file_count", "NotFound"),
-            ("traversal.counts.disappeared_file_count", "NotFound"),
-            ("census.disappeared_file_count", "NotFound"),
-            ("census.disappeared_file_count", "NotFound"),
             ("census.disappeared_file_count", "NotFound"),
             ("census.disappeared_file_count", "NotFound"),
             ("census.disappeared_file_count", "NotFound"),
         ];
-        for (piece, (counter, cause)) in pieces.into_iter().zip(expected) {
-            let call = piece.split(");").next().unwrap();
+        assert_eq!(increments.len(), expected.len());
+        for (call, (counter, cause)) in increments.into_iter().zip(expected) {
             assert!(call.contains(counter));
             assert!(call.contains(&format!("Cause::{cause}")));
         }
+        let not_found = calls("not_found");
+        let expected = [
+            (
+                "traversal.counts.disappeared_file_count",
+                "Site::WalkDirectory",
+            ),
+            ("traversal.counts.disappeared_file_count", "Site::WalkEntry"),
+            ("census.disappeared_file_count", "site"),
+            ("census.disappeared_file_count", "Site::Open"),
+        ];
+        assert_eq!(not_found.len(), expected.len());
+        for (call, (counter, site)) in not_found.into_iter().zip(expected) {
+            assert!(call.contains(counter));
+            assert!(call.contains(site));
+        }
+        // Process-only removals: Claude candidate and open sites, each in the
+        // parent-present branch, never an operational count.
+        let removals = calls("not_found_removal");
+        assert_eq!(removals.len(), 2);
+        for (call, site) in removals.into_iter().zip(["site", "Site::Open"]) {
+            assert!(call.contains(site));
+            assert!(!call.contains("disappeared_file_count"));
+        }
+        assert_eq!(
+            source.matches("claude_absence_is_removal(source, ").count(),
+            2
+        );
+        assert_eq!(source.matches("Site::CandidateWalk,").count(), 1);
+        assert_eq!(source.matches("Site::CandidateForcedIndex,").count(), 1);
         assert!(!source.contains("disappeared_file_count += 1;"));
         assert!(source
             .contains("traversal.counts.disappeared_file_count += census.disappeared_file_count;"));
