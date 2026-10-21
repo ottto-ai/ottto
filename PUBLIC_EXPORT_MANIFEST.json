@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 730,
-  "content_sha256": "8c9dabcaaa9825290c1fc324a6355f387f7cafab80df71fe6082528a86677903",
+  "candidate_file_count": 732,
+  "content_sha256": "e20ef4ebc4c64900e4b7a28297c49db353e4fefb7fec437c8bd5de9a975b37c5",
   "files": [
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "eecf0735bc06d5437ee04476850a12fb4754ca613ca0a823f1f6b36d2f8ea214",
-      "size_bytes": 2933570
+      "sha256": "4a292eafd02496bc0e91a17212f76a229f194a509475d12548f6abf65be0c805",
+      "size_bytes": 2933607
     },
     {
       "executable": false,
@@ -1345,6 +1345,13 @@
       "path": "crates/ottto-service/src/snapshots/cache_observations/tests.rs",
       "sha256": "620d46db86d32b35f3023fcaf950b79e3f9bf41d686b30cd8ecc3cf3d86b819e",
       "size_bytes": 6035
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/cache_policy_tests.rs",
+      "sha256": "52eb1cdf0270e9981e77352456cd9121dcc426416d88192a24e592f78581cfd6",
+      "size_bytes": 36193
     },
     {
       "executable": false,
@@ -3330,6 +3337,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-21-cache-policy-harness.md",
+      "sha256": "2d411def179210c59b3957fbcce33ccdc45c90f1f1325a68d2f087440eb4d99b",
+      "size_bytes": 3719
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-21-codex-in-file-fork-tail-retention.md",
       "sha256": "72083eb0b755be5df1af28c30a4823f8f8f44a56e7a41b70b7becbdfec8a7a99",
       "size_bytes": 3560
@@ -5115,7 +5129,7 @@
   ],
   "generated_at": "2026-10-21T07:18:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 731,
+  "output_file_count": 733,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
