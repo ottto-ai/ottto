@@ -825,7 +825,9 @@ fn daemon_is_release_signed() -> bool {
 /// every Codex home, at most once per
 /// [`LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS`] per home. Claude is left out:
 /// its Refresh never forced a provider read, and its accounts are served the
-/// stored reading the daemon's schedule keeps current.
+/// stored reading the daemon's schedule keeps current. Such a request cannot
+/// be told from the app's timer, so it reads nothing while Codex background
+/// limit refresh is off.
 const LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION: u16 = 15;
 const LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS: u64 = 5 * 60;
 
@@ -852,7 +854,9 @@ fn handle_command(
             refresh_agent_status,
         } => {
             if refresh_agent_status {
-                if let Some(source) = status_refresh_quota_source.as_ref() {
+                if let Some(source) = status_refresh_quota_source.as_ref().filter(|_| {
+                    FileCodexAccountSlotSettingsStore::default().background_quota_refresh_allowed()
+                }) {
                     require_authorized_local_client(daemon, &authorization)?;
                     crate::provider_calls::with_trigger(
                         crate::provider_calls::Trigger::OlderAppCompat,
@@ -1243,6 +1247,15 @@ fn handle_command(
                 schema_version,
                 &slot_id,
             )?))
+        }
+        LocalControlCommand::CodexAccountSetQuotaRefreshConsent {
+            schema_version,
+            consent,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(crate::codex_sign_in::present(
+                set_codex_quota_refresh_consent(schema_version, consent)?,
+            ))
         }
         LocalControlCommand::Detect { source } => {
             require_authorized_local_client(daemon, &authorization)?;
@@ -3039,6 +3052,16 @@ fn stop_waiting_for_codex_account(
     }
     FileCodexAccountSlotSettingsStore::default()
         .stop_waiting(schema_version, operation_id)
+        .map_err(codex_account_slot_settings_error)
+        .map(crate::agent_status::annotate_codex_accounts_status)
+}
+
+fn set_codex_quota_refresh_consent(
+    schema_version: u16,
+    consent: bool,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    FileCodexAccountSlotSettingsStore::default()
+        .set_quota_refresh_consent(schema_version, consent)
         .map_err(codex_account_slot_settings_error)
         .map(crate::agent_status::annotate_codex_accounts_status)
 }
@@ -16294,6 +16317,7 @@ mod tests {
                 remaining_slots: 9,
             },
             daemon_sign_in_supported: None,
+            background_quota_refresh: None,
         };
 
         assert_eq!(
