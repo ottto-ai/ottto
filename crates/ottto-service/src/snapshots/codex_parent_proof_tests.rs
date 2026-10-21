@@ -235,3 +235,248 @@ fn proof_state_serde_is_tagged_and_round_trips_every_wake() {
         CodexParentProofState::Owed(owed)
     );
 }
+
+fn owed(parent: &str, cause: u8, origin: OwedOrigin) -> CodexParentProofState {
+    CodexParentProofState::Owed(CodexParentProofOwed::new(parent.into(), 4, cause, origin))
+}
+
+fn held_side_record(cause: u8) -> serde_json::Value {
+    serde_json::json!({
+        "verdict": { "kind": "held", "lineage": true, "cause": cause },
+        "seal": serde_json::to_value(seal(&"f".repeat(64))).unwrap(),
+        "parsed": serde_json::to_value(stamp(7, 4096)).unwrap(),
+        "generation": 1,
+        "referenced_epoch": 0,
+    })
+}
+
+fn temp_index_path(name: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "ottto-u1a2a-{name}-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir.join("index.json")
+}
+
+/// Row 34 (rev 2 R1-M5, rev 3 §1.7, rev 4, rev 10 §2.3, rev 11/12): the
+/// proof map, both cursors, `seq` and the incarnation persist; the map
+/// decodes per entry and then semantically (digest; cause ordinal, or
+/// `CAUSE_NO_EVIDENCE` only for lineage; side `Held` causes); the RAM
+/// parent fold is rebuilt at load and in the subset; the subset takes the
+/// larger `seq`; replay clears the map, cursors and fold but never `seq` or
+/// the incarnation. A pre-2a file has none of the keys.
+#[test]
+fn proof_map_cursors_and_seq_follow_the_index_lifecycle() {
+    const P1: &str = "019a0000-0000-7000-8000-000000000001";
+    const P2: &str = "019a0000-0000-7000-8000-000000000002";
+    let empty = serde_json::to_value(ScanIndex::default()).unwrap();
+    for key in [
+        "codex_parent_prefix_proofs",
+        "codex_parent_proof_cursor",
+        "codex_parent_side_cursor",
+        "codex_parent_proof_seq",
+        "codex_proof_index_incarnation",
+        "codex_parent_proof_parents_live",
+    ] {
+        assert!(empty.get(key).is_none(), "{key}");
+    }
+
+    let cause = CodexParentUnresolvable::LedgerCapped.index() as u8;
+    let mut index = ScanIndex::default();
+    let proofs = [
+        (
+            "/c/proven.jsonl",
+            CodexParentProofState::Proven(proof(&"f".repeat(64), 2, true)),
+        ),
+        ("/c/owed.jsonl", owed(P1, cause, OwedOrigin::Child)),
+        ("/c/owed-2.jsonl", owed(P1, cause, OwedOrigin::Child)),
+        (
+            "/c/lineage.jsonl",
+            owed(P2, CAUSE_NO_EVIDENCE, OwedOrigin::Lineage),
+        ),
+    ];
+    for (key, state) in &proofs {
+        index
+            .codex_parent_prefix_proofs
+            .insert((*key).into(), state.clone());
+    }
+    index.codex_parent_proof_cursor = Some("/c/owed.jsonl".into());
+    index.codex_parent_side_cursor = Some("/p.jsonl".into());
+    index.codex_parent_proof_seq = 7;
+    index.codex_proof_index_incarnation = "0123456789abcdef0123456789abcdef".into();
+    let path = temp_index_path("proof-map");
+    index.save(&path).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        loaded.codex_parent_prefix_proofs,
+        index.codex_parent_prefix_proofs
+    );
+    assert_eq!(
+        loaded.codex_parent_proof_cursor,
+        index.codex_parent_proof_cursor
+    );
+    assert_eq!(
+        loaded.codex_parent_side_cursor,
+        index.codex_parent_side_cursor
+    );
+    assert_eq!(loaded.codex_parent_proof_seq, 7);
+    assert_eq!(
+        loaded.codex_proof_index_incarnation,
+        index.codex_proof_index_incarnation
+    );
+    let live = BTreeMap::from([(P1.to_owned(), 2), (P2.to_owned(), 1)]);
+    assert_eq!(loaded.codex_parent_proof_parents_live, live);
+    assert!(serde_json::to_value(&loaded)
+        .unwrap()
+        .get("codex_parent_proof_parents_live")
+        .is_none());
+
+    // Per entry, then semantically: each bad entry alone is dropped; the
+    // rest of the map, the side records and the index load.
+    let mut value = serde_json::to_value(&loaded).unwrap();
+    let proofs_value = &mut value["codex_parent_prefix_proofs"];
+    proofs_value["/c/bad-digest.jsonl"] = proofs_value["/c/proven.jsonl"].clone();
+    proofs_value["/c/bad-digest.jsonl"]["child_digest"] = serde_json::json!("not-hex");
+    proofs_value["/c/bad-cause.jsonl"] = proofs_value["/c/owed.jsonl"].clone();
+    proofs_value["/c/bad-cause.jsonl"]["cause"] = serde_json::json!(200);
+    proofs_value["/c/child-no-evidence.jsonl"] = proofs_value["/c/owed.jsonl"].clone();
+    proofs_value["/c/child-no-evidence.jsonl"]["cause"] = serde_json::json!(CAUSE_NO_EVIDENCE);
+    proofs_value["/c/malformed.jsonl"] = serde_json::json!({ "state": "owed" });
+    value["codex_parent_side"] = serde_json::json!({
+        "/p/held-valid.jsonl": held_side_record(cause),
+        "/p/held-no-evidence.jsonl": held_side_record(CAUSE_NO_EVIDENCE),
+        "/p/held-bad.jsonl": held_side_record(200),
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let lenient = ScanIndex::load(&path).unwrap();
+    assert!(path.exists(), "never quarantined");
+    assert_eq!(
+        lenient.codex_parent_prefix_proofs,
+        index.codex_parent_prefix_proofs
+    );
+    assert_eq!(
+        lenient.codex_parent_side.keys().collect::<Vec<_>>(),
+        ["/p/held-no-evidence.jsonl", "/p/held-valid.jsonl"]
+    );
+    assert_eq!(lenient.codex_parent_proof_parents_live, live);
+    assert_eq!(lenient.codex_parent_proof_seq, 7);
+
+    // A partial checkpoint carries the map, cursors and incarnation, takes
+    // the larger `seq`, and folds the parents again.
+    let previous = ScanIndex {
+        codex_parent_proof_seq: 9,
+        ..ScanIndex::default()
+    };
+    let subset = loaded.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(
+        subset.codex_parent_prefix_proofs,
+        loaded.codex_parent_prefix_proofs
+    );
+    assert_eq!(
+        subset.codex_parent_proof_cursor,
+        loaded.codex_parent_proof_cursor
+    );
+    assert_eq!(
+        subset.codex_parent_side_cursor,
+        loaded.codex_parent_side_cursor
+    );
+    assert_eq!(
+        subset.codex_proof_index_incarnation,
+        loaded.codex_proof_index_incarnation
+    );
+    assert_eq!(subset.codex_parent_proof_seq, 9);
+    assert_eq!(subset.codex_parent_proof_parents_live, live);
+    let subset =
+        loaded.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(subset.codex_parent_proof_seq, 7);
+    if crate::heap_layout_bound::layout_supported() {
+        assert!(
+            crate::heap_layout_bound::bound(&loaded, usize::MAX).unwrap()
+                > crate::heap_layout_bound::bound(&ScanIndex::default(), usize::MAX).unwrap()
+        );
+    }
+
+    // Replay clears the map, the cursors and the fold, never `seq` or the
+    // incarnation.
+    let mut replayed = loaded.clone();
+    replayed.prepare_historical_replay("replay-1".into());
+    assert!(replayed.codex_parent_prefix_proofs.is_empty());
+    assert_eq!(replayed.codex_parent_proof_cursor, None);
+    assert_eq!(replayed.codex_parent_side_cursor, None);
+    assert!(replayed.codex_parent_proof_parents_live.is_empty());
+    assert_eq!(replayed.codex_parent_proof_seq, 7);
+    assert_eq!(
+        replayed.codex_proof_index_incarnation,
+        loaded.codex_proof_index_incarnation
+    );
+}
+
+/// Row 4 (U-T54(e) unit): liveness by any of P's ids in the ownership refs
+/// or the owed-parent fold, or by P's key in the side requests; the fold
+/// comes back after save, load and the subset, and goes with replay.
+#[test]
+fn side_liveness_reads_refs_and_the_owed_fold_by_id_and_requests_by_key() {
+    const P: &str = "019a0000-0000-7000-8000-00000000000a";
+    const PATH_ID: &str = "019a0000-0000-7000-8000-00000000000b";
+    let p_key = "/s/rollout-p.jsonl";
+    let ids = [P.to_owned(), PATH_ID.to_owned()];
+    let mut index = ScanIndex::default();
+    assert!(!codex_parent_side_live(&index, p_key, &ids));
+    // A path-only id in the refs (an N1 parent with no header).
+    index.codex_parent_ownership_refs.insert(PATH_ID.into());
+    assert!(codex_parent_side_live(&index, p_key, &ids));
+    assert!(!codex_parent_side_live(&index, p_key, &ids[..1]));
+    index.codex_parent_ownership_refs.clear();
+    // A side request, by P's key only.
+    let request: SideRequest = serde_json::from_value(serde_json::json!({
+        "dev_ino": [1, 7],
+        "needed_extent": 4096,
+        "state": { "kind": "live" },
+        "state_extent": 4096,
+        "state_ctime": [1_792_540_800, 0],
+        "attempt_extent": 4096,
+        "attempt_ctime": [1_792_540_800, 0],
+        "attempts": 0,
+        "not_before_unix_seconds": 0,
+    }))
+    .unwrap();
+    index
+        .codex_parent_side_requests
+        .insert(p_key.into(), request);
+    assert!(codex_parent_side_live(&index, p_key, &[]));
+    assert!(!codex_parent_side_live(&index, "/s/other.jsonl", &ids));
+    index.codex_parent_side_requests.clear();
+    // An owed entry naming P, through the fold rebuilt at load and in the
+    // subset; a proven entry alone is not liveness.
+    let cause = CodexParentUnresolvable::DeferredRef.index() as u8;
+    index
+        .codex_parent_prefix_proofs
+        .insert("/s/child.jsonl".into(), owed(P, cause, OwedOrigin::Child));
+    index.codex_parent_prefix_proofs.insert(
+        "/s/proven.jsonl".into(),
+        CodexParentProofState::Proven(CodexParentPrefixProof {
+            parent: PATH_ID.into(),
+            ..proof(&"f".repeat(64), 1, true)
+        }),
+    );
+    assert!(
+        !codex_parent_side_live(&index, p_key, &ids),
+        "not folded yet"
+    );
+    let path = temp_index_path("side-live");
+    index.save(&path).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert!(codex_parent_side_live(&loaded, p_key, &ids));
+    assert!(!codex_parent_side_live(&loaded, p_key, &ids[1..]));
+    let subset =
+        index.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
+    assert!(codex_parent_side_live(&subset, p_key, &ids));
+    let mut replayed = loaded;
+    replayed.prepare_historical_replay("replay-1".into());
+    assert!(!codex_parent_side_live(&replayed, p_key, &ids));
+}
