@@ -8055,14 +8055,82 @@ fn serialized_json_digest<T: Serialize + ?Sized>(value: &T, domain: &[u8]) -> Op
     Some(writer.0)
 }
 
+// Counts rejected interpretations, not unique requests: the same row can be
+// checked during proof, account coverage and rebuild. No content or identity is
+// retained, and this diagnostic never participates in an authority decision.
+#[cfg(not(test))]
+static CLAUDE_API_CACHE_CREATION_REJECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_API_CACHE_CREATION_REJECTIONS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+
+fn with_claude_api_cache_creation_rejections<T>(
+    operation: impl FnOnce(&std::sync::atomic::AtomicU64) -> T,
+) -> T {
+    #[cfg(test)]
+    {
+        CLAUDE_API_CACHE_CREATION_REJECTIONS.with(operation)
+    }
+    #[cfg(not(test))]
+    {
+        operation(&CLAUDE_API_CACHE_CREATION_REJECTIONS)
+    }
+}
+
+pub(crate) fn claude_api_cache_creation_rejection_count() -> u64 {
+    with_claude_api_cache_creation_rejections(|counter| {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// New writers repeat the aggregate as a TTL split. Older writers expose only
+/// the aggregate; preserve it without inventing a TTL. Contradictions and
+/// overflow cannot authorize usage, even if their additive value would match.
+fn claude_api_cache_creation(
+    row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
+) -> Option<(u64, u64, u64)> {
+    let interpreted = row
+        .cache_creation_5m_tokens
+        .checked_add(row.cache_creation_1h_tokens)
+        .and_then(|split| {
+            if split == 0 {
+                Some((0, 0, row.cache_creation_tokens))
+            } else if row.cache_creation_tokens == 0 || row.cache_creation_tokens == split {
+                Some((
+                    row.cache_creation_5m_tokens,
+                    row.cache_creation_1h_tokens,
+                    0,
+                ))
+            } else {
+                None
+            }
+        });
+    if interpreted.is_none() {
+        with_claude_api_cache_creation_rejections(|counter| {
+            let _ = counter.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| count.checked_add(1),
+            );
+        });
+    }
+    interpreted
+}
+
 fn claude_api_matches_transcript_occurrence(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
     occurrence: &ClaudeTranscriptUsageOccurrenceWitness,
 ) -> bool {
-    let api_cache_creation = row
-        .cache_creation_tokens
-        .checked_add(row.cache_creation_5m_tokens)
-        .and_then(|value| value.checked_add(row.cache_creation_1h_tokens));
+    let Some(api_cache_creation) =
+        claude_api_cache_creation(row).and_then(|(five_m, one_h, unattributed)| {
+            five_m.checked_add(one_h)?.checked_add(unattributed)
+        })
+    else {
+        return false;
+    };
     let transcript_cache_creation = occurrence
         .cache_creation_5m_tokens
         .checked_add(occurrence.cache_creation_1h_tokens);
@@ -8089,7 +8157,7 @@ fn claude_api_matches_transcript_occurrence(
             row.reasoning_output_tokens,
             occurrence.reasoning_output_tokens,
         )
-        && api_cache_creation == transcript_cache_creation
+        && Some(api_cache_creation) == transcript_cache_creation
         && occurrence
             .model
             .as_deref()
@@ -8595,14 +8663,15 @@ fn claude_account_evidence_covers_snapshot(
             .map(|row| u128::from(value(row)))
             .sum::<u128>()
     };
-    let cache_creation = evidence
-        .iter()
-        .map(|row| {
-            u128::from(row.cache_creation_tokens)
-                + u128::from(row.cache_creation_5m_tokens)
-                + u128::from(row.cache_creation_1h_tokens)
-        })
-        .sum::<u128>();
+    let Some(cache_creation) = evidence.iter().try_fold(0_u128, |total, row| {
+        let (five_m, one_h, unattributed) = claude_api_cache_creation(row)?;
+        total
+            .checked_add(u128::from(five_m))?
+            .checked_add(u128::from(one_h))?
+            .checked_add(u128::from(unattributed))
+    }) else {
+        return false;
+    };
     item.unattributed_total_tokens == 0
         && sum(|row| row.input_tokens) == u128::from(item.input_tokens)
         && sum(|row| row.output_tokens) == u128::from(item.output_tokens)
@@ -9033,6 +9102,10 @@ fn prepare_claude_reported_usage_with_credit<
     let mut cost_complete = true;
 
     for row in row_refs() {
+        let (cache_5m, cache_1h, cache_unattributed) = claude_api_cache_creation(row)?;
+        let api_cache_creation = cache_5m
+            .checked_add(cache_1h)?
+            .checked_add(cache_unattributed)?;
         let cost_picos = row
             .cost_usd_micros
             .map(u128::from)
@@ -9078,10 +9151,6 @@ fn prepare_claude_reported_usage_with_credit<
             .and_then(|occurrence| occurrence.reasoning_effort.clone())
             .or(reported_effort);
         let (mut usage, model, timestamp) = if let Some(occurrence) = occurrence {
-            let api_cache_creation = row
-                .cache_creation_tokens
-                .checked_add(row.cache_creation_5m_tokens)
-                .and_then(|value| value.checked_add(row.cache_creation_1h_tokens));
             let transcript_cache_creation = occurrence
                 .usage
                 .cache_creation_5m_tokens
@@ -9093,7 +9162,7 @@ fn prepare_claude_reported_usage_with_credit<
                     row.reasoning_output_tokens,
                     occurrence.usage.reasoning_output_tokens,
                 )
-                || api_cache_creation != transcript_cache_creation
+                || Some(api_cache_creation) != transcript_cache_creation
                 || occurrence
                     .model
                     .as_deref()
@@ -9118,12 +9187,11 @@ fn prepare_claude_reported_usage_with_credit<
                     input_tokens: row.input_tokens,
                     output_tokens: row.output_tokens,
                     cache_read_tokens: row.cache_read_tokens,
-                    cache_creation_5m_tokens: row.cache_creation_5m_tokens,
-                    cache_creation_1h_tokens: row.cache_creation_1h_tokens,
+                    cache_creation_5m_tokens: cache_5m,
+                    cache_creation_1h_tokens: cache_1h,
                     reasoning_output_tokens: row.reasoning_output_tokens,
-                    // api_request exposes aggregate cache creation only. It is
-                    // exact usage, but not an honest TTL split.
-                    unattributed_total_tokens: row.cache_creation_tokens,
+                    // Aggregate-only writers cannot supply an honest TTL split.
+                    unattributed_total_tokens: cache_unattributed,
                     request_count: 1,
                     costs: UsageCosts::default(),
                 },
@@ -45815,6 +45883,251 @@ mod tests {
         let bytes = serde_json::to_vec(&row).expect("serialize trace evidence");
         row.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
         row
+    }
+
+    fn cache_split_fixture() -> (PathBuf, String, Vec<SnapshotItem>) {
+        let root = temp_dir("claude-cache-split");
+        let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5".to_string();
+        let path = root.join(format!("{parent}.jsonl"));
+        let record = json!({
+            "timestamp": "2026-08-02T07:00:01Z", "type": "assistant",
+            "sessionId": parent, "requestId": "req_cache_split",
+            "message": {"id": "msg_cache_split", "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 10,
+                    "cache_creation_input_tokens": 2014,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 2014,
+                        "ephemeral_1h_input_tokens": 0}}}
+        });
+        fs::write(&path, format!("{record}\n")).unwrap();
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-02T07:01:00Z",
+            "cache-split-fp".to_string(),
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        (root, parent, items)
+    }
+
+    fn cache_split_api_row(
+        parent: &str,
+        split: bool,
+    ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+        let mut row = complete_api_row(parent, "req_cache_split", 1, 10, 10, 2014);
+        if split {
+            row.cache_creation_5m_tokens = 2014;
+            row.app_version = "2.1.300".to_string();
+        }
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        row
+    }
+
+    #[test]
+    fn claude_cache_split_interpretation_checks_totals_and_counts_rejections() {
+        let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence::default();
+        for (total, five_m, one_h, expected) in [
+            (2014, 2014, 0, Some((2014, 0, 0))),
+            (2014, 0, 2014, Some((0, 2014, 0))),
+            (2014, 1000, 1014, Some((1000, 1014, 0))),
+            (0, 1000, 1014, Some((1000, 1014, 0))),
+            (2014, 0, 0, Some((0, 0, 2014))),
+            (0, 0, 0, Some((0, 0, 0))),
+            (u64::MAX, 0, 0, Some((0, 0, u64::MAX))),
+            (u64::MAX, u64::MAX, 0, Some((u64::MAX, 0, 0))),
+            (2013, 1000, 1014, None),
+            (2015, 1000, 1014, None),
+            (0, u64::MAX, 1, None),
+            (u64::MAX, u64::MAX, u64::MAX, None),
+        ] {
+            row.cache_creation_tokens = total;
+            row.cache_creation_5m_tokens = five_m;
+            row.cache_creation_1h_tokens = one_h;
+            let before = claude_api_cache_creation_rejection_count();
+            assert_eq!(claude_api_cache_creation(&row), expected);
+            assert_eq!(
+                claude_api_cache_creation_rejection_count(),
+                before + u64::from(expected.is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn claude_cache_split_matcher_accepts_aggregate_and_split() {
+        let (root, parent, items) = cache_split_fixture();
+        let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
+            items[0]
+                .claude_usage_occurrences
+                .get("req_cache_split")
+                .unwrap(),
+        );
+        assert!(claude_api_matches_transcript_occurrence(
+            &cache_split_api_row(&parent, true),
+            &occurrence
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_matcher_preserves_old_aggregate_only() {
+        let (root, parent, items) = cache_split_fixture();
+        let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
+            items[0]
+                .claude_usage_occurrences
+                .get("req_cache_split")
+                .unwrap(),
+        );
+        assert!(claude_api_matches_transcript_occurrence(
+            &cache_split_api_row(&parent, false),
+            &occurrence
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_account_accepts_both_shapes() {
+        let (root, parent, items) = cache_split_fixture();
+        for split in [false, true] {
+            let row = cache_split_api_row(&parent, split);
+            assert!(
+                claude_account_evidence_covers_snapshot(&items[0], &[&row]),
+                "split={split}"
+            );
+            let mut item = items[0].clone();
+            assert!(apply_claude_account_evidence(&mut item, &[row]));
+            assert_eq!(exact_session_account_hash(&item), Some("a".repeat(64)));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_rebuild_telemetry_only_does_not_double_count() {
+        let (root, parent, items) = cache_split_fixture();
+        for split in [false, true] {
+            let mut item = items[0].clone();
+            let owned = cache_split_api_row(&parent, false);
+            let mut auxiliary = cache_split_api_row(&parent, split);
+            auxiliary.request_id = "req_auxiliary".to_string();
+            assert!(rebuild_claude_reported_usage(
+                &mut item,
+                &[owned, auxiliary],
+                &BTreeSet::new(),
+                None
+            ));
+            assert_eq!(
+                item.cache_creation_5m_tokens,
+                if split { 4028 } else { 2014 }
+            );
+            assert_eq!(item.cache_creation_1h_tokens, 0);
+            assert_eq!(item.unattributed_total_tokens, if split { 0 } else { 2014 });
+            assert_eq!(item.request_count, 2);
+            validate_snapshot_item(0, &item).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_rebuild_owned_accepts_both_shapes() {
+        let (root, parent, items) = cache_split_fixture();
+        for split in [false, true] {
+            let mut item = items[0].clone();
+            assert!(rebuild_claude_reported_usage(
+                &mut item,
+                &[cache_split_api_row(&parent, split)],
+                &BTreeSet::new(),
+                None
+            ));
+            assert_eq!(item.cache_creation_5m_tokens, 2014);
+            assert_eq!(item.unattributed_total_tokens, 0);
+            validate_snapshot_item(0, &item).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_inconsistent_row_fails_closed() {
+        let (root, parent, items) = cache_split_fixture();
+        let mut row = cache_split_api_row(&parent, true);
+        row.cache_creation_tokens = 1000;
+        // Make the old additive result equal the transcript to catch silent
+        // acceptance of inconsistent telemetry at every decision boundary.
+        row.cache_creation_5m_tokens = 1014;
+        let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
+            items[0]
+                .claude_usage_occurrences
+                .get("req_cache_split")
+                .unwrap(),
+        );
+        let rejections_before = claude_api_cache_creation_rejection_count();
+        assert!(!claude_api_matches_transcript_occurrence(&row, &occurrence));
+        assert_eq!(
+            claude_api_cache_creation_rejection_count(),
+            rejections_before + 1
+        );
+        assert!(!claude_account_evidence_covers_snapshot(&items[0], &[&row]));
+        let mut item = items[0].clone();
+        let before = serde_json::to_vec(&item).unwrap();
+        assert!(!rebuild_claude_reported_usage(
+            &mut item,
+            &[row.clone()],
+            &BTreeSet::new(),
+            None
+        ));
+        assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+        row.request_id = "req_auxiliary".to_string();
+        assert!(!rebuild_claude_reported_usage(
+            &mut item,
+            &[cache_split_api_row(&parent, false), row],
+            &BTreeSet::new(),
+            None
+        ));
+        assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cache_split_new_family_proves_at_healthy_terminal() {
+        let (root, parent, mut items) = cache_split_fixture();
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), vec![cache_split_api_row(&parent, true)])]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                parent.clone(),
+                vec![complete_trace_row(&parent, "req_cache_split", "")],
+            )]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert_eq!(
+            items[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert!(index.claude_usage_family_witnesses.contains_key(&parent));
+        assert_eq!(items[0].cache_creation_5m_tokens, 2014);
+        assert_eq!(items[0].unattributed_total_tokens, 0);
+        assert_eq!(
+            items[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        validate_snapshot_item(0, &items[0]).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
