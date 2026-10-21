@@ -274,7 +274,7 @@ fn claude_realistic_record_charge_covers_requested_allocations() {
 }
 
 #[test]
-fn claude_tool_heavy_long_session_walk_stays_under_the_visit_limit() {
+fn claude_tool_heavy_seen_tool_use_walk_stays_under_the_visit_limit() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -282,12 +282,23 @@ fn claude_tool_heavy_long_session_walk_stays_under_the_visit_limit() {
     for responses in [500, 2000] {
         let parser = parser_for(&realistic_rows(0..responses, &CHROME));
         let mut counter = Counter::new(usize::MAX);
-        let walked = parser.heap_bound(&mut counter).is_some();
+        // Only the Claude-owned seen-tool-use conversion is in this slice.
+        // The shared capability buckets remain a BTreeMap pending clearance.
+        let walked = parser
+            .seen_claude_capability_tool_uses
+            .heap_bound(&mut counter)
+            .is_some();
+        let mut whole = Counter::new(usize::MAX);
+        let whole_walked = parser.heap_bound(&mut whole).is_some();
         eprintln!(
             "R1A_VISITS responses={responses} chrome_tool_uses={} walked={walked} visits={} bytes={}",
             responses * CHROME.len(),
             counter.visits_for_test(),
             counter.bytes
+        );
+        eprintln!(
+            "R1A_SHARED_VISIT_RESIDUAL responses={responses} walked={whole_walked} visits={}",
+            whole.visits_for_test()
         );
         assert!(
             walked,
@@ -796,4 +807,303 @@ fn claude_compact_records_decode_exactly() {
         assert_eq!(decoded, Some(expected), "response {response}");
     }
     assert!(inline > 0, "no selector overflowed the interned table");
+}
+
+/// Review R1a-F1: identical accepted progressive observations amplify their
+/// three selectors on decode even though resolve collapses to one occurrence.
+fn progressive_rows(count: usize) -> Vec<Value> {
+    let mut row = realistic_turn(0, &[])[2].clone();
+    row["requestId"] = json!("req_1");
+    row["message"]["id"] = json!("msg_1");
+    row["message"]["usage"]["inference_geo"] = json!("us");
+    vec![row; count]
+}
+
+fn decoded_baseline_charge(book: ClaudeResponseBook) -> usize {
+    let (responses, selectors) = book.into_parts();
+    // BASE kept all records decoded for the whole read, not just one response.
+    let decoded: Vec<_> = responses
+        .into_iter()
+        .map(|response| {
+            claude_response_records::decode_records(response.records.into_vec(), &selectors)
+                .unwrap()
+        })
+        .collect();
+    crate::heap_layout_bound::completed_bound(&decoded, usize::MAX).unwrap()
+}
+
+#[test]
+fn claude_near_cap_decode_is_reserved_before_retention_without_changing_output() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const STATE: usize = 32_505_856;
+    let rows = progressive_rows(MAX_CLAUDE_RECORDS_PER_RESPONSE);
+    let parser = parser_for(&rows);
+    assert_eq!(
+        parser.claude_response_record_count,
+        MAX_CLAUDE_RECORDS_PER_RESPONSE
+    );
+    assert_eq!(parser.dropped_usage_record_count, 0);
+    let compact = charge(&parser).unwrap();
+    let extra = parser
+        .claude_responses
+        .decode_peak_bound(usize::MAX)
+        .unwrap();
+    let baseline = decoded_baseline_charge(parser.claude_responses.clone());
+    assert!(
+        extra > STATE,
+        "must exercise the review's over-budget decode"
+    );
+    assert!(
+        extra >= baseline,
+        "real decoded record layout must be covered"
+    );
+    assert!(parser.claude_responses.finish_copy_budget(STATE).is_none());
+    assert!(parser
+        .claude_responses
+        .finish_copy_budget(extra - 1)
+        .is_none());
+    assert_eq!(parser.claude_responses.finish_copy_budget(extra), Some(0));
+    // The layout preflight itself must never allocate a decoded record.
+    let (preflight, allocation) = crate::retry_allocation_probe::measure(|| {
+        parser.claude_responses.decode_peak_bound(usize::MAX)
+    });
+    assert_eq!(preflight, Some(extra));
+    assert_eq!(allocation.allocations, 0);
+    drop(parser);
+
+    let fixture = TempJsonl::new("near-cap-finish");
+    fixture.append(&rows);
+    // Entire parser/finish lifetime is born inside this probe, so dropping the
+    // compact input cannot offset an unobserved pre-existing allocation.
+    let ((parsed, before_finish), actual) = crate::retry_allocation_probe::measure(|| {
+        let (mut native, expected) = native_parser(&fixture.path);
+        while !native.step().unwrap() {}
+        let before = crate::retry_allocation_probe::stats().requested_peak_with_overlap;
+        let scope = Scope("r1a-near-cap".into());
+        // A zero preflight budget declines reuse, never native usage/output.
+        assert!(native.retain_reduction(&scope, 1, 0).unwrap().is_none());
+        let parsed = native
+            .finish(
+                &expected,
+                &fixture.path,
+                NOW,
+                "near-cap".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        (parsed, before)
+    });
+    assert_eq!(parsed.dropped_usage_record_count, 0);
+    assert_eq!(parsed.recognized_usage_drop_count, 0);
+    assert_eq!(parsed.snapshots.len(), 1);
+    assert!(
+        actual.requested_peak_with_overlap > before_finish,
+        "probe must observe decoding/finish, not just parser construction"
+    );
+    let output = crate::heap_layout_bound::completed_bound(&parsed, usize::MAX).unwrap();
+    assert!(compact + extra + output >= actual.requested_peak_with_overlap);
+    eprintln!("R1A_NEAR_CAP records={} compact={compact} decoded_baseline={baseline} decode_extra={extra} pre_finish_peak={before_finish} finish_peak={} output={output} retention=false",
+        rows.len(), actual.requested_peak_with_overlap);
+    // Exercise the production budget hook, not just the arithmetic helper.
+    // The tiny resolved output must not admit a copy whose decode peak failed.
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (index, _, _) = production_scan(&fixture, ScanIndex::default(), Some(cache.clone()));
+    fixture.append(&[
+        json!({"type": "summary", "sessionId": SESSION, "summary": "Near-cap response"}),
+    ]);
+    let (_, sampled, modes) = production_scan(&fixture, index, Some(cache));
+    let (_, full, _) = production_scan(&fixture, ScanIndex::default(), None);
+    assert_eq!(
+        modes,
+        (1, 0, 0),
+        "over-budget decode must decline retention before finish"
+    );
+    assert_eq!(production_body(sampled), production_body(full));
+}
+
+#[test]
+fn claude_decode_preflight_reserves_only_the_largest_response() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let rows = progressive_rows(128);
+    let mut parser = parser_for(&rows);
+    let first = parser
+        .claude_responses
+        .decode_peak_bound(usize::MAX)
+        .unwrap();
+    for mut row in rows {
+        row["requestId"] = json!("req_2");
+        row["message"]["id"] = json!("msg_2");
+        apply_claude_code_line(&row, &mut parser);
+    }
+    assert_eq!(parser.claude_responses.values().count(), 2);
+    assert_eq!(
+        parser.claude_responses.decode_peak_bound(usize::MAX),
+        Some(first)
+    );
+    let budget = 4 * first;
+    assert_eq!(
+        parser.claude_responses.finish_copy_budget(budget),
+        Some(3 * first)
+    );
+    // Residents+active were subtracted before this budget was split. The
+    // retained copy, already-finalized output and decode peak coexist here.
+    assert!(2 * (budget - first) + first <= 2 * budget);
+}
+
+#[test]
+fn claude_native_finish_peak_covers_decode_output_and_retained_copy() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = TempJsonl::new("finish-peak");
+    fixture.append(&realistic_rows(0..120, &[SHELL, CHROME[0]]));
+    let (mut parser, expected) = native_parser(&fixture.path);
+    let scope = Scope("r1a-finish-peak".into());
+    parser.prepare_acquisition(None, &scope, None, 1).unwrap();
+    while !parser.step().unwrap() {}
+    let active = charge(&parser.accumulator).unwrap();
+    let extra = parser
+        .accumulator
+        .claude_responses
+        .decode_peak_bound(usize::MAX)
+        .unwrap();
+    let baseline = decoded_baseline_charge(parser.accumulator.claude_responses.clone());
+    let budget = parser
+        .accumulator
+        .claude_responses
+        .finish_copy_budget(crate::transcript_cache::ENTRY_BYTES)
+        .unwrap();
+    let retained = parser.retain_reduction(&scope, 1, budget).unwrap().unwrap();
+    let retained_charge = charge(&retained).unwrap();
+    assert!(retained.reduction.is_some());
+    // Born-pointer audit: freeing the pre-existing compact parser cannot hide
+    // newly allocated decoded records, sorting scratch or output allocations.
+    let (parsed, actual) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        parser
+            .finish(
+                &expected,
+                &fixture.path,
+                NOW,
+                "finish-peak".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+    });
+    let output = crate::heap_layout_bound::completed_bound(&parsed, budget).unwrap();
+    assert!(
+        extra + output >= actual.requested_peak_with_overlap,
+        "decode_extra={extra} output={output} actual={actual:?}"
+    );
+    let charged_peak = active + retained_charge + extra + output;
+    let measured_peak_bound = active + retained_charge + actual.requested_peak_with_overlap;
+    assert!(charged_peak >= measured_peak_bound);
+    eprintln!("R1A_FINISH_PEAK responses=120 active={active} retained={retained_charge} decoded_baseline={baseline} decode_extra={extra} output={output} born_finish_peak={} charged_peak={charged_peak} measured_peak_bound={measured_peak_bound}", actual.requested_peak_with_overlap);
+    drop(retained);
+}
+
+#[test]
+fn claude_decode_bound_covers_inline_selectors_explicit_slots_and_tools() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut selectors = ClaudeSelectorTable::default();
+    let mut records = crate::owned_heap::OwnedVec::new();
+    let mut expected = Vec::new();
+    for index in 0..80u16 {
+        let model = Some(MODEL.to_string());
+        let effort = Some("high".to_string());
+        let request_id = Some("req_bound".to_string());
+        let timestamp = Some(at(1, u64::from(index)));
+        let slot = RequestSlot {
+            request_ref: if index % 2 == 0 {
+                "req_bound"
+            } else {
+                "explicit"
+            }
+            .into(),
+            occurred_at: timestamp.clone().unwrap(),
+            model: model.clone(),
+            effort: effort.clone(),
+            prompt_tokens: Some(4),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            uncached_tokens: None,
+            output_tokens: Some(6),
+        };
+        let selector = selector(&[("region_mode", &format!("region-{index}"), "region")]);
+        let tools = (0..index % 12)
+            .map(|tool| (format!("tool-{tool}"), "Bash".into()))
+            .collect::<BTreeMap<String, String>>();
+        let usage = UsageTotals::default();
+        expected.push(ClaudeResponseRecord {
+            cache_slot: slot.clone(),
+            physical_sequence: u64::from(index),
+            usage: usage.clone(),
+            model: model.clone(),
+            selector: selector.clone(),
+            reasoning_effort: effort.clone(),
+            request_id: request_id.clone(),
+            timestamp: timestamp.clone(),
+            computed_effective_input_context: None,
+            tool_uses: tools.clone(),
+        });
+        records.push(CompactClaudeResponseRecord::encode(
+            records.first(),
+            index,
+            usage,
+            model,
+            selectors.intern(selector),
+            effort,
+            request_id,
+            timestamp,
+            None,
+            tools,
+            slot,
+        ));
+    }
+    let bound =
+        claude_response_records::decoded_response_peak_bound(&records, &selectors, usize::MAX)
+            .unwrap();
+    let real_layout = crate::heap_layout_bound::completed_bound(&expected, usize::MAX).unwrap();
+    assert!(bound >= real_layout);
+    let (decoded, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        claude_response_records::decode_records(records.into_vec(), &selectors).unwrap()
+    });
+    assert_eq!(decoded, expected);
+    assert!(bound >= allocation.requested_peak_with_overlap);
+}
+
+#[test]
+fn claude_hourly_capability_buckets_remain_a_shared_visit_limit_residual() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    let start = OffsetDateTime::parse(NOW, &Rfc3339).unwrap();
+    for index in 0..2000 {
+        let timestamp = (start + time::Duration::hours(index as i64))
+            .format(&Rfc3339)
+            .unwrap();
+        for mut row in realistic_turn(index, &[CHROME[0]]) {
+            row["timestamp"] = json!(timestamp);
+            apply_claude_code_line(&row, &mut parser);
+        }
+    }
+    assert_eq!(parser.seen_claude_capability_tool_uses.len(), 2000);
+    assert_eq!(parser.activity_capability_buckets.len(), 2000);
+    assert!(charge(&parser.seen_claude_capability_tool_uses).is_some());
+    let mut whole = Counter::new(usize::MAX);
+    assert!(parser.heap_bound(&mut whole).is_none());
+    eprintln!(
+        "R1A_SHARED_VISIT_RESIDUAL hourly_tool_uses=2000 buckets=2000 walked=false visits={}",
+        whole.visits_for_test()
+    );
 }

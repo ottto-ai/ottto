@@ -10599,9 +10599,8 @@ struct SnapshotAccumulator {
     // The value records whether the completion event (and its capability) was
     // seen. Like `activity_call_tools`, entries end at `function_call_output`.
     activity_mcp_call_ids: BTreeMap<String, bool>,
-    // Owned summaries: a long tool-heavy session must not make every retained
-    // walk cost one visit per bucket or per tool use.
-    activity_capability_buckets: crate::owned_heap::OwnedMap<(String, String, String), u64>,
+    activity_capability_buckets: BTreeMap<(String, String, String), u64>,
+    // Claude-only summary: the seen-tool-use walk does not grow with history.
     seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
     activity_skills: BTreeSet<String>,
     // A SKILL.md reference whose skill could not be named (`cat SKILL.md`,
@@ -10784,7 +10783,7 @@ impl SnapshotAccumulator {
             activity_mcp_tool_counts: BTreeMap::new(),
             activity_mcp_tool_usage_counts: BTreeMap::new(),
             activity_mcp_call_ids: BTreeMap::new(),
-            activity_capability_buckets: crate::owned_heap::OwnedMap::new(),
+            activity_capability_buckets: BTreeMap::new(),
             seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap::new(),
             activity_skills: BTreeSet::new(),
             skill_detector_incomplete: false,
@@ -11675,19 +11674,14 @@ impl SnapshotAccumulator {
         let Some((bucket_start, _)) = timestamp.and_then(activity_bucket_from_timestamp) else {
             return;
         };
-        let key = (
-            bucket_start,
-            capability_id.to_string(),
-            raw_origin.to_string(),
-        );
-        let counted = self
+        *self
             .activity_capability_buckets
-            .get_mut(&key)
-            .map(|mut count| *count += 1)
-            .is_some();
-        if !counted {
-            self.activity_capability_buckets.insert(key, 1);
-        }
+            .entry((
+                bucket_start,
+                capability_id.to_string(),
+                raw_origin.to_string(),
+            ))
+            .or_default() += 1;
     }
 
     fn activity_summary(&self) -> Option<SnapshotActivitySummary> {
@@ -16751,6 +16745,17 @@ impl OwnedSourceScan {
                     );
                     pending!();
                 }
+                // The existing copy budget funds two simultaneous allocations:
+                // retained reduction and native finish/output. Reserve the extra
+                // decoded response peak BEFORE either clone or decode. Active
+                // compact records and their selector table were already charged
+                // by copy_budget_step. A refusal disables retention, preserving
+                // the ordinary native finish and its loss/output semantics.
+                let finish_copy_budget = parser
+                    .accumulator
+                    .claude_responses
+                    .finish_copy_budget(copy_budget);
+                let copy_budget = finish_copy_budget.unwrap_or(0);
                 let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
                     && aliases.is_empty()
                     && applied_receipts.values().all(Option::is_none);
@@ -16933,8 +16938,9 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
-                let finalization_charge =
-                    crate::heap_layout_bound::completed_bound(&parsed_file, copy_budget);
+                let finalization_charge = finish_copy_budget.and_then(|budget| {
+                    crate::heap_layout_bound::completed_bound(&parsed_file, budget)
+                });
                 if finalization_charge.is_none() {
                     if let Some(completed) = completed_acquisition.as_mut() {
                         if completed.reduction.is_some() {
@@ -66350,6 +66356,7 @@ crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id);
 crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
 crate::heap_layout_bound::fields!(ClaudeDuplicateRequestOwner; root_session_id_hash, source_session_id_hash);
 crate::heap_layout_bound::fields!(ClaudeOwnedStartCensusWitness; marker_source_file_fingerprint, verified_source_file_fingerprint, emitted_source_file_fingerprint);
+crate::heap_layout_bound::fields!(ClaudeResponseRecord; cache_slot, physical_sequence, usage, model, selector, reasoning_effort, request_id, timestamp, computed_effective_input_context, tool_uses);
 crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
