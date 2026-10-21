@@ -34,6 +34,27 @@ Authority-quarantined Claude families are unaffected: the quarantine gate runs
 before the adoption gate, so a held family keeps its own bounded retry and is
 neither adopted nor deferred while held. It adopts on its next retry.
 
+## Local re-emission exclusions
+
+Some sessions must not be re-sent by this re-read until their own recovery
+settles them. The Mac's runtime owner can list them in a local file the daemon
+only reads: `<support dir>/snapshots/claude_code-reemission-exclusions.txt`
+(mode 0600, never in the repo, config or logs). Each line is the lowercase
+64-hex SHA-256 of one exact, full Claude `source_session_id`; blank and `#`
+lines are ignored; at most 1,024 lines and 64 KiB.
+
+- Read once per Claude cycle, before the scan. Other sources never read it.
+- Missing file: empty list, so every other Mac is unaffected.
+- Unreadable, oversized or malformed: fail closed for the re-read only. Every
+  adoption-only file is deferred that cycle; changed and new files are not.
+- A listed file is one whose family root id or own member id digest is in the
+  list. When only the re-read selects it, it takes the ordinary Skip: no read,
+  no upload, old stamp kept, no budget used. Removing its line later lets it
+  adopt with no new revision.
+- The parse-reason log line adds `body_witness_adoption_excluded=<n>` and
+  `body_witness_adoption_exclusions_invalid=<0|1>`. No id, digest or path is
+  logged.
+
 ## Release rule
 
 Ship in the same release as the Claude context parser change it serves, and
@@ -77,3 +98,6 @@ the server are unchanged.
 - `claude_context_backfill_leaves_codex_and_pi_unselected`
 - `claude_context_backfill_spreads_adoption_only_files_over_pages`
 - `claude_context_backfill_quarantined_family_keeps_its_own_retry_gate`
+- `claude_context_backfill_skips_sessions_on_the_local_reemission_list`
+- `snapshots::claude_reemission_exclusions::tests` (missing, listed root or
+  member, malformed and oversized lists)

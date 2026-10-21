@@ -4813,6 +4813,9 @@ fn prepare_sync_source(
     index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
         source,
     ));
+    if source == SnapshotSource::ClaudeCode {
+        index.load_claude_reemission_exclusions(support_dir);
+    }
     let committed_index = index.clone();
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);

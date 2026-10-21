@@ -33,6 +33,7 @@ mod claude_context_file_birth;
 pub(crate) use claude_context_file_birth::ClaudeFileBirthVerdict;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{ClaudeFileBirth, ClaudeVetoApiRows};
+mod claude_reemission_exclusions;
 pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
@@ -73,6 +74,7 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+use claude_reemission_exclusions::ReemissionExclusions;
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use claude_response_records::{
     ClaudeResponseBook, ClaudeSelectorTable, CompactClaudeResponseRecord, CompactClaudeSelector,
@@ -2430,6 +2432,10 @@ pub struct ScanIndex {
     /// Local held/mixed groups must not adopt a projection they did not upload.
     #[serde(skip)]
     effective_upload_body_witness_revision_excluded_source_files: BTreeSet<String>,
+    /// Runtime-only Claude sessions the adoption re-read must not re-emit,
+    /// read from the local list each cycle. Empty for other sources.
+    #[serde(skip)]
+    claude_reemission_exclusions: ReemissionExclusions,
 }
 
 impl Default for ScanIndex {
@@ -2497,6 +2503,7 @@ impl Default for ScanIndex {
             active_upload_context_fingerprint: None,
             active_effective_upload_body_witness_revision: 0,
             effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
+            claude_reemission_exclusions: ReemissionExclusions::default(),
         }
     }
 }
@@ -16140,6 +16147,7 @@ pub(crate) struct OwnedSourceScan {
     /// and the ones deferred past `body_witness_adoption_page_budget`.
     body_witness_adoption_only_parses: usize,
     body_witness_adoption_deferred: usize,
+    body_witness_adoption_excluded: usize,
     codex_state_only_blocked_session_ids: BTreeSet<String>,
     codex_parent_resolution_retry_required: bool,
     residue_index_keys: BTreeSet<String>,
@@ -17029,6 +17037,7 @@ impl OwnedSourceScan {
             semantic_noop_count,
             body_witness_adoption_only_parses: 0,
             body_witness_adoption_deferred: 0,
+            body_witness_adoption_excluded: 0,
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -17166,6 +17175,7 @@ impl OwnedSourceScan {
             mut semantic_noop_count,
             mut body_witness_adoption_only_parses,
             mut body_witness_adoption_deferred,
+            mut body_witness_adoption_excluded,
             mut codex_state_only_blocked_session_ids,
             mut codex_parent_resolution_retry_required,
             mut residue_index_keys,
@@ -19534,12 +19544,14 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::ClaudeCode
                     && (census.claude_parse_reasons.iter().any(|count| *count > 0)
                         || census.claude_compaction_unlinked_parent_count > 0
-                        || body_witness_adoption_deferred > 0)
+                        || body_witness_adoption_deferred > 0
+                        || body_witness_adoption_excluded > 0
+                        || index.claude_reemission_exclusions.is_invalid())
                 {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_exclusions_invalid={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         CANDIDATE_PARSE_REASON_NAMES
                             .iter()
@@ -19548,7 +19560,9 @@ impl OwnedSourceScan {
                             .collect::<Vec<_>>()
                             .join(" "),
                         census.claude_compaction_unlinked_parent_count,
-                        body_witness_adoption_deferred
+                        body_witness_adoption_deferred,
+                        body_witness_adoption_excluded,
+                        u8::from(index.claude_reemission_exclusions.is_invalid())
                     );
                 }
                 // A remove/rename hint can arrive after bounded reconciliation has already
@@ -20133,13 +20147,20 @@ impl OwnedSourceScan {
             }
             // One-time adoption pacing: past this page's budget, a file that
             // only a new body-witness revision selects is skipped unchanged.
-            // Its stamp stays old, so a later page adopts it.
+            // Its stamp stays old, so a later page adopts it. A file the local
+            // re-emission list names is skipped the same way without using the
+            // budget; an unreadable list defers every such file.
             if decision == CandidateDecision::Parse
                 && !comparison_target
                 && parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
                 && index.candidate_requires_only_body_witness_adoption(&candidate)
             {
-                if body_witness_adoption_only_parses < body_witness_adoption_page_budget() {
+                if index.claude_reemission_excluded(&candidate) {
+                    body_witness_adoption_excluded += 1;
+                    decision = CandidateDecision::Skip;
+                } else if !index.claude_reemission_exclusions.is_invalid()
+                    && body_witness_adoption_only_parses < body_witness_adoption_page_budget()
+                {
                     body_witness_adoption_only_parses += 1;
                 } else {
                     body_witness_adoption_deferred += 1;
@@ -20925,6 +20946,7 @@ impl OwnedSourceScan {
             semantic_noop_count,
             body_witness_adoption_only_parses,
             body_witness_adoption_deferred,
+            body_witness_adoption_excluded,
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -30018,6 +30040,12 @@ impl ScanIndex {
             .extend(source_files.iter().cloned());
     }
 
+    /// Claude only, before scanning: read the local list of sessions the
+    /// adoption re-read must not re-emit. A missing file is an empty list.
+    pub fn load_claude_reemission_exclusions(&mut self, support_dir: &Path) {
+        self.claude_reemission_exclusions = ReemissionExclusions::load(support_dir);
+    }
+
     pub fn mark_bounded_sweep_unsettled(&mut self) {
         self.bounded_sweep_had_unsettled_upload = true;
     }
@@ -31929,6 +31957,7 @@ impl ScanIndex {
             effective_upload_body_witness_revision_excluded_source_files: self
                 .effective_upload_body_witness_revision_excluded_source_files
                 .clone(),
+            claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
         };
         for key in &safe_keys {
             match self.terminal_jsonl_dispositions.get(key) {
@@ -32239,6 +32268,17 @@ impl ScanIndex {
         now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         self.candidate_decision_with_reason_gated(candidate, now, true)
+    }
+
+    /// True when the local list names this Claude file's family root or the
+    /// member itself.
+    fn claude_reemission_excluded(&self, candidate: &CandidateFile) -> bool {
+        !self.claude_reemission_exclusions.is_empty()
+            && claude_index_path_member_ref(&candidate.path).is_some_and(|member| {
+                let (root_session_id, member_session_id) = member.into_owned();
+                self.claude_reemission_exclusions
+                    .excludes(&root_session_id, &member_session_id)
+            })
     }
 
     /// True when only the body-witness revision selects this candidate: the
@@ -55858,6 +55898,130 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
+    #[test]
+    fn claude_context_backfill_skips_sessions_on_the_local_reemission_list() {
+        let (home, root, mut index) =
+            claude_context_backfill_fixture("claude-context-backfill-exclusions", 3);
+        let support = crate::test_scratch::ScratchDir::new("claude-reemission-exclusions");
+        let list = ReemissionExclusions::path(&support);
+        fs::create_dir_all(list.parent().unwrap()).unwrap();
+        let session = |slot: usize| format!("aaaaaaaa-bbbb-4ccc-8ddd-{slot:012x}");
+        let digest = |id: &str| format!("{:x}", Sha256::digest(id.as_bytes()));
+        // Slot 0 by its family root (root and subagent), slot 1 by its
+        // subagent member only. Slot 2 and slot 1's root are not listed.
+        let listed_member = index
+            .files
+            .keys()
+            .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+            .find(|(family_root, member)| *family_root == session(1) && *member != session(1))
+            .map(|(_, member)| member)
+            .unwrap();
+        fs::write(
+            &list,
+            format!(
+                "# local only\n{}\n\n{}\n",
+                digest(&session(0)),
+                digest(&listed_member)
+            ),
+        )
+        .unwrap();
+        let excluded = |key: &str| {
+            claude_index_path_family_member(Path::new(key)).is_some_and(|(family_root, member)| {
+                family_root == session(0) || member == listed_member
+            })
+        };
+        let revisions = |index: &ScanIndex| {
+            index
+                .files
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        excluded(key.as_str()),
+                        entry.effective_upload_body_witness_revision,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A malformed list defers every adoption-only file; a changed file
+        // is still read.
+        fs::write(&list, "not-a-digest\n").unwrap();
+        let mut refused = index.clone();
+        refused.load_claude_reemission_exclusions(&support);
+        let deferred =
+            claude_context_backfill_scan(&root, &mut refused, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(
+            deferred.scanned_file_count, 0,
+            "an unreadable list adopts nothing"
+        );
+        assert!(deferred.census_complete);
+        let changed = index
+            .files
+            .keys()
+            .find(|key| !excluded(key.as_str()))
+            .unwrap()
+            .clone();
+        let mut appended = refused.clone();
+        appended.files.get_mut(&changed).unwrap().size_bytes += 1;
+        let changed_scan =
+            claude_context_backfill_scan(&root, &mut appended, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert!(
+            changed_scan.scanned_file_count >= 1,
+            "the list only gates adoption, never a changed file"
+        );
+
+        fs::write(
+            &list,
+            format!(
+                "# local only\n{}\n\n{}\n",
+                digest(&session(0)),
+                digest(&listed_member)
+            ),
+        )
+        .unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        let previous = index.clone();
+        // Listed files never use the budget: three unlisted files fit in it.
+        let mut scan = with_body_witness_adoption_page_budget(3, || {
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(scan.scanned_file_count, 3, "only the unlisted files adopt");
+        assert!(scan.census_complete);
+        let mut index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+        let mut settled = revisions(&index);
+        settled.sort();
+        assert_eq!(
+            settled,
+            vec![
+                (false, 2),
+                (false, 2),
+                (false, 2),
+                (true, 1),
+                (true, 1),
+                (true, 1)
+            ],
+            "listed files keep the old stamp"
+        );
+        index.load_claude_reemission_exclusions(&support);
+        let held = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(held.scanned_file_count, 0, "listed files stay unread");
+
+        // Once their recovery settles the list is removed, and the old
+        // stamp lets them adopt with no new revision.
+        fs::remove_file(&list).unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        let previous = index.clone();
+        let mut released =
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(released.scanned_file_count, 3);
+        let index = claude_context_backfill_settle(&home, &previous, &mut released, &mut index);
+        assert!(index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 2));
+        let _ = fs::remove_dir_all(home);
+    }
+
     fn body_witness_finalizer_scan(
         root: &Path,
         index: &mut ScanIndex,
@@ -69666,12 +69830,12 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_deferred, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_deferred, body_witness_adoption_excluded, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
