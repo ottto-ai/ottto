@@ -561,14 +561,38 @@ mod lite_contract_tests {
         } else {
             "lite-partial-save"
         });
+        // The watcher-requeued root adds a sixth read to the ordinary five
+        // files, putting a child on the terminal two-file page. A later
+        // unrelated file makes a seventh read and an unrelated-only last page.
+        // Keep this layout change local to the two persistence probes.
+        let tail = "d4444444-4444-4444-8444-444444444444";
+        std::fs::write(
+            fixture
+                .root
+                .join("zz-terminal/nested")
+                .join(format!("{tail}.jsonl")),
+            rearm_transcript_line(tail, None, "req_lite_persistence_tail", 0),
+        )
+        .unwrap();
         let pages = growth_start(&fixture, true);
         let terminal = pages.last().unwrap();
         let before = ScanIndex::load(&fixture.index_path).unwrap();
         let keys = RearmFixture::family_keys(&before);
+        assert_eq!(terminal.parsed, BTreeSet::from([tail.to_string()]));
         assert!(
             terminal.parsed.is_disjoint(&rearm_family_sessions()),
             "family keys are off the terminal upload page"
         );
+        assert!(!terminal.scan.snapshots.is_empty());
+        assert!(terminal
+            .scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id == tail));
+        assert_eq!(keys.len(), rearm_family_sessions().len());
+        assert!(keys
+            .values()
+            .all(|key| !before.files[key].source_file_fingerprint.is_empty()));
         let old = serde_json::to_value(&before).unwrap();
         let mut working = before.clone();
         // CONTROLLED INPUT: stand in for the proposed terminal-only clear.
@@ -613,6 +637,9 @@ mod lite_contract_tests {
             .values()
             .all(|key| selected.files[key].source_file_fingerprint.is_empty()));
         let reloaded = ScanIndex::load(&fixture.index_path).unwrap();
+        assert!(keys
+            .values()
+            .all(|key| reloaded.files[key].source_file_fingerprint.is_empty()));
         let now = serde_json::to_value(&reloaded).unwrap();
         for field in [
             "file_snapshot_fingerprints",
@@ -648,6 +675,11 @@ mod lite_contract_tests {
         assert!(
             witness,
             "controlled persisted clear selects fresh BASE proof after restart"
+        );
+        eprintln!(
+            "lite_persistence: held_save={held_save} off_page_keys={} selected_clear=true reloaded_clear=true accepted_evidence_preserved=true restart_members={} restart_witness={witness}",
+            keys.len(),
+            observed.len()
         );
     }
 

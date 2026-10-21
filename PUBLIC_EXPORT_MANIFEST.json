@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 737,
-  "content_sha256": "ebdae663a96b1ce33d82af0ddafb09eac9e23f5dc3699aa24073180dae3b26e0",
+  "content_sha256": "fcc26be0171149ab31c379f9dbea0be03408f4bc18c4b91bb56302fa96121815",
   "files": [
     {
       "executable": false,
@@ -1245,8 +1245,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/first_proof_retry_lite_tests.rs",
-      "sha256": "853a20d9877dbecd54cc0943b8d3ea2f186ee8581c21970be29750f2c00b9a5e",
-      "size_bytes": 41293
+      "sha256": "c3e4ac2cf5c83467bf78cbbf6ed05ba4e3a72a5948d5b970f0fc05d9cf68b3ae",
+      "size_bytes": 42771
     },
     {
       "executable": false,
@@ -3380,8 +3380,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-first-proof-retry-red-baselines.md",
-      "sha256": "a8a71c5fec0e36df4b9fe46d6d2fa4151b40a7cf5411a6e5361d97783767b6a6",
-      "size_bytes": 5778
+      "sha256": "71eaa2670eb97c61a2419602ccf111c327a11cce105dde9dfae3cd70c2313156",
+      "size_bytes": 6229
     },
     {
       "executable": false,
@@ -5162,7 +5162,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T15:06:54+00:00",
+  "generated_at": "2026-10-21T15:48:57+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 738,
   "public_roots": [
@@ -5201,5 +5201,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "aa0f60c4e75fcaf53fc50e276d68abd36c5dc87d"
+  "source_commit": "18e9fa00b4a2b249b8d0054a93f2d5b187a31bca"
 }

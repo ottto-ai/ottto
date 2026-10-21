@@ -96,3 +96,10 @@ certify an exclusive transient failure from a first-cause enum after evidence
 loss, or enforce a cross-window N guard. Those resource and policy gaps remain
 explicit. The future optional path must remain fail-closed until the exact
 reason provenance, current hold/exclusion gates and owner funding are approved.
+
+The persistence fixture correction adds one synthetic unrelated transcript
+locally to those two probes. It offsets the extra watcher read so their real
+terminal page contains only the unrelated tail. The probes retain the off-page
+guard, require nonempty selected bodies, verify all family clears after reload,
+and exercise ordinary BASE reread/proof after restart. The eight intended red
+baselines and the shared pipeline fixtures remain unchanged.
