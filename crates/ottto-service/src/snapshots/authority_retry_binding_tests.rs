@@ -310,20 +310,34 @@ fn authority_retry_binding_unsettled_p1_preserves_per_member_own_c5_serialized_r
             !item.request_evidence.is_empty(),
             "own native requests emitted C5 evidence"
         );
-        // Contract-5 identity parts live on bucket wire rows; the top-level
-        // model_usage is a summary, not the per-request identity carrier.
-        let wire_rows = item
-            .usage_buckets
-            .iter()
-            .flat_map(|bucket| bucket.model_usage.iter())
-            .collect::<Vec<_>>();
-        assert!(!wire_rows.is_empty());
-        assert!(wire_rows.iter().all(|row| row.identity_parts.is_some()));
         assert_eq!(
             serde_json::to_vec(&candidate_body).unwrap(),
             serde_json::to_vec(&control_body).unwrap(),
             "same own-request C5 rows, evidence, account fields, names and tags"
         );
+        // All fixture requests have the same exact telemetry login. Both
+        // top-level and bucket rows therefore use Single, not mixed Parts.
+        assert!(!item.model_usage.is_empty());
+        let bucket_rows = item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| bucket.model_usage.iter())
+            .collect::<Vec<_>>();
+        assert!(!bucket_rows.is_empty());
+        let expected_login = "a".repeat(64);
+        for row in item.model_usage.iter().chain(bucket_rows) {
+            assert!(row.identity_parts.is_none());
+            assert_eq!(row.account_identifier_hash.as_ref(), Some(&expected_login));
+            let evidence = item
+                .request_evidence
+                .get(usize::from(row.evidence_ref.expect("own Single evidence")))
+                .expect("evidence reference is in range");
+            assert_eq!(
+                evidence.identity_basis,
+                claude_request_identity::TELEMETRY_LOGIN
+            );
+            assert!(evidence.provider_workspace_hash.is_none());
+        }
         // The real public ACK validator consumes the exact serialized body
         // identities, as an in-process backend would; no ACK state is seeded.
         let response: crate::snapshot_client::SnapshotBatchResponse =
