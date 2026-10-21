@@ -3353,6 +3353,10 @@ pub struct ClaudeRequestCensusShadowCounts {
     pub family_unknown_roots: usize,
     pub records: usize,
     pub hashes: usize,
+    pub hash_budget_usage_percent: usize,
+    pub hash_budget_warning: bool,
+    pub transient_limited: bool,
+    pub transient_peak_bytes: usize,
     pub duplicate_hashes: usize,
     pub duplicate_owner_entries: usize,
     pub shared_keys: usize,
@@ -28829,7 +28833,7 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
-        match serde_json::from_reader::<_, Self>(BufReader::new(file)) {
+        match claude_request_census::decode_index(file) {
             Ok(mut index)
                 if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
                     && index
@@ -28909,13 +28913,13 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         if path.exists() {
             let current: Self = match read_limit {
-                Some(cap) => crate::snapshot_retry::decode_state(
+                Some(cap) => claude_request_census::decode_bounded_index(
                     &crate::snapshot_retry::read_state(path, cap)
                         .context("read bounded current local snapshot scan index")?,
                 ),
-                None => serde_json::from_reader(BufReader::new(
+                None => claude_request_census::decode_index(
                     File::open(path).context("open current local snapshot scan index")?,
-                ))
+                )
                 .map_err(anyhow::Error::from),
             }
             .context("parse current local snapshot scan index for compare-and-swap")?;
@@ -66836,4 +66840,4 @@ crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_memb
 
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
 crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);

@@ -1546,7 +1546,7 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
 #[test]
 fn census_shadow_counts_encoding_is_bounded() {
     let shadow = ClaudeRequestCensusShadowCounts {
-        would_open: true,
+        would_open: false,
         would_open_flips: u64::MAX,
         family_keys: usize::MAX,
         covered_by_fingerprint: usize::MAX,
@@ -1568,6 +1568,10 @@ fn census_shadow_counts_encoding_is_bounded() {
         family_unknown_roots: usize::MAX,
         records: usize::MAX,
         hashes: usize::MAX,
+        hash_budget_usage_percent: usize::MAX,
+        hash_budget_warning: false,
+        transient_limited: false,
+        transient_peak_bytes: usize::MAX,
         duplicate_hashes: usize::MAX,
         duplicate_owner_entries: usize::MAX,
         shared_keys: usize::MAX,
@@ -1580,6 +1584,11 @@ fn census_shadow_counts_encoding_is_bounded() {
         encoded.len() <= CENSUS_SHADOW_MAX_BYTES,
         "{} bytes",
         encoded.len()
+    );
+    assert_eq!(
+        encoded.len(),
+        CENSUS_SHADOW_MAX_BYTES,
+        "longest scalar spellings"
     );
     let without = ClaudeDuplicateCensusCounts::default();
     let with = ClaudeDuplicateCensusCounts {
@@ -1601,4 +1610,343 @@ fn census_shadow_counts_encoding_is_bounded() {
         .contains("request_census"));
 }
 
-const CENSUS_SHADOW_MAX_BYTES: usize = 1_090;
+const CENSUS_SHADOW_MAX_BYTES: usize = 1_238;
+
+/// Literal tokens matter: Value cannot represent the overflow that regressed
+/// load and the compare-and-swap reader. Compare every other persisted field.
+#[test]
+fn census_numeric_overflow_is_isolated_from_load_and_cas() {
+    let scratch = crate::test_scratch::ScratchDir::new("census-overflow");
+    let mut base = census_index_json(serde_json::json!({}));
+    base["generation"] = serde_json::json!(7);
+    let expected = base.clone();
+    for (name, field, raw) in [
+        ("field", "claude_request_census", "1e400".to_owned()),
+        (
+            "record",
+            "claude_request_census",
+            format!(
+                r#"{{"bad":{{"v":1,"fp":"{}","s":"empty","w":1e400}},"good":{}}}"#,
+                hex_fingerprint('a'),
+                census_record_json('a', "exact", &[1])
+            ),
+        ),
+        (
+            "shadow-field",
+            "claude_request_census_shadow",
+            "1e400".to_owned(),
+        ),
+        (
+            "shadow-record",
+            "claude_request_census_shadow",
+            r#"{"o":true,"f":1e400}"#.to_owned(),
+        ),
+    ] {
+        let marker = "overflow-token";
+        let mut value = base.clone();
+        value[field] = serde_json::json!(marker);
+        let json = serde_json::to_string(&value)
+            .unwrap()
+            .replace(&format!("\"{marker}\""), &raw);
+        let mut loaded = census_load(&scratch, name, &json);
+        let mut actual = serde_json::to_value(&loaded).unwrap();
+        let mut expected = expected.clone();
+        for key in ["claude_request_census", "claude_request_census_shadow"] {
+            actual.as_object_mut().unwrap().remove(key);
+            expected.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(actual, expected, "all other fields: {name}");
+        if name == "record" {
+            assert_eq!(
+                loaded.claude_request_census_for_test().keys_for_test(),
+                vec!["good"]
+            );
+        }
+        let bounded_path = scratch.join(format!("{name}-bounded.json"));
+        std::fs::write(&bounded_path, &json).unwrap();
+        loaded
+            .clone()
+            .save_with_read_limit(&bounded_path, 128 * 1024)
+            .expect("bounded CAS also isolates malformed evidence");
+        loaded
+            .save(&scratch.join(format!("{name}.json")))
+            .expect("CAS accepts the same malformed shadow");
+        assert_eq!(loaded.generation, 8);
+    }
+}
+
+#[test]
+fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
+    use std::io::Write;
+    let scratch = crate::test_scratch::ScratchDir::new("census-hostile");
+    let path = scratch.join("oversized.json");
+    let base = census_index_json(serde_json::json!({}));
+    let mut file = std::fs::File::create(&path).unwrap();
+    let json = serde_json::to_string(&base).unwrap();
+    // Write a hostile scalar without constructing it in the test process.
+    let marker = "\"claude_request_census\":{}";
+    let (before, after) = json.split_once(marker).expect("census field");
+    write!(file, "{before}\"claude_request_census\":\"").unwrap();
+    let block = [b'x'; 8192];
+    for _ in 0..4097 {
+        file.write_all(&block).unwrap();
+    }
+    write!(file, "\"{after}").unwrap();
+    drop(file);
+    let mut loaded = ScanIndex::load(&path).expect("oversized evidence is optional");
+    assert_eq!(loaded.files.len(), 1);
+    assert!(loaded.claude_request_census_for_test().is_empty());
+    loaded
+        .save(&path)
+        .expect("CAS also drains oversized evidence");
+}
+
+#[test]
+fn census_hash_budget_warning_starts_at_eighty_percent() {
+    for hashes in [838_860, 838_861] {
+        let mut index = ScanIndex::default();
+        index.claude_request_census_mut_for_test().insert_for_test(
+            "key",
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &hex_fingerprint('a'),
+                1,
+                ClaudeRequestCensusShape::Lossy,
+                (0..hashes).collect(),
+            ),
+        );
+        let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+            &mut index,
+            &BTreeSet::from(["key".to_owned()]),
+            &BTreeSet::new(),
+            FIRST_WINDOW,
+        );
+        assert_eq!(counts.hash_budget_warning, hashes == 838_861);
+        assert_eq!(
+            counts.hash_budget_usage_percent,
+            if hashes == 838_861 { 80 } else { 79 }
+        );
+    }
+}
+
+/// A pre-D1 shape has no census fields: IgnoredAny consumes their tokens,
+/// including non-finite numbers, without trying to interpret them.
+#[test]
+fn census_old_shape_decoder_ignores_new_evidence() {
+    #[derive(serde::Deserialize)]
+    struct OldIndex {
+        schema_version: u16,
+        generation: u64,
+        files: BTreeMap<String, ScanIndexEntry>,
+    }
+    let json = serde_json::to_string(&census_index_json(serde_json::json!({})))
+        .unwrap()
+        .replace(
+            "\"claude_request_census\":{}",
+            "\"claude_request_census\":1e400",
+        );
+    let old: OldIndex =
+        serde_json::from_str(&json).expect("old shape skips the entire unknown field");
+    assert_eq!(old.schema_version, SCAN_INDEX_SCHEMA_VERSION);
+    assert_eq!(old.generation, 0);
+    assert_eq!(old.files.len(), 1);
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum CensusAbandonedParse {
+    Read,
+    Attribution,
+    Scope,
+    Object,
+    Reopen,
+    Reduction,
+}
+
+/// Real owned-reader continuations, with synthetic filesystem/acquisition
+/// failures. Every case starts with an older valid record and changed bytes.
+#[cfg(unix)]
+fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedParse) {
+    use crate::transcript_acquisition::{ReadPlan, Scope};
+    let scratch = crate::test_scratch::ScratchDir::new("census-abandoned");
+    let root = scratch.join("projects");
+    let session = "b2222222-2222-4222-8222-222222222222";
+    let name = format!("{session}.jsonl");
+    census_write(
+        &root,
+        &name,
+        &[census_response(session, Some("old"), "old", 1, 10)],
+    );
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, FIRST_WINDOW);
+    let key = census_key(&index, &root, &name);
+    let old = index
+        .claude_request_census_for_test()
+        .get(&key)
+        .unwrap()
+        .clone();
+    census_write(
+        &root,
+        &name,
+        &[
+            census_response(session, Some("old"), "old", 1, 10),
+            census_response(session, Some("new"), "new", 2, 10),
+        ],
+    );
+    let mut state = OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        index,
+        SECOND_WINDOW,
+        365,
+        100,
+        true,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_sampled_acquisition(
+        std::sync::Arc::new(sampled_scan::SharedCache::default()),
+        Scope("census-test".to_owned()),
+    );
+    // Stop at the actual selection/read boundary, without test hooks.
+    for _ in 0..100 {
+        if state.active_file.is_some() {
+            break;
+        }
+        state = match state.step(None) {
+            OwnedSourceScanStep::Pending(next) => next,
+            OwnedSourceScanStep::Complete { .. } => panic!("parse must be selected"),
+        };
+    }
+    assert_eq!(
+        state.index.claude_request_census_for_test().get(&key),
+        Some(&old)
+    );
+    let active = state.active_file.as_mut().expect("selected parser");
+    assert!(active.sampling.is_some(), "exercise sampled revalidation");
+    let mut context = None;
+    match failure {
+        CensusAbandonedParse::Read => {
+            active.parser.reader.reader = OpenedInput::plain(File::open(&root).unwrap());
+        }
+        CensusAbandonedParse::Attribution => {
+            let home = scratch.join("home");
+            let events = home.join(".ottto/launch-events");
+            std::fs::create_dir_all(&events).unwrap();
+            // Listing this regular file as the pending directory fails.
+            std::fs::write(events.join("pending"), b"unavailable").unwrap();
+            context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+                SnapshotSource::ClaudeCode,
+                &home,
+                true,
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+            );
+            assert!(context.is_some());
+        }
+        CensusAbandonedParse::Scope => {
+            active.sampling.as_mut().unwrap().scope = Scope("changed-scope".to_owned());
+        }
+        CensusAbandonedParse::Object => {
+            let path = &active.candidate.path;
+            let bytes = std::fs::read(path).unwrap();
+            std::fs::rename(path, scratch.join("old-object")).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        CensusAbandonedParse::Reopen => {
+            std::fs::remove_file(&active.candidate.path).unwrap();
+        }
+        CensusAbandonedParse::Reduction => {
+            // The selected scope is still current, but the acquisition's
+            // certificate belongs to another interpretation. EOF commit fails.
+            active.parser.reader.acquisition = Some(
+                ReadPlan::prepare(
+                    active.parser.reader.reader.get_mut(),
+                    None,
+                    &Scope("wrong-certificate".to_owned()),
+                    None,
+                    1,
+                )
+                .unwrap(),
+            );
+        }
+    }
+    for _ in 0..100 {
+        state = match state.step(context.as_ref()) {
+            OwnedSourceScanStep::Pending(next) => next,
+            OwnedSourceScanStep::Complete { .. } => panic!("expected an abandoned parse"),
+        };
+        if state.census.unreadable_path_count != 0 {
+            assert!(state.active_file.is_none(), "failure abandons the parser");
+            assert!(
+                state
+                    .index
+                    .claude_request_census_for_test()
+                    .get(&key)
+                    .is_none(),
+                "an abandoned parse must invalidate its previous record"
+            );
+            return;
+        }
+        assert_eq!(
+            state.index.claude_request_census_for_test().get(&key),
+            Some(&old),
+            "ordinary in-progress continuations keep their evidence"
+        );
+    }
+    panic!("failure path was not reached");
+}
+
+#[test]
+#[cfg(unix)]
+fn census_failed_read_invalidates_old_record() {
+    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Read);
+}
+#[test]
+#[cfg(unix)]
+fn census_failed_attribution_invalidates_old_record() {
+    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Attribution);
+}
+#[test]
+#[cfg(unix)]
+fn census_failed_scope_revalidation_invalidates_old_record() {
+    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Scope);
+}
+#[test]
+#[cfg(unix)]
+fn census_failed_object_revalidation_invalidates_old_record() {
+    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Object);
+}
+#[test]
+#[cfg(unix)]
+fn census_failed_reopen_invalidates_old_record() {
+    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reopen);
+}
+#[test]
+#[cfg(unix)]
+fn census_failed_reduction_invalidates_old_record() {
+    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reduction);
+}
+
+#[test]
+fn census_shadow_bounds_workspace_without_changing_the_index() {
+    let mut index = ScanIndex::default();
+    let key = format!("/census/projects/{}.jsonl", "x".repeat(5000));
+    index.files.insert(key, manifest_index_entry(Some("body")));
+    let before = serde_json::to_value(&index).unwrap();
+    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        FIRST_WINDOW,
+    );
+    assert!(counts.transient_limited);
+    assert!(!counts.would_open);
+    let mut after = serde_json::to_value(&index).unwrap();
+    after
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_request_census_shadow");
+    assert_eq!(after, before);
+}

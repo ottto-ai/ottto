@@ -44,6 +44,10 @@ pub(crate) const MAX_CLAUDE_REQUEST_CENSUS_HASHES: usize = 1_048_576;
 /// Decoder bounds: at most this many records, and keys of at most this many
 /// bytes. Anything beyond is skipped entry by entry, never the index.
 const MAX_CLAUDE_REQUEST_CENSUS_RECORDS: usize = MAX_CLAUDE_REQUEST_CENSUS_HASHES;
+/// Interpretation and raw buffering budgets are independent of retained records.
+const MAX_DECODE_ENTRIES: usize = 65_536;
+const MAX_RAW_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RECORD_BYTES: usize = 16 * MAX_CLAUDE_REQUEST_CENSUS_HASHES + 1024;
 const MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES: usize = 4_096;
 /// Longest scalar string the decoder copies (a fingerprint is 64 bytes).
 const MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES: usize = 128;
@@ -299,20 +303,217 @@ impl Serialize for ClaudeRequestCensusShadowState {
     }
 }
 
+/// Persisted readers bound raw optional evidence before Serde can buffer a
+/// scalar. Ordinary index bytes pass through unchanged. Oversized evidence is
+/// drained with constant space and replaced by null; interpretation stops at
+/// MAX_RAW_BYTES. Draining necessarily remains linear in the input bytes.
+/// The token scanner never converts a number or copies an unbounded string.
+pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<ScanIndex> {
+    serde_json::from_reader(CensusRead::new(reader))
+}
+
+pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
+    use std::io::Read;
+    let mut normalized = Vec::new();
+    CensusRead::new(bytes).read_to_end(&mut normalized)?;
+    crate::snapshot_retry::decode_state(&normalized)
+}
+
+struct CensusRead<R> {
+    reader: std::io::BufReader<R>,
+    replay: Option<u8>,
+    output: std::io::Cursor<Vec<u8>>,
+    depth: usize,
+    quoted: bool,
+    escaped: bool,
+    key: Vec<u8>,
+    shadow_key: bool,
+    shadow_state: bool,
+    capture: bool,
+}
+
+impl<R: std::io::Read> CensusRead<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader: std::io::BufReader::new(reader),
+            replay: None,
+            output: std::io::Cursor::new(Vec::new()),
+            depth: 0,
+            quoted: false,
+            escaped: false,
+            key: Vec::new(),
+            shadow_key: false,
+            shadow_state: false,
+            capture: false,
+        }
+    }
+
+    fn byte(&mut self) -> std::io::Result<Option<u8>> {
+        use std::io::Read;
+        if let Some(byte) = self.replay.take() {
+            return Ok(Some(byte));
+        }
+        let mut byte = [0];
+        Ok((self.reader.read(&mut byte)? != 0).then_some(byte[0]))
+    }
+
+    fn evidence(&mut self) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut depth = 0_usize;
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut overflow = false;
+        while let Some(byte) = self.byte()? {
+            if !quoted && depth == 0 && matches!(byte, b',' | b'}') {
+                self.replay = Some(byte);
+                break;
+            }
+            if !overflow {
+                if bytes.len() == MAX_RAW_BYTES {
+                    bytes = Vec::new();
+                    overflow = true;
+                } else {
+                    bytes.push(byte);
+                }
+            }
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else {
+                match byte {
+                    b'"' => quoted = true,
+                    b'{' | b'[' => depth = depth.saturating_add(1),
+                    b'}' | b']' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+        if overflow {
+            return Ok(b"null".to_vec());
+        }
+        // Parsing is isolated from the enclosing index, including numeric
+        // conversion and wrong-token errors. Only canonical, finite tokens
+        // leave this reader. JSON syntax outside the optional field is intact.
+        Ok(if self.shadow_state {
+            serde_json::to_vec(
+                &serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
+                    .unwrap_or_default(),
+            )
+            .expect("shadow serialization")
+        } else {
+            serde_json::to_vec(
+                &serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default(),
+            )
+            .expect("census serialization")
+        })
+    }
+
+    fn next(&mut self) -> std::io::Result<Option<u8>> {
+        use std::io::Read;
+        let mut byte = [0];
+        if self.output.read(&mut byte)? != 0 {
+            return Ok(Some(byte[0]));
+        }
+        // Release the previous raw buffer before allocating another one.
+        self.output = std::io::Cursor::new(Vec::new());
+        if self.capture {
+            self.capture = false;
+            self.output = std::io::Cursor::new(self.evidence()?);
+            if self.output.read(&mut byte)? != 0 {
+                return Ok(Some(byte[0]));
+            }
+        }
+        let Some(byte) = self.byte()? else {
+            return Ok(None);
+        };
+        if self.quoted {
+            if self.depth == 1 && self.key.len() < 128 {
+                self.key.push(byte);
+            }
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'\\' {
+                self.escaped = true;
+            } else if byte == b'"' {
+                self.quoted = false;
+                if self.depth == 1 {
+                    self.shadow_key =
+                        serde_json::from_slice::<String>(&self.key).is_ok_and(|key| {
+                            matches!(
+                                key.as_str(),
+                                "claude_request_census" | "claude_request_census_shadow"
+                            )
+                        });
+                }
+            }
+        } else {
+            match byte {
+                b'"' => {
+                    self.quoted = true;
+                    self.key.clear();
+                    if self.depth == 1 {
+                        self.key.push(byte);
+                    }
+                }
+                b'{' | b'[' => self.depth = self.depth.saturating_add(1),
+                b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+                b':' if self.depth == 1 && self.shadow_key => {
+                    self.capture = true;
+                    self.shadow_key = false;
+                }
+                b',' if self.depth == 1 => self.shadow_key = false,
+                _ => {}
+            }
+        }
+        Ok(Some(byte))
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CensusRead<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        for slot in out {
+            let Some(byte) = self.next()? else {
+                break;
+            };
+            *slot = byte;
+            written += 1;
+        }
+        Ok(written)
+    }
+}
+
 /// Streaming and per entry: a malformed record is dropped, never the index,
 /// and a non-map field is an empty census. No `ScanIndex::load` predicate
 /// reads this field. Work is one pass over the field's bytes; no record is
 /// materialized as a `serde_json::Value`.
 impl<'de> Deserialize<'de> for ClaudeRequestCensus {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(CensusVisitor)
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        if raw.get().len() > MAX_RAW_BYTES {
+            return Ok(Self::default());
+        }
+        let mut isolated = serde_json::Deserializer::from_str(raw.get());
+        Ok(isolated.deserialize_any(CensusVisitor).unwrap_or_default())
     }
 }
 
 /// Tolerant like the census: anything unexpected reads as the default.
 impl<'de> Deserialize<'de> for ClaudeRequestCensusShadowState {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(ShadowStateVisitor)
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        if raw.get().len() > MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES {
+            return Ok(Self::default());
+        }
+        let mut isolated = serde_json::Deserializer::from_str(raw.get());
+        Ok(isolated
+            .deserialize_any(ShadowStateVisitor)
+            .unwrap_or_default())
     }
 }
 
@@ -356,7 +557,15 @@ impl<'de> Visitor<'de> for CensusVisitor {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut census = ClaudeRequestCensus::default();
+        let mut attempted = 0;
+        let mut remaining_work = MAX_RAW_BYTES;
         while let Some(key) = map.next_key::<String>()? {
+            attempted += 1;
+            if attempted > MAX_DECODE_ENTRIES || remaining_work == 0 {
+                map.next_value::<IgnoredAny>()?;
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                break;
+            }
             if key.len() > MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES
                 || census.records.len() >= MAX_CLAUDE_REQUEST_CENSUS_RECORDS
             {
@@ -364,7 +573,15 @@ impl<'de> Visitor<'de> for CensusVisitor {
                 continue;
             }
             let remaining = MAX_CLAUDE_REQUEST_CENSUS_HASHES - census.hash_total;
-            if let Some(record) = map.next_value_seed(RecordSeed { remaining })? {
+            let raw = map.next_value::<Box<serde_json::value::RawValue>>()?;
+            let bytes = raw.get().len();
+            if bytes > MAX_RECORD_BYTES || bytes > remaining_work {
+                remaining_work = 0;
+                continue;
+            }
+            remaining_work -= bytes;
+            let mut isolated = serde_json::Deserializer::from_str(raw.get());
+            if let Ok(Some(record)) = (RecordSeed { remaining }).deserialize(&mut isolated) {
                 census.insert_decoded(key, record);
             }
         }
@@ -424,7 +641,7 @@ impl<'de> Visitor<'de> for RecordVisitor {
         Ok(None)
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut seen = BTreeSet::new();
+        let mut seen = 0_u8;
         let mut malformed = false;
         let mut derivation = None;
         let mut source_file_fingerprint = None;
@@ -434,11 +651,25 @@ impl<'de> Visitor<'de> for RecordVisitor {
         let mut unverified = false;
         let mut request_hashes = Vec::new();
         while let Some(field) = map.next_key::<String>()? {
-            if field.len() > MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES || !seen.insert(field.clone()) {
+            let bit = match field.as_str() {
+                "v" => 1,
+                "fp" => 2,
+                "w" => 4,
+                "s" => 8,
+                "tw" => 16,
+                "u" => 32,
+                "h" => 64,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                    continue;
+                }
+            };
+            if seen & bit != 0 {
                 malformed = true;
                 map.next_value::<IgnoredAny>()?;
                 continue;
             }
+            seen |= bit;
             match field.as_str() {
                 "h" => match map.next_value_seed(HashesSeed {
                     remaining: self.remaining,
@@ -660,8 +891,20 @@ pub(crate) fn claude_request_census_record(
             .iter()
             .flat_map(|item| item.claude_usage_request_ids.iter())
             .map(|request_id| claude_request_hash(request_id))
+            .take(MAX_CLAUDE_REQUEST_CENSUS_HASHES + 1)
             .collect::<Vec<_>>()
     };
+    if request_hashes.len() > MAX_CLAUDE_REQUEST_CENSUS_HASHES {
+        return Some(ClaudeRequestCensusRecord {
+            source_file_fingerprint,
+            derivation: CLAUDE_REQUEST_CENSUS_DERIVATION,
+            window,
+            shape: ClaudeRequestCensusShape::OverBudget,
+            twin: false,
+            unverified,
+            request_hashes: Vec::new(),
+        });
+    }
     request_hashes.sort_unstable();
     request_hashes.dedup();
     request_hashes.shrink_to_fit();
@@ -720,7 +963,11 @@ pub(super) fn claude_buffered_request_hashes(parser: &super::OwnedJsonlParser) -
         .flat_map(|response| response.records.iter())
         .filter_map(|record| record.request_id.as_deref())
         .map(claude_request_hash)
+        .take(MAX_CLAUDE_REQUEST_CENSUS_HASHES + 1)
         .collect::<Vec<_>>();
+    if hashes.len() > MAX_CLAUDE_REQUEST_CENSUS_HASHES {
+        return hashes;
+    }
     hashes.sort_unstable();
     hashes.dedup();
     hashes
@@ -878,6 +1125,14 @@ enum ClaudeRequestCensusCoverage {
     Migrate,
 }
 
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestCensusCoverage {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, _: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        Some(())
+    }
+}
+
 /// One pass over the index: per-key coverage, shape counts, the hash join
 /// across every present record (covering or not: either can only add
 /// duplicates) and the census-unknown families. Transient memory is one heap
@@ -900,12 +1155,29 @@ impl ClaudeRequestCensusJoin {
             counts: ClaudeRequestCensusShadowCounts {
                 records: census.records.len(),
                 hashes: census.hash_total,
+                hash_budget_usage_percent: census.hash_total.saturating_mul(100)
+                    / MAX_CLAUDE_REQUEST_CENSUS_HASHES,
+                hash_budget_warning: census.hash_total.saturating_mul(100)
+                    >= MAX_CLAUDE_REQUEST_CENSUS_HASHES * 80,
                 ..ClaudeRequestCensusShadowCounts::default()
             },
             coverage: BTreeMap::new(),
             shared_keys: BTreeSet::new(),
             unknown_roots: BTreeSet::new(),
         };
+        // Shadow-only workspace bound. Oversized inventories remain closed;
+        // ordinary scan decisions and existing resource caps are unchanged.
+        if index.files.len() > MAX_DECODE_ENTRIES
+            || census.records.len() > MAX_DECODE_ENTRIES
+            || index
+                .files
+                .keys()
+                .chain(census.records.keys())
+                .any(|key| key.len() > MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES)
+        {
+            join.counts.transient_limited = true;
+            return join;
+        }
         let mut path_owners = BTreeMap::<(String, String), usize>::new();
         for (key, entry) in &index.files {
             let Some(path_owner) = claude_index_path_family_member(Path::new(key)) else {
@@ -965,6 +1237,10 @@ impl ClaudeRequestCensusJoin {
             join.coverage.insert(key.clone(), coverage);
             *path_owners.entry(path_owner).or_default() += 1;
         }
+        join.observe_workspace(
+            crate::heap_layout_bound::completed_bound(&path_owners, usize::MAX)
+                .unwrap_or(usize::MAX),
+        );
         // A path twin: one (root, member) on two or more keys.
         join.unknown_roots.extend(
             path_owners
@@ -987,7 +1263,25 @@ impl ClaudeRequestCensusJoin {
         }
         join.counts.family_unknown_roots = join.unknown_roots.len();
         join.merge_hashes(census);
+        join.observe_workspace(0);
         join
+    }
+
+    fn observe_workspace(&mut self, extra: usize) {
+        let owned = crate::heap_layout_bound::completed_bound(&self.coverage, usize::MAX)
+            .and_then(|coverage| {
+                crate::heap_layout_bound::completed_bound(&self.shared_keys, usize::MAX)
+                    .and_then(|shared| coverage.checked_add(shared))
+            })
+            .and_then(|bytes| {
+                crate::heap_layout_bound::completed_bound(&self.unknown_roots, usize::MAX)
+                    .and_then(|roots| bytes.checked_add(roots))
+            })
+            .unwrap_or(usize::MAX);
+        self.counts.transient_peak_bytes = self
+            .counts
+            .transient_peak_bytes
+            .max(owned.saturating_add(extra));
     }
 
     fn coverage(
@@ -1057,6 +1351,20 @@ impl ClaudeRequestCensusJoin {
             }
         }
         self.close_run(&lists, &run_lists);
+        self.observe_workspace(
+            lists
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(&String, &[u64])>())
+                .saturating_add(
+                    heap.capacity()
+                        .saturating_mul(std::mem::size_of::<Reverse<(u64, usize, usize)>>()),
+                )
+                .saturating_add(
+                    run_lists
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                ),
+        );
     }
 
     fn close_run(&mut self, lists: &[(&String, &[u64])], run_lists: &[usize]) {
@@ -1082,6 +1390,7 @@ impl ClaudeRequestCensusJoin {
     pub(crate) fn disjointness_complete(&self, census_complete: bool) -> bool {
         let counts = &self.counts;
         census_complete
+            && !counts.transient_limited
             && counts.covered_by_fingerprint + counts.covered_by_window == counts.family_keys
             && counts.hashes <= MAX_CLAUDE_REQUEST_CENSUS_HASHES
             && counts.duplicate_owner_entries <= MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS
@@ -1268,6 +1577,22 @@ impl ScanIndex {
         &self.claude_request_census_shadow
     }
 
+    pub(crate) fn seed_census_correction_for_test(&mut self, root: &str) {
+        let record = self
+            .claude_usage_authority_quarantine
+            .get_mut(root)
+            .expect("terminal authority");
+        record.contract = super::CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_owned();
+        record.proof_correction = Some(super::ClaudeAuthorityProofCorrection {
+            proof_witness_fingerprint: record.proven_witness_fingerprint.clone(),
+            owed_member_ids: record
+                .member_source_file_fingerprints
+                .keys()
+                .cloned()
+                .collect(),
+        });
+    }
+
     /// Every decision the census, fence, rearm, quarantine and settlement
     /// paths persist, with paths made relative to `base` and source
     /// fingerprints reduced to present/cleared, so two fixtures at different
@@ -1322,7 +1647,7 @@ impl ScanIndex {
                     serde_json::json!({
                         "disposition": format!("{:?}", record.disposition),
                         "failed": record.failed_reconstruction_count,
-                        "proof_correction": record.proof_correction.is_some(),
+                        "proof_correction": record.proof_correction,
                         "members": record.member_source_file_fingerprints.keys().collect::<Vec<_>>(),
                     }),
                 )
@@ -1335,7 +1660,7 @@ impl ScanIndex {
             "rearm_attempt": self.claude_duplicate_fence_rearm_attempt,
             "next_full_rearm": self.claude_duplicate_fence_next_full_rearm_unix_seconds,
             "pending": pending,
-            "witness_roots": self.claude_usage_family_witnesses.keys().collect::<Vec<_>>(),
+            "witnesses": self.claude_usage_family_witnesses,
             "quarantine": quarantine,
             "owned_start": self
                 .claude_owned_start_census

@@ -96,7 +96,7 @@ fn census_parity_page_facts(fixture: &PipelineFixture, page: &PipelinePage) -> s
             .scan
             .snapshots
             .iter()
-            .map(|item| item.snapshot_fingerprint.clone())
+            .map(|item| (item.snapshot_fingerprint.clone(), snapshot_upload_body_witness(item)))
             .collect::<Vec<_>>(),
         "uploaded": page.uploaded,
         "held": page.held,
@@ -156,9 +156,40 @@ fn census_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usiz
         // A rearmed entry has no revision; any well-formed one seeds the debt.
         .unwrap_or_else(|| "c".repeat(64));
     index.insert_unproven_terminal_claude_authority_for_test(terminal_root, &revision);
+    index.seed_census_correction_for_test(terminal_root);
+    let debt = index
+        .claude_authority_record_for_test(terminal_root)
+        .expect("authority");
+    let correction = debt.correction.clone().expect("live correction grant");
+    assert!(!correction.1.is_empty(), "a real member owes a correction");
+    let mut reset = index.clone();
+    reset.prepare_historical_replay("replay-generation-2".to_owned());
+    let after = reset
+        .claude_authority_record_for_test(terminal_root)
+        .expect("reset retains authority");
+    assert_eq!(after.correction, Some(correction));
+    assert_eq!(
+        after.member_source_file_fingerprints,
+        debt.member_source_file_fingerprints
+    );
+    assert_eq!(
+        after.proven_witness_fingerprint,
+        debt.proven_witness_fingerprint
+    );
+    assert!(
+        after.bound_to_retained_witness,
+        "reset keeps the original proof binding"
+    );
     index.save(&fixture.index_path).expect("save scan index");
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
-    run(9, &PIPELINE_HOLD_CYCLE);
+    run(
+        9,
+        &PipelineCycle {
+            replay_generation: "replay-generation-2",
+            historical_replay: true,
+            ..PIPELINE_HOLD_CYCLE
+        },
+    );
     fixture.append(terminal_root, "req_2_2");
     fixture.append(CENSUS_PARITY_COPY, "req_copy_2");
     run(10, &PIPELINE_HOLD_CYCLE);

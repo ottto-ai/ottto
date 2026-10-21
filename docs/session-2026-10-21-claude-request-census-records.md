@@ -105,3 +105,37 @@ off. Every per-page decision and the persisted decision state are equal; only
 the record map and the shadow differ.
 
 No local builds or tests were run. CI on the PR is the verification.
+
+## Review corrections
+
+Persisted load and CAS reads cap each optional raw census field at 32 MiB
+before Serde buffers its tokens. Oversized evidence is drained in constant
+space and discarded. Input draining remains linear in the file bytes. Raw
+sub-parses isolate numeric overflow and wrong tokens from the enclosing index;
+individual records are limited to 16 MiB plus 1 KiB, 65,536 attempted entries,
+and 32 MiB of interpreted entry bytes, including rejected entries. Known-field
+duplicates use a fixed bitset. The `raw_value` Serde feature enables isolated
+sub-parses without a field-wide `Value`.
+
+The shadow reports integer hash-budget utilization and a warning beginning at
+80% (838,861 hashes). Unproven-family age buckets are a D2 obligation: the
+persisted authority record has a retry deadline, but no creation timestamp from
+which a family's age can be recovered without inventing one.
+
+Construction buffers retain at most 1,048,577 hashes before becoming an inert
+budget tombstone. The terminal join bounds inventory and key sizes before
+allocating workspace, reports `transient_limited` on refusal, and measures its
+peak requested layout separately as `transient_peak_bytes`. Ordinary scans
+have no transient admission budget; these shadow limits and measurements do
+not consume the cache-retention `copy_budget` or change its decisions. Native
+comparison targets continue to invalidate records.
+
+Parity compares semantic fingerprints plus additive-body witnesses for every
+offered item, full retained proof witnesses and correction grants/owed members.
+A live, nonempty correction is explicitly checked across historical replay
+reset, and the corpus also traverses the reset pipeline. An old-shape decoder
+control actually ignores the added fields.
+
+The maximal shadow row uses `false`, the longest boolean spelling. Including
+all added cost fields, its compact encoding is bounded by 1,238 bytes on the
+64-bit scalar domain; the assertion pins equality at that maximum.
