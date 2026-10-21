@@ -526,4 +526,5 @@ mod first_proof_retry_pipeline_tests {
             );
         }
     }
+    include!("first_proof_retry_lite_tests.rs");
 }

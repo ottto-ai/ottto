@@ -74,3 +74,25 @@ Agent: Codex GPT-Sol (opus-cli-agent helper for Claude Code owner)
 Agent session id: 166654d2-a05b-43d0-aca6-9d31e77ae2b3
 Agent session name: Daemon StateMissing/repeated-full-scan
 Agent session source: opus-cli-agent headless helper
+
+## LITE test and accounting extension
+
+The branch now merges main at 7c46fab6 and adds test-only LITE fixtures for
+multiple quiet windows, continuing growth with fixed telemetry, missing/extra
+membership, unchanged-revision nonprogress, 130 families across a 128-family
+batch, an indivisible 1,025-file family, and off-page partial/held-save recovery.
+The save probes explicitly supply a proposed fingerprint clear as controlled
+input to existing selected-save code; they install no production policy.
+
+An open-fence R0 diagnostic shows whether BASE global replay masks targeted
+recovery. It is expected red while the existing fence transition triggers
+that replay. Candidate reason decoding, a pinned old-reader shape, absent-byte
+identity, exact scalar carrier pricing, oldest-first ordering and an N=6 guard
+are standalone test-local contracts. They do not install a decoder, runtime
+carrier, historical discovery, or production fingerprint clear.
+
+A no-state terminal clear cannot retain cap-deferred work after pending prune,
+certify an exclusive transient failure from a first-cause enum after evidence
+loss, or enforce a cross-window N guard. Those resource and policy gaps remain
+explicit. The future optional path must remain fail-closed until the exact
+reason provenance, current hold/exclusion gates and owner funding are approved.
