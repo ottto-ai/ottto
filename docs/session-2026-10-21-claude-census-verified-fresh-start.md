@@ -89,14 +89,22 @@ A `SharesHash` status revokes whenever it is seen, even while the predicate
 is false. `Unobserved` changes nothing for an emitted root and does not
 verify a candidate. A candidate whose telemetry is not settled spends no
 verification re-arm. An unchanged file carries no current-window evidence,
-so a stranded candidate gets one settlement re-arm, and only when the pass
-holds the contract-5 permit, the fold is funded, and the census accepts its
-window with a `Disjoint`, source-verified own record. Never under the stub,
-never by time, and once per exact revision (file fingerprint, which includes
-path, size and modification time, plus the parser and 2c revision). The spent
-attempt is the `settlement_rearmed` state, saved with the cleared file
-fingerprint in the same selected save, so a failed save leaks neither and a
-restart neither repeats nor clears it.
+so a candidate gets one settlement attempt, spent by its first pass that
+holds the contract-5 permit, is funded, and whose census accepts its window
+with a `Disjoint`, source-verified own record. A stranded candidate (not
+parsed in that window) is re-armed once; a candidate parsed in that window
+that still did not verify spends the attempt without a re-arm, since a
+re-parse cannot change the outcome. Never under the stub, never by time, and
+once per exact revision (file fingerprint, which includes path, size and
+modification time, plus the parser and 2c revision; so a rename is a new
+binding). The spent attempt is the `settlement_rearmed` state. The full
+selected save commits it with the cleared file fingerprint, a failed save
+reloads the unspent candidate, and a restart neither repeats nor clears it.
+A partial (shed) checkpoint does not pair them yet: it keeps the cleared
+fingerprint as re-parse debt but the witness only moves with a settled key,
+so a crash after it can earn one more attempt. A stranded candidate's
+telemetry is checked only by its re-parse, so a re-parse whose telemetry
+does not settle spends the attempt with no gain.
 
 ## Admission
 
@@ -211,4 +219,5 @@ every witness.
   false, never a rollback to an older binary. The false switch re-arms every
   admissible revision once so its next body withdraws the numbers, then drops
   the map. An older binary ignores and drops the field on save without
-  withdrawing anything.
+  withdrawing anything, and an earlier 2c build drops `settlement_rearmed`
+  witnesses, so a re-upgrade could earn a second settlement attempt.

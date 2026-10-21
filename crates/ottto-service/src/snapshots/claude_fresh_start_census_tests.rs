@@ -2387,16 +2387,17 @@ fn a_f2_a_stranded_candidate_spends_one_settlement_rearm_only_on_a_permitted_acc
     let dir = temp_dir("claude-2c-a-f2-unit");
     let path = write(&dir, FRESH, &fresh_lines(FRESH, 0));
     let mut machine = Machine::new(vec![dir.clone()], &[]);
-    machine.permit = true;
     let accepting = || ClaudeCensusViewForTest {
         complete: true,
         ..ClaudeCensusViewForTest::default()
     };
-    // The parse pass: the telemetry is unsettled, so the candidate stays.
+    // The parse pass runs without the permit (a backfill), so the telemetry
+    // is unsettled and nothing is spent: the candidate is stranded.
     let (items, disposition) = machine.pass("2026-08-20T10:30:00Z");
     assert_cleared(item(&items, FRESH));
     assert_eq!(state(&machine.index, FRESH), Some(ClaudeFreshStartState::Candidate));
     assert_eq!(disposition.fresh_start_audit.settlement_rearms, 0);
+    machine.permit = true;
     // Stranded passes whose census does not accept this member spend nothing.
     type Refusal = fn(&mut ClaudeCensusViewForTest);
     let refusals: [(&str, Refusal); 4] = [
@@ -2455,6 +2456,23 @@ fn a_f2_a_stranded_candidate_spends_one_settlement_rearm_only_on_a_permitted_acc
         assert_eq!(disposition.fresh_start_audit.settlement_rearms, 0, "{collected_at}");
     }
     assert!(!indexed_fingerprint(&machine.index, &path).is_empty(), "spent once");
+    // A new revision parsed in an eligible (permitted, funded, accepted)
+    // window that still does not verify, here because its telemetry is
+    // unsettled, spends its attempt without a re-arm: a re-parse of the same
+    // bytes cannot change that pass's outcome.
+    let mut lines = fresh_lines(FRESH, 0);
+    lines.push(assistant(FRESH, "req_f9", &at(0, 9), 40));
+    write(&dir, FRESH, &lines);
+    let (items, disposition) = machine.pass("2026-08-20T11:10:00Z");
+    assert_cleared(item(&items, FRESH));
+    assert_eq!(
+        state(&machine.index, FRESH),
+        Some(ClaudeFreshStartState::SettlementRearmed)
+    );
+    assert!(!indexed_fingerprint(&machine.index, &path).is_empty(), "no re-arm");
+    assert_eq!(disposition.fresh_start_audit.settlement_rearms, 0);
+    let (items, _) = machine.pass("2026-08-20T11:20:00Z");
+    assert!(items.is_empty(), "never re-armed for settlement");
     drop(fixture);
     let _ = fs::remove_dir_all(dir);
 }

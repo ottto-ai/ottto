@@ -1031,6 +1031,11 @@ fn fresh_start_finish(
     );
     let index_path = preparation.index_path.clone();
     if ack == FreshStartFinishAck::LocalSaveFailure {
+        // The verified index is durable before finish, so the saved state
+        // after the failure is exactly what finish left on disk.
+        let mut durable = index.clone();
+        durable.save(&index_path).expect("pre-finish index save");
+        index.generation = durable.generation;
         // Every save of the upload checkpoint fails; the first one runs only
         // after the server's ACK.
         let progress_path = preparation.upload_progress_path.clone();
@@ -1110,10 +1115,17 @@ fn finish_sync_source_marks_emitted_only_when_the_server_stores_the_admitted_bod
                 );
             }
             FreshStartFinishAck::LocalSaveFailure => {
-                assert!(result.is_err(), "{ack:?}: the checkpoint save failed");
-                assert_ne!(
+                let error = result.as_ref().expect_err("the checkpoint save failed");
+                assert!(
+                    snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
+                        || error
+                            .chain()
+                            .any(|cause| cause.is::<SnapshotLocalStateRejected>()),
+                    "{ack:?}: a local-state error: {error:?}"
+                );
+                assert_eq!(
                     state,
-                    Some("emitted"),
+                    Some("verified"),
                     "{ack:?}: a local-state error never certifies the ACK"
                 );
             }

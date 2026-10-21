@@ -1646,16 +1646,26 @@ struct ClaudeFreshStartWindow<'a> {
 /// Settlement re-arm (A-F2): a `Candidate` parsed in a pass that could not
 /// settle it (no permit, no funds, or the H3 stub) has no current-window
 /// evidence afterwards, and an unchanged file is never parsed again. The
-/// first later census that accepts the window, finds the member `Disjoint`
-/// with a source-verified own record, and runs under the permit with funds,
-/// re-arms that exact revision once and records the spend as
-/// `SettlementRearmed`. The spend and the cleared fingerprint are written by
-/// this same fold, so the selected save or `committable_subset` commits both
-/// or neither, a failed save leaks nothing, and a restart reloads either the
-/// unspent candidate or the spent state with its owed parse. A new attempt
-/// needs a new binding (another fingerprint or revision), which only an
-/// ordinary changed-input parse creates. Never while H3 is the false stub,
-/// never per window and never by time.
+/// attempt is spent by the first census pass that makes the candidate
+/// eligible: the window is accepted, the member is `Disjoint` with a
+/// source-verified own record, and the pass holds the permit and funds. A
+/// stranded root's telemetry cannot settle before its re-parse (its pending
+/// was released, so the absence check does not visit it), so a re-parse
+/// whose telemetry then fails to settle spends the attempt with no gain
+/// (counted by the refill packet). If that pass did not parse the
+/// file in this window (stranded), it re-arms that exact revision once. If it
+/// did parse it (current-window pending, valid or not) and still did not
+/// verify, a re-parse cannot change the outcome, so the attempt is spent
+/// without a re-arm. Either way the state is `SettlementRearmed`. The full
+/// selected save commits the spend with the cleared fingerprint, and a failed
+/// save reloads the unspent candidate. A partial (shed) checkpoint does not
+/// pair them today: `committable_subset` keeps every cleared fingerprint as
+/// re-parse debt but moves the witness only with a settled key, so a crash
+/// after such a checkpoint can earn one more attempt (awaiting the scan
+/// owner's hunk). A new attempt otherwise needs a new binding (another
+/// fingerprint or revision), which only an ordinary changed-input parse
+/// creates. Never while H3 is the false stub, never per window and never by
+/// time.
 #[allow(clippy::too_many_arguments)]
 fn claude_fresh_start_census_step(
     census: &mut BTreeMap<String, ClaudeFreshStartCensusWitness>,
@@ -1802,17 +1812,23 @@ fn claude_fresh_start_census_step(
             witness.state = ClaudeFreshStartState::Verified;
             rearm_member(member, &witness.candidate_source_file_fingerprint);
         } else if witness.state == ClaudeFreshStartState::Candidate
-            && hashes.is_none()
             && census_accepts_member
             && window.settlement_rearm_permitted
         {
-            // A-F2: the stranded candidate's one settlement re-arm. Its next
-            // parse brings current-window evidence and, under the permit,
-            // settled telemetry; whatever that pass decides, this revision is
-            // never re-armed for settlement again.
+            // A-F2: the candidate's one settlement attempt, spent by its first
+            // eligible pass. Only a stranded candidate (no pending from this
+            // window, since pending is released after every complete census)
+            // is re-armed: its next parse brings current-window evidence. A
+            // candidate parsed in this window already had it and did not
+            // verify, so a re-parse cannot help.
             witness.state = ClaudeFreshStartState::SettlementRearmed;
-            rearm_member(member, &witness.candidate_source_file_fingerprint);
-            audit.settlement_rearms = audit.settlement_rearms.saturating_add(1);
+            let parsed_this_window = pending
+                .get(member)
+                .is_some_and(|family| family.census_window_end == census_window_end);
+            if !parsed_this_window {
+                rearm_member(member, &witness.candidate_source_file_fingerprint);
+                audit.settlement_rearms = audit.settlement_rearms.saturating_add(1);
+            }
         }
     }
     rearm
@@ -3560,7 +3576,9 @@ struct ClaudeOwnedStartCensusWitness {
 /// re-arms every admissible revision once, so its next body withdraws the
 /// numbers, and then drops the map. An older binary ignores and drops this
 /// field on save without withdrawing anything, and a later re-upgrade finds
-/// no witness to withdraw by.
+/// no witness to withdraw by. An earlier 2c build drops any witness in a
+/// state it does not know (`settlement_rearmed`), so a re-upgrade could earn
+/// a second settlement attempt.
 const CLAUDE_CENSUS_VERIFIED_FRESH_START_ENABLED: bool = false;
 /// A record older than file birth by more than this marks a copy.
 const CLAUDE_COPY_SIGNATURE_TOLERANCE_MS: i64 = 60_000;
@@ -3698,10 +3716,10 @@ struct ClaudeFreshStartCensusWitness {
 enum ClaudeFreshStartState {
     /// Signature passed; not yet verified in an accepted complete census.
     Candidate,
-    /// A `Candidate` whose one settlement re-arm for this exact revision is
-    /// spent (A-F2): an accepted, permitted and funded census found it with
-    /// no current-window evidence, so its file was re-armed once. It verifies
-    /// like a `Candidate` and is never re-armed for settlement again.
+    /// A `Candidate` whose one settlement attempt for this exact revision is
+    /// spent (A-F2): an accepted, permitted and funded census found it
+    /// unverified, and re-armed its file once if that pass had not parsed it. It verifies like a `Candidate` and is never re-armed
+    /// for settlement again.
     SettlementRearmed,
     /// Verified, and the one corrective parse for this transition is spent.
     Verified,
