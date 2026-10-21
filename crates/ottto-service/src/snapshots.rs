@@ -2398,17 +2398,37 @@ pub(crate) fn begin_codex_side_pass(
     CodexSidePass { ns, gate }
 }
 
+/// U1a-2a D5′ (C15), Codex only: the side ledger's save mark for this index,
+/// read immediately before the call that assembles and writes the selected
+/// save. Opaque outside `snapshots`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CodexSideSaveMark(sampled_scan::side_ledger::SaveMark);
+
+pub(crate) fn codex_side_save_mark(
+    cache: &sampled_scan::SharedCache,
+    index_path: &Path,
+) -> CodexSideSaveMark {
+    CodexSideSaveMark(
+        cache
+            .side_ledger()
+            .save_mark(sampled_scan::side_ledger::namespace_of(index_path)),
+    )
+}
+
 /// U1a-2a (C15), Codex only: the pass's selected save, carrying every side
-/// field, succeeded. `full` only for the full save; never an ACK.
+/// field, succeeded (call it on the `Ok` arm only). `full` only for the full
+/// save; `mark` from `codex_side_save_mark` before that save. Never an ACK.
 pub(crate) fn note_codex_side_pass_saved(
     cache: &sampled_scan::SharedCache,
     index_path: &Path,
     full: bool,
+    mark: CodexSideSaveMark,
 ) {
     cache.side_ledger().note_saved(
         sampled_scan::side_ledger::namespace_of(index_path),
         sampled_scan::now_seconds(),
         full,
+        mark.0,
     );
 }
 

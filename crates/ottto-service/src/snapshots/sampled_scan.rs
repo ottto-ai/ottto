@@ -49,7 +49,8 @@ impl HeapLayoutBound for SharedCache {
         self.cursor.heap_bound(c)?;
         // Never `side`'s lock: a busy lock would read as unbounded and zero
         // every copy budget. The ledger's whole heap is this proved constant;
-        // its inline tables are inside `size_of::<SharedCache>()`.
+        // its inline tables are inside `size_of::<SharedCache>()`, which the
+        // caller's `bound` (or `Arc`) charges once (D5′ size test).
         c.add(side_ledger::SIDE_LEDGER_BYTES)
     }
 }
@@ -139,7 +140,10 @@ impl SharedCache {
                 // records, outstanding claims) and the side ledger's fixed charge
                 // keep their charge: admission may not fill the state budget
                 // underneath them. Measured under the retained lock, so every
-                // claim made before this insert is seen.
+                // claim made before this insert is seen. The side term is the
+                // same constant `heap_bound` adds and cursor admission keeps
+                // (`codex_cursor::admission_budget`, F4b). Slice M order: PR-R,
+                // then M2, extend this reservation; they keep this term.
                 let live_bytes = live_bytes
                     .saturating_add(self.cursor_resident())
                     .saturating_add(side_ledger::SIDE_LEDGER_BYTES);

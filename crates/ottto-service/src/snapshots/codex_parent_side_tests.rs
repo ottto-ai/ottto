@@ -296,7 +296,8 @@ fn codex_side_pass_gates_on_the_previous_selected_save() {
             .side_allowed
     );
     // A partial checkpoint that carried the side fields opens it again.
-    note_codex_side_pass_saved(&cache, path, false);
+    let mark = codex_side_save_mark(&cache, path);
+    note_codex_side_pass_saved(&cache, path, false, mark);
     let next = begin_codex_side_pass(&cache, path, &mut index);
     assert!(next.gate.side_allowed && !next.gate.first_in_process);
     assert_eq!(index.codex_parent_side_requests, BTreeMap::new());

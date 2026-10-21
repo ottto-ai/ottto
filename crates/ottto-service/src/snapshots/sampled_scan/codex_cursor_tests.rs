@@ -6097,6 +6097,12 @@ fn retained_floor(cache: &SharedCache) -> usize {
     crate::heap_layout_bound::bound(&*cache.retained().unwrap(), usize::MAX).unwrap()
 }
 
+/// F4b: everything admission keeps beside the state and a charge: the
+/// retained cache's own bound and the side ledger's fixed reservation.
+fn admission_floor(cache: &SharedCache) -> usize {
+    retained_floor(cache) + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES
+}
+
 /// Every release `release_join_owners` reports, with its member keys.
 fn released(
     cache: &SharedCache,
@@ -6157,7 +6163,7 @@ fn join_provenance_charge_is_the_exact_accounted_delta() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     let three = join_members(&["a.jsonl", "bb.jsonl", "rollout-ccc.jsonl"]);
     cache.record_join_owner(JOIN_OWNER, &three);
@@ -6282,7 +6288,7 @@ fn outstanding_claim_blocks_a_second_claim_and_provenance() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let state = cache.cursor_resident();
     let claim = 4096;
     let members = join_members(&["a.jsonl", "b.jsonl"]);
@@ -6316,7 +6322,7 @@ fn paused_reserve_outranks_join_provenance() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     let members = join_members(&["a.jsonl", "b.jsonl"]);
     cache.record_join_owner(JOIN_OWNER, &members);
@@ -6367,7 +6373,7 @@ fn hopeless_admission_evicts_nothing() {
             .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
         // Measured with no retained copy and no provenance: the least an
         // admission could ever evict down to.
-        let floor = retained_floor(&cache);
+        let floor = admission_floor(&cache);
         let empty = cache.cursor_resident();
         cache.insert(
             key.clone(),
@@ -6421,6 +6427,86 @@ fn hopeless_admission_evicts_nothing() {
     });
 }
 
+/// F4b: every cursor admission keeps the side ledger's fixed reservation
+/// (full ledger here; its heap charge is the constant either way). Mandatory
+/// and optional admissions fit exactly at the boundary with it and are
+/// refused one byte past it, including where the old budget (no side term)
+/// would have taken them; a budget below the floor fails closed and evicts
+/// nothing. Settling returns the room; the ledger is never locked.
+#[test]
+fn cursor_admission_keeps_the_side_ledger_reservation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+    let cache = Arc::new(SharedCache::default());
+    cache.side_ledger().fill_for_test(7);
+    let entries = cache.side_ledger().len();
+    let floor = admission_floor(&cache);
+    assert_eq!(floor, retained_floor(&cache) + side);
+    let state = cache.cursor_resident();
+    let claim = 4096;
+    // The ledger lock is held throughout: admission never takes it.
+    let held = cache.side_ledger();
+    // Mandatory, exact boundary: one byte more is refused, the claim fits.
+    with_test_state_budget(state + claim + floor, || {
+        assert!(cache.cursor_reserve(claim + 1).is_none(), "one byte past");
+        let credit = cache.cursor_reserve(claim).expect("exactly fits");
+        assert_eq!(cache.cursor_resident(), state + claim);
+        credit.refund();
+    });
+    assert_eq!(cache.cursor_reserved(), 0);
+    // The old budget (no side term) would take it: refused, nothing claimed.
+    with_test_state_budget(state + claim + retained_floor(&cache), || {
+        assert!(cache.cursor_reserve(claim).is_none());
+    });
+    assert_eq!(cache.cursor_resident(), state);
+    // Optional (join provenance), exact boundary and one byte short.
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    let optional = join_charge(JOIN_OWNER, &members);
+    with_test_state_budget(state + optional + floor - 1, || {
+        cache.record_join_owner(JOIN_OWNER, &members);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+    with_test_state_budget(state + optional + retained_floor(&cache), || {
+        cache.record_join_owner(JOIN_OWNER, &members);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), None, "old budget: refused");
+    with_test_state_budget(state + optional + floor, || {
+        cache.record_join_owner(JOIN_OWNER, &members);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+    let resident = cache.cursor_resident();
+    assert_eq!(resident, state + optional);
+    // Below the floor (below the side reservation alone; below it with the
+    // retained floor; no room for one byte beside the state without its
+    // provenance): fails closed, and the provenance a mandatory charge
+    // could forget is kept.
+    for budget in [side - 1, floor - 1, state + floor] {
+        with_test_state_budget(budget, || {
+            assert!(cache.cursor_reserve(1).is_none(), "{budget}");
+            cache.record_join_owner(JOIN_OTHER, &members);
+        });
+        assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+        assert_eq!(cache.cursor_resident(), resident);
+    }
+    // A mandatory claim still forgets optional provenance for its room
+    // (baseline progress), inside the side reservation.
+    with_test_state_budget(state + optional + floor, || {
+        let credit = cache
+            .cursor_reserve(optional)
+            .expect("baseline progress forgets provenance");
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        assert_eq!(cache.cursor_resident(), state + optional);
+        credit.refund();
+    });
+    assert_eq!(cache.cursor_reserved(), 0);
+    assert_eq!(cache.cursor_resident(), state);
+    drop(held);
+    assert_eq!(cache.side_ledger().len(), entries);
+}
+
 /// J-T8: claim vs retained insert. The insert measures outstanding claims
 /// under the retained lock, so a copy that fits only if the claim is
 /// ignored is not kept.
@@ -6456,16 +6542,32 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         // Control: without a claim the copy fits.
         cache.insert(key.clone(), completed(copy), 0);
         assert!(cache.retained_checkpoint(&key).is_some());
-        let with_copy = retained_floor(&cache);
+        // F4b: the side ledger's reservation is part of the floor.
+        let with_copy = admission_floor(&cache);
         let state = cache.cursor_resident();
         assert!(with_copy + state <= STATE_BYTES);
         let copy = cache.take(&key).expect("retained");
+        // F4b exact boundary: a claim that leaves exactly the copy's room
+        // beside the side ledger's reservation; the copy is kept.
+        let exact = STATE_BYTES - state - with_copy;
+        let credit = cache.cursor_reserve(exact).expect("the claim fits alone");
+        cache.insert(key.clone(), completed(copy), 0);
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "kept at the boundary"
+        );
+        assert_eq!(
+            admission_floor(&cache) + cache.cursor_resident(),
+            STATE_BYTES
+        );
+        credit.refund();
+        let copy = cache.take(&key).expect("retained");
         // A claim that leaves one byte too few for it.
-        let claim = STATE_BYTES - state - with_copy + 1;
+        let claim = exact + 1;
         let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
         cache.insert(key.clone(), completed(copy), 0);
         assert!(cache.retained_checkpoint(&key).is_none(), "refused");
-        assert!(retained_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
@@ -6774,7 +6876,7 @@ fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     for n in 0..5_000_u64 {
         if n % 64 == 0 {
@@ -6819,7 +6921,7 @@ fn optional_65th_namespace_is_refused_and_the_retained_64_are_kept() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     let namespace = |n: usize| Scope(format!("namespace-{n:02}"));
     for n in 0..ROTATION_KEYS {
@@ -6982,7 +7084,7 @@ fn witness_admission() -> WitnessAdmission {
     let copy = cache
         .take(&key)
         .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     // A single-session root has no parent refs: no `parents` entry exists.
     assert!(cache

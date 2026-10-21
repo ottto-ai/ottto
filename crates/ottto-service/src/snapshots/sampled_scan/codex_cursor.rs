@@ -142,6 +142,18 @@ fn state_budget() -> usize {
     STATE_BYTES
 }
 
+/// F4b: the one checked budget every cursor admission measures against:
+/// the state budget less the side ledger's fixed heap reservation
+/// (`side_ledger::SIDE_LEDGER_BYTES`), which `SharedCache::heap_bound` and
+/// every retained insert also charge. A constant: no side-ledger lock is taken
+/// under the retained or cursor lock. The ledger's inline tables are inside
+/// `size_of::<SharedCache>()`, which none of these per-part sums measure, so
+/// nothing is charged twice. `None` (a budget below the reservation): no
+/// admission is feasible, so nothing is evicted.
+fn admission_budget() -> Option<usize> {
+    state_budget().checked_sub(super::side_ledger::SIDE_LEDGER_BYTES)
+}
+
 /// Scaled state budget for tests only (a pause that cannot fit).
 #[cfg(test)]
 pub(in crate::snapshots) fn with_test_state_budget<T>(bytes: usize, run: impl FnOnce() -> T) -> T {
@@ -2342,7 +2354,8 @@ fn parent_entry<'a>(
     Some(entry)
 }
 
-/// Whether `charge` fits beside the least the state and the retained cache
+/// Whether `charge` fits in `admission_budget` (the side ledger's reservation
+/// already taken) beside the least the state and the retained cache
 /// can measure after every eviction `admit_locked` may make: the empty
 /// retained cache's own bound (`release_until`'s floor) and, for `mandatory`,
 /// the state without its join provenance and without its parent witnesses
@@ -2367,7 +2380,7 @@ fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> b
     state
         .zip(floor)
         .and_then(|(state, floor)| {
-            state_budget()
+            admission_budget()?
                 .checked_sub(state)?
                 .checked_sub(charge)?
                 .checked_sub(floor)
@@ -2378,7 +2391,8 @@ fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> b
 /// K6 admission of `charge` more cursor bytes, under both locks (retained,
 /// then cursor): measure the cursor state (outstanding claims included),
 /// then release least-recently-useful retained copies until they fit beside
-/// it. If even an empty retained cache does not fit, `mandatory` (a paused
+/// it, all inside `admission_budget` (F4b: the side ledger's reservation is
+/// never spent). If even an empty retained cache does not fit, `mandatory` (a paused
 /// job: baseline progress) may then forget join provenance, which is
 /// optional and only keeps its owner blocked; optional admissions never take
 /// room that way. Once no provenance is left, a mandatory charge then forgets
@@ -2405,8 +2419,8 @@ fn admit_locked(
         let Some(state) = crate::heap_layout_bound::bound(&*cursor, STATE_BYTES) else {
             return false;
         };
-        let room = state_budget()
-            .checked_sub(state)
+        let room = admission_budget()
+            .and_then(|budget| budget.checked_sub(state))
             .and_then(|room| room.checked_sub(charge));
         if room.is_some_and(|room| retained.release_until(room)) {
             return true;
@@ -2429,7 +2443,7 @@ fn admit_locked(
         let Some(deficit) = state
             .checked_add(charge)
             .and_then(|need| need.checked_add(floor))
-            .and_then(|need| need.checked_sub(state_budget()))
+            .and_then(|need| need.checked_sub(admission_budget()?))
             .filter(|deficit| *deficit > 0)
         else {
             return false;

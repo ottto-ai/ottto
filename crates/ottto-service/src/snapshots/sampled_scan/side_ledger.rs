@@ -31,6 +31,10 @@ pub(in crate::snapshots) const SIDE_LEDGER_BYTES: usize = (MAX_SIDE_LEDGER + 1)
 const _: () = assert!(size_of::<LedgerKey>() == 48);
 const _: () = assert!(size_of::<LedgerEntry>() <= 96);
 const _: () = assert!(size_of::<Option<GateSlot>>() <= 48);
+/// D5′: the ledger's inline tables (gate slots, seen namespaces, the map
+/// head, counters) are inside `size_of::<SharedCache>()`, which every
+/// whole-cache bound charges beside `SIDE_LEDGER_BYTES`; this pins their size.
+const _: () = assert!(size_of::<SideLedger>() <= 576);
 
 /// A content-free 128-bit name: the first 16 bytes of SHA-256.
 fn h128(bytes: &[u8]) -> u128 {
@@ -79,8 +83,9 @@ pub(in crate::snapshots) enum LedgerTag {
 pub(in crate::snapshots) struct LedgerEntry {
     pub(in crate::snapshots) tag: LedgerTag,
     pub(in crate::snapshots) attempts: u8,
-    /// `SideLedger::pass_seq` of the last write (set by the ledger).
-    pub(in crate::snapshots) written_pass: u32,
+    /// D5′: the ledger's stamp for the last write (`SideLedger::next_wseq`;
+    /// 0 = never stamped, which no save covers).
+    pub(in crate::snapshots) wseq: u32,
     /// `Short` only.
     pub(in crate::snapshots) covered: u64,
     pub(in crate::snapshots) needed_extent: u64,
@@ -109,7 +114,7 @@ impl LedgerEntry {
         Self {
             tag,
             attempts: request.attempts,
-            written_pass: 0,
+            wseq: 0,
             covered,
             needed_extent: request.needed_extent,
             state_extent: request.state_extent,
@@ -157,14 +162,14 @@ impl LedgerEntry {
     }
 
     /// Equal persisted projection (every field but the ledger's own
-    /// `written_pass` and `stub_not_before`): the index already holds it.
+    /// `wseq` and `stub_not_before`): the index already holds it.
     pub(in crate::snapshots) fn same_projection(&self, other: &Self) -> bool {
         Self {
-            written_pass: 0,
+            wseq: 0,
             stub_not_before: 0,
             ..*self
         } == Self {
-            written_pass: 0,
+            wseq: 0,
             stub_not_before: 0,
             ..*other
         }
@@ -179,8 +184,26 @@ pub(in crate::snapshots) struct GateSlot {
     saved: bool,
     last_pass_unix: u64,
     last_saved_unix: u64,
-    /// `pass_seq` of the namespace's last full save.
-    full_saved_pass: u32,
+    /// D5′ custody: the stamp this slot was placed with. A save mark binds
+    /// to it, so a callback for a replaced or re-placed slot moves nothing.
+    incarnation: u32,
+    /// D5′: the highest save mark of a successful selected save (full or a
+    /// partial checkpoint) of this slot; entries stamped at or below it are
+    /// on disk. 0 = no proven save.
+    saved_wseq: u32,
+    /// The same for full saves only (lossless eviction).
+    full_saved_wseq: u32,
+}
+
+/// D5′: what a selected save may later prove, read immediately before the
+/// call that assembles its content. Bound to the namespace and to its slot's
+/// incarnation; `wseq` is the last stamp issued (`None` once exhausted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct SaveMark {
+    ns: u128,
+    /// 0: no slot when the mark was read.
+    incarnation: u32,
+    wseq: Option<u32>,
 }
 
 /// What C14 tells the pass.
@@ -210,6 +233,10 @@ pub(in crate::snapshots) struct SideLedger {
     pass_seq: u32,
     /// Namespaces seen by this process (0 = empty).
     seen_ns: [u128; GATE_SLOTS],
+    /// D5′: the last stamp issued, for entry writes and slot placements.
+    wseq: u32,
+    /// Sticky: the stamp ran out; from then on no save covers anything.
+    wseq_exhausted: bool,
 }
 
 impl Default for SideLedger {
@@ -219,6 +246,8 @@ impl Default for SideLedger {
             gate: [None; GATE_SLOTS],
             pass_seq: 0,
             seen_ns: [0; GATE_SLOTS],
+            wseq: 0,
+            wseq_exhausted: false,
         }
     }
 }
@@ -258,6 +287,43 @@ impl SideLedger {
         self.gate.iter_mut().flatten().find(|slot| slot.ns == ns)
     }
 
+    /// D5′: a fresh stamp. Checked: once it runs out the ledger is
+    /// exhausted for the process and every later stamp is 0 (uncertain).
+    fn next_wseq(&mut self) -> u32 {
+        match self.wseq.checked_add(1) {
+            Some(next) if !self.wseq_exhausted => {
+                self.wseq = next;
+                next
+            }
+            _ => {
+                self.wseq_exhausted = true;
+                0
+            }
+        }
+    }
+
+    /// D5′ C15 capture: read immediately before the call that assembles and
+    /// writes the selected save, so every entry stamped at or below it was
+    /// written into the index that save serializes.
+    pub(in crate::snapshots) fn save_mark(&self, ns: u128) -> SaveMark {
+        let incarnation = self.slot(ns).map_or(0, |slot| slot.incarnation);
+        SaveMark {
+            ns,
+            incarnation,
+            wseq: (!self.wseq_exhausted && incarnation != 0).then_some(self.wseq),
+        }
+    }
+
+    /// D5′ (c): a successful selected save of this slot already holds the
+    /// entry. Exhaustion, an unstamped entry, no slot or no proven save: no.
+    fn saved_covers(&self, ns: u128, entry: &LedgerEntry) -> bool {
+        !self.wseq_exhausted
+            && entry.wseq != 0
+            && self
+                .slot(ns)
+                .is_some_and(|slot| entry.wseq <= slot.saved_wseq)
+    }
+
     /// C14 step 1, at the start of a namespace's pass. A replaced slot's
     /// entries stay; only the namespace's gate memory is lost.
     pub(in crate::snapshots) fn begin_pass(&mut self, ns: u128, now: u64) -> GateOpen {
@@ -275,12 +341,16 @@ impl SideLedger {
             Some(slot) => slot.saved,
             None => {
                 let at = self.free_slot();
+                let incarnation = self.next_wseq();
+                // New, replaced or reused: no save of this slot is proven.
                 self.gate[at] = Some(GateSlot {
                     ns,
                     saved: false,
                     last_pass_unix: now,
                     last_saved_unix: now,
-                    full_saved_pass: 0,
+                    incarnation,
+                    saved_wseq: 0,
+                    full_saved_wseq: 0,
                 });
                 true
             }
@@ -315,16 +385,33 @@ impl SideLedger {
         })
     }
 
-    /// C15: the namespace's pass saved every side field. `full` only for
-    /// the full save; a partial checkpoint opens the gate but proves nothing
-    /// about later entries.
-    pub(in crate::snapshots) fn note_saved(&mut self, ns: u128, now: u64, full: bool) {
-        let pass = self.pass_seq;
-        if let Some(slot) = self.slot_mut(ns) {
-            slot.saved = true;
-            slot.last_saved_unix = now;
+    /// C15, on the `Ok` arm only: the namespace's selected save, carrying
+    /// every side field, succeeded. `mark` was read before that save was
+    /// assembled; it moves the slot's watermarks (`full` only for the full
+    /// save) and never past it. A mark for another namespace or another
+    /// incarnation of the slot (replaced or re-placed since) moves nothing,
+    /// not even the gate. Sync cycles are also serialized
+    /// (`SNAPSHOT_SYNC_LOCK`), so no other pass of this namespace writes
+    /// between the mark and this call.
+    pub(in crate::snapshots) fn note_saved(
+        &mut self,
+        ns: u128,
+        now: u64,
+        full: bool,
+        mark: SaveMark,
+    ) {
+        let Some(slot) = self
+            .slot_mut(ns)
+            .filter(|slot| mark.ns == ns && slot.incarnation == mark.incarnation)
+        else {
+            return;
+        };
+        slot.saved = true;
+        slot.last_saved_unix = now;
+        if let Some(wseq) = mark.wseq {
+            slot.saved_wseq = slot.saved_wseq.max(wseq);
             if full {
-                slot.full_saved_pass = pass;
+                slot.full_saved_wseq = slot.full_saved_wseq.max(wseq);
             }
         }
     }
@@ -340,17 +427,12 @@ impl SideLedger {
         key: &LedgerKey,
         entry: LedgerEntry,
     ) -> bool {
-        let pass = self.pass_seq;
-        match self.entries.get_mut(key) {
-            Some(slot) => {
-                *slot = LedgerEntry {
-                    written_pass: pass,
-                    ..entry
-                };
-                true
-            }
-            None => false,
+        if !self.entries.contains_key(key) {
+            return false;
         }
+        let wseq = self.next_wseq();
+        self.entries.insert(*key, LedgerEntry { wseq, ..entry });
+        true
     }
 
     /// The side charge (G7), the only creator. The layout guard comes before
@@ -368,7 +450,7 @@ impl SideLedger {
             return Err(ChargeRefusal::LayoutUnsupported);
         }
         let entry = LedgerEntry {
-            written_pass: self.pass_seq,
+            wseq: self.next_wseq(),
             ..entry
         };
         if let Some(slot) = self.entries.get_mut(&key) {
@@ -383,14 +465,17 @@ impl SideLedger {
     }
 
     fn evict_one(&mut self, caller: u128, now: u64) -> bool {
+        // D5′: lossless only when a full save of the slot proves the entry.
         let lossless = self
             .entries
             .iter()
             .find(|(key, entry)| {
                 key.ns != caller
+                    && !self.wseq_exhausted
+                    && entry.wseq != 0
                     && self
                         .slot(key.ns)
-                        .is_some_and(|slot| entry.written_pass <= slot.full_saved_pass)
+                        .is_some_and(|slot| entry.wseq <= slot.full_saved_wseq)
             })
             .map(|(key, _)| *key);
         if let Some(key) = lossless {
@@ -414,6 +499,37 @@ impl SideLedger {
             return true;
         }
         false
+    }
+
+    /// Tests: a full ledger for `ns` (F4b admission controls).
+    #[cfg(test)]
+    pub(in crate::snapshots) fn fill_for_test(&mut self, ns: u128) {
+        self.begin_pass(ns, 1000);
+        for p in 1..=MAX_SIDE_LEDGER as u128 {
+            let key = LedgerKey {
+                ns,
+                p,
+                dev: 1,
+                ino: p as u64,
+            };
+            let entry = LedgerEntry {
+                tag: LedgerTag::Live,
+                attempts: 1,
+                wseq: 0,
+                covered: 0,
+                needed_extent: 0,
+                state_extent: 0,
+                state_ctime: (0, 0),
+                attempt_extent: 0,
+                attempt_ctime: (0, 0),
+                not_before: 0,
+                needed_charge: 0,
+                stub_not_before: 0,
+            };
+            if self.charge(key, entry, 1000).is_err() {
+                self.entries.insert(key, entry);
+            }
+        }
     }
 
     pub(in crate::snapshots) fn has_namespace(&self, ns: u128) -> bool {
@@ -489,6 +605,14 @@ impl SideLedger {
             .collect::<BTreeMap<u128, String>>();
         let requests = &index.codex_parent_side_requests;
         let records = &index.codex_parent_side;
+        // D5′: the different-object terms prune only an entry a successful
+        // selected save of this slot proves; anything uncertain is kept and
+        // hydrated (the kept entry is the pacing).
+        let covered = self
+            .namespace(ns)
+            .filter(|(_, entry)| self.saved_covers(ns, entry))
+            .map(|(key, _)| *key)
+            .collect::<std::collections::BTreeSet<_>>();
         self.prune(ns, |key, entry| {
             // (c) P left the index.
             let Some(p_key) = keys.get(&key.p) else {
@@ -496,12 +620,14 @@ impl SideLedger {
             };
             let record = records.get(p_key);
             // (c) the saved record is for another object.
-            if record.is_some_and(|record| record.parsed.dev_ino() != (key.dev, key.ino)) {
+            if record.is_some_and(|record| record.parsed.dev_ino() != (key.dev, key.ino))
+                && covered.contains(key)
+            {
                 return true;
             }
             match requests.get(p_key) {
                 // (c) the saved request is for another object.
-                Some(loaded) if loaded.dev_ino != (key.dev, key.ino) => true,
+                Some(loaded) if loaded.dev_ino != (key.dev, key.ino) => covered.contains(key),
                 // (a) the index already holds this entry.
                 Some(loaded) => LedgerEntry::of_request(loaded).same_projection(entry),
                 // (c) the generation ended and the index agrees.
@@ -547,8 +673,17 @@ impl SideLedger {
                 }
             }
             let entry = match entry.tag {
+                // D5′: this key's generation ended, so only this object's
+                // request goes; a replacement's request (another key of the
+                // same P, hydrated in either key order) stays.
                 LedgerTag::Gone => {
-                    index.codex_parent_side_requests.remove(p_key);
+                    if index
+                        .codex_parent_side_requests
+                        .get(p_key)
+                        .is_some_and(|request| request.dev_ino == (key.dev, key.ino))
+                    {
+                        index.codex_parent_side_requests.remove(p_key);
+                    }
                     continue;
                 }
                 // The covering record's save was lost (no record covers this
@@ -586,7 +721,7 @@ mod tests {
         LedgerEntry {
             tag: LedgerTag::Live,
             attempts: 1,
-            written_pass: 0,
+            wseq: 0,
             covered: 0,
             needed_extent: 10,
             state_extent: 20,
@@ -695,7 +830,8 @@ mod tests {
         for p in 1..=(MAX_SIDE_LEDGER as u128 - 1) {
             ledger.charge(key(x, p), entry(), 1000).unwrap();
         }
-        ledger.note_saved(x, 1001, true);
+        let mark = ledger.save_mark(x);
+        ledger.note_saved(x, 1001, true, mark);
         // A later unsaved pass of X writes one more entry.
         ledger.begin_pass(x, 1100);
         ledger.charge(key(x, 100), entry(), 1100).unwrap();
@@ -737,7 +873,8 @@ mod tests {
         );
         // The pass did not save: the next pass is gated.
         assert!(!ledger.begin_pass(5, 20).side_allowed);
-        ledger.note_saved(5, 25, false);
+        let mark = ledger.save_mark(5);
+        ledger.note_saved(5, 25, false, mark);
         assert_eq!(
             ledger.begin_pass(5, 30),
             GateOpen {
@@ -800,7 +937,7 @@ mod tests {
             let entry = LedgerEntry::of_request(&request);
             assert_eq!(entry.request((3, 4)), Some(request));
             assert!(entry.same_projection(&LedgerEntry {
-                written_pass: 9,
+                wseq: 9,
                 stub_not_before: 9,
                 ..entry
             }));
@@ -825,8 +962,9 @@ mod tests {
     }
 
     #[test]
-    fn only_the_charge_creates_and_every_write_stamps_the_pass() {
+    fn only_the_charge_creates_and_every_write_stamps_a_fresh_wseq() {
         let mut ledger = SideLedger::default();
+        // Placing the slot takes stamp 1.
         ledger.begin_pass(1, 10);
         assert!(!ledger.write_existing(&key(1, 1), entry()));
         assert_eq!(ledger.get(&key(1, 1)), None);
@@ -839,11 +977,10 @@ mod tests {
         assert!(ledger.write_existing(&key(1, 1), cured));
         assert_eq!(
             ledger.get(&key(1, 1)),
-            Some(&LedgerEntry {
-                written_pass: 2,
-                ..cured
-            })
+            Some(&LedgerEntry { wseq: 2, ..cured })
         );
+        assert!(ledger.write_existing(&key(1, 1), cured));
+        assert_eq!(ledger.get(&key(1, 1)).unwrap().wseq, 3);
     }
 
     fn file_entry() -> crate::snapshots::ScanIndexEntry {
@@ -888,6 +1025,10 @@ mod tests {
             index.files.insert(key.into(), file_entry());
         }
         let mut ledger = SideLedger::default();
+        // Every entry below is written in an earlier pass whose save is
+        // proven (see the end of the setup), so (c) may prune.
+        ledger.begin_pass(ns, 50);
+        let live = stamped(&mut ledger, live);
         // (a) saved.
         index
             .codex_parent_side_requests
@@ -908,10 +1049,13 @@ mod tests {
             .insert("/c".into(), live.request((1, 30)).unwrap());
         ledger.entries.insert(at("/c", 3), live);
         // (c) Gone and the index agrees; Gone with a saved request.
-        let gone = LedgerEntry {
-            tag: LedgerTag::Gone,
-            ..entry()
-        };
+        let gone = stamped(
+            &mut ledger,
+            LedgerEntry {
+                tag: LedgerTag::Gone,
+                ..entry()
+            },
+        );
         ledger.entries.insert(at("/d", 4), gone);
         index
             .codex_parent_side_requests
@@ -931,6 +1075,8 @@ mod tests {
         ledger.entries.insert(at("/left", 7), live);
         // Another namespace.
         ledger.entries.insert(key(10, 1), live);
+        let mark = ledger.save_mark(ns);
+        ledger.note_saved(ns, 60, false, mark);
 
         let (gate, counts) =
             crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
@@ -967,6 +1113,14 @@ mod tests {
         let mut quiet = SideLedger::default();
         quiet.begin_index_pass(ns, 100, &mut index);
         assert_eq!(index.codex_parent_side_requests, before);
+    }
+
+    /// `entry` as the ledger's next write would stamp it.
+    fn stamped(ledger: &mut SideLedger, entry: LedgerEntry) -> LedgerEntry {
+        LedgerEntry {
+            wseq: ledger.next_wseq(),
+            ..entry
+        }
     }
 
     /// A side record of object (1, ino) whose seal covers `[0, sealed)`.
@@ -1057,10 +1211,15 @@ mod tests {
                 .insert((*key).into(), record.clone());
         }
         let mut ledger = SideLedger::default();
+        ledger.begin_pass(ns, 50);
+        let removed = stamped(&mut ledger, removed);
         ledger.entries.insert(at("/cover", 1), removed);
         ledger.entries.insert(at("/short", 2), removed);
         ledger.entries.insert(at("/short-paced", 3), removed);
         ledger.entries.insert(at("/other", 4), removed);
+        // A proven save of this slot holds them all (so (c) may prune /other).
+        let mark = ledger.save_mark(ns);
+        ledger.note_saved(ns, 60, false, mark);
 
         let (_, counts) = crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
             ledger.begin_index_pass(ns, 100, &mut index)
@@ -1108,6 +1267,380 @@ mod tests {
         ledger.begin_index_pass(ns, 200, &mut index);
         assert!(ledger.get(&at("/cover", 1)).is_none());
         assert!(!index.codex_parent_side_requests.contains_key("/cover"));
+    }
+
+    /// D5′ controls: one parent `P` replaced between objects.
+    const P: &str = "/p.jsonl";
+
+    fn pkey(ns: u128, ino: u64) -> LedgerKey {
+        LedgerKey {
+            ns,
+            p: parent_of(P),
+            dev: 1,
+            ino,
+        }
+    }
+
+    fn index_with_p() -> crate::snapshots::ScanIndex {
+        let mut index = crate::snapshots::ScanIndex::default();
+        index.files.insert(P.into(), file_entry());
+        index
+    }
+
+    /// G7: the side charge writes the entry and P's request in one step.
+    fn g7(
+        ledger: &mut SideLedger,
+        index: &mut crate::snapshots::ScanIndex,
+        key: LedgerKey,
+        attempts: u8,
+    ) -> SideRequest {
+        let charged = LedgerEntry {
+            attempts,
+            ..entry()
+        };
+        assert!(ledger.charge(key, charged, 100).is_ok());
+        let request = charged.request((key.dev, key.ino)).unwrap();
+        index.codex_parent_side_requests.insert(P.into(), request);
+        request
+    }
+
+    /// A replace: the old key's generation ends (`Gone`) and its request goes.
+    fn replace(ledger: &mut SideLedger, index: &mut crate::snapshots::ScanIndex, old: LedgerKey) {
+        let held = *ledger.get(&old).unwrap();
+        assert!(ledger.write_existing(
+            &old,
+            LedgerEntry {
+                tag: LedgerTag::Gone,
+                ..held
+            }
+        ));
+        index.codex_parent_side_requests.remove(P);
+    }
+
+    /// A successful selected save: the mark read before it, `note_saved` on
+    /// `Ok`. Returns the saved file.
+    fn save(
+        ledger: &mut SideLedger,
+        index: &crate::snapshots::ScanIndex,
+        ns: u128,
+        full: bool,
+    ) -> crate::snapshots::ScanIndex {
+        let mark = ledger.save_mark(ns);
+        let saved = index.clone();
+        ledger.note_saved(ns, 110, full, mark);
+        saved
+    }
+
+    fn tags(ledger: &SideLedger, ns: u128) -> BTreeMap<LedgerKey, (LedgerTag, u8)> {
+        ledger
+            .namespace(ns)
+            .map(|(key, entry)| (*key, (entry.tag, entry.attempts)))
+            .collect()
+    }
+
+    /// D5′ (i), U-T60(d)(xvii): a replace before a failed save. The new
+    /// key's charge is kept and hydrated with its attempts (no reset), and
+    /// the old key's `Gone` removes nothing of the replacement's, in both
+    /// key orders.
+    #[test]
+    fn d5_replace_before_a_failed_save_keeps_the_new_charge_in_either_key_order() {
+        if !layout_supported() {
+            return;
+        }
+        for (old_ino, new_ino) in [(5, 9), (9, 5)] {
+            let ns = 21;
+            let (old, new) = (pkey(ns, old_ino), pkey(ns, new_ino));
+            let mut ledger = SideLedger::default();
+            let mut work = index_with_p();
+            ledger.begin_index_pass(ns, 100, &mut work);
+            g7(&mut ledger, &mut work, old, 1);
+            let file = save(&mut ledger, &work, ns, true);
+            // The next pass charges the old object again, then P is replaced
+            // and the new object charged; the pass fails (no C15).
+            let mut work = file.clone();
+            ledger.begin_index_pass(ns, 200, &mut work);
+            g7(&mut ledger, &mut work, old, 2);
+            replace(&mut ledger, &mut work, old);
+            let charged = g7(&mut ledger, &mut work, new, 3);
+            let mut loaded = file.clone();
+            ledger.begin_index_pass(ns, 300, &mut loaded);
+            assert_eq!(
+                tags(&ledger, ns),
+                BTreeMap::from([(old, (LedgerTag::Gone, 2)), (new, (LedgerTag::Live, 3))]),
+                "{old_ino} -> {new_ino}"
+            );
+            assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&charged));
+        }
+    }
+
+    /// D5′ (ii), the parent's counterexample: a partial save, then a replace
+    /// and a charge in the same pass, then a failed full save. The partial
+    /// save's mark does not cover the later charge.
+    #[test]
+    fn d5_partial_save_before_a_replace_then_failure_keeps_the_new_charge() {
+        if !layout_supported() {
+            return;
+        }
+        for (old_ino, new_ino) in [(5, 9), (9, 5)] {
+            let ns = 22;
+            let (old, new) = (pkey(ns, old_ino), pkey(ns, new_ino));
+            let mut ledger = SideLedger::default();
+            let mut work = index_with_p();
+            ledger.begin_index_pass(ns, 100, &mut work);
+            g7(&mut ledger, &mut work, old, 1);
+            let partial = save(&mut ledger, &work, ns, false);
+            replace(&mut ledger, &mut work, old);
+            let charged = g7(&mut ledger, &mut work, new, 2);
+            // The full save fails: no C15.
+            let mut loaded = partial.clone();
+            ledger.begin_index_pass(ns, 200, &mut loaded);
+            assert_eq!(
+                tags(&ledger, ns),
+                BTreeMap::from([(old, (LedgerTag::Gone, 1)), (new, (LedgerTag::Live, 2))]),
+                "{old_ino} -> {new_ino}"
+            );
+            assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&charged));
+        }
+    }
+
+    /// D5′ (iii) and (iii′): a saved replacement prunes both keys; a later
+    /// replace written after that save's mark, then a failure, is kept.
+    #[test]
+    fn d5_saved_replacement_prunes_and_a_later_unsaved_replace_is_kept() {
+        if !layout_supported() {
+            return;
+        }
+        for (old_ino, new_ino, third_ino) in [(5, 9, 13), (13, 9, 5)] {
+            let ns = 23;
+            let (old, new, third) = (pkey(ns, old_ino), pkey(ns, new_ino), pkey(ns, third_ino));
+            let mut ledger = SideLedger::default();
+            let mut work = index_with_p();
+            ledger.begin_index_pass(ns, 100, &mut work);
+            g7(&mut ledger, &mut work, old, 1);
+            replace(&mut ledger, &mut work, old);
+            let saved_request = g7(&mut ledger, &mut work, new, 2);
+            let file = save(&mut ledger, &work, ns, true);
+            let mut loaded = file.clone();
+            ledger.begin_index_pass(ns, 200, &mut loaded);
+            assert_eq!(tags(&ledger, ns), BTreeMap::new());
+            assert_eq!(
+                loaded.codex_parent_side_requests.get(P),
+                Some(&saved_request)
+            );
+            // (iii′) This pass replaces again after the save, then fails.
+            g7(&mut ledger, &mut loaded, new, 3);
+            replace(&mut ledger, &mut loaded, new);
+            let charged = g7(&mut ledger, &mut loaded, third, 1);
+            let mut reloaded = file.clone();
+            ledger.begin_index_pass(ns, 300, &mut reloaded);
+            assert_eq!(
+                tags(&ledger, ns),
+                BTreeMap::from([(new, (LedgerTag::Gone, 3)), (third, (LedgerTag::Live, 1))])
+            );
+            assert_eq!(reloaded.codex_parent_side_requests.get(P), Some(&charged));
+        }
+    }
+
+    /// D5′ (iv): a namespace whose slot was replaced comes back with a fresh
+    /// slot and no proven save, so its mismatched entry is kept; the
+    /// namespace that reused its slot index is never pruned by its marks.
+    #[test]
+    fn d5_replaced_or_reused_slot_proves_nothing() {
+        if !layout_supported() {
+            return;
+        }
+        let x = 31;
+        let mut ledger = SideLedger::default();
+        let mut work = index_with_p();
+        ledger.begin_index_pass(x, 100, &mut work);
+        let stale = g7(&mut ledger, &mut work, pkey(x, 5), 1);
+        save(&mut ledger, &work, x, true);
+        // A file that now holds another object for P.
+        let mut other = index_with_p();
+        other.codex_parent_side_requests.insert(
+            P.into(),
+            SideRequest {
+                dev_ino: (1, 77),
+                ..stale
+            },
+        );
+        let at = ledger
+            .gate
+            .iter()
+            .position(|slot| slot.is_some_and(|slot| slot.ns == x))
+            .unwrap();
+        for ns in 100..100 + GATE_SLOTS as u128 {
+            ledger.begin_pass(ns, 200 + ns as u64);
+        }
+        assert!(ledger.slot(x).is_none());
+        let y = ledger.gate[at].unwrap().ns;
+        // Y's entry is stamped before X's save (inside X's old watermark).
+        ledger.entries.insert(
+            pkey(y, 6),
+            LedgerEntry {
+                attempts: 4,
+                wseq: 1,
+                ..entry()
+            },
+        );
+        let mut loaded = other.clone();
+        ledger.begin_index_pass(y, 400, &mut loaded);
+        assert_eq!(tags(&ledger, y).len(), 1, "Y's entry is kept");
+        // X's fresh slot: the earlier save proves nothing.
+        let mut loaded = other.clone();
+        ledger.begin_index_pass(x, 500, &mut loaded);
+        assert_eq!(
+            tags(&ledger, x),
+            BTreeMap::from([(pkey(x, 5), (LedgerTag::Live, 1))])
+        );
+        assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&stale));
+    }
+
+    /// D5′ custody: a save callback with a mark read for a slot that was
+    /// replaced and re-placed since, or for another namespace, moves no
+    /// watermark and does not open the gate.
+    #[test]
+    fn d5_stale_or_foreign_marks_move_nothing() {
+        let (x, y) = (41, 42);
+        let mut ledger = SideLedger::default();
+        ledger.begin_pass(x, 100);
+        ledger.begin_pass(y, 100);
+        let stale = ledger.save_mark(x);
+        for ns in 100..100 + GATE_SLOTS as u128 {
+            ledger.begin_pass(ns, 200 + ns as u64);
+        }
+        ledger.begin_pass(x, 300);
+        let fresh = *ledger.slot(x).unwrap();
+        assert_ne!(fresh.incarnation, stale.incarnation);
+        ledger.note_saved(x, 310, true, stale);
+        assert_eq!(*ledger.slot(x).unwrap(), fresh);
+        assert!(!ledger.begin_pass(x, 320).side_allowed);
+        // Another namespace's mark never lands on this slot.
+        ledger.begin_pass(y, 330);
+        let y_slot = *ledger.slot(y).unwrap();
+        ledger.note_saved(y, 340, true, ledger.save_mark(x));
+        assert_eq!(*ledger.slot(y).unwrap(), y_slot);
+        // A current mark does.
+        let mark = ledger.save_mark(y);
+        ledger.note_saved(y, 350, true, mark);
+        let saved = ledger.slot(y).unwrap();
+        assert!(saved.saved);
+        assert_eq!(
+            (saved.saved_wseq, saved.full_saved_wseq),
+            (ledger.wseq, ledger.wseq)
+        );
+    }
+
+    /// D5′ (v): once the stamp runs out nothing is covered: no mark, no
+    /// watermark move, mismatched entries kept, no lossless eviction; idle
+    /// eviction still applies.
+    #[test]
+    fn d5_exhausted_stamps_preserve_every_charge() {
+        if !layout_supported() {
+            return;
+        }
+        let ns = 51;
+        let mut ledger = SideLedger::default();
+        ledger.wseq = u32::MAX - 2;
+        let mut work = index_with_p();
+        ledger.begin_index_pass(ns, 100, &mut work);
+        let old = pkey(ns, 5);
+        g7(&mut ledger, &mut work, old, 1);
+        assert!(!ledger.wseq_exhausted);
+        replace(&mut ledger, &mut work, old);
+        assert!(ledger.wseq_exhausted);
+        assert_eq!(ledger.get(&old).unwrap().wseq, 0);
+        assert_eq!(ledger.save_mark(ns).wseq, None);
+        let charged = g7(&mut ledger, &mut work, pkey(ns, 9), 2);
+        let before = *ledger.slot(ns).unwrap();
+        save(&mut ledger, &work, ns, true);
+        let after = *ledger.slot(ns).unwrap();
+        assert!(after.saved, "the gate still behaves as today");
+        assert_eq!(
+            (after.saved_wseq, after.full_saved_wseq),
+            (before.saved_wseq, before.full_saved_wseq)
+        );
+        let mut other = index_with_p();
+        other.codex_parent_side_requests.insert(
+            P.into(),
+            SideRequest {
+                dev_ino: (1, 88),
+                ..charged
+            },
+        );
+        ledger.begin_index_pass(ns, 200, &mut other);
+        assert_eq!(tags(&ledger, ns).len(), 2, "both kept");
+        // Fill the ledger from this namespace; another namespace's charge
+        // finds nothing lossless, and evicts only once this one is idle.
+        for p in 1..=(MAX_SIDE_LEDGER as u128 - 2) {
+            ledger.charge(key(ns, p), entry(), 200).unwrap();
+        }
+        assert_eq!(ledger.len(), MAX_SIDE_LEDGER);
+        ledger.begin_pass(52, 300);
+        assert_eq!(
+            ledger.charge(key(52, 1), entry(), 300),
+            Err(ChargeRefusal::Full)
+        );
+        assert_eq!(ledger.charge(key(52, 1), entry(), 110 + 3600), Ok(true));
+    }
+
+    /// D5′ (vii): a write between the mark and the successful save's
+    /// callback is not covered by it.
+    #[test]
+    fn d5_a_write_after_the_mark_is_not_covered() {
+        if !layout_supported() {
+            return;
+        }
+        let ns = 61;
+        let (old, new) = (pkey(ns, 5), pkey(ns, 9));
+        let mut ledger = SideLedger::default();
+        let mut work = index_with_p();
+        ledger.begin_index_pass(ns, 100, &mut work);
+        g7(&mut ledger, &mut work, old, 1);
+        let mark = ledger.save_mark(ns);
+        let file = work.clone();
+        replace(&mut ledger, &mut work, old);
+        let charged = g7(&mut ledger, &mut work, new, 2);
+        ledger.note_saved(ns, 110, true, mark);
+        let mut loaded = file.clone();
+        ledger.begin_index_pass(ns, 200, &mut loaded);
+        assert_eq!(
+            tags(&ledger, ns),
+            BTreeMap::from([(old, (LedgerTag::Gone, 1)), (new, (LedgerTag::Live, 2))])
+        );
+        assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&charged));
+    }
+
+    /// D5′ sizes: the entry and slot keep their cleared sizes, so the heap
+    /// formula is unchanged; the ledger's inline growth is inside
+    /// `size_of::<SharedCache>()`, which the whole-cache bound charges once
+    /// beside the constant (never twice).
+    #[test]
+    fn d5_inline_ledger_is_in_the_cache_size_and_the_heap_formula_holds() {
+        use crate::heap_layout_bound::HeapLayoutBound;
+        assert_eq!(size_of::<LedgerEntry>(), 96);
+        assert_eq!(size_of::<GateSlot>(), 48);
+        assert_eq!(size_of::<Option<GateSlot>>(), 48);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_of::<SideLedger>(), 560);
+        assert!(size_of::<SharedCache>() >= size_of::<std::sync::Mutex<SideLedger>>());
+        if !layout_supported() {
+            return;
+        }
+        let cache = std::sync::Arc::new(SharedCache::default());
+        let mut whole = Counter::new(usize::MAX);
+        cache.heap_bound(&mut whole).unwrap();
+        let mut parts = Counter::new(usize::MAX);
+        cache.inner.heap_bound(&mut parts).unwrap();
+        cache.cursor.heap_bound(&mut parts).unwrap();
+        assert_eq!(
+            whole.bytes,
+            size_of::<SharedCache>()
+                + std::mem::align_of::<SharedCache>()
+                + 2 * size_of::<usize>()
+                + parts.bytes
+                + SIDE_LEDGER_BYTES
+        );
     }
 
     #[test]
