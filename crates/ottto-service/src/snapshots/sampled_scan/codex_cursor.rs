@@ -902,9 +902,23 @@ fn drop_suspended_proof_over(
     reserve: usize,
     budget: Option<usize>,
 ) {
+    if retire_suspended_proof_over(retained, cursor, reserve, budget) {
+        record_proof_drop();
+    }
+}
+
+/// `drop_suspended_proof_over`'s test and drop, uncounted: true when the
+/// suspended proof was retired (its box freed here, under the cursor lock;
+/// a `ProofJob` drop takes no lock). The caller counts the drop's cause.
+fn retire_suspended_proof_over(
+    retained: &super::RetainedCache,
+    cursor: &mut CursorState,
+    reserve: usize,
+    budget: Option<usize>,
+) -> bool {
     use crate::heap_layout_bound::bound;
     if matches!(cursor.proof, ProofHolder::None) {
-        return;
+        return false;
     }
     let fits = bound(&*cursor, STATE_BYTES)
         .zip(bound(retained, STATE_BYTES))
@@ -917,8 +931,8 @@ fn drop_suspended_proof_over(
         .is_some();
     if !fits {
         cursor.proof = ProofHolder::None;
-        record_proof_drop();
     }
+    !fits
 }
 
 /// Content-free RAM counters. They reach the scan's one completion log
@@ -2809,9 +2823,12 @@ impl SharedCache {
 
     /// Everything the cursor state holds (paused job, memo, parked, rotation
     /// and invalidation records, a suspended proof). An unbounded state reads
-    /// as the whole budget. Since U1a-2a ss-6 the insert reserves
-    /// `cursor_resident_for_main`; M1's `release_to_fit` and
-    /// `release_older_to_fit` still measure this whole state (U1a-2a D6(e)).
+    /// as the whole budget. Main's measures leave the suspended proof out:
+    /// the retained insert (U1a-2a ss-6) and M1's `release_to_fit` and
+    /// `release_older_to_fit` (D6(e), `release_room_for_main`) reserve
+    /// `cursor_resident_for_main` and retire the proof under their lock;
+    /// this whole-state measure is for tests.
+    #[cfg(test)]
     pub(super) fn cursor_resident(&self) -> usize {
         self.with_cursor(|cursor| crate::heap_layout_bound::bound(&*cursor, STATE_BYTES))
             .flatten()
@@ -2844,6 +2861,41 @@ impl SharedCache {
             .checked_sub(live_bytes_in)
             .and_then(|room| room.checked_sub(super::side_ledger::SIDE_LEDGER_BYTES));
         self.with_cursor(|cursor| drop_suspended_proof_over(retained, cursor, 0, budget));
+    }
+
+    /// U1a-2a D6(e): M1's release room, under the caller's retained lock, in
+    /// one cursor critical section (retained, then cursor; nothing relocks).
+    /// The room is main's: `STATE_BYTES` less `state_for_main` (no suspended
+    /// proof) and `pinned`, which carries the side ledger's fixed charge
+    /// once (`context_overhead`), as `heap_bound` and `admission_budget` do.
+    /// Only where `reachable(room)` holds (the caller's fit can be met) is a
+    /// suspended proof retired, and only when the whole state (the proof
+    /// included), the copies and `pinned` overflow `STATE_BYTES`; counted
+    /// `side_proof_release_drops`, never a retained release cause. So the
+    /// proof's bytes count toward the fit before any copy is evicted, and
+    /// the room returned is the no-proof one. Nothing mandatory (main's
+    /// state, a reservation, the side ledger) is touched. None, with nothing
+    /// dropped: the cursor lock is poisoned, main's state is unbounded, the
+    /// room is short, or `reachable` refuses it.
+    pub(super) fn release_room_for_main(
+        &self,
+        retained: &super::RetainedCache,
+        pinned: usize,
+        reachable: impl FnOnce(usize) -> bool,
+    ) -> Option<usize> {
+        self.with_cursor(|cursor| {
+            let room = STATE_BYTES
+                .checked_sub(state_for_main(cursor)?)?
+                .checked_sub(pinned)
+                .filter(|room| reachable(*room))?;
+            if retire_suspended_proof_over(retained, cursor, pinned, Some(STATE_BYTES)) {
+                crate::local_resource_diagnostics::codex_side_lifecycle::record(
+                    crate::local_resource_diagnostics::codex_side_lifecycle::Event::ProofReleaseDrop,
+                );
+            }
+            Some(room)
+        })
+        .flatten()
     }
 
     /// U1a-2a (cc rows 1, 5; rev 11 §5.3, rev 12): the proof hook's claim on

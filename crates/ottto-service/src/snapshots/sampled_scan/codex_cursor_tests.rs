@@ -8804,3 +8804,284 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         assert_eq!(cache.cursor_reserved(), 0);
     });
 }
+
+// ---------------------------------------------------------------------------
+// U1a-2a D6(e): M1's release to fit measures main's cursor state (no
+// suspended proof) and retires the proof first, under the same locks.
+
+type SideCounts = crate::local_resource_diagnostics::codex_side_lifecycle::Counts;
+type CacheCounts = crate::local_resource_diagnostics::cache_lifecycle::Counts;
+
+/// The `FILLERS` filled shared cache (`cache_policy_tests::filled_cache`),
+/// with a suspended proof when `proof`, and its measures.
+struct ReleaseScene {
+    cache: Arc<SharedCache>,
+    /// Main's cursor state (`cursor_resident_for_main`).
+    main: usize,
+    /// The retained copies' bound.
+    resident: usize,
+    /// One filler's charge.
+    filler: usize,
+    /// The proof's charge (suspended only when `proof`).
+    proof: usize,
+}
+impl ReleaseScene {
+    fn new(proof: bool) -> Self {
+        let (cache, filler) = crate::snapshots::cache_policy_tests::filled_cache();
+        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+        let charge = proof_charge(&job);
+        if proof {
+            assert!(
+                suspend(&cache, job),
+                "precondition: the proof fits beside the fillers"
+            );
+        }
+        let main = cache.cursor_resident_for_main();
+        assert_eq!(
+            cache.cursor_resident(),
+            main + if proof { charge } else { 0 }
+        );
+        Self {
+            resident: retained_floor(&cache),
+            cache,
+            main,
+            filler,
+            proof: charge,
+        }
+    }
+    /// The `pinned` at which the copies fit exactly beside main's state.
+    fn exact(&self) -> usize {
+        STATE_BYTES - self.main - self.resident
+    }
+    /// `pinned` at which even an empty retained cache would not fit.
+    fn unreachable(&self) -> usize {
+        let floor =
+            crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), STATE_BYTES)
+                .unwrap();
+        STATE_BYTES - self.main - floor + 1
+    }
+    /// M1's release (`release_to_fit`) or Path A (`release_older_to_fit`)
+    /// at `rank`, observing both counter sets.
+    fn release(
+        &self,
+        pinned: usize,
+        path_a: Option<(i64, i64)>,
+    ) -> (bool, SideCounts, CacheCounts) {
+        let ((released, side), counts) =
+            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+                crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| match path_a {
+                    Some(rank) => self.cache.release_older_to_fit(pinned, rank),
+                    None => self.cache.release_to_fit(pinned),
+                })
+            });
+        (released, side, counts)
+    }
+    fn fillers(&self) -> usize {
+        crate::snapshots::cache_policy_tests::fillers_resident(&self.cache)
+    }
+    /// What the release charged, all of it: the copies, the whole cursor
+    /// state (any proof left included) and `pinned`.
+    fn charged(&self, pinned: usize) -> usize {
+        retained_floor(&self.cache) + self.cache.cursor_resident() + pinned
+    }
+}
+
+fn evicted(counts: &CacheCounts) -> (u64, u64, u64) {
+    (
+        counts.copy_refusal_entries_evicted,
+        counts.copy_refusal_admission_evicted,
+        counts.copy_refusal_bytes_released,
+    )
+}
+
+const NONE_OLDER: (i64, i64) = (0, 0);
+const ALL_OLDER: (i64, i64) = (i64::MAX, 0);
+
+/// D6(e) (a), (d): over budget only beside a suspended proof. M1's release
+/// retires the proof first, counted under its own cause, and evicts no
+/// copy; with room for both, the proof stays. One retained lock, then one
+/// cursor critical section: the proof's box is freed under them (a
+/// `ProofJob` and its readers have no `Drop` that locks), a relock would
+/// trip the `retained` and `with_cursor` debug guards, and both locks are
+/// free and unpoisoned after.
+#[test]
+fn release_to_fit_retires_a_suspended_proof_before_any_copy() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    let scene = ReleaseScene::new(true);
+    let pinned = scene.exact() - scene.proof;
+    let (released, side, counts) = scene.release(pinned, None);
+    assert!(released);
+    assert!(scene.cache.proof_suspended_for_test().is_some());
+    assert_eq!(side, SideCounts::default());
+    assert_eq!(evicted(&counts), (0, 0, 0));
+    assert_eq!(scene.charged(pinned), STATE_BYTES);
+    // One byte more: the proof goes, and no copy does.
+    let (released, side, counts) = scene.release(pinned + 1, None);
+    assert!(released);
+    assert_eq!(scene.cache.proof_suspended_for_test(), None);
+    assert_eq!(
+        (side.side_proof_release_drops, side.side_proof_drops),
+        (1, 0)
+    );
+    assert_eq!(evicted(&counts), (0, 0, 0), "{counts:?}");
+    assert_eq!(scene.fillers(), FILLERS);
+    assert_eq!(scene.cache.cursor_resident(), scene.main);
+    assert!(scene.charged(pinned + 1) <= STATE_BYTES);
+    // (d) Nothing is held, locked or poisoned after the drop.
+    assert!(!cursor_held());
+    assert!(scene.cache.inner.try_lock().is_ok());
+    assert!(scene.cache.cursor.try_lock().is_ok());
+    assert_eq!(scene.cache.cursor_reserved(), 0);
+}
+
+/// D6(e) (b): Path A likewise, with no copy ranked older than the tail: an
+/// overflow the proof covers retires the proof and evicts nothing; one past
+/// it cannot fit, so nothing goes, the proof included (fit-or-nothing).
+#[test]
+fn release_older_to_fit_retires_the_proof_only_where_path_a_fits() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    let scene = ReleaseScene::new(true);
+    let (released, side, counts) = scene.release(scene.exact() + 1, Some(NONE_OLDER));
+    assert!(!released);
+    assert!(scene.cache.proof_suspended_for_test().is_some());
+    assert_eq!(side, SideCounts::default());
+    assert_eq!(evicted(&counts), (0, 0, 0));
+    let pinned = scene.exact() - scene.proof + 1;
+    let (released, side, counts) = scene.release(pinned, Some(NONE_OLDER));
+    assert!(released);
+    assert_eq!(scene.cache.proof_suspended_for_test(), None);
+    assert_eq!(
+        (side.side_proof_release_drops, side.side_proof_drops),
+        (1, 0)
+    );
+    assert_eq!(evicted(&counts), (0, 0, 0), "{counts:?}");
+    assert_eq!(scene.fillers(), FILLERS);
+    assert!(scene.charged(pinned) <= STATE_BYTES);
+}
+
+/// D6(e) (c) and no-proof parity: an overflow past the proof retires the
+/// proof first, then evicts in victim order only what main's room still
+/// needs, exactly what the same release evicts with no proof (one copy),
+/// for M1's release and for Path A with every copy ranked older.
+#[test]
+fn a_proof_smaller_than_the_overflow_goes_first_then_the_minimal_copies() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    for path_a in [None, Some(ALL_OLDER)] {
+        let mut outcomes = Vec::new();
+        for proof in [true, false] {
+            let scene = ReleaseScene::new(proof);
+            assert!(scene.proof < scene.filler / 2, "precondition");
+            let pinned = scene.exact() + scene.filler / 2;
+            let (released, side, counts) = scene.release(pinned, path_a);
+            assert!(released, "{path_a:?} proof={proof}");
+            assert_eq!(scene.cache.proof_suspended_for_test(), None);
+            assert_eq!(
+                (side.side_proof_release_drops, side.side_proof_drops),
+                (u64::from(proof), 0)
+            );
+            assert!(scene.charged(pinned) <= STATE_BYTES);
+            outcomes.push((
+                counts.copy_refusal_entries_evicted,
+                counts.copy_refusal_admission_evicted,
+                scene.fillers(),
+            ));
+        }
+        assert_eq!(outcomes[0], outcomes[1], "the no-proof decision");
+        let one = if path_a.is_some() { (0, 1) } else { (1, 0) };
+        assert_eq!(outcomes[0], (one.0, one.1, FILLERS - 1), "{path_a:?}");
+    }
+}
+
+/// D6(e) no-proof parity and the charge bound: with no proof, main's measure
+/// is the whole cursor state, so M1's limit is unchanged. `pinned` carries
+/// the side ledger's fixed charge once and nothing adds it again: copies
+/// fitting exactly beside main's state and `pinned` evict nothing (as the
+/// cursor admission floor agrees, F4b), one byte more evicts one copy, an
+/// unreachable fit evicts nothing. No proof drop is counted.
+#[test]
+fn with_no_proof_the_release_is_m1s() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    use crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+    let scene = ReleaseScene::new(false);
+    assert_eq!(scene.cache.cursor_resident(), scene.main);
+    let exact = scene.exact();
+    assert!(exact > SIDE_LEDGER_BYTES, "precondition");
+    let (credit, counts) = observe(|| scene.cache.cursor_reserve(exact - SIDE_LEDGER_BYTES));
+    credit
+        .expect("F4b: the cursor admission floor agrees")
+        .refund();
+    assert_eq!(counts.cursor_reservation_entries_evicted, 0);
+    for path_a in [Some(NONE_OLDER), None] {
+        for (pinned, fits) in [
+            (exact, true),
+            (scene.unreachable(), false),
+            (usize::MAX, false),
+        ] {
+            let (released, side, counts) = scene.release(pinned, path_a);
+            assert_eq!(released, fits, "{path_a:?} {pinned}");
+            assert_eq!(side, SideCounts::default());
+            assert_eq!(evicted(&counts), (0, 0, 0));
+            assert_eq!(scene.fillers(), FILLERS);
+        }
+    }
+    let (released, side, counts) = scene.release(exact + 1, Some(NONE_OLDER));
+    assert!(!released, "nothing older: Path A fits or evicts nothing");
+    assert_eq!((side, evicted(&counts)), (SideCounts::default(), (0, 0, 0)));
+    let (released, side, counts) = scene.release(exact + 1, None);
+    assert!(released);
+    assert_eq!(side, SideCounts::default());
+    assert_eq!(counts.copy_refusal_entries_evicted, 1);
+    assert_eq!(scene.fillers(), FILLERS - 1);
+    assert!(scene.charged(exact + 1) <= STATE_BYTES);
+}
+
+/// D6(e): a release that cannot measure keeps M1's refusal and drops no
+/// proof: an unreachable fit, a `pinned` past the budget, unsupported
+/// (overflowing) cursor accounting, a poisoned cursor lock. No copy goes.
+#[test]
+fn a_release_without_a_measure_drops_no_proof() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    let scene = ReleaseScene::new(true);
+    let overflow = scene.exact() + scene.filler / 2;
+    let refuses = |pinned: usize, label: &str| {
+        for path_a in [None, Some(ALL_OLDER)] {
+            let (released, side, counts) = scene.release(pinned, path_a);
+            assert!(!released, "{label} {path_a:?}");
+            assert_eq!(side, SideCounts::default(), "{label}");
+            assert_eq!(evicted(&counts), (0, 0, 0), "{label}");
+            assert_eq!(scene.fillers(), FILLERS, "{label}");
+        }
+    };
+    refuses(scene.unreachable(), "unreachable");
+    refuses(usize::MAX, "past the budget");
+    assert!(scene.cache.proof_suspended_for_test().is_some());
+    scene
+        .cache
+        .with_cursor(|cursor| cursor.reserved = usize::MAX);
+    refuses(overflow, "unsupported accounting");
+    scene.cache.with_cursor(|cursor| cursor.reserved = 0);
+    assert!(scene.cache.proof_suspended_for_test().is_some());
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        scene.cache.with_cursor(|_| panic!("poison the cursor"));
+    }));
+    assert!(unwound.is_err());
+    assert!(!cursor_held());
+    refuses(overflow, "poisoned cursor");
+}

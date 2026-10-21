@@ -83,28 +83,36 @@ impl SharedCache {
     /// poisoned, the cursor state is unbounded or poisoned, or even an empty
     /// cache would not fit. Evicted copies drop under the retained lock, as
     /// `clear` drops them; no guard or credit drops there, so nothing relocks.
+    /// U1a-2a D6(e): the cursor state is main's, without a suspended proof;
+    /// where the fit is reachable, that proof is retired first, under these
+    /// same locks, if the copies overflow beside it, so its bytes count
+    /// toward the fit before any copy is evicted (`release_room_for_main`).
     pub(super) fn release_to_fit(&self, pinned: usize) -> bool {
         let Ok(mut retained) = self.retained() else {
             return false;
         };
         let floor = crate::heap_layout_bound::bound(&RetainedCache::default(), STATE_BYTES);
-        STATE_BYTES
-            .checked_sub(self.cursor_resident())
-            .and_then(|room| room.checked_sub(pinned))
-            .filter(|limit| floor.is_some_and(|floor| floor <= *limit))
-            .is_some_and(|limit| retained.release_until_for(limit, Release::CopyRefusal))
+        let Some(limit) = self.release_room_for_main(&retained, pinned, |limit| {
+            floor.is_some_and(|floor| floor <= limit)
+        }) else {
+            return false;
+        };
+        retained.release_until_for(limit, Release::CopyRefusal)
     }
     /// M1 Path A: `release_to_fit`, evicting only retained copies ranked
     /// strictly below `rank`, and only where evicting them makes room;
-    /// otherwise nothing (`TranscriptCache::release_older_until`).
+    /// otherwise nothing, the suspended proof included
+    /// (`TranscriptCache::release_older_until`, `older_release_fits`).
     pub(super) fn release_older_to_fit(&self, pinned: usize, rank: (i64, i64)) -> bool {
         let Ok(mut retained) = self.retained() else {
             return false;
         };
-        STATE_BYTES
-            .checked_sub(self.cursor_resident())
-            .and_then(|room| room.checked_sub(pinned))
-            .is_some_and(|limit| retained.release_older_until(limit, rank))
+        let Some(limit) = self.release_room_for_main(&retained, pinned, |limit| {
+            retained.older_release_fits(limit, rank)
+        }) else {
+            return false;
+        };
+        retained.release_older_until(limit, rank)
     }
     pub(super) fn take(
         &self,

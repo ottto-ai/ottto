@@ -1258,7 +1258,7 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        // Option B: exactly nine lifetime totals and five last-measured gauges.
+        // Option B: exactly ten lifetime totals and five last-measured gauges.
         assert_eq!(
             keys,
             [
@@ -1266,6 +1266,7 @@ mod tests {
                 "side_ledger_evictions",
                 "side_not_due",
                 "side_proof_drops",
+                "side_proof_release_drops",
                 "side_reads_ended",
                 "side_reads_started",
                 "side_record_bytes",

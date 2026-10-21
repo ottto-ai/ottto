@@ -53,8 +53,12 @@ counters! {
     side_not_due: NotDue,
     // Ledger housekeeping: a lossless eviction or a replaced gate slot.
     side_ledger_evictions: LedgerEviction,
-    // A proof item was dropped or a proof page was skipped.
+    // A proof item was dropped or a proof page was skipped (not counting
+    // `side_proof_release_drops`).
     side_proof_drops: ProofDrop,
+    // M1's release to fit retired a suspended proof before evicting any
+    // retained copy (D6(e)); never a retained release cause.
+    side_proof_release_drops: ProofReleaseDrop,
 }
 
 /// Last measured side state (`set_gauges` only), never a lifetime sum.
