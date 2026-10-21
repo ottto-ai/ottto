@@ -17678,7 +17678,7 @@ impl SideOrigin {
 pub(in crate::snapshots) enum SideReadEnd {
     /// Rows 1–3: a certificate, the side seal minted from it, and the held
     /// file's length at the commit.
-    Certified { parse: SideMainParse, len: u64 },
+    Certified { parse: Box<SideMainParse>, len: u64 },
     /// Row 5: the source report showed data loss.
     Lossy,
     /// Row 6: no certificate otherwise (already charged).
@@ -17836,7 +17836,7 @@ impl ScanIndex {
         let tombstone = match end {
             SideReadEnd::Certified { parse, len } => {
                 let covered = parse.seal.sealed_offset();
-                let written = self.write_codex_parent_side_from_main(p_key, &[], parse, side);
+                let written = self.write_codex_parent_side_from_main(p_key, &[], *parse, side);
                 self.side_request_view(p_key, dev_ino, side)
                     .map(|mut request| {
                         request.state = if written {
@@ -20789,7 +20789,7 @@ impl OwnedSourceScan {
                     let end = match side_certificate {
                         Some((SideCertificate::Certified { completed, len }, Some(parsed))) => {
                             SideReadEnd::Certified {
-                                parse: SideMainParse {
+                                parse: Box::new(SideMainParse {
                                     seal: completed.checkpoint.seal_as(
                                         sampled_scan::now_seconds(),
                                         &codex_parent_side_scope(),
@@ -20797,7 +20797,7 @@ impl OwnedSourceScan {
                                     parsed,
                                     verdict: codex_parent_side_verdict(&parsed_file),
                                     unsealed: completed.unsealed,
-                                },
+                                }),
                                 len,
                             }
                         }
