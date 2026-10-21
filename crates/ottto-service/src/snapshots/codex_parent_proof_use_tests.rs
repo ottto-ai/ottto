@@ -833,3 +833,301 @@ fn the_record_site_settles_the_entry_per_the_table() {
         assert_eq!(state(&index), None, "{parent:?}");
     }
 }
+
+// U1a-2a row 33 (D6(c)/(d)): the job's readers and lockstep.
+
+fn job_of(parent: &Path, children: &[&Path]) -> CodexProofReaders {
+    let now = sampled_scan::now_seconds();
+    let parent_reader = CodexProofReader::parent(
+        local_index_key(parent),
+        parent.to_path_buf(),
+        File::open(parent).unwrap(),
+        now,
+    )
+    .unwrap();
+    let children = children
+        .iter()
+        .map(|child| {
+            CodexProofReader::child(
+                local_index_key(child),
+                child.to_path_buf(),
+                File::open(child).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    CodexProofReaders::new(PARENT.into(), parent_reader, now, children)
+}
+
+fn run_to_end(job: &mut CodexProofReaders) -> Vec<ChildResult> {
+    let mut budget = u64::MAX;
+    assert_eq!(job.run(&mut budget), CodexProofRun::Done);
+    job.children
+        .iter()
+        .map(|child| child.result.expect("every child has a result"))
+        .collect()
+}
+
+/// End offset of `values[..=row]` as `write_values` lays them out.
+fn row_end(values: &[Value], row: usize) -> u64 {
+    values[..=row]
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap().len() as u64 + 1)
+        .sum()
+}
+
+fn unsigned(timestamp: &str) -> Value {
+    json!({"timestamp": timestamp, "type": "response_item", "payload": {"type": "message", "role": "user"}})
+}
+
+fn proven_from(result: ChildResult) -> CodexParentPrefixProof {
+    let ChildResult::Decided {
+        matched,
+        digest,
+        owned,
+        ..
+    } = result
+    else {
+        panic!("not decided: {result:?}");
+    };
+    CodexParentPrefixProof {
+        parent: PARENT.into(),
+        parent_seal: unused_seal(),
+        matched,
+        child_digest: codex_digest_hex(&digest),
+        owned,
+        published: false,
+    }
+}
+
+/// Ledger/ring parity: each job child's result is the decision main's arm
+/// makes from P's complete ledger, and a decided child's proof reparses
+/// (under main's cap hold) exactly as the complete ledger does. Covers an
+/// owned divergence, a hold at 0, P exhausted, the child exhausted, another
+/// parent, an unsigned record between matches, and a boundary-buffer
+/// overflow (count-only in job mode, the same 64-record rule).
+#[test]
+fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
+    let root = temp_root("job-parity");
+    let parent = rollout(&root, PARENT);
+    let parent_rows = parent_values();
+    write_values(&parent, &parent_rows);
+    let meta = |id: &str, from: &str| json!({"timestamp": "2026-08-02T08:20:00Z", "type": "session_meta", "payload": {"id": id, "forked_from_id": from, "thread_source": "user"}});
+    let local = [
+        turn("2026-08-02T08:20:01Z", "child-local"),
+        tokens("2026-08-02T08:20:02Z", (115, 92, 13, 3), (15, 12, 3, 1)),
+    ];
+    let fixture = |name: &str, values: Vec<Value>| {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let path = rollout(&dir, CHILD);
+        write_values(&path, &values);
+        (path, values)
+    };
+    let owned = fixture("owned", child_values());
+    let held = fixture(
+        "held",
+        vec![meta(CHILD, PARENT), local[0].clone(), local[1].clone()],
+    );
+    let parent_exhausted = fixture("p-exhausted", {
+        let mut values = vec![meta(CHILD, PARENT)];
+        values.extend(parent_rows[1..].iter().cloned());
+        values.extend(local.iter().cloned());
+        values
+    });
+    let child_exhausted = fixture(
+        "c-exhausted",
+        vec![meta(CHILD, PARENT), parent_rows[1].clone()],
+    );
+    let other = fixture("other", {
+        let mut values = child_values();
+        values[0] = meta(CHILD, OTHER);
+        values
+    });
+    let gap = fixture(
+        "gap",
+        vec![
+            meta(CHILD, PARENT),
+            parent_rows[1].clone(),
+            unsigned("2026-08-02T08:00:01Z"),
+            parent_rows[2].clone(),
+            local[0].clone(),
+            local[1].clone(),
+        ],
+    );
+    let overflow = fixture("overflow", {
+        let mut values = vec![meta(CHILD, PARENT), parent_rows[1].clone()];
+        values.extend((0..65).map(|_| unsigned("2026-08-02T08:00:01Z")));
+        values.extend([parent_rows[2].clone(), local[0].clone(), local[1].clone()]);
+        values
+    });
+
+    let mut first = job_of(
+        &parent,
+        &[&owned.0, &held.0, &parent_exhausted.0, &child_exhausted.0],
+    );
+    let mut second = job_of(&parent, &[&other.0, &gap.0, &overflow.0]);
+    let results = [run_to_end(&mut first), run_to_end(&mut second)].concat();
+    // P's signature 2 is its row 3 (the session_meta row is unsigned).
+    let at_m2 = row_end(&parent_rows, 3);
+    let at_m0 = row_end(&parent_rows, 1);
+    let expect_owned = proof_of(&owned.1, &parent_rows, unused_seal());
+    assert_eq!(
+        results[0],
+        ChildResult::Decided {
+            matched: 2,
+            digest: codex_digest_from_hex(&expect_owned.child_digest).unwrap(),
+            owned: true,
+            at: at_m2,
+        }
+    );
+    assert!(matches!(
+        results[1],
+        ChildResult::Decided { matched: 0, owned: false, at, .. } if at == at_m0
+    ));
+    assert_eq!(results[2], ChildResult::ParentExhausted);
+    assert_eq!(results[3], ChildResult::ChildExhausted);
+    assert_eq!(results[4], ChildResult::NotAFork);
+    assert!(matches!(
+        results[5],
+        ChildResult::Decided { matched: 2, owned: true, at, .. } if at == at_m2
+    ));
+    assert_eq!(results[6], ChildResult::Undecidable);
+
+    // Decided → the proof reparses exactly as the complete ledger.
+    for (path, result) in [
+        (&owned.0, results[0]),
+        (&held.0, results[1]),
+        (&gap.0, results[5]),
+    ] {
+        let ledger = parse(path, complete_ledger(), None);
+        let proof = proven_from(result);
+        let used = parse(
+            path,
+            witness(CodexParentUnresolvable::Oversize),
+            Some(installed(&proof)),
+        );
+        assert_eq!(
+            serde_json::to_value(&used.snapshots).unwrap(),
+            serde_json::to_value(&ledger.snapshots).unwrap(),
+            "{}",
+            path.display()
+        );
+        assert_eq!(used.complete(), ledger.complete());
+        assert_eq!(used.codex_parent_proof_refusal, None);
+    }
+    // Undecided under the ledger too: main holds these children.
+    for path in [&parent_exhausted.0, &child_exhausted.0, &overflow.0] {
+        assert!(
+            !parse(path, complete_ledger(), None).complete(),
+            "{}",
+            path.display()
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+/// D6(d): P's row straddling its frozen extent is withheld (the sealed
+/// fragment): never parsed or observed, so it pushes no signature, and the
+/// seal would sit at the last newline. A child that needs that signature is
+/// `ParentExhausted`, not decided past it.
+#[test]
+fn a_straddling_parent_row_pushes_no_signature() {
+    let root = temp_root("job-straddle");
+    let parent = rollout(&root, PARENT);
+    let parent_rows = parent_values();
+    write_values(&parent, &parent_rows);
+    // Drop the final newline: P's last row now straddles its extent.
+    let bytes = fs::read(&parent).unwrap();
+    fs::write(&parent, &bytes[..bytes.len() - 1]).unwrap();
+    let child = root.join("child");
+    fs::create_dir_all(&child).unwrap();
+    let child = rollout(&child, CHILD);
+    let mut values = vec![
+        json!({"timestamp": "2026-08-02T08:40:00Z", "type": "session_meta", "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}}),
+    ];
+    values.extend(parent_rows[1..].iter().cloned());
+    values.extend([
+        turn("2026-08-02T08:40:01Z", "child-local"),
+        tokens("2026-08-02T08:40:02Z", (160, 120, 20, 4), (10, 5, 2, 1)),
+    ]);
+    write_values(&child, &values);
+
+    let mut job = job_of(&parent, &[&child]);
+    assert_eq!(run_to_end(&mut job), vec![ChildResult::ParentExhausted]);
+    assert!(job.parent.parser.reader.sealed_fragment());
+    assert_eq!(
+        job.parent.parser.reader.last_complete_line_end(),
+        row_end(&parent_rows, 3)
+    );
+    // Signatures 0..3 only: the straddling row's never entered the window.
+    assert_eq!(job.ring.end(), Some(3));
+    // With P's complete ledger (its full parse) main would decide at 4.
+    let ledger = parse(&child, complete_ledger(), None);
+    assert!(ledger.complete());
+    let _ = fs::remove_dir_all(root);
+}
+
+/// No overshoot: a run reads only while one more step fits its budget.
+#[test]
+fn a_job_reads_nothing_past_its_budget() {
+    let root = temp_root("job-budget");
+    let parent = rollout(&root, PARENT);
+    write_values(&parent, &parent_values());
+    let child = rollout(&root, CHILD);
+    write_values(&child, &child_values());
+    let reserve = codex_proof_step_reserve();
+
+    let mut job = job_of(&parent, &[&child]);
+    let mut budget = reserve - 1;
+    assert_eq!(job.run(&mut budget), CodexProofRun::Budget);
+    assert_eq!((budget, job.consumed), (reserve - 1, 0));
+
+    let mut budget = reserve;
+    assert_eq!(job.run(&mut budget), CodexProofRun::Budget);
+    assert!(job.consumed > 0 && budget == reserve - job.consumed);
+
+    let mut budget = u64::MAX;
+    assert_eq!(job.run(&mut budget), CodexProofRun::Done);
+    assert!(matches!(
+        job.children[0].result,
+        Some(ChildResult::Decided {
+            matched: 2,
+            owned: true,
+            ..
+        })
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+/// D6(c): the window is allocated once; a push past it, or of an odd shape,
+/// is refused (never a silent drop), and indices stay absolute.
+#[test]
+fn the_ring_refuses_past_its_window_and_odd_shapes() {
+    let mut ring = CodexParentRing::new();
+    let capacity = ring.entries.capacity();
+    assert!(capacity >= CODEX_PROOF_RING_ENTRIES);
+    let signature = |at: usize| sha256_hex(&[at.to_string().as_str()]);
+    for at in 0..CODEX_PROOF_RING_ENTRIES {
+        assert!(ring.push(&signature(at), at as u64));
+    }
+    assert!(!ring.push(&signature(64), 64));
+    assert_eq!(ring.entries.capacity(), capacity, "no growth");
+    assert_eq!(ring.end(), Some(64));
+    ring.drop_below(10);
+    assert_eq!(
+        (ring.base, ring.get(9), ring.get(10).map(|entry| entry.1)),
+        (10, None, Some(10))
+    );
+    assert!(ring.push(&signature(64), 64));
+    assert_eq!(
+        ring.get(64).map(|entry| entry.0.as_str()),
+        Some(signature(64).as_str())
+    );
+    assert!(!ring.push("short", 65));
+    assert!(ring
+        .entries
+        .iter()
+        .all(|(value, _)| value.capacity() == CODEX_SIGNATURE_HEX_BYTES));
+    assert_eq!(ring.entries.capacity(), capacity, "no growth");
+}

@@ -99,6 +99,12 @@ impl Limits {
     pub(in crate::snapshots) fn singleton(&self) -> u64 {
         self.singleton
     }
+
+    /// U1a-2a (row 33): a resumable read's overlong-skip chunk (a proof
+    /// job's readers use the cursor's).
+    pub(in crate::snapshots) fn skip_chunk(&self) -> usize {
+        self.skip_chunk
+    }
 }
 
 #[cfg(test)]

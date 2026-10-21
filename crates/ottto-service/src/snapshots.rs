@@ -12794,6 +12794,17 @@ struct SnapshotAccumulator {
     codex_parent_proof_mismatch: bool,
     /// U1a-2a: why the install refused this child's proof (record site).
     codex_parent_proof_refusal: Option<ProofRefusal>,
+    /// U1a-2a (row 33): a proof job's child. It reads P through the job's
+    /// ring (`CodexParentPrefix::Paged`), keeps a count-only boundary
+    /// buffer, pushes no physical signature and stops at its decision.
+    codex_proof_decision_only: bool,
+    /// U1a-2a (row 33): the count-only boundary buffer of a decision-only
+    /// child (its records are read only by the owned replay, which a job
+    /// child never reaches).
+    codex_boundary_buffer_count: u8,
+    /// U1a-2a (row 33): a proof job's parent reader: the signature of the
+    /// row just applied (`apply_codex_ledger_line`), taken by the driver.
+    codex_proof_ledger_row: Option<String>,
     codex_parent_ledger_identity_used: Option<String>,
     /// PR-P: the step-map witness this fork read for its parent.
     codex_parent_unresolvable: Option<CodexParentUnresolvable>,
@@ -13017,6 +13028,9 @@ impl SnapshotAccumulator {
             codex_parent_proof_used: None,
             codex_parent_proof_mismatch: false,
             codex_parent_proof_refusal: None,
+            codex_proof_decision_only: false,
+            codex_boundary_buffer_count: 0,
+            codex_proof_ledger_row: None,
             codex_parent_ledger_identity_used: None,
             codex_parent_unresolvable: None,
             codex_parent_ledger_consulted: false,
@@ -13418,6 +13432,17 @@ impl SnapshotAccumulator {
             CodexOwnershipBoundary::AllLocal
         } else if is_subagent && forked_from_id.is_some() {
             CodexOwnershipBoundary::AwaitingLegacyTrigger
+        } else if !is_subagent && forked_from_id.is_some() && self.codex_proof_decision_only {
+            // U1a-2a (row 33, D6(c)): a proof job's child reads P through the
+            // job's ring first (precedence: job ring → step-map ledger →
+            // cap/none + installed proof → main). Same arm, same comparison.
+            self.codex_parent_ledger_consulted = true;
+            self.codex_parent_prefix_digest = codex_parent_prefix_seed();
+            self.codex_parent_signatures = Some(CodexParentPrefix::Paged {
+                at: 0,
+                signature: None,
+            });
+            CodexOwnershipBoundary::AwaitingParentPrefix
         } else if !is_subagent && forked_from_id.is_some() {
             // PR-P: only this arm reads a parent ledger, so only its children
             // request one and can be parent-pending.
@@ -13529,7 +13554,7 @@ impl SnapshotAccumulator {
                             self.codex_parent_prefix_digest = chained;
                         }
                         self.codex_parent_signature_index += 1;
-                        self.codex_legacy_bootstrap_buffer.clear();
+                        self.clear_codex_boundary_buffer();
                         self.note_inherited_codex_record(value);
                         false
                     }
@@ -13537,7 +13562,7 @@ impl SnapshotAccumulator {
                         // The child's prefix is not the one proven: refused
                         // at finish, never admitted.
                         self.codex_parent_proof_mismatch = true;
-                        self.codex_legacy_bootstrap_buffer.clear();
+                        self.clear_codex_boundary_buffer();
                         self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
                         self.note_inherited_codex_record(value);
                         false
@@ -13557,7 +13582,7 @@ impl SnapshotAccumulator {
                             self.codex_owned_record_seen = true;
                             true
                         } else {
-                            self.codex_legacy_bootstrap_buffer.clear();
+                            self.clear_codex_boundary_buffer();
                             self.codex_legacy_bootstrap_valid = false;
                             self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
                             self.note_inherited_codex_record(value);
@@ -13799,13 +13824,30 @@ impl SnapshotAccumulator {
 
     fn buffer_codex_boundary_record(&mut self, value: &Value) {
         const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
-        if self.codex_legacy_bootstrap_buffer.len() == MAX_BOUNDARY_BUFFER_RECORDS {
-            self.codex_legacy_bootstrap_buffer.clear();
+        if self.codex_boundary_buffer_len() == MAX_BOUNDARY_BUFFER_RECORDS {
+            self.clear_codex_boundary_buffer();
             self.codex_legacy_bootstrap_valid = false;
             self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+        } else if self.codex_proof_decision_only {
+            // U1a-2a (row 33): count-only; same overflow rule by length.
+            self.codex_boundary_buffer_count += 1;
         } else {
             self.codex_legacy_bootstrap_buffer.push(value.clone());
         }
+    }
+
+    /// U1a-2a (row 33): the boundary buffer's length in either mode.
+    fn codex_boundary_buffer_len(&self) -> usize {
+        if self.codex_proof_decision_only {
+            usize::from(self.codex_boundary_buffer_count)
+        } else {
+            self.codex_legacy_bootstrap_buffer.len()
+        }
+    }
+
+    fn clear_codex_boundary_buffer(&mut self) {
+        self.codex_legacy_bootstrap_buffer.clear();
+        self.codex_boundary_buffer_count = 0;
     }
 
     fn note_inherited_codex_record(&mut self, value: &Value) {
@@ -13898,7 +13940,7 @@ impl SnapshotAccumulator {
         self.codex_parent_signatures = base.map(|_| CodexParentPrefix::Ledger(Vec::new()));
         self.codex_parent_unresolvable = base;
         self.codex_parent_signature_index = 0;
-        self.codex_legacy_bootstrap_buffer.clear();
+        self.clear_codex_boundary_buffer();
         self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
         self.codex_parent_proof_refusal = Some(ProofRefusal::Decision);
     }
@@ -16352,6 +16394,447 @@ fn install_codex_parent_proof(
     opened
 }
 
+/// U1a-2a (row 33, D6(c)): slots of a proof job's signature window.
+const CODEX_PROOF_RING_ENTRIES: usize = 64;
+/// `codex_ownership_signature` is SHA-256 hex, so every ring string has this
+/// length and each slot's allocation is fixed before it is pushed.
+const CODEX_SIGNATURE_HEX_BYTES: usize = 64;
+
+/// U1a-2a (row 33, D6(c)): a bounded window of P's physical signatures (the
+/// strings `note_codex_physical_signature` pushes, equal to the ledger's),
+/// indexed by P's absolute ledger index: `entries[0]` is index `base`. Each
+/// carries P's reader's consumed offset after the row that produced it.
+/// Only the parent reader fills it, one per signed row, in order; it never
+/// reorders. Its allocation (`CODEX_PROOF_RING_ENTRIES` slots) is made when
+/// the job starts and each string at its fixed length, so a push never
+/// grows the window; a push past it is refused, never a silent loss.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) struct CodexParentRing {
+    base: u64,
+    entries: VecDeque<(String, u64)>,
+}
+crate::heap_layout_bound::fields!(CodexParentRing; base, entries);
+
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+impl CodexParentRing {
+    fn new() -> Self {
+        Self {
+            base: 0,
+            entries: VecDeque::with_capacity(CODEX_PROOF_RING_ENTRIES),
+        }
+    }
+
+    /// One past the last index held; `None` (no index) on overflow.
+    fn end(&self) -> Option<u64> {
+        self.base
+            .checked_add(u64::try_from(self.entries.len()).ok()?)
+    }
+
+    fn get(&self, at: u64) -> Option<&(String, u64)> {
+        let offset = usize::try_from(at.checked_sub(self.base)?).ok()?;
+        self.entries.get(offset)
+    }
+
+    /// False, nothing pushed, when the window is full or the signature is
+    /// not the fixed shape.
+    fn push(&mut self, signature: &str, row_end: u64) -> bool {
+        if self.entries.len() >= CODEX_PROOF_RING_ENTRIES
+            || signature.len() != CODEX_SIGNATURE_HEX_BYTES
+        {
+            return false;
+        }
+        let mut owned = String::with_capacity(CODEX_SIGNATURE_HEX_BYTES);
+        owned.push_str(signature);
+        self.entries.push_back((owned, row_end));
+        true
+    }
+
+    /// Entries below `min`, the trailing undecided child's next index, are
+    /// never read again.
+    fn drop_below(&mut self, min: u64) {
+        while self.base < min && self.entries.pop_front().is_some() {
+            self.base += 1;
+        }
+    }
+}
+
+/// U1a-2a (row 33; rev 2 §2.3, rev 3 §2.3): one child's job result.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum ChildResult {
+    /// The arm decided (`AllLocal` at m > 0: owned; at 0: held). `at` is
+    /// P's consumed offset after the row of P's signature m.
+    Decided {
+        matched: u64,
+        digest: PrefixDigest,
+        owned: bool,
+        at: u64,
+    },
+    ParentExhausted,
+    ChildExhausted,
+    /// The boundary buffer overflowed, the window was full, or a job view
+    /// was inconsistent: never a silent signature loss.
+    Undecidable,
+    /// Not a ledger-consulting fork of this parent.
+    NotAFork,
+    /// The child's reader failed.
+    Unreadable,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ChildResult {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// U1a-2a (row 33, rev 2 §2.2, D6(d)): one reader of a proof job, frozen at
+/// its open extent with the existing extent limit (a straddling row is
+/// withheld as the sealed fragment: never parsed or observed).
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) struct CodexProofReader {
+    pub(in crate::snapshots) key: String,
+    pub(in crate::snapshots) path: PathBuf,
+    pub(in crate::snapshots) stamp_open: sampled_scan::codex_cursor::OpenStamp,
+    parser: OwnedJsonlParser,
+    /// Reached its frozen end, or failed.
+    done: bool,
+    failed: bool,
+}
+crate::heap_layout_bound::fields!(CodexProofReader; key, path, stamp_open, parser, done, failed);
+
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+impl CodexProofReader {
+    /// P's ledger-only reader: a fresh `Full(StateMissing)` plan under the
+    /// proof scope (its `commit_sealed_prefix` is the finish's certificate),
+    /// frozen at `min(frozen, open)`.
+    pub(in crate::snapshots) fn parent(
+        key: String,
+        path: PathBuf,
+        file: File,
+        now: u64,
+    ) -> Result<Self> {
+        let stamp_open = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
+        let mut parser = OwnedJsonlParser::new(
+            file,
+            &path,
+            SnapshotSource::Codex,
+            apply_codex_ledger_line,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )?;
+        parser.accumulator.codex_physical_signatures_complete = false;
+        let plan = crate::transcript_acquisition::ReadPlan::prepare(
+            parser.reader.reader.get_mut(),
+            None,
+            &codex_parent_proof_scope(),
+            None,
+            now,
+        )?;
+        let limit = plan
+            .frozen_length()
+            .min(stamp_open.extent())
+            .saturating_sub(plan.start_offset());
+        parser.reader.acquisition = Some(plan);
+        parser.reader.set_extent_limit(limit);
+        parser
+            .reader
+            .set_chunked_skip(sampled_scan::codex_cursor::Limits::current().skip_chunk());
+        Ok(Self {
+            key,
+            path,
+            stamp_open,
+            parser,
+            done: false,
+            failed: false,
+        })
+    }
+
+    /// A child's decision-only reader, frozen at its open extent. No
+    /// acquisition: the child side is re-proven at use by the chain.
+    pub(in crate::snapshots) fn child(key: String, path: PathBuf, file: File) -> Result<Self> {
+        let stamp_open = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
+        let mut parser = OwnedJsonlParser::new(
+            file,
+            &path,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )?;
+        parser.accumulator.codex_proof_decision_only = true;
+        parser.reader.set_extent_limit(stamp_open.extent());
+        parser
+            .reader
+            .set_chunked_skip(sampled_scan::codex_cursor::Limits::current().skip_chunk());
+        Ok(Self {
+            key,
+            path,
+            stamp_open,
+            parser,
+            done: false,
+            failed: false,
+        })
+    }
+
+    /// One row (or one chunk of an overlong skip); the bytes it consumed.
+    fn step(&mut self) -> u64 {
+        let before = self.parser.reader.consumed_bytes();
+        match self.parser.step() {
+            Ok(complete) => self.done = complete,
+            Err(_) => {
+                self.done = true;
+                self.failed = true;
+            }
+        }
+        self.parser.reader.consumed_bytes().saturating_sub(before)
+    }
+}
+
+/// U1a-2a (row 33): one child of a proof job and its result.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) struct CodexProofChild {
+    pub(in crate::snapshots) reader: CodexProofReader,
+    pub(in crate::snapshots) result: Option<ChildResult>,
+}
+crate::heap_layout_bound::fields!(CodexProofChild; reader, result);
+
+/// U1a-2a (row 33; rev 2 §2.1, D6(c)): a proof job's readers: P's
+/// ledger-only reader and 1..=4 decision-only children of the same P,
+/// lockstepped through the ring.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) struct CodexProofReaders {
+    /// P's resolved session id (every child's `forked_from_id`).
+    pub(in crate::snapshots) parent_id: String,
+    pub(in crate::snapshots) parent: CodexProofReader,
+    /// When P's read opened: the seal's `verified` (P1's `started`).
+    pub(in crate::snapshots) started: u64,
+    pub(in crate::snapshots) children: Vec<CodexProofChild>,
+    ring: CodexParentRing,
+    /// Bytes every reader consumed (what the job's pages charged).
+    pub(in crate::snapshots) consumed: u64,
+}
+crate::heap_layout_bound::fields!(CodexProofReaders; parent_id, parent, started, children, ring, consumed);
+
+/// U1a-2a (row 33): how a run within a budget ended.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum CodexProofRun {
+    /// Every child has a result and P's reader reached its frozen end (or
+    /// failed): the job finishes.
+    Done,
+    /// The budget cannot cover one more step: suspend, or end the page.
+    Budget,
+}
+
+/// U1a-2a (rev 11 §6.1, D6(d)): the most one reader step consumes (a capped
+/// line and its newline, or one chunk of an overlong skip after its capped
+/// prefix). A step runs only with this much budget left, so a page never
+/// reads past its leftover and no helper peeks ahead.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+pub(in crate::snapshots) fn codex_proof_step_reserve() -> u64 {
+    (MAX_JSONL_LINE_BYTES as u64)
+        .saturating_add(sampled_scan::codex_cursor::Limits::current().skip_chunk() as u64)
+        .saturating_add(1)
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+impl CodexProofReaders {
+    pub(in crate::snapshots) fn new(
+        parent_id: String,
+        parent: CodexProofReader,
+        started: u64,
+        children: Vec<CodexProofReader>,
+    ) -> Self {
+        Self {
+            parent_id,
+            parent,
+            started,
+            children: children
+                .into_iter()
+                .map(|reader| CodexProofChild {
+                    reader,
+                    result: None,
+                })
+                .collect(),
+            ring: CodexParentRing::new(),
+            consumed: 0,
+        }
+    }
+
+    /// The child's next signature index (its arm's index into P).
+    fn next_index(child: &CodexProofChild) -> u64 {
+        child.reader.parser.accumulator.codex_parent_signature_index as u64
+    }
+
+    /// The trailing undecided child and its next index.
+    fn trailing(&self) -> Option<(usize, u64)> {
+        self.children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| child.result.is_none())
+            .map(|(at, child)| (at, Self::next_index(child)))
+            .min_by_key(|(_, next)| *next)
+    }
+
+    /// Lockstep (rev 2 §2.3, D6(c)) within `budget`, which loses every byte
+    /// read. The trailing undecided child steps first; when its next index
+    /// is past the ring, P steps one row. Entries leave only below the
+    /// trailing child. Once every child has a result, P alone continues to
+    /// its frozen end. Children stop at their decision.
+    pub(in crate::snapshots) fn run(&mut self, budget: &mut u64) -> CodexProofRun {
+        let reserve = codex_proof_step_reserve();
+        loop {
+            self.settle_children();
+            if self.parent.failed {
+                return CodexProofRun::Done;
+            }
+            let trailing = self.trailing();
+            match trailing {
+                Some((_, min)) => self.ring.drop_below(min),
+                None => self.ring.drop_below(u64::MAX),
+            }
+            if trailing.is_none() && self.parent.done {
+                return CodexProofRun::Done;
+            }
+            if *budget < reserve {
+                return CodexProofRun::Budget;
+            }
+            match trailing {
+                Some((at, next)) if self.parent.done || self.ring.get(next).is_some() => {
+                    self.step_child(at, next, budget);
+                }
+                trailing => self.step_parent(trailing.map(|(at, _)| at), budget),
+            }
+        }
+    }
+
+    fn step_child(&mut self, at: usize, next: u64, budget: &mut u64) {
+        let signature = self.ring.get(next).map(|(signature, _)| signature.clone());
+        let child = &mut self.children[at];
+        let accumulator = &mut child.reader.parser.accumulator;
+        if matches!(
+            accumulator.codex_parent_signatures,
+            Some(CodexParentPrefix::Paged { .. })
+        ) {
+            accumulator.codex_parent_signatures = Some(CodexParentPrefix::Paged {
+                at: next,
+                signature,
+            });
+        }
+        let read = child.reader.step();
+        self.charge(read, budget);
+    }
+
+    fn step_parent(&mut self, trailing: Option<usize>, budget: &mut u64) {
+        let read = self.parent.step();
+        self.charge(read, budget);
+        let Some(signature) = self.parent.parser.accumulator.codex_proof_ledger_row.take() else {
+            return;
+        };
+        let Some(at) = trailing else {
+            // Every child has a result: P alone, no window.
+            return;
+        };
+        let row_end = self.parent.parser.reader.consumed_bytes();
+        if self.ring.push(&signature, row_end) {
+            return;
+        }
+        // The window cannot take P's next signature: the trailing child
+        // cannot be served. It is undecidable; the rest retry once.
+        self.children[at].result = Some(ChildResult::Undecidable);
+        if let Some((_, min)) = self.trailing() {
+            self.ring.drop_below(min);
+            if !self.ring.push(&signature, row_end) {
+                for child in self
+                    .children
+                    .iter_mut()
+                    .filter(|child| child.result.is_none())
+                {
+                    child.result = Some(ChildResult::Undecidable);
+                }
+            }
+        }
+    }
+
+    fn charge(&mut self, read: u64, budget: &mut u64) {
+        *budget = budget.saturating_sub(read);
+        self.consumed = self.consumed.saturating_add(read);
+    }
+
+    fn settle_children(&mut self) {
+        let parent_done = self.parent.done;
+        for child in self
+            .children
+            .iter_mut()
+            .filter(|child| child.result.is_none())
+        {
+            child.result =
+                codex_proof_child_result(child, &self.ring, &self.parent_id, parent_done);
+        }
+    }
+}
+
+/// U1a-2a (row 33; rev 2 §2.3, rev 3 §2.3): a child's result from its arm,
+/// once it has one. `None`: still undecided.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
+fn codex_proof_child_result(
+    child: &CodexProofChild,
+    ring: &CodexParentRing,
+    parent_id: &str,
+    parent_done: bool,
+) -> Option<ChildResult> {
+    let reader = &child.reader;
+    if reader.failed {
+        return Some(ChildResult::Unreadable);
+    }
+    let accumulator = &reader.parser.accumulator;
+    if accumulator.codex_parent_proof_mismatch {
+        return Some(ChildResult::Undecidable);
+    }
+    if accumulator.codex_ownership_boundary == CodexOwnershipBoundary::Undetermined {
+        return reader.done.then_some(ChildResult::ChildExhausted);
+    }
+    if !accumulator.codex_parent_ledger_consulted
+        || accumulator.codex_parent_session_ref.as_deref() != Some(parent_id)
+    {
+        return Some(ChildResult::NotAFork);
+    }
+    if let Some((matched, digest, owned)) = accumulator.codex_parent_prefix_decided {
+        return Some(match ring.get(matched) {
+            Some((_, at)) => ChildResult::Decided {
+                matched,
+                digest,
+                owned,
+                at: *at,
+            },
+            None => ChildResult::Undecidable,
+        });
+    }
+    match accumulator.codex_ownership_boundary {
+        CodexOwnershipBoundary::AwaitingParentPrefix => {
+            reader.done.then_some(ChildResult::ChildExhausted)
+        }
+        CodexOwnershipBoundary::AmbiguousFork => {
+            let next = accumulator.codex_parent_signature_index as u64;
+            Some(
+                if parent_done && ring.end().is_some_and(|end| next >= end) {
+                    ChildResult::ParentExhausted
+                } else {
+                    ChildResult::Undecidable
+                },
+            )
+        }
+        _ => Some(ChildResult::Undecidable),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// B2-T1 seam: runs after a Codex candidate's memo lookup (which probes
@@ -16473,6 +16956,11 @@ pub(in crate::snapshots) enum CodexParentPrefix {
     /// child's, and P's next one differs, for the child whose chain through
     /// that record is `digest`.
     Proof { matched: u64, digest: PrefixDigest },
+    /// U1a-2a (row 33, D6(c)): a proof job's child. The driver sets P's
+    /// signature at the child's next index `at` from the job's ring before
+    /// each child row (`None`: P's reader is exhausted there). It answers as
+    /// `Ledger` would for the same signature sequence.
+    Paged { at: u64, signature: Option<String> },
 }
 impl crate::heap_layout_bound::HeapLayoutBound for CodexParentPrefix {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -16481,6 +16969,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexParentPrefix {
                 crate::heap_layout_bound::HeapLayoutBound::heap_bound(values, c)
             }
             Self::Proof { .. } => c.add(0),
+            Self::Paged { signature, .. } => {
+                crate::heap_layout_bound::HeapLayoutBound::heap_bound(signature, c)
+            }
         }
     }
 }
@@ -16493,14 +16984,15 @@ enum ParentAt {
     Differs,
     /// The ledger has no signature at this index.
     Exhausted,
-    /// The child's chain through the deciding record is not the proven one.
+    /// The child's chain through the deciding record is not the proven one
+    /// (or a job view is not at the child's index: undecidable).
     ProofMismatch,
 }
 
 impl CodexParentPrefix {
-    /// The proof arm needs the child's chain through each signature.
+    /// The proof and job arms need the child's chain through each signature.
     fn chains(&self) -> bool {
-        matches!(self, Self::Proof { .. })
+        matches!(self, Self::Proof { .. } | Self::Paged { .. })
     }
 
     /// P at child signature index `at`. `chained` is the child's chain
@@ -16519,6 +17011,18 @@ impl CodexParentPrefix {
                 std::cmp::Ordering::Equal if chained == Some(digest) => ParentAt::Differs,
                 _ => ParentAt::ProofMismatch,
             },
+            Self::Paged {
+                at: view,
+                signature: expected,
+            } => {
+                debug_assert_eq!(*view, at as u64, "the job view is the child's index");
+                match expected {
+                    _ if *view != at as u64 => ParentAt::ProofMismatch,
+                    Some(value) if value == signature => ParentAt::Equal,
+                    Some(_) => ParentAt::Differs,
+                    None => ParentAt::Exhausted,
+                }
+            }
         }
     }
 }
@@ -27346,7 +27850,10 @@ fn claude_cache_request_slot(
 }
 
 fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.note_codex_physical_signature(value);
+    // U1a-2a (row 33): a job child's own signatures are never a ledger.
+    if !accumulator.codex_proof_decision_only {
+        accumulator.note_codex_physical_signature(value);
+    }
     apply_codex_envelope_line(value, accumulator);
     if string_eq_at(value, &["type"], "session_meta") {
         accumulator.session_start.note_codex_session_meta(value);
@@ -27355,11 +27862,26 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if !accumulator.codex_record_is_owned(value) {
         return;
     }
+    if accumulator.codex_proof_decision_only {
+        // U1a-2a (row 33): the deciding record; the job child stops here.
+        // Owned accounting is not a proof input.
+        return;
+    }
     let bootstrap = std::mem::take(&mut accumulator.codex_legacy_bootstrap_buffer);
     for bootstrap_value in &bootstrap {
         apply_codex_owned_line(bootstrap_value, accumulator);
     }
     apply_codex_owned_line(value, accumulator);
+}
+
+/// U1a-2a (row 33, rev 4 §4.1): a proof job's parent reader. P is not
+/// classified: only its envelope (its session id, the finish's identity
+/// check) and the row's ownership signature, which the driver moves into
+/// the job's ring. A row the reader withholds (a straddling fragment) is
+/// never applied, so it pushes no signature.
+fn apply_codex_ledger_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    apply_codex_envelope_line(value, accumulator);
+    accumulator.codex_proof_ledger_row = codex_ownership_signature(value);
 }
 
 fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
@@ -74037,7 +74559,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
