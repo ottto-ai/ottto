@@ -2418,6 +2418,18 @@ pub(crate) fn begin_codex_side_pass(
     CodexSidePass { ns, gate }
 }
 
+/// U1a-2a (row 36), Codex only: a replay that reset this index (its
+/// `prepare_historical_replay` returned true) cleared every side record,
+/// request and proof entry, so this index's side-ledger entries end their
+/// generation (`Gone`) in the same step; the next C14 hydrate then restores
+/// none of them.
+#[allow(dead_code)] // first caller is the replay call site in `sync` (pending clearance)
+pub(crate) fn note_codex_side_replay(cache: &sampled_scan::SharedCache, index_path: &Path) {
+    cache
+        .side_ledger()
+        .end_generation(sampled_scan::side_ledger::namespace_of(index_path), None);
+}
+
 /// U1a-2a D5′ (C15), Codex only: the side ledger's save mark for this index,
 /// read immediately before the call that assembles and writes the selected
 /// save. Opaque outside `snapshots`.
@@ -16567,7 +16579,7 @@ impl ScanIndex {
         if let Some((cache, ns)) = side {
             cache
                 .side_ledger()
-                .end_generation(ns, sampled_scan::side_ledger::parent_of(key));
+                .end_generation(ns, Some(sampled_scan::side_ledger::parent_of(key)));
         }
     }
 
@@ -32118,9 +32130,12 @@ impl ScanIndex {
         );
     }
 
-    pub fn prepare_historical_replay(&mut self, generation: String) {
+    /// True when this call reset the index (a new generation); false for the
+    /// generation it already holds (row 36's ledger mirror follows only a
+    /// reset).
+    pub fn prepare_historical_replay(&mut self, generation: String) -> bool {
         if self.historical_replay_generation.as_ref() == Some(&generation) {
-            return;
+            return false;
         }
         self.historical_replay_generation = Some(generation);
         self.upload_context_fingerprint = None;
@@ -32177,6 +32192,7 @@ impl ScanIndex {
                     | SnapshotQuarantineDisposition::SupersededTerminal
             )
         });
+        true
     }
 
     /// Arm at most `limit` ambiguous pre-ledger identities for re-entry through

@@ -969,3 +969,69 @@ fn drop_retires_a_keys_side_and_proof_items_and_its_ledger_generation() {
         fold(&[(OWE_P, 1)])
     );
 }
+
+/// Row 36 (rev 16 §2.3, lease "→ ledger `Gone`"): replay reports whether
+/// it reset the index; after a reset, the index's ledger entries end their
+/// generation, so the next C14 hydrates none of them back. Control: without
+/// the mirror, C14 restores the request replay cleared. Another
+/// namespace's entry is untouched.
+#[test]
+fn replay_ends_the_namespace_ledger_generation_so_c14_restores_nothing() {
+    use crate::snapshots::sampled_scan::side_ledger::{
+        namespace_of, parent_of, LedgerEntry, LedgerKey, LedgerTag,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let key = "/s/replayed.jsonl";
+    let path = Path::new("/idx/replay.json");
+    let other = Path::new("/idx/other.json");
+    let now = 1_792_540_800;
+    let ledger_key = |index_path| LedgerKey {
+        ns: namespace_of(index_path),
+        p: parent_of(key),
+        dev: 1,
+        ino: 7,
+    };
+    for mirror in [false, true] {
+        let cache = sampled_scan::SharedCache::default();
+        {
+            let mut ledger = cache.side_ledger();
+            for index_path in [path, other] {
+                ledger
+                    .charge(
+                        ledger_key(index_path),
+                        LedgerEntry::of_request(&side_request(7)),
+                        now,
+                    )
+                    .unwrap();
+            }
+        }
+        let mut index = ScanIndex::default();
+        index
+            .codex_parent_side_requests
+            .insert(key.into(), side_request(7));
+        assert!(index.prepare_historical_replay("replay-1".into()));
+        assert!(!index.prepare_historical_replay("replay-1".into()));
+        assert!(index.codex_parent_side_requests.is_empty());
+        if mirror {
+            note_codex_side_replay(&cache, path);
+            let ledger = cache.side_ledger();
+            assert_eq!(ledger.get(&ledger_key(path)).unwrap().tag, LedgerTag::Gone);
+            assert_eq!(ledger.get(&ledger_key(other)).unwrap().tag, LedgerTag::Live);
+        }
+        // The replay pass indexes P again; the next pass's C14 runs on it.
+        index
+            .files
+            .insert(key.into(), super::tests::manifest_index_entry(Some(key)));
+        begin_codex_side_pass(&cache, path, &mut index);
+        assert_eq!(
+            index.codex_parent_side_requests.contains_key(key),
+            !mirror,
+            "mirror={mirror}"
+        );
+        let ledger = cache.side_ledger();
+        assert_eq!(ledger.get(&ledger_key(path)).is_some(), !mirror);
+        assert_eq!(ledger.get(&ledger_key(other)).unwrap().tag, LedgerTag::Live);
+    }
+}
