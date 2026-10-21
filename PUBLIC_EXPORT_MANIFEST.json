@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 724,
-  "content_sha256": "8b4c9fa4e7194573242c524476139e05e5c3614c6f7919f9a73abd54b66e795e",
+  "content_sha256": "6cabb6ddc149f2dbebae4355d3ee6a4dd746d845378f69047227ae0f06bfdca2",
   "files": [
     {
       "executable": false,
@@ -1378,8 +1378,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_posture_member_waiver_tests.rs",
-      "sha256": "dcb753be23b5da7abfd6e6ae82e5fd3e4ba58b4df411f192ab8db78d4e208831",
-      "size_bytes": 39701
+      "sha256": "dc09cc73cf5ede3fd2fe55c516ae622fb851e89f96b5314aecd66cc041f5117f",
+      "size_bytes": 41375
     },
     {
       "executable": false,
@@ -3296,8 +3296,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-20-claude-posture-member-waiver.md",
-      "sha256": "3e76340eb4475919fa133c039e681bb2167bbe2163ac675993a7d0a421203a28",
-      "size_bytes": 5983
+      "sha256": "cd7631b55991ee290c814fb69432c3ef67ee50022c283a576ea7b5d2dcccc052",
+      "size_bytes": 6246
     },
     {
       "executable": false,
@@ -5071,7 +5071,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T02:06:27+00:00",
+  "generated_at": "2026-10-21T02:07:34+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 725,
   "public_roots": [
@@ -5110,5 +5110,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "247b9d8b4b803b9ac2d3fbb27f322bae738d40eb"
+  "source_commit": "a20c35db7cea9085fc4e134cea7264001cfff24c"
 }
