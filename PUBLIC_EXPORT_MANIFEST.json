@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 733,
-  "content_sha256": "4213fe86c0f543973b49b38588b9a1db003809a571d6f62fd38e54849396b059",
+  "content_sha256": "b4a123a6a5d7f528d43de3aec671a334df21c3340890d01f6373a7b3780b352c",
   "files": [
     {
       "executable": false,
@@ -1287,8 +1287,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs",
-      "sha256": "789e9d69d62d0b51517ca30bb02a45ca3dd44be06ff3e352eea64317999d7faf",
-      "size_bytes": 52283
+      "sha256": "af190ed32cf7b0e67027becd6603e6443d8952bbedf52f22d05a8892a0b7794b",
+      "size_bytes": 52391
     },
     {
       "executable": false,
@@ -3345,8 +3345,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-c1a-closed-fence-proof-rearm.md",
-      "sha256": "6194d2f838dbe81ba6bdcf8f8313993b9c51408e4d0d0058ba651472f8342532",
-      "size_bytes": 7870
+      "sha256": "c434005c6efd7db5511a4feacd8d4d690de68729bb3054741af3cb7ce2cc8f08",
+      "size_bytes": 8088
     },
     {
       "executable": false,
@@ -5134,7 +5134,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T11:10:01+00:00",
+  "generated_at": "2026-10-21T11:39:02+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 734,
   "public_roots": [
@@ -5173,5 +5173,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d7e52350145a9f2add36ab16622da966c7d265b3"
+  "source_commit": "c5f38da2f4c486269036a4ab746f5214317496fb"
 }
