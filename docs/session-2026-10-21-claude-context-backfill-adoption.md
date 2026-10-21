@@ -48,6 +48,21 @@ About 10,500 Claude files (14 GB). With the 2,000-file budget that is roughly
 minutes in total if pages settle. If uploads do not settle, unstamped files are
 selected again next cycle, which is the existing back-pressure.
 
+## Proven families (server constraint)
+
+The server permanently refuses a body without the
+`session_exclusive_reported_usage:v1` contract when the session's accepted head
+was proven. An adoption re-read goes through the same ownership fold as any
+other read, so a family with a local usage witness that would now lose the
+contract is held by the existing demotion quarantine: nothing is uploaded and
+its files keep the old revision (held source files never adopt). The re-read
+adds no new path to such a body. The remaining case is a session whose accepted
+head was proven but whose local witness is gone: the daemon does not store the
+accepted body-witness version, so it cannot tell. Any re-read reaches that case
+today (re-arms, appends); this re-read only reaches more history. It is
+refused once and the refused fingerprint is quarantined; money and identity on
+the server are unchanged.
+
 ## Residuals
 
 - A family's root and subagent files may adopt on different pages. Each file's
