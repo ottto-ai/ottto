@@ -790,6 +790,8 @@ fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
     let mut index = ScanIndex::default();
     let mut entry = manifest_index_entry(Some("body"));
     entry.source_file_fingerprint = hex_fingerprint('a');
+    // Modified in this window: not due for transcript retirement.
+    entry.modified_unix_seconds = rfc3339_unix_seconds(FIRST_WINDOW).expect("window");
     index.files.insert(indexed.clone(), entry);
     index
         .file_snapshot_fingerprints
@@ -844,6 +846,8 @@ fn census_member_status_names_disjoint_shared_unknown_and_unobserved() {
     let mut add = |name: &str, seed: char, record: Option<ClaudeRequestCensusRecord>| {
         let mut entry = manifest_index_entry(Some(name));
         entry.source_file_fingerprint = hex_fingerprint(seed);
+        // Modified in this window: not due for transcript retirement.
+        entry.modified_unix_seconds = window;
         index.files.insert(key(name), entry);
         index
             .file_snapshot_fingerprints
@@ -1715,7 +1719,9 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
 
 #[test]
 fn census_hash_budget_warning_starts_at_eighty_percent() {
-    for hashes in [838_860, 838_861] {
+    // 80% of the hash cap, rounded up: the first count that warns.
+    let threshold = (MAX_CLAUDE_REQUEST_CENSUS_HASHES * 4).div_ceil(5) as u64;
+    for hashes in [threshold - 1, threshold] {
         let mut index = ScanIndex::default();
         index.claude_request_census_mut_for_test().insert_for_test(
             "key",
@@ -1732,10 +1738,10 @@ fn census_hash_budget_warning_starts_at_eighty_percent() {
             &BTreeSet::new(),
             FIRST_WINDOW,
         );
-        assert_eq!(counts.hash_budget_warning, hashes == 838_861);
+        assert_eq!(counts.hash_budget_warning, hashes == threshold);
         assert_eq!(
             counts.hash_budget_usage_percent,
-            if hashes == 838_861 { 80 } else { 79 }
+            if hashes == threshold { 80 } else { 79 }
         );
     }
 }

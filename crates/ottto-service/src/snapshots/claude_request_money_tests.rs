@@ -254,13 +254,15 @@ fn money_ledger_records_are_invisible_to_d1() {
     assert!(is_ledger_key(&otel) && !is_ledger_key("/x/otel:y.jsonl"));
     let key = format!("/money/projects/-repo/{root}.jsonl");
     let mut index = ScanIndex::default();
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let mut entry = manifest_index_entry(Some("body"));
     entry.source_file_fingerprint = money_fingerprint('a');
+    // Modified in this window: not due for transcript retirement.
+    entry.modified_unix_seconds = window;
     index.files.insert(key.clone(), entry);
     index
         .claude_request_census_mut_for_test()
         .insert_for_test(&key, money_record('a', vec![1, 2]));
-    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let before = (
         claude_census_disjointness_complete(&index, MONEY_WINDOW, true),
         claude_census_member_status(&index, &key, MONEY_WINDOW, true),
