@@ -642,12 +642,12 @@ impl<R: std::io::Read> std::io::Read for CensusRead<R> {
                 written += copied;
                 continue;
             }
-            if !self.capture
-                && self.replay.is_none()
-                && !self.escaped
-                // Every top-level sequence value must visit next(), even a
-                // scalar with no structural byte, to recognize census slots.
-                && !(self.root_array && self.depth == 1 && !self.quoted)
+            // Every top-level sequence value must visit next(), even a
+            // scalar with no structural byte, to recognize census slots.
+            if !(self.capture
+                || self.replay.is_some()
+                || self.escaped
+                || self.root_array && self.depth == 1 && !self.quoted)
             {
                 let bytes = self.reader.fill_buf()?;
                 let limit = bytes.len().min(out.len() - written);
