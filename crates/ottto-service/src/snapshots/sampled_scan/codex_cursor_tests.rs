@@ -1993,6 +1993,30 @@ fn cursor_job_copy_refusal_keeps_conservative_release() {
         let active = scan.active_file.as_deref_mut().unwrap();
         active.sampling = sampling;
         active.parser.reader.acquisition = acquisition;
+        // P1-RETAIN R0 (T-R0d): read as a Tail, with its acquisition, the
+        // cursor conjunct alone still keeps the job off shape F, so its
+        // refusal keeps ClearOtherActive and its completion never reaches
+        // R0's release.
+        let active = scan.active_file.as_deref_mut().unwrap();
+        let sampling = active.sampling.as_mut().unwrap();
+        let mode = sampling.mode;
+        sampling.mode = crate::transcript_acquisition::ReadMode::Tail;
+        assert!(
+            active.parser.reader.acquisition.is_some(),
+            "precondition: the job's acquisition"
+        );
+        assert!(!crate::snapshots::sampled_scan::borrows_only_retained_reduction(active));
+        let cursor = active.cursor.take();
+        assert!(
+            crate::snapshots::sampled_scan::borrows_only_retained_reduction(active),
+            "precondition: only the cursor conjunct differs from shape F"
+        );
+        active.cursor = cursor;
+        let lifecycle = release(&scan);
+        assert_eq!(lifecycle.clear_other_active, 1, "a Tail cursor job");
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.sampling.as_mut().unwrap().mode = mode;
     });
 }
 
@@ -6375,6 +6399,7 @@ fn hopeless_admission_evicts_nothing() {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
+                released: None,
             },
             0,
         );
@@ -6451,6 +6476,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
+                released: None,
             }
         };
         // Control: without a claim the copy fits.
@@ -6994,6 +7020,7 @@ fn witness_admission() -> WitnessAdmission {
         sampled_jsonl::CompletedNativeAcquisition {
             checkpoint: copy.checkpoint,
             reduction: Some(copy.state),
+            released: None,
         },
         0,
     );

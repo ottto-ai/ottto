@@ -952,6 +952,36 @@ mod tests {
         assert!(cache.entries.contains_key("same") && cache.entries.contains_key("new"));
     }
 
+    /// Every admission ranks through `admission_rank` (a future mtime clips to
+    /// the admission clock); a rank computed before (P1-RETAIN R0, the rank
+    /// its release ran against) is admitted exactly, never re-ranked by a
+    /// later clock read.
+    #[test]
+    fn admission_rank_clips_once_and_a_carried_rank_is_admitted_exactly() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        assert_eq!(admission_rank((500, 7), at), (100, 0));
+        assert_eq!(admission_rank((50, 7), at), (50, 7));
+        assert_eq!(admission_rank((100, 0), at), (100, 0));
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        assert!(cache.insert_reserving_at_rank(
+            "carried".into(),
+            retained_at("c".into(), Some(500)),
+            0,
+            Some((90, 0))
+        ));
+        assert_eq!(cache.entries["carried"].modified_hint, (90, 0));
+        assert!(cache.insert_reserving_at_rank(
+            "ranked".into(),
+            retained_at("r".into(), Some(50)),
+            0,
+            None
+        ));
+        assert_eq!(cache.entries["ranked"].modified_hint, (50, 0));
+    }
+
     /// `Taken` carries the clipped admitted hint and the reserved finalization
     /// charge (β).
     #[test]

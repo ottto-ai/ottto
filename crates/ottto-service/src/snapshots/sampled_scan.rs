@@ -1111,6 +1111,10 @@ pub(super) fn tail_completion_budget(
         std::mem::size_of::<CachedJsonlReduction>()
             + std::mem::size_of::<crate::transcript_acquisition::ReadPlan>(),
     );
+    // Tests only: `ins_extra > A` does not occur on a supported layout, so
+    // the rows that need it set this term (`test_hooks::set_ins_extra`).
+    #[cfg(test)]
+    let ins_extra = test_hooks::ins_extra().unwrap_or(ins_extra);
     let floor = a.max(ins_extra);
     let b_ins = remaining.checked_sub(floor).map_or(0, |room| room / 2);
     let granted = RetainBudget::Granted {
@@ -1264,6 +1268,9 @@ pub(super) mod test_hooks {
         static PROBE: RefCell<Probe> = RefCell::new(Probe::default());
         static DECISIONS: RefCell<Vec<Decision>> = const { RefCell::new(Vec::new()) };
         static BUCKETS: RefCell<Vec<super::sampled_jsonl::Bucket>> = const { RefCell::new(Vec::new()) };
+        static UNREADABLE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        static FINISH_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        static INS_EXTRA: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
 
     /// Run `hook` each time this thread reaches `point`, until `clear`.
@@ -1277,6 +1284,9 @@ pub(super) mod test_hooks {
         PROBE.with(|probe| *probe.borrow_mut() = Probe::default());
         DECISIONS.with(|decisions| decisions.borrow_mut().clear());
         BUCKETS.with(|buckets| buckets.borrow_mut().clear());
+        UNREADABLE.with(|causes| causes.borrow_mut().clear());
+        FINISH_ERRORS.with(|errors| errors.borrow_mut().clear());
+        INS_EXTRA.with(|term| term.set(None));
     }
 
     pub(in crate::snapshots) fn fire(point: Point) {
@@ -1336,6 +1346,33 @@ pub(super) mod test_hooks {
 
     pub(in crate::snapshots) fn buckets() -> Vec<super::sampled_jsonl::Bucket> {
         BUCKETS.with(|buckets| buckets.borrow().clone())
+    }
+
+    /// A census unreadable cause, by its `UnreadableCause` ordinal.
+    pub(in crate::snapshots) fn record_unreadable(cause: usize) {
+        UNREADABLE.with(|causes| causes.borrow_mut().push(cause));
+    }
+
+    pub(in crate::snapshots) fn unreadable() -> Vec<usize> {
+        UNREADABLE.with(|causes| causes.borrow().clone())
+    }
+
+    /// The error chain of a sampled completion's failed `finish`.
+    pub(in crate::snapshots) fn record_finish_error(error: &anyhow::Error) {
+        FINISH_ERRORS.with(|errors| errors.borrow_mut().push(format!("{error:#}")));
+    }
+
+    pub(in crate::snapshots) fn finish_errors() -> Vec<String> {
+        FINISH_ERRORS.with(|errors| errors.borrow().clone())
+    }
+
+    /// Sets R0's insert term in place of the measured one, until `clear`.
+    pub(in crate::snapshots) fn set_ins_extra(term: Option<usize>) {
+        INS_EXTRA.with(|ins_extra| ins_extra.set(term));
+    }
+
+    pub(in crate::snapshots) fn ins_extra() -> Option<usize> {
+        INS_EXTRA.with(std::cell::Cell::get)
     }
 }
 

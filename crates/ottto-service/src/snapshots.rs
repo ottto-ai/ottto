@@ -16893,7 +16893,9 @@ impl OwnedSourceScan {
                 }
                 let mut parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
-                    Err(_) => {
+                    Err(_error) => {
+                        #[cfg(test)]
+                        sampled_scan::test_hooks::record_finish_error(&_error);
                         census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     }
@@ -24382,6 +24384,8 @@ impl ScanCensus {
         // Preserve the existing public count and operational predicates.
         self.unreadable_path_count += count;
         self.unreadable_causes.record(cause, count as u64);
+        #[cfg(test)]
+        sampled_scan::test_hooks::record_unreadable(cause as usize);
     }
 
     fn add_terminal_jsonl_loss(&mut self, loss: &TerminalJsonlLoss) {
