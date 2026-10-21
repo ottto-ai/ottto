@@ -44,7 +44,6 @@ impl ClaudeResponseBook {
     }
 
     /// Responses in first-seen order.
-    #[cfg(test)]
     pub(super) fn values(&self) -> std::slice::Iter<'_, ClaudeResponseObservation> {
         self.responses.iter()
     }
@@ -401,6 +400,16 @@ impl CompactClaudeResponseRecord {
             selector,
             tool_uses: tool_uses.into_iter().collect(),
         }
+    }
+
+    /// The provider request id `decode` would yield, borrowed without
+    /// decoding. `first` is the response's first retained record. A
+    /// back-reference without one cannot occur (the first record is always
+    /// encoded with its own text) and reads as no id.
+    pub(super) fn request_id<'a>(&'a self, first: Option<&'a Self>) -> Option<&'a str> {
+        self.request_id
+            .get(first.map(|first| &first.request_id))?
+            .as_deref()
     }
 
     fn decode(
