@@ -33,6 +33,16 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
 
+/// The contract a sync cycle builds Claude bodies under: the full collector
+/// token, which names its version, under a permit, and `""` without one.
+pub(crate) const fn cycle_contract(permitted: bool) -> &'static str {
+    if permitted {
+        COLLECTOR
+    } else {
+        ""
+    }
+}
+
 /// Compiled on. Each cycle still emits only under that cycle's exact cohort
 /// hint token (`emission_permit`); without it the body is today's.
 pub(crate) const EMISSION_ENABLED: bool = true;

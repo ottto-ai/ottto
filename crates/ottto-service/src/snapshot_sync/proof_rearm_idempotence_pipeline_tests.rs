@@ -318,8 +318,10 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
     );
 }
 
-/// Fallback equals BASE: a refused scratch budget and a latched identity
-/// contract are two independent ways to BASE, and both give the same windows.
+/// Fallback equals BASE: with the unchanged-proof scratch refused, every
+/// window equals the BASE windows this fixture produced on the baseline
+/// commit (its `C1A_PROOF_REARM case=c1a-fallback-refused` receipts), and the
+/// fallback is counted.
 #[test]
 #[serial(source_manifests)]
 fn c1a_refused_budget_fallback_equals_base() {
@@ -327,35 +329,35 @@ fn c1a_refused_budget_fallback_equals_base() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
-    let refused = c1a_fixture("c1a-fallback-refused");
-    let refused_windows = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        let fallbacks = crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test();
-        let (closing, reproved) = c1a_close_and_reprove(&refused, "refused");
-        let quiet = c1a_window(&c1a_generation(&refused, "refused", (8, 20)));
-        assert!(
-            crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() > fallbacks,
-            "the fallback is counted"
-        );
-        [closing, reproved, quiet]
+    let window = |reads, family_offered, semantic_noops, fence_before, full_rearm| C1aWindow {
+        pages: 3,
+        reads,
+        family_reads: 3,
+        family_offered,
+        semantic_noops,
+        debt: 3,
+        census_complete: true,
+        fence_before,
+        fence_after: true,
+        full_rearm,
+        retry_pending: false,
+        proven: true,
     };
-    // Second BASE route: the closing census records the contract, then an
-    // unknown record latches every later terminal until a full re-arm.
-    let latched = c1a_fixture("c1a-fallback-latched");
-    let closing = c1a_window(&c1a_generation(&latched, "latched", (8, 0)));
-    c1a_edit_index(&latched, |saved| {
-        saved.remove("claude_request_identity_contract");
-        saved.remove("claude_request_identity_contract_changed");
-    });
-    let reproved = c1a_window(&c1a_generation(&latched, "latched", (8, 10)));
-    let quiet = c1a_window(&c1a_generation(&latched, "latched", (8, 20)));
-    assert_eq!(refused_windows, [closing, reproved, quiet]);
-    let [_, reproved, quiet] = &refused_windows;
-    assert_eq!(reproved.debt, family);
-    assert_eq!(quiet.family_reads, family);
-    assert_eq!(quiet.family_offered, 0);
-    assert_eq!(quiet.debt, family);
+    let base = [
+        window(6, 3, 0, false, true),
+        window(6, 3, 3, true, false),
+        window(3, 0, 3, true, false),
+    ];
+    let refused = c1a_fixture("c1a-fallback-refused");
+    let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
+    let fallbacks = crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test();
+    let windows = [(8, 0), (8, 10), (8, 20)]
+        .map(|clock| c1a_window(&c1a_generation(&refused, "refused", clock)));
+    assert_eq!(windows, base, "the refused fallback is BASE");
+    assert!(
+        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() > fallbacks,
+        "the fallback is counted"
+    );
 }
 
 /// Positive control, changed witness: in a closed-fence window that reads
@@ -603,10 +605,12 @@ enum C1aContractChange {
     Malformed,
 }
 
-/// X(b), contract change: no skip while the latch is set, the latch survives
-/// every save and reload, and only a full re-arm terminal under one unchanged
-/// contract clears it. The skip then resumes.
-fn c1a_contract_change_blocks_skip_until_full_rearm(change: C1aContractChange) {
+/// X(b), contract change after the skip is active: the changed contract
+/// latches at the next traversal start, nothing skips, and that traversal's
+/// complete closed-fence terminal re-arms every family file, including the
+/// members the skip left unread, then clears the latch. The next window
+/// re-reads them under the new contract and the skip resumes.
+fn c1a_contract_change_rearms_skipped_family(change: C1aContractChange) {
     if !c1a_layout_supported("c1a_contract_change") {
         return;
     }
@@ -618,22 +622,20 @@ fn c1a_contract_change_blocks_skip_until_full_rearm(change: C1aContractChange) {
         C1aContractChange::Unknown => "c1a-contract-unknown",
         C1aContractChange::Malformed => "c1a-contract-malformed",
     });
-    if matches!(change, C1aContractChange::OffToOn) {
+    let before = if matches!(change, C1aContractChange::OffToOn) {
         fixture.request_identity = false;
         fixture.owned_base_preparation = true;
-    }
-    let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 0)));
-    assert!(closing.full_rearm && closing.fence_after);
-    let closed_contract = c1a_latch(&fixture);
-    assert!(
-        !closed_contract.1,
-        "the closing full re-arm cleared the latch"
-    );
+        Some(String::new())
+    } else {
+        c1a_collector()
+    };
+    let (_, reproved) = c1a_close_and_reprove(&fixture, "fix");
+    assert_eq!(c1a_latch(&fixture), (before, false));
+    assert_eq!(reproved.debt, 0, "the skip is active");
+    let quiet = c1a_window(&c1a_generation(&fixture, "fix", (8, 20)));
+    assert_eq!(quiet.family_reads, 0);
     match change {
-        C1aContractChange::OffToOn => {
-            assert_eq!(closed_contract.0.as_deref(), Some(""));
-            fixture.request_identity = true;
-        }
+        C1aContractChange::OffToOn => fixture.request_identity = true,
         C1aContractChange::OlderCollector => c1a_edit_index(&fixture, |saved| {
             saved.insert(
                 "claude_request_identity_contract".to_owned(),
@@ -651,54 +653,57 @@ fn c1a_contract_change_blocks_skip_until_full_rearm(change: C1aContractChange) {
             );
         }),
     }
-    for clock in [(8, 10), (8, 20)] {
-        let latched = c1a_window(&c1a_generation(&fixture, "fix", clock));
-        assert!(latched.fence_before && latched.fence_after && !latched.full_rearm);
-        assert_eq!(latched.family_reads, family, "{clock:?}");
-        assert_eq!(latched.debt, family, "{clock:?}: no skip while latched");
-        assert_eq!(c1a_latch(&fixture), (c1a_collector(), true), "{clock:?}");
-    }
-    c1a_full_rearm_due(&fixture);
-    let cleared = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
-    assert!(cleared.full_rearm && cleared.fence_before && cleared.fence_after);
-    assert_eq!(cleared.debt, family);
+    let changed = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
+    assert!(changed.fence_before && changed.fence_after && !changed.full_rearm);
+    assert_eq!(changed.family_reads, 0, "nothing re-selected the family");
+    assert_eq!(changed.debt, family, "the latch re-arms the skipped family");
     assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
-    let resumed = c1a_window(&c1a_generation(&fixture, "fix", (8, 40)));
-    assert_eq!(resumed.family_reads, family);
-    assert_eq!(resumed.debt, 0, "the skip resumes after the clear");
-    let quiet = c1a_window(&c1a_generation(&fixture, "fix", (8, 50)));
+    let reread = c1a_window(&c1a_generation(&fixture, "fix", (8, 40)));
+    assert_eq!(
+        reread.family_reads, family,
+        "re-read under the new contract"
+    );
+    // The skip resumes at once unless the new contract changed the proof
+    // itself; then the changed proof re-arms one more time.
+    let next = c1a_window(&c1a_generation(&fixture, "fix", (8, 45)));
+    let quiet = if reread.debt == 0 {
+        next
+    } else {
+        assert_eq!(next.debt, 0, "the skip resumes after the changed proof");
+        c1a_window(&c1a_generation(&fixture, "fix", (8, 52)))
+    };
     assert_eq!(quiet.family_reads, 0);
 }
 
 #[test]
 #[serial(source_manifests)]
-fn c1a_contract_off_to_on_blocks_skip_until_full_rearm() {
-    c1a_contract_change_blocks_skip_until_full_rearm(C1aContractChange::OffToOn);
+fn c1a_contract_off_to_on_rearms_skipped_family() {
+    c1a_contract_change_rearms_skipped_family(C1aContractChange::OffToOn);
 }
 
 #[test]
 #[serial(source_manifests)]
-fn c1a_contract_older_collector_blocks_skip_until_full_rearm() {
-    c1a_contract_change_blocks_skip_until_full_rearm(C1aContractChange::OlderCollector);
+fn c1a_contract_older_collector_rearms_skipped_family() {
+    c1a_contract_change_rearms_skipped_family(C1aContractChange::OlderCollector);
 }
 
 #[test]
 #[serial(source_manifests)]
-fn c1a_contract_unknown_after_downgrade_blocks_skip_until_full_rearm() {
-    c1a_contract_change_blocks_skip_until_full_rearm(C1aContractChange::Unknown);
+fn c1a_contract_unknown_after_downgrade_rearms_skipped_family() {
+    c1a_contract_change_rearms_skipped_family(C1aContractChange::Unknown);
 }
 
 #[test]
 #[serial(source_manifests)]
-fn c1a_contract_malformed_blocks_skip_until_full_rearm() {
-    c1a_contract_change_blocks_skip_until_full_rearm(C1aContractChange::Malformed);
+fn c1a_contract_malformed_rearms_skipped_family() {
+    c1a_contract_change_rearms_skipped_family(C1aContractChange::Malformed);
 }
 
 /// X(b), A-B-A within one traversal: off, on, off across its pages. The
 /// terminal sees the same contract as the traversal start, but the record
-/// marks the traversal changed, so nothing clears and nothing skips; the next
-/// traversal records the contract again and stays latched until a full
-/// re-arm under one contract.
+/// marks the traversal changed, so nothing skips and nothing clears. The next
+/// traversal records the contract again; its terminal re-arms every family
+/// file and clears the latch, and the skip resumes after that.
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_change_within_traversal_keeps_latch() {
@@ -728,21 +733,22 @@ fn c1a_contract_change_within_traversal_keeps_latch() {
     );
     let restarted = c1a_window(&c1a_generation(&fixture, "fix", (8, 20)));
     assert!(!restarted.full_rearm);
-    assert_eq!(restarted.debt, family);
-    assert_eq!(c1a_latch(&fixture), (Some(String::new()), true));
-    c1a_full_rearm_due(&fixture);
-    let cleared = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
-    assert!(cleared.full_rearm);
+    assert_eq!(
+        restarted.debt, family,
+        "the latch re-arms every family file"
+    );
     assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
-    let resumed = c1a_window(&c1a_generation(&fixture, "fix", (8, 40)));
+    let resumed = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
+    assert_eq!(resumed.family_reads, family);
     assert_eq!(resumed.debt, 0);
 }
 
-/// X(b) lifecycle and partial work: a shed or lost-ACK page keeps the latch
-/// through the full re-arm terminal of its traversal, and a partially
-/// settled traversal never skips, even with the latch clear. The next clean
-/// traversal skips.
-fn c1a_unsettled_traversal_keeps_latch_and_base_rearm(upload: RearmUpload) {
+/// X(b) lifecycle and partial work. A traversal with a shed or lost-ACK page
+/// drops its census (the follow-up walk starts clean), so it never reaches a
+/// complete terminal and keeps the latch it set. When the interrupted page is
+/// itself a full re-arm terminal, its fold clears the latch in memory, but the
+/// partial save keeps the committed latch.
+fn c1a_unsettled_traversal_keeps_latch(upload: RearmUpload) {
     if !c1a_layout_supported("c1a_unsettled") {
         return;
     }
@@ -753,67 +759,144 @@ fn c1a_unsettled_traversal_keeps_latch_and_base_rearm(upload: RearmUpload) {
         RearmUpload::AckLost => "c1a-unsettled-ack-lost",
         RearmUpload::Accept => unreachable!(),
     });
-    let closing = c1a_generation_with(
+    let interrupted = c1a_generation_with(
         &fixture,
         "fix",
         (8, 0),
         Some((0, upload, REARM_ROOT)),
         |_| {},
     );
-    assert!(!closing[0].fully_settled, "the first page was interrupted");
-    let closing = c1a_window(&closing);
-    assert!(closing.full_rearm && closing.fence_after);
+    assert!(
+        !interrupted[0].fully_settled,
+        "the first page was interrupted"
+    );
+    assert!(!c1a_window(&interrupted).census_complete);
     assert_eq!(
         c1a_latch(&fixture),
         (c1a_collector(), true),
-        "no latch clear after partial work"
+        "an interrupted traversal keeps the latch"
     );
-    let latched = c1a_window(&c1a_generation(&fixture, "fix", (8, 10)));
-    assert_eq!(latched.debt, family);
-    assert_eq!(c1a_latch(&fixture), (c1a_collector(), true));
-    c1a_full_rearm_due(&fixture);
-    let cleared = c1a_window(&c1a_generation(&fixture, "fix", (8, 20)));
-    assert!(cleared.full_rearm);
+    let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 10)));
+    assert!(closing.census_complete && closing.full_rearm && closing.fence_after);
     assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
-    // An unrelated offered body on the first page is interrupted; the family
-    // re-proof in the same traversal is unchanged but must not skip.
+
+    // Unknown record again, then a full re-arm terminal whose own page is
+    // interrupted: it offers a changed unrelated body.
+    c1a_edit_index(&fixture, |saved| {
+        saved.remove("claude_request_identity_contract");
+        saved.remove("claude_request_identity_contract_changed");
+    });
+    c1a_full_rearm_due(&fixture);
     RearmFixture::append(
-        &fixture.root.join(format!("{REARM_SIBLING}.jsonl")),
-        &rearm_transcript_line(REARM_SIBLING, None, "req_sibling_2", 1),
+        &fixture
+            .root
+            .join("zz-terminal")
+            .join("nested")
+            .join(format!("{REARM_TERMINAL}.jsonl")),
+        &rearm_transcript_line(REARM_TERMINAL, None, "req_terminal_2", 1),
     );
-    let partial = c1a_generation_with(
+    let terminal = c1a_generation_with(
         &fixture,
         "fix",
-        (8, 30),
-        Some((0, upload, REARM_SIBLING)),
+        (8, 20),
+        Some((2, upload, REARM_TERMINAL)),
         |_| {},
     );
     assert!(
-        !partial[0].fully_settled,
-        "the sibling page was interrupted"
+        !terminal[2].fully_settled,
+        "the full re-arm terminal page was interrupted"
     );
-    let partial = c1a_window(&partial);
-    assert_eq!(partial.family_reads, family);
-    assert!(!partial.full_rearm);
     assert_eq!(
-        partial.debt, family,
-        "no skip in a partially settled traversal"
+        c1a_latch(&fixture),
+        (c1a_collector(), true),
+        "a partial save of the clearing terminal keeps the latch"
     );
-    let clean = c1a_window(&c1a_generation(&fixture, "fix", (8, 40)));
-    assert_eq!(clean.family_reads, family);
-    assert_eq!(clean.debt, 0, "the next clean traversal skips");
+    let cleared = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
+    assert!(cleared.census_complete);
+    assert_eq!(
+        cleared.debt, family,
+        "the clearing terminal re-arms every file"
+    );
+    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
+    let resumed = c1a_window(&c1a_generation(&fixture, "fix", (8, 40)));
+    assert_eq!(resumed.family_reads, family);
+    assert_eq!(resumed.debt, 0, "the skip resumes after a settled clear");
 }
 
 #[test]
 #[serial(source_manifests)]
-fn c1a_shed_traversal_keeps_latch_and_base_rearm() {
-    c1a_unsettled_traversal_keeps_latch_and_base_rearm(RearmUpload::Shed);
+fn c1a_shed_traversal_keeps_latch() {
+    c1a_unsettled_traversal_keeps_latch(RearmUpload::Shed);
 }
 
 #[test]
 #[serial(source_manifests)]
-fn c1a_ack_lost_traversal_keeps_latch_and_base_rearm() {
-    c1a_unsettled_traversal_keeps_latch_and_base_rearm(RearmUpload::AckLost);
+fn c1a_ack_lost_traversal_keeps_latch() {
+    c1a_unsettled_traversal_keeps_latch(RearmUpload::AckLost);
+}
+
+/// Fence recovery: the invalid transcript is fixed while the skip is active,
+/// and the families the skip left unread are all that keep the fence closed.
+/// BASE re-read them anyway and reopens in that window; the fix re-arms every
+/// family file there and reopens one window later, not at the closed-fence
+/// full re-arm deadline. Only the family and the invalid transcript exist,
+/// three files per page, so the transcript is alone on the terminal page.
+#[test]
+#[serial(source_manifests)]
+fn c1a_fixed_invalid_transcript_reopens_fence_without_deadline() {
+    if !c1a_layout_supported("c1a_fence_recovery") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let family = rearm_family_sessions().len();
+    let fixture = |case: &'static str| {
+        let mut fixture = c1a_fixture(case);
+        fixture.native_file_limit = 3;
+        std::fs::remove_file(fixture.root.join(format!("{REARM_SIBLING}.jsonl"))).unwrap();
+        std::fs::remove_file(
+            fixture
+                .root
+                .join("zz-terminal")
+                .join("nested")
+                .join(format!("{REARM_TERMINAL}.jsonl")),
+        )
+        .unwrap();
+        fixture
+    };
+    let run = |fixture: &RearmFixture, arm: &str| {
+        let windows = [(8, 0), (8, 10), (8, 20)]
+            .map(|clock| c1a_window(&c1a_generation(fixture, arm, clock)));
+        std::fs::write(
+            c1a_invalid_path(fixture),
+            rearm_transcript_line(C1A_INVALID, None, "req_c1a_valid", 0),
+        )
+        .unwrap();
+        let fixed = c1a_window(&c1a_generation(fixture, arm, (8, 30)));
+        let after = c1a_window(&c1a_generation(fixture, arm, (8, 40)));
+        (windows, fixed, after)
+    };
+    let recovered = fixture("c1a-fence-recovery");
+    let (windows, fixed, after) = run(&recovered, "fix");
+    let base = fixture("c1a-fence-recovery-base");
+    let (base_windows, base_fixed, _) = {
+        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
+        run(&base, "base")
+    };
+    // Preconditions: the layout and the active skip.
+    assert_eq!(windows[1].pages, 2);
+    assert!(windows[1].fence_before && windows[1].fence_after);
+    assert_eq!(windows[1].debt, 0, "the skip is active");
+    assert_eq!(windows[2].family_reads, 0);
+    assert_eq!(base_windows[2].family_reads, family);
+    // BASE re-read the family and reopens in the fixed window.
+    assert!(!base_fixed.fence_after, "BASE reopens at once");
+    // The fix reads only the fixed transcript, re-arms every family file and
+    // reopens in the next window.
+    assert_eq!(fixed.family_reads, 0);
+    assert!(fixed.fence_after && !fixed.full_rearm);
+    assert_eq!(fixed.debt, family, "the recovery re-arms the unread family");
+    assert_eq!(after.family_reads, family);
+    assert!(after.fence_before && !after.fence_after, "reopened");
 }
 
 /// Positive control, account hold: a family member that is account-held when
