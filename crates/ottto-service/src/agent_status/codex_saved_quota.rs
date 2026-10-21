@@ -32,6 +32,13 @@
 //! Every home is scheduled whether or not the device uploads Codex status:
 //! the companion shows these readings locally.
 //!
+//! "Background limit refresh" (the Codex accounts settings, on until the
+//! owner chooses) gates the schedule for every home at once: while it is off
+//! a round reads nothing, scans no processes and runs no `codex app-server`,
+//! the same-login keep-alive included, and the setting is checked again under
+//! the settings lock right before each read. An explicit refresh and setup
+//! checks still read; saved readings are served and age as usual.
+//!
 //! A login is the account and workspace the home's credential names, not the
 //! `auth.json` file: each provider read refreshes the token, so Codex rewrites
 //! that file on every read. Only a credential that names no account falls back
@@ -46,7 +53,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use ottto_core::{default_support_dir, CodexHomeTrust, FileCodexAccountSlotSettingsStore};
+use ottto_core::{
+    default_support_dir, CodexHomeTrust, FileCodexAccountSlotSettingsStore,
+    CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME,
+};
 use ottto_protocol::{
     ActiveSession, AgentAccountStatus, AgentCreditBalance, AgentLoginState, AgentQuotaWindow,
     AgentStatusConfidence, CodexAccountSlotOwnershipV1, SourceKind,
@@ -108,6 +118,11 @@ const PROCESS_SCAN_MIN_GAP_SECONDS: u64 = 5 * 60;
 /// status read shows is on the schedule, which reads it within a minute.
 pub(super) const CODEX_QUOTA_NOT_READ_YET: &str =
     "Codex quota for this account has not been read since its login was last seen; the daemon reads it shortly.";
+
+/// Served instead of [`CODEX_QUOTA_NOT_READ_YET`] while background limit
+/// refresh is off: nothing reads the home until the owner asks.
+pub(super) const CODEX_QUOTA_BACKGROUND_REFRESH_OFF: &str =
+    "Codex quota for this account has not been read since its login was last seen, and background limit refresh is off; use Refresh limits to read it now.";
 
 /// The failure saved for a read that panicked.
 const CODEX_QUOTA_READ_PANICKED: &str = "Codex quota read failed unexpectedly.";
@@ -540,7 +555,27 @@ pub(super) fn serve_saved(
     home_trust: CodexHomeTrust,
     now: u64,
 ) -> Result<CodexUsageProbe, CodexQuotaFailure> {
-    serve_saved_at(&saved_quota_support_dir(), home, home_trust, now)
+    serve_saved_at(&saved_quota_support_dir(), home, home_trust, now).map_err(|failure| {
+        if failure.message == CODEX_QUOTA_NOT_READ_YET
+            && !quota_refresh_settings().background_quota_refresh_allowed()
+        {
+            CodexQuotaFailure {
+                message: CODEX_QUOTA_BACKGROUND_REFRESH_OFF.to_string(),
+                ..failure
+            }
+        } else {
+            failure
+        }
+    })
+}
+
+/// The Codex accounts settings that hold "Background limit refresh", in the
+/// support dir the saved copies use (the daemon's own; a unit test's scratch
+/// dir unless it chose one).
+fn quota_refresh_settings() -> FileCodexAccountSlotSettingsStore {
+    FileCodexAccountSlotSettingsStore::new(
+        saved_quota_support_dir().join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME),
+    )
 }
 
 /// Whether a saved time may be served at `now`: not in the future, not past
@@ -1197,11 +1232,14 @@ fn read_homes(
 
 /// One scheduler pass over `homes`: read every due one. Returns how many were
 /// read.
+/// `background_allowed` is asked right before each due read, under that
+/// home's lock; `false` skips the read.
 fn scheduled_round_for(
     support_dir: &Path,
     homes: Vec<ScheduledHome>,
     sessions: &[ActiveSession],
     now: u64,
+    background_allowed: impl Fn() -> bool + Sync,
     read: impl Fn(&ScheduledHome) -> Result<CodexUsageProbe, String> + Sync,
 ) -> usize {
     let in_use = homes_in_use(&homes, sessions, now);
@@ -1238,7 +1276,7 @@ fn scheduled_round_for(
                     .copied()
                     .unwrap_or(UNUSED_REFRESH_SECONDS),
                 now,
-            )
+            ) && background_allowed()
         },
         read,
     )
@@ -1271,8 +1309,13 @@ fn scan_running_homes_if_due(now: u64) {
 }
 
 /// One scheduler pass: read every due home. Returns how many were read.
+/// With background limit refresh off it reads nothing and scans nothing.
 pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
     crate::codex_sign_in::end_stale_run();
+    let settings = quota_refresh_settings();
+    if !settings.background_quota_refresh_allowed() {
+        return 0;
+    }
     scan_running_homes_if_due(now);
     let homes = scheduled_homes(support_dir, now);
     if homes.is_empty() {
@@ -1284,9 +1327,14 @@ pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
     )
     .map(|reconciliation| reconciliation.sessions)
     .unwrap_or_default();
-    scheduled_round_for(support_dir, homes, &sessions, now, |home| {
-        read_codex_usage_from_provider(&home.home, home.trust)
-    })
+    scheduled_round_for(
+        support_dir,
+        homes,
+        &sessions,
+        now,
+        || settings.background_quota_refresh_allowed_locked(),
+        |home| read_codex_usage_from_provider(&home.home, home.trust),
+    )
 }
 
 /// One scheduler pass in the support dir the daemon uses.
@@ -1844,11 +1892,18 @@ mod tests {
                 &running,
                 at,
             );
-            scheduled_round_for(&root, scheduled, &sessions, at, |home| {
-                let name = home.home.file_name().unwrap().to_str().unwrap().to_string();
-                reads.lock().unwrap().push(name.clone());
-                Ok(probe(&name, "w", &rfc3339(at)))
-            });
+            scheduled_round_for(
+                &root,
+                scheduled,
+                &sessions,
+                at,
+                || true,
+                |home| {
+                    let name = home.home.file_name().unwrap().to_str().unwrap().to_string();
+                    reads.lock().unwrap().push(name.clone());
+                    Ok(probe(&name, "w", &rfc3339(at)))
+                },
+            );
             let mut read = reads.lock().unwrap().clone();
             read.sort();
             read
@@ -2333,6 +2388,7 @@ mod tests {
                 self.scheduled(except, at),
                 &sessions,
                 at,
+                || true,
                 |home| self.read(home, at),
             );
             self.taken_reads()
@@ -2413,9 +2469,14 @@ mod tests {
                 home.process_seen_at = Some(start + 29 * 60);
             }
         }
-        scheduled_round_for(&fixture.root, homes, &[], start + 30 * 60, |home| {
-            fixture.read(home, start + 30 * 60)
-        });
+        scheduled_round_for(
+            &fixture.root,
+            homes,
+            &[],
+            start + 30 * 60,
+            || true,
+            |home| fixture.read(home, start + 30 * 60),
+        );
         assert_eq!(fixture.taken_reads(), ["default", "other"]);
 
         // Keep-alive: the slot reads by itself once a day, not before.

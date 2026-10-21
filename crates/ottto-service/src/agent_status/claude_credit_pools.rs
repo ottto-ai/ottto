@@ -3227,6 +3227,70 @@ mod tests {
         assert_eq!(harness.requests(), 2);
     }
 
+    /// "Background limit refresh" off: the daemon's own passes read no
+    /// Claude account, the default login included, and serve the stored
+    /// reading. A person's Refresh, a setup check and a read outside a pass
+    /// (an account check) still read; switching it on resumes the schedule.
+    #[test]
+    #[serial_test::serial]
+    fn background_refresh_off_stops_scheduled_reads_for_every_login() {
+        use super::super::ClaudeOAuthUsageCaller::{Default as DefaultLogin, RegisteredSlot};
+        use crate::provider_calls::{with_trigger, Trigger};
+        let harness = VariantHarness::new("background-refresh-off");
+        let settings = ottto_core::FileClaudeConfigSlotSettingsStore::default();
+        settings.set_upkeep_consent(1, false).expect("turn off");
+        let slot = || RegisteredSlot("slot-variant".to_string());
+        let now = super::super::current_unix_seconds();
+        let pass = |caller| {
+            super::super::with_claude_pass(false, now, || {
+                harness.collect_as(caller, respond_recognized)
+            })
+        };
+
+        // Due with nothing stored: no request for either login, and the
+        // status says why.
+        harness.due(ClaudeReadSchedule::default());
+        for caller in [DefaultLogin, slot()] {
+            assert_eq!(
+                pass(caller).result.err().as_deref(),
+                Some(super::super::CLAUDE_BACKGROUND_REFRESH_OFF_MESSAGE)
+            );
+        }
+        assert_eq!(harness.requests(), 0);
+
+        // A setup check reads, even inside a pass.
+        assert!(with_trigger(Trigger::Setup, || pass(DefaultLogin))
+            .result
+            .is_ok());
+        assert_eq!(harness.requests(), 1);
+
+        // Due again: the pass serves the stored reading, no request.
+        harness.due_keeping_reading();
+        assert!(pass(DefaultLogin).result.is_ok());
+        assert!(pass(slot()).result.is_ok());
+        assert_eq!(harness.requests(), 1);
+
+        // An account check runs outside any pass: it reads.
+        assert!(harness
+            .collect_as(slot(), respond_recognized)
+            .result
+            .is_ok());
+        assert_eq!(harness.requests(), 2);
+
+        // A person's Refresh reads in the daemon's pass.
+        harness.due_keeping_reading();
+        super::super::request_claude_explicit_refresh();
+        assert!(pass(DefaultLogin).result.is_ok());
+        assert_eq!(harness.requests(), 3);
+
+        // On again: the schedule reads a due account.
+        harness.due_keeping_reading();
+        settings.set_upkeep_consent(1, true).expect("turn on");
+        super::super::claude_explicit_refresh_request().at = 0;
+        assert!(pass(DefaultLogin).result.is_ok());
+        assert_eq!(harness.requests(), 4);
+    }
+
     /// At least 5 minutes between reads of one account, measured from the
     /// start of the pass that read: the daemon's next 5-min pass finds the
     /// account due wherever in the pass the read fell.

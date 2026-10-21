@@ -2,7 +2,7 @@ use ottto_protocol::{
     CodexAccountCapacityV1, CodexAccountSetupOperationStateV1, CodexAccountSetupOperationV1,
     CodexAccountSignInOutcomeV1, CodexAccountSignInPhaseV1, CodexAccountSignInV1,
     CodexAccountSlotCollectionStatusV1, CodexAccountSlotDescriptorV1, CodexAccountSlotOwnershipV1,
-    CodexAccountTargetCoverageV1, CodexAccountsStatusV1,
+    CodexAccountTargetCoverageV1, CodexAccountsStatusV1, CodexQuotaRefreshConsentState,
     CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,21 @@ struct PersistedCodexAccountSlotsV1 {
     /// exits 0 both when it saved one and when it was stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sign_in_baseline: Option<PersistedCodexSignInBaselineV1>,
+    /// "Background limit refresh" for every Codex home on this Mac. Read only
+    /// once `background_quota_refresh_consent_chosen` is set; until then the
+    /// switch is on. Older daemons ignore both fields; a downgrade rewrite
+    /// drops them, which only returns the switch to its default (on).
+    #[serde(default)]
+    background_quota_refresh_consent: bool,
+    /// Whether the owner ever set the switch.
+    #[serde(default)]
+    background_quota_refresh_consent_chosen: bool,
+}
+
+impl PersistedCodexAccountSlotsV1 {
+    fn background_quota_refresh_allowed(&self) -> bool {
+        self.background_quota_refresh_consent || !self.background_quota_refresh_consent_chosen
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +166,8 @@ impl Default for PersistedCodexAccountSlotsV1 {
             verifying_pinned_workspace: false,
             pending_open_slot_id: None,
             sign_in_baseline: None,
+            background_quota_refresh_consent: false,
+            background_quota_refresh_consent_chosen: false,
         }
     }
 }
@@ -1004,6 +1021,39 @@ impl FileCodexAccountSlotSettingsStore {
         Ok(status_contract(&persisted))
     }
 
+    /// Turn background Codex limit reads on or off for every Codex home.
+    pub fn set_quota_refresh_consent(
+        &self,
+        schema_version: u16,
+        consent: bool,
+    ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
+        validate_schema_version(schema_version)?;
+        self.mutate(|persisted| {
+            persisted.background_quota_refresh_consent = consent;
+            persisted.background_quota_refresh_consent_chosen = true;
+            Ok(())
+        })
+    }
+
+    /// Whether the daemon may read Codex limits in the background: a plain
+    /// read for the scheduler's per-round check. A settings file that cannot
+    /// be read counts as off.
+    pub fn background_quota_refresh_allowed(&self) -> bool {
+        self.read_persisted()
+            .is_ok_and(|persisted| persisted.background_quota_refresh_allowed())
+    }
+
+    /// The same answer under the settings transaction lock the switch's
+    /// writer takes, for the final check right before a background read: a
+    /// switch-off that has returned is always seen, and one being written
+    /// waits for this check. A read admitted here may still start after a
+    /// switch-off that lands just after it. When the lock cannot be taken no
+    /// writer can change the setting either, so the plain read stands.
+    pub fn background_quota_refresh_allowed_locked(&self) -> bool {
+        let _transaction = self.transaction_lock().ok();
+        self.background_quota_refresh_allowed()
+    }
+
     pub fn slot_home(&self, slot_id: &str) -> Result<PathBuf, CodexAccountSlotSettingsError> {
         validate_opaque_slot_id(slot_id)?;
         let persisted = self.read_persisted()?;
@@ -1383,6 +1433,11 @@ fn status_contract(persisted: &PersistedCodexAccountSlotsV1) -> CodexAccountsSta
             remaining_slots: MAX_CODEX_ACCOUNT_SLOTS.saturating_sub(used_slots),
         },
         daemon_sign_in_supported: None,
+        background_quota_refresh: Some(if persisted.background_quota_refresh_allowed() {
+            CodexQuotaRefreshConsentState::Granted
+        } else {
+            CodexQuotaRefreshConsentState::ConsentRequired
+        }),
     }
 }
 
@@ -2516,6 +2571,72 @@ mod tests {
             root.join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME),
         );
         (root, store)
+    }
+
+    #[test]
+    fn background_quota_refresh_is_on_until_chosen_and_survives_a_downgrade() {
+        let (root, store) = test_store("quota-refresh-consent");
+        let path = root.join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME);
+        // No settings file: on.
+        assert!(store.background_quota_refresh_allowed());
+        assert!(store.background_quota_refresh_allowed_locked());
+        assert_eq!(
+            store.load().expect("default").background_quota_refresh,
+            Some(CodexQuotaRefreshConsentState::Granted)
+        );
+        // A file an older daemon wrote has neither field: still on.
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"schema_version": 1})).expect("json"),
+        )
+        .expect("legacy settings");
+        assert!(store.background_quota_refresh_allowed());
+
+        let off = store.set_quota_refresh_consent(1, false).expect("turn off");
+        assert_eq!(
+            off.background_quota_refresh,
+            Some(CodexQuotaRefreshConsentState::ConsentRequired)
+        );
+        assert!(!store.background_quota_refresh_allowed());
+        assert!(!store.background_quota_refresh_allowed_locked());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("settings")).expect("json");
+        assert_eq!(persisted["background_quota_refresh_consent"], false);
+        assert_eq!(persisted["background_quota_refresh_consent_chosen"], true);
+        // Unrelated mutations keep the choice.
+        store
+            .prepare_managed_account(
+                1,
+                format!("codex_setup_{}", "c".repeat(32)),
+                "a".repeat(64),
+                "b".repeat(64),
+            )
+            .expect("prepare");
+        assert!(!store.background_quota_refresh_allowed());
+
+        let on = store.set_quota_refresh_consent(1, true).expect("turn on");
+        assert_eq!(
+            on.background_quota_refresh,
+            Some(CodexQuotaRefreshConsentState::Granted)
+        );
+        assert!(store.background_quota_refresh_allowed());
+
+        // An older daemon's rewrite drops both fields: back to the default.
+        store.set_quota_refresh_consent(1, false).expect("turn off");
+        let mut downgraded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("settings")).expect("json");
+        let object = downgraded.as_object_mut().expect("object");
+        object.remove("background_quota_refresh_consent");
+        object.remove("background_quota_refresh_consent_chosen");
+        fs::write(&path, serde_json::to_vec(&downgraded).expect("json")).expect("rewrite");
+        assert!(store.background_quota_refresh_allowed());
+
+        // Unreadable settings count as off; a wrong schema is refused.
+        fs::write(&path, b"{not json").expect("corrupt");
+        assert!(!store.background_quota_refresh_allowed());
+        assert!(!store.background_quota_refresh_allowed_locked());
+        assert!(store.set_quota_refresh_consent(2, true).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
