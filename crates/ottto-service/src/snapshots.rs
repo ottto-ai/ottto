@@ -59535,6 +59535,191 @@ mod tests {
         assert_parentless_held(&parsed, "appended header", PARENTLESS_CHILD);
     }
 
+    /// P1-RETAIN-3: the tail-cache lineage lift admits only forks whose
+    /// ownership boundary came from in-file header fields. A parented created
+    /// thread, a ledger-resolved ordinary fork and a pre-trigger legacy
+    /// subagent stay unretained even where every other reduction conjunct holds.
+    #[test]
+    fn codex_lineage_lift_keeps_created_ledger_and_pre_trigger_forks_unretained() {
+        fn reduced(
+            path: &Path,
+            metadata: &CodexTitleMetadata,
+            ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
+        ) -> SnapshotAccumulator {
+            let mut parser = OwnedJsonlParser::new(
+                File::open(path).expect("open lineage fixture"),
+                path,
+                SnapshotSource::Codex,
+                apply_codex_line,
+                Some(metadata),
+                None,
+                Some(Arc::new(Mutex::new(ledgers))),
+                true,
+                true,
+            )
+            .expect("lineage parser");
+            // A sampled full read observes priority turns, as `prepare_acquisition` does.
+            parser.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
+            while !parser.step().expect("step lineage parser") {}
+            parser.accumulator.clone()
+        }
+        fn ledger_for(
+            parent_id: &str,
+            parent: &[Value],
+        ) -> BTreeMap<String, CodexParentOwnershipLedger> {
+            BTreeMap::from([(
+                parent_id.to_string(),
+                CodexParentOwnershipLedger {
+                    signatures: parent
+                        .iter()
+                        .filter_map(codex_ownership_signature)
+                        .collect(),
+                    scan_complete: true,
+                    opened_object_identity: String::new(),
+                    unresolvable: None,
+                },
+            )])
+        }
+
+        // A provider-created thread with a trusted parent: complete native
+        // accounting, but native-only and outside the in-file boundaries.
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let child = vec![
+            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","history_base":{"cursor":"external"},"source":"vscode","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}}),
+            json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"01a03e99-5000-7000-8000-000000000001","trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
+            json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":"01a03e99-5000-7000-8000-000000000001","model":"gpt-5.6-sol"}}),
+            json!({"timestamp":"2026-08-02T08:20:02Z","ordinal":3,"type":"compacted","payload":{"replacement_history":[]}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:03Z",
+                Some(4),
+                (12, 8, 2, 1),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+        let root = temp_dir("codex-lineage-lift-created-thread");
+        let path = root.join(format!("rollout-{child_id}.jsonl"));
+        fs::write(&path, jsonl_body(&child)).expect("write created-thread fixture");
+        let mut metadata = CodexTitleMetadata::default();
+        metadata.state_created_threads.insert(child_id.to_string());
+        metadata
+            .spawn_parents
+            .insert(child_id.to_string(), parent_id.to_string());
+        metadata.state_threads.insert(
+            child_id.to_string(),
+            CodexStateThread {
+                tokens_used: 1,
+                created_at: Some("2026-08-02T08:20:00Z".to_string()),
+                ..CodexStateThread::default()
+            },
+        );
+        let created = reduced(&path, &metadata, ledger_for(parent_id, &parent));
+        assert_eq!(
+            created.codex_ownership_boundary,
+            CodexOwnershipBoundary::NativeCreatedThread
+        );
+        assert!(created.codex_is_fork && created.codex_created_thread_native_only);
+        assert!(created.codex_parent_session_ref.is_some());
+        assert!(created.codex_usage_accounting_complete());
+        assert!(!sampled_scan::compatible_reduction(&created));
+        // Each exclusion holds on its own: a cleared native-only flag leaves
+        // the created boundary, and an in-file boundary keeps the flag.
+        let mut flag_cleared = created.clone();
+        flag_cleared.codex_created_thread_native_only = false;
+        assert!(!sampled_scan::compatible_reduction(&flag_cleared));
+        let mut in_file_boundary = created.clone();
+        in_file_boundary.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
+        assert!(in_file_boundary.codex_usage_accounting_complete());
+        assert!(!sampled_scan::compatible_reduction(&in_file_boundary));
+        let _ = fs::remove_dir_all(root);
+
+        // An ordinary fork whose AllLocal boundary came from a parent ledger.
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"legacy-parent","thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-1","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+            json!({"timestamp":"2026-08-02T08:10:01Z","type":"turn_context","payload":{"turn_id":"parent-late-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:10:02Z",
+                None,
+                (160, 120, 18, 4),
+                Some((60, 40, 8, 2)),
+            ),
+        ];
+        let path = write_codex_test_values(
+            "codex-lineage-lift-ledger-fork",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"legacy-child","forked_from_id":"legacy-parent","thread_source":"user","source":"cli"}}),
+                parent[0].clone(),
+                parent[1].clone(),
+                parent[2].clone(),
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"timestamp":"2026-08-02T08:20:02Z","type":"turn_context","payload":{"turn_id":"child-first-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:03Z",
+                    None,
+                    (130, 100, 15, 3),
+                    Some((30, 20, 5, 1)),
+                ),
+            ],
+        );
+        let ledger_fork = reduced(
+            &path,
+            &CodexTitleMetadata::default(),
+            ledger_for("legacy-parent", &parent),
+        );
+        assert_eq!(
+            ledger_fork.codex_ownership_boundary,
+            CodexOwnershipBoundary::AllLocal
+        );
+        assert!(ledger_fork.codex_is_fork && ledger_fork.codex_parent_ledger_consulted);
+        assert!(!ledger_fork.codex_created_thread_native_only);
+        assert!(ledger_fork.codex_usage_accounting_complete());
+        assert!(!sampled_scan::compatible_reduction(&ledger_fork));
+        // The ledger read is the only excluding conjunct here.
+        let mut no_ledger = ledger_fork.clone();
+        no_ledger.codex_parent_ledger_consulted = false;
+        assert!(sampled_scan::compatible_reduction(&no_ledger));
+        let _ = fs::remove_file(path);
+
+        // A legacy subagent before its trigger turn has no local boundary yet.
+        let path = write_codex_test_values(
+            "codex-lineage-lift-pre-trigger",
+            &[
+                json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"child-pre-trigger","forked_from_id":"root","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}}}),
+                codex_test_token_line(
+                    "2026-08-02T06:00:01Z",
+                    None,
+                    (1_000, 800, 100, 20),
+                    Some((1_000, 800, 100, 20)),
+                ),
+            ],
+        );
+        let pre_trigger = reduced(&path, &CodexTitleMetadata::default(), BTreeMap::new());
+        assert_eq!(
+            pre_trigger.codex_ownership_boundary,
+            CodexOwnershipBoundary::AwaitingLegacyTrigger
+        );
+        assert!(pre_trigger.codex_is_fork);
+        assert!(!sampled_scan::compatible_reduction(&pre_trigger));
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn codex_created_thread_parentless_holds_every_unproven_shape() {
         let clock = ParentlessClock::now();
