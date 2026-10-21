@@ -9,6 +9,9 @@
 //! that continues the retained state yields the same points as a full read:
 //! - zero-size requests and requests without a usable timestamp are skipped;
 //! - the first point is pinned;
+//! - points are unique by time (whole seconds): a request in the tail point's
+//!   second replaces the tail, except the pinned first point, which keeps its
+//!   second (a later request in that same second adds no point);
 //! - inside one 15-minute wall-clock slot the tail point is overwritten by the
 //!   newer request unless the change is big (`max(20%, 20K)` tokens), so each
 //!   slot keeps its last request and the tail is always the latest request;
@@ -67,6 +70,10 @@ impl LocalContextPoints {
         };
         // Out-of-order lines never draw backwards.
         let at_unix_seconds = at_unix_seconds.max(tail.at_unix_seconds);
+        let same_second = at_unix_seconds == tail.at_unix_seconds;
+        if same_second && !has_pinned_first_and_tail {
+            return;
+        }
         let same_slot = at_unix_seconds / LOCAL_CONTEXT_POINT_SLOT_SECONDS
             == tail.at_unix_seconds / LOCAL_CONTEXT_POINT_SLOT_SECONDS;
         let big_change = tail.prompt_tokens.abs_diff(prompt_tokens)
@@ -75,7 +82,7 @@ impl LocalContextPoints {
             at_unix_seconds,
             prompt_tokens,
         };
-        if has_pinned_first_and_tail && same_slot && !big_change {
+        if same_second || (has_pinned_first_and_tail && same_slot && !big_change) {
             *tail = point;
             return;
         }
@@ -212,7 +219,36 @@ mod tests {
     fn out_of_order_times_clamp_to_the_tail() {
         assert_eq!(
             points(&[(1_000, 10_000), (2_000, 100_000), (100, 300_000)]),
-            [(1_000, 10_000), (2_000, 100_000), (2_000, 300_000)]
+            [(1_000, 10_000), (2_000, 300_000)]
+        );
+    }
+
+    #[test]
+    fn points_stay_unique_by_second() {
+        // A replay of the first request and a big change in the first's
+        // second add nothing; a big change in the tail's second replaces it.
+        assert_eq!(
+            points(&[
+                (0, 10_000),
+                (0, 10_000),
+                (0, 90_000),
+                (2_000, 20_000),
+                (2_000, 200_000),
+            ]),
+            [(0, 10_000), (2_000, 200_000)]
+        );
+        let mut points = LocalContextPoints::default();
+        points.push(Some("2026-10-21T10:00:00.100Z"), 10_000);
+        points.push(Some("2026-10-21T10:00:00.900Z"), 90_000);
+        points.push(Some("2026-10-21T10:20:00.100Z"), 20_000);
+        points.push(Some("2026-10-21T10:20:00.900Z"), 200_000);
+        assert_eq!(
+            points
+                .points
+                .iter()
+                .map(|point| (point.at_unix_seconds - BASE, point.prompt_tokens))
+                .collect::<Vec<_>>(),
+            [(0, 10_000), (1_200, 200_000)]
         );
     }
 
