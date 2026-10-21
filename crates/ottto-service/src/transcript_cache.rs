@@ -371,13 +371,16 @@ mod tests {
         use crate::transcript_acquisition::{ReadPlan, Scope};
         use std::fs::{self, OpenOptions};
         use std::io::{Read, Write};
+        // Clock reads can repeat; the counter keeps `create_new` names unique.
+        static FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ottto-cache-fixture-{}-{}",
+            "ottto-cache-fixture-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let mut file = OpenOptions::new()
             .read(true)

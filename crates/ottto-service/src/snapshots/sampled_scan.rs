@@ -338,6 +338,26 @@ pub(super) fn release_cache_for_copy_refusal(
     }
 }
 
+/// What one step's budget walk measured, for that step's refusal only.
+/// Tests-first seam for Slice M1.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct StepMeasure {
+    pub(super) resident: Option<usize>,
+    pub(super) active: Option<usize>,
+}
+
+/// Tests-first seam for Slice M1: main's release ignores the active's charge.
+#[cfg(test)]
+pub(super) fn release_cache_to_fit(
+    sampling: Option<&Context>,
+    active: Option<&OwnedActiveFile>,
+    step: StepMeasure,
+) {
+    let _ignored_on_main = step.active;
+    release_cache_for_copy_refusal(sampling, active, step.resident);
+}
+
 /// A completing cursor job's exact copy budget (E3), with the same
 /// refusal release the step start applies to an ordinary file.
 pub(super) fn completion_copy_budget(
