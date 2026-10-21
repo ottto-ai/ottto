@@ -1165,8 +1165,13 @@ pub(super) fn claude_buffered_request_hashes(parser: &super::OwnedJsonlParser) -
         .accumulator
         .claude_responses
         .values()
-        .flat_map(|response| response.records.iter())
-        .filter_map(|record| record.request_id.as_deref())
+        .flat_map(|response| {
+            let first = response.records.first();
+            response
+                .records
+                .iter()
+                .filter_map(move |record| record.request_id(first))
+        })
         .map(claude_request_hash)
         .take(MAX_CLAUDE_REQUEST_CENSUS_HASHES + 1)
         .collect::<Vec<_>>();
