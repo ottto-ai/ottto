@@ -54186,7 +54186,9 @@ mod tests {
     /// witness, and the points must never reach the wire.
     #[test]
     fn compaction_events_and_local_context_points_are_identity_neutral() {
-        let mut item = valid_v6_batch_request().snapshots.remove(0);
+        let mut request = valid_v6_batch_request();
+        let policy = request.upload_policy;
+        let mut item = request.snapshots.remove(0);
         item.peak_context_fill_tokens = Some(250_000);
         item.first_turn_context_tokens = Some(40_000);
         item.compaction_count = Some(1);
@@ -54211,6 +54213,13 @@ mod tests {
             assert_eq!(
                 snapshot_fingerprint(source, &with),
                 snapshot_fingerprint(source, &item),
+                "{source:?}"
+            );
+            // The whole envelope, so the lists can never slip into the
+            // revision or revision v2 input either.
+            assert_eq!(
+                snapshot_semantic_envelope(source, &with, policy),
+                snapshot_semantic_envelope(source, &item, policy),
                 "{source:?}"
             );
         }

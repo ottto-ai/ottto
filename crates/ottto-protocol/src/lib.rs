@@ -824,11 +824,13 @@ pub struct ActiveSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn_context_tokens: Option<u64>,
     /// Recorded context points for the Sessions graph, oldest first, unique
-    /// by time: the first and latest request exactly, the last request of each
-    /// 15-minute slot, and big changes in between; at most 64, thinned evenly
-    /// so the whole session span stays visible. Not every request. Local only,
-    /// never uploaded; present only while the session was active within the
-    /// last 75 minutes when it was read.
+    /// by time: the first request and (almost always) the latest timed
+    /// request exactly, the last request of each 15-minute slot, and big
+    /// changes in between; at most 64, thinned evenly so the whole session
+    /// span stays visible. Not every request. Local only, never uploaded;
+    /// present only while the session was active within the last 75 minutes
+    /// when it was read. Each point is a `[unix_seconds, tokens]` pair (whole
+    /// seconds, UTC).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_points: Vec<ActiveSessionContextPoint>,
     /// Cumulative observed session counters. Optional keeps older daemons and
@@ -913,12 +915,12 @@ pub struct ActiveSessionCompaction {
     pub trigger: Option<String>,
 }
 
-/// One recorded prompt size of an active session at the request's own time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActiveSessionContextPoint {
-    pub at: Rfc3339Timestamp,
-    pub tokens: u64,
-}
+/// One recorded prompt size of an active session at the request's own time,
+/// on the wire as a compact `[unix_seconds, tokens]` pair: whole seconds since
+/// the Unix epoch (UTC), then the prompt size in tokens. A plain tuple alias,
+/// not a tuple struct, so source-derived decode guards keep reading the
+/// protocol's named-field structs unchanged.
+pub type ActiveSessionContextPoint = (i64, u64);
 
 /// One detected billing destination for a source, as observed from local
 /// session telemetry. The Companion keys rows on
@@ -8278,16 +8280,8 @@ mod tests {
                 ],
                 first_turn_context_tokens: Some(24_000),
                 last_turn_context_tokens: Some(120_000),
-                context_points: vec![
-                    ActiveSessionContextPoint {
-                        at: "2026-07-19T17:00:00Z".to_string(),
-                        tokens: 24_000,
-                    },
-                    ActiveSessionContextPoint {
-                        at: "2026-07-19T17:59:00Z".to_string(),
-                        tokens: 120_000,
-                    },
-                ],
+                // 2026-07-19T17:00:00Z and 17:59:00Z.
+                context_points: vec![(1_784_480_400, 24_000), (1_784_483_940, 120_000)],
                 input_tokens: Some(1_000),
                 cache_read_tokens: Some(800),
                 cache_creation_5m_tokens: Some(50),
@@ -8335,10 +8329,7 @@ mod tests {
         assert_eq!(value["sessions"][0]["last_turn_context_tokens"], 120_000);
         assert_eq!(
             value["sessions"][0]["context_points"],
-            serde_json::json!([
-                {"at": "2026-07-19T17:00:00Z", "tokens": 24_000},
-                {"at": "2026-07-19T17:59:00Z", "tokens": 120_000}
-            ])
+            serde_json::json!([[1_784_480_400, 24_000], [1_784_483_940, 120_000]])
         );
         assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
         assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");

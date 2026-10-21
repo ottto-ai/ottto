@@ -439,15 +439,11 @@ fn active_session_compactions(events: &[SnapshotCompactionEvent]) -> Vec<ActiveS
 fn active_session_context_points(points: &[LocalContextPoint]) -> Vec<ActiveSessionContextPoint> {
     points
         .iter()
-        .filter_map(|point| {
-            let at = OffsetDateTime::from_unix_timestamp(i64::from(point.at_unix_seconds))
-                .ok()?
-                .format(&Rfc3339)
-                .ok()?;
-            Some(ActiveSessionContextPoint {
-                at,
-                tokens: u64::from(point.prompt_tokens),
-            })
+        .map(|point| {
+            (
+                i64::from(point.at_unix_seconds),
+                u64::from(point.prompt_tokens),
+            )
         })
         .collect()
 }
@@ -1541,16 +1537,7 @@ mod tests {
         assert_eq!(session.last_turn_context_tokens, Some(59_000));
         assert_eq!(
             session.context_points,
-            [
-                ActiveSessionContextPoint {
-                    at: "2026-07-19T09:50:00Z".to_string(),
-                    tokens: 90,
-                },
-                ActiveSessionContextPoint {
-                    at: "2026-07-19T10:04:00Z".to_string(),
-                    tokens: 59_000,
-                },
-            ]
+            [(1_784_454_600, 90), (1_784_455_440, 59_000),]
         );
         // The list file is compact JSON, and a quiet scan carries the row
         // with its points and sizes unchanged.

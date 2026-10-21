@@ -4,8 +4,10 @@
 //! field is `serde(skip)`).
 //!
 //! Points come from the same requests as first/peak/last, so the first point
-//! is the session's first request, the last point is its latest request and no
-//! point exceeds the peak. The rule depends only on input order, so a tail pass
+//! is the session's first request and no point exceeds the peak. The last
+//! point is the latest request with two rare exceptions: while only the pinned
+//! first point exists, a later request in that same second adds no point, and
+//! a latest request without a parseable timestamp is never a point. The rule depends only on input order, so a tail pass
 //! that continues the retained state yields the same points as a full read:
 //! - zero-size requests and requests without a usable timestamp are skipped;
 //! - the first point is pinned;
@@ -14,7 +16,7 @@
 //!   second (a later request in that same second adds no point);
 //! - inside one 15-minute wall-clock slot the tail point is overwritten by the
 //!   newer request unless the change is big (`max(20%, 20K)` tokens), so each
-//!   slot keeps its last request and the tail is always the latest request;
+//!   slot keeps its last request and the tail is the latest timed request;
 //! - on overflow past 64 points, every other middle point is dropped, keeping
 //!   the first and the last, so the whole session span stays visible.
 
@@ -86,17 +88,21 @@ impl LocalContextPoints {
             *tail = point;
             return;
         }
-        self.points.push(point);
-        if self.points.len() > LOCAL_CONTEXT_POINT_CAP {
-            self.halve();
+        if self.points.len() == LOCAL_CONTEXT_POINT_CAP {
+            self.halve_before_push();
         }
+        self.points.push(point);
     }
 
-    fn halve(&mut self) {
-        let last = self.points.len() - 1;
+    /// Halves a full list before the new point lands, so the `Vec` never grows
+    /// past the cap (capacity stays at 64 x 8 bytes). The result equals
+    /// pushing first and then keeping the first, the last and the even indices
+    /// of the 65: the new point is the even last index, and the old tail sits
+    /// at an odd index, so only the even indices of the current 64 stay.
+    fn halve_before_push(&mut self) {
         let mut index = 0;
         self.points.retain(|_| {
-            let keep = index == 0 || index == last || index % 2 == 0;
+            let keep = index % 2 == 0;
             index += 1;
             keep
         });
@@ -263,13 +269,28 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        // The 65th point leaves the first, the even indices and the new last.
+        let first_overflow = points(&input[..=LOCAL_CONTEXT_POINT_CAP]);
+        assert_eq!(first_overflow.len(), LOCAL_CONTEXT_POINT_CAP / 2 + 1);
+        assert_eq!(
+            first_overflow,
+            input[..=LOCAL_CONTEXT_POINT_CAP]
+                .iter()
+                .step_by(2)
+                .map(|(offset, tokens)| (*offset, u32::try_from(*tokens).unwrap()))
+                .collect::<Vec<_>>()
+        );
         let mut seen_max = 0;
+        let mut seen_max_capacity = 0;
         let mut points = LocalContextPoints::default();
         for (offset, tokens) in &input {
             points.push(Some(&at(BASE + offset)), *tokens);
             seen_max = seen_max.max(points.points.len());
+            seen_max_capacity = seen_max_capacity.max(points.points.capacity());
         }
         assert_eq!(seen_max, LOCAL_CONTEXT_POINT_CAP);
+        // The list never reallocates past the cap.
+        assert!(seen_max_capacity <= LOCAL_CONTEXT_POINT_CAP);
         assert_eq!(points.points.first().unwrap().prompt_tokens, 1_000);
         assert_eq!(points.points.last().unwrap().prompt_tokens, 1_199);
         assert!(points

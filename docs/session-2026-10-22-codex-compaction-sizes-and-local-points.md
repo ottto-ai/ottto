@@ -47,14 +47,17 @@ the ownership fold, never in `finish()`.
 
 `SnapshotItem.local_context_points` is `serde(skip)`: it is never serialized or
 uploaded. The points come from the same Codex block that sets first, peak and
-last. So the first point is the first request, the last point is the latest
-request, and no point is above the peak:
+last. So the first point is the first request and no point is above the peak.
+The last point is the latest request, with two rare exceptions: while only the
+pinned first point exists, a later request in that same second adds no point,
+and a latest request without a parseable timestamp is never a point:
 
 - zero-size requests and requests without a usable timestamp are skipped;
 - inside one 15-minute wall-clock slot, a newer request replaces the tail point
   unless the change is big (`max(20%, 20K)` tokens);
 - at most 64 points per session. On overflow, every other middle point is
-  dropped, keeping the first and the last;
+  dropped, keeping the first and the last. The list halves before the new
+  point is pushed, so its vector never grows past 64 entries;
 - only items whose last activity is within 75 minutes of collection carry
   points. The accumulator itself is not gated, so a tail pass and a full read
   agree.
@@ -62,8 +65,9 @@ request, and no point is above the peak:
 ## Sessions list (`ActiveSession`)
 
 `ActiveSession` gains `compaction_events` (`at`, `before_tokens`,
-`after_tokens`, `trigger`), `context_points` (`at`, `tokens`),
-`first_turn_context_tokens` and `last_turn_context_tokens`. All of them are
+`after_tokens`, `trigger`), `context_points` (compact `[unix_seconds, tokens]`
+pairs, whole seconds UTC), `first_turn_context_tokens` and
+`last_turn_context_tokens`. All of them are
 omitted when empty or unknown. The list file
 `active_sessions/<source>.json` is now written as compact JSON, because the
 status path reads it on every poll. That file is the 15-minute list and is
@@ -72,12 +76,16 @@ rewritten each scan; a row leaves it with its session.
 ## Weight
 
 - Per Codex accumulator: two empty vectors (48 bytes). It grows by 16 bytes
-  per compaction marker and by at most 512 bytes of points.
+  per compaction marker and by at most 512 bytes of points (64 x 8; the
+  vector's capacity never exceeds 64).
 - Per `SnapshotItem`: two empty vectors (48 bytes).
 - Per Codex line: a `compacted` marker pushes 16 bytes. A positive
   `token_count` record parses its timestamp once and updates or appends one
   8-byte point. A counted record checks the newest size pair. Every other line
   costs nothing.
+- Status: a point is about 20 bytes of compact JSON (`[1792576800,250000]`)
+  instead of about 46 bytes as an object, and the daemon formats no timestamps
+  for it. Compaction events on `ActiveSession` stay objects.
 - Upload: 0 bytes for sessions that never compact. About 65 bytes per Codex
   event, so at most about 4 KB at the 64 cap.
 
