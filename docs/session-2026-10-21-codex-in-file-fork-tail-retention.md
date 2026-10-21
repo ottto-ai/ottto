@@ -27,6 +27,10 @@ already folds in the file's family position through
 `path_reduction_fingerprint`, so a family change forces a full read
 (`ScopeChanged`).
 
+The lift applies wherever `compatible_reduction` gates retention, including
+cursor sealed-prefix retention (`sampled_jsonl::retain_sealed_prefix`): a lifted
+fork's cursor-certified prefix is now retained and tailed as well.
+
 No cache budget, cap, admission proof, persisted state, counter, wire field or
 runtime path changes. Usage boundaries and arithmetic are unchanged: a retained
 copy continues the same accumulator a full parse would build.
@@ -44,10 +48,18 @@ copy continues the same accumulator a full parse would build.
   `AllLocal` fork (complete accounting) stay incompatible, and a pre-trigger
   legacy subagent stays incompatible. Single-field controls show which conjunct
   excludes each.
-- The existing parentless created-thread retention test is unchanged.
+- `sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retained`:
+  a retained `Ordinal` fork followed by an ordinal gap or a backward step
+  tails, publishes nothing (parity with a full parse), drops the retained copy,
+  and the next change is `Full(StateMissing)` with parity.
+- `lifted_ordinal_fork_retains_sealed_prefix_then_tails_with_full_parity`
+  (cursor tests): a paged `Ordinal` fork keeps its certified sealed prefix,
+  tails one append from it, and matches an unpaged full read.
+- The existing parentless created-thread retention test keeps its assertions;
+  only its comment was corrected.
 
 The sampled-native test helpers `native_parser` and `acquire` gained
 metadata- and scope-taking variants; existing callers are unchanged.
 
-These tests are written but **UNRUN until CI**. No local builds or tests were
-run for this patch.
+CI ran these tests on the PR head (see the PR body for the receipt). No local
+builds or tests were run for this patch.

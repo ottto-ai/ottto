@@ -59436,11 +59436,13 @@ mod tests {
             "native own creator"
         );
 
-        // Created threads are forks to the sampled tail cache, so an admitted
-        // parentless file is never tail-retained: each change is a full re-parse.
-        // A tail resume would otherwise reuse the bound thread-history extent.
-        // Every other reduction conjunct holds, so `codex_is_fork` alone is the
-        // gate; a change that retains created threads must fail here.
+        // Created threads are never tail-retained, so an admitted parentless
+        // file is a full re-parse on each change. A tail resume would otherwise
+        // reuse the bound thread-history extent. Every other reduction conjunct
+        // holds; a fork is admitted only with an in-file boundary and without
+        // the native-only flag, so only clearing `codex_is_fork` (today's
+        // class) admits this copy. A change that retains created threads must
+        // fail here.
         let root = temp_dir("codex-parentless-not-retained");
         let path = root.join(format!("rollout-{PARENTLESS_CHILD}.jsonl"));
         let body = jsonl_body(&values);
@@ -59716,6 +59718,8 @@ mod tests {
             CodexOwnershipBoundary::AwaitingLegacyTrigger
         );
         assert!(pre_trigger.codex_is_fork);
+        // Excluded by the accounting conjunct; the boundary is not in-file either.
+        assert!(!pre_trigger.codex_usage_accounting_complete());
         assert!(!sampled_scan::compatible_reduction(&pre_trigger));
         let _ = fs::remove_file(path);
     }

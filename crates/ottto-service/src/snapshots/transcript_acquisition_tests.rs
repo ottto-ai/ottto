@@ -113,9 +113,12 @@ fn acquire(
         &scope,
         old,
         now,
+        true,
     )
 }
-/// `acquire` under explicit Codex sidecar metadata and reduction scope.
+/// `acquire` under explicit Codex sidecar metadata and reduction scope;
+/// `complete` is the expected `ParsedJsonlFile::complete()`.
+#[allow(clippy::too_many_arguments)]
 fn acquire_with(
     fixture: &Fixture,
     source: SnapshotSource,
@@ -123,6 +126,7 @@ fn acquire_with(
     scope: &Scope,
     old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
     now: u64,
+    complete: bool,
 ) -> (
     Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
     ReadMode,
@@ -170,7 +174,7 @@ fn acquire_with(
             None,
         )
         .unwrap();
-    assert!(parsed.complete());
+    assert_eq!(parsed.complete(), complete);
     let mut items = parsed.snapshots;
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     (retained, mode, guards, serde_json::to_value(items).unwrap())
@@ -672,6 +676,46 @@ fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
     }
 }
 #[test]
+fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retained() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let metadata = CodexTitleMetadata::default();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    // After a retained `Ordinal` copy, a gap or a backward step breaks the
+    // ordinal stream: the tail is held exactly as a full parse holds it, no
+    // copy is retained, and the next change is a full read.
+    for (case, broken) in [("gap", 4), ("backward", 1)] {
+        let fixture = lineage_fixture(&[
+            json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal-break","forked_from_id":"019fa111-2222-7333-8444-0000000000b1","thread_source":"subagent","subagent_history_start_ordinal":2}}),
+            lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+            lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+        ]);
+        let (retained, _, _, _) = acquire(&fixture, source, None, 100);
+        assert!(retained.is_some(), "{case}: the fork is retained first");
+        let (total, last) = LINEAGE_APPENDS[0];
+        fixture.append(&lineage_tokens(10, Some(broken), total, last));
+        let (next, mode, _, body) =
+            acquire_with(&fixture, source, &metadata, &scope, retained, 101, false);
+        assert_eq!(mode, ReadMode::Tail, "{case}");
+        assert_eq!(body, oracle(&fixture, source), "{case}: tail parity");
+        assert_eq!(body, json!([]), "{case}: held, never partial");
+        assert!(next.is_none(), "{case}: no copy after the break");
+        let (total, last) = LINEAGE_APPENDS[1];
+        fixture.append(&lineage_tokens(11, Some(broken + 1), total, last));
+        let (next, mode, _, body) =
+            acquire_with(&fixture, source, &metadata, &scope, next, 102, false);
+        assert_eq!(
+            mode,
+            ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing),
+            "{case}"
+        );
+        assert_eq!(body, oracle(&fixture, source), "{case}: full parity");
+        assert!(next.is_none(), "{case}");
+    }
+}
+#[test]
 fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_changes() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -705,7 +749,7 @@ fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_chang
         |metadata: &CodexTitleMetadata| Scope(metadata.path_reduction_fingerprint(&fixture.0));
 
     let (retained, mode, _, body) =
-        acquire_with(&fixture, source, &family, &scope(&family), None, 100);
+        acquire_with(&fixture, source, &family, &scope(&family), None, 100, true);
     assert_eq!(
         mode,
         ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
@@ -734,8 +778,15 @@ fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_chang
 
     let (total, last) = LINEAGE_APPENDS[0];
     fixture.append(&lineage_tokens(10, None, total, last));
-    let (retained, mode, _, body) =
-        acquire_with(&fixture, source, &family, &scope(&family), retained, 101);
+    let (retained, mode, _, body) = acquire_with(
+        &fixture,
+        source,
+        &family,
+        &scope(&family),
+        retained,
+        101,
+        true,
+    );
     assert_eq!(mode, ReadMode::Tail);
     assert_eq!(body, lineage_oracle(&fixture, &family));
     assert!(retained.is_some());
@@ -749,8 +800,15 @@ fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_chang
     assert_ne!(scope(&changed), scope(&family));
     let (total, last) = LINEAGE_APPENDS[1];
     fixture.append(&lineage_tokens(11, None, total, last));
-    let (retained, mode, _, body) =
-        acquire_with(&fixture, source, &changed, &scope(&changed), retained, 102);
+    let (retained, mode, _, body) = acquire_with(
+        &fixture,
+        source,
+        &changed,
+        &scope(&changed),
+        retained,
+        102,
+        true,
+    );
     assert_eq!(
         mode,
         ReadMode::Full(crate::transcript_acquisition::FullReason::ScopeChanged)
