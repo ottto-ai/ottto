@@ -40,7 +40,11 @@ pub(crate) struct MixedUploads {
 
 impl MixedUploads {
     pub(crate) fn admit_request_identity(&mut self, item: &SnapshotItem) {
-        if item.provenance.collector == super::claude_request_identity::COLLECTOR {
+        #[cfg(not(test))]
+        let identity_collector = super::claude_request_identity::COLLECTOR;
+        #[cfg(test)]
+        let identity_collector = super::claude_request_identity::cycle_contract(true);
+        if item.provenance.collector == identity_collector {
             self.request_identity.insert(
                 item.source_session_id.clone(),
                 (
@@ -52,10 +56,14 @@ impl MixedUploads {
     }
 
     pub(super) fn permits_request_identity(&self, item: &SnapshotItem) -> bool {
+        #[cfg(not(test))]
+        let identity_collector = super::claude_request_identity::COLLECTOR;
+        #[cfg(test)]
+        let identity_collector = super::claude_request_identity::cycle_contract(true);
         self.request_identity
             .get(&item.source_session_id)
             .is_some_and(|(semantic, body)| {
-                item.provenance.collector == super::claude_request_identity::COLLECTOR
+                item.provenance.collector == identity_collector
                     && item.snapshot_fingerprint == *semantic
                     && snapshot_fingerprint(SnapshotSource::ClaudeCode, item) == *semantic
                     && super::snapshot_upload_body_witness(item) == *body
