@@ -3340,6 +3340,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         usage_accounting_contract: item.usage_accounting_contract.clone(),
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
+        claude_request_residue: Vec::new(),
         cache_observations: item.cache_observations.clone(),
         cache_observations_state: None,
         cache_base_head_etag: None,
@@ -7086,6 +7087,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
+    // P1 per-request money, shadow only: reads this page's final items and
+    // the rows loaded above; writes only its own census records. Never fails
+    // or changes the page.
+    crate::snapshots::claude_request_money::shadow_page(
+        support_dir,
+        &scan_result.snapshots,
+        index,
+        &api_report,
+        scan_result.census_complete,
+    );
     Ok((disposition, census_withheld, stats))
 }
 
@@ -19226,6 +19237,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
+    mod claude_request_money_pipeline_tests {
+        include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
+    }
     mod p12_base_exit_tests {
         include!("snapshot_sync/p12_base_exit_tests.rs");
     }

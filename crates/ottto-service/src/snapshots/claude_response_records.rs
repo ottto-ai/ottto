@@ -97,18 +97,40 @@ impl ClaudeResponseBook {
                 )?);
             }
         }
-        // finalize_claude_responses sorts the response vector before decoding;
-        // this scratch never overlaps the per-response decode/sort scratch.
-        let response_sort = self
-            .responses
-            .len()
-            .checked_mul(std::mem::size_of::<ClaudeResponseObservation>())?;
+        // finalize_claude_responses pairs each response with its key (a key
+        // vector, then the pair vector), sorts the pairs before decoding and
+        // fills the P1 money shadow's residue side list (at most one entry
+        // per response); this scratch never overlaps the per-response
+        // decode/sort scratch.
+        let response_sort = self.responses.len().checked_mul(
+            std::mem::size_of::<String>()
+                + 2 * std::mem::size_of::<(String, ClaudeResponseObservation)>()
+                + std::mem::size_of::<super::ClaudeResidueOccurrence>(),
+        )?;
         let peak = peak.max(response_sort);
         (peak <= limit).then_some(peak)
     }
 
-    pub(super) fn into_parts(self) -> (Vec<ClaudeResponseObservation>, ClaudeSelectorTable) {
-        (self.responses.into_vec(), self.selectors)
+    /// Responses in first-seen order, each with its response key (the P1
+    /// money shadow tells request-id, message-only and idless responses apart
+    /// by it). Keys move out of the index; none is copied.
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Vec<(String, ClaudeResponseObservation)>,
+        ClaudeSelectorTable,
+    ) {
+        let mut keys = Vec::new();
+        keys.resize_with(self.responses.len(), String::new);
+        for (key, slot) in self.index.into_inner() {
+            if let Some(entry) = keys.get_mut(slot as usize) {
+                *entry = key;
+            }
+        }
+        (
+            keys.into_iter().zip(self.responses).collect(),
+            self.selectors,
+        )
     }
 }
 
