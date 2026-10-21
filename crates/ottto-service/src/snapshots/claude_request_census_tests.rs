@@ -8,7 +8,10 @@ use crate::snapshots::claude_request_census::{
     CLAUDE_REQUEST_CENSUS_CANARY, CLAUDE_REQUEST_CENSUS_DERIVATION,
     MAX_CLAUDE_REQUEST_CENSUS_HASHES,
 };
-use sha2::{Digest as _, Sha256 as CanarySha256};
+use sha2::Sha256 as CanarySha256;
+
+/// One canary fixture: (shape, sorted request hashes).
+type CanaryRow = (String, Vec<u64>);
 
 const FIRST_WINDOW: &str = "2026-08-02T09:00:00Z";
 const SECOND_WINDOW: &str = "2026-08-03T09:00:00Z";
@@ -255,7 +258,7 @@ fn write_census_corpus(root: &Path) {
 
 /// What the parser must yield for the canary corpus at the current
 /// derivation: (shape, request ids) per fixture name.
-fn expected_census_table() -> BTreeMap<String, (String, Vec<u64>)> {
+fn expected_census_table() -> BTreeMap<String, CanaryRow> {
     [
         ("canary-empty.jsonl", "empty", vec![]),
         (
@@ -323,7 +326,7 @@ fn census_key(index: &ScanIndex, root: &Path, name: &str) -> String {
         .unwrap_or_else(|| panic!("{name} has neither a record nor an entry"))
 }
 
-fn observed_census_table(index: &ScanIndex, root: &Path) -> BTreeMap<String, (String, Vec<u64>)> {
+fn observed_census_table(index: &ScanIndex, root: &Path) -> BTreeMap<String, CanaryRow> {
     let census = index.claude_request_census_for_test();
     census
         .keys_for_test()
@@ -341,7 +344,7 @@ fn observed_census_table(index: &ScanIndex, root: &Path) -> BTreeMap<String, (St
         .collect()
 }
 
-fn canary_digest(table: &BTreeMap<String, (String, Vec<u64>)>) -> String {
+fn canary_digest(table: &BTreeMap<String, CanaryRow>) -> String {
     let mut text = String::new();
     for (name, (shape, hashes)) in table {
         let hashes = hashes
@@ -355,10 +358,7 @@ fn canary_digest(table: &BTreeMap<String, (String, Vec<u64>)>) -> String {
 }
 
 /// The canary's verdict for a table produced under `derivation`.
-fn canary_verdict(
-    derivation: u16,
-    table: &BTreeMap<String, (String, Vec<u64>)>,
-) -> Result<(), String> {
+fn canary_verdict(derivation: u16, table: &BTreeMap<String, CanaryRow>) -> Result<(), String> {
     let (pinned_derivation, pinned_digest) = CLAUDE_REQUEST_CENSUS_CANARY;
     let digest = canary_digest(table);
     if derivation != pinned_derivation {
@@ -480,7 +480,7 @@ fn census_derivation_canary_fails_on_a_missed_bump() {
         canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION, &observed),
         Ok(())
     );
-    let mutate = |name: &str, change: &dyn Fn(&mut (String, Vec<u64>))| {
+    let mutate = |name: &str, change: &dyn Fn(&mut CanaryRow)| {
         let mut table = observed.clone();
         change(table.get_mut(name).expect("canary fixture"));
         table
