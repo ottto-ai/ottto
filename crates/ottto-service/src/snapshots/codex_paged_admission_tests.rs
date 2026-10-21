@@ -1597,14 +1597,13 @@ fn outlived_grown_cursor_read_stages_the_audit_debt() {
     });
 }
 
-// F-T19(a): today's loop for an over-limit file that does not change while
-// its cursor read spans the audit interval: it certifies and publishes, yet
-// the debt stays staged and the next decision is the full audit again
-// (P1-AUDIT-DUTY). AD-1 flips this test: under AD-1 the unchanged read
-// certifies with `verified = now`, `audit_overdue` +0 and no staged debt.
-// FC1 publication waits for that flip (post-AD-1 F-T19(a)).
+// F-T19(a), post-AD-1 (#659): an over-limit file that does not change while
+// its cursor read spans the audit interval certifies at commit: it
+// publishes, `audit_overdue` +0, no staged debt, no obligation due at the
+// commit time, and the next page starts no read. Before AD-1 this pinned the
+// P1-AUDIT-DUTY loop (debt staged, the next decision the full audit again).
 #[test]
-fn outlived_unchanged_cursor_read_pins_the_audit_loop_until_ad1() {
+fn outlived_unchanged_cursor_read_verifies_at_commit() {
     if !layout() {
         return;
     }
@@ -1618,23 +1617,35 @@ fn outlived_unchanged_cursor_read_pins_the_audit_loop_until_ad1() {
             let mut now = 1_900_000_000_u64;
             let mut index = ScanIndex::default();
             let mut published = false;
+            let mut certified_at = 0;
             for number in 0..64 {
                 clock.set(now);
                 let (next, scan, _) = page(&fixture, index, Some(&cache), &collected_at(number));
                 index = next;
                 if counters(&cache).jobs_certified == 1 {
                     published = !scan.snapshots.is_empty();
+                    certified_at = number;
                     break;
                 }
                 now += interval;
             }
             assert!(published, "{:?}", counters(&cache));
             let c = counters(&cache);
-            assert_eq!(c.audit_overdue, 1, "{c:?}");
-            assert!(c.audit_overdue_max_age_seconds > 0);
+            assert!(certified_at > 0, "the read spans the audit interval: {c:?}");
+            assert_eq!(c.audit_overdue, 0, "{c:?}");
             let checkpoint = cache.retained_checkpoint(&key).expect("certificate");
-            assert!(checkpoint.audit_debt().is_some(), "AD-1 flips this");
-            assert!(index.files[&key].audit_obligation(now).is_some());
+            assert!(checkpoint.audit_debt().is_none(), "no staged debt");
+            assert!(index.files[&key].audit_obligation(now).is_none());
+            // The loop is gone: the unchanged file is not read again.
+            let (_, again, stats) = page(
+                &fixture,
+                index,
+                Some(&cache),
+                &collected_at(certified_at + 1),
+            );
+            assert_eq!((stats.full, stats.tail), (0, 0), "{stats:?}");
+            assert!(again.snapshots.is_empty());
+            assert_eq!(counters(&cache).jobs_started, c.jobs_started);
         })
     });
 }
