@@ -203,8 +203,8 @@ impl SourceCadence {
 
     /// The gap the ordinary cadence wants between scans right now: the tier
     /// floor, or the failure backoff while failing, lengthened by any server
-    /// directive. This is also the ordinary-equivalent basis a continuation
-    /// page is charged against.
+    /// directive. This policy interval alone does not establish coverage for
+    /// same-revision admission: ordinary cycle and lock delays are unbounded.
     pub fn ordinary_interval(&self) -> Duration {
         if self.disabled {
             return self.config.cold_interval;

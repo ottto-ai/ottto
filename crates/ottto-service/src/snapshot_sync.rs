@@ -2563,7 +2563,6 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                         watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).ok();
                     }
                 }
-                let cycle_started = Instant::now();
                 match sync_once_with_retry(&home, &support_dir, &daemon, &mut retry) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                     Err(error) => {
@@ -2571,7 +2570,6 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                         crate::net_resilience::handle_sync_failure(&daemon);
                     }
                 }
-                continuation::note_ordinary_cycle(cycle_started, Instant::now());
                 // The cycle cadence itself is unchanged. What the tiers gate is the
                 // expensive part — the local transcript scan and its upload — while
                 // agent-status/quota freshness has an independent source owner.

@@ -4,8 +4,7 @@
 // socket.
 
 use super::super::{
-    negotiated_wait, record_finished_snapshot_cadence, validate_snapshot_scan_authority,
-    MAX_CYCLE_INTERVAL, SNAPSHOT_SYNC_INTERVAL,
+    record_finished_snapshot_cadence, validate_snapshot_scan_authority, SNAPSHOT_SYNC_INTERVAL,
 };
 use super::*;
 use crate::adaptive_collector::CadenceConfig;
@@ -228,7 +227,10 @@ impl CursorContinuation for FakePort<'_> {
             self.world.authority.set(authority);
         }
         let planned = self.ends.pop_front().unwrap_or(End::Paused);
-        match if cut { End::Paused } else { planned } {
+        if cut {
+            return PageEnd::PausedContended;
+        }
+        match planned {
             End::Paused => PageEnd::Paused(CursorTicket { _sealed: () }),
             End::Deferred => PageEnd::Deferred,
             End::Eof => PageEnd::Eof(EofCompletion::synthetic()),
@@ -635,6 +637,8 @@ fn ordinary_pass_clears(world: &World) {
 }
 
 fn ordinary_pass_mints_newer(world: &World) {
+    let _guard = world.lock.lock().unwrap();
+    world.ordinary_page_asks(Duration::from_secs(4));
     world.destination.set(Some(OTHER_DESTINATION));
     *lock_slot(&world.slot) = Some(ticket(OTHER_DESTINATION));
 }
@@ -657,16 +661,79 @@ fn the_ticket_is_taken_and_written_only_under_the_sync_lock() {
     assert!(!world.held());
 
     // An ordinary pass that minted a newer ticket (here under a rotated
-    // destination): the page runs on that one, and the ticket it leaves is the
-    // page's own, written before the lock is released.
+    // destination) also installs its own cadence request. Its new 36 s gap
+    // must elapse before even ready() is called.
     let world = World::new();
     world.ordinary_page_asks(Duration::from_secs(5));
     world.advance_to_due();
     let mut port = FakePort::new(&world, &[End::Paused]);
     let mut gates = FakeGates::allowed(&world);
     gates.on_power = Some(ordinary_pass_mints_newer as fn(&World));
-    assert_eq!(run(&world, &mut port, &mut gates), Outcome::Paused);
+    assert_eq!(
+        run(&world, &mut port, &mut gates),
+        Outcome::Skipped(Skip::NotDue)
+    );
+    let due = world.due().unwrap();
+    assert_eq!(due - world.now.get(), Duration::from_secs(36));
     assert_eq!(world.held_destination(), Some(OTHER_DESTINATION));
+    assert_eq!(port.calls, Calls::default());
+    assert_eq!(gates.entered, 0);
+    gates.on_power = None;
+    world.now.set(due - Duration::from_secs(1));
+    assert_eq!(
+        run(&world, &mut port, &mut gates),
+        Outcome::Skipped(Skip::NotDue)
+    );
+    assert_eq!(world.due(), Some(due));
+    assert_eq!(port.calls, Calls::default());
+    world.now.set(due);
+    assert_eq!(run(&world, &mut port, &mut gates), Outcome::Paused);
+    assert_eq!(port.calls.page, 1);
+    assert_eq!(world.held_destination(), Some(OTHER_DESTINATION));
+}
+
+#[test]
+fn policy_changes_between_precheck_and_lock_apply_to_the_current_ticket() {
+    type Change = fn(&World);
+    let rows: [(Change, Skip, bool); 4] = [
+        (
+            |w| {
+                w.cadence
+                    .borrow_mut()
+                    .set_server_min_interval(Some(Duration::from_secs(120)))
+            },
+            Skip::NotDue,
+            true,
+        ),
+        (
+            |w| {
+                w.cadence
+                    .borrow_mut()
+                    .set_server_min_interval(Some(Duration::from_secs(1800)))
+            },
+            Skip::NotDue,
+            false,
+        ),
+        (
+            |w| w.cadence.borrow_mut().record_scan_failure(w.now.get()),
+            Skip::Failing,
+            false,
+        ),
+        (|w| w.backoff.set(true), Skip::Backoff, false),
+    ];
+    for (change, reason, kept) in rows {
+        let world = World::new();
+        world.ordinary_page_asks(Duration::from_secs(4));
+        world.advance_to_due();
+        let mut port = FakePort::new(&world, &[End::Paused]);
+        let mut gates = FakeGates::allowed(&world);
+        gates.on_power = Some(change);
+        assert_eq!(run(&world, &mut port, &mut gates), Outcome::Skipped(reason));
+        assert_eq!(world.held(), kept);
+        assert_eq!(world.due().is_some(), kept);
+        assert_eq!(port.calls, Calls::default());
+        assert_eq!(gates.entered, 0);
+    }
 }
 
 #[test]
@@ -772,13 +839,39 @@ fn a_page_stops_at_the_ordinary_deadline() {
         ordinary + RECORD,
         "the overrun is at most the record being read"
     );
-    assert_eq!(outcome, Outcome::Paused);
-    // The next page would end after this cycle's deadline: ordinary next.
+    assert_eq!(outcome, Outcome::PausedContended);
+    assert!(!world.held());
+    assert_eq!(world.due(), None);
+    // No request survives into this or a later wait: ordinary next.
     let pending = world.due().zip(world.cadence.borrow().continuation_work());
     assert!(matches!(
         plan_wake(world.now.get(), ordinary, pending),
         Wake::Ordinary(_)
     ));
+}
+
+#[test]
+fn byte_budget_exhaustion_before_the_deadline_still_requests() {
+    let world = World::new();
+    world.ordinary_page_asks(Duration::from_secs(4));
+    world.advance_to_due();
+    let mut port = FakePort::new(&world, &[End::Paused]);
+    let mut gates = FakeGates::allowed(&world);
+    let deadline = world.now.get() + Duration::from_secs(6);
+    assert_eq!(
+        run_page(
+            &mut FakeHost(&world),
+            &mut port,
+            &mut gates,
+            &world.lock,
+            &world.slot,
+            deadline
+        ),
+        Outcome::Paused
+    );
+    assert_eq!(port.deadlines, vec![(deadline, false)]);
+    assert!(world.held());
+    assert!(world.due().is_some());
 }
 
 #[test]
@@ -1053,102 +1146,67 @@ fn other_sources_and_the_ordinary_eligibility_clock_are_untouched() {
     assert_eq!(format!("{claude:?}"), claude_before);
 }
 
-fn loop_shape(tick: Duration, cycle: Duration) -> Option<LoopShape> {
-    let start = Instant::now();
-    let mut record = LoopRecord::new();
-    record.observe(start, start + cycle);
-    assert_eq!(record.shape(), None, "unknown until a tick is observed");
-    record.observe(start + tick, start + tick + cycle);
-    record.shape()
-}
-
 #[test]
-fn the_ordinary_equivalent_follows_the_applicable_policy_unclamped() {
+fn a_slower_later_cycle_cannot_supply_same_revision_admission_credit() {
     let start = Instant::now();
-    let shape = loop_shape(Duration::from_secs(330), Duration::from_secs(30));
-    let slack = Duration::from_secs(330 + 30);
     let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
-    cadence.record_scan_success(start, 1);
-    assert_eq!(
-        ordinary_equivalent(&cadence, shape),
-        Some(Duration::from_secs(300) + slack)
-    );
-    cadence.record_scan_success(start + Duration::from_secs(20 * 60), 0);
-    assert_eq!(
-        ordinary_equivalent(&cadence, shape),
-        Some(Duration::from_secs(600) + slack)
-    );
-    cadence.set_server_min_interval(Some(Duration::from_secs(1200)));
-    assert_eq!(
-        ordinary_equivalent(&cadence, shape),
-        Some(Duration::from_secs(1200) + slack)
-    );
-    cadence.set_server_min_interval(None);
-    for _ in 0..5 {
-        cadence.record_scan_failure(start);
-    }
-    assert_eq!(
-        ordinary_equivalent(&cadence, shape),
-        Some(Duration::from_secs(3600) + slack),
-        "the loop waits out a one-hour backoff in full: only the reported wait is clamped"
-    );
-    assert_eq!(negotiated_wait(&cadence, start), MAX_CYCLE_INTERVAL);
+    cadence.record_scan_success(start, 0);
+    assert_eq!(cadence.ordinary_interval(), Duration::from_secs(600));
+    // Two earlier cycles observed tick=330 s and cycle=30 s. The withdrawn
+    // formula would credit 960 s, but a later cycle/lock wait can last longer.
+    let historical_estimate = cadence.ordinary_interval() + Duration::from_secs(330 + 30);
+    let delayed_scan = start + Duration::from_secs(1500);
+    assert!(cadence.next_scan_after(delayed_scan).is_zero());
+    assert!(delayed_scan - start > historical_estimate);
 
-    // Unknown loop shape or overflow: no equivalent, so no acceleration.
-    assert_eq!(ordinary_equivalent(&cadence, None), None);
-    let huge = Some(LoopShape {
-        longest_tick: Duration::MAX,
-        longest_cycle: Duration::ZERO,
-    });
-    assert_eq!(ordinary_equivalent(&cadence, huge), None);
+    // Consumer contract at final admission for a same-revision lossy/N2 or
+    // untrusted attempt. This is a guard model, not c22's future guard: unknown
+    // coverage must refuse even if accelerated pages have finished and their
+    // accumulated historical credit would otherwise admit the attempt.
+    let charged = historical_estimate * 3;
+    let admitted = production_ordinary_equivalent().is_some_and(|required| charged >= required);
+    assert!(!admitted);
 }
 
 #[test]
-fn the_ordinary_equivalent_is_never_shorter_than_the_real_ordinary_gap() {
-    let floor = SNAPSHOT_SYNC_INTERVAL;
-    type Policy = fn(&mut SourceCadence, Instant);
-    let policies: [(&str, Policy); 5] = [
-        ("warm", |c, at| c.record_scan_success(at, 1)),
-        ("idle", |c, at| c.record_scan_success(at, 0)),
-        ("directive", |c, at| {
-            c.set_server_min_interval(Some(Duration::from_secs(1200)));
-            c.record_scan_success(at, 1);
-        }),
-        ("cold directive", |c, at| {
-            c.set_server_min_interval(Some(Duration::from_secs(1800)));
-            c.record_scan_success(at, 0);
-        }),
-        ("one-hour backoff", |c, at| {
+fn final_same_revision_admission_refuses_unknown_coverage_after_policy_changes() {
+    type Policy = fn(&World);
+    let policies: [Policy; 5] = [
+        |_| {},
+        |w| {
+            w.cadence
+                .borrow_mut()
+                .set_server_min_interval(Some(Duration::from_secs(1800)))
+        },
+        |w| {
             for _ in 0..5 {
-                c.record_scan_failure(at);
+                w.cadence.borrow_mut().record_scan_failure(w.now.get());
             }
-        }),
+        },
+        |w| w.backoff.set(true),
+        |w| {
+            w.cadence.borrow_mut().set_server_min_interval(None);
+            w.backoff.set(false);
+        },
     ];
-    for (name, policy) in policies {
-        for cycle_secs in [1u64, 30, 120, 290] {
-            let cycle = Duration::from_secs(cycle_secs);
-            let tick = floor + cycle;
-            let base = Instant::now();
-            // Loop cycles start one tick apart, and Codex's place inside each
-            // cycle alternates between its start and its end.
-            let scan_at = |k: u32| base + tick * k + cycle * (k % 2);
-            let anchor = scan_at(1);
-            let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
-            policy(&mut cadence, anchor);
-            let equivalent =
-                ordinary_equivalent(&cadence, loop_shape(tick, cycle)).expect("a known loop shape");
-            assert!(equivalent >= cadence.ordinary_interval(), "{name}");
-            let next = (2..1000)
-                .map(scan_at)
-                .find(|at| cadence.next_scan_after(*at).is_zero())
-                .expect("the ordinary path scans again");
-            let gap = next - anchor;
-            assert!(gap >= cadence.ordinary_interval(), "{name}");
-            assert!(
-                gap <= equivalent,
-                "{name}, {cycle_secs}s cycles: real gap {gap:?} above {equivalent:?}"
-            );
-        }
+    for change in policies {
+        let world = World::new();
+        world.ordinary_page_asks(Duration::from_secs(4));
+        assert_eq!(production_ordinary_equivalent(), None);
+        // Apply the directive/backoff change after the attempt's initial
+        // coverage query, before its final admission decision.
+        change(&world);
+        let clock = format!("{:?}", world.cadence.borrow().ordinary_clock());
+        let charged = Duration::MAX;
+        assert!(!production_ordinary_equivalent().is_some_and(|required| charged >= required));
+        assert_eq!(
+            format!("{:?}", world.cadence.borrow().ordinary_clock()),
+            clock
+        );
+        assert!(
+            world.held(),
+            "coverage queries do not consume the page ticket"
+        );
     }
 }
 

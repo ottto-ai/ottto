@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 737,
-  "content_sha256": "04032e9a396f571726b83d27d47addf4e918e5ceb186af3f97b3e91190b47857",
+  "content_sha256": "72e57ba3000ca951e356ba318ed73cbabccdc60ae54bc4edabaedc2f1a795f27",
   "files": [
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/adaptive_collector.rs",
-      "sha256": "4081e44f5577c2154015af258cf627cfc8a608400aadd9ed0fdf62f6b704c770",
-      "size_bytes": 27512
+      "sha256": "df48566394ebf8871aa1b231b5f9141b2d429415cb07d4e45f10469a81529112",
+      "size_bytes": 27559
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "86ca502650bd03a0476d0b092196b3d769b14c00f7ee8858d6d10f1979bb28d0",
-      "size_bytes": 849947
+      "sha256": "ba6915186883f254b6d50f75bd8ea34233f00eb0a2a49708950e1f9bd47f997c",
+      "size_bytes": 849813
     },
     {
       "executable": false,
@@ -1245,15 +1245,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/continuation.rs",
-      "sha256": "787e7530d36fe0779aa974bba18b7f35ad4b2f0b344b3ded3003cdcd1f98d0e1",
-      "size_bytes": 32030
+      "sha256": "666a0ac2e1269ee0cb418541aa350a1e40fae671073a44d81bca04f6dc00309f",
+      "size_bytes": 30500
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/continuation_tests.rs",
-      "sha256": "24b2f2d032172bdbee5a29cc298cc31b3637aaa784b911de7dfab3585b4268b6",
-      "size_bytes": 42787
+      "sha256": "3b1eb2f02a7853335f1efb732d36359769c6285e1c2e263cd079c6ca122e3400",
+      "size_bytes": 44425
     },
     {
       "executable": false,
@@ -3394,8 +3394,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-paced-continuation-scaffolding.md",
-      "sha256": "3e455a2e501cd6c980c08a0a218a1f4ec3e54a8b6b7286c5995476701e3184dd",
-      "size_bytes": 10240
+      "sha256": "3dced759f2ad97f448c46ed0a2bf75ee02c97ce17f84263be4fc0e0821792f58",
+      "size_bytes": 10714
     },
     {
       "executable": false,
@@ -5162,7 +5162,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T11:16:26+00:00",
+  "generated_at": "2026-10-21T15:47:04+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 738,
   "public_roots": [
@@ -5201,5 +5201,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "8129944580d5d5a16603cc7bae49ddececfe18e8"
+  "source_commit": "c7257d91bf1ce7831e0e16ea56a3326da830114e"
 }

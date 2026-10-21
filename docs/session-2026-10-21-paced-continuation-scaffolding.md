@@ -22,7 +22,7 @@ continuation pages, compiled in but switched off: `continuation::ENABLED` is
 1. returns at once when there is no ticket;
 2. refuses on Failing, upload backoff, not-due, or a power state other than `Allowed`;
 3. takes `SNAPSHOT_SYNC_LOCK` with `try_lock`, so a busy lock is a contention skip;
-4. takes the ticket out of its slot, under the lock;
+4. under the lock, rechecks the current cadence, due time, failing state and upload backoff before taking the current ticket. A future due time preserves both ticket and request;
 5. rechecks the scan authority: the same device id, machine id, Codex grant, API endpoint and account witness that `ensure_snapshot_scan_authority` checks at every ordinary prepare and finish. The ticket carries them as one SHA-256 digest;
 6. rechecks the destination digest from local credentials;
 7. enters background QoS, restored by a drop guard as soon as the page returns;
@@ -40,10 +40,11 @@ Only these make network calls:
 
 The lock is released before `run_page` returns, so it is never held while waiting between pages. Measured work runs from entry to just before the lock is released.
 
-Only a `Paused` page whose work is at most 20 s, and whose cadence took the request, leaves a ticket behind. Every other ending clears the ticket and the cadence request, and the next page is ordinary:
+Only a byte-budget-exhausted `Paused` page whose work is at most 20 s, and whose cadence took the request, leaves a ticket behind. Every other ending clears the ticket and the cadence request, and the next page is ordinary:
 - Deferred, Cancelled or Failed;
 - any EOF outcome;
-- a page over 20 s (`paused_contended`);
+- a deadline/contention pause (`PageEnd::PausedContended`), even if it took less than 20 s;
+- a byte-budget pause over 20 s (`paused_contended`);
 - a page whose cadence took no request (`paused_without_request`);
 - any refusal.
 
@@ -54,7 +55,6 @@ Only a `Paused` page whose work is at most 20 s, and whose cadence took the requ
   - A page is offered only if, judged by the asking page's work, it ends before that deadline.
   - An account switch still ends the wait at once. `collect_file_activity_for` now returns whether it did.
 - `SnapshotCycleOwner` records the Codex preparation start and hands the ordinary page's ticket over after a successful finish, bound to the destination and scan authority it ran under, but only while enabled.
-- While enabled, the loop records each ordinary cycle's start and duration (`note_ordinary_cycle`) for the ordinary equivalent below.
 
 ## Interfaces left for the cursor owner
 
@@ -64,11 +64,11 @@ The cursor side is `CursorContinuation`. The production stub `NoCursorContinuati
 |---|---|
 | `ticket_for` | Mint the ticket at the single pause site. |
 | `ready` | `cursor_continuation_ready`. |
-| `page(ticket, deadline)` | One resume-only page: load, C14 continuation pass, scan, C15 mark, save, note. Past `deadline`, stop at the next record boundary, save and return `Paused`. |
+| `page(ticket, deadline)` | One resume-only page: load, C14 continuation pass, scan, C15 mark, save, note. Past `deadline`, stop at the next record boundary, save and return `PausedContended`, without a ticket or request. Only byte-budget exhaustion returns `Paused(ticket)`. |
 
 Two more pieces are left open:
 - `CursorTicket` is a sealed placeholder for the cursor owner's fields. The cursor side returns an EOF page as `EofCompletion::new(preparation, index, scan)`; StateMissing completes or defers it.
-- `production_ordinary_equivalent` returns the ordinary-equivalent gap for guard and E2 accounting. It is an upper bound in the safe direction: the unclamped ordinary interval (tier, directive or failure backoff) plus the longest observed loop tick plus the longest observed cycle, because the ordinary scan happens in the first cycle after eligibility and Codex's place in a cycle moves by at most one cycle. Until a tick has been observed, or on overflow, it is `None`, and the guard must not accelerate. A future tick longer than any observed one is a disclosed limit.
+- `production_ordinary_equivalent` always returns `None`: the scaffold cannot establish ordinary coverage for same-revision guard/E2 admission. Historical tick/cycle maxima do not bound a later cycle or lock wait, and directives/backoff may change during the attempt. The guard must refuse acceleration on `None`, even after accelerated pages finish; it must not substitute a historical estimate. A future implementation needs an actual ordinary eligibility/coverage witness carried through final admission. The unused loop-history machinery has been removed.
 
 ## Platform gates
 
@@ -80,9 +80,9 @@ Two more pieces are left open:
 ## Bounds (models, not measurements)
 
 - **Duty.** With pages of 3–5 s, the gap is 30–45 s. That bounds the wall-clock duty of one thread at 10 %. It is not a bound on process CPU, IO or foreground impact.
-- **Unchanged.** Ordinary cycles keep today's start times, request volume and per-source cadence.
+- **Ordinary schedule.** The ordinary wait and per-source cadence are unchanged. A running continuation can overrun the next cycle as described below.
 - **Added network.** The only new requests are one completion upload per completed job.
-- **Overrun.** A page is given the ordinary deadline. It can still delay the next ordinary cycle by the record it was reading when the deadline passed and, on an EOF page, the one completion upload, whose length the network decides.
+- **Overrun.** A page is given the ordinary deadline. It can still delay the next ordinary cycle by the record it was reading when the deadline passed, required local finalization and scheduling, plus any EOF completion upload. This cooperative deadline establishes no hard elapsed-time bound.
 - **EOF cadence.** An EOF completion leaves the ordinary Codex cadence unchanged; it is not counted as an ordinary scan.
 - **Ordinary page after a continuation.** It can follow a continuation page by less than a server directive. The continuation page made no request, and the ordinary schedule is unchanged by design.
 
@@ -95,9 +95,9 @@ CI only. The new tests are in `adaptive_collector.rs` and `snapshot_sync/continu
 - EOF success, refusal, authority/backoff/destination rechecks, cancellation and failed save;
 - an EOF completion leaving the ordinary Codex cadence unchanged, through the real `record_finished_snapshot_cadence`;
 - refusal, unknown and busy inputs, a revoked Codex grant and a changed account;
-- a failed cycle or a lost grant clearing the ticket, and tickets taken and written only under the sync lock;
+- a failed cycle or a lost grant clearing the ticket, tickets taken and written only under the sync lock, and a replacement ticket plus request between precheck and lock obeying its new due time;
 - the authority digest agreeing with `validate_snapshot_scan_authority` field by field;
-- the ordinary equivalent never shorter than the real ordinary gap, across tiers, directives, a one-hour backoff and cycle lengths;
+- the slow-later-cycle counterexample to historical coverage, and final same-revision admission refusing unknown coverage after directive/backoff changes (a consumer model; c22's real guard is not present);
 - ordinary-cycle cadence parity with and without continuation pages;
 - the inert default's constant gate and stubs.
 

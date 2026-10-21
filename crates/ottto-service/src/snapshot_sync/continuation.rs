@@ -114,6 +114,9 @@ pub(super) enum PageEnd {
     /// Saved `Ok` with its C15 callback, and the job paused again at its byte
     /// budget: the only end that may ask for another page.
     Paused(CursorTicket),
+    /// Saved at a deadline or contention boundary, without exhausting the byte
+    /// budget. No ticket or continuation request may follow this pause.
+    PausedContended,
     /// The resume was refused or not `Active`; the job's paths stay pending for
     /// the next ordinary pass.
     Deferred,
@@ -138,8 +141,9 @@ pub(super) trait CursorContinuation {
     /// One resume-only page: `ScanIndex::load`, then
     /// `begin_codex_side_pass(Continuation)`, the scan, the C15 mark, the save
     /// and `note_codex_side_saved` on `Ok`. Once `deadline` passes, the page
-    /// stops at the next record boundary, saves and returns `Paused`, so it
-    /// never holds `SNAPSHOT_SYNC_LOCK` without bound.
+    /// stops at the next record boundary, saves and returns `PausedContended`.
+    /// The deadline is cooperative: the in-progress record, local finalization
+    /// and scheduling may overrun it; it is not a hard lock-hold bound.
     fn page(&mut self, ticket: CursorTicket, deadline: Instant) -> PageEnd;
 }
 
@@ -290,9 +294,9 @@ impl Outcome {
 /// newer ordinary decision with an older ticket. Clearing needs no lock: it
 /// can only lose a continuation.
 ///
-/// The page must end by the earlier of `ordinary_deadline` and
-/// [`CONTENTION_WORK`] after entry. The measured work runs from entry to just
-/// before the lock is released, so lock wait, preparation, the page, any EOF
+/// The page receives the earlier of `ordinary_deadline` and
+/// [`CONTENTION_WORK`] after entry as a cooperative deadline. Measured work
+/// runs from entry to just before the lock is released, so preparation, any EOF
 /// completion and finalization all count.
 pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     host: &mut H,
@@ -310,23 +314,14 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
         clear(host, slot);
         Outcome::Skipped(skip)
     };
-    let Some((state, due)) = host.cadence(|cadence| {
-        let state = cadence.state();
-        (state, cadence.continuation_due(PACING))
-    }) else {
-        return skip(host, Skip::CadenceUnavailable);
+    let check_due = |host: &mut H, now| match page_due(host, now) {
+        Ok(true) => None,
+        // An early wake keeps the ticket and request without moving either.
+        Ok(false) => Some(Outcome::Skipped(Skip::NotDue)),
+        Err(reason) => Some(skip(host, reason)),
     };
-    if state == LocalCollectorState::Failing {
-        return skip(host, Skip::Failing);
-    }
-    if host.upload_backoff() {
-        return skip(host, Skip::Backoff);
-    }
-    match due {
-        Some(due) if started >= due => {}
-        // An early wake keeps the ticket without moving it earlier.
-        Some(_) => return Outcome::Skipped(Skip::NotDue),
-        None => return skip(host, Skip::NotDue),
+    if let Some(outcome) = check_due(host, started) {
+        return outcome;
     }
     if gates.power() != PlatformState::Allowed {
         return skip(host, Skip::Platform);
@@ -337,6 +332,16 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
         // A one-shot or ordinary cycle owns the index now; it decides.
         Err(TryLockError::WouldBlock) => return skip(host, Skip::LockBusy),
     };
+    if lock_slot(slot).is_none() {
+        return Outcome::Skipped(Skip::NoTicket);
+    }
+    // An ordinary one-shot may have replaced both the ticket and its request
+    // after the cheap precheck. Check the current policy under the same lock
+    // that protects ticket replacement, before consuming that ticket.
+    let now = host.now();
+    if let Some(outcome) = check_due(host, now) {
+        return outcome;
+    }
     let Some(ticket) = lock_slot(slot).take() else {
         // An ordinary pass cleared it after the check above.
         return Outcome::Skipped(Skip::NoTicket);
@@ -378,6 +383,7 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
                 cursor,
             }),
         ),
+        Some(PageEnd::PausedContended) => (Outcome::PausedContended, None),
         Some(PageEnd::Deferred) => (Outcome::Deferred, None),
         Some(PageEnd::Cancelled) => (Outcome::Cancelled, None),
         Some(PageEnd::Failed(_)) => (Outcome::Failed, None),
@@ -412,6 +418,21 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     };
     drop(guard);
     outcome
+}
+
+/// `Ok(false)` preserves a future request; any error clears it. Called both
+/// before and under the sync lock, so a replacement ticket uses its own policy.
+fn page_due(host: &mut impl Host, now: Instant) -> std::result::Result<bool, Skip> {
+    let (state, due) = host
+        .cadence(|cadence| (cadence.state(), cadence.continuation_due(PACING)))
+        .ok_or(Skip::CadenceUnavailable)?;
+    if state == LocalCollectorState::Failing {
+        return Err(Skip::Failing);
+    }
+    if host.upload_backoff() {
+        return Err(Skip::Backoff);
+    }
+    due.map(|due| now >= due).ok_or(Skip::NotDue)
 }
 
 /// Restores the thread's QoS when dropped, including on a panic in the page.
@@ -513,9 +534,10 @@ pub(super) trait LoopHost {
 
 /// Wait out one ordinary interval, running due continuation pages inside it.
 /// The ordinary deadline is fixed when the wait starts, and each page is given
-/// it as its own deadline. A page can still push the ordinary cycle out, by at
-/// most the record it was reading when the deadline passed plus, on an EOF
-/// page, the one completion upload, whose length the network decides.
+/// it as its own deadline. A page can still push the ordinary cycle out by
+/// the record it was reading when the deadline passed, required local
+/// finalization and scheduling, plus any EOF completion upload. There is no
+/// hard elapsed-time guarantee.
 pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Duration) {
     let start = host.now();
     let Some(deadline) = start.checked_add(interval) else {
@@ -771,101 +793,18 @@ pub(super) fn run_production_page(
     )
 }
 
-/// What the ordinary loop has done since this process started: the longest
-/// gap between two ordinary cycle starts and the longest cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct LoopShape {
-    pub(super) longest_tick: Duration,
-    pub(super) longest_cycle: Duration,
-}
-
-/// Running maxima behind [`LoopShape`].
-#[derive(Debug, Default)]
-pub(super) struct LoopRecord {
-    last_start: Option<Instant>,
-    longest_tick: Option<Duration>,
-    longest_cycle: Duration,
-}
-
-impl LoopRecord {
-    pub(super) const fn new() -> Self {
-        Self {
-            last_start: None,
-            longest_tick: None,
-            longest_cycle: Duration::ZERO,
-        }
-    }
-
-    pub(super) fn observe(&mut self, started: Instant, ended: Instant) {
-        if let Some(tick) = self
-            .last_start
-            .and_then(|last| started.checked_duration_since(last))
-        {
-            self.longest_tick = Some(self.longest_tick.map_or(tick, |longest| longest.max(tick)));
-        }
-        self.last_start = Some(started);
-        if let Some(cycle) = ended.checked_duration_since(started) {
-            self.longest_cycle = self.longest_cycle.max(cycle);
-        }
-    }
-
-    /// Unknown until two ordinary cycles have started.
-    pub(super) fn shape(&self) -> Option<LoopShape> {
-        Some(LoopShape {
-            longest_tick: self.longest_tick?,
-            longest_cycle: self.longest_cycle,
-        })
-    }
-}
-
-static LOOP: Mutex<LoopRecord> = Mutex::new(LoopRecord::new());
-
-/// One ordinary loop cycle ran from `started` to `ended`. Not recorded while
-/// inert.
-pub(super) fn note_ordinary_cycle(started: Instant, ended: Instant) {
-    if ENABLED {
-        LOOP.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .observe(started, ended);
-    }
-}
-
-/// The ordinary-equivalent duration of one page gap for c22's guard and E2
-/// accounting: never shorter than the gap the ordinary cadence would actually
-/// leave between two Codex scans, so charging it can never admit anything
-/// earlier than today.
-///
-/// The ordinary path scans Codex in the first loop cycle that finds
-/// [`SourceCadence::ordinary_interval`] (tier, server directive or failure
-/// backoff, unclamped: `negotiated_wait` clamps only the wait it reports, never
-/// the eligibility) elapsed since the last scan. That cycle starts at most one
-/// loop tick after the eligibility point, and Codex's place inside a cycle
-/// moves by at most one cycle, so the real gap is below `interval + longest
-/// tick + longest cycle`. The six-hour full sweep can only shorten it.
-///
-/// The tick and cycle are the longest observed since start. Until a tick has
-/// been observed, or on overflow, there is no equivalent and c22 must not
-/// accelerate. A future tick longer than any observed one is a disclosed
-/// limit of this bound.
-pub(super) fn ordinary_equivalent(
-    cadence: &SourceCadence,
-    shape: Option<LoopShape>,
-) -> Option<Duration> {
-    let shape = shape?;
-    cadence
-        .ordinary_interval()
-        .checked_add(shape.longest_tick)?
-        .checked_add(shape.longest_cycle)
-}
-
-/// [`ordinary_equivalent`] for Codex now.
+/// Ordinary-page coverage for c22's same-revision guard and E2 accounting.
+/// `None` means no acceleration: neither elapsed continuation work nor an
+/// observed loop maximum proves when the unaccelerated attempt would finish.
+/// Ordinary cycles and lock waits have no enforced duration bound, and policy
+/// can change during an attempt. This scaffold supplies no coverage witness,
+/// so it always refuses coverage, regardless of ENABLED or cadence history.
+/// A future integration must preserve the actual ordinary eligibility clock
+/// through final admission, including directive and upload-backoff changes,
+/// before returning any credit here.
 #[allow(dead_code)] // c22's guard (after #660) is the first production caller.
 pub(super) fn production_ordinary_equivalent() -> Option<Duration> {
-    let shape = LOOP.lock().ok()?.shape();
-    with_source_cadence(SnapshotSource::Codex, |cadence| {
-        ordinary_equivalent(cadence, shape)
-    })
-    .flatten()
+    None
 }
 
 #[cfg(test)]
