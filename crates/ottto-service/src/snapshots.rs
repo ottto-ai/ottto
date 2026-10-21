@@ -5915,6 +5915,24 @@ fn claude_duplicate_fence_rearm_delay_seconds(attempt: u8) -> u64 {
         .min(CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS)
 }
 
+/// Test seam for the C1a regressions: this baseline has no unchanged-proof
+/// check, so refusing its scratch budget changes nothing and no fallback is
+/// ever counted.
+#[cfg(test)]
+pub(crate) struct RefuseClaudeUnchangedProofBudgetForTest;
+
+#[cfg(test)]
+impl RefuseClaudeUnchangedProofBudgetForTest {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn claude_unchanged_proof_budget_fallbacks_for_test() -> usize {
+    0
+}
+
 fn complete_claude_usage_family_members(index: &ScanIndex) -> BTreeMap<String, BTreeSet<String>> {
     complete_claude_usage_family_members_matching(index, None)
 }

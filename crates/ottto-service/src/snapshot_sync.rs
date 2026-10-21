@@ -18633,6 +18633,9 @@ mod tests {
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
+        mod proof_rearm_idempotence_pipeline_tests {
+            include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
+        }
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
