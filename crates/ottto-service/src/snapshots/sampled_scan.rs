@@ -587,10 +587,13 @@ fn context_overhead(context: &Context) -> Option<usize> {
         completion_overdue_seconds: _,
         admission,
     } = context;
-    // The shared cache's `Arc` payload charge.
+    // The shared cache's `Arc` payload charge, and the side ledger's fixed
+    // charge, which `heap_bound` adds lock-free outside the two locked states
+    // (U1a-2a ss-4, F4b).
     let shared = size_of::<SharedCache>()
         .checked_add(align_of::<SharedCache>())?
-        .checked_add(2 * size_of::<usize>())?;
+        .checked_add(2 * size_of::<usize>())?
+        .checked_add(side_ledger::SIDE_LEDGER_BYTES)?;
     size_of::<Context>()
         .checked_add(shared)?
         .checked_add(bound(namespace, STATE_BYTES)?)?

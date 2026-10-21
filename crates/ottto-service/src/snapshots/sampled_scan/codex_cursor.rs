@@ -2793,9 +2793,9 @@ impl SharedCache {
 
     /// Everything the cursor state holds (paused job, memo, parked, rotation
     /// and invalidation records, a suspended proof). An unbounded state reads
-    /// as the whole budget. Tests only since U1a-2a ss-6: the insert reserves
-    /// `cursor_resident_for_main`.
-    #[cfg(test)]
+    /// as the whole budget. Since U1a-2a ss-6 the insert reserves
+    /// `cursor_resident_for_main`; M1's `release_to_fit` and
+    /// `release_older_to_fit` still measure this whole state (U1a-2a D6(e)).
     pub(super) fn cursor_resident(&self) -> usize {
         self.with_cursor(|cursor| crate::heap_layout_bound::bound(&*cursor, STATE_BYTES))
             .flatten()
