@@ -59,6 +59,19 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     }
 }
 
+/// Why `release_until_for` evicts; each cause keeps its own content-free
+/// counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Release {
+    /// Room for a paused cursor job's admission (K6).
+    CursorReservation,
+    /// A copy refusal fitting the residents beside the active file (M1).
+    CopyRefusal,
+    /// Room for a zero-budget tail's own copy, from entries ranked strictly
+    /// older than the tailed file only (M1 Path A).
+    CopyAdmission,
+}
+
 /// One common admission/eviction mechanism for compatible native states. Uses
 /// the existing fail-closed layout accounting, including strings, maps and Arc
 /// payloads; it never estimates memory from the source file's size.
@@ -123,6 +136,33 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// used) until the resident state fits `limit`. False when even an empty
     /// cache does not fit. The cursor makes room for a paused job this way.
     pub(crate) fn release_until(&mut self, limit: usize) -> bool {
+        self.release_until_for(limit, Release::CursorReservation)
+    }
+    /// `release_until`, counting each eviction under `cause`.
+    pub(crate) fn release_until_for(&mut self, limit: usize, cause: Release) -> bool {
+        self.evict_until(limit, cause, None)
+    }
+    /// M1 Path A: `release_until_for` restricted to entries ranked strictly
+    /// below `rank` (their `modified_hint`), in the same victim order, counted
+    /// under `Release::CopyAdmission`. Evicts nothing, and returns false,
+    /// unless evicting all of them fits `limit` by their stored `heap_bytes`
+    /// alone, a lower bound on what each eviction frees.
+    pub(crate) fn release_older_until(&mut self, limit: usize, rank: (i64, i64)) -> bool {
+        if heap_layout_bound::bound(self, limit).is_some() {
+            return true;
+        }
+        let older = self
+            .entries
+            .values()
+            .filter(|entry| entry.modified_hint < rank)
+            .fold(0usize, |sum, entry| sum.saturating_add(entry.heap_bytes));
+        heap_layout_bound::bound(self, usize::MAX)
+            .is_some_and(|resident| resident.saturating_sub(older) <= limit)
+            && self.evict_until(limit, Release::CopyAdmission, Some(rank))
+    }
+    /// Evict in victim order, only entries ranked strictly below `below`
+    /// when given, until the resident state fits `limit`.
+    fn evict_until(&mut self, limit: usize, cause: Release, below: Option<(i64, i64)>) -> bool {
         loop {
             if heap_layout_bound::bound(self, limit).is_some() {
                 return true;
@@ -130,13 +170,26 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             let Some(victim) = self
                 .entries
                 .iter()
+                .filter(|(_, entry)| below.map_or(true, |rank| entry.modified_hint < rank))
                 .min_by_key(|(_, entry)| (entry.modified_hint, entry.used))
                 .map(|(key, _)| key.clone())
             else {
                 return false;
             };
-            self.entries.remove(&victim);
-            record(Event::CursorReservationEntriesEvicted);
+            let Some(entry) = self.entries.remove(&victim) else {
+                return false;
+            };
+            match cause {
+                Release::CursorReservation => record(Event::CursorReservationEntriesEvicted),
+                Release::CopyRefusal => {
+                    record(Event::CopyRefusalEntriesEvicted);
+                    add(Event::CopyRefusalBytesReleased, entry.heap_bytes as u64);
+                }
+                Release::CopyAdmission => {
+                    record(Event::CopyRefusalAdmissionEvicted);
+                    add(Event::CopyRefusalBytesReleased, entry.heap_bytes as u64);
+                }
+            }
         }
     }
     /// Sealed offset of a retained entry without taking it, so a page budget
@@ -371,13 +424,16 @@ mod tests {
         use crate::transcript_acquisition::{ReadPlan, Scope};
         use std::fs::{self, OpenOptions};
         use std::io::{Read, Write};
+        // Clock reads can repeat; the counter keeps `create_new` names unique.
+        static FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ottto-cache-fixture-{}-{}",
+            "ottto-cache-fixture-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let mut file = OpenOptions::new()
             .read(true)
