@@ -3278,6 +3278,106 @@ fn claude_stale_pending_matches_witness(
             })
 }
 
+/// Content-free count of red retry starts that kept every stale family re-arm
+/// because the carry check was not admitted under its scratch budget.
+static CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// While alive, this thread refuses the carry check's scratch budget, so every
+/// red retry start takes the BASE whole-family re-arm.
+#[cfg(test)]
+pub(crate) struct RefuseClaudeStaleFamilyCarryBudgetForTest(bool);
+
+#[cfg(test)]
+impl RefuseClaudeStaleFamilyCarryBudgetForTest {
+    pub(crate) fn new() -> Self {
+        Self(REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST.with(|cell| cell.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RefuseClaudeStaleFamilyCarryBudgetForTest {
+    fn drop(&mut self) {
+        REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn claude_stale_family_carry_budget_fallbacks_for_test() -> usize {
+    CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// Price every scratch collection the carry check keeps live at once, before
+/// allocating any of them, against the existing parked overlap budget and with
+/// C1a's full-node pricing. Each bound comes from the persisted index and is
+/// never smaller than the collection it prices: the blocked-root, carried-root
+/// and shared-owner sets and the membership graph's outer maps hold at most
+/// one entry per stale root; the membership graph's inner maps hold at most
+/// one entry per stale-family index path plus one root node per family; the
+/// request-owner map holds at most one entry per stale pending request hash;
+/// the legacy-witness vector is allocated at exactly `legacy_witnesses`
+/// pointers. Every owned root, member or shared-owner string is shorter than
+/// the index key it is parsed from, and each stale-family path yields at most
+/// those three, so three times those keys' bytes bounds the strings. An
+/// unsupported layout, an overflow or a refused price keeps BASE.
+fn claude_stale_family_carry_scratch_admitted(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    legacy_witnesses: usize,
+) -> bool {
+    use crate::heap_layout_bound::tree_nodes;
+    #[cfg(test)]
+    if REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    if !crate::heap_layout_bound::layout_supported() {
+        return false;
+    }
+    let mut stale_paths = 0_usize;
+    let mut stale_path_bytes = 0_usize;
+    for index_key in index.files.keys() {
+        if claude_index_path_member_ref(Path::new(index_key))
+            .is_some_and(|member| stale.contains(member.root))
+        {
+            stale_paths = stale_paths.saturating_add(1);
+            stale_path_bytes = stale_path_bytes.saturating_add(index_key.len());
+        }
+    }
+    let stale_request_hashes = stale
+        .iter()
+        .filter_map(|root_session_id| index.claude_usage_family_pending.get(root_session_id))
+        .flat_map(|pending| pending.member_request_id_hashes.values())
+        .map(BTreeSet::len)
+        .fold(0_usize, usize::saturating_add);
+    let families = stale.len();
+    let (Some(family_paths), Some(legacy_bytes), Some(string_bytes)) = (
+        stale_paths.checked_add(families),
+        legacy_witnesses.checked_mul(std::mem::size_of::<&ClaudeUsageFamilyWitness>()),
+        stale_path_bytes.checked_mul(3),
+    ) else {
+        return false;
+    };
+    let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+    tree_nodes::<&str, ()>(families, &mut cost).is_some()
+        && cost.add(legacy_bytes).is_some()
+        && tree_nodes::<String, BTreeMap<String, usize>>(families, &mut cost).is_some()
+        && tree_nodes::<String, usize>(family_paths, &mut cost).is_some()
+        && tree_nodes::<String, BTreeSet<String>>(families, &mut cost).is_some()
+        && tree_nodes::<String, ()>(family_paths, &mut cost).is_some()
+        && tree_nodes::<String, ()>(families, &mut cost).is_some()
+        && tree_nodes::<&str, &str>(stale_request_hashes, &mut cost).is_some()
+        && tree_nodes::<String, ()>(families, &mut cost).is_some()
+        && cost.add(string_bytes).is_some()
+}
+
 /// Stale Claude families whose committed revisions a red retry keeps instead
 /// of re-arming them whole. Nothing is carried unless the start retries the
 /// prior traversal's context after its red terminal, no page of that
@@ -3290,8 +3390,9 @@ fn claude_stale_pending_matches_witness(
 /// included), a legacy-free witness whose member sets equal that membership,
 /// no legacy, owned-start or duplicate-request link, valid pending that
 /// passes the witness tripwire and shares no request with another family's
-/// pending, and every member file committed, accepted and not account-held. Unwitnessed and invalid families keep the re-arm. Pure:
-/// the caller compacts what this returns.
+/// pending, and every member file committed, accepted and not account-held. Unwitnessed and invalid families keep the re-arm. Nothing
+/// is carried unless the check's scratch is admitted first. Pure apart from
+/// that content-free refusal count: the caller compacts what this returns.
 fn claude_fence_closed_retry_carried_roots(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
@@ -3311,6 +3412,22 @@ fn claude_fence_closed_retry_carried_roots(
         || !claude_accepted_ledger_is_current(index)
         || index.upload_context_fingerprint != index.active_upload_context_fingerprint
     {
+        return BTreeSet::new();
+    }
+    let legacy_witness_count = index
+        .claude_usage_family_witnesses
+        .values()
+        .filter(|witness| !claude_usage_family_witness_legacy_free(witness))
+        .count();
+    if !claude_stale_family_carry_scratch_admitted(index, stale, legacy_witness_count) {
+        CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS_FOR_TEST
+            .with(|cell| cell.set(cell.get().saturating_add(1)));
+        eprintln!(
+            "local snapshot census kept every stale Claude family re-arm: the carry check was not admitted under its scratch budget"
+        );
         return BTreeSet::new();
     }
     let quarantine_preserves = |root_session_id: &str| {
@@ -3359,11 +3476,13 @@ fn claude_fence_closed_retry_carried_roots(
     {
         return BTreeSet::new();
     }
-    let legacy_witnesses = index
-        .claude_usage_family_witnesses
-        .values()
-        .filter(|witness| !claude_usage_family_witness_legacy_free(witness))
-        .collect::<Vec<_>>();
+    let mut legacy_witnesses = Vec::with_capacity(legacy_witness_count);
+    legacy_witnesses.extend(
+        index
+            .claude_usage_family_witnesses
+            .values()
+            .filter(|witness| !claude_usage_family_witness_legacy_free(witness)),
+    );
     let mut carried = complete_claude_usage_family_members_where(index, |root_session_id| {
         stale.contains(root_session_id) && !blocked.contains(root_session_id)
     })
@@ -3440,6 +3559,159 @@ fn claude_fence_closed_retry_carried_roots(
     }
     carried.retain(|root_session_id| !shared_owners.contains(root_session_id));
     carried
+}
+
+/// Content-free count of carried families whose carry a member parse
+/// cancelled within the retry window.
+static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn claude_stale_family_carry_cancellations_for_test() -> usize {
+    CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// SOURCE B9 liveness: a member of a family this red retry carried is about to
+/// be parsed (it changed, is new, or another gate selected it) while no member
+/// of that family has been parsed in this window yet, so its pending is still
+/// the compacted entry from an older window. Cancel the carry so the family is
+/// co-observed in this window as BASE's whole re-arm observes it: clear every
+/// other indexed member's retained revision, and append to this page every
+/// member the walk already passed. Members still queued on this page or the
+/// traversal, or not yet discovered, are read later in this window by their
+/// cleared revision. A family qualifies only while it is witnessed, no member
+/// of it was parsed earlier on this page and every other indexed member still
+/// retains its revision (a re-armed family's members do not), so the carry is
+/// cancelled at most once and no member is read twice for it.
+#[allow(clippy::too_many_arguments)]
+fn cancel_claude_family_carry_for_member_parse(
+    index: &mut ScanIndex,
+    census_window_end: &str,
+    member_path: &Path,
+    page_snapshots: &[SnapshotItem],
+    page: &mut VecDeque<CandidateFile>,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    mut prepare: impl FnMut(&mut CandidateFile),
+) {
+    let Some(member) = claude_index_path_member_ref(member_path) else {
+        return;
+    };
+    let root_session_id = member.root;
+    let carried = index
+        .claude_usage_family_pending
+        .get(root_session_id)
+        .zip(index.claude_usage_family_witnesses.get(root_session_id))
+        .is_some_and(|(pending, witness)| {
+            pending.census_window_end != census_window_end
+                && !pending.invalid
+                && pending.member_occurrences.is_empty()
+                && pending
+                    .member_request_id_hashes
+                    .values()
+                    .all(BTreeSet::is_empty)
+                && witness
+                    .member_request_id_fingerprints
+                    .keys()
+                    .eq(pending.member_request_id_hashes.keys())
+        })
+        && !index
+            .claude_usage_authority_quarantine
+            .contains_key(root_session_id)
+        && !page_snapshots
+            .iter()
+            .any(|item| claude_snapshot_family_root_ref(item) == root_session_id);
+    if !carried {
+        return;
+    }
+    let member_key = local_index_key(member_path);
+    let mut others = Vec::new();
+    for (index_key, entry) in &index.files {
+        if *index_key == member_key
+            || !claude_index_path_member_ref(Path::new(index_key))
+                .is_some_and(|other| other.root == root_session_id)
+        {
+            continue;
+        }
+        if entry.source_file_fingerprint.is_empty() {
+            return;
+        }
+        others.push(index_key.clone());
+    }
+    if others.is_empty() {
+        return;
+    }
+    for index_key in &others {
+        if let Some(entry) = index.files.get_mut(index_key) {
+            entry.source_file_fingerprint.clear();
+        }
+    }
+    let passed = index
+        .traversal
+        .as_ref()
+        .map(|traversal| {
+            others
+                .iter()
+                .filter(|index_key| {
+                    let path = Path::new(index_key.as_str());
+                    traversal.observed_index_keys.contains(*index_key)
+                        && !page.iter().any(|candidate| candidate.path == path)
+                        && !traversal
+                            .pending_candidates
+                            .iter()
+                            .any(|pending| pending.path == path)
+                })
+                .filter_map(|index_key| {
+                    let path = PathBuf::from(index_key);
+                    let scan_root = traversal
+                        .scan_roots
+                        .iter()
+                        .filter(|root| path.starts_with(root))
+                        .max_by_key(|root| root.components().count())
+                        .cloned()?;
+                    Some(ScanTraversalPath {
+                        scan_root,
+                        path,
+                        census_member: true,
+                        watcher_hint: false,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut appended = 0_usize;
+    for pending in passed {
+        let Some(mut candidate) = candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            pending,
+            census,
+            census_unix_seconds,
+            backfill_window_days,
+            &index.files,
+        ) else {
+            continue;
+        };
+        prepare(&mut candidate);
+        page.push_back(candidate);
+        appended += 1;
+    }
+    CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS_FOR_TEST
+        .with(|cell| cell.set(cell.get().saturating_add(1)));
+    eprintln!(
+        "local snapshot census cancelled a stale Claude family carry: a member is parsed in the \
+         retry window; {} indexed file(s) re-armed, {} read again on this page",
+        others.len(),
+        appended
+    );
 }
 
 /// A demoted revision cannot progress within a traversal only while its family
@@ -19092,6 +19364,33 @@ impl OwnedSourceScan {
                     let count = &mut census.claude_parse_reasons[reason as usize];
                     *count = count.saturating_add(1);
                 }
+            }
+            // A parse of a carried family's member cancels that family's
+            // carry, so the family is co-observed in this window as BASE's
+            // re-arm would observe it. A re-armed member is no new change.
+            if source == SnapshotSource::ClaudeCode
+                && decision == CandidateDecision::Parse
+                && parse_reason != Some(CandidateParseReason::Rearmed)
+            {
+                cancel_claude_family_carry_for_member_parse(
+                    index,
+                    &census_window_end,
+                    &candidate.path,
+                    &snapshots,
+                    &mut identified_candidates,
+                    &mut census,
+                    census_unix_seconds,
+                    backfill_window_days,
+                    |appended| {
+                        prepare_owned_scan_candidate(
+                            source,
+                            appended,
+                            &codex_title_metadata,
+                            &claude_title_metadata,
+                            claude_effort_support_dir_ref,
+                        )
+                    },
+                );
             }
             if source == SnapshotSource::Codex && decision == CandidateDecision::Skip {
                 let shared = codex_parent_ownership_ledgers.as_ref();

@@ -43,8 +43,18 @@ Family checks:
 - every member file has a committed revision, an accepted unquarantined body
   (or is confirmed empty), and no account-deferred hold.
 
-Unwitnessed and invalid families always keep the re-arm, so first-proof
-opportunities for never-proven families are unchanged.
+Unwitnessed and invalid families always keep the re-arm, so their own files
+are selected as before. That does not make every first-proof opportunity
+unchanged: a fork that depends on a carried root's sequence is the residual
+below.
+
+Before it builds any scratch, the carry check prices everything it keeps live
+at once (the blocked-root set, the legacy-witness vector, the
+complete-membership graph, the carried-root set, the request-owner map and the
+shared-owner set) with the same supported-layout full-node pricing and parked
+budget as C1a's unchanged-proof check. An unsupported layout, an overflow or a
+refused price carries nothing, so the start is BASE's, and a content-free
+counter plus a fixed-text log line record the refusal.
 
 A carried family's pending is compacted: occurrences are dropped and request
 hash sets emptied, while member keys, the old window and `invalid = false`
@@ -53,8 +63,14 @@ derivation, holds no cap budget, and keeps the next complete census invalid,
 so the fence cannot open on it. That census retires it as before.
 
 A carried member that changed on disk, including its sidecar stats (M1), is
-still selected by the ordinary fingerprint comparison and re-read; its parse
-resets the family pending to the current window.
+still selected by the ordinary fingerprint comparison and re-read. Any parse
+of a carried family's member (changed, new, or selected by another gate)
+before any other member of that family is parsed in the window cancels the
+carry: every other member's revision is cleared, and members the walk already
+passed are appended to the current page, so the whole family is co-observed
+in that window as BASE's re-arm observes it. This also holds when the change
+is found on the terminal page. A content-free counter and a fixed-text log
+line record each cancellation.
 
 No persisted field, schema, cap or constant changes. The traversal-start row
 gains two counters, `carried_pending_families` and `carried_index_files`; an
@@ -74,19 +90,40 @@ replace the equivalent inline checks in C1a's unchanged-proof check.
 - `snapshot_sync/stale_family_carry_pipeline_tests.rs` runs the C1a fixture
   through the real bounded pipeline with a red chain caused by an unrelated
   session: the carry at both retries, plus controls for invalid pending, a
-  sidecar change, a changed member, and a lost contract-5 record. Every window's
-  liveness equals BASE.
+  sidecar change, a changed member, and a lost contract-5 record. Those
+  cases' liveness (RetryPending, red, census complete, census invalid, fence,
+  full re-arm, proof) equals BASE in every window.
+- Round 2 adds: the scratch admission (a forced refusal and a 12,000-hash
+  priced refusal both equal BASE byte for byte, and an admitted positive);
+  the reviewed recoverable change (the provider ledger already holds a
+  subagent request, and the transcript gains it with matching usage) on a
+  later page and on the terminal page, each proving as BASE without
+  RetryPending; and the removed-member held path.
 
 ## Residual risks
 
 - A red full-coverage window with any invalid stale family no longer gets an
   immediate whole retry; reopening waits for the scheduled full re-arm
   (at most 86,400 s).
-- While a carried entry exists, the next complete census reports
-  `census_invalid` where a whole re-read might not have.
-- A member that changes after the carry takes the ordinary witnessed-family
-  path (demotion, RetryPending, forced family reparse) instead of the
-  incidental whole-family re-read.
+- Census-invalid residual. One retained, indexed, unquarantined old-window
+  entry makes the duplicate census invalid. With C carried families and M
+  nonempty indexed member files, a red retry saves up to M family file reads
+  and releases their occurrences (the fixture saves 3 reads per retry, 6 over
+  two). The invalidity lasts until the first complete fold of the carry span,
+  which removes the carried pending; red retries can extend the span. At that
+  fold, new cross-family duplicate detection is withheld, the fence cannot
+  reopen, and transcript ownership stays incomplete for unread members, so
+  reopening may wait for the scheduled full re-arm (capped at 86,400 s) plus
+  eligibility, traversal and settlement time. `note_policy_settled` can reset
+  #588 process history. Ordinary first proofs still run, and C1a is not
+  globally disabled by `census_invalid`; C1a's independent fence-recovery
+  path can still re-arm every family when unread witnessed families are the
+  only obstacle.
+- Held path (SOURCE B9): a carried member that changes without being parsed
+  in the window (it is removed, moved, or ages out of the backfill window)
+  does not cancel the carry. The remaining members are not read in that
+  window, while BASE re-reads them. They are read again only when a later
+  start re-arms the family or one of its members is parsed.
 - A compacted entry keeps no request hashes, so a fork that first copies a
   carried root's prefix after the carry is not seen at the next retry. It is
   held like C1a's dormant-owner successor (counted in the first-proof hold

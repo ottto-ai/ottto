@@ -657,3 +657,109 @@ fn c1b_negative_controls_rearm_exactly_like_base() {
         );
     }
 }
+
+/// F1, refused admission: the carry check prices its scratch before it
+/// allocates any. A refused price, here forced, keeps the BASE start byte for
+/// byte, row and transition counters included, and is counted once.
+#[test]
+fn c1b_refused_carry_scratch_admission_keeps_the_base_start() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let refusals = claude_stale_family_carry_budget_fallbacks_for_test();
+    let ((fix, row), (base, base_row)) = {
+        let _refuse = RefuseClaudeStaleFamilyCarryBudgetForTest::new();
+        carry_arms(&|_| {}, BACKFILL_WINDOW_DAYS)
+    };
+    assert_eq!(
+        claude_stale_family_carry_budget_fallbacks_for_test(),
+        refusals + 1,
+        "the fix arm's refusal is counted; BASE never prices"
+    );
+    assert_eq!(row, base_row, "the row is BASE's");
+    assert_eq!(row["carried_pending_families"], 0);
+    assert_eq!(row["carried_index_files"], 0);
+    assert_eq!(row["rearmed_index_files"], 3);
+    assert_eq!(
+        serde_json::to_value(&fix).unwrap(),
+        serde_json::to_value(&base).unwrap(),
+        "the index is BASE's"
+    );
+}
+
+/// F1, priced refusal: the request-owner map alone prices at (N + 1) * 704
+/// bytes on the supported layout, so a stale window holding 12,000 pending
+/// request hashes is refused under the 8 MiB parked budget (8,448,704 bytes
+/// before any other collection) while 1,000 is admitted. The refused start is
+/// BASE's; the admitted one carries the witnessed family.
+#[test]
+fn c1b_carry_scratch_price_refuses_a_large_stale_window() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    assert_eq!(
+        crate::heap_layout_bound::tree_node_bytes::<&str, &str>(),
+        Some(704)
+    );
+    let unwitnessed_hashes = |count: usize| {
+        move |index: &mut ScanIndex| {
+            let pending = index
+                .claude_usage_family_pending
+                .get_mut(CARRY_UNWITNESSED)
+                .unwrap();
+            pending.member_occurrences.clear();
+            pending.member_request_id_hashes.insert(
+                carry_member(CARRY_UNWITNESSED, None),
+                (0..count).map(|n| format!("{n:064x}")).collect(),
+            );
+        }
+    };
+    let refusals = claude_stale_family_carry_budget_fallbacks_for_test();
+    let ((_, admitted_row), _) = carry_arms(&unwitnessed_hashes(1_000), BACKFILL_WINDOW_DAYS);
+    assert_eq!(admitted_row["carried_pending_families"], 1, "admitted");
+    assert_eq!(
+        claude_stale_family_carry_budget_fallbacks_for_test(),
+        refusals
+    );
+    let ((fix, row), (base, base_row)) =
+        carry_arms(&unwitnessed_hashes(12_000), BACKFILL_WINDOW_DAYS);
+    assert_eq!(
+        claude_stale_family_carry_budget_fallbacks_for_test(),
+        refusals + 1
+    );
+    assert_eq!(row, base_row, "the refused start is BASE's");
+    assert_eq!(row["carried_pending_families"], 0);
+    assert_eq!(
+        serde_json::to_value(&fix).unwrap(),
+        serde_json::to_value(&base).unwrap()
+    );
+}
+
+/// F1, admitted: the fixture's carry scratch prices far under the parked
+/// budget, so nothing is refused and the witnessed family is carried.
+#[test]
+fn c1b_admitted_carry_scratch_carries_the_witnessed_family() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let index = carry_index();
+    let stale = index
+        .claude_usage_family_pending
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(claude_stale_family_carry_scratch_admitted(
+        &index, &stale, 0
+    ));
+    let refusals = claude_stale_family_carry_budget_fallbacks_for_test();
+    let ((fix, row), _) = carry_arms(&|_| {}, BACKFILL_WINDOW_DAYS);
+    assert_eq!(
+        claude_stale_family_carry_budget_fallbacks_for_test(),
+        refusals
+    );
+    assert_eq!(row["carried_pending_families"], 1);
+    assert_eq!(row["carried_index_files"], 2);
+    for key in carry_family_keys() {
+        assert!(!fix.files[&key].source_file_fingerprint.is_empty());
+    }
+}

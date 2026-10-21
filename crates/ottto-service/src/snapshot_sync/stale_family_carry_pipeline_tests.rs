@@ -47,12 +47,14 @@ struct C1bWindow {
 
 impl C1bWindow {
     /// What a family's liveness depends on: RetryPending, red or complete
-    /// terminals, the fence and the retained proof.
-    fn liveness(&self) -> (bool, bool, bool, bool, bool, bool, bool) {
+    /// terminals, the duplicate census's validity, the fence and the retained
+    /// proof.
+    fn liveness(&self) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
         (
             self.retry_pending,
             self.red,
             self.census_complete,
+            self.census_invalid,
             self.fence_before,
             self.fence_after,
             self.full_rearm,
@@ -168,7 +170,14 @@ struct C1bRun {
 }
 
 fn c1b_red_chain(case: &'static str, arm: &str, between: impl FnOnce(&RearmFixture)) -> C1bRun {
-    let fixture = c1a_fixture(case);
+    c1b_red_chain_with(c1a_fixture(case), arm, between)
+}
+
+fn c1b_red_chain_with(
+    fixture: RearmFixture,
+    arm: &str,
+    between: impl FnOnce(&RearmFixture),
+) -> C1bRun {
     let family = rearm_family_sessions().len();
     let closing = c1b_generation(&fixture, arm, (8, 0));
     assert!(closing.census_complete, "{arm}: the first census completes");
@@ -221,7 +230,7 @@ fn c1b_base_red_chain(case: &'static str, between: impl FnOnce(&RearmFixture)) -
     c1b_red_chain(case, "base", between)
 }
 
-fn c1b_liveness(run: &C1bRun) -> Vec<(bool, bool, bool, bool, bool, bool, bool)> {
+fn c1b_liveness(run: &C1bRun) -> Vec<(bool, bool, bool, bool, bool, bool, bool, bool)> {
     run.windows.iter().map(C1bWindow::liveness).collect()
 }
 
@@ -362,8 +371,9 @@ fn c1b_sidecar_changed_family_is_reread_like_base() {
 
 /// SOURCE B9: after the red window one subagent's transcript gains a request
 /// without telemetry. The walk re-parses that member at the 08:20 retry
-/// (`SourceChanged` instead of BASE's `Rearmed`), and the family takes the
-/// ordinary witnessed-family path. Its liveness equals BASE in every window.
+/// (`SourceChanged` instead of BASE's `Rearmed`), which cancels the family's
+/// carry so its other members are read in the same window. Its liveness
+/// equals BASE in every window.
 #[test]
 #[serial(source_manifests)]
 fn c1b_changed_member_after_carry_is_reparsed() {
@@ -410,4 +420,162 @@ fn c1b_identity_contract_change_keeps_base_rearm() {
         assert_eq!(window.start, base_window.start, "the start is BASE's");
     }
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
+}
+
+/// A request the provider ledger records for the first subagent from the
+/// start, before its transcript holds it.
+const C1B_RECORDED_REQUEST: &str = "req_agent_a_2";
+
+/// The C1a fixture whose paired API and trace sidecars also record
+/// `C1B_RECORDED_REQUEST` for the first subagent. Its transcript is a
+/// nonempty subset of its assigned requests, so the family still proves.
+fn c1b_recorded_request_fixture(case: &'static str, page_files: usize) -> RearmFixture {
+    let mut fixture = c1a_fixture(case);
+    fixture.native_file_limit = page_files;
+    let (api, trace) = rearm_evidence_lines(Some(REARM_AGENTS[0]), C1B_RECORDED_REQUEST, 5);
+    RearmFixture::append(&fixture.sidecar_path("claude-code-effort"), &api);
+    RearmFixture::append(&fixture.sidecar_path("claude-code-trace-ownership"), &trace);
+    fixture
+}
+
+/// Between the red window and its retry: the unrelated red producer is
+/// repaired, and the first subagent's transcript gains the request its
+/// provider ledger already holds, with matching usage. No sidecar changes.
+fn c1b_repair_and_gain_recorded_request(fixture: &RearmFixture) {
+    std::fs::write(
+        c1b_sibling_path(fixture),
+        rearm_transcript_line(REARM_SIBLING, None, &format!("req_{REARM_SIBLING}"), 0)
+            + &rearm_transcript_line(REARM_SIBLING, None, "req_sibling_2", 1),
+    )
+    .expect("repair the unrelated transcript");
+    RearmFixture::append(
+        &fixture.member_path(Some(REARM_AGENTS[0])),
+        &rearm_transcript_line(REARM_ROOT, Some(REARM_AGENTS[0]), C1B_RECORDED_REQUEST, 4),
+    );
+}
+
+/// Runs the recoverable member change in a fix arm and a BASE arm and checks
+/// that the 08:20 retry proves exactly as BASE: the carry is decided at the
+/// start, the changed member's parse cancels it once, every member is read in
+/// that same healthy window, and the proof, RetryPending, liveness, heads and
+/// witness all equal BASE's.
+fn c1b_assert_recoverable_change_proves_like_base(case: &'static str, page_files: usize) {
+    let cancellations = crate::snapshots::claude_stale_family_carry_cancellations_for_test();
+    let fix = c1b_red_chain_with(
+        c1b_recorded_request_fixture(case, page_files),
+        "fix",
+        c1b_repair_and_gain_recorded_request,
+    );
+    assert_eq!(
+        crate::snapshots::claude_stale_family_carry_cancellations_for_test(),
+        cancellations + 1,
+        "the changed member cancels the carry once"
+    );
+    let base = {
+        let _base = crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new();
+        c1b_red_chain_with(
+            c1b_recorded_request_fixture(case, page_files),
+            "base",
+            c1b_repair_and_gain_recorded_request,
+        )
+    };
+    let family = rearm_family_sessions().len();
+    let retry = &fix.windows[2];
+    let base_retry = &base.windows[2];
+    // Preconditions on BASE: the healthy retry re-reads the family and
+    // re-proves it with the gained request, without RetryPending.
+    assert!(base_retry.census_complete && !base_retry.red);
+    assert_eq!(base_retry.family_reads, family);
+    assert!(base_retry.proven && !base_retry.retry_pending);
+    assert_ne!(base.witness_after, base.witness_after_red, "BASE re-proves");
+    let start = retry.start.as_ref().expect("a retry start");
+    assert_eq!(start.reason, "terminal_unhealthy_retry");
+    assert_eq!(start.carried_pending_families, Some(1), "carried at start");
+    // FLIPS: without the cancel only the changed member is read, the root's
+    // absence fails the fresh proof and the family turns RetryPending.
+    assert_eq!(retry.family_reads, family, "the family is co-observed");
+    assert_eq!(retry.proven, base_retry.proven);
+    assert_eq!(retry.retry_pending, base_retry.retry_pending);
+    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
+    assert_eq!(fix.heads_after, base.heads_after);
+    assert_eq!(fix.witness_after, base.witness_after);
+}
+
+/// SOURCE B9, the reviewed recoverable case: after the red window the first
+/// subagent gains a request its provider ledger already recorded, and the red
+/// producer is repaired. The subagent is read on the second page, after the
+/// unchanged root was skipped on the first, so the cancel appends the root to
+/// the subagent's page.
+#[test]
+#[serial(source_manifests)]
+fn c1b_recoverable_member_change_cancels_the_carry_and_proves_like_base() {
+    if !c1a_layout_supported("c1b_recoverable_member_change") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    c1b_assert_recoverable_change_proves_like_base(
+        "c1b-recoverable-member-change",
+        REARM_PAGE_FILES,
+    );
+}
+
+/// The same recoverable change with every window on one page, so the change
+/// is discovered on the healthy terminal page itself. The cancel appends the
+/// already skipped root to that page, and the family still proves as BASE.
+#[test]
+#[serial(source_manifests)]
+fn c1b_member_change_on_the_terminal_page_cancels_the_carry_like_base() {
+    if !c1a_layout_supported("c1b_terminal_page_member_change") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    c1b_assert_recoverable_change_proves_like_base("c1b-terminal-page-member-change", 64);
+}
+
+/// SOURCE B9 held path, the remaining case: a member that disappears after
+/// the red window yields no parse in the retry window, so nothing cancels the
+/// carry there. BASE re-reads the remaining members; the fix keeps the
+/// family's committed revisions and reads none of them, and the family takes
+/// the ordinary path from the next start. The later windows are receipts only.
+#[test]
+#[serial(source_manifests)]
+fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
+    if !c1a_layout_supported("c1b_member_removed") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let run = |case: &'static str, arm: &str| {
+        let fixture = c1a_fixture(case);
+        c1b_generation(&fixture, arm, (8, 0));
+        RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+        let red = c1b_generation(&fixture, arm, (8, 10));
+        assert!(red.red, "{arm}: the window is red");
+        std::fs::remove_file(fixture.member_path(Some(REARM_AGENTS[1])))
+            .expect("remove the second subagent");
+        let retry = c1b_generation(&fixture, arm, (8, 20));
+        std::fs::write(
+            c1b_sibling_path(&fixture),
+            rearm_transcript_line(REARM_SIBLING, None, &format!("req_{REARM_SIBLING}"), 0),
+        )
+        .expect("repair the unrelated transcript");
+        c1b_generation(&fixture, arm, (8, 30));
+        retry
+    };
+    let cancellations = crate::snapshots::claude_stale_family_carry_cancellations_for_test();
+    let retry = run("c1b-member-removed", "fix");
+    assert_eq!(
+        crate::snapshots::claude_stale_family_carry_cancellations_for_test(),
+        cancellations,
+        "no member parse cancels the carry"
+    );
+    let base_retry = {
+        let _base = crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new();
+        run("c1b-member-removed-base", "base")
+    };
+    let remaining = rearm_family_sessions().len() - 1;
+    assert_eq!(base_retry.family_reads, remaining, "BASE reads the rest");
+    let start = retry.start.as_ref().expect("a retry start");
+    assert_eq!(start.carried_pending_families, Some(1));
+    assert_eq!(retry.family_reads, 0, "the carry stands in this window");
+    assert_eq!(retry.red, base_retry.red);
 }
