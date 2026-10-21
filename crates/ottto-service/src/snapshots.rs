@@ -4712,9 +4712,23 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             });
         for (root_session_id, family) in &proven {
             index.rebind_claude_authority_proof(root_session_id, &family.witness);
-            index
-                .claude_usage_family_witnesses
-                .insert(root_session_id.clone(), family.witness.clone());
+            // T1 must publish its paired witness immediately: later demotion
+            // and duplicate-census readers must see the correction's proof.
+            // Every other replacement waits for this fold's final resolution;
+            // an old or same-pass RetryPending may still require retained P0.
+            if index
+                .claude_usage_authority_quarantine
+                .get(root_session_id)
+                .is_some_and(|record| {
+                    record.proof_correction.is_some()
+                        && record.proven_witness_fingerprint
+                            == claude_usage_family_witness_fingerprint(&family.witness)
+                })
+            {
+                index
+                    .claude_usage_family_witnesses
+                    .insert(root_session_id.clone(), family.witness.clone());
+            }
         }
     } else if census_complete {
         // Report availability is not evidence that a previously proven
@@ -5649,6 +5663,25 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .claude_usage_authority_quarantine
             .remove(&root_session_id);
         index.claude_usage_family_pending.remove(&root_session_id);
+    }
+    // Reuse the already-owned proof graph only after both existing and
+    // same-pass restrictions are known. Unresolved P0 remains paired with its
+    // retained witness; successful resolution installs P1 in the same selected
+    // index mutation. Do not rebind here: a failed rebuild cannot gain T1.
+    for (root_session_id, family) in proven {
+        if index
+            .claude_usage_authority_quarantine
+            .get(&root_session_id)
+            .is_some_and(|record| {
+                record.proven_witness_fingerprint
+                    != claude_usage_family_witness_fingerprint(&family.witness)
+            })
+        {
+            continue;
+        }
+        index
+            .claude_usage_family_witnesses
+            .insert(root_session_id, family.witness);
     }
     duplicate_census.fence_after = index.claude_duplicate_request_witness_overflowed;
     disposition.duplicate_census = duplicate_census;
@@ -31549,6 +31582,9 @@ mod tests {
     }
     mod authority_proof_correction_tests {
         include!("snapshots/authority_proof_correction_tests.rs");
+    }
+    mod authority_retry_binding_tests {
+        include!("snapshots/authority_retry_binding_tests.rs");
     }
     mod claude_posture_member_waiver_tests {
         include!("snapshots/claude_posture_member_waiver_tests.rs");
