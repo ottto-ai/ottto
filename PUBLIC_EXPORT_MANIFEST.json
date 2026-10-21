@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 725,
-  "content_sha256": "8e07e68e754b27a081b0911bb82b65e41f7973623bc36fb67e1bb8fffeefa46d",
+  "candidate_file_count": 724,
+  "content_sha256": "f341188173eb3a8e821a859693f2c0ceb67bcf9477ec0159de57c8060ed1d85c",
   "files": [
     {
       "executable": false,
@@ -1196,8 +1196,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_audit.rs",
-      "sha256": "69a9048400fc295593d4033a75f8ccb9be95de39faa5a739ef16cff4e0f39e2d",
-      "size_bytes": 60922
+      "sha256": "5264a795bf3001074808bb92ee249823d5ddaafaf27ddcd81e12eeecdaa5450e",
+      "size_bytes": 58430
     },
     {
       "executable": false,
@@ -1301,8 +1301,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "e84fc811b92d85c537dc30e7f82743c7bdd7bdeff2ed9221df08d3df0dd45ae5",
-      "size_bytes": 2921373
+      "sha256": "c40908257ddf5301f83e4e8f567a8f816211aeb5aca374e6e8adc13fe10ec0a1",
+      "size_bytes": 2923609
     },
     {
       "executable": false,
@@ -1378,8 +1378,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_posture_member_waiver_tests.rs",
-      "sha256": "0651af29c3cd041940180c786db3ce456cd77b422a9c64b89f0c8f8bd22066f9",
-      "size_bytes": 25679
+      "sha256": "a790200c190160a3479d3e777c2e8d0861784d9677ab2072fce6756a4dfd3b24",
+      "size_bytes": 38943
     },
     {
       "executable": false,
@@ -3296,8 +3296,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-20-claude-posture-member-waiver.md",
-      "sha256": "de7176c49feb66338b73ee2d6bd854e9f81f983f59faa140d6f869faaefe35b6",
-      "size_bytes": 4605
+      "sha256": "3e76340eb4475919fa133c039e681bb2167bbe2163ac675993a7d0a421203a28",
+      "size_bytes": 5983
     },
     {
       "executable": false,
@@ -4555,13 +4555,6 @@
     {
       "executable": false,
       "mode": "0644",
-      "path": "fixtures/snapshot-audit/v5-golden-keys.json",
-      "sha256": "9868548f0329a659545f7b0a12d30ba6560b08ee1e6db9fdcbee8515f28a9fdf",
-      "size_bytes": 1055
-    },
-    {
-      "executable": false,
-      "mode": "0644",
       "path": "fixtures/source-health/codex-needs-repair.json",
       "sha256": "7793a21d37711b56d986f20703b95512fdcde73b88d6cf1c18ff480fb322eadb",
       "size_bytes": 5678
@@ -5078,9 +5071,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T22:01:33+00:00",
+  "generated_at": "2026-10-21T01:48:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 726,
+  "output_file_count": 725,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5117,5 +5110,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f2a6c753fe3ef994dc8ef91b0fea304c0c9e31da"
+  "source_commit": "f226b524d84377645d1279fa36823966d5809177"
 }
