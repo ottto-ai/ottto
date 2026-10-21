@@ -8536,6 +8536,10 @@ fn semantic_attribution_facts(item: &SnapshotItem) -> Vec<Value> {
 }
 
 fn semantic_attribution(item: &SnapshotItem) -> Value {
+    #[cfg(not(test))]
+    let identity_collector = claude_request_identity::COLLECTOR;
+    #[cfg(test)]
+    let identity_collector = claude_request_identity::cycle_contract(true);
     let account_identifier_hashes = item
         .model_usage
         .iter()
@@ -8555,8 +8559,8 @@ fn semantic_attribution(item: &SnapshotItem) -> Value {
         claude_request_accounts::COMPLETE
             | claude_request_accounts::UNKNOWN
             | claude_request_accounts::MIXED
-            | claude_request_identity::COLLECTOR
-    ) {
+    ) || item.provenance.collector == identity_collector
+    {
         value
             .as_object_mut()
             .expect("semantic attribution is an object")
@@ -8657,7 +8661,11 @@ pub(crate) fn snapshot_semantic_component_hashes(
             .expect("usage accounting semantic body is an object")
             .insert("usage_accounting_contract".to_string(), json!(contract));
     }
-    if item.provenance.collector == claude_request_identity::COLLECTOR {
+    #[cfg(not(test))]
+    let identity_collector = claude_request_identity::COLLECTOR;
+    #[cfg(test)]
+    let identity_collector = claude_request_identity::cycle_contract(true);
+    if item.provenance.collector == identity_collector {
         usage_accounting
             .as_object_mut()
             .expect("usage accounting semantic body is an object")
@@ -28403,7 +28411,16 @@ impl ScanIndex {
                     }
                 }
                 SnapshotSource::ClaudeCode
-                    if item.provenance.collector == claude_request_identity::COLLECTOR =>
+                    if item.provenance.collector == {
+                        #[cfg(not(test))]
+                        {
+                            claude_request_identity::COLLECTOR
+                        }
+                        #[cfg(test)]
+                        {
+                            claude_request_identity::cycle_contract(true)
+                        }
+                    } =>
                 {
                     // Contract-5 row identities are request facts, never the
                     // creator/owner: no row login, even one equal to the owner,
