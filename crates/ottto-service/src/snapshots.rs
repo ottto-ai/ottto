@@ -850,11 +850,16 @@ pub(crate) struct ClaudeCompactionObservation {
     /// its boundary's key when its `parentUuid` chain (through `attachment`
     /// records) leads to that boundary, and `None` otherwise.
     pair_key: Option<u64>,
+    /// Whether the record named a `parentUuid`. Read only for a legacy summary:
+    /// one that names a parent outside its boundary's chain is its own event,
+    /// so only a summary without any link may pair by time.
+    has_parent_link: bool,
 }
 
-// The time fallback consumes legacy summaries greedily in current-boundary
-// input order. Equal distances prefer the original legacy index; keep
-// millisecond truncation and the inclusive tolerance identical for both callers.
+// The time fallback consumes unlinked legacy summaries greedily in
+// current-boundary input order. Equal distances prefer the original legacy
+// index; keep millisecond truncation and the inclusive tolerance identical for
+// both callers.
 fn matching_claude_legacy_compaction(
     observations: &[ClaudeCompactionObservation],
     current_millis: i128,
@@ -865,6 +870,7 @@ fn matching_claude_legacy_compaction(
         .enumerate()
         .filter(|(index, observation)| {
             observation.kind == ClaudeCompactionKind::LegacySummary
+                && !observation.has_parent_link
                 && !matched_legacy.contains(index)
         })
         .filter_map(|(index, observation)| {
@@ -883,7 +889,7 @@ fn matching_claude_legacy_compaction(
 /// Legacy summaries folded into a current boundary, shared by the count and
 /// the curve so both see one event list. A summary pairs with the boundary it
 /// structurally descends from first; only boundaries left unlinked then fall
-/// back to the nearest unmatched summary inside the time tolerance.
+/// back to the nearest summary inside the time tolerance that names no parent.
 fn paired_claude_legacy_compactions(
     observations: &[ClaudeCompactionObservation],
 ) -> BTreeSet<usize> {
@@ -24730,7 +24736,8 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // Current Claude transcripts write both of these shapes for one compaction.
     // Keep the raw observations here; `claude_compaction_summary` pairs a
     // summary with the boundary its `parentUuid` chain leads to, falls back to
-    // a short time window, and preserves either shape when it appears alone.
+    // a short time window only for a summary with no `parentUuid`, and
+    // preserves either shape when it appears alone.
     let is_legacy_compaction = string_eq_at(value, &["type"], "user")
         && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
     let is_current_compaction = string_eq_at(value, &["type"], "system")
@@ -24768,6 +24775,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 duration_ms: None,
                 response_count_before: accumulator.claude_response_sequence,
                 pair_key,
+                has_parent_link: value.get("parentUuid").and_then(Value::as_str).is_some(),
             });
     }
     if is_current_compaction {
@@ -24797,6 +24805,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 duration_ms,
                 response_count_before: accumulator.claude_response_sequence,
                 pair_key: Some(pair_key),
+                has_parent_link: value.get("parentUuid").and_then(Value::as_str).is_some(),
             });
     }
     accumulator.note_time(timestamp.clone());
@@ -51653,6 +51662,7 @@ mod tests {
                 duration_ms: None,
                 response_count_before,
                 pair_key: None,
+                has_parent_link: false,
             };
         let legacy = ClaudeCompactionKind::LegacySummary;
         let current = ClaudeCompactionKind::CurrentBoundary;
@@ -51707,6 +51717,7 @@ mod tests {
             duration_ms: Some(4),
             response_count_before: 0,
             pair_key: None,
+            has_parent_link: false,
         };
         let legacy = ClaudeCompactionKind::LegacySummary;
         let current = ClaudeCompactionKind::CurrentBoundary;
@@ -51847,18 +51858,40 @@ mod tests {
         assert_eq!(item.compaction_total_pre_tokens, Some(1_700_000));
         assert_eq!(item.compaction_total_post_tokens, Some(190_000));
         assert_eq!(item.compaction_total_duration_ms, Some(50));
+        // The curve sees the same events: one boundary per pair, including the
+        // pair linked 5 s apart that the time window alone would split.
+        let curve = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries);
+        assert_eq!(
+            curve
+                .iter()
+                .map(|boundary| (boundary.kind, boundary.timestamp.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ClaudeCompactionKind::CurrentBoundary,
+                    Some("2026-10-20T09:01:00.600Z")
+                ),
+                (
+                    ClaudeCompactionKind::CurrentBoundary,
+                    Some("2026-10-20T09:11:05Z")
+                ),
+            ]
+        );
     }
 
     #[test]
-    fn claude_code_parser_pairs_unlinked_compaction_within_fallback_window() {
+    fn claude_code_parser_pairs_only_parentless_compaction_summary_by_time() {
         let item = parse_claude_compaction_fixture(
             "claude-compaction-fallback-pair",
             &[
                 "{\"timestamp\":\"2026-10-20T10:00:00Z\",\"sessionId\":\"claude-fallback\",\"requestId\":\"req_fallback_1\",\"message\":{\"id\":\"msg_fallback_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
-                // No structural link: the summary's parent is not the boundary
-                // chain, so the pair rests on the 1.5 s time fallback.
+                // No link field at all: the pair rests on the 1.5 s time fallback.
                 "{\"timestamp\":\"2026-10-20T10:01:01.500Z\",\"uuid\":\"boundary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
-                "{\"timestamp\":\"2026-10-20T10:01:00Z\",\"uuid\":\"summary-fallback\",\"parentUuid\":\"unrelated\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                "{\"timestamp\":\"2026-10-20T10:01:00Z\",\"uuid\":\"summary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // A summary whose parent lies outside the boundary's chain is
+                // not paired by time, even 1.5 s away: two events.
+                "{\"timestamp\":\"2026-10-20T10:05:01.500Z\",\"uuid\":\"boundary-elsewhere\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
+                "{\"timestamp\":\"2026-10-20T10:05:00Z\",\"uuid\":\"summary-elsewhere\",\"parentUuid\":\"unrelated\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
                 // A boundary alone still counts once.
                 "{\"timestamp\":\"2026-10-20T10:11:00Z\",\"uuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\",\"preTokens\":600000}}",
                 "{\"timestamp\":\"2026-10-20T10:12:00Z\",\"uuid\":\"prompt-1\",\"parentUuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}",
@@ -51867,16 +51900,85 @@ mod tests {
             ],
         );
 
-        assert_eq!(item.compaction_count, Some(3));
+        assert_eq!(item.compaction_count, Some(5));
         assert_eq!(
             item.compaction_timestamps,
             vec![
                 "2026-10-20T10:01:01.500Z".to_string(),
+                "2026-10-20T10:05:00Z".to_string(),
+                "2026-10-20T10:05:01.500Z".to_string(),
                 "2026-10-20T10:11:00Z".to_string(),
                 "2026-10-20T10:21:00Z".to_string(),
             ]
         );
-        assert_eq!(item.compaction_total_pre_tokens, Some(1_300_000));
+        assert_eq!(item.compaction_total_pre_tokens, Some(1_800_000));
+    }
+
+    #[test]
+    fn claude_code_parser_time_fallback_never_claims_a_linked_summary() {
+        let item = parse_claude_compaction_fixture(
+            "claude-compaction-unlinked-beside-linked",
+            &[
+                "{\"timestamp\":\"2026-10-20T11:00:00Z\",\"sessionId\":\"claude-beside\",\"requestId\":\"req_beside_1\",\"message\":{\"id\":\"msg_beside_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // A boundary without a uuid cannot be linked to.
+                "{\"timestamp\":\"2026-10-20T11:01:00.500Z\",\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":400000}}",
+                "{\"timestamp\":\"2026-10-20T11:01:03Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":300000}}",
+                // Linked to the second boundary, yet 10 ms from the first: the
+                // first boundary's fallback must skip it.
+                "{\"timestamp\":\"2026-10-20T11:01:00.490Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // The first boundary's own unlinked summary, 1 s away.
+                "{\"timestamp\":\"2026-10-20T11:01:01.500Z\",\"uuid\":\"summary-unlinked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ],
+        );
+
+        assert_eq!(item.compaction_count, Some(2));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec![
+                "2026-10-20T11:01:00.500Z".to_string(),
+                "2026-10-20T11:01:03Z".to_string(),
+            ]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(700_000));
+        assert_eq!(
+            canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn claude_copied_prefix_filter_drops_a_linked_compaction_pair_together() {
+        let mut item = parse_claude_compaction_fixture(
+            "claude-compaction-copied-prefix-pair",
+            &[
+                "{\"timestamp\":\"2026-10-20T12:00:00Z\",\"sessionId\":\"claude-prefix\",\"requestId\":\"req_prefix_1\",\"message\":{\"id\":\"msg_prefix_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // Copied-prefix compaction, linked 5 s apart: only the link
+                // pairs it, so a split filter would leave a stray summary.
+                "{\"timestamp\":\"2026-10-20T12:01:05Z\",\"uuid\":\"boundary-copied\",\"parentUuid\":null,\"sessionId\":\"claude-prefix\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":900000}}",
+                "{\"timestamp\":\"2026-10-20T12:01:05.001Z\",\"uuid\":\"attachment-copied\",\"parentUuid\":\"boundary-copied\",\"sessionId\":\"claude-prefix\",\"type\":\"attachment\"}",
+                "{\"timestamp\":\"2026-10-20T12:01:00Z\",\"uuid\":\"summary-copied\",\"parentUuid\":\"attachment-copied\",\"sessionId\":\"claude-prefix\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                "{\"timestamp\":\"2026-10-20T12:02:00Z\",\"sessionId\":\"claude-prefix\",\"requestId\":\"req_prefix_2\",\"message\":{\"id\":\"msg_prefix_2\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":60,\"output_tokens\":6}}}",
+                "{\"timestamp\":\"2026-10-20T12:03:05Z\",\"uuid\":\"boundary-owned\",\"parentUuid\":null,\"sessionId\":\"claude-prefix\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":800000}}",
+                "{\"timestamp\":\"2026-10-20T12:03:00Z\",\"uuid\":\"summary-owned\",\"parentUuid\":\"boundary-owned\",\"sessionId\":\"claude-prefix\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ],
+        );
+        assert_eq!(item.compaction_count, Some(2));
+
+        // The first owned response is sequence 1, so the copied pair (one
+        // response before it) leaves the count and the curve as a whole.
+        rebuild_claude_context_posture(&mut item, &[], Some(1));
+        assert_eq!(item.compaction_count, Some(1));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec!["2026-10-20T12:03:05Z".to_string()]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(800_000));
+        let curve = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries)
+            .into_iter()
+            .filter(|boundary| boundary.response_count_before > 1)
+            .map(|boundary| boundary.timestamp)
+            .collect::<Vec<_>>();
+        assert_eq!(curve, vec![Some("2026-10-20T12:03:05Z".to_string())]);
     }
 
     #[test]
@@ -68620,7 +68722,7 @@ crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, select
 crate::heap_layout_bound::fields!(CandidateFile; scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; census_window_end, account_identifier_hash, evidence_request_count, members, member_request_id_hashes, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier_hash, evidence_request_count, members, member_request_id_fingerprints);
-crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key);
+crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link);
 crate::heap_layout_bound::fields!(ClaudeDesktopIdentityEvidence; account_identifier_hash, provider_workspace_hash, source_created_at, imported);
 crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id);
 crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
