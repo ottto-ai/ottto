@@ -16873,6 +16873,15 @@ impl OwnedSourceScan {
                             counting.fold_receipts(&mut receipts);
                             receipts
                         });
+                // Slice D1: before `finish` consumes the parser.
+                let claude_itemless_request_hashes = if source == SnapshotSource::ClaudeCode
+                    && !comparison_target
+                    && !parser.positive_usage_evidence
+                {
+                    claude_request_census::claude_buffered_request_hashes(&parser)
+                } else {
+                    Vec::new()
+                };
                 let parsed_file = parser.finish(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -17445,6 +17454,7 @@ impl OwnedSourceScan {
                                     || recognized_usage_drop_count > 0
                                     || report.over_line_cap_count > 0,
                                 source_verified,
+                                itemless_request_hashes: claude_itemless_request_hashes,
                             },
                             &parsed,
                         );

@@ -20,6 +20,9 @@ input. No fence, coverage, rearm, posture, ACK or upload decision reads them.
 replaces the key's record:
 
 - A complete, loss-free parse is classified by shape.
+- A parse with no positive usage yields no item, but the request ids of its
+  buffered responses (zero-usage API errors) are hashed before `finish`
+  consumes the parser. They are kept as `identity_incomplete`.
 - Any loss, an incomplete or residue parse, or more than one item is `lossy`,
   and keeps the ids it saw.
 - A failed finish and a native comparison target remove the record. An older

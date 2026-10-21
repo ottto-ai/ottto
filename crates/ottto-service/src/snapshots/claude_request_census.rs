@@ -638,10 +638,14 @@ fn decode_hashes(value: &str) -> Option<Vec<u64>> {
 /// The record one parse of a Claude family-member file yields, or None when
 /// the fingerprint is not a 64-hex digest (never a scan candidate's).
 /// `complete` is `ParsedJsonlFile::complete`; `lossy` is any dropped
-/// response, recognized-usage drop or over-cap line.
+/// response, recognized-usage drop or over-cap line. `itemless_request_hashes`
+/// are `claude_buffered_request_hashes`, used only when the parse yields no
+/// item.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn claude_request_census_record(
     path_owner: &(String, String),
     items: &[SnapshotItem],
+    itemless_request_hashes: Vec<u64>,
     source_file_fingerprint: &str,
     window: u64,
     complete: bool,
@@ -649,11 +653,15 @@ pub(crate) fn claude_request_census_record(
     unverified: bool,
 ) -> Option<ClaudeRequestCensusRecord> {
     let source_file_fingerprint = decode_fingerprint(source_file_fingerprint)?;
-    let mut request_hashes = items
-        .iter()
-        .flat_map(|item| item.claude_usage_request_ids.iter())
-        .map(|request_id| claude_request_hash(request_id))
-        .collect::<Vec<_>>();
+    let mut request_hashes = if items.is_empty() {
+        itemless_request_hashes
+    } else {
+        items
+            .iter()
+            .flat_map(|item| item.claude_usage_request_ids.iter())
+            .map(|request_id| claude_request_hash(request_id))
+            .collect::<Vec<_>>()
+    };
     request_hashes.sort_unstable();
     request_hashes.dedup();
     request_hashes.shrink_to_fit();
@@ -661,8 +669,11 @@ pub(crate) fn claude_request_census_record(
         _ if !complete || lossy => ClaudeRequestCensusShape::Lossy,
         // A Claude file yields at most one item; more is treated as loss.
         [_, _, ..] => ClaudeRequestCensusShape::Lossy,
-        // No usage-bearing response, so no item (a confirmed-empty file).
-        [] => ClaudeRequestCensusShape::Empty,
+        // No item, no response id (a confirmed-empty file).
+        [] if request_hashes.is_empty() => ClaudeRequestCensusShape::Empty,
+        // Responses without positive usage (API errors) make no item. Their
+        // ids are kept, but no item certified the identity.
+        [] => ClaudeRequestCensusShape::IdentityIncomplete,
         [item] if !item.claude_context_curve_identity_complete => {
             ClaudeRequestCensusShape::IdentityIncomplete
         }
@@ -694,6 +705,25 @@ pub(crate) struct ClaudeRequestCensusParse<'a> {
     pub(crate) complete: bool,
     pub(crate) lossy: bool,
     pub(crate) source_verified: bool,
+    pub(crate) itemless_request_hashes: Vec<u64>,
+}
+
+/// The request-id hashes of the Claude responses a parser buffered, taken
+/// before `finish` consumes it. Only a parse with no positive usage needs
+/// them: it yields no item, so its ids (zero-usage API errors included) would
+/// otherwise reach no record. Sorted and unique.
+pub(super) fn claude_buffered_request_hashes(parser: &super::OwnedJsonlParser) -> Vec<u64> {
+    let mut hashes = parser
+        .accumulator
+        .claude_responses
+        .values()
+        .flat_map(|response| response.records.iter())
+        .filter_map(|record| record.request_id.as_deref())
+        .map(claude_request_hash)
+        .collect::<Vec<_>>();
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
 }
 
 /// Every Claude family-member parse that reaches `finish` replaces the key's
@@ -716,6 +746,7 @@ pub(crate) fn record_claude_request_census(
     let Some(record) = claude_request_census_record(
         &path_owner,
         items,
+        parse.itemless_request_hashes,
         parse.source_file_fingerprint,
         window,
         parse.complete,
@@ -727,9 +758,14 @@ pub(crate) fn record_claude_request_census(
     };
     if let Some(old) = index.claude_request_census.get(parse.index_key) {
         // S3(d): the same verified revision under the same derivation must
-        // yield the same census. Residue and lossy records are excluded.
+        // yield the same census. Residue, lossy and budget tombstones (whose
+        // shape and hashes the budget replaced) are excluded.
         let comparable = |record: &ClaudeRequestCensusRecord| {
-            !record.unverified && record.shape != ClaudeRequestCensusShape::Lossy
+            !record.unverified
+                && !matches!(
+                    record.shape,
+                    ClaudeRequestCensusShape::Lossy | ClaudeRequestCensusShape::OverBudget
+                )
         };
         if parse.complete
             && comparable(old)
@@ -936,6 +972,19 @@ impl ClaudeRequestCensusJoin {
                 .filter(|(_, keys)| *keys > 1)
                 .map(|((root, _), _)| root),
         );
+        // A member that is not a counted key (residue never indexed, or a
+        // confirmed-empty file) still leaves its family census-unknown.
+        for (key, record) in &census.records {
+            if join.coverage.contains_key(key)
+                || record.derivation != CLAUDE_REQUEST_CENSUS_DERIVATION
+                || !(record.shape.unknown() || record.twin)
+            {
+                continue;
+            }
+            if let Some((root, _)) = claude_index_path_family_member(Path::new(key)) {
+                join.unknown_roots.insert(root);
+            }
+        }
         join.counts.family_unknown_roots = join.unknown_roots.len();
         join.merge_hashes(census);
         join

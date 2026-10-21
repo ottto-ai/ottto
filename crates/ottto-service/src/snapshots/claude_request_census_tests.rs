@@ -1116,6 +1116,129 @@ fn census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
             .derivation_drift_for_test(),
         1
     );
+    // A budget tombstone at the same revision is no drift either: the budget,
+    // not extraction, replaced its shape and hashes.
+    index.claude_request_census_mut_for_test().insert_for_test(
+        &key,
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &record.fingerprint_hex_for_test(),
+            record.window_for_test(),
+            ClaudeRequestCensusShape::OverBudget,
+            vec![],
+        ),
+    );
+    index
+        .files
+        .get_mut(&key)
+        .expect("entry")
+        .source_file_fingerprint
+        .clear();
+    census_scan(&root, &mut index, "2026-08-05T09:00:00Z");
+    assert_eq!(
+        index
+            .claude_request_census_for_test()
+            .get(&key)
+            .expect("reparsed record")
+            .shape_for_test(),
+        ClaudeRequestCensusShape::Exact
+    );
+    assert_eq!(
+        index
+            .claude_request_census_shadow_for_test()
+            .derivation_drift_for_test(),
+        1
+    );
+}
+
+/// A transcript of zero-usage responses only (API errors) yields no item, yet
+/// its request ids still reach the census and meet a peer's copy.
+#[test]
+fn census_records_keep_ids_of_zero_usage_only_transcripts() {
+    let scratch = crate::test_scratch::ScratchDir::new("census-zero-usage-only");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "census-api-errors.jsonl",
+        &[census_response(
+            "census-api-errors",
+            Some("req_shared_err"),
+            "msg_err_1",
+            1,
+            0,
+        )],
+    );
+    census_write(
+        &root,
+        "census-peer.jsonl",
+        &[census_response(
+            "census-peer",
+            Some("req_shared_err"),
+            "msg_peer_1",
+            2,
+            10,
+        )],
+    );
+    let mut index = ScanIndex::default();
+    let scan = census_scan(&root, &mut index, FIRST_WINDOW);
+    let errors = census_key(&index, &root, "census-api-errors.jsonl");
+    let peer = census_key(&index, &root, "census-peer.jsonl");
+    let record = index
+        .claude_request_census_for_test()
+        .get(&errors)
+        .expect("zero-usage record");
+    assert_eq!(
+        record.request_hashes_for_test(),
+        &[claude_request_hash("req_shared_err")]
+    );
+    assert_ne!(record.shape_for_test(), ClaudeRequestCensusShape::Empty);
+    assert_ne!(record.shape_for_test(), ClaudeRequestCensusShape::Exact);
+    assert_eq!(
+        claude_census_member_status(&index, &peer, &scan.census_window_end, true),
+        ClaudeCensusMemberStatus::SharesHash
+    );
+}
+
+/// A lossy member that has no counted entry (a residue subagent never
+/// indexed) still leaves its family census-unknown.
+#[test]
+fn census_unindexed_lossy_member_leaves_its_family_unknown() {
+    let root_key = "/census/projects/census-clean.jsonl".to_string();
+    let member_key = "/census/projects/census-clean/subagents/agent-residue.jsonl".to_string();
+    let mut index = ScanIndex::default();
+    let mut entry = manifest_index_entry(Some("clean"));
+    entry.source_file_fingerprint = hex_fingerprint('a');
+    index.files.insert(root_key.clone(), entry);
+    index
+        .file_snapshot_fingerprints
+        .insert(root_key.clone(), BTreeSet::from(["clean".to_string()]));
+    for (key, seed, shape, hash) in [
+        (&root_key, 'a', ClaudeRequestCensusShape::Exact, 1),
+        (&member_key, 'b', ClaudeRequestCensusShape::Lossy, 2),
+    ] {
+        index.claude_request_census_mut_for_test().insert_for_test(
+            key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &hex_fingerprint(seed),
+                1,
+                shape,
+                vec![hash],
+            ),
+        );
+    }
+    assert_eq!(
+        claude_census_member_status(&index, &root_key, FIRST_WINDOW, true),
+        ClaudeCensusMemberStatus::FamilyUnknown
+    );
+    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &BTreeSet::from([member_key.clone()]),
+        &BTreeSet::from([member_key.clone()]),
+        FIRST_WINDOW,
+    );
+    assert!(counts.would_open);
+    assert_eq!(counts.family_keys, 1);
+    assert_eq!(counts.family_unknown_roots, 1);
+    assert_eq!(counts.records, 2);
 }
 
 fn census_index_json(records: serde_json::Value) -> serde_json::Value {
