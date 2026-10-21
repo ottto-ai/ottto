@@ -27,8 +27,10 @@ keeps its scalar tuple only when all of these hold:
 - the member's own family pending is valid in the current census window and
   holds exactly this item's request set;
 - no request is a persisted duplicate, held by another (root, member) owner in
-  any retained non-invalid family pending, or reported under another root in the
-  loaded API or trace evidence.
+  any retained non-invalid family pending (`visible_dupes`), or reported under
+  another root in the loaded API or trace evidence (`foreign_otel`). Both are
+  new fold-local, read-only values; the persisted duplicate witness is not
+  touched.
 
 Uniqueness is never proof. A hidden family can only hide negative evidence, and
 the waiver depends on none: a copier cannot hold telemetry for requests another
@@ -58,16 +60,25 @@ so the curve stays `ownership_unresolved` while the fence is closed.
 Fence state, its persistence, coverage, re-arm, caps, scan identity and parser
 versions are unchanged. No wire field is added.
 
-## Audit
+## Resource bounds
 
-`snapshot-audit` reports `local_snapshot_audit:v5`. Each session row adds the
-four posture integers (or null) and `posture_admission`: `strict`,
-`member_waiver`, `withheld_no_contract`, `withheld_global_census`,
-`withheld_own_family`, `withheld_duplicate` or `withheld_identity`. The report
-adds per-rule counts, sessions with peak above 1,000,000 and incoherent tuples
-(first or last above peak). Admission is recorded only when Claude support
-evidence runs the ownership fold. Blinded keys move to the v5 domain; the
-golden oracle is `fixtures/snapshot-audit/v5-golden-keys.json`.
+The waiver evidence is built only while the fence is closed, once per fold
+(one scan page). Candidates are this page's items with the v1 contract, complete
+identity, no legacy exclusion and their own current, valid family pending.
+Before any allocation the fold sums the candidates' request ids and refuses the
+evidence above the existing Mac-wide 250,000 pending-occurrence cap; candidates
+already sit inside that capped pending, so the refusal guards the invariant, and
+a refused fold keeps the strict rule (cleared scalars) for every candidate. No
+cap changes.
+
+Within the bound the evidence holds one borrowed request id and one hash per
+candidate request, at most one owner per candidate hash (collapsed to "shared"
+at the second owner), and one borrowed reporting root per reported candidate
+request. Worst case per page is therefore linear in the page's candidate
+requests, never in the pending or report maps. Each closed-fence fold walks the
+retained pending member hashes and occurrence keys once and the loaded API and
+trace rows once; nothing is cloned from those maps. The admission reason is an
+in-memory value used for branching; tests record it, release folds do not.
 
 ## Verification
 
@@ -78,6 +89,14 @@ a visible duplicate in a valid peer family, a request reported under another
 root, incomplete identity, owned-boundary compaction filtering, the open-fence
 strict rule, family-level-only trace attribution, a persisted duplicate owner
 under the closed fence, a stale valid peer holding the request, and a request
-traced under another root. The existing hidden-copy
+traced under another root. Compaction fixtures pin the
+`response_count_before > first_owned_sequence` rule (0-based ordinals) for a
+non-zero, non-contiguous first owned ordinal, provider-stamped copied responses
+and boundaries before, between and after owned responses, and an own boundary
+with no owned response (count stays null). One regression checks that the waived
+upload body differs from the withheld body only in the context scalar tuple and
+the derived semantic fingerprint; account, attribution and identity fields are
+identical. A copier whose requests are reported under another root stays
+cleared, and the evidence refuses past its allocation bound. The existing hidden-copy
 regression now records that the curve stays fenced while the provider-owned
 child keeps its scalars and the hidden copy is cleared.

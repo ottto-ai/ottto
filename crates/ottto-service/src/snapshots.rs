@@ -1026,36 +1026,51 @@ fn rebuild_claude_context_posture(
 }
 
 /// Visible negative evidence against the Claude posture member waiver, built
-/// only while the global census fence is closed and bounded by the requests of
-/// this page's waiver candidates: one entry per candidate request, never one
-/// per matching owner or row.
+/// only while the global census fence is closed. It is local to one fold and
+/// read only: never persisted, never merged into the duplicate witness, and
+/// bounded by the requests of this page's waiver candidates (one entry per
+/// candidate request, never one per matching owner or row).
 #[derive(Default)]
-struct ClaudePostureWaiverEvidence {
+struct ClaudePostureWaiverEvidence<'r> {
     /// Candidate request hashes that retained, non-invalid family pending of
     /// any window assigns to more than one (root, member) owner.
-    shared_request_hashes: BTreeSet<String>,
+    visible_dupes: BTreeSet<String>,
     /// Candidate request ids reported by loaded local API or trace evidence,
     /// with the one reporting root or a marker that several roots report it.
-    reported_request_roots: BTreeMap<String, ClaudeReportedRequestRoot>,
+    /// Keys and roots borrow the loaded reports.
+    foreign_otel: BTreeMap<&'r str, ClaudeReportedRequestRoot<'r>>,
 }
 
-enum ClaudeReportedRequestRoot {
-    One(String),
+enum ClaudeReportedRequestRoot<'r> {
+    One(&'r str),
     Several,
 }
 
-fn claude_posture_waiver_evidence<'a>(
-    candidates: impl Iterator<Item = &'a SnapshotItem>,
+/// Build the waiver evidence, or refuse before allocating anything when the
+/// candidates carry more requests than `max_candidate_requests`. Candidates
+/// are members of current, valid family pending, which the Mac-wide pending
+/// occurrence cap already bounds, so the refusal is a guard on that
+/// invariant; a refused fold keeps the strict rule for every candidate.
+fn claude_posture_waiver_evidence<'s, 'r>(
+    candidates: impl Iterator<Item = &'s SnapshotItem> + Clone,
+    max_candidate_requests: usize,
     index: &ScanIndex,
-    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
-    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-) -> ClaudePostureWaiverEvidence {
+    api_report: &'r crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &'r crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) -> Option<ClaudePostureWaiverEvidence<'r>> {
+    let candidate_request_count = candidates
+        .clone()
+        .map(|item| item.claude_usage_request_ids.len())
+        .fold(0_usize, usize::saturating_add);
+    if candidate_request_count > max_candidate_requests {
+        return None;
+    }
+    if candidate_request_count == 0 {
+        return Some(ClaudePostureWaiverEvidence::default());
+    }
     let candidate_request_ids = candidates
         .flat_map(|item| item.claude_usage_request_ids.iter().map(String::as_str))
         .collect::<BTreeSet<_>>();
-    if candidate_request_ids.is_empty() {
-        return ClaudePostureWaiverEvidence::default();
-    }
     let candidate_request_hashes = candidate_request_ids
         .iter()
         .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
@@ -1093,36 +1108,46 @@ fn claude_posture_waiver_evidence<'a>(
             }
         }
     }
-    let shared_request_hashes = owners
+    let visible_dupes = owners
         .into_iter()
         .filter(|(_, owner)| owner.is_none())
         .map(|(request_hash, _)| request_hash.to_string())
         .collect();
     let api_rows = api_report.evidence.iter().flat_map(|(root, rows)| {
-        rows.iter()
-            .map(move |row| (root, row.session_id.as_str(), row.request_id.as_str()))
+        rows.iter().map(move |row| {
+            (
+                root.as_str(),
+                row.session_id.as_str(),
+                row.request_id.as_str(),
+            )
+        })
     });
     let trace_rows = trace_report.evidence.iter().flat_map(|(root, rows)| {
-        rows.iter()
-            .map(move |row| (root, row.session_id.as_str(), row.request_id.as_str()))
+        rows.iter().map(move |row| {
+            (
+                root.as_str(),
+                row.session_id.as_str(),
+                row.request_id.as_str(),
+            )
+        })
     });
-    let mut reported_request_roots = BTreeMap::<String, ClaudeReportedRequestRoot>::new();
+    let mut foreign_otel = BTreeMap::<&'r str, ClaudeReportedRequestRoot<'r>>::new();
     for (root, session_id, request_id) in api_rows.chain(trace_rows) {
         if !candidate_request_ids.contains(request_id) {
             continue;
         }
-        let reported = reported_request_roots
-            .entry(request_id.to_string())
-            .or_insert_with(|| ClaudeReportedRequestRoot::One(root.clone()));
-        if matches!(reported, ClaudeReportedRequestRoot::One(first) if first != root || first != session_id)
+        let reported = foreign_otel
+            .entry(request_id)
+            .or_insert(ClaudeReportedRequestRoot::One(root));
+        if matches!(reported, ClaudeReportedRequestRoot::One(first) if *first != root || *first != session_id)
         {
             *reported = ClaudeReportedRequestRoot::Several;
         }
     }
-    ClaudePostureWaiverEvidence {
-        shared_request_hashes,
-        reported_request_roots,
-    }
+    Some(ClaudePostureWaiverEvidence {
+        visible_dupes,
+        foreign_otel,
+    })
 }
 
 /// Inputs shared by every withheld item's posture admission in one fold.
@@ -1132,7 +1157,8 @@ struct ClaudePostureFence<'a> {
     census_window_end: &'a str,
     own_pending: Option<&'a ClaudeUsageFamilyPending>,
     duplicated_request_hashes: &'a BTreeSet<String>,
-    evidence: &'a ClaudePostureWaiverEvidence,
+    /// `None` when the evidence was refused at its allocation bound.
+    evidence: Option<&'a ClaudePostureWaiverEvidence<'a>>,
 }
 
 /// Classify an item the strict posture rule withheld, and admit the member
@@ -1194,16 +1220,18 @@ fn claude_withheld_posture_admission(
     if !own_family_current_valid {
         return ClaudePostureAdmission::WithheldOwnFamily;
     }
+    let Some(evidence) = fence.evidence else {
+        return ClaudePostureAdmission::WithheldEvidenceBound;
+    };
     let visibly_shared = request_hashes
         .iter()
-        .any(|request_hash| fence.evidence.shared_request_hashes.contains(request_hash));
+        .any(|request_hash| evidence.visible_dupes.contains(request_hash));
     let reported_elsewhere = item.claude_usage_request_ids.iter().any(|request_id| {
-        fence
-            .evidence
-            .reported_request_roots
-            .get(request_id)
+        evidence
+            .foreign_otel
+            .get(request_id.as_str())
             .is_some_and(|reported| match reported {
-                ClaudeReportedRequestRoot::One(root) => root != root_session_id,
+                ClaudeReportedRequestRoot::One(root) => *root != root_session_id,
                 ClaudeReportedRequestRoot::Several => true,
             })
     });
@@ -2919,8 +2947,10 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// authority quarantine excuses nothing. Taken before the census prunes
     /// this window's pending; never a census, fence or upload input.
     pub(crate) transcript_ownership_complete: bool,
-    /// Why each folded item kept or lost its Claude posture scalars. Local
-    /// only: the snapshot audit counts it; never a wire, index or upload input.
+    /// Why each folded item kept or lost its Claude posture scalars. Kept for
+    /// tests only: never built in a release fold, never serialized, and never
+    /// an index, account, identity, audit or upload input.
+    #[cfg(test)]
     pub(crate) posture_admissions: BTreeMap<String, ClaudePostureAdmission>,
 }
 
@@ -2945,8 +2975,12 @@ pub(crate) enum ClaudePostureAdmission {
     WithheldDuplicate,
     /// A response lacks one unique request id, or no response was counted.
     WithheldIdentity,
+    /// The fold's waiver candidates exceeded the evidence allocation bound,
+    /// so the strict rule applies.
+    WithheldEvidenceBound,
 }
 
+#[cfg(test)]
 impl ClaudePostureAdmission {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -2957,17 +2991,21 @@ impl ClaudePostureAdmission {
             Self::WithheldOwnFamily => "withheld_own_family",
             Self::WithheldDuplicate => "withheld_duplicate",
             Self::WithheldIdentity => "withheld_identity",
+            Self::WithheldEvidenceBound => "withheld_evidence_bound",
         }
     }
 }
 
+#[cfg(test)]
 impl ClaudeUsageAuthorityDisposition {
     pub(crate) fn posture_admission(&self, source_session_id: &str) -> Option<&'static str> {
         self.posture_admissions
             .get(source_session_id)
             .map(|admission| admission.as_str())
     }
+}
 
+impl ClaudeUsageAuthorityDisposition {
     pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {
         self.account_deferred_source_session_ids
             .extend(session_ids.iter().cloned());
@@ -4874,6 +4912,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     // so it may keep its scalar tuple while no visible evidence contradicts it.
     let global_posture_fence =
         duplicate_census_invalid || index.claude_duplicate_request_witness_overflowed;
+    // `usage_accounting_contract` was reset and set by the rebuild above, in
+    // this call, so the waiver never reads a persisted contract flag.
     let posture_waiver_evidence = if global_posture_fence {
         claude_posture_waiver_evidence(
             snapshots.iter().filter(|item| {
@@ -4881,6 +4921,16 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 item.usage_accounting_contract.as_deref()
                     == Some("session_exclusive_reported_usage:v1")
                     && item.claude_context_curve_identity_complete
+                    && index
+                        .claude_usage_family_pending
+                        .get(&root_session_id)
+                        .is_some_and(|pending| {
+                            !pending.invalid
+                                && pending.census_window_end == census_window_end
+                                && pending
+                                    .member_request_id_hashes
+                                    .contains_key(&item.source_session_id)
+                        })
                     && !proven
                         .get(&root_session_id)
                         .or_else(|| reconstructed.get(&root_session_id))
@@ -4892,13 +4942,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                         })
                         .is_some_and(|excluded| !excluded.is_empty())
             }),
+            max_pending_occurrences,
             index,
             api_report,
             trace_report,
         )
     } else {
-        ClaudePostureWaiverEvidence::default()
+        Some(ClaudePostureWaiverEvidence::default())
     };
+    #[cfg(test)]
     let mut posture_admissions = BTreeMap::new();
     for item in snapshots.iter_mut() {
         let root_session_id = claude_snapshot_family_root(item);
@@ -4939,10 +4991,11 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     census_window_end,
                     own_pending: index.claude_usage_family_pending.get(&root_session_id),
                     duplicated_request_hashes: &duplicated_request_hashes,
-                    evidence: &posture_waiver_evidence,
+                    evidence: posture_waiver_evidence.as_ref(),
                 },
             )
         };
+        #[cfg(test)]
         posture_admissions.insert(item.source_session_id.clone(), posture_admission);
 
         if posture_admission == ClaudePostureAdmission::MemberWaiver {
@@ -5194,6 +5247,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
 
     let mut disposition = ClaudeUsageAuthorityDisposition {
         request_groupings,
+        #[cfg(test)]
         posture_admissions,
         ..ClaudeUsageAuthorityDisposition::default()
     };

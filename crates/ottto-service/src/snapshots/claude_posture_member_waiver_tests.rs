@@ -24,7 +24,14 @@ fn id_less_assistant(session: &str, second: u32, input_tokens: u64) -> String {
     )
 }
 
-fn boundary(session: &str, second: u32, pre: u64, post: u64, dropped: u64, duration: u64) -> String {
+fn boundary(
+    session: &str,
+    second: u32,
+    pre: u64,
+    post: u64,
+    dropped: u64,
+    duration: u64,
+) -> String {
     format!(
         "{{\"timestamp\":\"2026-08-02T07:00:{second:02}.500Z\",\"sessionId\":\"{session}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"trigger\":\"auto\",\"preTokens\":{pre},\"postTokens\":{post},\"cumulativeDroppedTokens\":{dropped},\"durationMs\":{duration}}}}}\n"
     )
@@ -34,9 +41,10 @@ fn boundary(session: &str, second: u32, pre: u64, post: u64, dropped: u64, durat
 fn session(dir: &Path, session_id: &str, lines: &[String]) -> (PathBuf, SnapshotItem) {
     let path = dir.join(format!("{session_id}.jsonl"));
     fs::write(&path, lines.concat()).expect("write transcript fixture");
-    let item = parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", format!("{session_id}-fp"))
-        .expect("parse transcript fixture")
-        .remove(0);
+    let item =
+        parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", format!("{session_id}-fp"))
+            .expect("parse transcript fixture")
+            .remove(0);
     (path, item)
 }
 
@@ -52,7 +60,14 @@ fn reports(
     for (root, request, sequence, input_tokens) in rows {
         api.entry(root.to_string())
             .or_default()
-            .push(complete_api_row(root, request, *sequence, *input_tokens, 1, 0));
+            .push(complete_api_row(
+                root,
+                request,
+                *sequence,
+                *input_tokens,
+                1,
+                0,
+            ));
         trace
             .entry(root.to_string())
             .or_default()
@@ -167,7 +182,14 @@ fn unrelated_cap_invalid_family_keeps_member_owned_scalars() {
         .and_then(|start| (*start).inherited());
     let mut index = indexed(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
 
-    let disposition = fold(&mut items, &reports(&owned_rows()), &mut index, true, WINDOW, 3);
+    let disposition = fold(
+        &mut items,
+        &reports(&owned_rows()),
+        &mut index,
+        true,
+        WINDOW,
+        3,
+    );
 
     assert!(disposition.duplicate_census.census_invalid);
     assert!(index.claude_duplicate_request_witness_overflowed);
@@ -217,7 +239,14 @@ fn own_invalid_family_withholds_even_with_reconstructed_witness() {
         },
     );
     let mut later = vec![owned];
-    let disposition = fold(&mut later, &evidence, &mut index, false, LATER_WINDOW, 1_000);
+    let disposition = fold(
+        &mut later,
+        &evidence,
+        &mut index,
+        false,
+        LATER_WINDOW,
+        1_000,
+    );
 
     assert!(disposition.duplicate_census.census_invalid);
     assert_eq!(later[0].usage_accounting_contract.as_deref(), V1);
@@ -263,13 +292,23 @@ fn stale_unrelated_family_keeps_current_valid_reconstructed_member() {
         },
     );
     let mut later = vec![owned];
-    let disposition = fold(&mut later, &evidence, &mut index, false, LATER_WINDOW, 1_000);
+    let disposition = fold(
+        &mut later,
+        &evidence,
+        &mut index,
+        false,
+        LATER_WINDOW,
+        1_000,
+    );
 
     assert!(!disposition.duplicate_census.census_complete);
     assert!(disposition.duplicate_census.census_invalid);
     assert_eq!(later[0].usage_accounting_contract.as_deref(), V1);
     assert_eq!(disposition.posture_admission(OWNED), Some("member_waiver"));
-    assert_eq!(posture(&later[0]), (Some(100), Some(300), Some(200), Some(0)));
+    assert_eq!(
+        posture(&later[0]),
+        (Some(100), Some(300), Some(200), Some(0))
+    );
     assert_curve_withheld(&later[0]);
     let _ = fs::remove_dir_all(dir);
 }
@@ -354,7 +393,10 @@ fn legacy_excluded_successor_stays_on_the_global_fence() {
     );
     assert_cleared(&items[1]);
     // The maker still shares that request with a visible peer: fail closed.
-    assert_eq!(disposition.posture_admission(parent), Some("withheld_duplicate"));
+    assert_eq!(
+        disposition.posture_admission(parent),
+        Some("withheld_duplicate")
+    );
     assert_cleared(&items[0]);
     let _ = fs::remove_dir_all(dir);
 }
@@ -393,9 +435,15 @@ fn visible_duplicate_in_valid_peer_family_withholds() {
 
     assert!(disposition.duplicate_census.census_invalid);
     assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
-    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_duplicate"));
+    assert_eq!(
+        disposition.posture_admission(OWNED),
+        Some("withheld_duplicate")
+    );
     assert_cleared(&items[0]);
-    assert_eq!(disposition.posture_admission(PEER), Some("withheld_no_contract"));
+    assert_eq!(
+        disposition.posture_admission(PEER),
+        Some("withheld_no_contract")
+    );
     assert_cleared(&items[1]);
     let _ = fs::remove_dir_all(dir);
 }
@@ -406,16 +454,19 @@ fn request_reported_under_another_root_withholds() {
     let (paths, mut items) = owned_and_cap_invalid(&dir);
     let mut index = indexed(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
     let mut evidence = reports(&owned_rows());
-    evidence
-        .0
-        .evidence
-        .insert(OTHER_ROOT.to_string(), vec![complete_api_row(OTHER_ROOT, "req_a2", 9, 300, 1, 0)]);
+    evidence.0.evidence.insert(
+        OTHER_ROOT.to_string(),
+        vec![complete_api_row(OTHER_ROOT, "req_a2", 9, 300, 1, 0)],
+    );
 
     let disposition = fold(&mut items, &evidence, &mut index, true, WINDOW, 3);
 
     assert!(disposition.duplicate_census.census_invalid);
     assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
-    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_duplicate"));
+    assert_eq!(
+        disposition.posture_admission(OWNED),
+        Some("withheld_duplicate")
+    );
     assert_cleared(&items[0]);
     let _ = fs::remove_dir_all(dir);
 }
@@ -435,7 +486,10 @@ fn request_traced_under_another_root_withholds() {
 
     assert!(disposition.duplicate_census.census_invalid);
     assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
-    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_duplicate"));
+    assert_eq!(
+        disposition.posture_admission(OWNED),
+        Some("withheld_duplicate")
+    );
     assert_cleared(&items[0]);
     let _ = fs::remove_dir_all(dir);
 }
@@ -459,11 +513,21 @@ fn stale_valid_peer_holding_the_request_withholds() {
         },
     );
 
-    let disposition = fold(&mut items, &reports(&owned_rows()), &mut index, true, WINDOW, 3);
+    let disposition = fold(
+        &mut items,
+        &reports(&owned_rows()),
+        &mut index,
+        true,
+        WINDOW,
+        3,
+    );
 
     assert!(disposition.duplicate_census.census_invalid);
     assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
-    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_duplicate"));
+    assert_eq!(
+        disposition.posture_admission(OWNED),
+        Some("withheld_duplicate")
+    );
     assert_cleared(&items[0]);
     let _ = fs::remove_dir_all(dir);
 }
@@ -481,11 +545,21 @@ fn persisted_duplicate_owner_withholds_under_the_closed_fence() {
         ]),
     );
 
-    let disposition = fold(&mut items, &reports(&owned_rows()), &mut index, true, WINDOW, 3);
+    let disposition = fold(
+        &mut items,
+        &reports(&owned_rows()),
+        &mut index,
+        true,
+        WINDOW,
+        3,
+    );
 
     assert!(disposition.duplicate_census.census_invalid);
     assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
-    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_duplicate"));
+    assert_eq!(
+        disposition.posture_admission(OWNED),
+        Some("withheld_duplicate")
+    );
     assert_cleared(&items[0]);
     let _ = fs::remove_dir_all(dir);
 }
@@ -523,9 +597,19 @@ fn incomplete_request_identity_withholds() {
     let (paths, mut items) = owned_and_cap_invalid(&dir_2);
     items[0].claude_context_curve_identity_complete = false;
     let mut index = indexed(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
-    let disposition = fold(&mut items, &reports(&owned_rows()), &mut index, true, WINDOW, 3);
+    let disposition = fold(
+        &mut items,
+        &reports(&owned_rows()),
+        &mut index,
+        true,
+        WINDOW,
+        3,
+    );
     assert_eq!(items[0].usage_accounting_contract.as_deref(), V1);
-    assert_eq!(disposition.posture_admission(OWNED), Some("withheld_identity"));
+    assert_eq!(
+        disposition.posture_admission(OWNED),
+        Some("withheld_identity")
+    );
     assert_cleared(&items[0]);
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(dir_2);
@@ -559,7 +643,14 @@ fn waiver_counts_only_compactions_after_the_first_owned_response() {
     let mut items = vec![owned, unrelated];
     let mut index = indexed(&[&owned_path, &unrelated_path]);
 
-    let disposition = fold(&mut items, &reports(&compacted_rows()), &mut index, true, WINDOW, 2);
+    let disposition = fold(
+        &mut items,
+        &reports(&compacted_rows()),
+        &mut index,
+        true,
+        WINDOW,
+        2,
+    );
 
     assert!(disposition.duplicate_census.census_invalid);
     assert_eq!(disposition.posture_admission(OWNED), Some("member_waiver"));
@@ -603,10 +694,10 @@ fn open_fence_keeps_the_strict_rule_unchanged() {
     // The strict exclusive-root rule still owns every observed boundary.
     assert_eq!(posture(owned), (Some(100), Some(150), Some(150), Some(2)));
     assert_eq!(owned.compaction_total_pre_tokens, Some(900_120));
-    assert!(owned
-        .context_curve
-        .as_ref()
-        .map_or(true, |curve| matches!(curve.coverage.as_str(), "complete" | "sampled")));
+    assert!(owned.context_curve.as_ref().map_or(true, |curve| matches!(
+        curve.coverage.as_str(),
+        "complete" | "sampled"
+    )));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -625,12 +716,23 @@ fn family_level_only_attribution_has_no_member_waiver() {
     let api_rows = (1..=5_u64)
         .map(|index| {
             let output_tokens = if index == 5 { 1 } else { 10 };
-            complete_api_row(&parent, &format!("req_{index}"), index, 10, output_tokens, 0)
+            complete_api_row(
+                &parent,
+                &format!("req_{index}"),
+                index,
+                10,
+                output_tokens,
+                0,
+            )
         })
         .collect::<Vec<_>>();
     let trace_rows = (1..=5_u64)
         .map(|index| {
-            let agent = if matches!(index, 1 | 5) { child_agent } else { "" };
+            let agent = if matches!(index, 1 | 5) {
+                child_agent
+            } else {
+                ""
+            };
             complete_trace_row(&parent, &format!("req_{index}"), agent)
         })
         .collect::<Vec<_>>();
@@ -665,4 +767,321 @@ fn family_level_only_attribution_has_no_member_waiver() {
         assert_cleared(item);
     }
     let _ = fs::remove_dir_all(root);
+}
+
+const CHILD: &str = "d0000000-0000-4000-8000-00000000000d";
+
+/// A provider-stamped copied record, written by branch/fork/rewind writers.
+fn copied_assistant(session: &str, request: &str, second: u32, input_tokens: u64) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-08-02T07:00:{second:02}Z\",\"uuid\":\"copied-{request}\",\"sessionId\":\"{session}\",\"forkedFrom\":{{\"sessionId\":\"{OTHER_ROOT}\",\"messageUuid\":\"original-{request}\"}},\"type\":\"assistant\",\"requestId\":\"{request}\",\"message\":{{\"id\":\"msg_{request}\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":{input_tokens},\"output_tokens\":1}}}}}}\n"
+    )
+}
+
+fn copied_boundary(session: &str, second: u32, pre: u64) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-08-02T07:00:{second:02}.250Z\",\"uuid\":\"copied-compact-{second}\",\"sessionId\":\"{session}\",\"forkedFrom\":{{\"sessionId\":\"{OTHER_ROOT}\",\"messageUuid\":\"original-compact-{second}\"}},\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"trigger\":\"auto\",\"preTokens\":{pre},\"postTokens\":1,\"cumulativeDroppedTokens\":1,\"durationMs\":1}}}}\n"
+    )
+}
+
+#[test]
+fn waiver_compactions_follow_a_non_zero_non_contiguous_first_owned_sequence() {
+    let dir = temp_dir("claude-waiver-sparse-sequence");
+    let (owned_path, mut owned) = session(
+        &dir,
+        OWNED,
+        &[
+            boundary(OWNED, 0, 1_000, 1, 1, 1),
+            assistant(OWNED, "req_a1", 1, 100),
+            boundary(OWNED, 1, 2_000, 1, 1, 1),
+            assistant(OWNED, "req_a2", 2, 300),
+            boundary(OWNED, 2, 30, 3, 3, 3),
+            assistant(OWNED, "req_a3", 3, 200),
+            boundary(OWNED, 3, 40, 4, 4, 4),
+            boundary(OWNED, 4, 50, 5, 5, 5),
+        ],
+    );
+    // The parser numbers responses consecutively from zero. Pin the rule to
+    // ordinals, not positions: the counted responses sit at 2, 5 and 9, and
+    // the other ordinals are responses this member does not count. Request
+    // order (a1, a2, a3) deliberately differs from ordinal order.
+    for (request_id, sequence) in [("req_a1", 9), ("req_a2", 2), ("req_a3", 5)] {
+        owned
+            .claude_usage_occurrences
+            .get_mut(request_id)
+            .expect("parsed occurrence")
+            .sequence = sequence;
+    }
+    assert_eq!(owned.claude_context_curve_boundaries.len(), 5);
+    // Before the inherited ordinals, at the first owned response, after it,
+    // after the second owned response, and after the last one.
+    for (observation, response_count_before) in owned
+        .claude_context_curve_boundaries
+        .iter_mut()
+        .zip([0, 2, 3, 6, 10])
+    {
+        observation.response_count_before = response_count_before;
+    }
+    let (unrelated_path, unrelated) =
+        session(&dir, UNRELATED, &[assistant(UNRELATED, "req_u1", 5, 50)]);
+    let mut items = vec![owned, unrelated];
+    let mut index = indexed(&[&owned_path, &unrelated_path]);
+
+    let disposition = fold(
+        &mut items,
+        &reports(&owned_rows()),
+        &mut index,
+        true,
+        WINDOW,
+        3,
+    );
+
+    assert!(disposition.duplicate_census.census_invalid);
+    assert_eq!(disposition.posture_admission(OWNED), Some("member_waiver"));
+    let owned = &items[0];
+    // First and last follow ordinals 2 and 9; the boundaries at 0 and at the
+    // first owned ordinal (2) have no owned response before them.
+    assert_eq!(posture(owned), (Some(300), Some(300), Some(100), Some(3)));
+    assert_eq!(owned.compaction_total_pre_tokens, Some(30 + 40 + 50));
+    assert_eq!(
+        owned.compaction_timestamps,
+        vec![
+            "2026-08-02T07:00:02.500Z".to_string(),
+            "2026-08-02T07:00:03.500Z".to_string(),
+            "2026-08-02T07:00:04.500Z".to_string(),
+        ]
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn copied_markers_and_responses_never_borrow_ownership() {
+    let dir = temp_dir("claude-waiver-copied-markers");
+    let (child_path, child) = session(
+        &dir,
+        CHILD,
+        &[
+            // Inherited history and its compaction, then an own boundary
+            // before any owned response.
+            copied_assistant(CHILD, "req_p1", 0, 800_000),
+            copied_boundary(CHILD, 0, 700_000),
+            boundary(CHILD, 1, 900_000, 1, 1, 1),
+            assistant(CHILD, "req_c1", 2, 100),
+            // Copied records between and after owned responses.
+            copied_assistant(CHILD, "req_p2", 2, 850_000),
+            copied_boundary(CHILD, 3, 600_000),
+            boundary(CHILD, 3, 30, 3, 3, 3),
+            assistant(CHILD, "req_c2", 4, 400),
+            copied_boundary(CHILD, 5, 500_000),
+        ],
+    );
+    assert!(child.claude_context_curve_owned_start_proven);
+    assert_eq!(child.claude_context_curve_boundaries.len(), 2);
+    let expected_start = child
+        .session_start
+        .clone()
+        .and_then(|start| (*start).inherited());
+    let (unrelated_path, unrelated) =
+        session(&dir, UNRELATED, &[assistant(UNRELATED, "req_u1", 6, 50)]);
+    let mut items = vec![child, unrelated];
+    let mut index = indexed(&[&child_path, &unrelated_path]);
+    // The maker's telemetry reports the copied requests under its own root.
+    let evidence = reports(&[
+        (CHILD, "req_c1", 2, 100),
+        (CHILD, "req_c2", 4, 400),
+        (OTHER_ROOT, "req_p1", 0, 800_000),
+        (OTHER_ROOT, "req_p2", 1, 850_000),
+    ]);
+
+    let disposition = fold(&mut items, &evidence, &mut index, true, WINDOW, 2);
+
+    assert!(disposition.duplicate_census.census_invalid);
+    let child = &items[0];
+    assert_eq!(child.usage_accounting_contract.as_deref(), V1);
+    assert_eq!(disposition.posture_admission(CHILD), Some("member_waiver"));
+    assert_eq!(posture(child), (Some(100), Some(400), Some(400), Some(1)));
+    assert_eq!(child.compaction_total_pre_tokens, Some(30));
+    assert_eq!(
+        child.compaction_timestamps,
+        vec!["2026-08-02T07:00:03.500Z".to_string()]
+    );
+    assert_eq!(child.session_start.as_deref(), expected_start.as_ref());
+    assert!(child.cache_observations.is_none(), "cache stays strict");
+    assert_curve_withheld(child);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn own_boundary_without_an_owned_response_stays_null() {
+    let dir = temp_dir("claude-waiver-no-owned-response");
+    let (child_path, child) = session(
+        &dir,
+        CHILD,
+        &[
+            copied_assistant(CHILD, "req_p1", 0, 800_000),
+            boundary(CHILD, 1, 900_000, 1, 1, 1),
+        ],
+    );
+    assert_eq!(child.compaction_count, Some(1));
+    let (unrelated_path, unrelated) =
+        session(&dir, UNRELATED, &[assistant(UNRELATED, "req_u1", 2, 50)]);
+    let mut items = vec![child, unrelated];
+    let mut index = indexed(&[&child_path, &unrelated_path]);
+    let evidence = reports(&[
+        (OTHER_ROOT, "req_p1", 0, 800_000),
+        (UNRELATED, "req_u1", 2, 50),
+    ]);
+
+    let disposition = fold(&mut items, &evidence, &mut index, true, WINDOW, 0);
+
+    assert!(disposition.duplicate_census.census_invalid);
+    assert_eq!(items[0].usage_accounting_contract, None);
+    assert_eq!(
+        disposition.posture_admission(CHILD),
+        Some("withheld_global_census")
+    );
+    assert_cleared(&items[0]);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn waived_body_differs_from_the_withheld_control_only_in_context_scalars() {
+    let dir = temp_dir("claude-waiver-body-diff");
+    let (owned_path, owned) = compacted_owned(&dir);
+    let (unrelated_path, unrelated) =
+        session(&dir, UNRELATED, &[assistant(UNRELATED, "req_u1", 4, 50)]);
+    let mut items = vec![owned, unrelated];
+    let mut index = indexed(&[&owned_path, &unrelated_path]);
+
+    let disposition = fold(
+        &mut items,
+        &reports(&compacted_rows()),
+        &mut index,
+        true,
+        WINDOW,
+        2,
+    );
+
+    assert_eq!(disposition.posture_admission(OWNED), Some("member_waiver"));
+    let waived = items[0].clone();
+    // Without the waiver this fold's only other branch for the item clears
+    // the posture; every later step is shared and re-derives the semantic
+    // fingerprint from the item.
+    let mut control = waived.clone();
+    clear_claude_context_posture(&mut control);
+    control.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &control);
+    let waived_body = serde_json::to_value(&waived).expect("serialize waived body");
+    let control_body = serde_json::to_value(&control).expect("serialize control body");
+    let (waived_body, control_body) = (
+        waived_body.as_object().expect("body object"),
+        control_body.as_object().expect("body object"),
+    );
+    let differing = waived_body
+        .keys()
+        .chain(control_body.keys())
+        .filter(|key| waived_body.get(*key) != control_body.get(*key))
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        differing,
+        BTreeSet::from([
+            "compaction_count",
+            "compaction_timestamps",
+            "compaction_total_cumulative_dropped_tokens",
+            "compaction_total_duration_ms",
+            "compaction_total_post_tokens",
+            "compaction_total_pre_tokens",
+            "first_turn_context_tokens",
+            "last_turn_context_tokens",
+            "peak_context_fill_tokens",
+            // Derived: context posture participates in semantic identity.
+            "snapshot_fingerprint",
+        ])
+    );
+    for identity_field in [
+        "source_session_id",
+        "session_account_evidence",
+        "attribution_facts",
+        "request_evidence",
+        "usage_accounting_contract",
+        "session_display_name",
+        "session_start",
+        "provenance",
+        "origin",
+    ] {
+        assert_eq!(
+            waived_body.get(identity_field),
+            control_body.get(identity_field),
+            "{identity_field} must not depend on the waiver"
+        );
+    }
+    assert_eq!(
+        waived.claude_account_withheld_reason,
+        control.claude_account_withheld_reason
+    );
+    assert_eq!(
+        waived.request_identity_refusals,
+        control.request_identity_refusals
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn copier_with_requests_reported_under_another_root_stays_cleared() {
+    let dir = temp_dir("claude-waiver-copier");
+    // An unmarked copy of another root's request: its maker's telemetry
+    // reports it under that root, never under the copier.
+    let (copier_path, copier) = session(
+        &dir,
+        OWNED,
+        &[
+            assistant(OWNED, "req_copied", 1, 900_000),
+            assistant(OWNED, "req_a2", 2, 300),
+        ],
+    );
+    let (unrelated_path, unrelated) =
+        session(&dir, UNRELATED, &[assistant(UNRELATED, "req_u1", 4, 50)]);
+    let mut items = vec![copier, unrelated];
+    let mut index = indexed(&[&copier_path, &unrelated_path]);
+    let evidence = reports(&[
+        (OTHER_ROOT, "req_copied", 1, 900_000),
+        (OWNED, "req_a2", 2, 300),
+    ]);
+
+    let disposition = fold(&mut items, &evidence, &mut index, true, WINDOW, 2);
+
+    assert!(disposition.duplicate_census.census_invalid);
+    assert_ne!(disposition.posture_admission(OWNED), Some("member_waiver"));
+    assert_cleared(&items[0]);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn waiver_evidence_refuses_before_allocating_past_its_bound() {
+    let dir = temp_dir("claude-waiver-evidence-bound");
+    let (_, owned) = session(
+        &dir,
+        OWNED,
+        &[
+            assistant(OWNED, "req_a1", 1, 100),
+            assistant(OWNED, "req_a2", 2, 300),
+        ],
+    );
+    let candidates = [owned];
+    let index = ScanIndex::default();
+    let evidence = reports(&[(OWNED, "req_a1", 1, 100), (OWNED, "req_a2", 2, 300)]);
+
+    assert!(
+        claude_posture_waiver_evidence(candidates.iter(), 1, &index, &evidence.0, &evidence.1)
+            .is_none()
+    );
+    let bounded =
+        claude_posture_waiver_evidence(candidates.iter(), 2, &index, &evidence.0, &evidence.1)
+            .expect("candidates within the bound");
+    assert!(bounded.visible_dupes.is_empty());
+    assert_eq!(bounded.foreign_otel.len(), 2);
+    assert!(bounded.foreign_otel.values().all(
+        |reported| matches!(reported, ClaudeReportedRequestRoot::One(root) if *root == OWNED)
+    ));
+    let _ = fs::remove_dir_all(dir);
 }
