@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 723,
-  "content_sha256": "c200767c3dddf5f3946c8e7fd8570b5f30163915499543ece2d6f58df9e48921",
+  "candidate_file_count": 724,
+  "content_sha256": "7a34e6c0c6f83cd084977b8c7119ffc26c17ffa328eadc67944b4d420f3a93ab",
   "files": [
     {
       "executable": false,
@@ -1301,8 +1301,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "bdfdf04866faf0132429487dd6b540b8b21d68411ec7d215451e7399c88cf402",
-      "size_bytes": 2906260
+      "sha256": "d82ccd5dad1b3e8d93874d6d76aa85dab8ce92533939def66df07171bf9ff587",
+      "size_bytes": 2915912
     },
     {
       "executable": false,
@@ -1560,8 +1560,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "861a2b0b92310616909421db5db89aa96e4ad5458edccc7e45d5f3b1d28ee5ed",
-      "size_bytes": 19448
+      "sha256": "00a9525e8e9997cf2cbf53ce3b3d683b7d907175581c444cffeb8aeeb793ee23",
+      "size_bytes": 20483
     },
     {
       "executable": false,
@@ -1574,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "9921e0e41dffc6735dee726e18d8ff4511db5278340a40ac1c66f16435e2096d",
-      "size_bytes": 307472
+      "sha256": "26395e4f9ac19b97b5bcb2d69f5c0f636fd15b2a21fcf6d3713b5bbc0ea5ec2c",
+      "size_bytes": 310633
     },
     {
       "executable": false,
@@ -1588,8 +1588,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "0bd7fe16bee3a1962b8e40889c8441a063c0d3ad637e7cc6d172172b0f1048d7",
-      "size_bytes": 76645
+      "sha256": "f5923eb55b5cfca35c06f6d7b0db599e1205acf765fae7dff574c13bcbfbabf7",
+      "size_bytes": 90520
     },
     {
       "executable": false,
@@ -3298,6 +3298,13 @@
       "path": "docs/session-2026-10-20-permanent-source-finish.md",
       "sha256": "574cd6b52d2dc5f61cacbd7c4c0ea8fb07627e4872029f812f20e7300fd539eb",
       "size_bytes": 3377
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-21-codex-in-file-fork-tail-retention.md",
+      "sha256": "72083eb0b755be5df1af28c30a4823f8f8f44a56e7a41b70b7becbdfec8a7a99",
+      "size_bytes": 3560
     },
     {
       "executable": false,
@@ -5064,9 +5071,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T00:25:26+00:00",
+  "generated_at": "2026-10-21T03:48:25+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 724,
+  "output_file_count": 725,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5103,5 +5110,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "1fd7a51dfef9f72099d007e664c66a98f8151540"
+  "source_commit": "c8cf68ccc9dd331fdb818bc8d3b2c53cedf9e638"
 }

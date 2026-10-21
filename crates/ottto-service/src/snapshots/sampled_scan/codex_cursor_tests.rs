@@ -1174,6 +1174,72 @@ fn uncached_scan_never_pages() {
     assert_eq!(fingerprints(&scaled), fingerprints(&full));
 }
 
+/// P1-RETAIN-3 reaches cursor sealed-prefix retention too: a Codex fork whose
+/// ownership boundary is in-file (`Ordinal`) keeps its certified prefix, then
+/// tails from it with the output of an unpaged full read.
+#[test]
+fn lifted_ordinal_fork_retains_sealed_prefix_then_tails_with_full_parity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let ordinal_token = |ordinal: u64| {
+        codex_line(
+            json!({"timestamp": "2026-10-07T10:30:00Z", "ordinal": ordinal, "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"model": "fixture-model",
+            "total_token_usage": {"input_tokens": ordinal * 100, "cached_input_tokens": ordinal * 50,
+                "output_tokens": ordinal * 10},
+            "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 50,
+                "output_tokens": 10}}}}),
+        )
+    };
+    let fixture = ScanRoot::new(0);
+    // Ordinal 1 is inherited context; 2..=80 are the fork's own records.
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z", "ordinal": 0,
+        "type": "session_meta", "payload": {"id": SESSION,
+        "forked_from_id": "019fa111-2222-7333-8444-0000000000d1",
+        "thread_source": "subagent", "subagent_history_start_ordinal": 2}}));
+    for ordinal in 1..=80 {
+        body.extend(ordinal_token(ordinal));
+    }
+    fs::write(fixture.file(SESSION), body).unwrap();
+    let key = local_index_key(&fixture.file(SESSION));
+    let cache = Arc::new(SharedCache::default());
+    let tail = with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        let mut certified = false;
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                assert!(!scan.snapshots.is_empty(), "the certified read publishes");
+                certified = true;
+                break;
+            }
+            assert!(scan.snapshots.is_empty(), "a paused job publishes nothing");
+        }
+        assert!(
+            certified,
+            "cursor job did not complete: {}",
+            counters(&cache)
+        );
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+        let prefix = cache.retained_checkpoint(&key).unwrap_or_else(|| {
+            panic!("the fork's sealed prefix is retained: {}", counters(&cache))
+        });
+        assert!(prefix.sealed_offset() <= fixture.len(SESSION));
+        fixture.append(SESSION, &ordinal_token(81));
+        let (_, tail, modes) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+        assert_eq!(modes, (0, 1), "the append tails from the sealed prefix");
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+        let tailed = cache.retained_checkpoint(&key).expect("tail retained");
+        assert_eq!(tailed.sealed_offset(), fixture.len(SESSION));
+        tail
+    });
+    let (_, full) = page(&fixture, ScanIndex::default(), None);
+    assert!(!full.snapshots.is_empty());
+    assert_eq!(fingerprints(&tail), fingerprints(&full));
+}
+
 fn counter(cache: &SharedCache, read: fn(&Counters) -> u64) -> u64 {
     cache.with_cursor(|cursor| read(&cursor.counters)).unwrap()
 }
