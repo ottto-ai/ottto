@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 734,
-  "content_sha256": "17b0b5e04512127e82bbb4b288e479aeb152fc89623dbb7e3ebaafde60f7c9ed",
+  "content_sha256": "4a3767f23b53dea9897f9c9b6410f94968686666bc0572a7a4c7663c7c814b44",
   "files": [
     {
       "executable": false,
@@ -1035,8 +1035,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics/cache_lifecycle.rs",
-      "sha256": "e247c09468dbbd7c129eede2934ca0351acbe4d096b5d34238467ec694120a05",
-      "size_bytes": 4047
+      "sha256": "c8f3df27ef69a26f48654035d0c79ac46cf14666b09dc8856a65945a3644a944",
+      "size_bytes": 4672
     },
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "09ff6e176eafa5acaef49d5e964dca7fa21ea760cc2da72d030efd4ba4dafc99",
-      "size_bytes": 2937285
+      "sha256": "434b2d7eee5ef7524c41fa9dd4093a1c39f4b364e5c1448c8f9ae6187ebeb58e",
+      "size_bytes": 2936263
     },
     {
       "executable": false,
@@ -1345,6 +1345,13 @@
       "path": "crates/ottto-service/src/snapshots/cache_observations/tests.rs",
       "sha256": "620d46db86d32b35f3023fcaf950b79e3f9bf41d686b30cd8ecc3cf3d86b819e",
       "size_bytes": 6035
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/cache_policy_tests.rs",
+      "sha256": "b8cd38e525d880b4e8d5e585708a7154cbc9d716d82730ffdddcd65822b4fb24",
+      "size_bytes": 43046
     },
     {
       "executable": false,
@@ -1469,8 +1476,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join/group_job_tests.rs",
-      "sha256": "78976048824ebdcd7604260b999f3a62e5b223e5288bc72792fb8495a46cf3e9",
-      "size_bytes": 93310
+      "sha256": "ed059a144401d78073da051c708b828a605d05c19e0e9dd0ff9bea0ff1b6be4b",
+      "size_bytes": 97415
     },
     {
       "executable": false,
@@ -1552,13 +1559,6 @@
     {
       "executable": false,
       "mode": "0644",
-      "path": "crates/ottto-service/src/snapshots/paged_claude_s0_baseline_tests.rs",
-      "sha256": "a019ad48d01f3eb8d8195317ed056bb6bce2f5cb77606d2fc5a398c65f774fc5",
-      "size_bytes": 33266
-    },
-    {
-      "executable": false,
-      "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
       "sha256": "597b5868c322d74682577abe200589b29182dde5efe819075f6f96c71821cc9b",
       "size_bytes": 176325
@@ -1581,8 +1581,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "8067d522a4034e9a60c711c18828a5910d6e165f73c8aff0e2dddf492c689a2f",
-      "size_bytes": 22536
+      "sha256": "5b3ff4141b6b680e82b202f1731cdeecacd35da4c4417a19483cf7ca9e780aa4",
+      "size_bytes": 35077
     },
     {
       "executable": false,
@@ -1658,8 +1658,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_cache.rs",
-      "sha256": "076cda14e9834a9bdf9104734e0070a031a8ef612aac6336df70b71b0089c078",
-      "size_bytes": 24188
+      "sha256": "1724a52f8bfec1795377b0817f84b582e27a3fdc07f77123c5d167454ece14fc",
+      "size_bytes": 27032
     },
     {
       "executable": false,
@@ -3372,9 +3372,9 @@
     {
       "executable": false,
       "mode": "0644",
-      "path": "docs/session-2026-10-21-paged-claude-s0-red-baselines.md",
-      "sha256": "d0e30a5f8f12f2a855207e1937a71f52d1a8d0506fe4e630155295503a41d94b",
-      "size_bytes": 2720
+      "path": "docs/session-2026-10-21-m1-cache-evict-to-fit.md",
+      "sha256": "0930910c0b0962022d3b3dacf2dd58b1ed35160443b8599e3c9bc76b3e6de61d",
+      "size_bytes": 8969
     },
     {
       "executable": false,
@@ -5141,7 +5141,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T11:58:36+00:00",
+  "generated_at": "2026-10-21T11:16:26+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 735,
   "public_roots": [
@@ -5180,5 +5180,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "21ce02dffa77ac8009bca9943f6ee711cad27548"
+  "source_commit": "8129944580d5d5a16603cc7bae49ddececfe18e8"
 }
