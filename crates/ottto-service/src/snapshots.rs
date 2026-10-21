@@ -16512,29 +16512,21 @@ impl OwnedSourceScan {
                             pending!();
                         }
                     };
-                    // The replay below reads the whole file in this page. A
-                    // file larger than the singleton budget is instead
-                    // requeued to the cursor (P1: never an unbounded in-page
-                    // read above that budget). `Bounded` implies Codex, a
-                    // sampled scan and a validated layout; the retained entry
-                    // was consumed at selection, so the next plan is a full
-                    // read (`Cursor`, `Defer` or `Fenced`), never this replay.
-                    let reopened_len = file.metadata().map_or(u64::MAX, |metadata| metadata.len());
-                    let overrun = if active.admission == ReadAdmission::Bounded
-                        && active.cursor.is_none()
-                        && reopened_len > sampled_scan::codex_cursor::Limits::current().singleton()
-                    {
-                        Some(Overrun::Requeue)
-                    } else {
-                        // R-c: the unpaged backstop on the reopened descriptor.
-                        refuse_unpaged_overrun(
-                            source,
-                            active.admission,
-                            &file,
-                            0,
-                            active.cursor.is_some(),
-                        )
-                    };
+                    // The replay below reads the whole file in this page, as
+                    // on main. R-c checks the reopened descriptor before any
+                    // parser exists: over the unpaged limit a `Bounded` file
+                    // is requeued to the cursor (the retained entry was
+                    // consumed at selection, so the next plan is a full read:
+                    // `Cursor`, `Defer` or `Fenced`, never this replay) and an
+                    // `Unpaged` one is counted oversized. This is a length
+                    // check, not a byte cap against concurrent growth.
+                    let overrun = refuse_unpaged_overrun(
+                        source,
+                        active.admission,
+                        &file,
+                        0,
+                        active.cursor.is_some(),
+                    );
                     match overrun {
                         Some(Overrun::Requeue) => {
                             drop(file);
@@ -27623,13 +27615,15 @@ enum ReadAdmission {
     /// file that grows past the limit during an in-page read is read on, and
     /// only the finish identity check fails (pre-existing).
     Unpaged,
-    /// Codex only, on a sampled scan with a validated layout: bodies are read
-    /// by the P1 cursor or as a tail, and other uses take identity samples
-    /// (at most 2 x 4 KiB). No size limit at open. The tail's singleton
-    /// budget is enforced by the page plan, not by this type, and
-    /// `refuse_unpaged_overrun` backstops only at the unpaged limit:
-    /// a singleton threshold there would turn a post-plan growth race into a
-    /// full cursor re-read.
+    /// Codex only, on a sampled scan with a validated layout. No size limit
+    /// at open; identity-only uses take samples (at most 2 x 4 KiB). Bodies
+    /// are read by the P1 cursor, as a tail within the page plan's singleton
+    /// budget, or, for the protected-tier fallback (O7), as the whole-file
+    /// in-page replay main already runs. Wherever a non-cursor read starts,
+    /// `refuse_unpaged_overrun` checks the descriptor against the unpaged
+    /// limit and requeues above it, so at or below it routing is main's.
+    /// That check is a length check, not a byte cap against concurrent
+    /// growth, and not a total memory bound (as for `Unpaged`).
     Bounded,
 }
 
