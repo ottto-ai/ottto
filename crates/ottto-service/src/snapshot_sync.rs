@@ -1571,6 +1571,14 @@ fn quarantine_retry_after(fingerprint: &str) -> u64 {
     let digest = Sha256::digest(fingerprint.as_bytes());
     let jitter = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
         % SNAPSHOT_QUARANTINE_RETRY_SECONDS;
+    #[cfg(test)]
+    if let Some(now) =
+        tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::retry_clock()
+    {
+        return now
+            .saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS)
+            .saturating_add(jitter);
+    }
     current_unix_seconds()
         .saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS)
         .saturating_add(jitter)
@@ -5638,6 +5646,26 @@ fn finish_sync_source(
             upload_fully_settled = false;
         }
     }
+    // Every selected-state restoration above has finished. A non-current
+    // comparison already revoked this lease locally and cannot mint a native
+    // correction later in this finish. Retire only that Claude prior index
+    // before the full disk-index CAS decode; keep every possible receipt path.
+    let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
+    #[cfg(test)]
+    let retire_prior_index = retire_prior_index
+        && !tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::keep_prior();
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::before_retirement();
+    let committed_index = if retire_prior_index {
+        drop(committed_index);
+        None
+    } else {
+        Some(committed_index)
+    };
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::after_retirement(
+        committed_index.is_some(),
+    );
     backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
@@ -5677,7 +5705,9 @@ fn finish_sync_source(
         if let Some(comparison) = comparison_completion.as_mut() {
             let mint = comparison.note_native_corrections_after_save(
                 &index,
-                &committed_index,
+                committed_index.as_ref().ok_or_else(|| {
+                    anyhow!("native correction receipt lacks its retained prior index")
+                })?,
                 |fp, witness| {
                     if upload_progress.quarantined_fingerprints.contains_key(fp)
                         || upload_progress.permanent_rejections.contains_key(fp)
@@ -18606,7 +18636,7 @@ mod tests {
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
-    mod permanent_finish_pipeline_tests {
+    pub(super) mod permanent_finish_pipeline_tests {
         include!("snapshot_sync/permanent_finish_pipeline_tests.rs");
     }
     mod authority_proof_correction_pipeline_tests {

@@ -380,6 +380,14 @@ mod process {
         }
         new
     }
+    // Copy bookkeeping only; never walk pointers or allocate. A snapshot is
+    // meaningful only inside this thread's existing born-pointer audit.
+    pub(super) fn caller_stats() -> Option<Stats> {
+        if !on_caller_thread() {
+            return None;
+        }
+        CALLER.active().map(|audit| audit.stats)
+    }
     pub(super) fn measure<T>(f: impl FnOnce() -> T) -> (T, Stats) {
         PROCESS.measure(f)
     }
@@ -402,6 +410,10 @@ mod process {
             f()
         })
     }
+}
+
+pub(crate) fn caller_thread_stats() -> Option<Stats> {
+    process::caller_stats()
 }
 
 pub(crate) fn measure_process<T>(f: impl FnOnce() -> T) -> (T, Stats) {
@@ -485,6 +497,18 @@ mod tests {
         unsafe {
             drop(Box::from_raw(leaked));
         }
+    }
+
+    #[test]
+    fn caller_thread_stats_is_allocation_free_and_observational() {
+        assert!(caller_thread_stats().is_none());
+        let ((), total) = measure_caller_thread(|| {
+            let before = caller_thread_stats().unwrap();
+            let after = caller_thread_stats().unwrap();
+            assert_eq!(formatless(before), formatless(after));
+        });
+        assert_eq!((total.allocations, total.deallocations), (0, 0));
+        assert!(caller_thread_stats().is_none());
     }
 
     // Parallel-safe: the caller table never charges another thread.
