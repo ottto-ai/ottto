@@ -18804,6 +18804,9 @@ mod tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
         mod proof_rearm_idempotence_pipeline_tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
+            mod stale_family_carry_pipeline_tests {
+                include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
+            }
         }
     }
 
