@@ -1411,6 +1411,19 @@ fn group_with_legacy_tee_is_byte_charged() {
         "{walked:?}"
     );
     assert!(owned.sampled_copy_budget() > 0, "the E3 estimate");
+    // L-A1: a group active owns a proof and tee, so even a measured copy
+    // refusal keeps the conservative release.
+    let (_, measured) = owned.sampled_copy_parts();
+    assert!(measured.is_some(), "precondition: residents measured");
+    let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        sampled_scan::release_cache_for_copy_refusal(
+            owned.sampling.as_ref(),
+            owned.active_file.as_deref(),
+            measured,
+        )
+    });
+    assert_eq!(lifecycle.clear_other_active, 1);
+    assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
     fs::remove_dir_all(root).unwrap();
 }
 

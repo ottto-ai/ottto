@@ -1810,6 +1810,192 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
     });
 }
 
+/// L-A1: an unsampled Claude read (sidecar census incomplete) beside a
+/// paused Codex job. A measured copy refusal keeps every resident and the
+/// job's charge; the conservative no-argument release still clears retained
+/// copies only (K6).
+#[test]
+fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 4096, 64, || {
+        let (_, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
+        assert!(scan.snapshots.is_empty());
+        let charge = cache.cursor_charge();
+        assert!(
+            charge > 0,
+            "precondition: the job paused: {}",
+            counters(&cache)
+        );
+        assert_eq!(cache.cursor_reserved(), 0);
+        let claude_root = Temp::new("claude-root", b"");
+        fs::remove_file(&claude_root.0).unwrap();
+        let projects = claude_root.0.join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        let support = claude_root.0.join("support");
+        fs::create_dir_all(&support).unwrap();
+        let mut transcript = Vec::new();
+        for line in [
+            json!({"type":"user", "sessionId":"native-tail-fixture",
+                "timestamp":"2026-10-07T10:00:00Z",
+                "message":{"role":"user","content":"Synthetic test"}}),
+            json!({"type":"assistant", "sessionId":"native-tail-fixture",
+                "timestamp":"2026-10-07T10:00:00Z", "requestId":"req-0",
+                "message":{"id":"response-0", "model":"fixture-model",
+                "usage":{"input_tokens":100,"cache_read_input_tokens":50,"output_tokens":10}}}),
+        ] {
+            serde_json::to_writer(&mut transcript, &line).unwrap();
+            transcript.push(b'\n');
+        }
+        fs::write(projects.join("native-tail-fixture.jsonl"), transcript).unwrap();
+        let mut claude = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects),
+            ScanIndex::default(),
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            Some(&support),
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
+        claude.sidecar_census_complete = false;
+        for _ in 0..10_000 {
+            if claude.active_file.is_some() {
+                break;
+            }
+            match claude.step(None) {
+                OwnedSourceScanStep::Pending(next) => claude = next,
+                OwnedSourceScanStep::Complete { .. } => panic!("the Claude file never opened"),
+            }
+        }
+        let active = claude.active_file.as_deref().unwrap();
+        assert!(
+            active.sampling.is_none()
+                && active.cursor.is_none()
+                && active.group.is_none()
+                && active.parser.reader.acquisition.is_none(),
+            "precondition: an unsampled native read"
+        );
+        let context = claude.sampling.as_ref().unwrap();
+        let measured = crate::heap_layout_bound::bound(context, STATE_BYTES);
+        assert!(measured.is_some(), "precondition: residents measured");
+        let (_, lifecycle) = observe(|| {
+            crate::snapshots::sampled_scan::release_cache_for_copy_refusal(
+                Some(context),
+                Some(active),
+                measured,
+            )
+        });
+        assert_eq!(lifecycle.clear_other_active, 0);
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+        assert_eq!(lifecycle.clear_entries_released, 0);
+        assert!(crate::heap_layout_bound::bound(context, STATE_BYTES).is_some());
+        assert_eq!(cache.cursor_charge(), charge, "the paused job's charge");
+        assert_eq!(cache.cursor_reserved(), 0, "no reservation");
+        let (_, lifecycle) = observe(|| claude.release_sampled_cache_for_copy_refusal());
+        assert_eq!(
+            lifecycle.clear_full_resident_bound_unknown, 1,
+            "conservative"
+        );
+        assert_eq!(lifecycle.clear_other_active, 0);
+        drop(claude);
+        assert_eq!(cache.cursor_charge(), charge, "K6: the paused job survives");
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+    });
+}
+
+/// L-A1: a live cursor job reads a fresh `Full` acquisition, so the unchanged
+/// #641 `Full` branch decides its refusal. The cursor conjunct alone still
+/// keeps an otherwise unsampled shape on the conservative release.
+#[test]
+fn cursor_job_copy_refusal_keeps_conservative_release() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 4096, 64, || {
+        let mut scan = codex_scan(&fixture, ScanIndex::default(), NOW)
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        for _ in 0..10_000 {
+            if scan
+                .active_file
+                .as_ref()
+                .is_some_and(|active| active.cursor.is_some())
+            {
+                break;
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { .. } => panic!("the job never started"),
+            }
+        }
+        assert!(
+            scan.active_file
+                .as_ref()
+                .is_some_and(|active| active.cursor.is_some()),
+            "precondition: a live cursor job"
+        );
+        let release = |scan: &OwnedSourceScan| {
+            let measured =
+                crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), STATE_BYTES);
+            assert!(measured.is_some(), "precondition: residents measured");
+            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+                crate::snapshots::sampled_scan::release_cache_for_copy_refusal(
+                    scan.sampling.as_ref(),
+                    scan.active_file.as_deref(),
+                    measured,
+                )
+            })
+            .1
+        };
+        let active = scan.active_file.as_deref().unwrap();
+        assert!(
+            matches!(
+                active.sampling.as_ref().map(|sampling| sampling.mode),
+                Some(crate::transcript_acquisition::ReadMode::Full(_))
+            ),
+            "precondition: a cursor job reads a fresh Full acquisition"
+        );
+        let lifecycle = release(&scan);
+        assert_eq!(lifecycle.clear_other_active, 0, "the #641 Full branch");
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+        // Isolate the cursor conjunct, then restore the job before its frame
+        // returns it to the slot.
+        let active = scan.active_file.as_deref_mut().unwrap();
+        let sampling = active.sampling.take();
+        let acquisition = active.parser.reader.acquisition.take();
+        assert!(
+            active.cursor.is_some()
+                && active.group.is_none()
+                && active.aliases.is_empty()
+                && active.applied_receipts.is_empty()
+                && active
+                    .parser
+                    .accumulator
+                    .codex_tier_replay
+                    .as_ref()
+                    .map_or(true, |replay| replay.join.is_none()),
+            "precondition: only the cursor conjunct owns state"
+        );
+        let lifecycle = release(&scan);
+        assert_eq!(lifecycle.clear_other_active, 1, "the cursor conjunct");
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.sampling = sampling;
+        active.parser.reader.acquisition = acquisition;
+    });
+}
+
 /// K12 (R2-H3): dropping a scan frame mid-job returns the intact job to the
 /// slot; the next page resumes it instead of restarting from byte zero.
 #[test]
