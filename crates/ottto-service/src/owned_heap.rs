@@ -114,6 +114,10 @@ impl<K: Ord + HeapLayoutBound, V: HeapLayoutBound> OwnedMap<K, V> {
     pub(crate) fn new() -> Self {
         Self::default()
     }
+    /// The entries, moved out (no copy).
+    pub(crate) fn into_inner(self) -> BTreeMap<K, V> {
+        self.values
+    }
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
         // BTreeMap::insert preserves the stored key on replacement.
         let old_heap = self.values.get(&key).map(heap);

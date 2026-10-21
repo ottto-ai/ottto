@@ -824,7 +824,7 @@ fn decoded_baseline_charge(book: ClaudeResponseBook) -> usize {
     // BASE kept all records decoded for the whole read, not just one response.
     let decoded: Vec<_> = responses
         .into_iter()
-        .map(|response| {
+        .map(|(_, response)| {
             claude_response_records::decode_records(response.records.into_vec(), &selectors)
                 .unwrap()
         })

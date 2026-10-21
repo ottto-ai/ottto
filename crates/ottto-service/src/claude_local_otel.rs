@@ -28,8 +28,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub(crate) mod support_health;
 
 mod bounded_read;
+pub(crate) mod telemetry_tail;
 
-const STORE_DIR: &str = "local-otel/claude-code-effort";
+pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
 const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -1696,6 +1697,18 @@ fn append_evidence_bytes(
         "Claude local evidence reached its byte limit; strict proof unavailable"
     );
     Ok(())
+}
+
+/// Size of a root's API sidecar, None when it is absent or not a file. Used
+/// only to bound the P1 money shadow's reread before it reads.
+/// The API sidecar's length: None when it does not exist, `u64::MAX` when it
+/// exists but cannot be read as a regular file (never "no rows").
+pub(crate) fn claude_api_sidecar_len(support_dir: &Path, session_id: &str) -> Option<u64> {
+    match fs::symlink_metadata(evidence_path(support_dir, session_id)) {
+        Ok(metadata) if metadata.is_file() => Some(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        _ => Some(u64::MAX),
+    }
 }
 
 fn evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
