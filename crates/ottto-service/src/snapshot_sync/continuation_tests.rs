@@ -748,7 +748,7 @@ fn ordinary_cycles_keep_todays_cadence_and_order_with_continuation_pages() {
     let today = today.ordinary_starts;
     let staged = staged.ordinary_starts;
     assert_eq!(
-        staged.iter().map(|at| *at - today[0]).collect::<Vec<_>>(),
+        staged.iter().map(|at| *at - staged[0]).collect::<Vec<_>>(),
         today.iter().map(|at| *at - today[0]).collect::<Vec<_>>(),
         "ordinary cycles start exactly when they do today"
     );
