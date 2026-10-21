@@ -18628,6 +18628,7 @@ mod tests {
     include!("retry_bounded_native_tests.rs");
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
+    include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod p12_base_exit_tests {
         include!("snapshot_sync/p12_base_exit_tests.rs");
     }
