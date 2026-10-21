@@ -1201,6 +1201,7 @@ fn assert_o7_requeued_then_paged(row: O7Tail) {
         );
         let c = counters(&row.cache);
         assert_eq!(c.jobs_started, 2, "a second whole cursor read: {c:?}");
+        assert!(index_is_protected(&recertified.index, &key));
     });
 }
 
