@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn codex_personal_pro_and_team_surface_as_separate_detected_uses() {
-        // THE KEY CASE: Codex history with a Personal Pro context and a Singular
+        // THE KEY CASE: Codex history with a Personal Pro context and a Acme
         // Team context under the same OpenAI identity. plan_type and the
         // secondary-reset day bucket differ, so the plan_fingerprints differ and
         // the two MUST surface as distinct detected uses (never collapsed onto a
