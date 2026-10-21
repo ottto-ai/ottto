@@ -54,6 +54,7 @@ crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduct
 
 /// A side read's certificate (U1a-2a): no retained copy and no cache event.
 #[cfg_attr(not(test), allow(dead_code))] // first production caller is the side exit
+#[allow(clippy::large_enum_variant)] // Moved once to the side exit; never stored.
 pub(super) enum SideCertificate {
     /// `len` is the held file's length when the certificate was committed.
     Certified {
