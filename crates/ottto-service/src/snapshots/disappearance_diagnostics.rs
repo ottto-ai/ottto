@@ -124,14 +124,78 @@ impl Totals {
 mod tests {
     use super::super::{
         advance_bounded_directory_traversal, candidate_from_traversal_path,
-        ensure_bounded_traversal, open_and_identify_scan_candidate, OwnedSourceScan,
-        OwnedSourceScanStep, ScanCensus, ScanIndex, ScanTraversalPath, SourceScanResult,
-        BACKFILL_WINDOW_DAYS,
+        ensure_bounded_traversal, local_index_key, open_and_identify_scan_candidate,
+        scan_source_roots_with_limit_and_attribution, OwnedSourceScan, OwnedSourceScanStep,
+        ScanCensus, ScanIndex, ScanTraversalPath, SourceScanResult, BACKFILL_WINDOW_DAYS,
     };
     use super::*;
-    use std::{collections::BTreeMap, fs};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     const NOW: &str = "2026-10-07T12:00:00Z";
+    const LATER: &str = "2026-10-07T12:10:00Z";
+    const RETRY: &str = "2026-10-07T12:20:00Z";
+
+    fn claude_line(session: &str, request: &str) -> String {
+        serde_json::json!({"type":"assistant", "sessionId":session,
+            "timestamp":"2026-10-07T10:00:00Z", "requestId":request,
+            "message":{"id":format!("{request}-message"), "model":"fixture-model",
+                "usage":{"input_tokens":10,"output_tokens":2}}})
+        .to_string()
+            + "\n"
+    }
+
+    /// One real bounded Claude page through the production scan entry.
+    fn claude_page(
+        index: &mut ScanIndex,
+        root: &Path,
+        at: &str,
+        file_limit: usize,
+        hints: &[PathBuf],
+    ) -> SourceScanResult {
+        scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::ClaudeCode,
+            &[root.to_path_buf()],
+            index,
+            at,
+            BACKFILL_WINDOW_DAYS,
+            file_limit,
+            false,
+            None,
+            None,
+            hints,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// Pages until the generation retires healthy (its traversal is dropped)
+    /// or ends red (discovery done with errors). `hints` go to the first page.
+    fn claude_generation(
+        index: &mut ScanIndex,
+        root: &Path,
+        at: &str,
+        file_limit: usize,
+        hints: &[PathBuf],
+    ) -> Vec<SourceScanResult> {
+        let mut pages = Vec::new();
+        for page in 0..32 {
+            let page_hints: &[PathBuf] = if page == 0 { hints } else { &[] };
+            pages.push(claude_page(index, root, at, file_limit, page_hints));
+            let done = index.traversal.as_ref().map_or(true, |traversal| {
+                traversal.pending_directories.is_empty()
+                    && traversal.pending_candidates.is_empty()
+                    && traversal.counts.has_errors()
+            });
+            if done {
+                return pages;
+            }
+        }
+        panic!("synthetic Claude generation failed to retire within its page bound");
+    }
 
     fn finish(mut state: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
         for _ in 0..1024 {
@@ -147,16 +211,24 @@ mod tests {
     fn real_pending_member_and_watcher_absence_have_distinct_outcomes() {
         let dir = crate::test_scratch::ScratchDir::new("disappearance-pending");
         let path = dir.join("missing.jsonl");
-        for (member, watcher, expected) in [
-            (true, false, 1),
-            (true, true, 0),
-            (false, false, 0),
-            (false, true, 0),
+        // (source, member, watcher, disappeared, process NotFound, removed).
+        // A Claude census member absent beneath its present parent is the same
+        // removal as a remove hint; Codex and Pi keep today's loss.
+        for (source, member, watcher, expected, event, removed) in [
+            (SnapshotSource::Pi, true, false, 1, 1, false),
+            (SnapshotSource::Pi, true, true, 0, 0, true),
+            (SnapshotSource::Pi, false, false, 0, 0, false),
+            (SnapshotSource::Pi, false, true, 0, 0, true),
+            (SnapshotSource::Codex, true, false, 1, 1, false),
+            (SnapshotSource::ClaudeCode, true, false, 0, 1, true),
+            (SnapshotSource::ClaudeCode, true, true, 0, 0, true),
+            (SnapshotSource::ClaudeCode, false, false, 0, 0, false),
+            (SnapshotSource::ClaudeCode, false, true, 0, 0, true),
         ] {
             let mut census = ScanCensus::default();
             let (candidate, events) = observe(|| {
                 candidate_from_traversal_path(
-                    SnapshotSource::Pi,
+                    source,
                     ScanTraversalPath {
                         scan_root: dir.to_path_buf(),
                         path: path.clone(),
@@ -170,14 +242,15 @@ mod tests {
                 )
             });
             assert!(candidate.is_none());
-            assert_eq!(census.disappeared_file_count, expected);
+            assert_eq!(census.disappeared_file_count, expected, "{source:?}");
             assert_eq!(census.unreadable_path_count, 0);
-            assert_eq!(events, [[0; 4], [0; 4], [expected as u64, 0, 0, 0]]);
+            let mut expected_events = [[0; 4]; 3];
+            expected_events[source_index(source)][0] = event;
+            assert_eq!(events, expected_events, "{source:?}");
             assert_eq!(
-                census
-                    .removed_index_keys
-                    .contains(&super::super::local_index_key(&path)),
-                watcher
+                census.removed_index_keys.contains(&local_index_key(&path)),
+                removed,
+                "{source:?}"
             );
         }
     }
@@ -286,38 +359,64 @@ mod tests {
     fn real_selected_file_removed_before_open_records_only_not_found() {
         let dir = crate::test_scratch::ScratchDir::new("disappearance-open");
         let path = dir.join("session.jsonl");
-        fs::write(&path, b"{}\n").unwrap();
-        let mut census = ScanCensus::default();
-        let candidate = candidate_from_traversal_path(
-            SnapshotSource::Pi,
-            ScanTraversalPath {
-                scan_root: dir.to_path_buf(),
-                path: path.clone(),
-                census_member: true,
-                watcher_hint: false,
-            },
-            &mut census,
-            None,
-            BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
-        )
-        .unwrap();
-        fs::remove_file(&path).unwrap();
-        let (opened, events) = observe(|| {
-            open_and_identify_scan_candidate(
-                SnapshotSource::Pi,
-                candidate,
+        let key = local_index_key(&path);
+        // N-T2: removed between the candidate stat and the no-follow open. A
+        // Claude file beneath its present parent settles as removal and drops
+        // this page's observation; Codex and Pi keep today's loss.
+        for (source, removal) in [
+            (SnapshotSource::Pi, false),
+            (SnapshotSource::Codex, false),
+            (SnapshotSource::ClaudeCode, true),
+        ] {
+            fs::write(&path, b"{}\n").unwrap();
+            let mut census = ScanCensus::default();
+            let candidate = candidate_from_traversal_path(
+                source,
+                ScanTraversalPath {
+                    scan_root: dir.to_path_buf(),
+                    path: path.clone(),
+                    census_member: true,
+                    watcher_hint: false,
+                },
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
                 &BTreeMap::new(),
             )
-        });
-        assert!(opened.is_none());
-        assert_eq!(events, [[0; 4], [0; 4], [1, 0, 0, 0]]);
-        assert_eq!(census.disappeared_file_count, 1);
-        assert_eq!(census.unreadable_path_count, 0);
-        assert!(census.removed_index_keys.is_empty());
+            .unwrap();
+            assert!(census.observed_index_keys.contains(&key));
+            fs::remove_file(&path).unwrap();
+            let (opened, events) = observe(|| {
+                open_and_identify_scan_candidate(
+                    source,
+                    candidate,
+                    &mut census,
+                    None,
+                    BACKFILL_WINDOW_DAYS,
+                    &BTreeMap::new(),
+                )
+            });
+            assert!(opened.is_none());
+            let mut expected_events = [[0; 4]; 3];
+            expected_events[source_index(source)][0] = 1;
+            assert_eq!(events, expected_events, "{source:?}");
+            assert_eq!(
+                census.disappeared_file_count,
+                usize::from(!removal),
+                "{source:?}"
+            );
+            assert_eq!(census.unreadable_path_count, 0);
+            assert_eq!(
+                census.removed_index_keys.contains(&key),
+                removal,
+                "{source:?}"
+            );
+            assert_eq!(
+                census.observed_index_keys.contains(&key),
+                !removal,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]
@@ -385,6 +484,320 @@ mod tests {
             1,
             "the operational census merges once without another diagnostic event"
         );
+    }
+
+    /// N-T1: a walk-queued Claude member is deleted after the walk queued it
+    /// and its remove hint is dropped by the queue's dedupe, so the member
+    /// reaches its candidate stat without the hint flag. It retires as a
+    /// removal: no disappeared count, a complete census, the entry gone.
+    #[test]
+    fn claude_queued_member_deleted_while_its_remove_hint_is_deduped_retires_as_removal() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-deduped-hint");
+        let first = "a1111111-1111-4111-8111-111111111111";
+        let second = "b2222222-2222-4222-8222-222222222222";
+        let first_path = dir.join(format!("{first}.jsonl"));
+        let second_path = dir.join(format!("{second}.jsonl"));
+        fs::write(&first_path, claude_line(first, "request-first")).unwrap();
+        fs::write(&second_path, claude_line(second, "request-second")).unwrap();
+        let mut index = ScanIndex::default();
+        let baseline = claude_generation(&mut index, &dir, NOW, 1, &[]);
+        assert!(baseline.last().unwrap().census_complete);
+        assert!(index.files.contains_key(&local_index_key(&second_path)));
+
+        // The next generation walks both and selects only the first.
+        let page = claude_page(&mut index, &dir, LATER, 1, &[]);
+        assert_eq!(page.disappeared_file_count, 0);
+        let queued = &index.traversal.as_ref().unwrap().pending_candidates;
+        assert!(queued
+            .iter()
+            .any(|pending| pending.path == second_path && pending.census_member));
+        fs::remove_file(&second_path).unwrap();
+        let (pages, events) = observe(|| {
+            claude_generation(
+                &mut index,
+                &dir,
+                LATER,
+                1,
+                std::slice::from_ref(&second_path),
+            )
+        });
+        assert!(
+            pages.iter().all(|page| page.disappeared_file_count == 0),
+            "a vanished member under its present parent is not loss"
+        );
+        assert!(pages.last().unwrap().census_complete);
+        assert!(index.traversal.is_none(), "the generation retired healthy");
+        assert!(!index.files.contains_key(&local_index_key(&second_path)));
+        assert!(index.files.contains_key(&local_index_key(&first_path)));
+        // The process diagnostic still records the NotFound.
+        assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
+    }
+
+    /// A deleted Claude subagent of a quarantined family, carrying unverified
+    /// audit debt, in a forced family reparse while membership is not
+    /// authoritative (a rejected symlink keeps it so here). The forced
+    /// enumeration re-adds it from the index every such generation.
+    #[cfg(unix)]
+    struct ForcedFamilyFixture {
+        dir: crate::test_scratch::ScratchDir,
+        member_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    const FORCED_ROOT: &str = "c3333333-3333-4333-8333-333333333333";
+
+    #[cfg(unix)]
+    impl ForcedFamilyFixture {
+        fn new(prefix: &str) -> Self {
+            let dir = crate::test_scratch::ScratchDir::new(prefix);
+            fs::write(
+                dir.join(format!("{FORCED_ROOT}.jsonl")),
+                claude_line(FORCED_ROOT, "request-root"),
+            )
+            .unwrap();
+            let subagents = dir.join(FORCED_ROOT).join("subagents");
+            fs::create_dir_all(&subagents).unwrap();
+            std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("zz-link")).unwrap();
+            let member_path = subagents.join("agent-a4d1585d310070d0f.jsonl");
+            Self { dir, member_path }
+        }
+
+        fn index(&self) -> ScanIndex {
+            let mut index = ScanIndex::default();
+            index.insert_retry_pending_claude_authority_for_test(FORCED_ROOT);
+            let mut entry = super::super::tests::manifest_index_entry(Some("held-member-body"));
+            entry.source_file_fingerprint = "held-member-revision".to_string();
+            entry.scan_identity_version = Some(format!(
+                "{}:4000000000",
+                super::super::sampled_audit::UNVERIFIED_IDENTITY
+            ));
+            assert!(entry.has_unverified_source());
+            index
+                .files
+                .insert(local_index_key(&self.member_path), entry);
+            index
+        }
+    }
+
+    /// N-T3: main records the forced member's NotFound as loss in every such
+    /// generation. With the parent present it is a removal each time instead:
+    /// never disappeared, and the traversal no longer observes the member. The
+    /// existing retirement keeps an entry with unverified audit debt
+    /// (`remove_file_entry`), so the entry and its marker stay.
+    #[cfg(unix)]
+    #[test]
+    fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
+        let fixture = ForcedFamilyFixture::new("absence-forced-family");
+        let member_key = local_index_key(&fixture.member_path);
+        let mut index = fixture.index();
+        for at in [NOW, RETRY] {
+            let (pages, events) =
+                observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]));
+            assert!(
+                pages.iter().all(|page| page.disappeared_file_count == 0),
+                "{at}: the forced member's absence beneath its present parent is not loss"
+            );
+            // The first generation is forced by the quarantine revision. A
+            // later one is forced only while the record still disagrees.
+            if at == NOW {
+                assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
+            } else {
+                assert!(events[1][0] <= 1 && events[1][1..] == [0; 3], "{at}");
+                assert_eq!((events[0], events[2]), ([0; 4], [0; 4]), "{at}");
+            }
+            let traversal = index.traversal.as_ref().expect("symlink keeps it red");
+            assert!(!traversal.observed_index_keys.contains(&member_key));
+            assert_eq!(traversal.counts.disappeared_file_count, 0);
+            assert_eq!(traversal.counts.symlink_rejected_count, 1);
+            assert!(index
+                .files
+                .get(&member_key)
+                .is_some_and(|entry| entry.has_unverified_source()));
+        }
+    }
+
+    /// Control: the quarantined family losing one member through N leaves the
+    /// family's quarantine, witness, pending and holds exactly as the reviewed
+    /// remove-hint retirement of the same member does. N adds no quarantine
+    /// rule, so no held body is released by it, and the failure count moves at
+    /// most once.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_removal_matches_remove_hint_for_quarantined_family() {
+        let fixture = ForcedFamilyFixture::new("absence-quarantine-control");
+        let initial = fixture.index();
+        let failures_before =
+            initial.claude_usage_authority_quarantine[FORCED_ROOT].failed_reconstruction_count;
+        let mut removal = initial.clone();
+        let removal_pages = claude_generation(&mut removal, &fixture.dir, NOW, 10, &[]);
+        let mut hinted = initial;
+        claude_generation(
+            &mut hinted,
+            &fixture.dir,
+            NOW,
+            10,
+            std::slice::from_ref(&fixture.member_path),
+        );
+        assert!(removal_pages
+            .iter()
+            .all(|page| page.disappeared_file_count == 0));
+        let family_state = |index: &ScanIndex| {
+            serde_json::json!({
+                "quarantine": index.claude_usage_authority_quarantine,
+                "witnesses": index.claude_usage_family_witnesses,
+                "pending": index.claude_usage_family_pending,
+                "deferred_holds": index.claude_account_deferred_holds,
+                "member": index.files.get(&local_index_key(&fixture.member_path)),
+            })
+        };
+        assert_eq!(family_state(&removal), family_state(&hinted));
+        if let Some(record) = removal.claude_usage_authority_quarantine.get(FORCED_ROOT) {
+            assert!(record.failed_reconstruction_count <= failures_before.saturating_add(1));
+        }
+    }
+
+    /// Control: a single-file rename. The old path, deleted after the walk
+    /// queued it, retires as a removal; the new path arrives as a hint and is
+    /// indexed in the same generation.
+    #[test]
+    fn claude_single_file_rename_retires_old_path_and_indexes_new_path() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-rename");
+        let first = "a1111111-1111-4111-8111-111111111111";
+        let second = "b2222222-2222-4222-8222-222222222222";
+        let renamed = "d4444444-4444-4444-8444-444444444444";
+        let first_path = dir.join(format!("{first}.jsonl"));
+        let second_path = dir.join(format!("{second}.jsonl"));
+        let renamed_path = dir.join(format!("{renamed}.jsonl"));
+        fs::write(&first_path, claude_line(first, "request-first")).unwrap();
+        fs::write(&second_path, claude_line(second, "request-second")).unwrap();
+        let mut index = ScanIndex::default();
+        assert!(
+            claude_generation(&mut index, &dir, NOW, 1, &[])
+                .last()
+                .unwrap()
+                .census_complete
+        );
+        claude_page(&mut index, &dir, LATER, 1, &[]);
+        fs::rename(&second_path, &renamed_path).unwrap();
+        let pages = claude_generation(
+            &mut index,
+            &dir,
+            LATER,
+            1,
+            &[second_path.clone(), renamed_path.clone()],
+        );
+        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
+        assert!(pages.last().unwrap().census_complete);
+        assert!(!index.files.contains_key(&local_index_key(&second_path)));
+        assert!(index.files.contains_key(&local_index_key(&renamed_path)));
+        assert!(index.files.contains_key(&local_index_key(&first_path)));
+    }
+
+    /// Control: a missing, renamed or symlinked parent is not evidence of
+    /// removal. The Claude NotFound stays loss at the candidate stat and at
+    /// the open.
+    #[cfg(unix)]
+    #[test]
+    fn claude_absence_without_a_present_real_parent_stays_red() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-parent-gone");
+        let real = dir.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for path in [
+            dir.join("gone").join("missing.jsonl"),
+            link.join("missing.jsonl"),
+        ] {
+            let mut census = ScanCensus::default();
+            let (candidate, events) = observe(|| {
+                candidate_from_traversal_path(
+                    SnapshotSource::ClaudeCode,
+                    ScanTraversalPath {
+                        scan_root: dir.to_path_buf(),
+                        path: path.clone(),
+                        census_member: true,
+                        watcher_hint: false,
+                    },
+                    &mut census,
+                    None,
+                    BACKFILL_WINDOW_DAYS,
+                    &BTreeMap::new(),
+                )
+            });
+            assert!(candidate.is_none());
+            assert_eq!(census.disappeared_file_count, 1, "{path:?}");
+            assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
+            assert!(census.removed_index_keys.is_empty());
+        }
+
+        let project = dir.join("project");
+        fs::create_dir(&project).unwrap();
+        let path = project.join("session.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let mut census = ScanCensus::default();
+        let candidate = candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            ScanTraversalPath {
+                scan_root: dir.to_path_buf(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            None,
+            BACKFILL_WINDOW_DAYS,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        fs::rename(&project, dir.join("project-renamed")).unwrap();
+        let (opened, events) = observe(|| {
+            open_and_identify_scan_candidate(
+                SnapshotSource::ClaudeCode,
+                candidate,
+                &mut census,
+                None,
+                BACKFILL_WINDOW_DAYS,
+                &BTreeMap::new(),
+            )
+        });
+        assert!(opened.is_none());
+        assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
+        assert_eq!(census.disappeared_file_count, 1);
+        assert!(census.removed_index_keys.is_empty());
+    }
+
+    /// Control: EACCES on the parent is not NotFound and stays Metadata red.
+    #[cfg(unix)]
+    #[test]
+    fn claude_absence_below_inaccessible_parent_stays_metadata_red() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_scratch::ScratchDir::new("absence-parent-eacces");
+        let project = dir.join("project");
+        fs::create_dir(&project).unwrap();
+        let path = project.join("missing.jsonl");
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut census = ScanCensus::default();
+        let (candidate, events) = observe(|| {
+            candidate_from_traversal_path(
+                SnapshotSource::ClaudeCode,
+                ScanTraversalPath {
+                    scan_root: dir.to_path_buf(),
+                    path: path.clone(),
+                    census_member: true,
+                    watcher_hint: false,
+                },
+                &mut census,
+                None,
+                BACKFILL_WINDOW_DAYS,
+                &BTreeMap::new(),
+            )
+        });
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(candidate.is_none());
+        assert_eq!(events, [[0; 4]; 3]);
+        assert_eq!(census.unreadable_path_count, 1);
+        assert_eq!(census.disappeared_file_count, 0);
+        assert!(census.removed_index_keys.is_empty());
     }
 
     #[test]
