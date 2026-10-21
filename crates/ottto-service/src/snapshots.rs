@@ -4917,13 +4917,13 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     let posture_waiver_evidence = if global_posture_fence {
         claude_posture_waiver_evidence(
             snapshots.iter().filter(|item| {
-                let root_session_id = claude_snapshot_family_root(item);
+                let root_session_id = claude_snapshot_family_root_ref(item);
                 item.usage_accounting_contract.as_deref()
                     == Some("session_exclusive_reported_usage:v1")
                     && item.claude_context_curve_identity_complete
                     && index
                         .claude_usage_family_pending
-                        .get(&root_session_id)
+                        .get(root_session_id)
                         .is_some_and(|pending| {
                             !pending.invalid
                                 && pending.census_window_end == census_window_end
@@ -4932,8 +4932,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                                     .contains_key(&item.source_session_id)
                         })
                     && !proven
-                        .get(&root_session_id)
-                        .or_else(|| reconstructed.get(&root_session_id))
+                        .get(root_session_id)
+                        .or_else(|| reconstructed.get(root_session_id))
                         .and_then(|family| {
                             family
                                 .witness

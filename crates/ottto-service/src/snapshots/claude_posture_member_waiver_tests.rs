@@ -914,14 +914,19 @@ fn copied_markers_and_responses_never_borrow_ownership() {
 #[test]
 fn own_boundary_without_an_owned_response_stays_null() {
     let dir = temp_dir("claude-waiver-no-owned-response");
+    // Inherited history, an own boundary, and one own response without a
+    // request id: no response of this session is provably owned. A transcript
+    // with no own response at all yields no snapshot.
     let (child_path, child) = session(
         &dir,
         CHILD,
         &[
             copied_assistant(CHILD, "req_p1", 0, 800_000),
             boundary(CHILD, 1, 900_000, 1, 1, 1),
+            id_less_assistant(CHILD, 2, 100),
         ],
     );
+    assert!(child.claude_usage_request_ids.is_empty());
     assert_eq!(child.compaction_count, Some(1));
     let (unrelated_path, unrelated) =
         session(&dir, UNRELATED, &[assistant(UNRELATED, "req_u1", 2, 50)]);
@@ -947,29 +952,39 @@ fn own_boundary_without_an_owned_response_stays_null() {
 #[test]
 fn waived_body_differs_from_the_withheld_control_only_in_context_scalars() {
     let dir = temp_dir("claude-waiver-body-diff");
-    let (owned_path, owned) = compacted_owned(&dir);
-    let (unrelated_path, unrelated) =
-        session(&dir, UNRELATED, &[assistant(UNRELATED, "req_u1", 4, 50)]);
-    let mut items = vec![owned, unrelated];
-    let mut index = indexed(&[&owned_path, &unrelated_path]);
+    let fold_once = |persisted_duplicate: bool| {
+        let (owned_path, owned) = compacted_owned(&dir);
+        let (unrelated_path, unrelated) =
+            session(&dir, UNRELATED, &[assistant(UNRELATED, "req_u1", 4, 50)]);
+        let mut items = vec![owned, unrelated];
+        let mut index = indexed(&[&owned_path, &unrelated_path]);
+        if persisted_duplicate {
+            index.claude_duplicate_request_owners.insert(
+                format!("{:x}", Sha256::digest(b"req_a1")),
+                BTreeSet::from([
+                    claude_duplicate_request_owner(OWNED, OWNED),
+                    claude_duplicate_request_owner(PEER, PEER),
+                ]),
+            );
+        }
+        let disposition = fold(
+            &mut items,
+            &reports(&compacted_rows()),
+            &mut index,
+            true,
+            WINDOW,
+            2,
+        );
+        (disposition.posture_admission(OWNED), items.remove(0))
+    };
+    let (waived_admission, waived) = fold_once(false);
+    // The same fixture through a second real fold, withheld by a persisted
+    // duplicate owner: the base behaviour for this item.
+    let (control_admission, control) = fold_once(true);
+    assert_eq!(waived_admission, Some("member_waiver"));
+    assert_eq!(control_admission, Some("withheld_duplicate"));
+    assert_cleared(&control);
 
-    let disposition = fold(
-        &mut items,
-        &reports(&compacted_rows()),
-        &mut index,
-        true,
-        WINDOW,
-        2,
-    );
-
-    assert_eq!(disposition.posture_admission(OWNED), Some("member_waiver"));
-    let waived = items[0].clone();
-    // Without the waiver this fold's only other branch for the item clears
-    // the posture; every later step is shared and re-derives the semantic
-    // fingerprint from the item.
-    let mut control = waived.clone();
-    clear_claude_context_posture(&mut control);
-    control.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &control);
     let waived_body = serde_json::to_value(&waived).expect("serialize waived body");
     let control_body = serde_json::to_value(&control).expect("serialize control body");
     let (waived_body, control_body) = (
