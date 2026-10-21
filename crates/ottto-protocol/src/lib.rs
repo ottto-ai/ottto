@@ -824,13 +824,15 @@ pub struct ActiveSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn_context_tokens: Option<u64>,
     /// Recorded context points for the Sessions graph, oldest first, unique
-    /// by time: the first request and (almost always) the latest timed
-    /// request exactly, the last request of each 15-minute slot, and big
-    /// changes in between; at most 64, thinned evenly so the whole session
+    /// by time: the first request, the latest timed request, the last request
+    /// of each 15-minute slot, and big changes in between; at most 64,
+    /// thinned evenly so the whole session
     /// span stays visible. Not every request. Local only, never uploaded;
     /// present only while the session was active within the last 75 minutes
     /// when it was read. Each point is a `[unix_seconds, tokens]` pair (whole
-    /// seconds, UTC).
+    /// seconds, UTC). A request without a usable timestamp adds no point;
+    /// while only the pinned first point exists, another request in that
+    /// same second also adds no point, so the last point can differ from Last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_points: Vec<ActiveSessionContextPoint>,
     /// Cumulative observed session counters. Optional keeps older daemons and

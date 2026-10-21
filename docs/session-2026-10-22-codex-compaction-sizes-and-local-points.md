@@ -57,7 +57,8 @@ and a latest request without a parseable timestamp is never a point:
   unless the change is big (`max(20%, 20K)` tokens);
 - at most 64 points per session. On overflow, every other middle point is
   dropped, keeping the first and the last. The list halves before the new
-  point is pushed, so its vector never grows past 64 entries;
+  point is pushed. Bounded `reserve_exact` growth also keeps vector capacity
+  at most 64, including when a tail pass resumes a cloned list;
 - only items whose last activity is within 75 minutes of collection carry
   points. The accumulator itself is not gated, so a tail pass and a full read
   agree.
@@ -85,7 +86,11 @@ rewritten each scan; a row leaves it with its session.
   costs nothing.
 - Status: a point is about 20 bytes of compact JSON (`[1792576800,250000]`)
   instead of about 46 bytes as an object, and the daemon formats no timestamps
-  for it. Compaction events on `ActiveSession` stay objects.
+  for it. Compaction events on `ActiveSession` stay objects (about 74 bytes
+  each). For 100 listed Codex sessions with 64 points each, realistic usage
+  (about 3 events per session) is about 157 KB; the worst case (64 events per
+  session) is about 610 KB, dominated by events. The former object points
+  made those cases about 324 KB and 775 KB, respectively.
 - Upload: 0 bytes for sessions that never compact. About 65 bytes per Codex
   event, so at most about 4 KB at the 64 cap.
 
@@ -95,8 +100,8 @@ rewritten each scan; a row leaves it with its session.
   `bounded_compaction_timestamps` with duplicate and out-of-order markers, and
   the wire shape.
 - `snapshots/local_context_points.rs`: the pinned first point, slot overwrite,
-  big changes, skips, the out-of-order clamp, halving on overflow and the
-  75-minute gate.
+  big changes, skips, the out-of-order clamp, halving on overflow, the vector
+  capacity bound across cloned tail state, and the 75-minute gate.
 - `codex_compaction_events_take_last_before_and_first_counted_after` and
   `codex_compaction_events_and_points_match_full_read_at_every_tail_split`
   (tail parity at every line boundary).

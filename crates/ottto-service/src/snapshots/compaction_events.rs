@@ -68,7 +68,8 @@ pub(super) struct CodexCompactionSizes {
 
 impl CodexCompactionSizes {
     /// A marker was recorded at `at`; `before` is the session's last owned
-    /// request size at that moment.
+    /// request size at that moment. `_at` is reserved for a possible keyed-map
+    /// implementation; the current vector uses timestamp index alignment.
     pub(super) fn note_marker(&mut self, _at: &str, before: Option<u64>) {
         self.entries.push(CodexCompactionSize {
             before: before.and_then(NonZeroU64::new),

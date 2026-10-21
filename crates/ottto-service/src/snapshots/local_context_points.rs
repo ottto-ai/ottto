@@ -7,8 +7,9 @@
 //! is the session's first request and no point exceeds the peak. The last
 //! point is the latest request with two rare exceptions: while only the pinned
 //! first point exists, a later request in that same second adds no point, and
-//! a latest request without a parseable timestamp is never a point. The rule depends only on input order, so a tail pass
-//! that continues the retained state yields the same points as a full read:
+//! a latest request without a parseable timestamp is never a point. The rule
+//! depends only on input order, so a tail pass that continues the retained
+//! state yields the same points as a full read:
 //! - zero-size requests and requests without a usable timestamp are skipped;
 //! - the first point is pinned;
 //! - points are unique by time (whole seconds): a request in the tail point's
@@ -16,7 +17,7 @@
 //!   second (a later request in that same second adds no point);
 //! - inside one 15-minute wall-clock slot the tail point is overwritten by the
 //!   newer request unless the change is big (`max(20%, 20K)` tokens), so each
-//!   slot keeps its last request and the tail is the latest timed request;
+//!   slot keeps its last request, subject to the pinned-first exception above;
 //! - on overflow past 64 points, every other middle point is dropped, keeping
 //!   the first and the last, so the whole session span stays visible.
 
@@ -90,6 +91,13 @@ impl LocalContextPoints {
         }
         if self.points.len() == LOCAL_CONTEXT_POINT_CAP {
             self.halve_before_push();
+        }
+        if self.points.len() == self.points.capacity() {
+            // Double, but never past the cap: a retained tail state is a clone
+            // whose capacity equals its length, so plain doubling could
+            // overshoot 64 and `retain` would never give it back.
+            let target = (self.points.capacity() * 2).clamp(4, LOCAL_CONTEXT_POINT_CAP);
+            self.points.reserve_exact(target - self.points.len());
         }
         self.points.push(point);
     }
@@ -297,6 +305,24 @@ mod tests {
             .points
             .windows(2)
             .all(|pair| pair[0].at_unix_seconds < pair[1].at_unix_seconds));
+
+        // A tail pass resumes from a clone (capacity == length) and still
+        // never grows past the cap.
+        for retained in [5, 33, 40, 63] {
+            let mut original = LocalContextPoints::default();
+            for (offset, tokens) in &input[..retained] {
+                original.push(Some(&at(BASE + offset)), *tokens);
+            }
+            let mut resumed = original.clone();
+            for (offset, tokens) in &input[retained..] {
+                resumed.push(Some(&at(BASE + offset)), *tokens);
+                assert!(
+                    resumed.points.capacity() <= LOCAL_CONTEXT_POINT_CAP,
+                    "{retained}"
+                );
+            }
+            assert_eq!(resumed.points, points.points, "{retained}");
+        }
     }
 
     #[test]
