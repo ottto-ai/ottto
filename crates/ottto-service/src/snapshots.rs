@@ -42,6 +42,8 @@ mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
 #[cfg(test)]
+mod claude_response_compaction_tests;
+#[cfg(test)]
 mod claude_thinking_tokens_tests;
 mod codex_usage_occurrence;
 mod context_curve;

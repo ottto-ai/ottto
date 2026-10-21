@@ -1,0 +1,640 @@
+//! Retained Claude response records (R1a): realistic per-response charge, the
+//! per-step visit walk of a long tool-heavy session, and byte parity between a
+//! retained-then-tailed read and an independent full read.
+//! No fixture content comes from a provider account.
+use super::*;
+use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+use crate::transcript_acquisition::{FullReason, ReadMode, Scope};
+use crate::transcript_cache::Retained;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+const NOW: &str = "2026-10-07T12:00:00Z";
+const SESSION: &str = "5e551011-0000-4000-8000-00000000a1a1";
+const MODEL: &str = "claude-fable-5-1";
+const SHELL: &str = "Bash";
+const CHROME: [&str; 3] = [
+    "mcp__claude-in-chrome__computer",
+    "mcp__claude-in-chrome__navigate",
+    "mcp__claude-in-chrome__read_page",
+];
+/// Retained charge allowed per realistic response once records are compact.
+const PER_RESPONSE_TARGET_BYTES: usize = 4 * 1024;
+/// Retained copy allowed for a 600-response realistic session.
+const COPY_TARGET_BYTES_AT_600: usize = 2 * 1024 * 1024;
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+fn unique_dir(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "ottto-r1a-{label}-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+    ))
+}
+
+struct TempJsonl {
+    dir: PathBuf,
+    path: PathBuf,
+}
+impl TempJsonl {
+    fn new(label: &str) -> Self {
+        let dir = unique_dir(label);
+        let root = dir.join("home/.claude/projects");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("{SESSION}.jsonl"));
+        Self { dir, path }
+    }
+    fn root(&self) -> PathBuf {
+        self.dir.join("home/.claude/projects")
+    }
+    fn append(&self, rows: &[Value]) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .unwrap();
+        for row in rows {
+            serde_json::to_writer(&mut file, row).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+    }
+}
+impl Drop for TempJsonl {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `2026-10-06T..` with millisecond precision; `seconds` stays within the day.
+fn at(seconds: u64, millis: u64) -> String {
+    format!(
+        "2026-10-06T{:02}:{:02}:{:02}.{millis:03}Z",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+fn envelope(kind: &str, uuid: String, timestamp: String) -> Value {
+    json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/work/r1a-fixture",
+        "sessionId": SESSION,
+        "version": "2.1.40",
+        "gitBranch": "main",
+        "type": kind,
+        "uuid": uuid,
+        "timestamp": timestamp,
+    })
+}
+
+/// One Claude Code turn as current writers persist it: the user row that
+/// prompted it, then one assistant row per content block (thinking, text, one
+/// row per tool use) sharing the response ids, each with cumulative usage and
+/// the usage-level selectors. Every tenth response is written Fable style: the
+/// terminal block first, then the earlier partial blocks. Every tenth response
+/// (another one) adds a selector only on its terminal block.
+fn realistic_turn(index: usize, tools: &[&str]) -> Vec<Value> {
+    let base = 20 * index as u64;
+    let mut user = envelope("user", format!("u{index:07}"), at(base, 0));
+    user["message"] = if index == 0 {
+        json!({"role": "user", "content": "Check the compact record fixture."})
+    } else {
+        json!({"role": "user", "content": [{
+            "type": "tool_result",
+            "tool_use_id": format!("toolu_01{:08}00", index - 1),
+            "content": "ok",
+        }]})
+    };
+    let request_id = format!("req_011CU{index:019}");
+    let message_id = format!("msg_01R1A{index:019}");
+    let assistant = |block: usize, offset_millis: u64, content: Value, output: u64, late: bool| {
+        let mut row = envelope(
+            "assistant",
+            format!("a{index:07}-{block}"),
+            at(base + 1 + offset_millis / 1000, offset_millis % 1000),
+        );
+        row["requestId"] = json!(request_id);
+        row["effort"] = json!("high");
+        let mut usage = json!({
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 300 + index as u64,
+            "cache_read_input_tokens": 40_000 + 120 * index as u64,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 300 + index as u64,
+            },
+            "output_tokens": output,
+            "service_tier": "standard",
+            "speed": "standard",
+        });
+        if late {
+            usage["inference_geo"] = json!("us");
+        }
+        row["message"] = json!({
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": MODEL,
+            "content": [content],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": usage,
+        });
+        row
+    };
+    let late_selector = index % 10 == 3;
+    let mut blocks = vec![
+        assistant(
+            0,
+            0,
+            json!({"type": "thinking", "thinking": "Plan the next step.", "signature": "c2ln"}),
+            6,
+            false,
+        ),
+        assistant(
+            1,
+            900,
+            json!({"type": "text", "text": "Running the next check."}),
+            6,
+            false,
+        ),
+    ];
+    for (tool_index, tool) in tools.iter().enumerate() {
+        blocks.push(assistant(
+            2 + tool_index,
+            1800 + 700 * tool_index as u64,
+            json!({
+                "type": "tool_use",
+                "id": format!("toolu_01{index:08}{tool_index:02}"),
+                "name": tool,
+                "input": {"command": "true"},
+            }),
+            120 + tool_index as u64,
+            late_selector && tool_index + 1 == tools.len(),
+        ));
+    }
+    if index % 10 == 7 {
+        blocks.rotate_right(1);
+    }
+    let mut rows = vec![user];
+    rows.extend(blocks);
+    rows
+}
+
+fn title_rows() -> Vec<Value> {
+    vec![
+        json!({"type": "summary", "sessionId": SESSION, "summary": "Compact Claude records", "leafUuid": "u0000000"}),
+        json!({"type": "ai-title", "sessionId": SESSION, "aiTitle": "R1a realistic fixture"}),
+    ]
+}
+
+fn realistic_rows(responses: Range<usize>, tools: &[&str]) -> Vec<Value> {
+    let mut rows = if responses.start == 0 {
+        title_rows()
+    } else {
+        Vec::new()
+    };
+    for index in responses {
+        rows.extend(realistic_turn(index, tools));
+    }
+    rows
+}
+
+fn parser_for(rows: &[Value]) -> SnapshotAccumulator {
+    let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    for row in rows {
+        apply_claude_code_line(row, &mut parser);
+    }
+    parser
+}
+
+fn charge<T: HeapLayoutBound>(value: &T) -> Option<usize> {
+    crate::heap_layout_bound::bound(value, usize::MAX)
+}
+
+#[test]
+fn claude_realistic_records_meet_the_per_response_charge_target() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let baseline = charge(&parser_for(&title_rows())).expect("baseline charge");
+    let mut failures = Vec::new();
+    for responses in [300, 600] {
+        let parser = parser_for(&realistic_rows(0..responses, &[SHELL]));
+        let active = charge(&parser).expect("active charge within the visit limit");
+        let copy = charge(&parser.clone()).expect("copy charge within the visit limit");
+        let per_response = active.saturating_sub(baseline) / responses;
+        let copy_per_response = copy.saturating_sub(baseline) / responses;
+        eprintln!(
+            "R1A_CHARGE responses={responses} baseline_bytes={baseline} active_bytes={active} copy_bytes={copy} active_per_response={per_response} copy_per_response={copy_per_response}"
+        );
+        if per_response > PER_RESPONSE_TARGET_BYTES {
+            failures.push(format!(
+                "responses={responses}: active charge {per_response} B per response > {PER_RESPONSE_TARGET_BYTES} (active={active} copy={copy})"
+            ));
+        }
+        if responses == 600 && copy > COPY_TARGET_BYTES_AT_600 {
+            failures.push(format!(
+                "responses=600: retained copy {copy} B > {COPY_TARGET_BYTES_AT_600}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+#[test]
+fn claude_realistic_record_charge_covers_requested_allocations() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let rows = realistic_rows(0..120, &[SHELL, CHROME[0]]);
+    let (parser, actual) = crate::retry_allocation_probe::measure(|| parser_for(&rows));
+    let active = charge(&parser).unwrap();
+    assert!(
+        active >= actual.requested_live as usize,
+        "active={active} requested={}",
+        actual.requested_live
+    );
+    let (copy, actual) = crate::retry_allocation_probe::measure(|| parser.clone());
+    let copied = charge(&copy).unwrap();
+    assert!(
+        copied >= actual.requested_live as usize,
+        "copy={copied} requested={}",
+        actual.requested_live
+    );
+}
+
+#[test]
+fn claude_tool_heavy_long_session_walk_stays_under_the_visit_limit() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut visits = Vec::new();
+    for responses in [500, 2000] {
+        let parser = parser_for(&realistic_rows(0..responses, &CHROME));
+        let mut counter = Counter::new(usize::MAX);
+        let walked = parser.heap_bound(&mut counter).is_some();
+        eprintln!(
+            "R1A_VISITS responses={responses} chrome_tool_uses={} walked={walked} visits={} bytes={}",
+            responses * CHROME.len(),
+            counter.visits_for_test(),
+            counter.bytes
+        );
+        assert!(
+            walked,
+            "responses={responses}: the retained walk refused after {} visits",
+            counter.visits_for_test()
+        );
+        visits.push(counter.visits_for_test());
+    }
+    assert_eq!(
+        visits[0], visits[1],
+        "per-step visits grow with history: {visits:?}"
+    );
+}
+
+fn native_parser(path: &Path) -> (OwnedJsonlParser, String) {
+    let mut file = File::open(path).unwrap();
+    let expected = opened_object_identity(SnapshotSource::ClaudeCode, &mut file).unwrap();
+    let parser = OwnedJsonlParser::new(
+        file,
+        path,
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        Some(&CodexTitleMetadata::default()),
+        None,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+    (parser, expected)
+}
+
+/// One native acquisition: reuse `old` if the reader accepts it, read to EOF,
+/// retain a copy within the entry limit, then finish natively.
+fn acquire(
+    path: &Path,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    Value,
+) {
+    let scope = Scope("r1a-native".into());
+    let (mut parser, expected) = native_parser(path);
+    let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
+    let mode = parser.prepare_acquisition(old, &scope, debt, now).unwrap();
+    while !parser.step().unwrap() {}
+    let acquisition = parser
+        .retain_reduction(&scope, now, crate::transcript_cache::ENTRY_BYTES)
+        .unwrap()
+        .unwrap();
+    let retained = acquisition.reduction.map(|state| Retained {
+        checkpoint: acquisition.checkpoint,
+        state,
+    });
+    let parsed = parser
+        .finish(
+            &expected,
+            path,
+            NOW,
+            "native-fixture".into(),
+            Some(&CodexTitleMetadata::default()),
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+        )
+        .unwrap();
+    let mut items = parsed.snapshots;
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        &mut items,
+        SnapshotUploadPolicy::default(),
+    );
+    (retained, mode, serde_json::to_value(items).unwrap())
+}
+
+fn oracle(path: &Path) -> Value {
+    let mut items =
+        parse_claude_code_jsonl_file_with_artifacts(path, NOW, "native-fixture".into(), false)
+            .unwrap();
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        &mut items,
+        SnapshotUploadPolicy::default(),
+    );
+    serde_json::to_value(items).unwrap()
+}
+
+/// Retain after every row boundary, tail the rest, and require the tailed
+/// output to equal an independent full read of the whole file.
+fn assert_every_split_tails_with_full_parity(label: &str, rows: &[Value]) {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for split in 1..rows.len() {
+        let file = TempJsonl::new(label);
+        file.append(&rows[..split]);
+        let (retained, mode, _) = acquire(&file.path, None, 100);
+        assert_eq!(mode, ReadMode::Full(FullReason::StateMissing));
+        assert!(
+            retained.is_some(),
+            "{label}: the prefix through row {split} was not retained"
+        );
+        file.append(&rows[split..]);
+        let (_, mode, tailed) = acquire(&file.path, retained, 101);
+        assert_eq!(mode, ReadMode::Tail, "{label}: split {split}");
+        assert_eq!(tailed, oracle(&file.path), "{label}: split {split}");
+    }
+}
+
+fn full_item(rows: &[Value]) -> SnapshotItem {
+    let file = TempJsonl::new("full-item");
+    file.append(rows);
+    parse_claude_code_jsonl_file(&file.path, NOW, "fp".into())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("snapshot")
+}
+
+fn speed_record(timestamp: Option<&str>, top_level: bool) -> Value {
+    let mut usage = json!({"input_tokens": 12, "output_tokens": 7, "cache_read_input_tokens": 40});
+    let mut row = json!({
+        "type": "assistant",
+        "sessionId": SESSION,
+        "requestId": "req_sources",
+        "message": {"id": "msg_sources", "model": MODEL, "role": "assistant"},
+    });
+    if top_level {
+        row["speed"] = json!("standard");
+    } else {
+        usage["speed"] = json!("standard");
+    }
+    row["message"]["usage"] = usage;
+    if let Some(timestamp) = timestamp {
+        row["timestamp"] = json!(timestamp);
+    }
+    row
+}
+
+/// M-review F6: records with equal selector context but different sources,
+/// where a record equal to its physical predecessor sorts last by provider
+/// time. A "same as previous" dedupe would change the uploaded source.
+#[test]
+fn claude_equal_context_differing_sources_keep_parity_at_every_split() {
+    let user = json!({"type": "user", "sessionId": SESSION, "timestamp": "2026-10-06T10:00:00Z", "message": {"role": "user", "content": "work"}});
+    // Provider order r2, r1, r3: the terminal source is r3's top-level `speed`.
+    let stamped = vec![
+        user.clone(),
+        speed_record(Some("2026-10-06T10:00:02Z"), false),
+        speed_record(Some("2026-10-06T10:00:01Z"), true),
+        speed_record(Some("2026-10-06T10:00:03Z"), true),
+    ];
+    // One unstamped record keeps physical order: the terminal source is r3's.
+    let unstamped = vec![
+        user,
+        speed_record(Some("2026-10-06T10:00:02Z"), true),
+        speed_record(Some("2026-10-06T10:00:01Z"), false),
+        speed_record(None, false),
+    ];
+    for (label, rows, source) in [
+        ("sources-stamped", &stamped, "speed"),
+        ("sources-unstamped", &unstamped, "message.usage.speed"),
+    ] {
+        let item = full_item(rows);
+        assert_eq!(item.request_count, 1, "{label}");
+        let usage = &item.model_usage[0];
+        assert_eq!(
+            usage.selector_context.get("speed_mode").map(String::as_str),
+            Some("standard"),
+            "{label}"
+        );
+        assert_eq!(
+            usage.selector_sources.get("speed_mode").map(String::as_str),
+            Some(source),
+            "{label}"
+        );
+        assert_every_split_tails_with_full_parity(label, rows);
+    }
+}
+
+/// The Fable out-of-order writer and a late selector on a progressive
+/// response (fixtures of the existing native parse tests) stay exact when the
+/// response spans the retained boundary.
+#[test]
+fn claude_out_of_order_and_late_selector_responses_keep_parity_at_every_split() {
+    let out_of_order: Vec<Value> = [
+        r#"{"timestamp":"2026-09-11T08:31:20Z","sessionId":"claude-progressive-order","type":"user","message":{"role":"user","content":"work"}}"#,
+        r#"{"timestamp":"2026-09-11T08:31:22.985Z","sessionId":"claude-progressive-order","type":"assistant","requestId":"req_progressive_order","speed":"standard","message":{"id":"msg_progressive_order","model":"claude-fable-5-1","usage":{"input_tokens":32,"output_tokens":1026,"cache_read_input_tokens":960010,"cache_creation":{"ephemeral_1h_input_tokens":6006}}}}"#,
+        r#"{"timestamp":"2026-09-11T08:31:29.473Z","sessionId":"claude-progressive-order","type":"assistant","requestId":"req_progressive_order","speed":"standard","message":{"id":"msg_progressive_order","model":"claude-fable-5-1","usage":{"input_tokens":32,"output_tokens":1026,"cache_read_input_tokens":960010,"cache_creation":{"ephemeral_1h_input_tokens":6006}}}}"#,
+        r#"{"timestamp":"2026-09-11T08:31:22.985Z","sessionId":"claude-progressive-order","type":"assistant","requestId":"req_progressive_order","message":{"id":"msg_progressive_order","model":"claude-fable-5-1","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":6006}}}}"#,
+        r#"{"timestamp":"2026-09-11T08:31:29.473Z","sessionId":"claude-progressive-order","type":"assistant","requestId":"req_progressive_order","message":{"id":"msg_progressive_order","model":"claude-fable-5-1","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":6006}}}}"#,
+    ]
+    .iter()
+    .map(|row| serde_json::from_str(row).unwrap())
+    .collect();
+    let late_selector: Vec<Value> = [
+        r#"{"timestamp":"2026-08-02T09:00:00Z","type":"user","sessionId":"11111111-2222-3333-4444-555555555555","isSidechain":true,"message":{"role":"user","content":"work"}}"#,
+        r#"{"timestamp":"2026-08-02T09:00:01Z","type":"assistant","sessionId":"11111111-2222-3333-4444-555555555555","isSidechain":true,"requestId":"req_progress","message":{"id":"msg_progress","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":30}}}"#,
+        r#"{"timestamp":"2026-08-02T09:00:02Z","type":"assistant","sessionId":"11111111-2222-3333-4444-555555555555","isSidechain":true,"requestId":"req_progress","speed":"standard","message":{"id":"msg_progress","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":19,"cache_read_input_tokens":30}}}"#,
+    ]
+    .iter()
+    .map(|row| serde_json::from_str(row).unwrap())
+    .collect();
+    let item = full_item(&out_of_order);
+    assert_eq!((item.output_tokens, item.request_count), (1_026, 1));
+    assert_eq!(
+        item.model_usage[0]
+            .selector_context
+            .get("context_bucket")
+            .map(String::as_str),
+        Some("long")
+    );
+    let item = full_item(&late_selector);
+    assert_eq!((item.output_tokens, item.request_count), (19, 1));
+    assert_eq!(
+        item.model_usage[0]
+            .selector_sources
+            .get("speed_mode")
+            .map(String::as_str),
+        Some("speed")
+    );
+    assert_every_split_tails_with_full_parity("out-of-order", &out_of_order);
+    assert_every_split_tails_with_full_parity("late-selector", &late_selector);
+}
+
+/// Titles, the first prompt, tool uses, Fable replays and a late selector in a
+/// short realistic session: every retained boundary tails to the full output.
+#[test]
+fn claude_realistic_session_keeps_parity_at_every_split() {
+    let rows = realistic_rows(0..9, &[SHELL, CHROME[1]]);
+    let item = full_item(&rows);
+    assert_eq!(item.request_count, 9);
+    assert!(item.session_display_name.is_some());
+    assert!(item.session_start.is_some());
+    assert!(item
+        .tool_usage
+        .as_ref()
+        .is_some_and(|tools| tools.len() >= 2));
+    let sources = &item.model_usage[0].selector_sources;
+    assert!(sources.contains_key("service_tier") && sources.contains_key("speed_mode"));
+    assert_every_split_tails_with_full_parity("realistic", &rows);
+}
+
+fn production_scan(
+    file: &TempJsonl,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let source = SnapshotSource::ClaudeCode;
+    let mut scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&file.root()),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    );
+    if let Some(cache) = cache {
+        scan = scan.with_sampled_acquisition(cache, Scope("r1a-production".into()));
+    }
+    let mut modes = (0, 0, 0);
+    loop {
+        if let Some(context) = scan.sampling.as_ref() {
+            modes = (
+                context.full_files,
+                context.tail_files,
+                context.unchanged_files,
+            );
+        }
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    source,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(source, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan, modes);
+            }
+        }
+    }
+}
+
+fn production_body(mut scan: SourceScanResult) -> Value {
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        &mut scan.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    serde_json::to_value(scan.snapshots).unwrap()
+}
+
+/// A 600-response realistic session retains its reader state, so the next
+/// append tails, and the tailed output equals an independent full read. The
+/// retained boundary falls inside response 600.
+#[test]
+fn claude_realistic_600_response_session_tails_with_full_read_parity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let file = TempJsonl::new("production-600");
+    let mut rows = realistic_rows(0..600, &[SHELL]);
+    let mut appended = realistic_rows(600..608, &[SHELL, CHROME[2]]);
+    rows.extend(appended.drain(..2));
+    file.append(&rows);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (index, _, modes) = production_scan(&file, ScanIndex::default(), Some(cache.clone()));
+    assert_eq!(modes, (1, 0, 0));
+    file.append(&appended);
+    let (_, tail, modes) = production_scan(&file, index, Some(cache));
+    let (_, full, _) = production_scan(&file, ScanIndex::default(), None);
+    let tail = production_body(tail);
+    let full = production_body(full);
+    assert_eq!(tail, full);
+    let item = &full[0];
+    assert_eq!(item["request_count"], json!(608));
+    assert!(
+        item["session_display_name"].is_string(),
+        "{}",
+        item["session_display_name"]
+    );
+    assert!(item["session_start"].is_object());
+    assert!(item["tool_usage"]
+        .as_array()
+        .is_some_and(|tools| tools.len() >= 2));
+    let usage = item["model_usage"].as_array().expect("model usage");
+    assert!(usage
+        .iter()
+        .any(|row| row["selector_context"].get("context_bucket").is_some()));
+    assert!(usage
+        .iter()
+        .any(|row| row["selector_sources"].get("region_mode").is_some()));
+    assert_eq!(modes, (0, 1, 0), "the 600-response session did not tail");
+}
