@@ -5,25 +5,33 @@
 //! That next page runs through [`run_page`], a dedicated entry point that is not
 //! `sync_once`: it makes no network call (no relay token, activity hint,
 //! receipt, status or health upload) unless the job reaches EOF, and then only
-//! the existing authorized completion upload, after rechecking the destination
-//! and the upload backoff. Ordinary cycles keep their own deadline, so other
-//! sources' due work and network cadence are unchanged.
+//! the existing authorized completion upload, after rechecking the scan
+//! authority, the destination and the upload backoff. Ordinary cycles keep
+//! their own deadline, so other sources' due work and network cadence are
+//! unchanged, and an EOF completion does not move the ordinary Codex cadence.
 //!
 //! Everything here is compiled in and **inert**: [`ENABLED`] is false, the
 //! cursor side is the [`NoCursorContinuation`] stub (c22 owns hunks A/D/E and
 //! the guard, after #660), and the platform gates are [`NoPlatformSignals`],
-//! whose unknown state falls back to the ordinary cadence.
+//! whose unknown state falls back to the ordinary cadence. Inert parity rests
+//! on that constant gate and on review: the loop takes today's path before it
+//! reaches anything in this module.
 
+use super::live_snapshot_retry::LiveRetryOwner;
 use super::{
-    load_snapshot_device_credentials, snapshot_upload_destination_namespace,
-    source_upload_backoff_remaining, with_source_cadence, SnapshotSource, SourceScanResult,
-    MAX_CYCLE_INTERVAL, SNAPSHOT_SYNC_INTERVAL, SNAPSHOT_SYNC_LOCK,
+    complete_continuation_eof, enabled_snapshot_sources, load_snapshot_device_credentials,
+    snapshot_api_base_url, snapshot_upload_destination_namespace, source_upload_backoff_remaining,
+    with_source_cadence, ScanIndex, SnapshotSource, SourcePreparation, SourceScanResult,
+    SNAPSHOT_SYNC_LOCK,
 };
 use crate::adaptive_collector::{ContinuationPacing, SourceCadence};
+use crate::LocalDaemon;
 use anyhow::{anyhow, Result};
+use ottto_core::LocalDeviceBinding;
 use ottto_protocol::LocalCollectorState;
 use sha2::{Digest, Sha256};
-use std::sync::{Mutex, TryLockError};
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
@@ -40,7 +48,8 @@ pub(super) const PACING: ContinuationPacing = ContinuationPacing {
 
 /// A page whose measured work exceeds this is read as contention (a loaded
 /// machine, a slow disk or a long lock wait): the next page waits for the
-/// ordinary cadence instead.
+/// ordinary cadence instead. It is also the page's own deadline, so a page
+/// never holds `SNAPSHOT_SYNC_LOCK` much longer than this.
 pub(super) const CONTENTION_WORK: Duration = Duration::from_secs(20);
 
 /// c22's cursor binding for one paused attempt (hunk A: namespace, rotation
@@ -51,19 +60,51 @@ pub(super) struct CursorTicket {
     _sealed: (),
 }
 
-/// What c22's EOF page hands back for the existing completion upload: the
-/// committed job's preparation, index and scan for the unchanged
-/// `finish_sync_source`. Unconstructible in production until c22 wires it.
-#[allow(dead_code)] // Built only by c22's EOF page (after #660).
-pub(super) struct EofCompletion {
-    _sealed: (),
+/// What c22's EOF page hands back: the committed job's preparation, index and
+/// scan. StateMissing settles it ([`Host::complete_eof`] or
+/// [`Host::defer_eof`]) through the same completion an ordinary Codex finish
+/// runs. Nothing in production builds one until c22 wires its EOF page.
+pub(super) struct EofCompletion(EofParts);
+
+enum EofParts {
+    Scan(Box<(SourcePreparation, ScanIndex, SourceScanResult)>),
+    /// A stand-in for the fakes, which have no real scan to complete.
+    #[cfg(test)]
+    Synthetic,
+}
+
+impl EofCompletion {
+    #[allow(dead_code)] // Built only by c22's EOF page (after #660).
+    pub(super) fn new(
+        preparation: SourcePreparation,
+        index: ScanIndex,
+        scan: SourceScanResult,
+    ) -> Self {
+        Self(EofParts::Scan(Box::new((preparation, index, scan))))
+    }
+
+    #[cfg(test)]
+    pub(super) fn synthetic() -> Self {
+        Self(EofParts::Synthetic)
+    }
+
+    /// The committed job's preparation, index and scan.
+    pub(super) fn into_parts(self) -> Option<(SourcePreparation, ScanIndex, SourceScanResult)> {
+        match self.0 {
+            EofParts::Scan(parts) => Some(*parts),
+            #[cfg(test)]
+            EofParts::Synthetic => None,
+        }
+    }
 }
 
 /// The permission a finished Codex page leaves for the next continuation page.
+/// Both bindings are fixed-size digests, so the slot never allocates.
 pub(super) struct ContinuationTicket {
-    /// SHA-256 of the destination namespace the asking page ran under. Fixed
-    /// size, so the slot never allocates.
+    /// SHA-256 of the destination namespace the asking page ran under.
     destination: [u8; 32],
+    /// The scan authority the asking page ran under ([`current_authority`]).
+    authority: [u8; 32],
     cursor: CursorTicket,
 }
 
@@ -86,7 +127,8 @@ pub(super) enum PageEnd {
 }
 
 /// The cursor side of a continuation page. c22 implements it after #660.
-/// Every method except `complete_eof` must make no network call.
+/// None of its methods may make a network call; the EOF completion upload is
+/// StateMissing's ([`Host::complete_eof`]).
 pub(super) trait CursorContinuation {
     /// Hunk A: the ticket of a just-finished ordinary Codex page, only for a
     /// valid, budget-exhausted, accelerated pause.
@@ -95,16 +137,10 @@ pub(super) trait CursorContinuation {
     fn ready(&mut self, ticket: &CursorTicket) -> bool;
     /// One resume-only page: `ScanIndex::load`, then
     /// `begin_codex_side_pass(Continuation)`, the scan, the C15 mark, the save
-    /// and `note_codex_side_saved` on `Ok`.
-    fn page(&mut self, ticket: CursorTicket) -> PageEnd;
-    /// The existing authorized completion upload: the unchanged
-    /// `finish_sync_source` for the completed job's own obligations, preceded
-    /// by the same authority and destination validation an ordinary finish
-    /// runs. It is attempted once; a failure is never retried here.
-    fn complete_eof(&mut self, completion: EofCompletion) -> Result<()>;
-    /// The existing safe partial-checkpoint / owed path when completion cannot
-    /// proceed now. Never a whole-index save of the un-uploaded commit.
-    fn defer_eof(&mut self, completion: EofCompletion);
+    /// and `note_codex_side_saved` on `Ok`. Once `deadline` passes, the page
+    /// stops at the next record boundary, saves and returns `Paused`, so it
+    /// never holds `SNAPSHOT_SYNC_LOCK` without bound.
+    fn page(&mut self, ticket: CursorTicket, deadline: Instant) -> PageEnd;
 }
 
 /// The production cursor side until c22's hunks land: there is never a
@@ -118,13 +154,9 @@ impl CursorContinuation for NoCursorContinuation {
     fn ready(&mut self, _ticket: &CursorTicket) -> bool {
         false
     }
-    fn page(&mut self, _ticket: CursorTicket) -> PageEnd {
+    fn page(&mut self, _ticket: CursorTicket, _deadline: Instant) -> PageEnd {
         PageEnd::Deferred
     }
-    fn complete_eof(&mut self, _completion: EofCompletion) -> Result<()> {
-        Err(anyhow!("continuation completion is not wired"))
-    }
-    fn defer_eof(&mut self, _completion: EofCompletion) {}
 }
 
 /// A platform answer. Anything but `Allowed` falls back to the ordinary
@@ -161,15 +193,31 @@ impl PlatformGates for NoPlatformSignals {
     fn restore_qos(&mut self) {}
 }
 
-/// The local state a continuation page reads. None of it touches the network.
-pub(super) trait Host {
+/// Codex's cadence, for short critical sections.
+pub(super) trait CadenceAccess {
+    /// `None` when the cadence is unavailable.
+    fn cadence<T>(&mut self, apply: impl FnOnce(&mut SourceCadence) -> T) -> Option<T>;
+}
+
+/// The state a continuation page reads, and StateMissing's settlement of an
+/// EOF page. Only [`Host::complete_eof`] touches the network.
+pub(super) trait Host: CadenceAccess {
     fn now(&mut self) -> Instant;
     /// Whether the server's upload backoff for Codex is still running.
     fn upload_backoff(&mut self) -> bool;
     /// SHA-256 of the current destination namespace, from local credentials.
     fn destination(&mut self) -> Option<[u8; 32]>;
-    /// Short critical sections on Codex's cadence; `None` when unavailable.
-    fn cadence<T>(&mut self, apply: impl FnOnce(&mut SourceCadence) -> T) -> Option<T>;
+    /// The current scan authority ([`current_authority`]) from the local device
+    /// record, endpoint and account witness; `None` when Codex is no longer
+    /// granted or an input is unavailable.
+    fn authority(&mut self) -> Option<[u8; 32]>;
+    /// The existing authorized completion upload, attempted once: the same
+    /// census fence, authority and destination validation and unchanged
+    /// `finish_sync_source` an ordinary Codex finish runs.
+    fn complete_eof(&mut self, completion: EofCompletion) -> Result<()>;
+    /// Completion cannot proceed now: the job's obligations stay owed to the
+    /// next ordinary pass. Never a whole-index save of the un-uploaded commit.
+    fn defer_eof(&mut self, completion: EofCompletion);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +228,7 @@ pub(super) enum Skip {
     Backoff,
     Platform,
     LockBusy,
+    Authority,
     Destination,
     NotReady,
     CadenceUnavailable,
@@ -191,6 +240,9 @@ pub(super) enum Outcome {
     Paused,
     /// Paused, but too slow to ask for another page: ordinary cadence next.
     PausedContended,
+    /// Paused and saved, but the cadence took no request (unavailable, or the
+    /// source is now disabled): ordinary cadence next.
+    PausedWithoutRequest,
     Deferred,
     EofCompleted,
     EofDeferred,
@@ -209,12 +261,14 @@ impl Outcome {
                 Skip::Backoff => "skipped_upload_backoff",
                 Skip::Platform => "skipped_platform",
                 Skip::LockBusy => "skipped_lock_busy",
+                Skip::Authority => "skipped_authority",
                 Skip::Destination => "skipped_destination",
                 Skip::NotReady => "skipped_not_ready",
                 Skip::CadenceUnavailable => "skipped_cadence_unavailable",
             },
             Outcome::Paused => "paused",
             Outcome::PausedContended => "paused_contended",
+            Outcome::PausedWithoutRequest => "paused_without_request",
             Outcome::Deferred => "deferred",
             Outcome::EofCompleted => "eof_completed",
             Outcome::EofDeferred => "eof_deferred",
@@ -231,21 +285,29 @@ impl Outcome {
 /// leaves a ticket and a cadence request behind; every other end clears both,
 /// so the next page is ordinary. `lock` is held for the whole page (c22 R0) and
 /// released before return, so it is never held while waiting between pages.
-/// The measured work runs from entry to after the lock is released, so lock
-/// wait, preparation, the page, any EOF completion and finalization all count.
+/// The ticket is taken and any new ticket written only while `lock` is held,
+/// as an ordinary Codex finish writes its own, so a page can never overwrite a
+/// newer ordinary decision with an older ticket. Clearing needs no lock: it
+/// can only lose a continuation.
+///
+/// The page must end by the earlier of `ordinary_deadline` and
+/// [`CONTENTION_WORK`] after entry. The measured work runs from entry to just
+/// before the lock is released, so lock wait, preparation, the page, any EOF
+/// completion and finalization all count.
 pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     host: &mut H,
     port: &mut P,
     gates: &mut G,
     lock: &Mutex<()>,
-    slot: &mut Option<ContinuationTicket>,
+    slot: &Mutex<Option<ContinuationTicket>>,
+    ordinary_deadline: Instant,
 ) -> Outcome {
     let started = host.now();
-    let Some(ticket) = slot.take() else {
+    if lock_slot(slot).is_none() {
         return Outcome::Skipped(Skip::NoTicket);
-    };
+    }
     let skip = |host: &mut H, skip: Skip| {
-        host.cadence(SourceCadence::clear_continuation);
+        clear(host, slot);
         Outcome::Skipped(skip)
     };
     let Some((state, due)) = host.cadence(|cadence| {
@@ -262,10 +324,8 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     }
     match due {
         Some(due) if started >= due => {}
-        Some(_) => {
-            *slot = Some(ticket);
-            return Outcome::Skipped(Skip::NotDue);
-        }
+        // An early wake keeps the ticket without moving it earlier.
+        Some(_) => return Outcome::Skipped(Skip::NotDue),
         None => return skip(host, Skip::NotDue),
     }
     if gates.power() != PlatformState::Allowed {
@@ -277,26 +337,44 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
         // A one-shot or ordinary cycle owns the index now; it decides.
         Err(TryLockError::WouldBlock) => return skip(host, Skip::LockBusy),
     };
+    let Some(ticket) = lock_slot(slot).take() else {
+        // An ordinary pass cleared it after the check above.
+        return Outcome::Skipped(Skip::NoTicket);
+    };
+    // The same authority an ordinary pass checks at every prepare and finish:
+    // device, machine, Codex grant, endpoint and account.
+    if host.authority() != Some(ticket.authority) {
+        return skip(host, Skip::Authority);
+    }
     if host.destination() != Some(ticket.destination) {
-        drop(guard);
         return skip(host, Skip::Destination);
     }
     if gates.enter_background_qos() != PlatformState::Allowed {
-        drop(guard);
         return skip(host, Skip::Platform);
     }
-    let destination = ticket.destination;
-    let ended = if port.ready(&ticket.cursor) {
-        Some(port.page(ticket.cursor))
+    let ContinuationTicket {
+        destination,
+        authority,
+        cursor,
+    } = ticket;
+    let deadline = started
+        .checked_add(CONTENTION_WORK)
+        .map_or(ordinary_deadline, |limit| limit.min(ordinary_deadline));
+    let qos = RestoreQos(gates);
+    let ended = if port.ready(&cursor) {
+        Some(port.page(cursor, deadline))
     } else {
         None
     };
+    // Back to the thread's own QoS before any EOF network work.
+    drop(qos);
     let (outcome, next) = match ended {
         None => (Outcome::Skipped(Skip::NotReady), None),
         Some(PageEnd::Paused(cursor)) => (
             Outcome::Paused,
             Some(ContinuationTicket {
                 destination,
+                authority,
                 cursor,
             }),
         ),
@@ -304,43 +382,93 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
         Some(PageEnd::Cancelled) => (Outcome::Cancelled, None),
         Some(PageEnd::Failed(_)) => (Outcome::Failed, None),
         Some(PageEnd::Eof(completion)) => {
-            // Recheck before the first network call of the page.
-            if host.upload_backoff() || host.destination() != Some(destination) {
-                port.defer_eof(completion);
-                (Outcome::EofDeferred, None)
-            } else if port.complete_eof(completion).is_ok() {
-                (Outcome::EofCompleted, None)
-            } else {
-                (Outcome::EofFailed, None)
-            }
+            (settle_eof(host, completion, destination, authority), None)
         }
     };
-    gates.restore_qos();
-    drop(guard);
     let finished = host.now();
-    match next {
+    let outcome = match next {
         Some(next) => match finished.checked_duration_since(started) {
             Some(work) if work <= CONTENTION_WORK => {
-                if host
-                    .cadence(|cadence| cadence.request_continuation(finished, work))
-                    .is_some()
-                {
-                    *slot = Some(next);
-                    outcome
-                } else {
-                    Outcome::Skipped(Skip::CadenceUnavailable)
+                match host.cadence(|cadence| cadence.request_continuation(finished, work)) {
+                    Some(true) => {
+                        *lock_slot(slot) = Some(next);
+                        outcome
+                    }
+                    _ => {
+                        clear(host, slot);
+                        Outcome::PausedWithoutRequest
+                    }
                 }
             }
             _ => {
-                host.cadence(SourceCadence::clear_continuation);
+                clear(host, slot);
                 Outcome::PausedContended
             }
         },
         None => {
-            host.cadence(SourceCadence::clear_continuation);
+            clear(host, slot);
             outcome
         }
+    };
+    drop(guard);
+    outcome
+}
+
+/// Restores the thread's QoS when dropped, including on a panic in the page.
+struct RestoreQos<'a, G: PlatformGates>(&'a mut G);
+
+impl<G: PlatformGates> Drop for RestoreQos<'_, G> {
+    fn drop(&mut self) {
+        self.0.restore_qos();
     }
+}
+
+/// Settle an EOF page, still under the sync lock. The authority, destination
+/// and upload backoff are rechecked before the first network call of the page.
+/// The completion upload is attempted once and never retried here.
+///
+/// An EOF completion is not an ordinary scan: the unchanged
+/// `finish_sync_source` records its cadence as one, so the ordinary Codex clock
+/// (tier, last scan, failures, full sweep) is saved first and put back after.
+/// The ordinary Codex cadence is therefore exactly what it was before the page.
+/// Without a saved clock the completion is deferred to the ordinary pass.
+fn settle_eof<H: Host>(
+    host: &mut H,
+    completion: EofCompletion,
+    destination: [u8; 32],
+    authority: [u8; 32],
+) -> Outcome {
+    let current = !host.upload_backoff()
+        && host.destination() == Some(destination)
+        && host.authority() == Some(authority);
+    let clock = if current {
+        host.cadence(|cadence| cadence.ordinary_clock())
+    } else {
+        None
+    };
+    let Some(clock) = clock else {
+        host.defer_eof(completion);
+        return Outcome::EofDeferred;
+    };
+    let completed = host.complete_eof(completion);
+    host.cadence(|cadence| cadence.restore_ordinary_clock(clock));
+    if completed.is_ok() {
+        Outcome::EofCompleted
+    } else {
+        Outcome::EofFailed
+    }
+}
+
+fn lock_slot(
+    slot: &Mutex<Option<ContinuationTicket>>,
+) -> MutexGuard<'_, Option<ContinuationTicket>> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// No continuation: neither the ticket nor the cadence request survives.
+fn clear(cadence: &mut impl CadenceAccess, slot: &Mutex<Option<ContinuationTicket>>) {
+    *lock_slot(slot) = None;
+    cadence.cadence(SourceCadence::clear_continuation);
 }
 
 /// What the sync loop does next.
@@ -379,13 +507,15 @@ pub(super) trait LoopHost {
     /// for the ordinary cycle now.
     fn wait(&mut self, wait: Duration) -> bool;
     fn pending(&mut self) -> Option<(Instant, Duration)>;
-    fn page(&mut self) -> Outcome;
+    /// One continuation page, which should end by `deadline`.
+    fn page(&mut self, deadline: Instant) -> Outcome;
 }
 
 /// Wait out one ordinary interval, running due continuation pages inside it.
-/// The ordinary deadline is fixed when the wait starts, so pages never push
-/// the ordinary cycle out except by the overrun of a page that ran longer than
-/// the one before it.
+/// The ordinary deadline is fixed when the wait starts, and each page is given
+/// it as its own deadline. A page can still push the ordinary cycle out, by at
+/// most the record it was reading when the deadline passed plus, on an EOF
+/// page, the one completion upload, whose length the network decides.
 pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Duration) {
     let start = host.now();
     let Some(deadline) = start.checked_add(interval) else {
@@ -404,7 +534,7 @@ pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Durati
                 if host.wait(wait) {
                     return;
                 }
-                let outcome = host.page();
+                let outcome = host.page(deadline);
                 if matches!(outcome, Outcome::EofFailed | Outcome::Failed) {
                     eprintln!(
                         "local snapshot continuation page ended: {}",
@@ -418,26 +548,72 @@ pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Durati
 
 static TICKET: Mutex<Option<ContinuationTicket>> = Mutex::new(None);
 
+/// Codex's production cadence.
+struct CodexCadence;
+
+impl CadenceAccess for CodexCadence {
+    fn cadence<T>(&mut self, apply: impl FnOnce(&mut SourceCadence) -> T) -> Option<T> {
+        with_source_cadence(SnapshotSource::Codex, apply)
+    }
+}
+
 fn destination_digest(namespace: &str) -> [u8; 32] {
     Sha256::digest(namespace.as_bytes()).into()
 }
 
+/// The scan authority a Codex page may run under, as one fixed-size digest:
+/// exactly the inputs `validate_snapshot_scan_authority` compares (device id,
+/// machine id, the Codex grant, the API endpoint and the account witness).
+/// `None` once the device record no longer grants Codex.
+pub(super) fn current_authority(
+    device: &LocalDeviceBinding,
+    endpoint: &str,
+    account: &[u8; 32],
+) -> Option<[u8; 32]> {
+    if !enabled_snapshot_sources(device).contains(&SnapshotSource::Codex) {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:continuation-scan-authority:v1\0");
+    for field in [
+        Some(device.device_id.as_str()),
+        device.machine_id.as_deref(),
+        Some(endpoint),
+    ] {
+        match field {
+            Some(value) => {
+                digest.update([1u8]);
+                digest.update((value.len() as u64).to_le_bytes());
+                digest.update(value.as_bytes());
+            }
+            None => digest.update([0u8]),
+        }
+    }
+    digest.update(account);
+    Some(digest.finalize().into())
+}
+
 /// The ticket an ordinary Codex page's pause minted, bound to the destination
-/// it ran under. Read before the finish consumes the scan.
+/// and the scan authority it ran under. Read before the finish consumes the
+/// scan. No authority, no ticket.
 pub(super) fn ordinary_ticket(
     port: &impl CursorContinuation,
     scan: &SourceScanResult,
     destination_namespace: &str,
+    authority: Option<[u8; 32]>,
 ) -> Option<ContinuationTicket> {
+    let authority = authority?;
     port.ticket_for(scan).map(|cursor| ContinuationTicket {
         destination: destination_digest(destination_namespace),
+        authority,
         cursor,
     })
 }
 
-/// After an ordinary Codex finish: keep the page's ticket (with its measured
-/// work, from preparation to the end of the finish) only if the finish
-/// succeeded and the page was not contended; otherwise clear any older one.
+/// After an ordinary Codex finish, under `SNAPSHOT_SYNC_LOCK`: keep the page's
+/// ticket (with its measured work, from preparation to the end of the finish)
+/// only if the finish succeeded, the page was not contended and the cadence
+/// took the request; otherwise clear any older one.
 pub(super) fn after_ordinary_codex_page(
     ticket: Option<ContinuationTicket>,
     started: Option<Instant>,
@@ -449,27 +625,57 @@ pub(super) fn after_ordinary_codex_page(
         .flatten()
         .zip(started.and_then(|started| finished.checked_duration_since(started)))
         .filter(|(_, work)| *work <= CONTENTION_WORK);
-    let mut slot = TICKET.lock().unwrap_or_else(|p| p.into_inner());
-    match ticket {
-        Some((ticket, work)) => {
-            let requested = with_source_cadence(SnapshotSource::Codex, |cadence| {
-                cadence.request_continuation(finished, work)
-            });
-            *slot = requested.map(|()| ticket);
+    if let Some((ticket, work)) = ticket {
+        let requested = with_source_cadence(SnapshotSource::Codex, |cadence| {
+            cadence.request_continuation(finished, work)
+        });
+        if requested == Some(true) {
+            *lock_slot(&TICKET) = Some(ticket);
+            return;
         }
-        None => clear_production(&mut slot),
     }
+    clear(&mut CodexCadence, &TICKET);
 }
 
 /// An ordinary Codex pass failed: no continuation follows it.
 pub(super) fn after_ordinary_codex_failure() {
-    let mut slot = TICKET.lock().unwrap_or_else(|p| p.into_inner());
-    clear_production(&mut slot);
+    clear(&mut CodexCadence, &TICKET);
 }
 
-fn clear_production(slot: &mut Option<ContinuationTicket>) {
-    *slot = None;
-    with_source_cadence(SnapshotSource::Codex, SourceCadence::clear_continuation);
+/// How an ordinary cycle ended, for the continuation it leaves behind. A cycle
+/// that failed, including before rotation, or ran without the Codex grant
+/// leaves none.
+pub(super) fn settle_cycle(
+    cadence: &mut impl CadenceAccess,
+    slot: &Mutex<Option<ContinuationTicket>>,
+    succeeded_with_codex: bool,
+) {
+    if !succeeded_with_codex {
+        clear(cadence, slot);
+    }
+}
+
+/// Settles the continuation when an ordinary cycle ends ([`settle_cycle`]).
+/// Created right after `SNAPSHOT_SYNC_LOCK` is taken, so it drops, and settles,
+/// before the lock is released on every return path, including `?`.
+#[derive(Default)]
+pub(super) struct CycleSettlement {
+    succeeded_with_codex: bool,
+}
+
+impl CycleSettlement {
+    /// The cycle succeeded; `codex_granted` is whether it ran with Codex.
+    pub(super) fn succeeded(&mut self, codex_granted: bool) {
+        self.succeeded_with_codex = codex_granted;
+    }
+}
+
+impl Drop for CycleSettlement {
+    fn drop(&mut self) {
+        if ENABLED {
+            settle_cycle(&mut CodexCadence, &TICKET, self.succeeded_with_codex);
+        }
+    }
 }
 
 /// The pending page for the loop planner, or `None` while inert.
@@ -477,7 +683,7 @@ pub(super) fn production_pending() -> Option<(Instant, Duration)> {
     if !ENABLED {
         return None;
     }
-    if TICKET.lock().ok()?.is_none() {
+    if lock_slot(&TICKET).is_none() {
         return None;
     }
     with_source_cadence(SnapshotSource::Codex, |cadence| {
@@ -488,9 +694,21 @@ pub(super) fn production_pending() -> Option<(Instant, Duration)> {
     .flatten()
 }
 
-struct ProductionHost;
+/// The production host: local reads, plus the EOF completion inputs.
+struct ProductionHost<'a> {
+    home: &'a Path,
+    support_dir: &'a Path,
+    daemon: &'a LocalDaemon,
+    retry: &'a mut LiveRetryOwner,
+}
 
-impl Host for ProductionHost {
+impl CadenceAccess for ProductionHost<'_> {
+    fn cadence<T>(&mut self, apply: impl FnOnce(&mut SourceCadence) -> T) -> Option<T> {
+        with_source_cadence(SnapshotSource::Codex, apply)
+    }
+}
+
+impl Host for ProductionHost<'_> {
     fn now(&mut self) -> Instant {
         Instant::now()
     }
@@ -503,40 +721,151 @@ impl Host for ProductionHost {
         secret.zeroize();
         Some(destination_digest(&namespace))
     }
-    fn cadence<T>(&mut self, apply: impl FnOnce(&mut SourceCadence) -> T) -> Option<T> {
-        with_source_cadence(SnapshotSource::Codex, apply)
+    fn authority(&mut self) -> Option<[u8; 32]> {
+        let current = ottto_core::FileDeviceStore::default().load().ok()??;
+        let account = self.daemon.snapshot_scan_account_witness().ok()?;
+        current_authority(&current, &snapshot_api_base_url(), &account)
+    }
+    fn complete_eof(&mut self, completion: EofCompletion) -> Result<()> {
+        let completed = completion
+            .into_parts()
+            .ok_or_else(|| anyhow!("continuation completion has no scan"))?;
+        complete_continuation_eof(
+            self.home,
+            self.support_dir,
+            self.daemon,
+            self.retry,
+            completed,
+        )
+    }
+    fn defer_eof(&mut self, completion: EofCompletion) {
+        // Nothing is uploaded or saved: the committed job stays owed to the
+        // next ordinary pass, which re-reads at most this page.
+        drop(completion);
     }
 }
 
 /// One production continuation page, or a skip while inert.
-pub(super) fn run_production_page() -> Outcome {
+pub(super) fn run_production_page(
+    home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    retry: &mut LiveRetryOwner,
+    ordinary_deadline: Instant,
+) -> Outcome {
     if !ENABLED {
         return Outcome::Skipped(Skip::NoTicket);
     }
-    // Take the ticket out so its mutex is never held across the page.
-    let mut slot = TICKET.lock().unwrap_or_else(|p| p.into_inner()).take();
-    let outcome = run_page(
-        &mut ProductionHost,
+    run_page(
+        &mut ProductionHost {
+            home,
+            support_dir,
+            daemon,
+            retry,
+        },
         &mut NoCursorContinuation,
         &mut NoPlatformSignals,
         SNAPSHOT_SYNC_LOCK.get_or_init(|| Mutex::new(())),
-        &mut slot,
-    );
-    *TICKET.lock().unwrap_or_else(|p| p.into_inner()) = slot;
-    outcome
+        &TICKET,
+        ordinary_deadline,
+    )
+}
+
+/// What the ordinary loop has done since this process started: the longest
+/// gap between two ordinary cycle starts and the longest cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LoopShape {
+    pub(super) longest_tick: Duration,
+    pub(super) longest_cycle: Duration,
+}
+
+/// Running maxima behind [`LoopShape`].
+#[derive(Debug, Default)]
+pub(super) struct LoopRecord {
+    last_start: Option<Instant>,
+    longest_tick: Option<Duration>,
+    longest_cycle: Duration,
+}
+
+impl LoopRecord {
+    pub(super) const fn new() -> Self {
+        Self {
+            last_start: None,
+            longest_tick: None,
+            longest_cycle: Duration::ZERO,
+        }
+    }
+
+    pub(super) fn observe(&mut self, started: Instant, ended: Instant) {
+        if let Some(tick) = self
+            .last_start
+            .and_then(|last| started.checked_duration_since(last))
+        {
+            self.longest_tick = Some(self.longest_tick.map_or(tick, |longest| longest.max(tick)));
+        }
+        self.last_start = Some(started);
+        if let Some(cycle) = ended.checked_duration_since(started) {
+            self.longest_cycle = self.longest_cycle.max(cycle);
+        }
+    }
+
+    /// Unknown until two ordinary cycles have started.
+    pub(super) fn shape(&self) -> Option<LoopShape> {
+        Some(LoopShape {
+            longest_tick: self.longest_tick?,
+            longest_cycle: self.longest_cycle,
+        })
+    }
+}
+
+static LOOP: Mutex<LoopRecord> = Mutex::new(LoopRecord::new());
+
+/// One ordinary loop cycle ran from `started` to `ended`. Not recorded while
+/// inert.
+pub(super) fn note_ordinary_cycle(started: Instant, ended: Instant) {
+    if ENABLED {
+        LOOP.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe(started, ended);
+    }
 }
 
 /// The ordinary-equivalent duration of one page gap for c22's guard and E2
-/// accounting: the interval the ordinary cadence would actually have applied,
-/// never less than the loop's own interval and never more than the ceiling
-/// the loop clamps a wait to. A lower bound: the real ordinary period also
-/// includes the cycle's own duration.
-#[allow(dead_code)] // c22's guard (after #660) is the first production caller.
-pub(super) fn ordinary_equivalent(cadence: &SourceCadence) -> Duration {
+/// accounting: never shorter than the gap the ordinary cadence would actually
+/// leave between two Codex scans, so charging it can never admit anything
+/// earlier than today.
+///
+/// The ordinary path scans Codex in the first loop cycle that finds
+/// [`SourceCadence::ordinary_interval`] (tier, server directive or failure
+/// backoff, unclamped: `negotiated_wait` clamps only the wait it reports, never
+/// the eligibility) elapsed since the last scan. That cycle starts at most one
+/// loop tick after the eligibility point, and Codex's place inside a cycle
+/// moves by at most one cycle, so the real gap is below `interval + longest
+/// tick + longest cycle`. The six-hour full sweep can only shorten it.
+///
+/// The tick and cycle are the longest observed since start. Until a tick has
+/// been observed, or on overflow, there is no equivalent and c22 must not
+/// accelerate. A future tick longer than any observed one is a disclosed
+/// limit of this bound.
+pub(super) fn ordinary_equivalent(
+    cadence: &SourceCadence,
+    shape: Option<LoopShape>,
+) -> Option<Duration> {
+    let shape = shape?;
     cadence
         .ordinary_interval()
-        .min(MAX_CYCLE_INTERVAL)
-        .max(SNAPSHOT_SYNC_INTERVAL)
+        .checked_add(shape.longest_tick)?
+        .checked_add(shape.longest_cycle)
+}
+
+/// [`ordinary_equivalent`] for Codex now.
+#[allow(dead_code)] // c22's guard (after #660) is the first production caller.
+pub(super) fn production_ordinary_equivalent() -> Option<Duration> {
+    let shape = LOOP.lock().ok()?.shape();
+    with_source_cadence(SnapshotSource::Codex, |cadence| {
+        ordinary_equivalent(cadence, shape)
+    })
+    .flatten()
 }
 
 #[cfg(test)]

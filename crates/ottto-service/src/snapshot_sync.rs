@@ -2563,6 +2563,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                         watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).ok();
                     }
                 }
+                let cycle_started = Instant::now();
                 match sync_once_with_retry(&home, &support_dir, &daemon, &mut retry) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                     Err(error) => {
@@ -2570,6 +2571,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                         crate::net_resilience::handle_sync_failure(&daemon);
                     }
                 }
+                continuation::note_ordinary_cycle(cycle_started, Instant::now());
                 // The cycle cadence itself is unchanged. What the tiers gate is the
                 // expensive part — the local transcript scan and its upload — while
                 // agent-status/quota freshness has an independent source owner.
@@ -2650,8 +2652,14 @@ impl continuation::LoopHost for ContinuationLoop<'_> {
     fn pending(&mut self) -> Option<(Instant, Duration)> {
         continuation::production_pending()
     }
-    fn page(&mut self) -> continuation::Outcome {
-        continuation::run_production_page()
+    fn page(&mut self, deadline: Instant) -> continuation::Outcome {
+        continuation::run_production_page(
+            self.home,
+            self.support_dir,
+            self.daemon,
+            self.retry,
+            deadline,
+        )
     }
 }
 
@@ -3016,6 +3024,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Declared after the guard, so it settles before the lock is released.
+    let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -3023,18 +3033,7 @@ fn sync_once_with_retry(
     let account_witness = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
-    let api_base_url = snapshot_api_base_url();
-    let device_label = daemon
-        .machine_for_trusted_client()
-        .ok()
-        .map(|machine| machine.display_name);
-    let account_binding = daemon
-        .account_for_trusted_client()
-        .ok()
-        .map(|account| account.state);
-    let client = SnapshotApiClient::new(api_base_url)
-        .with_receipt_state_dir(support_dir)
-        .with_receipt_context(device_label, account_binding);
+    let client = snapshot_cycle_client(support_dir, daemon);
     let enabled_sources = enabled_snapshot_sources(&device);
 
     if let Some(source) = enabled_sources.first().copied() {
@@ -3110,7 +3109,65 @@ fn sync_once_with_retry(
             failed_sources.len()
         ));
     }
+    continuation_cycle.succeeded(enabled_sources.contains(&SnapshotSource::Codex));
     Ok(())
+}
+
+/// The cycle's API client, with the receipt state and context every cycle uses.
+fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> SnapshotApiClient {
+    let device_label = daemon
+        .machine_for_trusted_client()
+        .ok()
+        .map(|machine| machine.display_name);
+    let account_binding = daemon
+        .account_for_trusted_client()
+        .ok()
+        .map(|account| account.state);
+    SnapshotApiClient::new(snapshot_api_base_url())
+        .with_receipt_state_dir(support_dir)
+        .with_receipt_context(device_label, account_binding)
+}
+
+/// A continuation job's EOF completion, called with `SNAPSHOT_SYNC_LOCK` held:
+/// the existing authorized completion upload through
+/// [`SnapshotCycleOwner::finish_completed`], the same completion an ordinary
+/// Codex finish runs. Its local inputs are read as `sync_once_with_retry`
+/// reads them. It sends no cycle-start receipt, health upload or activity-hint
+/// request, and it is not a sync cycle, so its transport outcome does not feed
+/// the cycle streak.
+fn complete_continuation_eof(
+    home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    retry: &mut live_snapshot_retry::LiveRetryOwner,
+    completed: (SourcePreparation, ScanIndex, SourceScanResult),
+) -> Result<()> {
+    let (device, device_secret) = load_snapshot_device_credentials()?;
+    let Some(machine_id) = snapshot_machine_id(&device)? else {
+        return Err(anyhow!("machine identity is missing"));
+    };
+    let account_witness = daemon
+        .snapshot_scan_account_witness()
+        .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
+    let client = snapshot_cycle_client(support_dir, daemon);
+    let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
+    let mut failed_sources = Vec::new();
+    SnapshotCycleOwner {
+        client: &client,
+        device: &device,
+        device_secret: &device_secret,
+        machine_id: &machine_id,
+        home,
+        support_dir,
+        daemon,
+        transport_cycle: &mut transport_cycle,
+        failed_sources: &mut failed_sources,
+        started: Instant::now(),
+        codex_started: None,
+        account_witness,
+        retry,
+    }
+    .finish_completed(completed)
 }
 
 #[allow(dead_code)] // Native retained-copy preparation; activation review remains closed.
@@ -3228,6 +3285,42 @@ struct SnapshotCycleOwner<'a> {
     /// measured work. Only written while continuation pages are enabled.
     codex_started: Option<Instant>,
 }
+impl SnapshotCycleOwner<'_> {
+    /// One completed source scan: the census fence over the authority and
+    /// destination rechecks, then the unchanged `finish_sync_source`. An
+    /// ordinary finish and a continuation job's EOF completion both run this.
+    fn finish_completed(
+        &mut self,
+        (preparation, index, scan): (SourcePreparation, ScanIndex, SourceScanResult),
+    ) -> Result<()> {
+        use crate::source_rotation::Owner as _;
+        codex_scan_diagnostics::observe_existing_outer_census_fence(
+            preparation.source,
+            self.support_dir,
+            || {
+                self.validate(&preparation)?;
+                ensure_snapshot_destination_current(&preparation.upload_destination_namespace)
+            },
+        )?;
+        let source = preparation.source;
+        finish_sync_source(
+            preparation,
+            index,
+            scan,
+            self.client,
+            self.device,
+            self.device_secret,
+            source,
+            self.machine_id,
+            self.home,
+            self.support_dir,
+            self.daemon,
+            self.transport_cycle,
+            self.retry,
+        )
+    }
+}
+
 impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     type Source = SnapshotSource;
     type Frame = SourcePreparation;
@@ -3302,38 +3395,27 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         // Read before the scan is consumed; kept only if the finish succeeds.
         let continuation_ticket =
             (continuation::ENABLED && source == SnapshotSource::Codex).then(|| {
+                let endpoint = snapshot_api_base_url();
+                let authority = self
+                    .client
+                    .matches_api_base(&endpoint)
+                    .then(|| {
+                        continuation::current_authority(
+                            self.device,
+                            &endpoint,
+                            &self.account_witness,
+                        )
+                    })
+                    .flatten();
                 continuation::ordinary_ticket(
                     &continuation::NoCursorContinuation,
                     &completed.2,
                     &completed.0.upload_destination_namespace,
+                    authority,
                 )
             });
         let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
-            let (preparation, index, scan) = completed;
-            codex_scan_diagnostics::observe_existing_outer_census_fence(
-                source,
-                self.support_dir,
-                || {
-                    self.validate(&preparation)?;
-                    ensure_snapshot_destination_current(&preparation.upload_destination_namespace)
-                },
-            )?;
-            let source = preparation.source;
-            finish_sync_source(
-                preparation,
-                index,
-                scan,
-                self.client,
-                self.device,
-                self.device_secret,
-                source,
-                self.machine_id,
-                self.home,
-                self.support_dir,
-                self.daemon,
-                self.transport_cycle,
-                self.retry,
-            )
+            self.finish_completed(completed)
         });
         if let Some(ticket) = continuation_ticket {
             continuation::after_ordinary_codex_page(ticket, self.codex_started, finished.is_ok());
