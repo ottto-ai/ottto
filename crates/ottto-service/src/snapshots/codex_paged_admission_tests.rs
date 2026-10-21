@@ -1599,9 +1599,11 @@ fn outlived_grown_cursor_read_stages_the_audit_debt() {
 
 // F-T19(a), post-AD-1 (#659): an over-limit file that does not change while
 // its cursor read spans the audit interval certifies at commit: it
-// publishes, `audit_overdue` +0, no staged debt, no obligation due at the
-// commit time, and the next page starts no read. Before AD-1 this pinned the
-// P1-AUDIT-DUTY loop (debt staged, the next decision the full audit again).
+// publishes, verified at the commit time, `audit_overdue` +0, no staged
+// debt, no obligation due at the commit time, and the next page starts no
+// read. Before AD-1 this pinned the P1-AUDIT-DUTY loop (debt staged, the next
+// decision the full audit again). The Skip in later generations past
+// `commit + I` is #659's AD-T6/T7.
 #[test]
 fn outlived_unchanged_cursor_read_verifies_at_commit() {
     if !layout() {
@@ -1618,10 +1620,14 @@ fn outlived_unchanged_cursor_read_verifies_at_commit() {
             let mut index = ScanIndex::default();
             let mut published = false;
             let mut certified_at = 0;
+            let mut start_now = None;
             for number in 0..64 {
                 clock.set(now);
                 let (next, scan, _) = page(&fixture, index, Some(&cache), &collected_at(number));
                 index = next;
+                if start_now.is_none() && counters(&cache).jobs_started == 1 {
+                    start_now = Some(now);
+                }
                 if counters(&cache).jobs_certified == 1 {
                     published = !scan.snapshots.is_empty();
                     certified_at = number;
@@ -1632,11 +1638,17 @@ fn outlived_unchanged_cursor_read_verifies_at_commit() {
             assert!(published, "{:?}", counters(&cache));
             let c = counters(&cache);
             assert!(certified_at > 0, "the read spans the audit interval: {c:?}");
+            let start_now = start_now.expect("the cursor job started");
+            assert!(
+                now - start_now >= interval,
+                "the read outlives the audit interval: {c:?}"
+            );
             assert_eq!(c.audit_overdue, 0, "{c:?}");
             let checkpoint = cache.retained_checkpoint(&key).expect("certificate");
+            assert_eq!(checkpoint.last_full_verified(), now, "verified at commit");
             assert!(checkpoint.audit_debt().is_none(), "no staged debt");
             assert!(index.files[&key].audit_obligation(now).is_none());
-            // The loop is gone: the unchanged file is not read again.
+            // The next page (same generation) starts no read.
             let (_, again, stats) = page(
                 &fixture,
                 index,
@@ -1880,9 +1892,10 @@ fn paged_scan_reads_an_over_limit_parent_and_resolves_its_child() {
 }
 
 // F-T10 `LedgerCapped` (delta-656 §6): on a paged scan an over-limit parent
-// is admitted and cursor-read, but a parent with more than 4096 ownership
-// signatures still has no usable ledger: the child is held under
-// `LedgerCapped`, never `Oversize`, and nothing is counted oversized.
+// is admitted and cursor-read, but a parent with 4097 ownership signatures
+// (one turn plus 4096 usages), one past the cap, still has no usable ledger:
+// the child is held under `LedgerCapped`, never `Oversize`, and nothing is
+// counted oversized.
 #[test]
 fn paged_over_limit_parent_past_the_signature_cap_is_ledger_capped() {
     if !layout() {
@@ -1912,6 +1925,39 @@ fn paged_over_limit_parent_past_the_signature_cap_is_ledger_capped() {
                 }
             }
             panic!("no LedgerCapped witness: {:?}", counters(&cache));
+        })
+    });
+}
+
+// F-T10 at-cap control: 4096 ownership signatures (one turn plus 4095
+// usages) still give a ledger, and the paged scan resolves the child.
+#[test]
+fn paged_over_limit_parent_at_the_signature_cap_resolves_its_child() {
+    if !layout() {
+        return;
+    }
+    let usages = MAX_CODEX_PARENT_LEDGER_SIGNATURES as u64 - 1;
+    let home = ForkHome::with_parent(ForkHome::parent_with_usages(usages));
+    let parent_len = home.fixture.len(PARENT);
+    let cache = Arc::new(SharedCache::default());
+    with_test_unpaged_limit(parent_len - 1, || {
+        with_test_limits(64 * 1024, 64 * 1024, 64, || {
+            let mut index = ScanIndex::default();
+            for n in 0..96 {
+                let (next, scan) = home.generation(index, Some(&cache), n);
+                index = next;
+                let causes = parent_causes(&scan);
+                assert_eq!(
+                    causes[CodexParentUnresolvable::LedgerCapped.index()],
+                    0,
+                    "{causes:?}"
+                );
+                assert_eq!(scan.oversized_file_count, 0);
+                if ForkHome::parent_ledger(&index).is_some() && child_usage(&scan) {
+                    return;
+                }
+            }
+            panic!("the child did not resolve: {:?}", counters(&cache));
         })
     });
 }

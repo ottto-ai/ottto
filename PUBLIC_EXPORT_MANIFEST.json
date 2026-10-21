@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 734,
-  "content_sha256": "efc8360625cb4ba4f4fca94acbb2cb21e0c42c8dbebb350ebad5be2246e299fc",
+  "content_sha256": "da1682209cb5779bc6150bec4dc24b980c07d9d2b98b9d1795185cf4eabb3d17",
   "files": [
     {
       "executable": false,
@@ -1476,8 +1476,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_paged_admission_tests.rs",
-      "sha256": "7a1c41d8a603f219ef4f9ae4c59f7a17a0362dbc03ac60b37c3b90ad012872f3",
-      "size_bytes": 84555
+      "sha256": "69a03d439f50c74053fd8c11db1c7eddfe87fc8f01506e88deb72725d2bdf7e5",
+      "size_bytes": 86483
     },
     {
       "executable": false,
