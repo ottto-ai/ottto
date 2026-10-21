@@ -250,14 +250,22 @@ impl OwnedSourceScan {
         }
         self
     }
+    /// The conservative release: no resident measurement is supplied, so an
+    /// unsampled native active still clears (L-A1).
+    #[cfg(test)]
     pub(crate) fn release_sampled_cache_for_copy_refusal(&self) {
-        release_cache_for_copy_refusal(self.sampling.as_ref(), self.active_file.as_deref());
+        release_cache_for_copy_refusal(self.sampling.as_ref(), self.active_file.as_deref(), None);
     }
     /// Charge only optimization-owned native state, samples/keys and copies.
     /// The unchanged serial index/metadata is baseline; parked/proof/send
     /// frames still use their existing aggregate 32MiB allocation/lifetime gate.
+    #[cfg(test)]
     pub(super) fn sampled_copy_budget(&mut self) -> usize {
-        copy_budget_beside(
+        self.sampled_copy_parts().0
+    }
+    /// The copy budget and the resident bound measured by the same walk.
+    pub(super) fn sampled_copy_parts(&mut self) -> (usize, Option<usize>) {
+        copy_budget_parts(
             self.sampling.as_ref(),
             self.active_file.as_deref_mut(),
             false,
@@ -265,10 +273,32 @@ impl OwnedSourceScan {
     }
 }
 
+/// L-A1: an unsampled synchronous native read. Its retained entry, if any,
+/// was dropped before the active was built; it owns no acquisition, cursor
+/// job, group proof or tee, alias or receipt. Each conjunct is checked even
+/// where another implies it today.
+fn owns_no_optimization_state(active: &OwnedActiveFile) -> bool {
+    active.sampling.is_none()
+        && active.cursor.is_none()
+        && active.group.is_none()
+        && active.aliases.is_empty()
+        && active.applied_receipts.is_empty()
+        && active.parser.reader.acquisition.is_none()
+        && active
+            .parser
+            .accumulator
+            .codex_tier_replay
+            .as_ref()
+            .map_or(true, |replay| replay.join.is_none())
+}
+
 /// The copy-refusal release for `sampling` beside `active`.
+/// `measured_resident` is the resident bound from this same step's budget
+/// walk, used only for this decision; `None` keeps the conservative release.
 pub(super) fn release_cache_for_copy_refusal(
     sampling: Option<&Context>,
     active: Option<&OwnedActiveFile>,
+    measured_resident: Option<usize>,
 ) {
     if let Some(context) = sampling {
         // A full parser's native accumulator is the unchanged synchronous
@@ -292,6 +322,15 @@ pub(super) fn release_cache_for_copy_refusal(
             record(Event::ClearMetadataUnsupported);
         } else if active.is_none() {
             record(Event::ClearNoActive);
+        } else if active.is_some_and(owns_no_optimization_state) {
+            // Like a full parser, an unsampled native read is the unchanged
+            // synchronous baseline and retains nothing, so its refusal does
+            // not invalidate residents this step measured as bounded. This
+            // is not a combined native-plus-cache bound.
+            if measured_resident.is_some_and(|resident| resident <= STATE_BYTES) {
+                return;
+            }
+            record(Event::ClearFullResidentBoundUnknown);
         } else {
             record(Event::ClearOtherActive);
         }
@@ -305,9 +344,9 @@ pub(super) fn completion_copy_budget(
     sampling: Option<&Context>,
     active: &mut OwnedActiveFile,
 ) -> usize {
-    let budget = copy_budget_beside(sampling, Some(&mut *active), true);
+    let budget = copy_budget_parts(sampling, Some(&mut *active), true).0;
     if budget == 0 {
-        release_cache_for_copy_refusal(sampling, Some(&*active));
+        release_cache_for_copy_refusal(sampling, Some(&*active), None);
     }
     budget
 }
@@ -320,19 +359,21 @@ pub(super) fn completion_copy_budget(
 /// at the next walk, at most every `CHARGE_REFRESH_BYTES`); `completing`
 /// walks exactly, once, on the step that consumes the budget.
 /// This accounting is amortized across the job, not completion-only.
-pub(super) fn copy_budget_beside(
+/// Also returns the resident bound this walk measured (`None` on the early
+/// returns), for the same step's refusal decision only.
+pub(super) fn copy_budget_parts(
     sampling: Option<&Context>,
     active: Option<&mut OwnedActiveFile>,
     completing: bool,
-) -> usize {
+) -> (usize, Option<usize>) {
     let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
-        return 0;
+        return (0, None);
     };
     let Some(resident) = crate::heap_layout_bound::bound(context, STATE_BYTES) else {
-        return 0;
+        return (0, None);
     };
     let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
-        return 0;
+        return (0, None);
     };
     let active = active.map_or(Some(0), |active| {
         let consumed = active.parser.reader.consumed_bytes();
@@ -369,10 +410,11 @@ pub(super) fn copy_budget_beside(
         }
         bound
     });
-    active
+    let budget = active
         .and_then(|used| remaining.checked_sub(used))
         .map(|remaining| remaining / 2)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    (budget, Some(resident))
 }
 
 #[cfg(test)]
