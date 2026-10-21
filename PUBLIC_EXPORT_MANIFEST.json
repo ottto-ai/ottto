@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 739,
-  "content_sha256": "99bd41327ddecaf63978da446309de22f51004b22b624200df10c16a39e5184f",
+  "content_sha256": "9a993896b308b7b19d001f58144dba203a3a91b0a4d9950dbad4f4a7dc84181f",
   "files": [
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/stale_family_carry_pipeline_tests.rs",
-      "sha256": "810c8c0a29135fbcd398040b5dae914048329823a61385113a8910fefc7a8b8c",
-      "size_bytes": 25456
+      "sha256": "8f3950dacd5de234cf7114f9de41b33a5a9d3d388e2bec17784a24d118e679bd",
+      "size_bytes": 26436
     },
     {
       "executable": false,
@@ -1322,8 +1322,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "4faf1559d15e17ecdc7b20ebe418052c037b7d9b3f186388e6d8042593a780fc",
-      "size_bytes": 2986692
+      "sha256": "b320cfc8c8c313e27eaeaee95e7a2b71f88a040e6810f979b500645f5bfc064b",
+      "size_bytes": 2988594
     },
     {
       "executable": false,
@@ -3380,8 +3380,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-c1b-red-retry-stale-family-carry.md",
-      "sha256": "0c896501fb4d9ffe063d7e18426a74885991e9dbee217a0e83a5e6ea452e7e39",
-      "size_bytes": 7852
+      "sha256": "4385a18148526f04814dabbca620daa1032c4d4c61e9b49a5f3e44f59ae5156c",
+      "size_bytes": 8747
     },
     {
       "executable": false,
@@ -5176,7 +5176,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T17:46:24+00:00",
+  "generated_at": "2026-10-21T18:10:32+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 740,
   "public_roots": [
@@ -5215,5 +5215,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c06cdce4402b6577dd782c1b2a594c9405b7c2d1"
+  "source_commit": "587ce4e378dcb9a0b9714c3e3f205c4d4e6ff0b5"
 }
