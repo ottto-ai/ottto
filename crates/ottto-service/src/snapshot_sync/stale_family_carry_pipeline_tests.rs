@@ -504,8 +504,8 @@ fn c1b_assert_recoverable_change_proves_like_base(case: &'static str, page_files
 /// SOURCE B9, the reviewed recoverable case: after the red window the first
 /// subagent gains a request its provider ledger already recorded, and the red
 /// producer is repaired. The subagent is read on the second page, after the
-/// unchanged root was skipped on the first, so the cancel appends the root to
-/// the subagent's page.
+/// unchanged root was skipped on the first, so the cancel queues the root
+/// again for a later bounded page of the same window.
 #[test]
 #[serial(source_manifests)]
 fn c1b_recoverable_member_change_cancels_the_carry_and_proves_like_base() {
@@ -520,8 +520,9 @@ fn c1b_recoverable_member_change_cancels_the_carry_and_proves_like_base() {
 }
 
 /// The same recoverable change with every window on one page, so the change
-/// is discovered on the healthy terminal page itself. The cancel appends the
-/// already skipped root to that page, and the family still proves as BASE.
+/// is discovered on the page that would have been the healthy terminal. The
+/// cancel queues the already skipped root again, so the window gains one
+/// bounded page instead of ending there, and the family still proves as BASE.
 #[test]
 #[serial(source_manifests)]
 fn c1b_member_change_on_the_terminal_page_cancels_the_carry_like_base() {

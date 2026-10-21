@@ -67,9 +67,11 @@ still selected by the ordinary fingerprint comparison and re-read. Any parse
 of a carried family's member (changed, new, or selected by another gate)
 before any other member of that family is parsed in the window cancels the
 carry: every other member's revision is cleared, and members the walk already
-passed are appended to the current page, so the whole family is co-observed
-in that window as BASE's re-arm observes it. This also holds when the change
-is found on the terminal page. A content-free counter and a fixed-text log
+passed are queued again at the front of the traversal, so a later bounded
+page of the same window reads them and the whole family is co-observed in
+that window as BASE's re-arm observes it. When the change is found on the
+page that would have been terminal, that page is no longer terminal: the
+window gains one bounded page. The page file limit is unchanged. A content-free counter and a fixed-text log
 line record each cancellation.
 
 No persisted field, schema, cap or constant changes. The traversal-start row

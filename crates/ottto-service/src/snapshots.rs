@@ -3582,24 +3582,21 @@ pub(crate) fn claude_stale_family_carry_cancellations_for_test() -> usize {
 /// of that family has been parsed in this window yet, so its pending is still
 /// the compacted entry from an older window. Cancel the carry so the family is
 /// co-observed in this window as BASE's whole re-arm observes it: clear every
-/// other indexed member's retained revision, and append to this page every
-/// member the walk already passed. Members still queued on this page or the
-/// traversal, or not yet discovered, are read later in this window by their
-/// cleared revision. A family qualifies only while it is witnessed, no member
-/// of it was parsed earlier on this page and every other indexed member still
-/// retains its revision (a re-armed family's members do not), so the carry is
-/// cancelled at most once and no member is read twice for it.
-#[allow(clippy::too_many_arguments)]
+/// other indexed member's retained revision, and queue every member the walk
+/// already passed at the front of this traversal, so a later bounded page of
+/// the same census window reads it (a page that would have been terminal is
+/// then not). Members still queued on this page or the traversal, or not yet
+/// discovered, are read later in this window by their cleared revision. A
+/// family qualifies only while it is witnessed, no member of it was parsed
+/// earlier on this page and every other indexed member still retains its
+/// revision (a re-armed family's members do not), so the carry is cancelled
+/// at most once and no member is read twice for it.
 fn cancel_claude_family_carry_for_member_parse(
     index: &mut ScanIndex,
     census_window_end: &str,
     member_path: &Path,
     page_snapshots: &[SnapshotItem],
-    page: &mut VecDeque<CandidateFile>,
-    census: &mut ScanCensus,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-    mut prepare: impl FnMut(&mut CandidateFile),
+    page: &VecDeque<CandidateFile>,
 ) {
     let Some(member) = claude_index_path_member_ref(member_path) else {
         return;
@@ -3653,54 +3650,36 @@ fn cancel_claude_family_carry_for_member_parse(
             entry.source_file_fingerprint.clear();
         }
     }
-    let passed = index
-        .traversal
-        .as_ref()
-        .map(|traversal| {
-            others
+    let mut requeued = 0_usize;
+    if let Some(traversal) = index.traversal.as_mut() {
+        for index_key in &others {
+            let path = Path::new(index_key.as_str());
+            if !traversal.observed_index_keys.contains(index_key)
+                || page.iter().any(|candidate| candidate.path == path)
+                || traversal
+                    .pending_candidates
+                    .iter()
+                    .any(|pending| pending.path == path)
+            {
+                continue;
+            }
+            let Some(scan_root) = traversal
+                .scan_roots
                 .iter()
-                .filter(|index_key| {
-                    let path = Path::new(index_key.as_str());
-                    traversal.observed_index_keys.contains(*index_key)
-                        && !page.iter().any(|candidate| candidate.path == path)
-                        && !traversal
-                            .pending_candidates
-                            .iter()
-                            .any(|pending| pending.path == path)
-                })
-                .filter_map(|index_key| {
-                    let path = PathBuf::from(index_key);
-                    let scan_root = traversal
-                        .scan_roots
-                        .iter()
-                        .filter(|root| path.starts_with(root))
-                        .max_by_key(|root| root.components().count())
-                        .cloned()?;
-                    Some(ScanTraversalPath {
-                        scan_root,
-                        path,
-                        census_member: true,
-                        watcher_hint: false,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let mut appended = 0_usize;
-    for pending in passed {
-        let Some(mut candidate) = candidate_from_traversal_path(
-            SnapshotSource::ClaudeCode,
-            pending,
-            census,
-            census_unix_seconds,
-            backfill_window_days,
-            &index.files,
-        ) else {
-            continue;
-        };
-        prepare(&mut candidate);
-        page.push_back(candidate);
-        appended += 1;
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+            else {
+                continue;
+            };
+            traversal.pending_candidates.push_front(ScanTraversalPath {
+                scan_root,
+                path: path.to_path_buf(),
+                census_member: true,
+                watcher_hint: false,
+            });
+            requeued += 1;
+        }
     }
     CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -3708,9 +3687,9 @@ fn cancel_claude_family_carry_for_member_parse(
         .with(|cell| cell.set(cell.get().saturating_add(1)));
     eprintln!(
         "local snapshot census cancelled a stale Claude family carry: a member is parsed in the \
-         retry window; {} indexed file(s) re-armed, {} read again on this page",
+         retry window; {} indexed file(s) re-armed, {} queued again in this window",
         others.len(),
-        appended
+        requeued
     );
 }
 
@@ -19377,19 +19356,7 @@ impl OwnedSourceScan {
                     &census_window_end,
                     &candidate.path,
                     &snapshots,
-                    &mut identified_candidates,
-                    &mut census,
-                    census_unix_seconds,
-                    backfill_window_days,
-                    |appended| {
-                        prepare_owned_scan_candidate(
-                            source,
-                            appended,
-                            &codex_title_metadata,
-                            &claude_title_metadata,
-                            claude_effort_support_dir_ref,
-                        )
-                    },
+                    &identified_candidates,
                 );
             }
             if source == SnapshotSource::Codex && decision == CandidateDecision::Skip {

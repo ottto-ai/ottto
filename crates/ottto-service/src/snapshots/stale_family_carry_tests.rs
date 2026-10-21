@@ -200,6 +200,9 @@ fn carry_arms(
 /// BASE does. The row stays count-only.
 #[test]
 fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
     let ((fix, row), (base, base_row)) = carry_arms(&|_| {}, BACKFILL_WINDOW_DAYS);
     let before = carry_index();
     for arm_row in [&row, &base_row] {
@@ -265,6 +268,9 @@ fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
 /// (the tripwire is vacuous on it) with no re-arm of its family.
 #[test]
 fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
     let mut index = carry_index();
     carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
     // The retry re-read the unwitnessed family and ended red again.
@@ -303,6 +309,9 @@ fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
 /// shared pending budget counts only the re-armed family's.
 #[test]
 fn c1b_compaction_releases_the_pending_occurrence_budget() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
     let ((mut fix, _), (mut base, _)) = carry_arms(&|_| {}, BACKFILL_WINDOW_DAYS);
     let budget = |index: &mut ScanIndex| {
         accumulate_claude_usage_family_pending_with_limit(
@@ -323,6 +332,9 @@ fn c1b_compaction_releases_the_pending_occurrence_budget() {
 /// valid. With the unwitnessed family invalid, the witnessed one is carried.
 #[test]
 fn c1b_invalid_stale_family_cannot_reopen_so_the_witnessed_family_is_carried() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
     let mutate = |index: &mut ScanIndex| {
         index.files.remove(&carry_key(CARRY_OTHER, None));
         let pending = index
@@ -761,5 +773,29 @@ fn c1b_admitted_carry_scratch_carries_the_witnessed_family() {
     assert_eq!(row["carried_index_files"], 2);
     for key in carry_family_keys() {
         assert!(!fix.files[&key].source_file_fingerprint.is_empty());
+    }
+}
+
+/// F1, layout: the carry check is admitted exactly on the supported layout.
+/// Elsewhere it refuses, so every red retry start is BASE's.
+#[test]
+fn c1b_carry_scratch_admission_follows_the_supported_layout() {
+    let index = carry_index();
+    let stale = index
+        .claude_usage_family_pending
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        claude_stale_family_carry_scratch_admitted(&index, &stale, 0),
+        crate::heap_layout_bound::layout_supported()
+    );
+    if !crate::heap_layout_bound::layout_supported() {
+        let ((fix, row), (base, base_row)) = carry_arms(&|_| {}, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row, base_row);
+        assert_eq!(
+            serde_json::to_value(&fix).unwrap(),
+            serde_json::to_value(&base).unwrap()
+        );
     }
 }
