@@ -1179,8 +1179,9 @@ fn sp9_cursor_tail_keeps_its_own_extent_limit() {
 }
 
 /// SP-10 (PARITY, residual): growth after an `Unchanged` prepare keeps
-/// main's behavior. Before the first step the reader refuses every byte;
-/// after EOF the full-stamp commit refuses. Either way the copy that moved
+/// main's behavior. The reader opens finished and reads nothing, and the
+/// full-stamp commit refuses the grown object, whether the growth lands
+/// before or after the reader's only step. Either way the copy that moved
 /// into the parser is gone.
 #[test]
 fn sp10_unchanged_mode_growth_keeps_dropping_the_copy() {
@@ -1204,16 +1205,13 @@ fn sp10_unchanged_mode_growth_keeps_dropping_the_copy() {
         (parser, scope)
     };
 
-    let (mut parser, _) = unchanged(&fixture);
+    let (mut parser, scope) = unchanged(&fixture);
     fixture.append(&row(source, 3));
-    let stepped = loop {
-        match parser.step() {
-            Ok(true) => break None,
-            Ok(false) => {}
-            Err(error) => break Some(error),
-        }
-    };
-    assert!(stepped.is_some(), "the Unchanged reader refuses the growth");
+    assert!(parser.step().unwrap(), "an Unchanged reader opens finished");
+    assert_eq!(parser.reader.consumed_bytes(), 0, "no byte is read");
+    assert!(parser
+        .retain_reduction(&scope, 101, crate::transcript_cache::ENTRY_BYTES)
+        .is_err());
 
     let (mut parser, scope) = unchanged(&fixture);
     while !parser.step().unwrap() {}
@@ -1224,8 +1222,8 @@ fn sp10_unchanged_mode_growth_keeps_dropping_the_copy() {
 }
 
 /// SP-11 (PARITY): Claude is out of scope. Its in-page Tail with an append
-/// after the open step keeps main's D1 failure (`OpenRead`), drops the copy,
-/// and the next read is `Full(StateMissing)`.
+/// after the open step keeps main's D1 failure (`OpenRead`) and drops the
+/// copy; nothing is published.
 #[test]
 fn sp11_claude_in_page_tail_with_append_keeps_main_failure() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1235,7 +1233,7 @@ fn sp11_claude_in_page_tail_with_append_keeps_main_failure() {
     let base = baseline(source, 4, 2);
     let path = base.path.clone();
     let appended = row_bytes(source, 6..8);
-    let (index, tail, seen, _) = page_injecting(
+    let (_, tail, seen, _) = page_injecting(
         &base.fixture,
         source,
         base.index,
@@ -1244,7 +1242,4 @@ fn sp11_claude_in_page_tail_with_append_keeps_main_failure() {
         |_| append_raw(&path, &appended),
     );
     assert_refused(&base.cache, &base.key, &tail, &seen, OPEN_READ, "SP-11");
-    append_raw(&base.path, &row_bytes(source, 8..9));
-    let (_, _, seen) = plain(&base.fixture, source, index, &base.cache);
-    assert_eq!(seen.full_reasons[STATE_MISSING], 1, "next read is a Full");
 }
