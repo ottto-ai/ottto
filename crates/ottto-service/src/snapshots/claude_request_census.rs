@@ -493,7 +493,13 @@ impl<R: std::io::Read> CensusRead<R> {
             return Ok(Some(byte));
         }
         let mut byte = [0];
-        Ok((self.reader.read(&mut byte)? != 0).then_some(byte[0]))
+        loop {
+            match self.reader.read(&mut byte) {
+                // Keep root-key/evidence capture state across interrupted I/O.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => return Ok((result? != 0).then_some(byte[0])),
+            }
+        }
     }
 
     fn evidence(&mut self) -> std::io::Result<Vec<u8>> {
@@ -649,7 +655,13 @@ impl<R: std::io::Read> std::io::Read for CensusRead<R> {
                 || self.escaped
                 || self.root_array && self.depth == 1 && !self.quoted)
             {
-                let bytes = self.reader.fill_buf()?;
+                let bytes = match self.reader.fill_buf() {
+                    Ok(bytes) => bytes,
+                    // Retain the bytes already copied into out. Retrying at
+                    // Serde's Bytes layer would discard that consumed prefix.
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
                 let limit = bytes.len().min(out.len() - written);
                 let run = bytes[..limit]
                     .iter()
@@ -1996,6 +2008,62 @@ mod reader_regression_tests {
                 output.extend_from_slice(&buffer[..read]);
             }
             assert_eq!(output, expected, "read buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn census_bulk_decode_retries_interruptions_without_losing_consumed_bytes() {
+        struct InterruptedChunks<'a> {
+            remaining: &'a [u8],
+            chunk_size: usize,
+            interrupt_next: bool,
+            interruptions: usize,
+        }
+        impl Read for InterruptedChunks<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.interrupt_next {
+                    self.interrupt_next = false;
+                    self.interruptions += 1;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let limit = out.len().min(self.chunk_size);
+                let read = self.remaining.read(&mut out[..limit])?;
+                self.interrupt_next = read != 0;
+                Ok(read)
+            }
+        }
+
+        let mut index = ScanIndex {
+            claude_request_census: serde_json::from_value(serde_json::json!({
+                "synthetic/member": {"v": 1, "fp": "00".repeat(32), "w": 7, "s": "empty"},
+            }))
+            .expect("valid evidence"),
+            claude_request_census_shadow: ClaudeRequestCensusShadowState {
+                would_open: Some(true),
+                would_open_flips: 7,
+                derivation_drift: 0,
+            },
+            ..ScanIndex::default()
+        };
+        index
+            .confirmed_empty_files
+            .insert(format!("synthetic/{}", "x".repeat(16 * 1024)));
+        assert!(!index.claude_request_census.is_empty());
+        let expected = serde_json::to_value(&index).expect("expected index");
+        let bytes = serde_json::to_vec(&index).expect("index bytes");
+        // Every chunk is followed by an interruption. This includes ordinary
+        // copied runs, root-key capture and optional evidence capture. The
+        // schema-prefix case specifically interrupts after a consumed prefix.
+        for chunk_size in [1, 7, b"{\"schema_version\":".len(), 8191] {
+            let mut source = InterruptedChunks {
+                remaining: &bytes,
+                chunk_size,
+                interrupt_next: false,
+                interruptions: 0,
+            };
+            let decoded = decode_index(&mut source).expect("interrupted load/CAS read");
+            assert!(source.interruptions > 0);
+            assert_eq!(serde_json::to_value(decoded).expect("decoded"), expected);
         }
     }
 }
