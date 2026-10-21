@@ -32,8 +32,9 @@ refusal excluded files that the cursor could read.
   child (existing census ordering, unchanged). The ledger helps where the
   census exists at validation: a resumed traversal, or a sampled scan.
 - **Parent ledger cap.** A paged scan admits and cursor-reads an over-limit
-  parent, but a parent past the 4096-signature cap still has no usable
-  ledger: its child is held under `LedgerCapped`, never `Oversize`.
+  parent, but a parent with 4097 ownership signatures, one past the cap,
+  still has no usable ledger: its child is held under `LedgerCapped`, never
+  `Oversize`. At the cap (4096) the ledger resolves the child.
 - **One runtime refusal** (`refuse_unpaged_overrun`), at every point where a
   non-cursor read starts:
   - R-a: the main-loop read;
@@ -102,14 +103,21 @@ FC1 moves one read, the first priority tail's in-page replay, to the cursor:
 `ceil(L / 64 MiB)` pages once. Later changes cost what they cost on main.
 A test pins this: the second change is a Full cursor read, not an O7 tail.
 
+Protection is a sufficient cause of that per-change cost, not the only one.
+A cursor reduction is retained only with at most 256 distinct usage turns
+(`MAX_PRIORITY_WITNESSES`), so a file over that is not retained either and
+its next change is a full cursor read
+(`over_limit_file_with_257_usage_turns_is_not_retained`). A session over
+2 GiB is expected to exceed 256 turns.
+
 | File length L | Pages | 5-minute cadence | Idle cadence (10 min) |
 |---|---|---|---|
 | 65 MiB – 2 GiB (existing), first priority tail | 2 – 32, once | 10 min – 2.7 h | 20 min – 5.3 h |
-| 4 GiB (newly admitted), every protected change | 64 per change | 5.3 h | 10.7 h |
-| over 2 GiB in general | `ceil(L / 64 MiB)` per change | no upper bound: linear in L | no upper bound |
+| 4 GiB (newly admitted), every change of a non-retained file (protected, or over 256 usage turns, expected for sessions over 2 GiB) | 64 per change | 5.3 h | 10.7 h |
+| over 2 GiB in general, same files | `ceil(L / 64 MiB)` per change | no upper bound: linear in L | no upper bound |
 
 Files over 2 GiB are new coverage (they were excluded before). Once
-protected, each of their changes is a Full cursor read of the whole file.
+non-retained, each of their changes is a Full cursor read of the whole file.
 
 **Plus the slot wait.** There is one cursor slot, rotated by whole attempts.
 On main, every change of a protected file over 64 MiB already takes a whole
@@ -138,15 +146,39 @@ and there is no fence.
 
 **After AD-1 (#659).** AD-1 does not change any figure above. It changes what
 follows a file's last change. The audit interval is one hour, so a cursor
-read of more than about 12 pages at the 5-minute cadence (a file over about
-768 MiB) outlives it. Before AD-1, such a read of an unchanged file staged
+read of more than about 12 pages at the 5-minute cadence, or about 6 pages
+at the 10-minute idle cadence, outlives it: a file over about 768 MiB or
+about 384 MiB respectively, or a smaller one when the read waits for the
+slot or the fence. Before AD-1, such a read of an unchanged file staged
 audit debt and was read in full again every generation, so a large quiescent
 file kept paying whole reads with no change at all. After AD-1 a stable
-outlived read verifies at commit: a quiescent file needs at most one more
-whole read after its last change, then it is skipped (F-T19(a)). A read
+outlived read verifies at commit: a quiescent, loss-free, complete file
+under a trusted census needs at most one more whole read after its last
+change (F-T19(a); the Skip in later generations is #659's AD-T6/T7). A read
 during which the file grows still stages its debt (F-T19(b)), so an active
-protected session over 2 GiB can be read back to back while it keeps
+non-retained session over 2 GiB can be read back to back while it keeps
 changing; that is the per-change cost above, not an extra one.
+
+**Does not converge, for files over 2 GiB (new coverage).** These are the
+non-converging classes of the FC1 design of record (§0.3, the four-class
+steady-state table). FC1 does not create their mechanisms; it newly exposes
+files over 2 GiB to them.
+
+- **Lossy** (for example, one record over 16 MiB, `MAX_JSONL_LINE_BYTES`):
+  the read refuses as `Lossy` before AD-1's arm, publishes uncertified and
+  keeps its marker (#659's
+  `lossy_grown_job_publishes_uncertified_through_same_object_identity`). It
+  costs `ceil(L / 64 MiB)` pages every census generation with no change,
+  holding the single slot, and its marker permanently takes one audit slot
+  toward the pending limit that disables sampling for every file when
+  exceeded.
+- **N2, a withheld final record on a stable file:** its fragment debt is due
+  at the read's start plus one hour, so a read that outlives the interval
+  (every read over 2 GiB) is due at commit. The same `ceil(L / 64 MiB)`
+  pages every generation, while the record stays withheld.
+- **Singletons under an untrusted census:** the cursor certificate is not
+  retained, so every change is a whole `ceil(L / 64 MiB)` read while the
+  census stays untrusted.
 
 The bytes read are the same as before; they are spread over pages instead of
 one page of up to 2 GiB. This is a material publication-latency cost for a
@@ -154,13 +186,17 @@ priority-tier session's first priority change over 64 MiB, and for every
 change of protected sessions over 2 GiB. It is not a counter shift. It is the
 price of never reading more than the singleton budget in one page.
 
-## Residuals (unchanged by this change)
+## Residuals
 
 - P1-AUDIT-DUTY, as left by AD-1 (#659): a read that outlives the audit
-  interval verifies at commit when the file was stable (F-T19(a)); a grown,
-  partial or lossy read still stages its debt (F-T19(b)).
-- P1-RETAIN: retention limits and eviction.
-- Lossy reads and N2.
+  interval verifies at commit when the file was stable (F-T19(a)). A grown
+  read stages its debt (F-T19(b)); a partial read does too (#659's AD-T4).
+  A lossy read refuses before the arm and keeps its marker (#659's
+  `lossy_grown_job_publishes_uncertified_through_same_object_identity`).
+- P1-RETAIN: retention limits and eviction. Mechanism unchanged; FC1 extends
+  its reach to files over 2 GiB (the per-change row above; design §0.3).
+- Lossy reads and N2. Mechanism unchanged; FC1 extends its reach to files
+  over 2 GiB (the "does not converge" list above; design §0.3).
 - Restart, memory pressure and unsupported layouts. A scan with an
   unsupported layout still refuses Codex files over 2 GiB, counted and
   disclosed.
