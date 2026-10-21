@@ -403,7 +403,7 @@ impl SideLedger {
             .keys()
             .find(|key| {
                 key.ns != caller
-                    && self.slot(key.ns).is_none_or(|slot| {
+                    && self.slot(key.ns).map_or(true, |slot| {
                         now.saturating_sub(slot.last_saved_unix) >= NAMESPACE_IDLE_SECONDS
                     })
             })

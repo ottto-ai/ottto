@@ -5018,7 +5018,6 @@ fn capture_codex_recovery_evidence(
     scan_result.finish_codex_capture_boundary(index);
 }
 
-#[allow(clippy::too_many_arguments)]
 /// U1a-2a (C15): this pass's side-ledger entries are now on disk (a full
 /// save, or a partial checkpoint that carries every side field).
 fn note_codex_side_saved(
@@ -5032,6 +5031,7 @@ fn note_codex_side_saved(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_sync_source(
     preparation: SourcePreparation,
     mut index: ScanIndex,
