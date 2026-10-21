@@ -2427,7 +2427,9 @@ fn admit_locked(
 }
 
 impl SharedCache {
-    fn with_cursor<T>(&self, run: impl FnOnce(&mut CursorState) -> T) -> Option<T> {
+    /// The cursor lock, marked held (`CursorHeld`) for `run`. Also R0's
+    /// blocking resident measure (`SharedCache::heap_bound`).
+    pub(super) fn with_cursor<T>(&self, run: impl FnOnce(&mut CursorState) -> T) -> Option<T> {
         // Checked before locking: a relock would deadlock, not panic.
         debug_assert!(
             !cursor_held(),

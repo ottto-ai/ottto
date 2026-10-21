@@ -844,6 +844,10 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
         let run = run(&mut world, Opts::default());
         let probe = run.probe;
         assert_eq!(probe.need, None, "{source:?}");
+        assert!(
+            probe.finalization_prev > 0,
+            "β: the Full insert's finalization charge reaches the Tail {source:?}"
+        );
         assert_eq!(
             probe.k,
             probe.clone.map(|clone| clone.max(probe.finalization_prev)),
@@ -1442,6 +1446,86 @@ fn r0_retained_relock_panics_in_debug_builds() {
     let cache = sampled_scan::SharedCache::default();
     let _held = cache.retained().unwrap();
     let _ = cache.retained();
+}
+
+/// T-D1: R0's completion measure waits for a held retained lock; every other
+/// walk reads contention as unbounded.
+#[test]
+fn r0_blocking_measure_waits_for_the_retained_lock() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let guard = cache.retained().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(guard);
+        })
+    };
+    held_rx.recv().unwrap();
+    assert_eq!(
+        crate::heap_layout_bound::bound(&*cache, usize::MAX),
+        None,
+        "an ordinary walk reads contention as unbounded"
+    );
+    release_tx.send(()).unwrap();
+    let blocking = {
+        let _blocking = sampled_scan::BlockingResidentMeasure::enter();
+        crate::heap_layout_bound::bound(&*cache, usize::MAX)
+    };
+    holder.join().unwrap();
+    assert!(blocking.is_some());
+    assert_eq!(
+        blocking,
+        crate::heap_layout_bound::bound(&*cache, usize::MAX),
+        "the same bound as uncontended"
+    );
+}
+
+/// T-D3 (β): an insert keeps its own finalization charge on the entry, apart
+/// from the cursor reservation, and the next take carries it.
+#[test]
+fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let fixture = resident(
+            source,
+            &cache,
+            1,
+            SystemTime::now() - Duration::from_secs(60),
+        );
+        let taken = cache.take(&key(&fixture)).expect("resident");
+        assert!(
+            taken.finalization_charge > 0,
+            "a production insert carries its finalization charge {source:?}"
+        );
+        cache.insert(
+            key(&fixture),
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: taken.retained.checkpoint,
+                reduction: Some(taken.retained.state),
+                released: None,
+            },
+            1_234,
+        );
+        assert_eq!(
+            cache
+                .take(&key(&fixture))
+                .expect("reinserted")
+                .finalization_charge,
+            1_234,
+            "{source:?}"
+        );
+    }
 }
 
 /// The packet: one bucket per refused pass, from the budget it was admitted

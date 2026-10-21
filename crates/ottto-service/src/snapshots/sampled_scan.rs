@@ -130,8 +130,18 @@ impl std::fmt::Debug for SharedCache {
 }
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        self.inner.heap_bound(c)?;
-        self.cursor.heap_bound(c)
+        if BLOCKING_RESIDENT_MEASURE.with(std::cell::Cell::get) {
+            // P1-RETAIN R0's completion measure: wait for each lock, one at a
+            // time and in lock order (`retained` checks this thread holds
+            // neither; `with_cursor` marks the cursor lock held, as every
+            // cursor critical section does), so contention is never read as
+            // an unbounded resident.
+            self.retained().ok()?.heap_bound(c)?;
+            self.with_cursor(|cursor| cursor.heap_bound(c)).flatten()
+        } else {
+            self.inner.heap_bound(c)?;
+            self.cursor.heap_bound(c)
+        }
     }
 }
 impl SharedCache {
@@ -238,15 +248,19 @@ impl SharedCache {
                 // records, outstanding claims) keeps its charge: admission may
                 // not fill the state budget underneath it. Measured under the
                 // retained lock, so every claim made before this insert is seen.
+                // `live_bytes` is this copy's own finalization charge: kept on
+                // the entry, so its next shape-F completion reserves it beside
+                // the copy (P1-RETAIN β, `K = max(C, F_prev)`).
                 // A copy whose R0 release ran is admitted at exactly the rank
                 // that release ranked residents against.
-                let live_bytes = live_bytes.saturating_add(self.cursor_resident());
+                let reserved = live_bytes.saturating_add(self.cursor_resident());
                 cache.insert_reserving_at_rank(
                     key,
                     crate::transcript_cache::Retained {
                         checkpoint: completed.checkpoint,
                         state,
                     },
+                    reserved,
                     live_bytes,
                     completed.released,
                 );

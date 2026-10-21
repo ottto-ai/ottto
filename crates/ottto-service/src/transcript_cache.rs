@@ -381,19 +381,22 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// cannot mutate the authoritative file index or settle upload progress.
     #[cfg(test)]
     pub(crate) fn insert(&mut self, key: String, retained: Retained<S>) -> bool {
-        self.insert_reserving(key, retained, 0)
+        self.insert_reserving(key, retained, 0, 0)
     }
     /// `live_bytes` is an actual checked native-layout charge, not file size.
     /// Native output/active copies keep this room while entries are admitted.
-    /// Production admits through `insert_reserving_at_rank`.
+    /// `finalization_charge` (within `live_bytes`) is this entry's own
+    /// finalization copy, carried to its next take (P1-RETAIN β). Production
+    /// admits through `insert_reserving_at_rank`.
     #[cfg(test)]
     pub(crate) fn insert_reserving(
         &mut self,
         key: String,
         retained: Retained<S>,
         live_bytes: usize,
+        finalization_charge: usize,
     ) -> bool {
-        self.insert_reserving_at_rank(key, retained, live_bytes, None)
+        self.insert_reserving_at_rank(key, retained, live_bytes, finalization_charge, None)
     }
     /// `insert_reserving`, admitting the entry at `rank` when one was computed
     /// before (P1-RETAIN R0: the rank its completion's release ran against,
@@ -405,13 +408,21 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         key: String,
         retained: Retained<S>,
         live_bytes: usize,
+        finalization_charge: usize,
         rank: Option<(i64, i64)>,
     ) -> bool {
         match rank {
-            Some(rank) => self.admit_at_rank(key, retained, live_bytes, 0, rank),
-            None => self.insert_at(key, retained, live_bytes, admission_now()),
+            Some(rank) => self.admit_at_rank(key, retained, live_bytes, finalization_charge, rank),
+            None => self.admit(
+                key,
+                retained,
+                live_bytes,
+                finalization_charge,
+                admission_now(),
+            ),
         }
     }
+    #[cfg(test)]
     fn insert_at(
         &mut self,
         key: String,
@@ -562,7 +573,8 @@ mod tests {
             assert!(!cache.insert_reserving(
                 "no-room".into(),
                 retained("x".into()),
-                2 * 1024 * 1024
+                2 * 1024 * 1024,
+                0
             ));
             // Cursor reservation still uses the same victim order. Leave room
             // for the empty map; no policy or byte limit is changed.
@@ -705,7 +717,8 @@ mod tests {
             assert!(cache.insert_reserving(
                 n.to_string(),
                 retained("x".repeat(4 * 1024 * 1024)),
-                live_bytes
+                live_bytes,
+                0
             ));
             assert!(cache.resident_bound().unwrap() + live_bytes + overlap <= CACHE_BYTES);
         }
@@ -713,7 +726,12 @@ mod tests {
             cache.entries.len() < 8,
             "admission evicts instead of consuming live/overlap reservation"
         );
-        assert!(!cache.insert_reserving("no-room".into(), retained("x".into()), 33 * 1024 * 1024));
+        assert!(!cache.insert_reserving(
+            "no-room".into(),
+            retained("x".into()),
+            33 * 1024 * 1024,
+            0
+        ));
     }
     #[test]
     fn sampled_cache_frozen_charges_survive_aggregate_walk_pressure_and_remeasure_mutation() {
@@ -970,12 +988,14 @@ mod tests {
             "carried".into(),
             retained_at("c".into(), Some(500)),
             0,
+            0,
             Some((90, 0))
         ));
         assert_eq!(cache.entries["carried"].modified_hint, (90, 0));
         assert!(cache.insert_reserving_at_rank(
             "ranked".into(),
             retained_at("r".into(), Some(50)),
+            0,
             0,
             None
         ));
