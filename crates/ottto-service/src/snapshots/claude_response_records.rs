@@ -133,7 +133,7 @@ impl ClaudeSelectorTable {
         CompactClaudeSelector::Interned((self.selectors.len() - 1) as u32)
     }
 
-    fn get(&self, selector: &CompactClaudeSelector) -> Option<&SelectorCapture> {
+    fn get<'a>(&'a self, selector: &'a CompactClaudeSelector) -> Option<&'a SelectorCapture> {
         match selector {
             CompactClaudeSelector::Interned(index) => self.selectors.get(*index as usize),
             CompactClaudeSelector::Inline(selector) => Some(selector),
