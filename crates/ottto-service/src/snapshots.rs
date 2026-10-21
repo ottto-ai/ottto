@@ -27311,10 +27311,39 @@ fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
 }
 
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(limit) = TEST_CLAUDE_FILE_CAP.with(std::cell::Cell::get) {
+            return limit;
+        }
+    }
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode | SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLAUDE_FILE_CAP: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A scaled Claude file cap for tests only, so oversized-transcript fixtures
+/// are KiB-sized; production values never change. Every Claude site that
+/// reads `max_jsonl_file_bytes` sees it on this thread: discovery,
+/// revalidation, open and the finish identity.
+#[cfg(test)]
+fn with_test_claude_file_cap<T>(limit: u64, run: impl FnOnce() -> T) -> T {
+    // Restores the enclosing cap, so an unscaled oracle can nest.
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CLAUDE_FILE_CAP.with(|slot| slot.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_CLAUDE_FILE_CAP.with(|slot| slot.replace(Some(limit))));
+    run()
 }
 
 /// Resolve one operator-configured root before discovery. A configured root
@@ -31541,6 +31570,7 @@ pub(crate) mod envelope_selection_experiment {
 #[cfg(test)]
 mod tests {
     include!("snapshots/claude_request_account_tests.rs");
+    include!("snapshots/paged_claude_s0_baseline_tests.rs");
     mod claude_request_identity_tests {
         include!("snapshots/claude_request_identity_tests.rs");
     }
