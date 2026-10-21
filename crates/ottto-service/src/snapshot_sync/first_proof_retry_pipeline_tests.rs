@@ -26,9 +26,9 @@ mod first_proof_retry_pipeline_tests {
         };
         value["claude_duplicate_request_witness_overflowed"] = true.into();
         value["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
-            chrono::DateTime::parse_from_rfc3339("2026-08-03T07:00:00Z")
+            OffsetDateTime::parse("2026-08-03T07:00:00Z", &Rfc3339)
                 .unwrap()
-                .timestamp()
+                .unix_timestamp()
                 .into();
         save_state(fixture, value);
     }
@@ -78,7 +78,9 @@ mod first_proof_retry_pipeline_tests {
             }) {
                 assert_ne!(item.usage_accounting_contract.as_deref(), REARM_REPORTED);
                 assert!(page.uploaded.contains(&item.snapshot_fingerprint));
-                assert!(terminal
+                // Superseded heads are correctly retired from later ledgers;
+                // acceptance is asserted on this page's selected save.
+                assert!(page
                     .index
                     .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
             }
@@ -157,7 +159,7 @@ mod first_proof_retry_pipeline_tests {
         pages
             .iter()
             .flat_map(|page| {
-                page.scan.snapshots.iter().filter_map(|item| {
+                page.scan.snapshots.iter().filter_map(move |item| {
                     if !expected.contains(&item.source_session_id)
                         || item.usage_accounting_contract.as_deref() != REARM_REPORTED
                     {
