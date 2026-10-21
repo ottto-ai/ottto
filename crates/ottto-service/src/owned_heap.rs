@@ -154,9 +154,6 @@ impl<K: Ord + HeapLayoutBound, V: HeapLayoutBound> OwnedMap<K, V> {
             .and_then(|n| n.checked_sub(heap(&key)?)?.checked_sub(heap(&value)?));
         Some(value)
     }
-    pub(crate) fn into_values(self) -> std::collections::btree_map::IntoValues<K, V> {
-        self.values.into_values()
-    }
 }
 impl<K: Ord + Clone + HeapLayoutBound, V: Clone + HeapLayoutBound> Clone for OwnedMap<K, V> {
     fn clone(&self) -> Self {
