@@ -930,6 +930,29 @@ fn decode_api_sidecar(
     support_dir: &Path,
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    decode_api_sidecar_within(support_dir, session_id, MAX_EVIDENCE_FILE_BYTES)
+}
+
+/// One root's strict API rows, read only when the whole file is shorter than
+/// `max_bytes` and stays the same file and length through the read (the
+/// money shadow's admitted reread). None when missing, larger, changed or not
+/// fully healthy; the read never passes `max_bytes`.
+pub(crate) fn load_claude_api_rows_within(
+    support_dir: &Path,
+    session_id: &str,
+    max_bytes: u64,
+) -> Option<Vec<ClaudeLocalOtelEvidence>> {
+    let (rows, witness) = decode_api_sidecar_within(support_dir, session_id, max_bytes).ok()?;
+    (witness.generation.is_some() && witness.health.is_complete()).then_some(rows)
+}
+
+/// `decode_api_sidecar` with its read bound: a file of `limit` bytes or more
+/// is oversized and never read past `limit`.
+fn decode_api_sidecar_within(
+    support_dir: &Path,
+    session_id: &str,
+    limit: u64,
+) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
     let path = evidence_path(support_dir, session_id);
     let mut health = ClaudeLocalOtelLoadHealth::default();
     let empty = |health| {
@@ -956,7 +979,7 @@ fn decode_api_sidecar(
     if !metadata.is_file() {
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
-    if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if metadata.len() >= limit {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -987,13 +1010,13 @@ fn decode_api_sidecar(
     if !opened.is_file() {
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
-    if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if opened.len() >= limit {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
     let before_opened = api_file_generation(&opened);
     // A concurrent writer must not defeat the existing per-file read bound.
-    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
+    let mut reader = BufReader::new((&file).take(limit));
     let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
@@ -1001,7 +1024,7 @@ fn decode_api_sidecar(
             hook(&path);
         }
     });
-    if bytes >= MAX_EVIDENCE_FILE_BYTES {
+    if bytes >= limit {
         health.oversized_files += 1;
         return Ok(empty(health));
     }

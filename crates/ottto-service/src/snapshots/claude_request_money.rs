@@ -46,7 +46,7 @@ pub(crate) const SHADOW_MEMORY_CEILING_BYTES: usize = 32 * 1024 * 1024;
 /// Each reread is admitted on its own, before it reads, from its file length;
 /// a refused or oversized reread leaves that root's rows unavailable.
 const REREAD_MAX_ROOTS: usize = 16;
-const REREAD_MAX_FILE_BYTES: u64 = 512 * 1024;
+const REREAD_MAX_FILE_BYTES: u64 = 256 * 1024;
 /// The shortest line the loader can keep as a row: the session id (36), a
 /// request id and the JSON keys around them.
 const REREAD_MIN_ROW_LINE_BYTES: u64 = 48;
@@ -861,10 +861,11 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) rows_unavailable_roots: u64,
     /// The live load reported a fault, so its rows were reread per root.
     pub(crate) rows_live_distrusted: u64,
-    /// Rereads refused by admission, and rereads dropped because the file
-    /// grew past its admitted length (both leave the root unavailable).
+    /// Rereads refused by admission, and rereads that failed (the file grew
+    /// past its admitted length, changed, or was not fully healthy); both
+    /// leave the root unavailable.
     pub(crate) rows_reread_refused: u64,
-    pub(crate) rows_reread_grew: u64,
+    pub(crate) rows_reread_failed: u64,
     pub(crate) unbuilt_items: u64,
     pub(crate) residue_negative: u64,
     pub(crate) tokens_old: u64,
@@ -1123,15 +1124,17 @@ pub(crate) fn shadow_page_at(
             None => {}
             Some(len) if len <= REREAD_MAX_FILE_BYTES && reread_left > 0 => {
                 reread_left -= 1;
-                // The decoded rows (their strings fit in the file's bytes),
-                // their page-hash entries and holders.
+                // The read never passes `len` bytes. Charged: the line buffer,
+                // the rows' strings and the decoder's id sets (each within
+                // the file's bytes), the row vector at its growth peak, the
+                // page-hash entries and the holders.
                 let rows_bound = (len / REREAD_MIN_ROW_LINE_BYTES) as usize;
-                let charge =
-                    (len as usize)
-                        .saturating_add(rows_bound.saturating_mul(
-                            std::mem::size_of::<ClaudeLocalOtelEvidence>() + ROW_BYTES,
-                        ))
-                        .saturating_add(claude_request_ledger::holders_bound(rows_bound));
+                let row_bytes =
+                    2 * std::mem::size_of::<ClaudeLocalOtelEvidence>() + ROW_BYTES + 128;
+                let charge = (len as usize)
+                    .saturating_mul(3)
+                    .saturating_add(rows_bound.saturating_mul(row_bytes))
+                    .saturating_add(claude_request_ledger::holders_bound(rows_bound));
                 let Some(reservation) = ShadowReservation::admit(charge) else {
                     counts.rows_reread_refused += 1;
                     unavailable.insert(root);
@@ -1139,24 +1142,22 @@ pub(crate) fn shadow_page_at(
                 };
                 reread_reservations.push(reservation);
                 counts.admission_bytes = counts.admission_bytes.saturating_add(charge as u64);
-                let report = crate::claude_local_otel::load_claude_api_request_evidence_report(
-                    support_dir,
-                    [root.to_owned()],
-                );
                 counts.rows_reread_roots += 1;
                 counts.rows_reread_bytes += len;
-                let kept = report.evidence.values().map(Vec::len).sum::<usize>();
-                if kept > rows_bound {
-                    // The file grew past its admitted length: drop it.
-                    counts.rows_reread_grew += 1;
-                    unavailable.insert(root);
-                } else if report.health.is_complete() {
-                    reread.insert(
-                        root.to_owned(),
-                        report.evidence.into_values().flatten().collect(),
-                    );
-                } else {
-                    unavailable.insert(root);
+                // Bounded by the admitted length: a file that grew, changed
+                // or is not fully healthy leaves the root unavailable.
+                match crate::claude_local_otel::load_claude_api_rows_within(
+                    support_dir,
+                    root,
+                    len.saturating_add(1),
+                ) {
+                    Some(rows) => {
+                        reread.insert(root.to_owned(), rows);
+                    }
+                    None => {
+                        counts.rows_reread_failed += 1;
+                        unavailable.insert(root);
+                    }
                 }
             }
             Some(_) => {
