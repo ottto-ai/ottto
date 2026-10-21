@@ -2431,6 +2431,9 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::CodexAccountStopWaiting { .. } => "codex_account_stop_waiting",
         LocalControlCommand::CodexAccountStartSignIn { .. } => "codex_account_start_sign_in",
         LocalControlCommand::CodexAccountRemove { .. } => "codex_account_remove",
+        LocalControlCommand::CodexAccountSetQuotaRefreshConsent { .. } => {
+            "codex_account_set_quota_refresh_consent"
+        }
         LocalControlCommand::Detect { .. } => "detect",
         LocalControlCommand::Setup { .. } => "setup",
         LocalControlCommand::SetupAnswer { .. } => "setup_answer",

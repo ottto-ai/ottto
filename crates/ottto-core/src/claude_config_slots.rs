@@ -2661,6 +2661,8 @@ fn status_contract_with_selected_operation(
         browser_auth_supported: None,
         auth_code_entry_supported: None,
         retained_provisional_login_count: None,
+        // This daemon's consent also withholds background limit reads.
+        consent_covers_limit_reads: Some(true),
     }
 }
 
