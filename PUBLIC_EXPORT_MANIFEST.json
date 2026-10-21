@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 727,
-  "content_sha256": "a02f8fbccb67c21247798586aedd54aa8af1d22faef647d74677a2fd84b97026",
+  "candidate_file_count": 729,
+  "content_sha256": "b8dd1ca99fb2b0d185d1216251c719e8912f3af65cff47ec209bd77df1af0051",
   "files": [
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "d82ccd5dad1b3e8d93874d6d76aa85dab8ce92533939def66df07171bf9ff587",
-      "size_bytes": 2915912
+      "sha256": "917d1b0a7d4ac3a3c5528d0251c4a656104b67681ba9be28b89a9c9273d4ea07",
+      "size_bytes": 2933262
     },
     {
       "executable": false,
@@ -1380,6 +1380,13 @@
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
       "sha256": "c4c6a22805129de08b9f721cae4c33bee598a6d27b78488e4ea77b41a20b0bae",
       "size_bytes": 59711
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_posture_member_waiver_tests.rs",
+      "sha256": "dc09cc73cf5ede3fd2fe55c516ae622fb851e89f96b5314aecd66cc041f5117f",
+      "size_bytes": 41375
     },
     {
       "executable": false,
@@ -2337,8 +2344,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-30-claude-owned-context-posture.md",
-      "sha256": "b249d24e317f7ec59a56b4ced6d7c8ca115f35816af7ef2b6648b0e31a0dbc38",
-      "size_bytes": 6013
+      "sha256": "c35e7ada03f56bfbfa91d703b8280cab0842f86a571a7e190efdcf9699007815",
+      "size_bytes": 6356
     },
     {
       "executable": false,
@@ -3291,6 +3298,13 @@
       "path": "docs/session-2026-10-19-retained-cache-lifecycle.md",
       "sha256": "b0a030fe780592407e0b9ea233fe9e8ef041c4a5994ddda2ae07fd85305fd135",
       "size_bytes": 2797
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-20-claude-posture-member-waiver.md",
+      "sha256": "cd7631b55991ee290c814fb69432c3ef67ee50022c283a576ea7b5d2dcccc052",
+      "size_bytes": 6246
     },
     {
       "executable": false,
@@ -5092,9 +5106,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T06:00:51+00:00",
+  "generated_at": "2026-10-21T07:18:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 728,
+  "output_file_count": 730,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5131,5 +5145,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3a67fe826d681e6550b4ed2078018b5835f71141"
+  "source_commit": "ff0859562f416e974060a16b6305100a71716716"
 }
