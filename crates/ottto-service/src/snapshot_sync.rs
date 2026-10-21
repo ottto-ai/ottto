@@ -241,7 +241,16 @@ fn with_bootstrap_deferred(
 }
 
 // Local index projection producer revision; independent of semantic/wire identity.
-const EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION: u64 = 1;
+// Each indexed file whose stored revision differs is re-read once; the stamp is
+// written only when its upload settles, so an interrupted pass resumes. Claude
+// Code 2 re-reads its history once so the newer context numbers fill in. Bump a
+// source at most once per release; Codex and Pi stay unchanged.
+pub(crate) fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
+    match source {
+        SnapshotSource::ClaudeCode => 2,
+        SnapshotSource::Codex | SnapshotSource::Pi => 1,
+    }
+}
 
 fn exclude_held_effective_body_witness_revision(
     index: &mut ScanIndex,
@@ -4801,7 +4810,9 @@ fn prepare_sync_source(
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
-    index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        source,
+    ));
     let committed_index = index.clone();
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
@@ -9830,7 +9841,7 @@ mod tests {
             let mut index = ScanIndex::load(&index_path).unwrap();
             index.activate_upload_context("cache-on".into());
             index.activate_effective_upload_body_witness_revision(
-                EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+                effective_upload_body_witness_revision(SnapshotSource::Codex),
             );
             index
         };
@@ -10179,7 +10190,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let mut baseline = ScanIndex::default();
         baseline.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let raw = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10297,7 +10308,7 @@ mod tests {
                 if held {
                     0
                 } else {
-                    EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION
+                    effective_upload_body_witness_revision(SnapshotSource::Codex)
                 },
                 "caller excludes raw held file from effective adoption"
             );
@@ -10405,7 +10416,7 @@ mod tests {
         };
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-off".into());
         let mut progress = test_upload_progress();
@@ -10549,7 +10560,7 @@ mod tests {
         let mut loaded = ScanIndex::load(&index_path).unwrap();
         loaded.activate_upload_context("cache-on-mandatory".into());
         loaded.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let mut progress = SnapshotUploadProgress::load(
             &progress_path,
@@ -10637,7 +10648,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let (mut index, _) = cache_effective_wire_released143_index(&root);
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let next = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10671,7 +10682,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let (mut index, mut progress) = cache_effective_wire_released143_index(&root);
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-on-new-context-same-effective-body".into());
         let previous = index.clone();
@@ -10751,7 +10762,7 @@ mod tests {
         let mut retry_index = ScanIndex::load(&path).unwrap();
         retry_index.activate_upload_context("cache-on-new-context-same-effective-body".into());
         retry_index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let mut retry = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10835,10 +10846,10 @@ mod tests {
             .files
             .values()
             .all(|entry| entry.effective_upload_body_witness_revision
-                == EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION));
+                == effective_upload_body_witness_revision(SnapshotSource::Codex)));
         loaded.activate_upload_context("cache-on-new-context-same-effective-body".into());
         loaded.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let stable = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10862,7 +10873,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-off".into());
         let scan = |index: &mut ScanIndex| {
