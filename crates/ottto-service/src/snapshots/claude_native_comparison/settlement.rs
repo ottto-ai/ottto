@@ -189,6 +189,13 @@ impl NativeCorrection {
     }
 }
 
+/// Slice 2c credit taken from the moving reservation for one fold's
+/// settled-telemetry root set: the allocation and ceiling to restore.
+#[derive(Debug, Default)]
+pub(crate) struct FreshStartRootsCredit {
+    paid: Option<(usize, usize)>,
+}
+
 /// A borrow of the SAME completion reservation and its immutable producer
 /// receipts. No allowance is created here. Only allocation provenance is
 /// consulted; callers cannot use this view as identity/coverage evidence.
@@ -461,6 +468,64 @@ impl Completion {
         Ok(())
     }
 
+    /// Slice 2c (P4): fund the fold-local settled-telemetry root set from the
+    /// same moving reservation before it is allocated. `None` refuses 2c for
+    /// this fold. Without a reservation this fold has no native budget and
+    /// the set keeps its ordinary bound (the funded witness map).
+    pub(crate) fn fund_fresh_start_roots(
+        &mut self,
+        roots: usize,
+        key_bytes: usize,
+    ) -> Option<FreshStartRootsCredit> {
+        let Some(paid) = self.reservation.as_mut() else {
+            return Some(FreshStartRootsCredit::default());
+        };
+        let mut cost =
+            crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+        restore_tree_insert_peak::<String, ()>(roots, roots, &mut cost)?;
+        cost.add(key_bytes)?;
+        let old_allocated = paid.allocated();
+        let old_ceiling = paid.allocation_ceiling();
+        let owned = old_allocated.checked_add(cost.bytes)?;
+        if !paid.grow_for(owned) || !paid.record_allocated(owned) {
+            paid.release_temporary_peak(old_ceiling);
+            return None;
+        }
+        Some(FreshStartRootsCredit {
+            paid: Some((old_allocated, old_ceiling)),
+        })
+    }
+    /// Return the root set's credit once the fold has dropped the set.
+    pub(crate) fn release_fresh_start_roots(&mut self, credit: FreshStartRootsCredit) {
+        if let (Some((old_allocated, old_ceiling)), Some(paid)) =
+            (credit.paid, self.reservation.as_mut())
+        {
+            paid.record_allocated(old_allocated);
+            paid.release_temporary_peak(old_ceiling);
+        }
+    }
+    /// A completion carrying only a moving reservation: no window, fallback
+    /// or native terminal, so its fold is an ordinary one paid from `paid`.
+    #[cfg(test)]
+    pub(crate) fn reservation_only_for_test(
+        reservation: Option<crate::source_rotation::PaidReservation>,
+    ) -> Self {
+        Self {
+            reservation,
+            window: None,
+            fallback: None,
+            native_plans: BTreeMap::new(),
+            pending_corrections: Vec::new(),
+            target_charges: TargetChargeReceipts::default(),
+            native_terminal: None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn reservation_allocated_for_test(&self) -> Option<usize> {
+        self.reservation
+            .as_ref()
+            .map(crate::source_rotation::PaidReservation::allocated)
+    }
     pub(crate) fn attach_reservation(
         &mut self,
         reservation: Option<crate::source_rotation::PaidReservation>,

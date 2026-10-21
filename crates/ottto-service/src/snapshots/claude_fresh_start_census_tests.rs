@@ -3,6 +3,10 @@
 // when SOURCE's copy signature passes, a complete accepted census verified its
 // exact revision, and no duplicate, telemetry verdict or contradicting row
 // refuses it. Default off. All fixtures are synthetic and content-free.
+//
+// Window acceptance is StateMissing's `claude_census_disjointness_complete`,
+// stubbed false in production. These tests inject a test-only census view
+// (complete unless a test says otherwise) to exercise the machinery.
 use super::*;
 
 const FRESH: &str = "f0000000-0000-4000-8000-00000000000f";
@@ -14,8 +18,11 @@ const CONTRA: &str = "a0000000-0000-4000-8000-00000000000a";
 const WINDOW: &str = "2026-08-20T10:30:00Z";
 const LATER_WINDOW: &str = "2026-08-20T11:30:00Z";
 
-/// Switch and birth overrides for this test thread, reset on drop.
-struct Fixture;
+/// Switch, birth and census-view overrides for this test thread, reset on
+/// drop. The injected view accepts every complete census.
+struct Fixture {
+    _overrides: ClaudeFreshStartTestOverrides,
+}
 
 impl Fixture {
     fn on(births: &[(&str, &str)]) -> Self {
@@ -23,24 +30,60 @@ impl Fixture {
     }
 
     fn with(enabled: bool, births: &[(&str, &str)]) -> Self {
-        CLAUDE_FRESH_START_ENABLED_FOR_TEST.with(|switch| switch.set(Some(enabled)));
-        CLAUDE_TRANSCRIPT_BIRTH_FOR_TEST.with(|map| {
-            *map.borrow_mut() = Some(
-                births
-                    .iter()
-                    .map(|(stem, birth)| (stem.to_string(), ms(birth)))
-                    .collect(),
+        let births = births
+            .iter()
+            .map(|(stem, birth)| (*stem, ms(birth)))
+            .collect::<Vec<_>>();
+        Fixture {
+            _overrides: ClaudeFreshStartTestOverrides::new(enabled, &births, Some(true)),
+        }
+    }
+
+    /// Change the injected census view for later census steps.
+    fn view(&self, update: impl FnOnce(&mut ClaudeCensusViewForTest)) {
+        CLAUDE_CENSUS_VIEW_FOR_TEST.with(|view| {
+            update(
+                view.borrow_mut()
+                    .get_or_insert_with(ClaudeCensusViewForTest::default),
             )
         });
-        Fixture
+    }
+
+    /// Back to the production H3 stub: no window is accepted.
+    fn production_stub(&self) {
+        CLAUDE_CENSUS_VIEW_FOR_TEST.with(|view| *view.borrow_mut() = None);
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        CLAUDE_FRESH_START_ENABLED_FOR_TEST.with(|switch| switch.set(None));
-        CLAUDE_TRANSCRIPT_BIRTH_FOR_TEST.with(|map| *map.borrow_mut() = None);
-    }
+/// How the simulated server answers an admitted body (B-F3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ack {
+    /// An `accepted` entity: the server applied the body.
+    Applied,
+    /// An `unchanged` entity, a refusal or no ACK at all.
+    NotApplied,
+}
+
+/// The upload settlement after one fold, as the sync loop runs it.
+fn settle(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+    disposition: &ClaudeUsageAuthorityDisposition,
+    ack: Ack,
+) -> u64 {
+    let applied = match ack {
+        Ack::Applied => items
+            .iter()
+            .filter(|item| {
+                disposition
+                    .fresh_start_admitted
+                    .contains(&item.source_session_id)
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+        Ack::NotApplied => BTreeSet::new(),
+    };
+    settle_claude_fresh_start_emissions(index, items, &disposition.fresh_start_admitted, &applied)
 }
 
 fn ms(timestamp: &str) -> i64 {
@@ -199,6 +242,7 @@ struct Machine {
         crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
     ),
     settled: BTreeSet<String>,
+    ack: Ack,
 }
 
 impl Machine {
@@ -208,6 +252,7 @@ impl Machine {
             index: ScanIndex::default(),
             reports: rows(&[], &[]),
             settled: settled.iter().map(|root| root.to_string()).collect(),
+            ack: Ack::Applied,
         }
     }
 
@@ -241,6 +286,7 @@ impl Machine {
         );
         let items = page.snapshots.clone();
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut page, &mut self.index);
+        settle(&mut self.index, &items, &disposition, self.ack);
         (items, disposition)
     }
 }
@@ -259,7 +305,34 @@ fn fold(
     max_pending_occurrences: usize,
     settled: &[&str],
 ) -> ClaudeUsageAuthorityDisposition {
-    apply_claude_reported_usage_with_index_limits_and_current_files(
+    fold_with_ack(
+        items,
+        reports,
+        index,
+        census_complete,
+        window,
+        max_pending_occurrences,
+        settled,
+        Ack::Applied,
+    )
+}
+
+/// `fold`, followed by the upload settlement the server's `ack` decides.
+#[allow(clippy::too_many_arguments)]
+fn fold_with_ack(
+    items: &mut [SnapshotItem],
+    reports: &(
+        crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+        crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    ),
+    index: &mut ScanIndex,
+    census_complete: bool,
+    window: &str,
+    max_pending_occurrences: usize,
+    settled: &[&str],
+    ack: Ack,
+) -> ClaudeUsageAuthorityDisposition {
+    let disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
         items,
         &reports.0,
         &reports.1,
@@ -273,7 +346,9 @@ fn fold(
         None,
         None,
         &settled.iter().map(|root| root.to_string()).collect(),
-    )
+    );
+    settle(index, items, &disposition, ack);
+    disposition
 }
 
 /// Parse one transcript outside the scan loop; its fingerprint is `<stem>-fp`.
@@ -858,20 +933,17 @@ fn sessions_without_usable_request_identity_never_carry_numbers() {
     for member in [api_error, id_less] {
         assert_eq!(state(&machine.index, member), None);
     }
-    // Today's census composition: such a member is never covered by family
-    // pending, so the window is not accepted and no fresh root verifies on
-    // this Mac. StateMissing's `claude_census_disjointness_complete` owns that
-    // seam; this pins the fail-closed behavior until it lands.
+    // Finding kept for StateMissing: such a member is never covered by
+    // family pending, so today's composition (`transcript_ownership_complete`)
+    // would accept no window on this Mac. 2c no longer reads it; window
+    // acceptance is `claude_census_disjointness_complete`, injected here.
     assert!(!first_disposition.transcript_ownership_complete);
+    assert_cleared(item(&first, FRESH));
+    assert_fresh_scalars(item(&second, FRESH));
     assert_eq!(
         state(&machine.index, FRESH),
-        Some(ClaudeFreshStartState::Candidate)
+        Some(ClaudeFreshStartState::Emitted)
     );
-    for item in first.iter().chain(&second) {
-        if item.source_session_id == FRESH {
-            assert_cleared(item);
-        }
-    }
     drop(fixture);
     let _ = fs::remove_dir_all(dir);
 }
@@ -989,6 +1061,7 @@ fn a_transient_refusal_owes_exactly_one_corrective_parse() {
             .expect("indexed")
             .source_file_fingerprint = format!("{FRESH}-fp");
     };
+    // Census passes in which this root's telemetry is settled (A-F2).
     let window_end = |index: &mut ScanIndex, census_complete: bool, window: &str| {
         fold(
             &mut [],
@@ -997,7 +1070,7 @@ fn a_transient_refusal_owes_exactly_one_corrective_parse() {
             census_complete,
             window,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            &[],
+            &[FRESH],
         )
     };
     // An emitted revision re-parsed while its telemetry is unsettled loses
@@ -1068,28 +1141,49 @@ fn a_transient_refusal_owes_exactly_one_corrective_parse() {
 }
 
 #[test]
-fn repeated_windows_through_the_real_pipeline_parse_an_unsettled_root_once() {
-    // Parent P2 through the scan loop: verification costs one corrective
-    // parse; a root whose telemetry never settles is not parsed again.
+fn repeated_windows_verify_only_a_settled_root_and_parse_it_once() {
+    // Parent P2 and review A-F2 through the scan loop: a root whose telemetry
+    // is not settled in the census pass stays a candidate and is never
+    // re-parsed; once settled, verification costs one corrective parse.
     let fixture = Fixture::on(&[(FRESH, "2026-08-20T10:00:00Z")]);
     let dir = temp_dir("claude-2c-no-replay");
     write(&dir, FRESH, &fresh_lines(FRESH, 0));
     let mut machine = Machine::new(vec![dir.clone()], &[]);
     let (first, _) = machine.pass("2026-08-20T10:30:00Z");
     assert_cleared(item(&first, FRESH));
+    for minute in [40, 50, 55] {
+        let (later, _) = machine.pass(&format!("2026-08-20T10:{minute}:00Z"));
+        assert!(later.is_empty(), "an unsettled root spends no re-arm");
+        assert_eq!(
+            state(&machine.index, FRESH),
+            Some(ClaudeFreshStartState::Candidate)
+        );
+    }
+    // An unchanged file has no current-window evidence, so it waits for its
+    // next parse. Here the session grows while its telemetry is settled.
+    machine.settled.insert(FRESH.to_string());
+    let mut grown = fresh_lines(FRESH, 0);
+    grown.push(assistant(FRESH, "req_f4", &at(0, 6), 250));
+    write(&dir, FRESH, &grown);
+    let (verifying, _) = machine.pass("2026-08-20T10:58:00Z");
+    assert_cleared(item(&verifying, FRESH));
     assert_eq!(
         state(&machine.index, FRESH),
         Some(ClaudeFreshStartState::Verified)
     );
-    let (second, _) = machine.pass("2026-08-20T10:40:00Z");
-    assert_cleared(item(&second, FRESH));
-    for minute in [50, 55, 59] {
-        let (later, _) = machine.pass(&format!("2026-08-20T10:{minute}:00Z"));
+    let (corrective, _) = machine.pass("2026-08-20T10:59:00Z");
+    let corrective = item(&corrective, FRESH);
+    assert_eq!(
+        posture(corrective),
+        (Some(100), Some(300), Some(250), Some(1))
+    );
+    for collected_at in ["2026-08-20T11:10:00Z", "2026-08-20T11:20:00Z"] {
+        let (later, _) = machine.pass(collected_at);
         assert!(later.is_empty(), "no replay loop");
     }
     assert_eq!(
         state(&machine.index, FRESH),
-        Some(ClaudeFreshStartState::Verified)
+        Some(ClaudeFreshStartState::Emitted)
     );
     drop(fixture);
     let _ = fs::remove_dir_all(dir);
@@ -1275,7 +1369,10 @@ fn a_later_duplicate_revokes_and_rearms_exactly_once() {
 }
 
 #[test]
-fn only_an_accepted_complete_window_verifies() {
+fn only_the_census_predicate_with_a_disjoint_verified_record_verifies() {
+    // SOURCE-rulings-D S1 condition 3(a): the predicate is true, the own
+    // status is `Disjoint` and the own record is `Exact` or `Empty` from a
+    // source-verified parse; telemetry is settled in this pass (A-F2).
     let fixture = Fixture::on(&[]);
     let dir = temp_dir("claude-2c-window");
     let (fresh_path, fresh) = parsed(&dir, FRESH, &fresh_lines(FRESH, 0));
@@ -1288,53 +1385,369 @@ fn only_an_accepted_complete_window_verifies() {
         ],
     );
     let run = |census_complete: bool,
-               max_pending: usize,
-               prepare: &dyn Fn(&mut ScanIndex)|
-     -> ScanIndex {
+               settled: &[&str],
+               view: &dyn Fn(&mut ClaudeCensusViewForTest)|
+     -> (ScanIndex, ClaudeUsageAuthorityDisposition) {
+        fixture.view(|current| {
+            *current = ClaudeCensusViewForTest {
+                complete: true,
+                ..ClaudeCensusViewForTest::default()
+            };
+            view(current);
+        });
         let mut index = indexed(&[&fresh_path, &unrelated_path]);
         witness(&mut index, FRESH, ClaudeFreshStartState::Candidate);
-        prepare(&mut index);
         let mut items = vec![fresh.clone(), unrelated.clone()];
-        fold(
+        let disposition = fold(
             &mut items,
             &rows(&[], &[]),
             &mut index,
             census_complete,
             WINDOW,
-            max_pending,
-            &[FRESH, PEER],
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            settled,
         );
-        index
+        (index, disposition)
     };
-    let none = |_: &mut ScanIndex| {};
-    // Control: a complete, valid, fully observed window verifies.
-    let index = run(true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES, &none);
+    let both = [FRESH, PEER];
+    let none = |_: &mut ClaudeCensusViewForTest| {};
+    // Control: the predicate accepts the window and the record is Disjoint.
+    let (index, disposition) = run(true, &both, &none);
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Verified));
-    // Census incomplete.
-    let index = run(false, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES, &none);
+    assert!(indexed_fingerprint(&index, &fresh_path).is_empty());
+    assert_eq!(
+        disposition.fresh_start_audit,
+        ClaudeFreshStartAuditCounts::default()
+    );
+    // Census incomplete: the step does not run.
+    let (index, _) = run(false, &both, &none);
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
-    // Complete but invalid: the cap invalidates a family.
-    let index = run(true, 3, &none);
+    // The predicate is false (Unobserved): not verified.
+    let (index, _) = run(true, &both, &|view| view.complete = false);
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
-    // Complete but an indexed member was not observed this window.
-    let index = run(true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES, &|index| {
-        let ghost = dir.join(format!("{OTHER_ROOT}.jsonl"));
-        index
-            .files
-            .insert(local_index_key(&ghost), manifest_index_entry(None));
+    // An unverified or tail-derived own record never backs the verdict.
+    let (index, _) = run(true, &both, &|view| {
+        view.unverified_records.insert(FRESH.to_string());
     });
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
-    // Complete, but the fence stays closed after the update.
-    let index = run(true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES, &|index| {
-        index.claude_duplicate_request_witness_overflowed = true;
-        let ghost = dir.join(format!("{OTHER_ROOT}.jsonl"));
-        index
-            .files
-            .insert(local_index_key(&ghost), manifest_index_entry(None));
-    });
-    assert!(index.claude_duplicate_request_witness_overflowed);
+    assert!(!indexed_fingerprint(&index, &fresh_path).is_empty());
+    // Telemetry not settled in this pass: it waits, spending no re-arm.
+    let (index, _) = run(true, &[PEER], &none);
     assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
+    assert!(!indexed_fingerprint(&index, &fresh_path).is_empty());
+    // A shared hash always revokes, even while the predicate is false.
+    let (index, _) = run(true, &both, &|view| {
+        view.complete = false;
+        view.shares_hash.insert(FRESH.to_string());
+    });
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Revoked));
+    // Condition 3(f): a verification while an IdentityIncomplete or Lossy
+    // record exists is counted (in memory only).
+    let (index, disposition) = run(true, &both, &|view| {
+        view.identity_incomplete_or_lossy = true;
+    });
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Verified));
+    assert_eq!(
+        disposition.fresh_start_audit.verified_with_incomplete_records,
+        1
+    );
+    // Budget overflow (SOURCE known limit): the predicate stays false, no new
+    // verification, and the window is counted.
+    let (index, disposition) = run(true, &both, &|view| view.budget_exceeded = true);
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
+    assert_eq!(disposition.fresh_start_audit.owner_budget_exceeded_windows, 1);
+    // The production stub accepts no window at all.
+    fixture.production_stub();
+    let mut index = indexed(&[&fresh_path, &unrelated_path]);
+    witness(&mut index, FRESH, ClaudeFreshStartState::Candidate);
+    fold(
+        &mut [fresh.clone(), unrelated.clone()],
+        &rows(&[], &[]),
+        &mut index,
+        true,
+        WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        &both,
+    );
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Candidate));
+    assert!(!indexed_fingerprint(&index, &fresh_path).is_empty());
     drop(fixture);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_production_stub_verifies_nothing_through_the_real_pipeline() {
+    // H3: until StateMissing's `claude_census_disjointness_complete` lands, no
+    // window is accepted, nothing is re-armed and no body carries numbers.
+    let fixture = Fixture::on(&[(FRESH, "2026-08-20T10:00:00Z")]);
+    fixture.production_stub();
+    let dir = temp_dir("claude-2c-stub");
+    write(&dir, FRESH, &fresh_lines(FRESH, 0));
+    let mut machine = Machine::new(vec![dir.clone()], &[FRESH]);
+    let (first, _) = machine.pass("2026-08-20T10:30:00Z");
+    assert_cleared(item(&first, FRESH));
+    for collected_at in ["2026-08-20T10:40:00Z", "2026-08-20T10:50:00Z"] {
+        let (later, _) = machine.pass(collected_at);
+        assert!(later.is_empty(), "nothing is re-armed");
+    }
+    assert_eq!(
+        state(&machine.index, FRESH),
+        Some(ClaudeFreshStartState::Candidate)
+    );
+    drop(fixture);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_later_shared_hash_withdraws_an_emitted_admission_and_unobserved_keeps_it() {
+    // Condition 3(d) and the status contract: `Unobserved` changes nothing
+    // for `Emitted`; a later `SharesHash` revokes and re-arms it once.
+    let fixture = Fixture::on(&[]);
+    let dir = temp_dir("claude-2c-shares-hash");
+    let (path, fresh) = parsed(&dir, FRESH, &fresh_lines(FRESH, 0));
+    let mut index = indexed(&[&path]);
+    witness(&mut index, FRESH, ClaudeFreshStartState::Emitted);
+    let census = |index: &mut ScanIndex| {
+        fold(
+            &mut [fresh.clone()],
+            &rows(&[], &[]),
+            index,
+            true,
+            WINDOW,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            &[FRESH],
+        );
+    };
+    fixture.view(|view| view.complete = false);
+    census(&mut index);
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Emitted));
+    assert!(!indexed_fingerprint(&index, &path).is_empty());
+    fixture.view(|view| {
+        view.shares_hash.insert(FRESH.to_string());
+    });
+    census(&mut index);
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Revoked));
+    assert!(indexed_fingerprint(&index, &path).is_empty(), "one re-arm");
+
+    // A body admitted in the same fold that revokes is withdrawn too, before
+    // the server has answered for it.
+    let mut index = indexed(&[&path]);
+    witness(&mut index, FRESH, ClaudeFreshStartState::Verified);
+    let mut items = vec![fresh.clone()];
+    fold(
+        &mut items,
+        &rows(&[], &[]),
+        &mut index,
+        true,
+        WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        &[FRESH],
+    );
+    assert_fresh_scalars(&items[0]);
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Revoked));
+    assert!(indexed_fingerprint(&index, &path).is_empty(), "one re-arm");
+    drop(fixture);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_sticky_witness_binds_to_the_parser_version() {
+    // Condition 3(c): a witness from another `CLAUDE_CODE_SNAPSHOT_PARSER_VERSION`
+    // admits nothing, even at the same source fingerprint.
+    let fixture = Fixture::on(&[]);
+    let dir = temp_dir("claude-2c-parser-version");
+    let (path, fresh) = parsed(&dir, FRESH, &fresh_lines(FRESH, 0));
+    let mut index = indexed(&[&path]);
+    witness(&mut index, FRESH, ClaudeFreshStartState::Emitted);
+    index
+        .claude_fresh_start_census
+        .get_mut(FRESH)
+        .expect("witness")
+        .derivation_revision = format!("claude_code_jsonl:v1;{CLAUDE_FRESH_START_DERIVATION_REVISION}");
+    assert_ne!(
+        CLAUDE_CODE_SNAPSHOT_PARSER_VERSION, "claude_code_jsonl:v1",
+        "the fixture revision must be stale"
+    );
+    let mut items = vec![fresh];
+    let disposition = fold(
+        &mut items,
+        &rows(&[], &[]),
+        &mut index,
+        true,
+        WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        &[FRESH],
+    );
+    assert_cleared(&items[0]);
+    assert_ne!(
+        disposition.posture_admission(FRESH),
+        Some("census_verified_fresh_start")
+    );
+    assert!(disposition.fresh_start_admitted.is_empty());
+    drop(fixture);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn only_a_server_applied_body_marks_the_witness_emitted() {
+    // B-F3: an `unchanged` or refused ACK (for example a contract-less body
+    // against a proven server head, h573) leaves the witness `Verified`. It
+    // is not offered again until the file changes, and a later revocation
+    // owes no withdrawal because the server never applied the numbers.
+    let fixture = Fixture::on(&[]);
+    let dir = temp_dir("claude-2c-ack");
+    let (path, fresh) = parsed(&dir, FRESH, &fresh_lines(FRESH, 0));
+    let mut index = indexed(&[&path]);
+    witness(&mut index, FRESH, ClaudeFreshStartState::Verified);
+    let mut items = vec![fresh.clone()];
+    let disposition = fold_with_ack(
+        &mut items,
+        &rows(&[], &[]),
+        &mut index,
+        false,
+        WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        &[FRESH],
+        Ack::NotApplied,
+    );
+    assert_fresh_scalars(&items[0]);
+    assert_eq!(
+        disposition.fresh_start_admitted,
+        BTreeSet::from([FRESH.to_string()])
+    );
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Verified));
+    assert_eq!(
+        settle(&mut index, &items, &disposition, Ack::NotApplied),
+        1,
+        "counted for the audit follow-up"
+    );
+    // A later shared hash revokes without a re-arm: nothing to withdraw.
+    fixture.view(|view| {
+        view.shares_hash.insert(FRESH.to_string());
+    });
+    fold(
+        &mut [],
+        &rows(&[], &[]),
+        &mut index,
+        true,
+        WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        &[FRESH],
+    );
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Revoked));
+    assert!(!indexed_fingerprint(&index, &path).is_empty());
+
+    // An applied body marks it `Emitted`; an owed corrective parse is spent
+    // by the admitted body itself.
+    fixture.view(|view| view.shares_hash.clear());
+    let mut index = indexed(&[&path]);
+    witness(&mut index, FRESH, ClaudeFreshStartState::ReparseOwed);
+    let mut items = vec![fresh];
+    let disposition = fold_with_ack(
+        &mut items,
+        &rows(&[], &[]),
+        &mut index,
+        false,
+        WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        &[FRESH],
+        Ack::NotApplied,
+    );
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Verified));
+    assert_eq!(settle(&mut index, &items, &disposition, Ack::Applied), 0);
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Emitted));
+    drop(fixture);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn t18_the_native_precharge_refuses_a_new_witness_before_allocation() {
+    // T18 (H2n): on the native target path a new root witness is charged to
+    // the moving reservation before finalization. The smallest remainder that
+    // funds the parse while off is refused while on, so the parse is not
+    // finalized and no witness is written; off, the charge is unchanged.
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("UNEXECUTED t18 native pre-charge: unsupported layout");
+        return;
+    }
+    let dir = temp_dir("claude-2c-t18");
+    let path = write(&dir, FRESH, &fresh_lines(FRESH, 0));
+    let revision = format!("{FRESH}-fp");
+    let mut file = File::open(&path).expect("open fixture");
+    let identity =
+        opened_object_identity(SnapshotSource::ClaudeCode, &mut file).expect("identify fixture");
+    let mut parsed = parse_opened_jsonl_file(
+        file,
+        &identity,
+        &path,
+        WINDOW,
+        revision.clone(),
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        None,
+        None,
+        None,
+        None,
+        true,
+        None,
+        true,
+    )
+    .expect("parse fixture");
+    let candidate = CandidateFile {
+        scan_root: dir.clone(),
+        path: path.clone(),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: revision.clone(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: identity,
+    };
+    // The accumulator builds a Codex ownership ledger for any parse that saw a
+    // session id, and the pre-charge refuses such a file as a Codex branch.
+    // Clear it to isolate the 2c charge (reported to the native owner).
+    parsed.codex_parent_ownership_ledger = None;
+    let index = indexed(&[&path]);
+    let charge = |enabled: bool, remaining: usize| {
+        let _overrides = ClaudeFreshStartTestOverrides::new(enabled, &[], None);
+        let mut pending = Vec::new();
+        let mut credit =
+            crate::source_rotation::PaidReservation::from_remainder(Some(remaining), 0, 0);
+        claude_native_comparison::NativePhase::default()
+            .prepay_target_finalization_metadata(
+                claude_native_comparison::TargetFinalizationInputs {
+                    candidate: &candidate,
+                    revision: &revision,
+                    parsed: &parsed,
+                    index: &index,
+                    pending: &mut pending,
+                    path_set_entries: index.files.len(),
+                },
+                &mut credit,
+            )
+            .ok()
+    };
+    // The smallest remainder that funds the parse in each mode.
+    let smallest = |enabled: bool| {
+        let (mut low, mut high) = (0_usize, 1 << 24);
+        assert!(charge(enabled, high).is_some(), "an ample remainder funds it");
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if charge(enabled, middle).is_some() {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        low
+    };
+    let off = smallest(false);
+    let on = smallest(true);
+    assert!(on > off, "the witness insert is charged only while on");
+    assert!(charge(false, off).is_some());
+    assert!(charge(true, off).is_none(), "refused before allocation");
+    assert!(charge(true, on).is_some());
     let _ = fs::remove_dir_all(dir);
 }
 

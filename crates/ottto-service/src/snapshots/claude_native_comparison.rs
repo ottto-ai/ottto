@@ -6,7 +6,9 @@ mod metadata;
 mod settlement;
 use metadata::{Map as DescriptorMap, Set as DescriptorSet};
 use settlement::NativeCorrection;
-pub(crate) use settlement::{Completion, NativeBodyBudget, SelectedFallback};
+pub(crate) use settlement::{
+    Completion, FreshStartRootsCredit, NativeBodyBudget, SelectedFallback,
+};
 
 #[cfg(test)]
 thread_local! {

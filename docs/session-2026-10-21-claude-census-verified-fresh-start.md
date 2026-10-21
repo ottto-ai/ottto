@@ -40,7 +40,11 @@ revision, and a state.
 - `verified`: a complete, accepted census saw the root's own family complete
   and no duplicate. Verification re-arms the root's file once so the next body
   carries its numbers.
-- `emitted`: posture built a body with numbers for this revision.
+- `emitted`: the server applied a body with numbers for this revision (an
+  `accepted` entity in the upload ACK). An `unchanged` or refused ACK, a held
+  body or no ACK leaves the witness `verified`, and nothing is offered again
+  until the file changes. This keeps a contract-less body against a proven
+  server head (which the server answers with `unchanged`) from looping.
 - `reparse_owed`: an emitted revision was re-parsed and refused for a
   transient reason, so its body went out without numbers. The next accepted
   census re-arms it once and moves it back to `verified`.
@@ -53,14 +57,30 @@ revision, and a state.
   emitted path the same way.
 
 Every re-arm is spent by its transition. A `verified` revision is never
-re-armed again, so repeated closed and open windows cannot replay a file.
+re-armed again, so repeated closed and open windows cannot replay a file. A
+revocation also re-arms a root whose body was admitted in the same fold.
 
-A census window is accepted only when the census is complete, the duplicate
-census is valid, the persisted fence is not overflowed, every indexed family
-member was observed this window, reports are healthy and the fold does not
-carry a native completion or a selected fallback. The predicate uses today's census composition: an
-indexed member without usable request identity (for example an API-error-only
-session) leaves the window unaccepted, so nothing verifies on that Mac.
+## Verification
+
+A census window is accepted only by the census disjointness predicate
+(`claude_census_disjointness_complete`, owned by the census work). Until that
+predicate exists, the window check is a stub that accepts nothing, so nothing
+verifies. A candidate verifies only when, in a complete census:
+
+- the predicate is true, and the fold carries no native completion or
+  selected fallback and its reports are healthy;
+- the root's own census status is `Disjoint` (only possible while the
+  predicate is true);
+- its own census record is `Exact` or `Empty` from a source-verified parse;
+  unverified or tail records never back a positive verdict;
+- its telemetry is settled in this pass;
+- its own family is complete with a non-empty request set and no duplicate.
+
+A `SharesHash` status revokes whenever it is seen, even while the predicate
+is false. `Unobserved` changes nothing for an emitted root and does not
+verify a candidate. A candidate whose telemetry is not settled waits without
+a re-arm; an unchanged file carries no current-window evidence, so it waits
+for its next parse.
 
 ## Admission
 
@@ -76,6 +96,10 @@ Telemetry is settled when both sidecars are confirmed absent by the existing
 absence check or both were read completely. An unknown, unreadable, present
 but unpaired sidecar is not absent. Rows that agree (this root, this session,
 no agent) refuse nothing and add no authority.
+
+The witness binds to the source fingerprint and to
+`CLAUDE_CODE_SNAPSHOT_PARSER_VERSION` plus a 2c revision, not to the census
+derivation alone, so a parser upgrade withholds until re-verified.
 
 Admission is sticky while the duplicate census fence is closed: an admitted
 revision keeps its scalars, but any known duplicate still wins. Admitted items
@@ -107,8 +131,13 @@ body uploads without numbers, and drops every witness.
   copy the witness map like the sibling census maps.
 - Replacing an emitted witness walks the index once to re-arm another path
   of the same root. That happens only on that transition.
-- The settled-telemetry root set holds only roots with an admissible witness,
-  so it is bounded by the witness map.
+- The settled-telemetry root set holds only roots with a candidate or
+  admissible witness, so it is bounded by the witness map. On a fold with a
+  native reservation it is charged to that reservation before allocation and
+  the credit is returned after the fold; on insufficient funds the set stays
+  empty, which refuses 2c for that fold.
+- The upload keeps the fingerprints of this fold's admitted bodies and of
+  those the server applied; both are empty while off.
 - No audit schema change, no scan or parser version bump, no wire field.
 
 ## Limits and open items
@@ -117,7 +146,16 @@ body uploads without numbers, and drops every witness.
   its records by at most 60 s and whose ids were rewritten is not detected.
 - A duplicate always revokes, including for the original session when a later
   copy shares its requests.
-- Admission and refusal counts are not yet in the local audit.
+- Admission and refusal counts are not yet in the local audit. In-memory
+  values exist for verifications made while an `IdentityIncomplete` or
+  `Lossy` record exists, for census windows over the owner budget, and for
+  admitted bodies the server did not apply.
+- Over the owner budget the census map is incomplete: the predicate stays
+  false (no new verification) and the case is counted, but a new duplicate
+  of an emitted root can go unseen until a later in-budget complete census,
+  which then withholds it.
+- A body the server applied but whose index save was lost to a crash stays
+  `verified`, so a later revocation does not re-arm it.
 - The settled-telemetry check reuses the existing absence check, which runs
   only when the pass may emit request identity. Without that permit no root
   settles, so an emitted root re-parsed in such a pass loses its numbers

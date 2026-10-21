@@ -5185,6 +5185,21 @@ fn finish_sync_source(
     }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
+    // Slice 2c (B-F3): the bodies this fold built with fresh-start scalars,
+    // and those the server applied (an `accepted` entity, not `unchanged`).
+    // Both stay empty, and nothing is walked, while off.
+    let fresh_start_admitted = &claude_authority_disposition.fresh_start_admitted;
+    let fresh_start_offered = if fresh_start_admitted.is_empty() {
+        BTreeSet::new()
+    } else {
+        scan_result
+            .snapshots
+            .iter()
+            .filter(|snapshot| fresh_start_admitted.contains(&snapshot.source_session_id))
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let mut fresh_start_applied = BTreeSet::new();
     let mut accepted = 0;
     let upload_result = upload_resumable_batches_with_body_witness_partitioned(
         &scan_result.snapshots,
@@ -5234,6 +5249,15 @@ fn finish_sync_source(
             validate_joined(&request.snapshots)?;
             let response = client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
             response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
+            if !fresh_start_offered.is_empty() {
+                fresh_start_applied.extend(
+                    response
+                        .accepted_entities
+                        .iter()
+                        .filter(|entity| fresh_start_offered.contains(&entity.snapshot_fingerprint))
+                        .map(|entity| entity.snapshot_fingerprint.clone()),
+                );
+            }
             let request_fingerprints = request
                 .snapshots
                 .iter()
@@ -5280,6 +5304,18 @@ fn finish_sync_source(
             &upload_progress.accepted_fingerprints,
             &upload_progress.accepted_body_witnesses,
         );
+        let not_applied = crate::snapshots::settle_claude_fresh_start_emissions(
+            &mut index,
+            &scan_result.snapshots,
+            &claude_authority_disposition.fresh_start_admitted,
+            &fresh_start_applied,
+        );
+        if not_applied > 0 {
+            eprintln!(
+                "local snapshot sync: {not_applied} census-verified fresh-start body/bodies \
+                 were not applied by the server; their witnesses stay verified, not emitted"
+            );
+        }
     }
 
     index.log_claude_proof_correction_debt();
@@ -6516,7 +6552,27 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Slice 2c: admissible roots whose telemetry is settled this pass, either
     // both sidecars confirmed absent by the existing check or both read
     // completely below. Unknown, unreadable, present or unpaired is neither.
-    // Bounded by the funded witness map; empty and never consulted while off.
+    // The set is funded before allocation from the native reservation when
+    // this fold has one; on insufficient funds it stays empty, which refuses
+    // 2c for this fold. Empty and never consulted while off.
+    let fresh_start_credit = if crate::snapshots::claude_census_verified_fresh_start_enabled() {
+        let (roots, key_bytes) = usage_roots
+            .iter()
+            .filter(|root| crate::snapshots::claude_fresh_start_root_admissible(index, root))
+            .fold((0_usize, 0_usize), |(roots, bytes), root| {
+                (roots.saturating_add(1), bytes.saturating_add(root.len()))
+            });
+        match comparison.as_deref_mut() {
+            Some(comparison) if roots > 0 => comparison.fund_fresh_start_roots(roots, key_bytes),
+            _ => Some(crate::snapshots::claude_native_comparison::FreshStartRootsCredit::default()),
+        }
+    } else {
+        None
+    };
+    let fresh_start_settles = |index: &ScanIndex, root: &str| {
+        fresh_start_credit.is_some()
+            && crate::snapshots::claude_fresh_start_root_admissible(index, root)
+    };
     let mut fresh_start_telemetry_roots = BTreeSet::new();
     let usage_roots = usage_roots
         .into_iter()
@@ -6536,7 +6592,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 // The existing absence check only; 2c adds no stat or read.
                 if !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id) {
                     identity_unhealthy_roots.insert(session_id.clone());
-                } else if crate::snapshots::claude_fresh_start_root_admissible(index, session_id) {
+                } else if fresh_start_settles(index, session_id) {
                     fresh_start_telemetry_roots.insert(session_id.clone());
                 }
             }
@@ -6577,7 +6633,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             continue;
         }
         stats.complete_sidecar_root_count += 1;
-        if crate::snapshots::claude_fresh_start_root_admissible(index, &root_session_id) {
+        if fresh_start_settles(index, &root_session_id) {
             fresh_start_telemetry_roots.insert(root_session_id.clone());
         }
         let api_request_ids = api
@@ -6637,6 +6693,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             }),
         &fresh_start_telemetry_roots,
     );
+    drop(fresh_start_telemetry_roots);
+    if let (Some(credit), Some(comparison)) = (fresh_start_credit, comparison.as_deref_mut()) {
+        comparison.release_fresh_start_roots(credit);
+    }
     if let Some(fallback) = comparison
         .as_deref()
         .and_then(|comparison| comparison.fallback.as_ref())
@@ -18652,6 +18712,9 @@ mod tests {
     }
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
+    }
+    mod claude_fresh_start_pipeline_tests {
+        include!("snapshot_sync/claude_fresh_start_pipeline_tests.rs");
     }
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
