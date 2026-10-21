@@ -74,6 +74,10 @@ fn bind_different_witness(index: &mut ScanIndex) {
 fn save_reload(index: &mut ScanIndex, path: &Path) -> ScanIndex {
     index.save(path).expect("save prototype state");
     let loaded = ScanIndex::load(path).expect("reload prototype state");
+    // U1a-2a row 35: a load mints an unminted index's proof incarnation.
+    index
+        .codex_proof_index_incarnation
+        .clone_from(&loaded.codex_proof_index_incarnation);
     assert_eq!(
         serde_json::to_vec(&loaded).unwrap(),
         serde_json::to_vec(index).unwrap(),

@@ -159,6 +159,10 @@ fn apc_owed(index: &ScanIndex) -> Option<BTreeSet<String>> {
 fn apc_save_reload(index: &mut ScanIndex, path: &Path) -> ScanIndex {
     index.save(path).expect("save correction state");
     let loaded = ScanIndex::load(path).expect("reload correction state");
+    // U1a-2a row 35: a load mints an unminted index's proof incarnation.
+    index
+        .codex_proof_index_incarnation
+        .clone_from(&loaded.codex_proof_index_incarnation);
     assert_eq!(
         serde_json::to_vec(&loaded).unwrap(),
         serde_json::to_vec(index).unwrap(),
@@ -1027,6 +1031,10 @@ fn m1_reappearance_is_a_new_file_and_a_vanished_family_clears_its_record() {
                 index.save(&path).unwrap();
                 let loaded = ScanIndex::load(&path).unwrap();
                 assert!(path.exists(), "{label}: the saved index reloads intact");
+                // U1a-2a row 35: a load mints an unminted index's proof incarnation.
+                index
+                    .codex_proof_index_incarnation
+                    .clone_from(&loaded.codex_proof_index_incarnation);
                 assert_eq!(
                     serde_json::to_vec(&loaded).unwrap(),
                     serde_json::to_vec(&index).unwrap(),

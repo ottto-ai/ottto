@@ -551,6 +551,25 @@ impl SideLedger {
             .take_while(move |(key, _)| key.ns == ns)
     }
 
+    /// Row 30: P's key left the index, so every entry of P (by key digest)
+    /// in `ns` ends its generation (`Gone`, freshly stamped), in the same
+    /// step as the index drop. Allocates nothing under the lock.
+    pub(in crate::snapshots) fn end_generation(&mut self, ns: u128, p: u128) {
+        while let Some((key, entry)) = self
+            .namespace(ns)
+            .find(|(key, entry)| key.p == p && entry.tag != LedgerTag::Gone)
+            .map(|(key, entry)| (*key, *entry))
+        {
+            self.write_existing(
+                &key,
+                LedgerEntry {
+                    tag: LedgerTag::Gone,
+                    ..entry
+                },
+            );
+        }
+    }
+
     /// C14 prune: drops this namespace's entries that `drop` selects.
     pub(in crate::snapshots) fn prune(
         &mut self,

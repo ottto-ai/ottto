@@ -16435,6 +16435,367 @@ impl ScanIndex {
     }
 }
 
+/// U1a-2a (row 2): `+1` on the owed-parent fold. Saturates; a pinned count
+/// never decrements (conservatively live until the next rebuild).
+fn fold_owed_parent_in(live: &mut BTreeMap<String, u32>, parent: &str) {
+    let count = live.entry(parent.to_owned()).or_default();
+    *count = count.saturating_add(1);
+}
+
+/// U1a-2a (row 2): `-1` on the owed-parent fold; 0 removes the parent.
+fn fold_owed_parent_out(live: &mut BTreeMap<String, u32>, parent: &str) {
+    match live.get_mut(parent) {
+        Some(count) if *count == u32::MAX => {}
+        Some(count) if *count > 1 => *count -= 1,
+        Some(_) => {
+            live.remove(parent);
+        }
+        None => {}
+    }
+}
+
+/// U1a-2a (row 2, rev 3 §3.2): a record-site transition of one child's
+/// proof entry after the fence.
+#[allow(dead_code)] // first production caller is the record site (rows 8/39a)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum ProofSettle {
+    /// The fence admitted the `Proven` entry; `debt` is the seal's staged
+    /// debt (`PrefixSeal::has_debt`), whose one publication this use may be.
+    Admitted { debt: bool },
+    /// Fence mismatch, resolved another way, parent mismatch or a group:
+    /// remove the entry.
+    Remove,
+    /// Held under a cause a proof cannot cure: remove an `Owed` entry, keep
+    /// a `Proven` one (not used, may be later).
+    RemoveOwed,
+    /// The fence found P's side held or unknown: a `Proven` entry becomes
+    /// `Owed` under the child's `cause`, keeping the proof for a re-fence.
+    ParentHeld { cause: u8, wake: ProofWake },
+}
+
+/// U1a-2a (row 2): what a finished proof job hands back for one child.
+#[allow(dead_code)] // first production caller is the proof finish (cc PROOF rows)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum ProofFinish {
+    Proven(CodexParentPrefixProof),
+    Attempt {
+        outcome: ProofOutcome,
+        wake: ProofWake,
+    },
+}
+
+#[allow(dead_code)] // first production callers are the record site and the proof finish
+impl ScanIndex {
+    /// U1a-2a (row 2; rev 3 §3.1, rev 5 R2-M6, rev 11 R1-M1, rev 13 R1-L4):
+    /// owe `key`'s proof against `parent`. Idempotent: an `Owed` entry for
+    /// the same parent keeps its wake, outcome, attempts, backoff, `kept`
+    /// and `seq` (cause and origin follow the latest owe); an unused
+    /// `Proven` for the same parent is a no-op; a `Proven` that was used and
+    /// refused (`proven_refused`), another parent or no entry becomes a new
+    /// `Owed` with `seq = ++codex_parent_proof_seq`, raising the incarnation's
+    /// `MINTED` high-water. A cause load would drop (a non-ordinal, or
+    /// `CAUSE_NO_EVIDENCE` without `Lineage`) is refused. Returns whether
+    /// `key` is owed against `parent` afterwards.
+    pub(in crate::snapshots) fn owe_codex_parent_proof(
+        &mut self,
+        key: &str,
+        parent: &str,
+        cause: u8,
+        origin: OwedOrigin,
+        proven_refused: bool,
+    ) -> bool {
+        if !codex_owed_cause_decodes(cause, origin) {
+            return false;
+        }
+        match self.codex_parent_prefix_proofs.get_mut(key) {
+            Some(CodexParentProofState::Owed(owed)) if owed.parent == parent => {
+                owed.cause = cause;
+                owed.origin = origin;
+                return true;
+            }
+            Some(CodexParentProofState::Proven(proof))
+                if proof.parent == parent && !proven_refused =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+        self.insert_owed_codex_parent_proof(
+            key,
+            CodexParentProofOwed::new(parent.to_owned(), 0, cause, origin),
+        )
+    }
+
+    /// Inserts `owed` with a fresh `seq`, keeping the fold and the
+    /// high-water. `seq` overflow refuses (nothing changes).
+    fn insert_owed_codex_parent_proof(
+        &mut self,
+        key: &str,
+        mut owed: CodexParentProofOwed,
+    ) -> bool {
+        let Some(seq) = self.codex_parent_proof_seq.checked_add(1) else {
+            return false;
+        };
+        self.codex_parent_proof_seq = seq;
+        owed.seq = seq;
+        let parent = owed.parent.clone();
+        if let Some(CodexParentProofState::Owed(previous)) = self
+            .codex_parent_prefix_proofs
+            .insert(key.to_owned(), CodexParentProofState::Owed(owed))
+        {
+            fold_owed_parent_out(&mut self.codex_parent_proof_parents_live, &previous.parent);
+        }
+        fold_owed_parent_in(&mut self.codex_parent_proof_parents_live, &parent);
+        raise_codex_proof_seq_high_water(&self.codex_proof_index_incarnation, seq);
+        true
+    }
+
+    /// U1a-2a (row 30, rev 11 §2.7): `key` left `files` (a watcher remove
+    /// or rename hint, or reconciliation): its side record, side request
+    /// and proof entry go (with the owed-parent fold), and, given the
+    /// pass's cache and ledger namespace, the side ledger's entries for it
+    /// end their generation (`Gone`) in the same step. Items keyed by other
+    /// files are untouched.
+    pub(in crate::snapshots) fn drop_codex_proof_items(
+        &mut self,
+        key: &str,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) {
+        self.codex_parent_side.remove(key);
+        self.codex_parent_side_requests.remove(key);
+        self.remove_codex_parent_proof(key);
+        if let Some((cache, ns)) = side {
+            cache
+                .side_ledger()
+                .end_generation(ns, sampled_scan::side_ledger::parent_of(key));
+        }
+    }
+
+    /// U1a-2a (row 2/30): removes `key`'s proof entry, keeping the fold.
+    pub(in crate::snapshots) fn remove_codex_parent_proof(
+        &mut self,
+        key: &str,
+    ) -> Option<CodexParentProofState> {
+        let removed = self.codex_parent_prefix_proofs.remove(key)?;
+        if let CodexParentProofState::Owed(owed) = &removed {
+            fold_owed_parent_out(&mut self.codex_parent_proof_parents_live, &owed.parent);
+        }
+        Some(removed)
+    }
+
+    /// U1a-2a (row 2, rev 3 §3.2): the record-site transition. Returns
+    /// `Some(publication)` for an admission: `publication` is true for the
+    /// one use of an outlived seal's staged debt, and sets `published`.
+    pub(in crate::snapshots) fn settle_codex_parent_proof_entry(
+        &mut self,
+        key: &str,
+        settle: ProofSettle,
+    ) -> Option<bool> {
+        match settle {
+            ProofSettle::Admitted { debt } => {
+                let Some(CodexParentProofState::Proven(proof)) =
+                    self.codex_parent_prefix_proofs.get_mut(key)
+                else {
+                    return None;
+                };
+                let publication = debt && !proof.published;
+                proof.published |= publication;
+                Some(publication)
+            }
+            ProofSettle::Remove => {
+                self.remove_codex_parent_proof(key);
+                None
+            }
+            ProofSettle::RemoveOwed => {
+                if matches!(
+                    self.codex_parent_prefix_proofs.get(key),
+                    Some(CodexParentProofState::Owed(_))
+                ) {
+                    self.remove_codex_parent_proof(key);
+                }
+                None
+            }
+            ProofSettle::ParentHeld { cause, wake } => {
+                if !codex_owed_cause_decodes(cause, OwedOrigin::Child) {
+                    return None;
+                }
+                let Some(CodexParentProofState::Proven(proof)) =
+                    self.codex_parent_prefix_proofs.get(key)
+                else {
+                    return None;
+                };
+                let mut owed =
+                    CodexParentProofOwed::new(proof.parent.clone(), 0, cause, OwedOrigin::Child);
+                owed.wake = wake;
+                owed.kept = Some(Box::new(proof.clone()));
+                self.insert_owed_codex_parent_proof(key, owed);
+                None
+            }
+        }
+    }
+
+    /// U1a-2a (row 2; rev 10 §5.3, rev 11 R1-M1): a finished job's delta
+    /// for `key` applies only to an `Owed` entry with the job's `seq`, in
+    /// the job's (minted, non-empty) incarnation. A proof replaces the
+    /// entry; an attempt records its outcome and backoff. Returns whether
+    /// it applied.
+    pub(in crate::snapshots) fn finish_codex_parent_proof_entry(
+        &mut self,
+        key: &str,
+        seq: u64,
+        incarnation: &str,
+        finish: ProofFinish,
+        now: u64,
+    ) -> bool {
+        if incarnation.is_empty() || incarnation != self.codex_proof_index_incarnation {
+            return false;
+        }
+        let Some(CodexParentProofState::Owed(owed)) = self.codex_parent_prefix_proofs.get_mut(key)
+        else {
+            return false;
+        };
+        if owed.seq != seq {
+            return false;
+        }
+        match finish {
+            ProofFinish::Attempt { outcome, wake } => owed.after_attempt(outcome, wake, now),
+            ProofFinish::Proven(proof) => {
+                self.remove_codex_parent_proof(key);
+                self.codex_parent_prefix_proofs
+                    .insert(key.to_owned(), CodexParentProofState::Proven(proof));
+            }
+        }
+        true
+    }
+}
+
+/// The owe-side twin of `retain_decodable_codex_parent_state`'s rule.
+fn codex_owed_cause_decodes(cause: u8, origin: OwedOrigin) -> bool {
+    CodexParentUnresolvable::from_index(cause).is_some()
+        || (cause == CAUSE_NO_EVIDENCE && origin == OwedOrigin::Lineage)
+}
+
+/// U1a-2a (row 35, rev 12 §5.3): what `load_inner` found at the path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LoadOrigin {
+    /// Decoded and accepted: the opened file's identity.
+    Loaded(sampled_scan::codex_cursor::OpenStamp),
+    Missing,
+    /// Renamed away as invalid: the path is missing now.
+    Quarantined,
+}
+
+/// The index file a `MINTED` nonce belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MintedIdentity {
+    Loaded(sampled_scan::codex_cursor::OpenStamp),
+    Missing,
+}
+
+struct MintedIncarnation {
+    identity: MintedIdentity,
+    nonce: String,
+    seq_high_water: u64,
+}
+
+/// U1a-2a (row 35): per destination index path (≤ 1 entry each), the
+/// incarnation last minted or kept there and its `seq` high-water.
+static MINTED_PROOF_INCARNATIONS: Mutex<BTreeMap<PathBuf, MintedIncarnation>> =
+    Mutex::new(BTreeMap::new());
+
+/// Every critical section is one lookup plus one whole-entry insert or one
+/// `max`, so a poisoned lock's map is consistent: it is recovered at once,
+/// never left unmemoized (as the side ledger's poison, rev 18 R2-L4).
+fn minted_proof_incarnations(
+) -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, MintedIncarnation>> {
+    MINTED_PROOF_INCARNATIONS.lock().unwrap_or_else(|poisoned| {
+        MINTED_PROOF_INCARNATIONS.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// U1a-2a (row 2, rev 13 R1-L4): raises the high-water of the `MINTED`
+/// entry whose nonce is `incarnation`. `""` (unminted) has none.
+fn raise_codex_proof_seq_high_water(incarnation: &str, seq: u64) {
+    if incarnation.is_empty() {
+        return;
+    }
+    if let Some(minted) = minted_proof_incarnations()
+        .values_mut()
+        .find(|minted| minted.nonce == incarnation)
+    {
+        minted.seq_high_water = minted.seq_high_water.max(seq);
+    }
+}
+
+/// 32 hex of sha256(path, nanos, pid, process counter).
+fn mint_codex_proof_index_nonce(path: &Path) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, b"ottto:codex-proof-index-incarnation:v1");
+    update_length_prefixed(&mut digest, path.as_os_str().as_bytes());
+    digest.update(nanos.to_be_bytes());
+    digest.update(std::process::id().to_be_bytes());
+    digest.update(
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_be_bytes(),
+    );
+    let mut nonce = format!("{:x}", digest.finalize());
+    nonce.truncate(32);
+    nonce
+}
+
+impl ScanIndex {
+    /// U1a-2a (row 35, rev 12 §5.3 table): keeps a loaded file's persisted
+    /// nonce; reuses the memo's nonce for the same unchanged file (loaded
+    /// without one) or for a still-missing index; otherwise (a quarantine
+    /// included) mints fresh. `seq` never falls below the path's
+    /// high-water, so within one process it never repeats across failed
+    /// checkpoints, unsaved missing indexes or partial commits.
+    fn mint_or_reuse_codex_proof_incarnation(&mut self, path: &Path, origin: LoadOrigin) {
+        let mut minted = minted_proof_incarnations();
+        let memo = minted.get(path);
+        let high_water = memo.map_or(0, |memo| memo.seq_high_water);
+        let reused = memo.and_then(|memo| match (&origin, &memo.identity) {
+            (LoadOrigin::Loaded(now), MintedIdentity::Loaded(before)) if now == before => {
+                Some(memo.nonce.clone())
+            }
+            (LoadOrigin::Missing, MintedIdentity::Missing) => Some(memo.nonce.clone()),
+            _ => None,
+        });
+        let (identity, nonce) = match origin {
+            LoadOrigin::Loaded(stamp) if !self.codex_proof_index_incarnation.is_empty() => (
+                MintedIdentity::Loaded(stamp),
+                self.codex_proof_index_incarnation.clone(),
+            ),
+            LoadOrigin::Loaded(stamp) => (
+                MintedIdentity::Loaded(stamp),
+                reused.unwrap_or_else(|| mint_codex_proof_index_nonce(path)),
+            ),
+            LoadOrigin::Missing => (
+                MintedIdentity::Missing,
+                reused.unwrap_or_else(|| mint_codex_proof_index_nonce(path)),
+            ),
+            LoadOrigin::Quarantined => {
+                (MintedIdentity::Missing, mint_codex_proof_index_nonce(path))
+            }
+        };
+        self.codex_parent_proof_seq = self.codex_parent_proof_seq.max(high_water);
+        self.codex_proof_index_incarnation = nonce.clone();
+        minted.insert(
+            path.to_path_buf(),
+            MintedIncarnation {
+                identity,
+                nonce,
+                seq_high_water: self.codex_parent_proof_seq,
+            },
+        );
+    }
+}
+
 /// PR-P: the referenced ids of this path whose parse can still produce new
 /// evidence: main's index clause minus parents that a settling witness
 /// already explains. The raw index clause stays here only: a stale index
@@ -20486,6 +20847,11 @@ impl OwnedSourceScan {
                 // absent beneath the configured root above, so retire the corresponding
                 // derived index state directly. Any recreation after this absence witness
                 // belongs to the next generation.
+                // U1a-2a (row 30): the side ledger's namespace for this pass.
+                let codex_side_drop = sampling
+                    .as_ref()
+                    .zip(codex_side_pass)
+                    .map(|(context, pass)| (&*context.cache, pass.ns));
                 for index_key in &census.removed_index_keys {
                     if !index
                         .files
@@ -20512,6 +20878,9 @@ impl OwnedSourceScan {
                                 source,
                                 disappearance_diagnostics::Vanished::RequestCensusRemoved,
                             );
+                        }
+                        if !index.files.contains_key(index_key) {
+                            index.drop_codex_proof_items(index_key, codex_side_drop);
                         }
                     }
                 }
@@ -20602,7 +20971,7 @@ impl OwnedSourceScan {
                     && state_census_complete
                     && sidecar_census_complete
                 {
-                    reconcile_missing_index_entries_bounded(index)
+                    reconcile_missing_index_entries_bounded(index, codex_side_drop)
                 } else {
                     false
                 };
@@ -30174,11 +30543,23 @@ fn candidate_from_traversal_path_at(
     })
 }
 
-fn reconcile_missing_index_entries_bounded(index: &mut ScanIndex) -> bool {
-    reconcile_missing_index_entries_with_limit(index, MAX_BACKFILL_FILES_PER_SOURCE)
+fn reconcile_missing_index_entries_bounded(
+    index: &mut ScanIndex,
+    codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+) -> bool {
+    reconcile_missing_index_entries_with_side(index, MAX_BACKFILL_FILES_PER_SOURCE, codex_side_drop)
 }
 
+#[cfg(test)]
 fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
+    reconcile_missing_index_entries_with_side(index, limit, None)
+}
+
+fn reconcile_missing_index_entries_with_side(
+    index: &mut ScanIndex,
+    limit: usize,
+    codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+) -> bool {
     let Some(snapshot) = index.traversal.as_ref() else {
         return false;
     };
@@ -30211,6 +30592,7 @@ fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usiz
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
             index.claude_account_deferred_holds.remove(key);
+            index.drop_codex_proof_items(key, codex_side_drop);
         }
     }
     let done = page.last() == Some(&upper_bound) || page.len() < limit;
@@ -32138,12 +32520,22 @@ impl ScanIndex {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
+        let (mut index, origin) = Self::load_inner(path)?;
+        index.mint_or_reuse_codex_proof_incarnation(path, origin);
+        Ok(index)
+    }
+
+    /// `load` before the U1a-2a proof incarnation (row 35): each accepted
+    /// return says what it found.
+    fn load_inner(path: &Path) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), LoadOrigin::Missing));
         }
         let _lock = CheckpointLock::acquire(path)?;
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
+        let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)
+            .with_context(|| format!("stat scan index {}", path.display()))?;
         take_dropped_codex_side_requests();
         let decoded = claude_request_census::decode_index(file);
         let dropped_side_requests = take_dropped_codex_side_requests();
@@ -32189,18 +32581,21 @@ impl ScanIndex {
                     );
                     index.codex_parent_proof_parents_live =
                         codex_parent_proof_parents_live(&index.codex_parent_prefix_proofs);
-                    Ok(index)
+                    Ok((index, LoadOrigin::Loaded(opened)))
                 } else {
                     quarantine_invalid_scan_index(path)
+                        .map(|index| (index, LoadOrigin::Quarantined))
                 }
             }
             Ok(index) if index.schema_version == SCAN_INDEX_SCHEMA_VERSION => {
-                quarantine_invalid_scan_index(path)
+                quarantine_invalid_scan_index(path).map(|index| (index, LoadOrigin::Quarantined))
             }
             Ok(_) => Err(anyhow::anyhow!(
                 "unsupported local snapshot scan index schema"
             )),
-            Err(error) if !error.is_io() => quarantine_invalid_scan_index(path),
+            Err(error) if !error.is_io() => {
+                quarantine_invalid_scan_index(path).map(|index| (index, LoadOrigin::Quarantined))
+            }
             Err(error) => {
                 Err(error).with_context(|| format!("parse scan index {}", path.display()))
             }
