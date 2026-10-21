@@ -556,11 +556,15 @@ impl SideLedger {
     /// the same step as the index's removal. Allocates nothing under the
     /// lock.
     pub(in crate::snapshots) fn end_generation(&mut self, ns: u128, p: Option<u128>) {
-        while let Some((key, entry)) = self
-            .namespace(ns)
-            .find(|(key, entry)| p.map_or(true, |p| key.p == p) && entry.tag != LedgerTag::Gone)
-            .map(|(key, entry)| (*key, *entry))
-        {
+        loop {
+            // Bound first: the iterator's borrow ends before the write.
+            let next = self
+                .namespace(ns)
+                .find(|(key, entry)| p.map_or(true, |p| key.p == p) && entry.tag != LedgerTag::Gone)
+                .map(|(key, entry)| (*key, *entry));
+            let Some((key, entry)) = next else {
+                break;
+            };
             self.write_existing(
                 &key,
                 LedgerEntry {
