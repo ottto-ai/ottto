@@ -80,6 +80,11 @@ retained pending member hashes and occurrence keys once and the loaded API and
 trace rows once; nothing is cloned from those maps. The admission reason is an
 in-memory value used for branching; tests record it, release folds do not.
 
+Local audit counts by admission reason (waived sessions, each refusal, and a
+non-zero foreign-telemetry count as a signal) are deliberately not part of this
+change. They need a snapshot-audit schema change, which is proposed separately
+with that schema's owner.
+
 ## Verification
 
 Synthetic regressions cover an unrelated cap-invalid family, an own invalid

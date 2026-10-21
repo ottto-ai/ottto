@@ -1100,3 +1100,57 @@ fn waiver_evidence_refuses_before_allocating_past_its_bound() {
     ));
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn refused_evidence_keeps_an_eligible_member_withheld() {
+    let dir = temp_dir("claude-waiver-refused-evidence");
+    let (_, mut owned) = session(
+        &dir,
+        OWNED,
+        &[
+            assistant(OWNED, "req_a1", 1, 100),
+            assistant(OWNED, "req_a2", 2, 300),
+        ],
+    );
+    owned.usage_accounting_contract = V1.map(str::to_string);
+    let own_pending = ClaudeUsageFamilyPending {
+        census_window_end: WINDOW.to_string(),
+        member_request_id_hashes: BTreeMap::from([(
+            OWNED.to_string(),
+            owned
+                .claude_usage_request_ids
+                .iter()
+                .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
+                .collect::<BTreeSet<_>>(),
+        )]),
+        member_occurrences: BTreeMap::new(),
+        invalid: false,
+    };
+    let no_duplicates = BTreeSet::new();
+    let empty_evidence = ClaudePostureWaiverEvidence::default();
+    let admission = |evidence| {
+        claude_withheld_posture_admission(
+            &owned,
+            OWNED,
+            &BTreeSet::new(),
+            ClaudePostureFence {
+                closed: true,
+                reports_healthy: true,
+                census_window_end: WINDOW,
+                own_pending: Some(&own_pending),
+                duplicated_request_hashes: &no_duplicates,
+                evidence,
+            },
+        )
+    };
+
+    assert_eq!(
+        admission(Some(&empty_evidence)),
+        ClaudePostureAdmission::MemberWaiver
+    );
+    assert_eq!(
+        admission(None),
+        ClaudePostureAdmission::WithheldEvidenceBound
+    );
+    let _ = fs::remove_dir_all(dir);
+}
