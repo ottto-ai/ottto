@@ -171,6 +171,70 @@ fn open_stamp_accepts_growth_and_refuses_shrink_or_replacement() {
     assert!(!open.append_compatible(&replaced));
 }
 
+/// U-T56 (cc): `OpenStamp::append_compatible` delegates to the shared rule
+/// and keeps the inline predicate it replaced on every identity case.
+#[test]
+fn open_stamp_delegation_matches_the_replaced_inline_predicate() {
+    let base = OpenStamp {
+        dev: 7,
+        ino: 11,
+        extent: 100,
+        modified: (1, 2),
+        changed: (3, 4),
+    };
+    let cases = [
+        ("identical", base.clone(), true),
+        (
+            "grown",
+            OpenStamp {
+                extent: 150,
+                modified: (5, 6),
+                changed: (5, 6),
+                ..base.clone()
+            },
+            true,
+        ),
+        (
+            "equal-length edit",
+            OpenStamp {
+                modified: (5, 6),
+                ..base.clone()
+            },
+            false,
+        ),
+        (
+            "shrink",
+            OpenStamp {
+                extent: 50,
+                ..base.clone()
+            },
+            false,
+        ),
+        (
+            "replaced",
+            OpenStamp {
+                ino: 12,
+                ..base.clone()
+            },
+            false,
+        ),
+        (
+            "replaced and grown",
+            OpenStamp {
+                dev: 8,
+                extent: 150,
+                ..base.clone()
+            },
+            false,
+        ),
+    ];
+    for (case, now, expected) in cases {
+        let inline = base.same_object(&now) && (now.extent > base.extent || now == base);
+        assert_eq!(base.append_compatible(&now), expected, "{case}");
+        assert_eq!(inline, expected, "{case}: replaced inline predicate");
+    }
+}
+
 fn reader_input() -> (Vec<u8>, u64, u64) {
     let mut input = b"{\"n\":1}\n".to_vec();
     input.extend_from_slice(format!("{{\"big\":\"{}\"}}\n", "x".repeat(200)).as_bytes());

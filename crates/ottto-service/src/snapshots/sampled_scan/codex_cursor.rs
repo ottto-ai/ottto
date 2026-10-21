@@ -307,9 +307,10 @@ impl OpenStamp {
     }
 
     /// Same object, no shrink, and no equal-length in-place change. Growth
-    /// is compatible: appended bytes are outside the frozen extent.
+    /// is compatible: appended bytes are outside the frozen extent. The rule
+    /// is the shared `transcript_acquisition::append_compatible`.
     pub(in crate::snapshots) fn append_compatible(&self, now: &Self) -> bool {
-        self.same_object(now) && (now.extent > self.extent || now == self)
+        crate::transcript_acquisition::append_compatible(self, now)
     }
 
     fn same_object(&self, other: &Self) -> bool {
@@ -317,6 +318,15 @@ impl OpenStamp {
     }
 
     pub(in crate::snapshots) fn extent(&self) -> u64 {
+        self.extent
+    }
+}
+
+impl crate::transcript_acquisition::StampIdentity for OpenStamp {
+    fn same_object(&self, other: &Self) -> bool {
+        OpenStamp::same_object(self, other)
+    }
+    fn length(&self) -> u64 {
         self.extent
     }
 }
