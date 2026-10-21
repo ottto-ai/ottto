@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 723,
-  "content_sha256": "5a90bd4b921fc370d0665d30dba5ea1e4a7f1d9687a122e6d00eab503aead8da",
+  "content_sha256": "2771327a804e31c90e1fba5c03828657ef12073f801cf8b8010c97ca01805047",
   "files": [
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_tls.rs",
-      "sha256": "4ebb22d7242e9e85bc8a24ee22117ef5eee93bfc3b8ad6e2fb47ac841aa74187",
-      "size_bytes": 39153
+      "sha256": "99da4cc65befbcbb888f7703131132ef1d063c18d9c07ea15b5bea0e61fa7842",
+      "size_bytes": 47139
     },
     {
       "executable": false,
@@ -3303,8 +3303,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-tls-webpki-advisory-repair.md",
-      "sha256": "aae4696d971cbfcd855135c908c4a15cf07a08785e96cc75091aec51a083a058",
-      "size_bytes": 2635
+      "sha256": "ef62b022edc9e5a419dcd1e24d4509ae26d04a99355d05799cc8e87178ccd083",
+      "size_bytes": 3566
     },
     {
       "executable": false,
@@ -5064,7 +5064,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-20T23:16:30+00:00",
+  "generated_at": "2026-10-21T00:25:26+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 724,
   "public_roots": [
@@ -5103,5 +5103,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "797dcda18834d7ade395a1bca3108a251b0e87a5"
+  "source_commit": "1fd7a51dfef9f72099d007e664c66a98f8151540"
 }
