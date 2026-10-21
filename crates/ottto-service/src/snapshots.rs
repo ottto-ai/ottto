@@ -2589,10 +2589,16 @@ pub struct ScanIndex {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     codex_parent_proof_seq: u64,
     /// This index's proof incarnation; `""` = unminted, which no proof job
-    /// binds to. Minted at load (row 35); carried by the subset and `Clone`;
-    /// not cleared by replay.
+    /// binds to. Adopted from `codex_proof_index_minted` at its first use;
+    /// carried by the subset and `Clone`; not cleared by replay.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     codex_proof_index_incarnation: String,
+    /// RAM only (row 35): the incarnation `load` minted or reused, persisted
+    /// only once a use binds it (an owe, a proof job), so an index with no
+    /// proof work keeps its bytes. Carried by the subset and `Clone`; not
+    /// cleared by replay.
+    #[serde(skip)]
+    codex_proof_index_minted: String,
     /// RAM fold, never persisted: owed proof entries per resolved parent id
     /// (`codex_parent_side_live`'s third term). Rebuilt at load and in the
     /// subset, cleared by replay.
@@ -2848,6 +2854,7 @@ impl Default for ScanIndex {
             codex_parent_side_cursor: None,
             codex_parent_proof_seq: 0,
             codex_proof_index_incarnation: String::new(),
+            codex_proof_index_minted: String::new(),
             codex_parent_proof_parents_live: BTreeMap::new(),
             claude_desktop_title_files: BTreeMap::new(),
             claude_account_family_witnesses: BTreeMap::new(),
@@ -16558,7 +16565,7 @@ impl ScanIndex {
             fold_owed_parent_out(&mut self.codex_parent_proof_parents_live, &previous.parent);
         }
         fold_owed_parent_in(&mut self.codex_parent_proof_parents_live, &parent);
-        raise_codex_proof_seq_high_water(&self.codex_proof_index_incarnation, seq);
+        raise_codex_proof_seq_high_water(self.codex_proof_incarnation_in_use(), seq);
         true
     }
 
@@ -16581,6 +16588,18 @@ impl ScanIndex {
                 .side_ledger()
                 .end_generation(ns, Some(sampled_scan::side_ledger::parent_of(key)));
         }
+    }
+
+    /// U1a-2a (row 35): this index's proof incarnation for a use that binds
+    /// it (an owe's high-water, a proof job). The first use adopts the nonce
+    /// `load` minted or reused, so it persists from the next save. `""` for
+    /// an index that was never loaded.
+    pub(in crate::snapshots) fn codex_proof_incarnation_in_use(&mut self) -> &str {
+        if self.codex_proof_index_incarnation.is_empty() {
+            self.codex_proof_index_incarnation
+                .clone_from(&self.codex_proof_index_minted);
+        }
+        &self.codex_proof_index_incarnation
     }
 
     /// U1a-2a (row 2/30): removes `key`'s proof entry, keeping the fold.
@@ -16764,9 +16783,11 @@ impl ScanIndex {
     /// U1a-2a (row 35, rev 12 §5.3 table): keeps a loaded file's persisted
     /// nonce; reuses the memo's nonce for the same unchanged file (loaded
     /// without one) or for a still-missing index; otherwise (a quarantine
-    /// included) mints fresh. `seq` never falls below the path's
-    /// high-water, so within one process it never repeats across failed
-    /// checkpoints, unsaved missing indexes or partial commits.
+    /// included) mints fresh. The result goes to the RAM
+    /// `codex_proof_index_minted`, persisted from its first use. `seq` never
+    /// falls below the path's high-water, so within one process it never
+    /// repeats across failed checkpoints, unsaved missing indexes or partial
+    /// commits.
     fn mint_or_reuse_codex_proof_incarnation(&mut self, path: &Path, origin: LoadOrigin) {
         let mut minted = minted_proof_incarnations();
         let memo = minted.get(path);
@@ -16796,7 +16817,7 @@ impl ScanIndex {
             }
         };
         self.codex_parent_proof_seq = self.codex_parent_proof_seq.max(high_water);
-        self.codex_proof_index_incarnation = nonce.clone();
+        self.codex_proof_index_minted = nonce.clone();
         minted.insert(
             path.to_path_buf(),
             MintedIncarnation {
@@ -33667,6 +33688,7 @@ impl ScanIndex {
                 .codex_parent_proof_seq
                 .max(previous.codex_parent_proof_seq),
             codex_proof_index_incarnation: self.codex_proof_index_incarnation.clone(),
+            codex_proof_index_minted: self.codex_proof_index_minted.clone(),
             codex_parent_proof_parents_live: codex_parent_proof_parents_live(
                 &self.codex_parent_prefix_proofs,
             ),
@@ -72100,7 +72122,7 @@ crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verifi
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

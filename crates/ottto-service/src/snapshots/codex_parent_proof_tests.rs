@@ -281,6 +281,7 @@ fn proof_map_cursors_and_seq_follow_the_index_lifecycle() {
         "codex_parent_side_cursor",
         "codex_parent_proof_seq",
         "codex_proof_index_incarnation",
+        "codex_proof_index_minted",
         "codex_parent_proof_parents_live",
     ] {
         assert!(empty.get(key).is_none(), "{key}");
@@ -564,9 +565,9 @@ fn owe_is_idempotent_takes_a_fresh_seq_and_folds_by_parent() {
         .insert("/c/p".into(), proven.clone());
     assert!(!index.owe_codex_parent_proof("/c/p", OWE_P, cause, OwedOrigin::Child, false));
     assert_eq!(index.codex_parent_prefix_proofs["/c/p"], proven);
-    assert_eq!(index.codex_parent_proof_seq, 2);
+    assert_eq!(index.codex_parent_proof_seq, 3);
     assert!(index.owe_codex_parent_proof("/c/p", OWE_P, cause, OwedOrigin::Child, true));
-    assert_eq!(owed_at(&index, "/c/p").seq, 3);
+    assert_eq!(owed_at(&index, "/c/p").seq, 4);
     assert_eq!(
         index.codex_parent_proof_parents_live,
         fold(&[(OWE_P, 1), (OWE_Q, 2)])
@@ -726,44 +727,66 @@ fn settle_and_finish_move_one_entry_and_the_finish_needs_the_jobs_seq_and_incarn
 
 /// Row 35 (rev 12 §5.3 table, rev 13 R1-L4; U-T59(a)/(c) unit legs): a
 /// missing index mints once and reuses while missing; an unsaved reload
-/// starts above the owe's high-water, so `seq` never repeats; a saved
-/// nonce is kept; a file without one reuses only while it is the same
-/// object; a quarantine mints fresh, and the then-missing path reuses it.
+/// starts above the owe's high-water, so `seq` never repeats; a saved nonce
+/// is kept; a file without one reuses only while it is the same object; a
+/// quarantine mints fresh, and the then-missing path reuses it. Nothing is
+/// persisted until a use binds the nonce, so an index with no proof work
+/// keeps its bytes.
 #[test]
 fn load_keeps_reuses_or_mints_the_incarnation_and_seq_never_repeats() {
     let cause = CodexParentUnresolvable::DeferredRef.index() as u8;
+    let is_nonce = |nonce: &str| {
+        nonce.len() == 32
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
     let path = temp_index_path("mint");
     let mut missing = ScanIndex::load(&path).unwrap();
-    let nonce = missing.codex_proof_index_incarnation.clone();
-    assert_eq!(nonce.len(), 32);
-    assert!(nonce
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert!(
+        missing.codex_proof_index_incarnation.is_empty(),
+        "not before a use"
+    );
+    let nonce = missing.codex_proof_incarnation_in_use().to_owned();
+    assert!(is_nonce(&nonce));
     assert!(missing.owe_codex_parent_proof("/c/a", OWE_P, cause, OwedOrigin::Child, false));
     assert_eq!(missing.codex_parent_proof_seq, 1);
 
     let mut again = ScanIndex::load(&path).unwrap();
-    assert_eq!(again.codex_proof_index_incarnation, nonce);
+    assert_eq!(again.codex_proof_incarnation_in_use(), nonce);
     assert_eq!(again.codex_parent_proof_seq, 1);
     assert!(again.owe_codex_parent_proof("/c/a", OWE_P, cause, OwedOrigin::Child, false));
     assert_eq!(again.codex_parent_proof_seq, 2, "seq never repeats");
 
     again.save(&path).unwrap();
     let saved = ScanIndex::load(&path).unwrap();
-    assert_eq!(saved.codex_proof_index_incarnation, nonce);
+    assert_eq!(
+        saved.codex_proof_index_incarnation, nonce,
+        "persisted and kept"
+    );
     assert_eq!(saved.codex_parent_proof_seq, 2);
 
     let bare = temp_index_path("mint-bare");
     ScanIndex::default().save(&bare).unwrap();
-    let first = ScanIndex::load(&bare)
-        .unwrap()
-        .codex_proof_index_incarnation;
-    assert_eq!(first.len(), 32);
+    let bytes = fs::read(&bare).unwrap();
+    let mut unused = ScanIndex::load(&bare).unwrap();
+    unused.save(&bare).unwrap();
+    let mut first_index = ScanIndex::load(&bare).unwrap();
+    assert!(
+        fs::read(&bare).unwrap().len() == bytes.len()
+            && serde_json::to_value(&first_index)
+                .unwrap()
+                .get("codex_proof_index_incarnation")
+                .is_none(),
+        "no proof work, no persisted incarnation"
+    );
+    let first = first_index.codex_proof_incarnation_in_use().to_owned();
+    assert!(is_nonce(&first));
     assert_ne!(first, nonce);
     assert_eq!(
         ScanIndex::load(&bare)
             .unwrap()
-            .codex_proof_index_incarnation,
+            .codex_proof_incarnation_in_use(),
         first,
         "the same file reuses"
     );
@@ -773,16 +796,17 @@ fn load_keeps_reuses_or_mints_the_incarnation_and_seq_never_repeats() {
     assert_ne!(
         ScanIndex::load(&bare)
             .unwrap()
-            .codex_proof_index_incarnation,
+            .codex_proof_incarnation_in_use(),
         first,
         "a replaced file mints"
     );
 
     fs::write(&path, b"not json").unwrap();
-    let quarantined = ScanIndex::load(&path).unwrap();
+    let mut quarantined = ScanIndex::load(&path).unwrap();
     assert!(!path.exists(), "quarantined");
-    assert_ne!(quarantined.codex_proof_index_incarnation, nonce);
-    assert_eq!(quarantined.codex_proof_index_incarnation.len(), 32);
+    let fresh = quarantined.codex_proof_incarnation_in_use().to_owned();
+    assert!(is_nonce(&fresh));
+    assert_ne!(fresh, nonce);
     assert_eq!(
         quarantined.codex_parent_proof_seq, 2,
         "the path's high-water"
@@ -790,8 +814,8 @@ fn load_keeps_reuses_or_mints_the_incarnation_and_seq_never_repeats() {
     assert_eq!(
         ScanIndex::load(&path)
             .unwrap()
-            .codex_proof_index_incarnation,
-        quarantined.codex_proof_index_incarnation
+            .codex_proof_incarnation_in_use(),
+        fresh
     );
 }
 

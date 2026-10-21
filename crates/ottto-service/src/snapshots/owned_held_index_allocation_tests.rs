@@ -285,10 +285,6 @@ fn compare(roots: usize, debt: bool) {
         "exact durable bytes"
     );
     let restored = ScanIndex::load(&new_path).expect("reload owned output");
-    // U1a-2a row 35: a load mints an unminted index's proof incarnation.
-    new_output
-        .codex_proof_index_incarnation
-        .clone_from(&restored.codex_proof_index_incarnation);
     assert_eq!(
         serde_json::to_vec(&restored).unwrap(),
         serde_json::to_vec(&new_output).unwrap()
