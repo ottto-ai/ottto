@@ -59,8 +59,25 @@ Curves and cache observations still read the strict rule; curves stay off (R10).
 
 ### Session start
 
-Session start stays under its existing gate: an item the strict rule does not
-own keeps the client version only, admitted or not.
+- Fresh root file: the full split from the first own request, the same
+  occurrence as `first_turn_context_tokens`. The census fence no longer
+  reduces it.
+- A tagged record inside the session-start window (the first three requests):
+  first turn is the first own request and session start keeps the client
+  version only.
+- Subagent: its own split.
+- One classification decides both: the split is kept only when the scalar
+  tuple is admitted and nothing copied sits in the opening window. Any
+  withhold (tripwire, unknown birth, untimed record, all copied, evidence
+  bound) or a second file for the session id keeps the version only. A copied
+  block later in the file, after own requests, does not erase an owned
+  opening; a resume that appends to the same file is not a copied prefix.
+- The split comes from response sequence 0, the same sequence index the
+  tally uses (id-less responses included), and the existing D6 branch emits
+  request-1 parts only when they add up to `first_turn_context_tokens`. The
+  retained tail copy carries the same birth and tally, so a tail read and a
+  full read select the same first request. `session_start.rs` only exposes
+  the window size.
 
 ### Same session id in two folders
 
@@ -231,7 +248,7 @@ process-lifetime, at most 4,096 entries of two `u64` (under 100 KB).
 
 Synthetic regressions through the real parser and fold: a Rewind-style copy
 with a second copied block (own-only first/peak/last and compactions, session
-start reduced to the version, money unchanged), a growing fresh file with
+start inherited, money unchanged), a growing fresh file with
 numbers on its first fold under an incomplete census, a late-born subagent
 file, a root transcript copied under a subagent path, the same session id in
 two folders and across two accounts, unknown birth and an unparsed item, an
@@ -252,7 +269,12 @@ the R9 counters (witness missing on a fresh file, witness present in the
 seven-entity demotion cohort), an `unchanged` ACK with `usage_identical` or
 `dominated_by_head` that is held, not marked emitted, and not re-sent (with a
 plain `unchanged` control), and a held body followed by local growth whose
-new body is offered and accepted.
+new body is offered and accepted. Session start controls: a fresh root with
+the fence closed (full split that sums to first), a copied opening (version
+only), a later copied block (opening kept), an id-less first occurrence,
+contradicting telemetry and unknown birth (version only), a same-file append,
+a subagent's own split, and tail-versus-full parity of the first request at
+every append boundary.
 One capture-ON test runs the real scan and local evidence pipeline with the
 request identity permit, with the duplicate fence open and closed, and checks
 that every body differs from the withheld control only in context scalars,

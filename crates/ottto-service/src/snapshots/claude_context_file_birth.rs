@@ -73,6 +73,8 @@ pub(crate) struct ClaudeFileBirth {
     /// In-process hash of the file's local index key, used only to notice the
     /// same session id at two paths in one fold. Never persisted.
     path_key_hash: u64,
+    /// A tagged record arrived before the session-start opening window closed.
+    tagged_in_opening: bool,
     tagged_responses: u64,
     own_responses: u64,
     /// Root records whose usage or boundary timestamp could not be read.
@@ -84,7 +86,8 @@ pub(crate) struct ClaudeFileBirth {
     /// A tagged response came before the first own response.
     tagged_before_first_own: bool,
 }
-crate::heap_layout_bound::fields!(ClaudeFileBirth; scope, path_key_hash, tagged_responses, own_responses, untimed_records, first_own_sequence, own_first_context,
+crate::heap_layout_bound::fields!(ClaudeFileBirth; scope, path_key_hash, tagged_in_opening,
+    tagged_responses, own_responses, untimed_records, first_own_sequence, own_first_context,
     own_peak_context, own_last_context, tagged_before_first_own);
 
 /// A reported birth at or before the floor is no evidence (F5).
@@ -141,6 +144,17 @@ impl ClaudeFileBirth {
         matches!(self.scope, ClaudeBirthScope::Root(_))
     }
 
+    /// One owned or copied line, before its response is resolved. Only the
+    /// opening window is checked, so this costs at most a few timestamp parses
+    /// per file.
+    pub(super) fn observe_line(&mut self, timestamp: Option<&str>, responses_before: u64) {
+        if responses_before < super::session_start::WINDOW_REQUESTS as u64
+            && self.copied(timestamp) == Some(true)
+        {
+            self.tagged_in_opening = true;
+        }
+    }
+
     /// One resolved response, in transcript order. Today's naive scalars are
     /// computed beside this and stay untouched; the fold decides which ships.
     pub(super) fn observe_response(
@@ -161,6 +175,9 @@ impl ClaudeFileBirth {
         if copied {
             self.tagged_responses = self.tagged_responses.saturating_add(1);
             self.tagged_before_first_own |= self.own_responses == 0;
+            if sequence < super::session_start::WINDOW_REQUESTS as u64 {
+                self.tagged_in_opening = true;
+            }
             return;
         }
         self.own_responses = self.own_responses.saturating_add(1);
@@ -898,12 +915,15 @@ pub(super) fn admit_claude_file_birth_posture(
     match verdict {
         ClaudeFileBirthVerdict::Admitted => {
             apply_own_context_scalars(item);
-            // Session start stays under its existing gate: version only.
-            item.session_start = item
-                .session_start
-                .take()
-                .and_then(|start| (*start).inherited())
-                .map(Box::new);
+            if birth.tagged_in_opening {
+                // A copied opening did not start fresh here: keep the
+                // version only. A second file for the id withholds above.
+                item.session_start = item
+                    .session_start
+                    .take()
+                    .and_then(|start| (*start).inherited())
+                    .map(Box::new);
+            }
         }
         _ => clear_claude_context_posture(item),
     }

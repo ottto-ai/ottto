@@ -24753,6 +24753,9 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     let timestamp = string_at(value, &["timestamp"])
         .or_else(|| string_at(value, &["created_at"]))
         .or_else(|| string_at(value, &["message", "created_at"]));
+    accumulator
+        .claude_file_birth
+        .observe_line(timestamp.as_deref(), accumulator.claude_response_sequence);
     note_claude_capability_calls(value, timestamp.as_deref(), accumulator);
     // Current Claude transcripts write both of these shapes for one compaction.
     // Keep the raw observations here; `claude_compaction_summary` pairs a
@@ -47364,10 +47367,9 @@ mod tests {
             local_index_key(&hidden_copy_path),
             manifest_index_entry(None),
         );
-        let expected_child_start = items[1]
-            .session_start
-            .clone()
-            .and_then(|start| (*start).inherited());
+        // A subagent file is exempt from the birth rule and keeps its own
+        // full session-start split.
+        let expected_child_start = items[1].session_start.clone();
 
         let disposition = apply_claude_reported_usage_with_index(
             &mut items,
@@ -47407,10 +47409,7 @@ mod tests {
             ),
             (Some(10), Some(10), Some(10), Some(0))
         );
-        assert_eq!(
-            child.session_start.as_deref(),
-            expected_child_start.as_ref()
-        );
+        assert_eq!(child.session_start, expected_child_start);
         assert!(child.cache_observations.is_none());
         let hidden_copy = &items[2];
         assert_eq!(hidden_copy.usage_accounting_contract, None);

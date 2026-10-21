@@ -401,11 +401,7 @@ fn fresh_growing_file_has_numbers_on_its_first_upload() {
     let counts = &disposition.context_file_birth;
     assert_eq!(counts.contractless_scalars_witness_missing_session_count, 1);
     assert_eq!(counts.contractless_scalars_witness_present_session_count, 0);
-    assert_eq!(
-        items[0].session_start.as_deref(),
-        inherited_start(&parsed).as_ref(),
-        "session start stays under its existing gate"
-    );
+    assert_eq!(items[0].session_start, parsed.session_start, "full split");
 
     // The same file keeps its birth while it grows.
     fs::write(
@@ -421,10 +417,7 @@ fn fresh_growing_file_has_numbers_on_its_first_upload() {
         posture(&items[0]),
         (Some(100), Some(300), Some(300), Some(0))
     );
-    assert_eq!(
-        items[0].session_start.as_deref(),
-        inherited_start(&grown).as_ref()
-    );
+    assert_eq!(items[0].session_start, grown.session_start);
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -456,10 +449,7 @@ fn late_born_subagent_file_is_not_tagged() {
         Some("file_birth_rule")
     );
     assert_eq!(posture(&items[0]), (Some(40), Some(40), Some(40), Some(0)));
-    assert_eq!(
-        items[0].session_start.as_deref(),
-        inherited_start(&parsed).as_ref()
-    );
+    assert_eq!(items[0].session_start, parsed.session_start, "own split");
     assert_eq!(disposition.context_file_birth.total.tagged_record_count, 0);
     let _ = fs::remove_dir_all(dir);
 }
@@ -1633,10 +1623,7 @@ fn telemetry_proven_session_keeps_todays_numbers() {
         birth.compaction_total_pre_tokens,
         strict.compaction_total_pre_tokens
     );
-    assert_eq!(
-        birth.session_start.as_deref(),
-        inherited_start(&strict).as_ref()
-    );
+    assert_eq!(birth.session_start, strict.session_start);
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1861,4 +1848,275 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
         assert_eq!(posture(fresh), (Some(100), Some(300), Some(300), Some(0)));
     }
     fs::remove_dir_all(dir).unwrap();
+}
+
+// ---- Session start (addendum 4) -------------------------------------------
+// One classification feeds the scalars and the split: the split is kept only
+// when the scalar tuple is admitted and nothing copied sits in the opening
+// window, and it comes from the same occurrence as first.
+
+/// The request-1 split total, when the split was kept.
+fn split_total(item: &SnapshotItem) -> Option<u64> {
+    let start = item.session_start.as_deref()?;
+    Some(
+        start.first_request_uncached_input_tokens?
+            + start.first_request_cache_read_tokens.unwrap_or(0)
+            + start.first_request_cache_write_5m_tokens.unwrap_or(0)
+            + start.first_request_cache_write_1h_tokens.unwrap_or(0),
+    )
+}
+
+#[test]
+fn session_start_split_follows_the_scalar_classification() {
+    let dir = temp_dir("claude-file-birth-session-start");
+    let now = OffsetDateTime::now_utc();
+    let own = |session: &str, request: &str, offset: i64, tokens: u64| {
+        assistant(session, request, &stamp(now, offset), tokens)
+    };
+    let copied =
+        |session: &str, request: &str| assistant(session, request, &stamp(now, COPIED), 900_000);
+    // (label, session, lines, telemetry owner of the first request, forget
+    // birth, verdict, first, full split kept)
+    let session = |number: u64| format!("e0000000-0000-4000-8000-{number:012}");
+    let cases = [
+        (
+            "fresh root, fence closed",
+            session(1),
+            vec![
+                own(&session(1), "req_1a", -30, 100),
+                own(&session(1), "req_1b", -29, 300),
+            ],
+            None,
+            false,
+            "file_birth_rule",
+            Some(100),
+            true,
+        ),
+        (
+            "copied opening",
+            session(2),
+            vec![
+                copied(&session(2), "req_2c"),
+                own(&session(2), "req_2a", -30, 100),
+                own(&session(2), "req_2b", -29, 300),
+            ],
+            None,
+            false,
+            "file_birth_rule",
+            Some(100),
+            false,
+        ),
+        (
+            "later copied block keeps the owned opening",
+            session(3),
+            vec![
+                own(&session(3), "req_3a", -30, 100),
+                own(&session(3), "req_3b", -29, 200),
+                own(&session(3), "req_3c", -28, 300),
+                copied(&session(3), "req_3x"),
+                own(&session(3), "req_3d", -27, 400),
+            ],
+            None,
+            false,
+            "file_birth_rule",
+            Some(100),
+            true,
+        ),
+        (
+            "id-less first occurrence",
+            session(4),
+            vec![
+                id_less_assistant(&session(4), &stamp(now, -30), 50),
+                own(&session(4), "req_4a", -29, 100),
+            ],
+            None,
+            false,
+            "file_birth_rule",
+            Some(50),
+            true,
+        ),
+        (
+            "contradicting telemetry",
+            session(5),
+            vec![
+                own(&session(5), "req_5a", -30, 100),
+                own(&session(5), "req_5b", -29, 300),
+            ],
+            Some((OTHER_ROOT, "req_5a")),
+            false,
+            "withheld_tripwire",
+            None,
+            false,
+        ),
+        (
+            "unknown birth",
+            session(6),
+            vec![own(&session(6), "req_6a", -30, 100)],
+            None,
+            true,
+            "withheld_unknown_birth",
+            None,
+            false,
+        ),
+    ];
+    for (label, session_id, lines, owner, forget, verdict, first, full_split) in cases {
+        let (path, mut parsed) = root_session(&dir, &session_id, &lines);
+        if forget {
+            parsed.claude_file_birth.forget_birth_for_test();
+        }
+        let mut items = vec![parsed.clone()];
+        let mut index = indexed(&[&path], true);
+        let evidence = match owner {
+            Some((root, request)) => reports(&[(root, request, 1, 100)], true),
+            None => no_reports(),
+        };
+        let disposition = fold(&mut items, &evidence, &mut index, true);
+        let item = &items[0];
+        assert_eq!(
+            disposition.posture_admission(&session_id),
+            Some(verdict),
+            "{label}"
+        );
+        assert_eq!(item.first_turn_context_tokens, first, "{label}");
+        if full_split {
+            assert_eq!(item.session_start, parsed.session_start, "{label}");
+            assert_eq!(split_total(item), first, "{label}: split sums to first");
+        } else {
+            assert_eq!(
+                item.session_start.as_deref().cloned(),
+                inherited_start(&parsed),
+                "{label}: version only"
+            );
+            assert_eq!(split_total(item), None, "{label}");
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// One native read: reuse `old` when the reader accepts it, retain, finish.
+fn native_read(
+    path: &Path,
+    old: Option<
+        crate::transcript_cache::Retained<crate::snapshots::sampled_jsonl::CachedJsonlReduction>,
+    >,
+    now: u64,
+    collected_at: &str,
+) -> (
+    Option<
+        crate::transcript_cache::Retained<crate::snapshots::sampled_jsonl::CachedJsonlReduction>,
+    >,
+    crate::transcript_acquisition::ReadMode,
+    SnapshotItem,
+) {
+    let scope = crate::transcript_acquisition::Scope("file-birth-tail".into());
+    let mut file = fs::File::open(path).expect("open fixture");
+    let expected = opened_object_identity(SnapshotSource::ClaudeCode, &mut file).expect("identity");
+    let mut parser = OwnedJsonlParser::new(
+        file,
+        path,
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        Some(&CodexTitleMetadata::default()),
+        None,
+        None,
+        false,
+        true,
+    )
+    .expect("parser");
+    let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
+    let mode = parser
+        .prepare_acquisition(old, &scope, debt, now)
+        .expect("prepare");
+    while !parser.step().expect("step") {}
+    let acquisition = parser
+        .retain_reduction(&scope, now, crate::transcript_cache::ENTRY_BYTES)
+        .expect("retain")
+        .expect("retained");
+    let retained = acquisition
+        .reduction
+        .map(|state| crate::transcript_cache::Retained {
+            checkpoint: acquisition.checkpoint,
+            state,
+        });
+    let parsed = parser
+        .finish(
+            &expected,
+            path,
+            collected_at,
+            "file-birth-fp".into(),
+            Some(&CodexTitleMetadata::default()),
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+        )
+        .expect("finish");
+    let item = parsed.snapshots.into_iter().next().expect("snapshot");
+    (retained, mode, item)
+}
+
+/// The tail path and a full read select the same first request, so the
+/// scalars and the split agree at every append boundary.
+#[test]
+fn tail_and_full_read_select_the_same_first_request() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let dir = temp_dir("claude-file-birth-tail");
+    fs::create_dir_all(&dir).expect("create project dir");
+    let now = OffsetDateTime::now_utc();
+    let collected_at = stamp(now, 0);
+    let rows = [
+        id_less_assistant(ROOT, &stamp(now, -10), 50),
+        assistant(ROOT, "req_a1", &stamp(now, -9), 100),
+        assistant(ROOT, "req_a2", &stamp(now, -8), 300),
+        assistant(ROOT, "req_c0", &stamp(now, COPIED), 900_000),
+        assistant(ROOT, "req_a3", &stamp(now, -7), 200),
+    ];
+    let path = dir.join(format!("{ROOT}.jsonl"));
+    for split in 1..rows.len() {
+        let _ = fs::remove_file(&path);
+        fs::write(&path, rows[..split].concat()).expect("write prefix");
+        let (retained, _, _) = native_read(&path, None, 100, &collected_at);
+        assert!(retained.is_some(), "split {split}: prefix retained");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for append");
+        std::io::Write::write_all(&mut file, rows[split..].concat().as_bytes())
+            .expect("append rest");
+        drop(file);
+        let (_, mode, tailed) = native_read(&path, retained, 101, &collected_at);
+        assert_eq!(
+            mode,
+            crate::transcript_acquisition::ReadMode::Tail,
+            "split {split}"
+        );
+        let (_, _, full) = native_read(&path, None, 102, &collected_at);
+        assert_eq!(
+            tailed.claude_file_birth, full.claude_file_birth,
+            "split {split}"
+        );
+        let mut folded = Vec::new();
+        for item in [tailed, full] {
+            let mut items = vec![item];
+            let mut index = indexed(&[&path], true);
+            let disposition = fold(&mut items, &no_reports(), &mut index, true);
+            assert_eq!(
+                disposition.posture_admission(ROOT),
+                Some("file_birth_rule"),
+                "split {split}"
+            );
+            folded.push(items.remove(0));
+        }
+        assert_eq!(posture(&folded[0]), posture(&folded[1]), "split {split}");
+        assert_eq!(
+            posture(&folded[0]),
+            (Some(50), Some(300), Some(200), Some(0))
+        );
+        assert_eq!(
+            folded[0].session_start, folded[1].session_start,
+            "split {split}"
+        );
+        assert_eq!(split_total(&folded[0]), Some(50), "split {split}");
+    }
+    let _ = fs::remove_dir_all(dir);
 }
