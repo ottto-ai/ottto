@@ -997,8 +997,9 @@ fn sampled_group_unpaged_over_the_limit_is_oversized() {
 
 /// The O7 tail page: a file read in one page and retained, then a small
 /// tail with priority usage (here the file's first; any would do), which
-/// needs the full replay. `singleton` and `unpaged` are functions of the file's length
-/// after the tail.
+/// needs the full replay. `singleton` and `unpaged` are functions of the file's
+/// length after the tail. With `grow_at_open`, the file grows by one more
+/// line after the tail page opens it, before the O7 reopen.
 struct O7Tail {
     fixture: Root,
     cache: Arc<SharedCache>,
@@ -1011,8 +1012,17 @@ struct O7Tail {
 }
 
 fn o7_tail(singleton: impl Fn(u64) -> u64, unpaged: impl Fn(u64) -> u64) -> O7Tail {
+    o7_tail_with(singleton, unpaged, false)
+}
+
+fn o7_tail_with(
+    singleton: impl Fn(u64) -> u64,
+    unpaged: impl Fn(u64) -> u64,
+    grow_at_open: bool,
+) -> O7Tail {
     let fixture = Root::new(&[(SESSION, 24)]);
-    let key = local_index_key(&fixture.file(SESSION));
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
     let tail = priority_line(25);
     let after_tail = fixture.len(SESSION) + tail.len() as u64;
     let cache = Arc::new(SharedCache::default());
@@ -1030,7 +1040,24 @@ fn o7_tail(singleton: impl Fn(u64) -> u64, unpaged: impl Fn(u64) -> u64) -> O7Ta
                 assert_eq!(fixture.len(SESSION), after_tail);
                 let before = counters(&cache);
                 reset_counters();
-                let (index, scan, stats) = page(&fixture, index, Some(&cache), NOW);
+                let (index, scan, stats) = if grow_at_open {
+                    let grown = path.clone();
+                    with_codex_before_parse(
+                        move |opened| {
+                            if opened == grown.as_path() {
+                                OpenOptions::new()
+                                    .append(true)
+                                    .open(opened)
+                                    .unwrap()
+                                    .write_all(&token_line(26))
+                                    .unwrap();
+                            }
+                        },
+                        || page(&fixture, index, Some(&cache), NOW),
+                    )
+                } else {
+                    page(&fixture, index, Some(&cache), NOW)
+                };
                 (index, scan, stats, before, take_test_parser_constructions())
             })
         });
@@ -1061,20 +1088,93 @@ fn o7_tail_at_the_singleton_budget_replays_in_the_page() {
     assert_eq!(row.parsers, 2, "tail, then replay");
 }
 
-// F-T7: at extent == singleton + 1 the replay is requeued to the cursor;
-// the next generation pages it once and publishes the priority tier.
+/// Pages on from `first_page` until the next change of `path` is read:
+/// a Full cursor start (the entry is protected, so never sampled), not an
+/// O7 tail or requeue. Returns the index and the next page number.
+fn protected_change_is_a_full_cursor_read(
+    fixture: &Root,
+    cache: &Arc<SharedCache>,
+    mut index: ScanIndex,
+    mut number: u64,
+) -> (ScanIndex, u64) {
+    let mut seen = Vec::new();
+    loop {
+        let before = counters(cache);
+        let (next, again, stats) = page(fixture, index, Some(cache), &collected_at(number));
+        index = next;
+        number += 1;
+        seen.push(stats);
+        if stats.full + stats.tail == 0 {
+            assert!(seen.len() < 4, "never selected again: {seen:?}");
+            continue;
+        }
+        assert_eq!((stats.full, stats.tail), (1, 0), "{seen:?}");
+        assert_eq!(stats.priority_replays, 0, "no in-page full replay");
+        assert!(again.snapshots.is_empty());
+        let after = counters(cache);
+        assert_eq!(
+            after.deferred, before.deferred,
+            "a cursor start, not an O7 requeue"
+        );
+        assert_eq!(after.jobs_started, before.jobs_started + 1);
+        return (index, number);
+    }
+}
+
+// FC1-narrow, at the unpaged limit: a tail over the singleton budget whose
+// reopened descriptor is exactly at the unpaged limit replays in the page,
+// as on main (direct O7 routing at or below the limit is unchanged), with
+// body and tier parity against the unsampled oracle. The later protected
+// change is a Full cursor read, as on main for files over the singleton
+// budget.
 #[test]
-fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
+fn o7_tail_at_the_unpaged_limit_replays_in_the_page() {
     if !layout() {
         return;
     }
-    let row = o7_tail(|len| len - 1, |_| MAX_CODEX_JSONL_FILE_BYTES);
+    let row = o7_tail(|len| len - 1, |len| len);
+    let path = row.fixture.file(SESSION);
+    let key = local_index_key(&path);
+    assert_eq!(row.stats.tail, 1);
+    assert_eq!(row.stats.priority_replays, 1, "the in-page full replay");
+    assert_eq!(row.after.deferred, row.before.deferred, "no requeue");
+    assert_eq!(row.after.jobs_started, row.before.jobs_started);
+    assert_eq!(row.parsers, 2, "tail, then replay");
+    assert!(!row.scan.snapshots.is_empty());
+    assert_eq!(fingerprints(&row.scan), oracle(&row.fixture, NOW));
+    // The later change. The completed priority read captured a tier receipt,
+    // so the entry has protected history and is never sampled again
+    // (`allow_sample` requires `!protected`, as on main): the next change is
+    // a Full read, here a whole cursor read.
+    assert!(index_is_protected(&row.index, &key));
+    let len = row.fixture.len(SESSION);
+    with_test_limits(1024, len - 1, 64, || {
+        row.fixture.append(SESSION, &priority_line(26));
+        let (index, number) =
+            protected_change_is_a_full_cursor_read(&row.fixture, &row.cache, row.index, 1);
+        let certified = page_until_certified(&row.fixture, index, &row.cache, number);
+        assert_eq!(
+            fingerprints(&certified.scan),
+            oracle(&row.fixture, &certified.collected_at)
+        );
+        let c = counters(&row.cache);
+        assert_eq!(c.jobs_started, 1, "one whole cursor read: {c:?}");
+        assert!(index_is_protected(&certified.index, &key));
+    });
+}
+
+/// The over-limit O7 row: the replay is requeued with no in-page parser,
+/// then one cursor read publishes it and the later protected change is a
+/// Full cursor read.
+fn assert_o7_requeued_then_paged(row: O7Tail) {
     let path = row.fixture.file(SESSION);
     assert_eq!(row.stats.tail, 1);
     assert_eq!(row.stats.priority_replays, 0, "no in-page full replay");
     assert_eq!(row.after.deferred, row.before.deferred + 1);
     assert_eq!(row.parsers, 1, "the tail's parser only");
     assert!(row.scan.snapshots.is_empty());
+    assert_eq!(row.scan.oversized_file_count, 0);
+    assert_eq!(open_read_unreadable(&row.scan), 0);
     assert!(pending(&row.index, &path));
     let len = row.fixture.len(SESSION);
     with_test_limits(1024, len - 1, 64, || {
@@ -1085,46 +1185,15 @@ fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
         );
         let c = counters(&row.cache);
         assert_eq!(c.jobs_started, 1, "one cursor read, no requeue loop: {c:?}");
-        // R2-M2, the second change. The first completed priority read
-        // captured a tier receipt, so the entry has protected history and is
-        // never sampled again (`allow_sample` requires `!protected`, as on main):
-        // the next change is a Full read, not a second O7 tail. On a file
-        // over the singleton budget that is a whole cursor read, which main
-        // already paid for protected files; only the first priority tail's
-        // in-page replay moved to the cursor.
         let key = local_index_key(&path);
-        assert!(
-            index_is_protected(&certified.index, &key),
-            "retained: {}",
-            row.cache.retained_checkpoint(&key).is_some()
+        assert!(index_is_protected(&certified.index, &key));
+        row.fixture.append(SESSION, &priority_line(27));
+        let (index, number) = protected_change_is_a_full_cursor_read(
+            &row.fixture,
+            &row.cache,
+            certified.index,
+            1 + certified.pages,
         );
-        row.fixture.append(SESSION, &priority_line(26));
-        // The file is read again on the first page that selects it.
-        let mut number = 1 + certified.pages;
-        let mut index = certified.index;
-        let mut seen = Vec::new();
-        loop {
-            let before = counters(&row.cache);
-            let (next, again, stats) =
-                page(&row.fixture, index, Some(&row.cache), &collected_at(number));
-            index = next;
-            number += 1;
-            seen.push(stats);
-            if stats.full + stats.tail == 0 {
-                assert!(seen.len() < 4, "never selected again: {seen:?}");
-                continue;
-            }
-            assert_eq!((stats.full, stats.tail), (1, 0), "{seen:?}");
-            assert_eq!(stats.priority_replays, 0, "no in-page full replay");
-            assert!(again.snapshots.is_empty());
-            let after = counters(&row.cache);
-            assert_eq!(
-                after.deferred, before.deferred,
-                "a cursor start, not an O7 requeue"
-            );
-            assert_eq!(after.jobs_started, before.jobs_started + 1);
-            break;
-        }
         let recertified = page_until_certified(&row.fixture, index, &row.cache, number);
         assert_eq!(
             fingerprints(&recertified.scan),
@@ -1132,24 +1201,30 @@ fn o7_tail_over_the_singleton_budget_requeues_to_the_cursor() {
         );
         let c = counters(&row.cache);
         assert_eq!(c.jobs_started, 2, "a second whole cursor read: {c:?}");
-        assert!(index_is_protected(&recertified.index, &key));
     });
 }
 
-// F-T22 (R-c): with the unpaged limit below the scaled singleton
-// (tail < unpaged limit < reopened length <= singleton), the widened guard
-// does not fire and the unpaged backstop requeues the replay.
+// F-T22 (R-c), over the unpaged limit: R-c is the only O7 guard. A `Bounded`
+// replay whose reopened descriptor is over the limit is requeued before any
+// parser is built, and the cursor pages it.
 #[test]
-fn o7_replay_over_the_unpaged_limit_requeues_through_the_backstop() {
+fn o7_tail_over_the_unpaged_limit_requeues_to_the_cursor() {
     if !layout() {
         return;
     }
-    let row = o7_tail(|len| len, |len| len - 1);
-    assert_eq!(row.stats.priority_replays, 0);
-    assert_eq!(row.after.deferred, row.before.deferred + 1);
-    assert_eq!(row.parsers, 1);
-    assert!(row.scan.snapshots.is_empty());
-    assert!(pending(&row.index, &row.fixture.file(SESSION)));
+    assert_o7_requeued_then_paged(o7_tail(|len| len - 1, |len| len - 1));
+}
+
+// Growth across the selection/reopen boundary: the file is at the unpaged
+// limit when the tail page selects it and grows past it before the O7
+// reopen. R-c on the reopened descriptor requeues it (`Bounded`), never an
+// in-page replay, and it is not counted oversized or unreadable.
+#[test]
+fn o7_growth_past_the_unpaged_limit_before_the_reopen_requeues() {
+    if !layout() {
+        return;
+    }
+    assert_o7_requeued_then_paged(o7_tail_with(|len| len - 1, |len| len, true));
 }
 
 // F-T7 reopen failure (M1), unit level: the O7 reopen is
@@ -1262,8 +1337,8 @@ fn o7_unpaged_reopen_over_the_limit_is_oversized() {
 }
 
 // F-T7 Fenced row (R2-L1): a file whose cursor attempt completed in this
-// census generation, re-tailed with priority usage, is requeued
-// and then fenced to the next generation, where it publishes.
+// census generation, re-tailed with priority usage past the unpaged limit,
+// is requeued and then fenced to the next generation, where it publishes.
 #[test]
 fn o7_requeue_after_an_attempt_in_the_generation_is_fenced() {
     if !layout() {
@@ -1273,44 +1348,48 @@ fn o7_requeue_after_an_attempt_in_the_generation_is_fenced() {
     let key = local_index_key(&fixture.file(SESSION));
     let cache = Arc::new(SharedCache::default());
     let len = fixture.len(SESSION);
-    with_test_limits(1024, len - 1, 64, || {
-        // One census generation: every page is collected at `NOW`.
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page(&fixture, index, Some(&cache), NOW);
-            index = next;
-            if counters(&cache).jobs_certified == 1 {
-                break;
+    // The re-tailed file is over the unpaged limit, so R-c requeues its
+    // replay (at or below it the replay would run in the page, as on main).
+    with_test_unpaged_limit(len, || {
+        with_test_limits(1024, len - 1, 64, || {
+            // One census generation: every page is collected at `NOW`.
+            let mut index = ScanIndex::default();
+            for _ in 0..64 {
+                let (next, _, _) = page(&fixture, index, Some(&cache), NOW);
+                index = next;
+                if counters(&cache).jobs_certified == 1 {
+                    break;
+                }
             }
-        }
-        assert_eq!(counters(&cache).jobs_certified, 1, "{:?}", counters(&cache));
-        assert!(cache.retained_checkpoint(&key).is_some(), "precondition");
-        fixture.append(SESSION, &priority_line(25));
-        let before = counters(&cache);
-        let (index, tailed, stats) = page(&fixture, index, Some(&cache), NOW);
-        assert_eq!(stats.tail, 1);
-        assert_eq!(stats.priority_replays, 0);
-        assert!(tailed.snapshots.is_empty());
-        assert_eq!(counters(&cache).deferred, before.deferred + 1);
-        let before = counters(&cache);
-        reset_counters();
-        let (index, fenced, stats) = page(&fixture, index, Some(&cache), NOW);
-        let after = counters(&cache);
-        assert_eq!(
-            after.deferred_next_generation,
-            before.deferred_next_generation + 1,
-            "{after:?}"
-        );
-        assert_eq!(after.jobs_started, before.jobs_started);
-        assert_eq!(stats.priority_replays, 0);
-        assert_eq!(take_test_parser_constructions(), 0);
-        assert!(fenced.snapshots.is_empty());
-        // The next generation pages it and publishes the appended bytes.
-        let certified = page_until_certified(&fixture, index, &cache, 1);
-        assert_eq!(
-            fingerprints(&certified.scan),
-            oracle(&fixture, &certified.collected_at)
-        );
+            assert_eq!(counters(&cache).jobs_certified, 1, "{:?}", counters(&cache));
+            assert!(cache.retained_checkpoint(&key).is_some(), "precondition");
+            fixture.append(SESSION, &priority_line(25));
+            let before = counters(&cache);
+            let (index, tailed, stats) = page(&fixture, index, Some(&cache), NOW);
+            assert_eq!(stats.tail, 1);
+            assert_eq!(stats.priority_replays, 0);
+            assert!(tailed.snapshots.is_empty());
+            assert_eq!(counters(&cache).deferred, before.deferred + 1);
+            let before = counters(&cache);
+            reset_counters();
+            let (index, fenced, stats) = page(&fixture, index, Some(&cache), NOW);
+            let after = counters(&cache);
+            assert_eq!(
+                after.deferred_next_generation,
+                before.deferred_next_generation + 1,
+                "{after:?}"
+            );
+            assert_eq!(after.jobs_started, before.jobs_started);
+            assert_eq!(stats.priority_replays, 0);
+            assert_eq!(take_test_parser_constructions(), 0);
+            assert!(fenced.snapshots.is_empty());
+            // The next generation pages it and publishes the appended bytes.
+            let certified = page_until_certified(&fixture, index, &cache, 1);
+            assert_eq!(
+                fingerprints(&certified.scan),
+                oracle(&fixture, &certified.collected_at)
+            );
+        })
     });
 }
 
