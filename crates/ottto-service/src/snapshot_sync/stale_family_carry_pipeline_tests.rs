@@ -598,3 +598,39 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
     assert_eq!(retry.family_reads, 0, "the carry stands in this window");
     assert_eq!(retry.red, base_retry.red);
 }
+
+/// R1, carry-time refusal through the fold: the walk-ending-page change, with
+/// the family's worst-case cancellation unfunded. The retry start does not
+/// carry the family, so nothing is held or cancelled, and every window's
+/// start, reads, parsed sessions and liveness, the proof at 08:20, the
+/// accepted heads and the witness equal a real BASE arm's.
+#[test]
+#[serial(source_manifests)]
+fn c1b_unfunded_carry_takes_the_base_path_through_the_fold() {
+    if !c1a_layout_supported("c1b_unfunded_carry") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let unfunded = crate::snapshots::claude_stale_family_carry_unfunded_families_for_test();
+    let (fix, base, cancelled, held) = {
+        let _budget = crate::snapshots::ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+        c1b_recoverable_change_arms("c1b-unfunded-carry", 64)
+    };
+    assert_eq!(
+        crate::snapshots::claude_stale_family_carry_unfunded_families_for_test() - unfunded,
+        1,
+        "the retry start drops the family once"
+    );
+    assert_eq!((cancelled, held), (0, 0), "no cancel, no hold");
+    let base_retry = &base.windows[2];
+    assert!(base_retry.census_complete && !base_retry.red);
+    assert_eq!(base_retry.family_reads, rearm_family_sessions().len());
+    assert!(base_retry.proven && !base_retry.retry_pending);
+    let start = fix.windows[2].start.as_ref().expect("a retry start");
+    assert_eq!(start.carried_pending_families, Some(0), "not carried");
+    assert_eq!(fix.windows, base.windows, "every window is BASE's");
+    assert_eq!(fix.heads_after_red, base.heads_after_red);
+    assert_eq!(fix.heads_after, base.heads_after);
+    assert_eq!(fix.witness_after, base.witness_after);
+    assert_eq!(fix.family_pending_after, base.family_pending_after);
+}

@@ -3324,7 +3324,8 @@ pub(crate) fn claude_stale_family_carry_budget_fallbacks_for_test() -> usize {
 /// one entry per stale-family index path plus one root node per family; the
 /// request-owner map holds at most one entry per stale pending request hash;
 /// the legacy-witness vector is allocated at exactly `legacy_witnesses`
-/// pointers. Every owned root, member or shared-owner string is shorter than
+/// pointers; the cancellation funding map holds at most one entry per stale
+/// root. Every owned root, member or shared-owner string is shorter than
 /// the index key it is parsed from, and each stale-family path yields at most
 /// those three, so three times those keys' bytes bounds the strings. An
 /// unsupported layout, an overflow or a refused price keeps BASE.
@@ -3375,6 +3376,7 @@ fn claude_stale_family_carry_scratch_admitted(
         && tree_nodes::<String, ()>(families, &mut cost).is_some()
         && tree_nodes::<&str, &str>(stale_request_hashes, &mut cost).is_some()
         && tree_nodes::<String, ()>(families, &mut cost).is_some()
+        && tree_nodes::<&str, (usize, usize)>(families, &mut cost).is_some()
         && cost.add(string_bytes).is_some()
 }
 
@@ -3391,8 +3393,9 @@ fn claude_stale_family_carry_scratch_admitted(
 /// no legacy, owned-start or duplicate-request link, valid pending that
 /// passes the witness tripwire and shares no request with another family's
 /// pending, and every member file committed, accepted and not account-held. Unwitnessed and invalid families keep the re-arm. Nothing
-/// is carried unless the check's scratch is admitted first. Pure apart from
-/// that content-free refusal count: the caller compacts what this returns.
+/// is carried unless the check's scratch is admitted first, and a family is
+/// carried only once its worst-case cancellation is funded. Pure apart from
+/// those content-free counts: the caller compacts what this returns.
 fn claude_fence_closed_retry_carried_roots(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
@@ -3558,7 +3561,112 @@ fn claude_fence_closed_retry_carried_roots(
         }
     }
     carried.retain(|root_session_id| !shared_owners.contains(root_session_id));
+    fund_claude_family_carry_cancellations(index, &mut carried);
     carried
+}
+
+/// Content-free count of families a red retry start did not carry because
+/// their worst-case cancellation was not funded under the parked budget, so
+/// they keep BASE's whole-family re-arm.
+static CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_STALE_FAMILY_CARRY_FUNDING_BUDGET_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// While alive, this thread funds carry cancellations under `bytes` instead
+/// of the parked budget.
+#[cfg(test)]
+pub(crate) struct ClaudeStaleFamilyCarryFundingBudgetForTest(Option<usize>);
+
+#[cfg(test)]
+impl ClaudeStaleFamilyCarryFundingBudgetForTest {
+    pub(crate) fn new(bytes: usize) -> Self {
+        Self(
+            CLAUDE_STALE_FAMILY_CARRY_FUNDING_BUDGET_FOR_TEST
+                .with(|cell| cell.replace(Some(bytes))),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClaudeStaleFamilyCarryFundingBudgetForTest {
+    fn drop(&mut self) {
+        CLAUDE_STALE_FAMILY_CARRY_FUNDING_BUDGET_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn claude_stale_family_carry_unfunded_families_for_test() -> usize {
+    CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// Fund, when the carry is admitted, the worst-case cancellation of every
+/// carried family, so a later member parse can always cancel it. That worst
+/// case queues every indexed member of the family again (a new member's parse
+/// leaves none of them out): one queue slot each, and a cloned scan root plus
+/// a member path each, where the scan root is a component prefix of the
+/// member path and so no longer than its index key. All of it is charged as
+/// growth of the traversal's candidate queue as it is at the start, which is
+/// empty, through the same price the cancel's own check uses. Families are
+/// funded cumulatively in root order; one whose worst case does not fit
+/// beside those already funded is not carried, keeps BASE's re-arm and is
+/// counted content-free, while a later, smaller family may still fit. The
+/// map's scratch is priced by the carry check's admission.
+fn fund_claude_family_carry_cancellations(index: &ScanIndex, carried: &mut BTreeSet<String>) {
+    if carried.is_empty() {
+        return;
+    }
+    let mut worst_cases = BTreeMap::<&str, (usize, usize)>::new();
+    for index_key in index.files.keys() {
+        let Some(member) = claude_index_path_member_ref(Path::new(index_key)) else {
+            continue;
+        };
+        if !carried.contains(member.root) {
+            continue;
+        }
+        let (requeues, path_bytes) = worst_cases.entry(member.root).or_default();
+        *requeues = requeues.saturating_add(1);
+        *path_bytes = path_bytes.saturating_add(index_key.len().saturating_mul(2));
+    }
+    let (mut funded_requeues, mut funded_path_bytes) = (0_usize, 0_usize);
+    let mut unfunded = 0_usize;
+    carried.retain(|root_session_id| {
+        let (requeues, path_bytes) = worst_cases
+            .get(root_session_id.as_str())
+            .copied()
+            .unwrap_or_default();
+        let funded = funded_requeues
+            .checked_add(requeues)
+            .zip(funded_path_bytes.checked_add(path_bytes))
+            .filter(|&(requeues, path_bytes)| {
+                claude_family_carry_cancellation_admitted(0, 0, requeues, path_bytes)
+            });
+        let Some((requeues, path_bytes)) = funded else {
+            unfunded += 1;
+            return false;
+        };
+        funded_requeues = requeues;
+        funded_path_bytes = path_bytes;
+        true
+    });
+    if unfunded == 0 {
+        return;
+    }
+    CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES
+        .fetch_add(unfunded, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES_FOR_TEST
+        .with(|cell| cell.set(cell.get().saturating_add(unfunded)));
+    eprintln!(
+        "local snapshot census kept {unfunded} stale Claude family re-arm(s): the carry could \
+         not fund cancelling them under its parked budget"
+    );
 }
 
 /// Content-free count of carried families whose carry a member parse
@@ -3572,8 +3680,10 @@ static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS: std::sync::atomic::AtomicUsize =
 static CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Content-free count of carry cancellations refused under their scratch
-/// budget, so the carry stays and the family takes the ordinary path.
+/// Content-free count of carry cancellations whose carry-time funding a
+/// defensive check found missing, so the cancel re-armed the family's other
+/// members without queueing any; the carry never stays. Not expected: the
+/// carry funded every cancel it admitted.
 static CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -3620,10 +3730,11 @@ pub(crate) fn claude_stale_family_carry_cancellation_refusals_for_test() -> usiz
 /// fold, which demotes the changed member's revision before the family can be
 /// re-proved; there the carry stays and the family takes the ordinary path
 /// (SOURCE B9's held path), counted content-free. Elsewhere the cancel counts
-/// its members by borrowing, then prices and reserves its queue growth and
-/// queued paths before its first mutation; a refusal likewise keeps the
-/// carry on the ordinary path, counted content-free, and never cancels it
-/// partially.
+/// its members by borrowing and draws on the funding the carry admitted for
+/// it, then reserves its queue growth before its first mutation, so it is
+/// never refused. Should a defensive check find that funding missing or the
+/// reservation fail, it debug-asserts and re-arms the family's other members
+/// as BASE does, without queueing them; it never keeps the carry.
 fn cancel_claude_family_carry_for_member_parse(
     index: &mut ScanIndex,
     census_window_end: &str,
@@ -3669,6 +3780,7 @@ fn cancel_claude_family_carry_for_member_parse(
     };
     // Count, borrowing only: no scratch collection is built for the cancel.
     let mut others = 0_usize;
+    let mut member_key_bytes = 0_usize;
     for (index_key, entry) in &index.files {
         if !is_other(index_key) {
             continue;
@@ -3677,10 +3789,18 @@ fn cancel_claude_family_carry_for_member_parse(
             return;
         }
         others = others.saturating_add(1);
+        member_key_bytes = member_key_bytes.saturating_add(index_key.len());
     }
     if others == 0 {
         return;
     }
+    // The family's worst case as the carry funded it: every indexed member.
+    let mut members = others;
+    if index.files.contains_key(&member_key) {
+        members = members.saturating_add(1);
+        member_key_bytes = member_key_bytes.saturating_add(member_key.len());
+    }
+    let funded_path_bytes = member_key_bytes.saturating_mul(2);
     let mut passed = 0_usize;
     let mut requeues = 0_usize;
     let mut requeue_path_bytes = 0_usize;
@@ -3714,38 +3834,42 @@ fn cancel_claude_family_carry_for_member_parse(
         );
         return;
     }
-    // Price, then reserve, before the first mutation: a refusal or a failed
-    // reservation leaves the carry and the traversal untouched, so the family
-    // takes the ordinary path, never a partially cancelled carry.
-    let (queue_len, queue_capacity) = index.traversal.as_ref().map_or((0, 0), |traversal| {
-        (
-            traversal.pending_candidates.len(),
-            traversal.pending_candidates.capacity(),
-        )
-    });
-    let mut admitted = claude_family_carry_cancellation_admitted(
-        queue_len,
-        queue_capacity,
-        requeues,
-        requeue_path_bytes,
-    );
-    if admitted {
+    // The carry funded this cancel's worst case under the parked budget when
+    // it was admitted, so the cancel is never refused. The defensive checks
+    // confirm it draws no more than that worst case, then reserve its queue
+    // growth before the first mutation. The queue's existing entries move
+    // with its buffer when it grows, as on every discovery push; the funding
+    // covers the slots and paths the cancel adds.
+    let mut funded = requeues <= members
+        && requeue_path_bytes <= funded_path_bytes
+        && claude_family_carry_cancellation_admitted(0, 0, members, funded_path_bytes);
+    if funded {
         if let Some(traversal) = index.traversal.as_mut() {
-            admitted = traversal
+            funded = traversal
                 .pending_candidates
                 .try_reserve_exact(requeues)
                 .is_ok();
         }
     }
-    if !admitted {
+    debug_assert!(
+        funded,
+        "a carried family's cancellation was funded at carry time"
+    );
+    if !funded {
+        // BASE's re-arm, without the queueing the funding was for: never the carry.
+        for (index_key, entry) in &mut index.files {
+            if is_other(index_key) {
+                entry.source_file_fingerprint.clear();
+            }
+        }
         CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS_FOR_TEST
             .with(|cell| cell.set(cell.get().saturating_add(1)));
         eprintln!(
-            "local snapshot census kept a stale Claude family carry: cancelling it was not \
-             admitted under its scratch budget; the family takes the ordinary path"
+            "local snapshot census cancelled a stale Claude family carry without its funding: \
+             {others} indexed file(s) re-armed, none queued again in this window"
         );
         return;
     }
@@ -3814,14 +3938,15 @@ fn claude_family_carry_passed_member<'t>(
     )
 }
 
-/// Price what cancelling a carry allocates, before it allocates, against the
-/// existing parked overlap budget. Queueing `requeues` passed members grows
-/// the traversal's candidate queue only beyond its spare capacity; that growth
-/// is charged as the old and the new buffer live at once, at the exact
-/// element size. Each queued entry owns a cloned scan root and a member path,
-/// charged at their exact byte lengths. Nothing else is allocated: the cancel
-/// counts and clears in place. An unsupported layout, an overflow or a
-/// refused price keeps the carry.
+/// Price queueing `requeues` members with `requeue_path_bytes` of owned paths
+/// against the existing parked overlap budget. Queueing grows the traversal's
+/// candidate queue only beyond its spare capacity; that growth is charged as
+/// the old and the new buffer live at once, at the exact element size. Each
+/// queued entry owns a cloned scan root and a member path, charged at their
+/// byte lengths. The carry funds each family's worst-case cancellation with
+/// it against the queue at the start, which is empty, and the cancel checks
+/// its family's worst case with it again. An unsupported layout, an overflow
+/// or a refused price is not funded.
 fn claude_family_carry_cancellation_admitted(
     queue_len: usize,
     queue_capacity: usize,
@@ -3844,7 +3969,13 @@ fn claude_family_carry_cancellation_admitted(
     let Some(growth_bytes) = growth_bytes else {
         return false;
     };
-    let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+    #[cfg(test)]
+    let budget = CLAUDE_STALE_FAMILY_CARRY_FUNDING_BUDGET_FOR_TEST
+        .with(std::cell::Cell::get)
+        .unwrap_or(crate::source_rotation::PARKED_BUDGET);
+    #[cfg(not(test))]
+    let budget = crate::source_rotation::PARKED_BUDGET;
+    let mut cost = crate::heap_layout_bound::Counter::new(budget);
     cost.add(growth_bytes).is_some() && cost.add(requeue_path_bytes).is_some()
 }
 

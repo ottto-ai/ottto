@@ -953,46 +953,143 @@ fn c1b_carry_cancellation_price_admits_up_to_the_parked_budget() {
     ));
 }
 
-/// R1, refused: when queueing the passed member would grow a full candidate
-/// queue past the parked budget, the cancel is refused before it allocates or
-/// mutates anything. The carry stays whole (no revision cleared, the queue
-/// untouched, the pending and witness unchanged), so the family takes the
-/// ordinary path, and the refusal is counted once.
+/// R1, funded: the carry funded this cancel's worst case when it was
+/// admitted, so a parse on a non-terminal page cancels it even behind a full
+/// candidate backlog whose growth, priced then, would exceed the parked
+/// budget (the round-3 refusal). The other member is re-armed and queued once
+/// at the front; nothing is refused or held.
 #[test]
-fn c1b_refused_carry_cancellation_keeps_the_carry_whole() {
+fn c1b_funded_carry_cancellation_is_not_refused_behind_a_large_backlog() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let slot = std::mem::size_of::<ScanTraversalPath>();
     let mut index = carry_cancel_index(crate::source_rotation::PARKED_BUDGET / slot / 2 + 1);
-    let take_queue = |index: &mut ScanIndex| {
-        std::mem::take(&mut index.traversal.as_mut().unwrap().pending_candidates)
+    let [root_key, agent_key] = carry_family_keys();
+    let (queued, capacity) = {
+        let queue = &index.traversal.as_ref().unwrap().pending_candidates;
+        (queue.len(), queue.capacity())
     };
-    let queue = take_queue(&mut index);
-    let (queued, capacity) = (queue.len(), queue.capacity());
     assert_eq!(queued, capacity, "the queue is full");
-    let before = serde_json::to_value(&index).unwrap();
-    index.traversal.as_mut().unwrap().pending_candidates = queue;
+    let requeue_bytes = CARRY_SCAN_ROOT.len() + agent_key.len();
+    assert!(
+        !claude_family_carry_cancellation_admitted(queued, capacity, 1, requeue_bytes),
+        "pricing the backlog at the cancel refuses it"
+    );
+    assert!(claude_family_carry_cancellation_admitted(
+        0,
+        0,
+        2,
+        2 * (root_key.len() + agent_key.len())
+    ));
+    let before = index.clone();
     let cancellations = claude_stale_family_carry_cancellations_for_test();
     let refusals = claude_stale_family_carry_cancellation_refusals_for_test();
     let holds = claude_stale_family_carry_terminal_holds_for_test();
     carry_cancel(&mut index);
     assert_eq!(
-        claude_stale_family_carry_cancellation_refusals_for_test(),
-        refusals + 1
+        claude_stale_family_carry_cancellations_for_test(),
+        cancellations + 1
     );
     assert_eq!(
-        claude_stale_family_carry_cancellations_for_test(),
-        cancellations
+        claude_stale_family_carry_cancellation_refusals_for_test(),
+        refusals
     );
     assert_eq!(claude_stale_family_carry_terminal_holds_for_test(), holds);
-    let queue = take_queue(&mut index);
-    assert_eq!((queue.len(), queue.capacity()), (queued, capacity));
-    assert!(queue
-        .iter()
-        .all(|pending| pending.path.as_os_str().is_empty()));
-    assert_eq!(serde_json::to_value(&index).unwrap(), before);
-    for key in carry_family_keys() {
-        assert!(!index.files[&key].source_file_fingerprint.is_empty());
+    assert_eq!(
+        index.files[&root_key].source_file_fingerprint,
+        before.files[&root_key].source_file_fingerprint
+    );
+    assert!(index.files[&agent_key].source_file_fingerprint.is_empty());
+    let pending = &index.traversal.as_ref().unwrap().pending_candidates;
+    assert_eq!(pending.len(), queued + 1);
+    assert_eq!(
+        pending.front(),
+        Some(&ScanTraversalPath {
+            scan_root: PathBuf::from(CARRY_SCAN_ROOT),
+            path: PathBuf::from(&agent_key),
+            census_member: true,
+            watcher_hint: false,
+        })
+    );
+}
+
+const CARRY_SECOND_WITNESSED: &str = "d4444444-4444-4444-8444-444444444444";
+
+/// A carried family's funded worst case: every indexed member queued again,
+/// one slot each plus a scan root and a member path no longer than its key.
+fn carry_worst_case(keys: &[String]) -> usize {
+    keys.iter()
+        .map(|key| std::mem::size_of::<ScanTraversalPath>() + 2 * key.len())
+        .sum()
+}
+
+/// R1, carry-time funding boundary: with a second witnessed family, each
+/// carried family's worst-case cancellation is funded cumulatively in root
+/// order. At exactly both worst cases both are carried; one byte less drops
+/// the later family; a budget that fits only the smaller, later family drops
+/// the earlier one and still carries it. Every dropped family is counted once
+/// and re-armed as BASE re-arms it.
+#[test]
+fn c1b_carry_funds_each_family_cancellation_up_to_the_budget() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
     }
+    let first = carry_worst_case(&carry_family_keys());
+    let second_key = carry_key(CARRY_SECOND_WITNESSED, None);
+    let second = carry_worst_case(std::slice::from_ref(&second_key));
+    assert!(second < first);
+    let with_second = |index: &mut ScanIndex| {
+        carry_family(index, CARRY_SECOND_WITNESSED, &[None], true);
+    };
+    let start = |budget: usize| {
+        let unfunded = claude_stale_family_carry_unfunded_families_for_test();
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(budget);
+        let ((fix, row), _) = carry_arms(&with_second, BACKFILL_WINDOW_DAYS);
+        let dropped = claude_stale_family_carry_unfunded_families_for_test() - unfunded;
+        let carried = |key: &String| !fix.files[key].source_file_fingerprint.is_empty();
+        let first_carried = carry_family_keys().iter().all(carried);
+        assert!(first_carried || !carry_family_keys().iter().any(carried));
+        (row, dropped, first_carried, carried(&second_key))
+    };
+    let (row, dropped, first_carried, second_carried) = start(first + second);
+    assert_eq!(row["carried_pending_families"], 2);
+    assert_eq!((dropped, first_carried, second_carried), (0, true, true));
+    let (row, dropped, first_carried, second_carried) = start(first + second - 1);
+    assert_eq!(row["carried_pending_families"], 1);
+    assert_eq!(row["carried_index_files"], 2);
+    assert_eq!((dropped, first_carried, second_carried), (1, true, false));
+    let (row, dropped, first_carried, second_carried) = start(second);
+    assert_eq!(row["carried_pending_families"], 1);
+    assert_eq!(row["carried_index_files"], 1);
+    assert_eq!((dropped, first_carried, second_carried), (1, false, true));
+}
+
+/// R1, carry-time refusal: when no carried family's worst-case cancellation
+/// is funded, none is carried and the start is BASE's byte for byte, row and
+/// transition counters included, with each dropped family counted once.
+#[test]
+fn c1b_unfunded_carry_keeps_the_base_start() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let first = carry_worst_case(&carry_family_keys());
+    let unfunded = claude_stale_family_carry_unfunded_families_for_test();
+    let ((fix, row), (base, base_row)) = {
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(first - 1);
+        carry_arms(&|_| {}, BACKFILL_WINDOW_DAYS)
+    };
+    assert_eq!(
+        claude_stale_family_carry_unfunded_families_for_test(),
+        unfunded + 1,
+        "the fix arm's dropped family is counted; BASE never funds"
+    );
+    assert_eq!(row, base_row, "the row is BASE's");
+    assert_eq!(row["carried_pending_families"], 0);
+    assert_eq!(row["rearmed_index_files"], 3);
+    assert_eq!(
+        serde_json::to_value(&fix).unwrap(),
+        serde_json::to_value(&base).unwrap(),
+        "the index is BASE's"
+    );
 }

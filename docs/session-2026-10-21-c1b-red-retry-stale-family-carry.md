@@ -77,14 +77,24 @@ ordinary path (the held path below). A content-free counter and a fixed-text
 log line record each hold. A content-free counter and a fixed-text log
 line record each cancellation.
 
+The carry funds each family's worst-case cancellation when it is admitted:
+queueing every indexed member of the family again, one queue slot each plus a
+cloned scan root and a member path no longer than its index key, priced as
+growth of the start's empty candidate queue against the same parked budget.
+Families are funded cumulatively in root order. One whose worst case does not
+fit beside those already funded is not carried and keeps BASE's re-arm,
+counted content-free with a fixed-text log line; a later, smaller family may
+still fit. The funding map is part of the carry check's priced scratch.
+
 The cancel builds no scratch collection: it counts the family's other
-members by borrowing, then prices what it allocates (any growth of the
-traversal's candidate queue, charged as its old and new buffers together,
-and each queued entry's cloned scan root and member path) against the same
-parked budget, and reserves that growth, before its first mutation. An
-unsupported layout, an overflow, a refused price or a failed reservation
-cancels nothing: the carry stays whole and the family takes the ordinary
-path, counted content-free with a fixed-text log line.
+members by borrowing, confirms it draws no more than the worst case the carry
+funded, and reserves its queue growth before its first mutation, so it is
+never refused. The queue's existing entries move with its buffer when it
+grows, as on every discovery push; the funding covers what the cancel adds.
+Should a defensive check find the funding missing or the reservation fail
+(not expected), it debug-asserts and re-arms the family's other members as
+BASE does, without queueing them, counted content-free; it never keeps the
+carry.
 
 No persisted field, schema, cap or constant changes. The traversal-start row
 gains two counters, `carried_pending_families` and `carried_index_files`; an
@@ -120,6 +130,14 @@ replace the equivalent inline checks in C1a's unchanged-proof check.
   once at the front of the traversal), the cancel price at its budget
   boundaries, and a refused cancel on a full candidate queue that leaves the
   index, the carry and the queue untouched and is counted once.
+- Round 4 replaces round 3's refused-cancel test, whose kept carry the owner
+  ruled out, and adds: a funded cancel behind a full candidate backlog that
+  round 3 refused (re-armed and queued once); the carry-time funding boundary
+  with two witnessed families (exactly funded, one byte short, and only the
+  smaller, later family funded); an unfunded carry whose start equals BASE
+  byte for byte; and the walk-ending-page change with the family unfunded,
+  whose every window, proof, heads and witness equal a real BASE arm's
+  through the fold.
 
 ## Residual risks
 
