@@ -1808,6 +1808,19 @@ fn cursor_job_copy_refusal_keeps_conservative_release() {
         let active = scan.active_file.as_deref_mut().unwrap();
         let sampling = active.sampling.take();
         let acquisition = active.parser.reader.acquisition.take();
+        assert!(
+            active.cursor.is_some()
+                && active.group.is_none()
+                && active.aliases.is_empty()
+                && active.applied_receipts.is_empty()
+                && active
+                    .parser
+                    .accumulator
+                    .codex_tier_replay
+                    .as_ref()
+                    .map_or(true, |replay| replay.join.is_none()),
+            "precondition: only the cursor conjunct owns state"
+        );
         let lifecycle = release(&scan);
         assert_eq!(lifecycle.clear_other_active, 1, "the cursor conjunct");
         assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);

@@ -1429,6 +1429,77 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             .unwrap()
             .applied_receipts
             .clear();
+        let no_join = |active: &OwnedActiveFile| {
+            active
+                .parser
+                .accumulator
+                .codex_tier_replay
+                .as_ref()
+                .map_or(true, |replay| replay.join.is_none())
+        };
+        let others_absent = |active: &OwnedActiveFile| {
+            active.sampling.is_none()
+                && active.cursor.is_none()
+                && active.group.is_none()
+                && active.aliases.is_empty()
+                && active.applied_receipts.is_empty()
+        };
+        // An acquisition alone, which `sampling` implies today, still clears.
+        let active = scan.active_file.as_deref_mut().unwrap();
+        assert!(
+            others_absent(&*active)
+                && no_join(&*active)
+                && active.parser.reader.acquisition.is_none(),
+            "precondition: only the acquisition conjunct changes {source:?}"
+        );
+        let mut file = OpenOptions::new().read(true).open(&large.file.0).unwrap();
+        let plan = crate::transcript_acquisition::ReadPlan::prepare(
+            &mut file,
+            None,
+            &Scope("guard-matrix".into()),
+            None,
+            100,
+        )
+        .unwrap();
+        active.parser.reader.acquisition = Some(plan);
+        assert_eq!(
+            release(&scan, measured).clear_other_active,
+            1,
+            "acquisition {source:?}"
+        );
+        scan.active_file
+            .as_deref_mut()
+            .unwrap()
+            .parser
+            .reader
+            .acquisition = None;
+        // A Codex group join alone, which `group` implies today, still clears.
+        if source == SnapshotSource::Codex {
+            let active = scan.active_file.as_deref_mut().unwrap();
+            assert!(
+                others_absent(&*active)
+                    && active.parser.reader.acquisition.is_none()
+                    && no_join(&*active),
+                "precondition: only the join conjunct changes"
+            );
+            let replay = active.parser.accumulator.codex_tier_replay.take();
+            let mut joined = replay
+                .clone()
+                .unwrap_or_else(|| codex_file_join::TierReplay::new(None, false, String::new()));
+            joined.join = Some(Box::new(codex_file_join::StreamProof::new(
+                String::new(),
+                false,
+                vec![codex_file_join::MemberPlan::default()],
+            )));
+            active.parser.accumulator.codex_tier_replay = Some(joined);
+            assert_eq!(release(&scan, measured).clear_other_active, 1, "join");
+            scan.active_file
+                .as_deref_mut()
+                .unwrap()
+                .parser
+                .accumulator
+                .codex_tier_replay = replay;
+        }
 
         // An unknown resident bound keeps the clear, recorded as such.
         let counts = release(&scan, None);
