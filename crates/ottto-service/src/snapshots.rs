@@ -2491,8 +2491,13 @@ pub struct ScanIndex {
     codex_parent_ownership_ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     /// U1a-2a: paced side requests for unchanged parent rollouts, keyed by
     /// the parent's index key. Pacing only, never evidence; the process side
-    /// ledger holds any charge made since the last save.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// ledger holds any charge made since the last save. Decoded per entry
+    /// (D4): a malformed request is dropped and counted, never the index.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_codex_side_requests"
+    )]
     codex_parent_side_requests: BTreeMap<String, SideRequest>,
     /// U1a-2a: side records for unchanged parent rollouts, keyed by the
     /// parent's index key. Decoded per entry: an undecodable record is
@@ -3022,6 +3027,36 @@ where
         .into_iter()
         .filter_map(|(key, value)| serde_json::from_value(value).ok().map(|value| (key, value)))
         .collect())
+}
+thread_local! {
+    /// Side requests `deserialize_codex_side_requests` dropped on this thread
+    /// since the last take. Only `ScanIndex::load` takes and counts them.
+    static DROPPED_CODEX_SIDE_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// U1a-2a (D4): the request map must be an object (the outer shape is
+/// unchanged); a request this binary cannot decode is dropped. It is unknown
+/// scheduling evidence: P then has no request, never a record or an
+/// admission, and an in-process ledger charge for it still hydrates at C14.
+fn deserialize_codex_side_requests<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, SideRequest>, D::Error> {
+    let raw = BTreeMap::<String, Value>::deserialize(deserializer)?;
+    let mut dropped = 0_u64;
+    let requests = raw
+        .into_iter()
+        .filter_map(|(key, value)| match serde_json::from_value(value) {
+            Ok(request) => Some((key, request)),
+            Err(_) => {
+                dropped += 1;
+                None
+            }
+        })
+        .collect();
+    DROPPED_CODEX_SIDE_REQUESTS.with(|count| count.set(count.get().saturating_add(dropped)));
+    Ok(requests)
+}
+fn take_dropped_codex_side_requests() -> u64 {
+    DROPPED_CODEX_SIDE_REQUESTS.with(|count| count.replace(0))
 }
 fn valid_codex_protected_owner(owner: &str) -> bool {
     owner.len() == 64
@@ -31689,7 +31724,10 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
-        match claude_request_census::decode_index(file) {
+        take_dropped_codex_side_requests();
+        let decoded = claude_request_census::decode_index(file);
+        let dropped_side_requests = take_dropped_codex_side_requests();
+        match decoded {
             Ok(mut index)
                 if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
                     && index
@@ -31723,6 +31761,11 @@ impl ScanIndex {
             {
                 if index.canonicalize_codex_identity_keys() {
                     index.drop_unbound_claude_authority_records("load");
+                    // D4: `side_request_rearm{decode_dropped}`.
+                    crate::local_resource_diagnostics::codex_side_lifecycle::add(
+                        crate::local_resource_diagnostics::codex_side_lifecycle::Event::RequestRearmed,
+                        dropped_side_requests,
+                    );
                     Ok(index)
                 } else {
                     quarantine_invalid_scan_index(path)

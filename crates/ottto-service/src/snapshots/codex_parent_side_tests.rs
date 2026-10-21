@@ -592,3 +592,225 @@ fn side_records_persist_decode_per_record_and_follow_the_index_lifecycle() {
     assert_eq!(index.codex_parent_side_generation, 3);
     assert_eq!(index.codex_parent_proof_wrap_epoch, 2);
 }
+
+fn file_entry() -> ScanIndexEntry {
+    ScanIndexEntry {
+        size_bytes: 42,
+        modified_unix_seconds: 1_700_000_000,
+        modified_unix_nanos: None,
+        source_file_fingerprint: "sha256:test".to_string(),
+        last_snapshot_fingerprint: None,
+        last_upload_body_witness: None,
+        effective_upload_body_witness_revision: 0,
+        scan_identity_version: None,
+        codex_joined_member_set: None,
+        codex_captured_joined_member_set: None,
+        codex_protected_owner: None,
+        codex_applied_tier_receipt: None,
+        codex_applied_tier_receipt_required: false,
+        codex_captured_tier_receipt: None,
+        codex_captured_tier_receipt_required: false,
+        codex_captured_uncommitted: false,
+        codex_counting_v2: false,
+    }
+}
+
+/// Test support for the D2 capacity controls outside `snapshots`.
+impl ScanIndex {
+    /// Adds `parents` side records and side requests at field extremes.
+    pub(crate) fn add_codex_side_state_for_test(&mut self, parents: usize) {
+        let request = SideRequest {
+            dev_ino: (u64::MAX, u64::MAX),
+            needed_extent: u64::MAX,
+            state: SideRequestState::Short { covered: u64::MAX },
+            state_extent: u64::MAX,
+            state_ctime: (i64::MIN, i64::MIN),
+            attempt_extent: u64::MAX,
+            attempt_ctime: (i64::MIN, i64::MIN),
+            attempts: u8::MAX,
+            not_before_unix_seconds: u64::MAX,
+            needed_charge: None,
+        };
+        for n in 0..parents {
+            let key = format!(
+                "/Users/someone/.codex/sessions/2026/10/21/\
+                 rollout-2026-10-21T05-43-00-0199f0a1-2b3c-7d4e-8f90-{n:012}.jsonl"
+            );
+            self.codex_parent_side.insert(key.clone(), extreme_record());
+            self.codex_parent_side_requests.insert(key, request);
+        }
+    }
+
+    /// (records, requests).
+    pub(crate) fn codex_side_state_len_for_test(&self) -> (usize, usize) {
+        (
+            self.codex_parent_side.len(),
+            self.codex_parent_side_requests.len(),
+        )
+    }
+}
+
+/// D4: requests decode per entry. A malformed entry is dropped and counted
+/// once at `ScanIndex::load` (`side_request_rearm{decode_dropped}` →
+/// `side_requests_rearmed`); every valid sibling keeps its exact pacing,
+/// and a corrected save/reload persists only the valid entries.
+#[test]
+fn side_requests_decode_per_entry_and_drop_only_the_malformed_one() {
+    let mut index = ScanIndex::default();
+    index
+        .codex_parent_side_requests
+        .insert("/a.jsonl".into(), side_request(SideRequestState::Live));
+    index.codex_parent_side_requests.insert(
+        "/c.jsonl".into(),
+        side_request(SideRequestState::Short { covered: 1024 }),
+    );
+    index
+        .codex_parent_side
+        .insert("/a.jsonl".into(), extreme_record());
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["codex_parent_side_requests"]["/b.jsonl"] = serde_json::json!({
+        "dev_ino": [1, 2],
+        "state": { "kind": "newer" },
+    });
+
+    take_dropped_codex_side_requests();
+    let decoded: ScanIndex = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(take_dropped_codex_side_requests(), 1);
+    assert_eq!(
+        decoded.codex_parent_side_requests,
+        index.codex_parent_side_requests
+    );
+    assert_eq!(decoded.codex_parent_side, index.codex_parent_side);
+
+    let path = temp_path("requests-mixed");
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let (loaded, counts) = crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
+        ScanIndex::load(&path).unwrap()
+    });
+    assert_eq!(counts.side_requests_rearmed, 1);
+    assert!(path.exists());
+    assert_eq!(
+        loaded.codex_parent_side_requests,
+        index.codex_parent_side_requests
+    );
+    assert_eq!(loaded.codex_parent_side, index.codex_parent_side);
+
+    // Corrected save/reload: only the valid entries persist, nothing drops.
+    let mut loaded = loaded;
+    loaded.save(&path).unwrap();
+    assert!(!fs::read_to_string(&path).unwrap().contains("/b.jsonl"));
+    let (reloaded, counts) =
+        crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
+            ScanIndex::load(&path).unwrap()
+        });
+    assert_eq!(counts.side_requests_rearmed, 0);
+    assert_eq!(
+        reloaded.codex_parent_side_requests,
+        index.codex_parent_side_requests
+    );
+}
+
+/// D4: all requests malformed still loads, and the rest of the index (ACK
+/// fingerprints, held sessions, side records) is what the same file without
+/// any request loads as. A legacy index without the map keeps the defaults.
+/// The map's outer shape is not relaxed: a non-object still quarantines.
+#[test]
+fn malformed_or_absent_side_requests_leave_the_rest_of_the_index_alone() {
+    let mut index = ScanIndex::default();
+    index.accepted_snapshot_fingerprints.insert("a".repeat(64));
+    index
+        .codex_state_only_blocked_session_ids
+        .insert("held-session".into());
+    index
+        .codex_parent_side
+        .insert("/p.jsonl".into(), extreme_record());
+    let legacy = serde_json::to_value(&index).unwrap();
+    assert!(legacy.get("codex_parent_side_requests").is_none());
+    let legacy_path = temp_path("requests-legacy");
+    fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    let (expected, counts) =
+        crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
+            ScanIndex::load(&legacy_path).unwrap()
+        });
+    assert_eq!(counts.side_requests_rearmed, 0);
+    assert!(expected.codex_parent_side_requests.is_empty());
+    assert!(expected
+        .accepted_snapshot_fingerprints
+        .contains(&"a".repeat(64)));
+
+    let mut value = legacy.clone();
+    value["codex_parent_side_requests"] = serde_json::json!({
+        "/p.jsonl": 7,
+        "/q.jsonl": { "state": { "kind": "live" } },
+    });
+    let path = temp_path("requests-all-malformed");
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let (loaded, counts) = crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
+        ScanIndex::load(&path).unwrap()
+    });
+    assert_eq!(counts.side_requests_rearmed, 2);
+    assert!(path.exists());
+    assert_eq!(
+        serde_json::to_value(&loaded).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+
+    value["codex_parent_side_requests"] = serde_json::json!([]);
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let rebuilt = ScanIndex::load(&path).unwrap();
+    assert!(!path.exists());
+    assert!(rebuilt.accepted_snapshot_fingerprints.is_empty());
+}
+
+/// D4: a dropped request is absent scheduling evidence only. Reloading the
+/// same corrupt file in the same process never resets the ledger's charge
+/// (C14 restores it every time), and the drop creates no record, so it can
+/// never admit a child by itself.
+#[test]
+fn a_dropped_request_never_resets_the_ledger_charge_or_admits() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = sampled_scan::SharedCache::default();
+    let path = temp_path("requests-ledger");
+    let p_key = "/p.jsonl";
+    let mut index = ScanIndex::default();
+    index.files.insert(p_key.into(), file_entry());
+    index.save(&path).unwrap();
+
+    let charged = SideRequest {
+        attempts: 3,
+        not_before_unix_seconds: 1_792_541_000,
+        ..side_request(SideRequestState::Live)
+    };
+    let key = sampled_scan::side_ledger::LedgerKey {
+        ns: sampled_scan::side_ledger::namespace_of(&path),
+        p: sampled_scan::side_ledger::parent_of(p_key),
+        dev: charged.dev_ino.0,
+        ino: charged.dev_ino.1,
+    };
+    let entry = sampled_scan::side_ledger::LedgerEntry::of_request(&charged);
+    assert!(cache
+        .side_ledger()
+        .charge(key, entry, 1_792_540_900)
+        .is_ok());
+
+    let mut value = serde_json::to_value(ScanIndex::load(&path).unwrap()).unwrap();
+    value["codex_parent_side_requests"] = serde_json::json!({});
+    value["codex_parent_side_requests"][p_key] = serde_json::json!({ "dev_ino": "bad" });
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    for _ in 0..2 {
+        let (mut loaded, counts) =
+            crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
+                ScanIndex::load(&path).unwrap()
+            });
+        assert_eq!(counts.side_requests_rearmed, 1);
+        assert!(loaded.codex_parent_side_requests.is_empty());
+        assert!(loaded.codex_parent_side.is_empty());
+        begin_codex_side_pass(&cache, &path, &mut loaded);
+        assert_eq!(loaded.codex_parent_side_requests[p_key], charged);
+        assert!(loaded.codex_parent_side.is_empty());
+        let held = *cache.side_ledger().get(&key).unwrap();
+        assert!(held.same_projection(&entry));
+    }
+}

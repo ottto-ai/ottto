@@ -320,6 +320,10 @@ impl OpenStamp {
     pub(in crate::snapshots) fn extent(&self) -> u64 {
         self.extent
     }
+
+    pub(in crate::snapshots) fn dev_ino(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
 }
 
 impl crate::transcript_acquisition::StampIdentity for OpenStamp {

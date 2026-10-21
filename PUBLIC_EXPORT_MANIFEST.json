@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 811,
-  "content_sha256": "a289b4111f55b045429b5ce090fa177710c7abef4a1619f29090b9ebd4983168",
+  "content_sha256": "0d2681d43940050662a5d908189d1089f8be00e3a72c56fa106ee8f3faa452d2",
   "files": [
     {
       "executable": false,
@@ -1371,8 +1371,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_bounded_native_tests.rs",
-      "sha256": "4c916d3b54799597f10ade13083a9f73f5bcafc500888195c066e8f060f60e32",
-      "size_bytes": 39080
+      "sha256": "250b847211ec8a678b38f57d4055a37e9416b7fb849d2d73fe6df51df1fe604a",
+      "size_bytes": 42719
     },
     {
       "executable": false,
@@ -1574,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "ab703fdf2287047164078aefa8382fc9a7999a03c2a38f039cfd23537d5ed36b",
-      "size_bytes": 3155416
+      "sha256": "c489192fd9ed18f73d333f406b494e51967aff4cacfe13d543828de5e1e7b49f",
+      "size_bytes": 3158242
     },
     {
       "executable": false,
@@ -1847,8 +1847,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_parent_side_tests.rs",
-      "sha256": "bba98971dd9cd07a62cb9b8fee10299f41f34c29e6572e027571b90fa27931b9",
-      "size_bytes": 19990
+      "sha256": "98ba94db0c71ec1b185f785ed4ff019fc536261382780b759ddeacff8eb8899f",
+      "size_bytes": 29748
     },
     {
       "executable": false,
@@ -1980,8 +1980,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "0e2ac6568721ca0c3858c81e38bcee4477e0f2863a8a5239fb50f3391f1e6e10",
-      "size_bytes": 193454
+      "sha256": "ae4ff9501884db5187ddefd9ca1d39c1e3390fcaf6ca14e3df0aca8aaea36b2e",
+      "size_bytes": 193553
     },
     {
       "executable": false,
@@ -1994,8 +1994,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/side_ledger.rs",
-      "sha256": "f50f8999ec62e5881daeea82c08cdb2e101757cb3dcb5418d7ee5dc88b374624",
-      "size_bytes": 34388
+      "sha256": "20e2d10bd6697ea02f2fb247e77b23923aee4bc12c479c23e4814810583bac7f",
+      "size_bytes": 42045
     },
     {
       "executable": false,

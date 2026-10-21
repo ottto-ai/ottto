@@ -446,10 +446,23 @@ impl SideLedger {
     }
 }
 
+/// A record of the entry's object whose seal covers what the entry's
+/// children need. (dev, ino) equality is the identity part only; coverage is
+/// the seal's sealed offset against `needed_extent`.
+fn covers(
+    record: &crate::snapshots::CodexParentSide,
+    key: &LedgerKey,
+    entry: &LedgerEntry,
+) -> bool {
+    record.parsed.dev_ino() == (key.dev, key.ino)
+        && record.seal.sealed_offset() >= entry.needed_extent
+}
+
 impl SideLedger {
     /// C14 (Codex only), right after the index load and against the index
     /// exactly as loaded: the gate slot, then prune and eager hydrate of this
-    /// namespace's entries. Touches only side requests. With no entry for
+    /// namespace's entries. Touches only side requests and a covering side
+    /// record's `pace`. With no entry for
     /// the namespace it builds nothing.
     pub(in crate::snapshots) fn begin_index_pass(
         &mut self,
@@ -475,18 +488,35 @@ impl SideLedger {
             })
             .collect::<BTreeMap<u128, String>>();
         let requests = &index.codex_parent_side_requests;
+        let records = &index.codex_parent_side;
         self.prune(ns, |key, entry| {
             // (c) P left the index.
             let Some(p_key) = keys.get(&key.p) else {
                 return true;
             };
+            let record = records.get(p_key);
+            // (c) the saved record is for another object.
+            if record.is_some_and(|record| record.parsed.dev_ino() != (key.dev, key.ino)) {
+                return true;
+            }
             match requests.get(p_key) {
                 // (c) the saved request is for another object.
                 Some(loaded) if loaded.dev_ino != (key.dev, key.ino) => true,
                 // (a) the index already holds this entry.
                 Some(loaded) => LedgerEntry::of_request(loaded).same_projection(entry),
                 // (c) the generation ended and the index agrees.
-                None => entry.tag == LedgerTag::Gone,
+                None if entry.tag == LedgerTag::Gone => true,
+                // (b) the covering record's save carried the stub.
+                None => {
+                    entry.tag == LedgerTag::Removed
+                        && record.is_some_and(|record| {
+                            covers(record, key, entry)
+                                && record.pace.is_some_and(|pace| {
+                                    pace.not_before_unix_seconds >= entry.stub_not_before
+                                        && pace.attempts_floor >= 6
+                                })
+                        })
+                }
             }
         });
         let survivors = self
@@ -497,6 +527,25 @@ impl SideLedger {
             let Some(p_key) = keys.get(&key.p) else {
                 continue;
             };
+            if entry.tag == LedgerTag::Removed {
+                // The covering record's request removal was lost: the stub
+                // goes on the record, and P has no request.
+                if let Some(record) = index
+                    .codex_parent_side
+                    .get_mut(p_key)
+                    .filter(|record| covers(record, &key, &entry))
+                {
+                    record.pace = Some(crate::snapshots::SidePace::merged(
+                        record.pace,
+                        crate::snapshots::SidePace {
+                            not_before_unix_seconds: entry.stub_not_before,
+                            attempts_floor: 6,
+                        },
+                    ));
+                    index.codex_parent_side_requests.remove(p_key);
+                    continue;
+                }
+            }
             let entry = match entry.tag {
                 LedgerTag::Gone => {
                     index.codex_parent_side_requests.remove(p_key);
@@ -918,6 +967,147 @@ mod tests {
         let mut quiet = SideLedger::default();
         quiet.begin_index_pass(ns, 100, &mut index);
         assert_eq!(index.codex_parent_side_requests, before);
+    }
+
+    /// A side record of object (1, ino) whose seal covers `[0, sealed)`.
+    fn side_record(
+        ino: u64,
+        sealed: u64,
+        pace: Option<crate::snapshots::SidePace>,
+    ) -> crate::snapshots::CodexParentSide {
+        let stamp = serde_json::json!({
+            "length": sealed,
+            "device": 1,
+            "inode": ino,
+            "modified": [1_792_540_800, 0],
+            "changed": [1_792_540_800, 0],
+        });
+        serde_json::from_value(serde_json::json!({
+            "verdict": { "kind": "settled" },
+            "seal": {
+                "stamp": stamp,
+                "scope": "f".repeat(64),
+                "sample_len": 0,
+                "head_sha256": "f".repeat(64),
+                "boundary_sha256": "f".repeat(64),
+                "verified_unix_seconds": 1_792_540_800,
+                "sealed_unix_seconds": 1_792_540_800,
+            },
+            "parsed": {
+                "dev": 1,
+                "ino": ino,
+                "extent": sealed,
+                "modified": [1_792_540_800, 0],
+                "changed": [1_792_540_800, 0],
+            },
+            "pace": pace,
+            "generation": 1,
+            "referenced_epoch": 0,
+        }))
+        .unwrap()
+    }
+
+    /// D3: the record terms of C14. (dev, ino) equality is identity only:
+    /// the stub moves onto a record, and (b) prunes, only when the record's
+    /// seal also covers `needed_extent` (and, for (b), its pace covers the
+    /// stub).
+    #[test]
+    fn begin_index_pass_record_terms_need_the_same_object_and_coverage() {
+        use crate::snapshots::SidePace;
+        let ns = 11;
+        let at = |p_key: &str, ino: u64| LedgerKey {
+            ns,
+            p: parent_of(p_key),
+            dev: 1,
+            ino,
+        };
+        let removed = LedgerEntry {
+            tag: LedgerTag::Removed,
+            attempts: 7,
+            needed_extent: 4096,
+            stub_not_before: 5000,
+            ..entry()
+        };
+        let mut index = crate::snapshots::ScanIndex::default();
+        for key in ["/cover", "/short", "/short-paced", "/other"] {
+            index.files.insert(key.into(), file_entry());
+        }
+        let short_pace = SidePace {
+            not_before_unix_seconds: 9000,
+            attempts_floor: 6,
+        };
+        let earlier_pace = SidePace {
+            not_before_unix_seconds: 100,
+            attempts_floor: 2,
+        };
+        let records = [
+            // Same object, covering: the stub goes on the record.
+            ("/cover", side_record(1, 8192, Some(earlier_pace))),
+            // Same object, insufficient coverage: one paced re-read.
+            ("/short", side_record(2, 1024, None)),
+            // Same object, short, already paced past the stub: (b) still
+            // needs coverage, so this re-reads too.
+            ("/short-paced", side_record(3, 1024, Some(short_pace))),
+            // Another object: (c) prunes the entry; the record is untouched.
+            ("/other", side_record(40, 8192, None)),
+        ];
+        for (key, record) in &records {
+            index
+                .codex_parent_side
+                .insert((*key).into(), record.clone());
+        }
+        let mut ledger = SideLedger::default();
+        ledger.entries.insert(at("/cover", 1), removed);
+        ledger.entries.insert(at("/short", 2), removed);
+        ledger.entries.insert(at("/short-paced", 3), removed);
+        ledger.entries.insert(at("/other", 4), removed);
+
+        let (_, counts) = crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
+            ledger.begin_index_pass(ns, 100, &mut index)
+        });
+        // Only the two short records re-arm.
+        assert_eq!(counts.side_requests_rearmed, 2);
+        let kept = ledger
+            .namespace(ns)
+            .map(|(key, entry)| (*key, entry.tag))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            kept,
+            BTreeMap::from([
+                (at("/cover", 1), LedgerTag::Removed),
+                (at("/short", 2), LedgerTag::Live),
+                (at("/short-paced", 3), LedgerTag::Live),
+            ])
+        );
+        assert_eq!(
+            index.codex_parent_side["/cover"].pace,
+            Some(SidePace {
+                not_before_unix_seconds: 5000,
+                attempts_floor: 6,
+            })
+        );
+        assert!(!index.codex_parent_side_requests.contains_key("/cover"));
+        for (key, ino) in [("/short", 2), ("/short-paced", 3)] {
+            let request = index.codex_parent_side_requests[key];
+            assert_eq!(request.state, crate::snapshots::SideRequestState::Live);
+            assert_eq!(
+                (
+                    request.dev_ino,
+                    request.attempts,
+                    request.not_before_unix_seconds
+                ),
+                ((1, ino), 6, 5000)
+            );
+        }
+        assert_eq!(index.codex_parent_side["/short"], records[1].1);
+        assert_eq!(index.codex_parent_side["/short-paced"], records[2].1);
+        assert_eq!(index.codex_parent_side["/other"], records[3].1);
+        assert!(!index.codex_parent_side_requests.contains_key("/other"));
+
+        // After the save that carried the stub, (b) prunes the covering entry.
+        ledger.begin_index_pass(ns, 200, &mut index);
+        assert!(ledger.get(&at("/cover", 1)).is_none());
+        assert!(!index.codex_parent_side_requests.contains_key("/cover"));
     }
 
     #[test]
