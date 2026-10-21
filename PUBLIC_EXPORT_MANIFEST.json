@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 739,
-  "content_sha256": "a9fed2180db612320d3f15c1f7431ddc53ab0eeaf5c2e4422780620b9342c77f",
+  "content_sha256": "a84d12e0626d74b1e988750012ac85411f8cb542d23a685faf1736637e75273c",
   "files": [
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "03620a6fba7ecf1c69a0087f07f48444ab01d54a28ab3030a4307c3bad0f1d79",
-      "size_bytes": 844159
+      "sha256": "03c9e325b382f1ee96fdf6d5db04f892880629e6a72dc917bea045b4b0c55094",
+      "size_bytes": 844287
     },
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/stale_family_carry_pipeline_tests.rs",
-      "sha256": "8f3950dacd5de234cf7114f9de41b33a5a9d3d388e2bec17784a24d118e679bd",
-      "size_bytes": 26436
+      "sha256": "0752ff37495ffe406fed00ea869f8038b643c35bcee19eb47aff3decc6e5a37c",
+      "size_bytes": 28247
     },
     {
       "executable": false,
@@ -1322,8 +1322,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "2d729b1d8e156d38e6a5fc5db5a5b5d86501200b1394351d4994c369ef59462c",
-      "size_bytes": 2993483
+      "sha256": "e36a5025c77360d9f582afc4193e229288cd09d021e8a909519197a06ecd0be2",
+      "size_bytes": 3011381
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/stale_family_carry_tests.rs",
-      "sha256": "7c3d2cc6e85457c62bde9f3341cd3e3480b9676422c901c2062570c2cfe7ffa5",
-      "size_bytes": 38175
+      "sha256": "81e1d588e331f9aaa161a2c76314a5267ac30596d88c194ac9d1737ffb048fd9",
+      "size_bytes": 42449
     },
     {
       "executable": false,
@@ -3380,8 +3380,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-c1b-red-retry-stale-family-carry.md",
-      "sha256": "e1832cdb139847972099dd195377ac458a8d8fcde6619234a929b2c36893ddd2",
-      "size_bytes": 9598
+      "sha256": "ec3d3630313b95d867b69171c4b90d4deae92c507dbc9e3c166a1a0e8b4f85d7",
+      "size_bytes": 10790
     },
     {
       "executable": false,
@@ -5176,7 +5176,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T18:47:29+00:00",
+  "generated_at": "2026-10-21T19:28:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 740,
   "public_roots": [
@@ -5215,5 +5215,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c69b23ffea0e52934c65f31dfbc3a58642be284e"
+  "source_commit": "65c8a121d7fc85c6b3163aa708d082ddeee420a6"
 }
