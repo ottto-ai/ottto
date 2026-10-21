@@ -379,6 +379,22 @@ login horizon. Three days and one day before it, the slot (and the default
 login) report `relogin_approaching`; once elapsed it reports `needs_login` and
 waits for the customer to sign in again.
 
+### Background limit refresh
+
+The same setting also covers the daemon's own usage-limit reads. With it off,
+the status lane's passes make no `oauth/usage` request for any Claude login on
+this Mac: the default login, registered slots and accounts read through a
+slot alike. Stored readings are still served and age as usual; a login with no
+stored reading says background limit refresh is off. A person's **Refresh
+limits**, setup and account checks still read, as does a collection outside the
+lane. Nothing new is read, stored or uploaded.
+
+The setting keeps its name and wire contract
+(`claude_account_set_upkeep_consent`, `consent`). A status that carries
+`consent_covers_limit_reads: true` comes from a daemon that also stops limit
+reads when it is off; an older daemon omits it and keeps reading limits for
+logins with a valid access token.
+
 Residual risks not removed: a server-side 401 makes Claude Code refresh
 regardless of the local clock; a crash or power loss between the provider
 rotating the token and Claude Code saving it; the customer's own short Claude

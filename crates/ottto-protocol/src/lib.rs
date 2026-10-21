@@ -43,6 +43,11 @@ pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 24;
 /// keep their meaning; clients send v26 only when the status carries
 /// `daemon_sign_in_supported`.
 pub const CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION: u16 = 26;
+/// Command-scoped version for the Codex background limit refresh switch
+/// (`codex_account_set_quota_refresh_consent`). An older daemon rejects it
+/// instead of accepting a switch it would not honor; clients send v27 only
+/// when the status carries `background_quota_refresh`.
+pub const CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION: u16 = 27;
 /// Destructive installation reset is command-scoped so an older daemon cannot
 /// accept the request while silently ignoring `forget_installation`.
 pub const INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION: u16 = 25;
@@ -2923,6 +2928,9 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         LocalControlCommand::CodexAccountStartSignIn { .. } => {
             CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION
         }
+        LocalControlCommand::CodexAccountSetQuotaRefreshConsent { .. } => {
+            CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION
+        }
         LocalControlCommand::AuthReset {
             forget_installation: true,
             ..
@@ -2952,12 +2960,27 @@ pub enum LocalClientKind {
     WebUi,
 }
 
-/// Whether the machine-local Claude config-slot registry may be maintained by
-/// the daemon in the background. Consent applies to the whole registry; a slot
-/// never acquires a separate hidden or inferred grant.
+/// Whether the daemon may keep Claude logins current in the background: renew
+/// their sign-in and, where the status carries `consent_covers_limit_reads`,
+/// read their usage limits on its own schedule, for every Claude login on this
+/// Mac (the default login and each registered slot). Consent applies to the
+/// whole registry; a slot never acquires a separate hidden or inferred grant.
+/// A person's Refresh and setup checks read regardless.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeAccountUpkeepConsentState {
+    ConsentRequired,
+    Granted,
+}
+
+/// Whether the daemon may read Codex usage limits in the background (its
+/// scheduled `codex app-server` reads, which also renew each home's sign-in),
+/// for every Codex home on this Mac. On until the owner chooses. A person's
+/// Refresh and setup checks read regardless. Same wire values as
+/// [`ClaudeAccountUpkeepConsentState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexQuotaRefreshConsentState {
     ConsentRequired,
     Granted,
 }
@@ -3467,6 +3490,13 @@ pub struct ClaudeAccountsStatusV1 {
     /// root aliases, paths, or destructive account actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_provisional_login_count: Option<u16>,
+    /// Presence: `consent` also covers background usage-limit reads. With it
+    /// off this daemon reads no Claude limits on its own schedule for any
+    /// login, the default login included; a person's Refresh and setup checks
+    /// still read. Older daemons omit it (their consent covers sign-in
+    /// renewal and expired saved slots only); older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_covers_limit_reads: Option<bool>,
 }
 
 /// Provider-owned Codex sign-in observation for one daemon-created home. The
@@ -3778,6 +3808,12 @@ pub struct CodexAccountsStatusV1 {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_sign_in_supported: Option<bool>,
+    /// The background limit refresh switch for every Codex home on this Mac.
+    /// Presence is the capability bit for the v27
+    /// `codex_account_set_quota_refresh_consent`. Older daemons omit it (they
+    /// always read in the background); older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_quota_refresh: Option<CodexQuotaRefreshConsentState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4155,6 +4191,13 @@ pub enum LocalControlCommand {
     CodexAccountRemove {
         schema_version: u16,
         slot_id: String,
+    },
+    /// v27: turn background Codex limit reads on or off for every Codex home
+    /// on this Mac. Off stops the daemon's scheduled reads (and the sign-in
+    /// renewal they do); a person's Refresh and setup checks still read.
+    CodexAccountSetQuotaRefreshConsent {
+        schema_version: u16,
+        consent: bool,
     },
     Detect {
         source: SourceKind,
@@ -5216,6 +5259,7 @@ mod tests {
                 remaining_slots: 9,
             },
             daemon_sign_in_supported: None,
+            background_quota_refresh: None,
         };
 
         let wire = serde_json::to_value(&status).expect("serialize");
@@ -5260,6 +5304,110 @@ mod tests {
             assert!(error.to_string().contains("expected 26"));
         }
         assert_eq!(CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION, 26);
+    }
+
+    #[test]
+    fn codex_quota_refresh_consent_is_v27_only() {
+        let wire = serde_json::json!({
+            "request_id": "req_codex_quota_refresh",
+            "protocol_version": CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "codex_account_set_quota_refresh_consent",
+            "schema_version": 1,
+            "consent": false
+        });
+        let request =
+            serde_json::from_value::<LocalControlRequest>(wire.clone()).expect("v27 consent");
+        assert_eq!(
+            request.command,
+            LocalControlCommand::CodexAccountSetQuotaRefreshConsent {
+                schema_version: 1,
+                consent: false,
+            }
+        );
+        let round_trip = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            round_trip["command"],
+            "codex_account_set_quota_refresh_consent"
+        );
+        assert_eq!(round_trip["consent"], false);
+        // An older client's version, or any other command family's, is
+        // rejected: the switch never lands on a daemon that would ignore it.
+        for wrong in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = wire.clone();
+            stale["protocol_version"] = serde_json::json!(wrong);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("the switch rejects every other protocol");
+            assert!(error.to_string().contains("expected 27"), "{error}");
+        }
+        assert_eq!(CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION, 27);
+
+        // A daemon that predates the command cannot decode it at all.
+        let error = serde_json::from_value::<LocalControlCommand>(serde_json::json!({
+            "command": "codex_account_set_quota_refresh_consents",
+            "schema_version": 1,
+            "consent": true
+        }))
+        .expect_err("unknown commands are rejected, never ignored");
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn background_quota_refresh_status_fields_are_additive() {
+        // An older daemon's statuses carry neither field.
+        let legacy: CodexAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "setup_operation": {"state": "idle"},
+            "default_slot": {"slot_id": "default", "ownership": "default"},
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("v26 status decodes");
+        assert_eq!(legacy.background_quota_refresh, None);
+        let mut status = legacy.clone();
+        let wire = serde_json::to_value(&status).expect("serialize");
+        assert!(wire.get("background_quota_refresh").is_none(), "{wire}");
+
+        for (state, value) in [
+            (CodexQuotaRefreshConsentState::Granted, "granted"),
+            (
+                CodexQuotaRefreshConsentState::ConsentRequired,
+                "consent_required",
+            ),
+        ] {
+            status.background_quota_refresh = Some(state);
+            let wire = serde_json::to_value(&status).expect("serialize");
+            assert_eq!(wire["background_quota_refresh"], value);
+            let decoded: CodexAccountsStatusV1 = serde_json::from_value(wire).expect("decode");
+            assert_eq!(decoded.background_quota_refresh, Some(state));
+        }
+
+        let claude = serde_json::json!({
+            "schema_version": 1,
+            "consent": "granted",
+            "setup_operation": {"state": "idle"},
+            "default_slot": {
+                "slot_id": "default",
+                "ownership": "external",
+                "service_name": "Claude Code-credentials"
+            },
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        });
+        let legacy: ClaudeAccountsStatusV1 =
+            serde_json::from_value(claude.clone()).expect("older Claude status decodes");
+        assert_eq!(legacy.consent_covers_limit_reads, None);
+        let mut covered = claude;
+        covered["consent_covers_limit_reads"] = serde_json::json!(true);
+        let covered: ClaudeAccountsStatusV1 =
+            serde_json::from_value(covered).expect("newer Claude status decodes");
+        assert_eq!(covered.consent_covers_limit_reads, Some(true));
+        assert_eq!(
+            serde_json::to_value(&covered).expect("serialize")["consent_covers_limit_reads"],
+            true
+        );
     }
 
     #[test]
