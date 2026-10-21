@@ -67,6 +67,9 @@ pub(crate) enum Release {
     CursorReservation,
     /// A copy refusal fitting the residents beside the active file (M1).
     CopyRefusal,
+    /// Room for a zero-budget tail's own copy, from entries ranked strictly
+    /// older than the tailed file only (M1 Path A).
+    CopyAdmission,
 }
 
 /// One common admission/eviction mechanism for compatible native states. Uses
@@ -137,6 +140,29 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     }
     /// `release_until`, counting each eviction under `cause`.
     pub(crate) fn release_until_for(&mut self, limit: usize, cause: Release) -> bool {
+        self.evict_until(limit, cause, None)
+    }
+    /// M1 Path A: `release_until_for` restricted to entries ranked strictly
+    /// below `rank` (their `modified_hint`), in the same victim order, counted
+    /// under `Release::CopyAdmission`. Evicts nothing, and returns false,
+    /// unless evicting all of them fits `limit` by their stored `heap_bytes`
+    /// alone, a lower bound on what each eviction frees.
+    pub(crate) fn release_older_until(&mut self, limit: usize, rank: (i64, i64)) -> bool {
+        if heap_layout_bound::bound(self, limit).is_some() {
+            return true;
+        }
+        let older = self
+            .entries
+            .values()
+            .filter(|entry| entry.modified_hint < rank)
+            .fold(0usize, |sum, entry| sum.saturating_add(entry.heap_bytes));
+        heap_layout_bound::bound(self, usize::MAX)
+            .is_some_and(|resident| resident.saturating_sub(older) <= limit)
+            && self.evict_until(limit, Release::CopyAdmission, Some(rank))
+    }
+    /// Evict in victim order, only entries ranked strictly below `below`
+    /// when given, until the resident state fits `limit`.
+    fn evict_until(&mut self, limit: usize, cause: Release, below: Option<(i64, i64)>) -> bool {
         loop {
             if heap_layout_bound::bound(self, limit).is_some() {
                 return true;
@@ -144,6 +170,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             let Some(victim) = self
                 .entries
                 .iter()
+                .filter(|(_, entry)| below.map_or(true, |rank| entry.modified_hint < rank))
                 .min_by_key(|(_, entry)| (entry.modified_hint, entry.used))
                 .map(|(key, _)| key.clone())
             else {
@@ -156,6 +183,10 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 Release::CursorReservation => record(Event::CursorReservationEntriesEvicted),
                 Release::CopyRefusal => {
                     record(Event::CopyRefusalEntriesEvicted);
+                    add(Event::CopyRefusalBytesReleased, entry.heap_bytes as u64);
+                }
+                Release::CopyAdmission => {
+                    record(Event::CopyRefusalAdmissionEvicted);
                     add(Event::CopyRefusalBytesReleased, entry.heap_bytes as u64);
                 }
             }

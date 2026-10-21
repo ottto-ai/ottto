@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 733,
-  "content_sha256": "a513b0e4eb852915b87367d81a4237cbe829eb14f86d202f0715f2da68175444",
+  "content_sha256": "6de07554f79e59416ff2b1088b5a0ec36712a91bf4d5ed964422b18b40ea8a6e",
   "files": [
     {
       "executable": false,
@@ -1035,8 +1035,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics/cache_lifecycle.rs",
-      "sha256": "16b99ad9d4d5dec1fa5c51445eaa85346f83d3db55d3256735dbf483fec490c7",
-      "size_bytes": 4259
+      "sha256": "c8f3df27ef69a26f48654035d0c79ac46cf14666b09dc8856a65945a3644a944",
+      "size_bytes": 4672
     },
     {
       "executable": false,
@@ -1350,8 +1350,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/cache_policy_tests.rs",
-      "sha256": "8aac18905de570608e1d49be6a60ee1a096b3c8566c1d076ca73d1513ca7efaf",
-      "size_bytes": 30559
+      "sha256": "b8cd38e525d880b4e8d5e585708a7154cbc9d716d82730ffdddcd65822b4fb24",
+      "size_bytes": 43046
     },
     {
       "executable": false,
@@ -1476,8 +1476,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join/group_job_tests.rs",
-      "sha256": "78976048824ebdcd7604260b999f3a62e5b223e5288bc72792fb8495a46cf3e9",
-      "size_bytes": 93310
+      "sha256": "ed059a144401d78073da051c708b828a605d05c19e0e9dd0ff9bea0ff1b6be4b",
+      "size_bytes": 97415
     },
     {
       "executable": false,
@@ -1581,8 +1581,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "0e46e7c630ee57a175eb23679049dd1f93ac7efd06ef1c06b0ccb5bb2fbd988e",
-      "size_bytes": 29999
+      "sha256": "5b3ff4141b6b680e82b202f1731cdeecacd35da4c4417a19483cf7ca9e780aa4",
+      "size_bytes": 35077
     },
     {
       "executable": false,
@@ -1658,8 +1658,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_cache.rs",
-      "sha256": "efe601df8550c4d8a52e66472decc00e4b37418c33212b3a5786dc21544b74f0",
-      "size_bytes": 25335
+      "sha256": "1724a52f8bfec1795377b0817f84b582e27a3fdc07f77123c5d167454ece14fc",
+      "size_bytes": 27032
     },
     {
       "executable": false,
@@ -3366,8 +3366,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-m1-cache-evict-to-fit.md",
-      "sha256": "c8a54b5d8538da058a4fff1cbab19a63168330552fe6f95293a5d6444c54d059",
-      "size_bytes": 4720
+      "sha256": "0930910c0b0962022d3b3dacf2dd58b1ed35160443b8599e3c9bc76b3e6de61d",
+      "size_bytes": 8969
     },
     {
       "executable": false,
@@ -5134,7 +5134,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T10:18:12+00:00",
+  "generated_at": "2026-10-21T11:42:14+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 734,
   "public_roots": [
@@ -5173,5 +5173,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c350325b9776dc8877209d13439565b1be54ab89"
+  "source_commit": "8972943b09dd81501ee5df21f530677df55e0d0e"
 }
