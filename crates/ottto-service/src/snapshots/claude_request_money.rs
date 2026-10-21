@@ -43,8 +43,13 @@ pub(crate) const MATURITY_SECONDS: u64 = 60;
 pub(crate) const SHADOW_MEMORY_CEILING_BYTES: usize = 32 * 1024 * 1024;
 
 /// Bounded reread of API rows for page roots the live path did not load.
+/// Each reread is admitted on its own, before it reads, from its file length;
+/// a refused or oversized reread leaves that root's rows unavailable.
 const REREAD_MAX_ROOTS: usize = 16;
-const REREAD_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const REREAD_MAX_FILE_BYTES: u64 = 512 * 1024;
+/// The shortest line the loader can keep as a row: the session id (36), a
+/// request id and the JSON keys around them.
+const REREAD_MIN_ROW_LINE_BYTES: u64 = 48;
 
 /// Daily JSONL: per-day byte cap and days kept.
 const JSONL_DAY_CAP_BYTES: u64 = 8 * 1024 * 1024;
@@ -856,6 +861,10 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) rows_unavailable_roots: u64,
     /// The live load reported a fault, so its rows were reread per root.
     pub(crate) rows_live_distrusted: u64,
+    /// Rereads refused by admission, and rereads dropped because the file
+    /// grew past its admitted length (both leave the root unavailable).
+    pub(crate) rows_reread_refused: u64,
+    pub(crate) rows_reread_grew: u64,
     pub(crate) unbuilt_items: u64,
     pub(crate) residue_negative: u64,
     pub(crate) tokens_old: u64,
@@ -1038,14 +1047,12 @@ pub(crate) fn shadow_page_at(
         .flat_map(|item| &item.usage_buckets)
         .map(|bucket| bucket.model_usage.len())
         .fold(0_usize, usize::saturating_add);
-    let reread_rows = REREAD_MAX_ROOTS * (REREAD_MAX_FILE_BYTES as usize / 256);
     let admission = units
         .saturating_add(rows)
-        .saturating_add(reread_rows)
         .saturating_mul(UNIT_BYTES.max(ROW_BYTES))
         .saturating_add(bucket_rows.saturating_mul(BUCKET_ROW_BYTES))
         .saturating_add(claude_request_ledger::holders_bound(
-            units.saturating_add(rows).saturating_add(reread_rows),
+            units.saturating_add(rows),
         ))
         .saturating_add(roots.len().saturating_mul(FAMILY_BYTES))
         .saturating_add(index.files.len().saturating_mul(64))
@@ -1107,6 +1114,7 @@ pub(crate) fn shadow_page_at(
     let mut reread = BTreeMap::<String, Vec<ClaudeLocalOtelEvidence>>::new();
     let mut unavailable = BTreeSet::<&str>::new();
     let mut reread_left = REREAD_MAX_ROOTS;
+    let mut reread_reservations = Vec::new();
     for &root in &roots {
         if live_trusted && api_report.evidence.contains_key(root) {
             continue;
@@ -1115,13 +1123,34 @@ pub(crate) fn shadow_page_at(
             None => {}
             Some(len) if len <= REREAD_MAX_FILE_BYTES && reread_left > 0 => {
                 reread_left -= 1;
+                // The decoded rows (their strings fit in the file's bytes),
+                // their page-hash entries and holders.
+                let rows_bound = (len / REREAD_MIN_ROW_LINE_BYTES) as usize;
+                let charge =
+                    (len as usize)
+                        .saturating_add(rows_bound.saturating_mul(
+                            std::mem::size_of::<ClaudeLocalOtelEvidence>() + ROW_BYTES,
+                        ))
+                        .saturating_add(claude_request_ledger::holders_bound(rows_bound));
+                let Some(reservation) = ShadowReservation::admit(charge) else {
+                    counts.rows_reread_refused += 1;
+                    unavailable.insert(root);
+                    continue;
+                };
+                reread_reservations.push(reservation);
+                counts.admission_bytes = counts.admission_bytes.saturating_add(charge as u64);
                 let report = crate::claude_local_otel::load_claude_api_request_evidence_report(
                     support_dir,
                     [root.to_owned()],
                 );
                 counts.rows_reread_roots += 1;
                 counts.rows_reread_bytes += len;
-                if report.health.is_complete() {
+                let kept = report.evidence.values().map(Vec::len).sum::<usize>();
+                if kept > rows_bound {
+                    // The file grew past its admitted length: drop it.
+                    counts.rows_reread_grew += 1;
+                    unavailable.insert(root);
+                } else if report.health.is_complete() {
                     reread.insert(
                         root.to_owned(),
                         report.evidence.into_values().flatten().collect(),
