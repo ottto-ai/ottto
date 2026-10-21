@@ -1204,15 +1204,19 @@ fn c1a_late_row_between_windows_equals_base() {
 /// Disclosure, not a pass/fail claim on either arm: the dormant-window
 /// residual. The skip at 08:10 leaves the family unread at 08:20. A change
 /// to it then lands after its directory was walked and before the 08:20
-/// terminal page: the root API rows gain account evidence (`late_row`), or
-/// one subagent gains a request in its transcript and both sidecars
-/// (`member_growth`). BASE read the family on 08:20's earlier pages, so its
-/// terminal re-proves the family from that window's pending and the new rows.
-/// The fix has no 08:20 pending for the family, so its next window
-/// reconstructs against the 08:10 witness. A re-arm at the 08:20 terminal
-/// would not change that: the between-windows control shows a re-armed
-/// family going to RetryPending the same way. The receipts record both arms'
-/// state per window for the report.
+/// terminal page.
+/// - `late_row`: the root API rows gain account evidence. BASE read the
+///   family on 08:20's earlier pages, so its terminal re-proves the family
+///   from that window's pending and the new rows. The fix has no 08:20
+///   pending for the family, so its next window reconstructs against the
+///   08:10 witness. A re-arm at the 08:20 terminal would not change that: the
+///   between-windows control shows a re-armed family going to RetryPending
+///   the same way.
+/// - `member_growth`: one subagent gains a request in its transcript and both
+///   sidecars. BASE also holds the family in the next window, so both arms
+///   behave the same.
+///
+/// The receipts record both arms' state per window for the report.
 #[test]
 #[serial(source_manifests)]
 fn c1a_residual_dormant_family_change_receipt() {

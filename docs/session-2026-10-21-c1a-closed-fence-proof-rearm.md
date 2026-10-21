@@ -118,30 +118,32 @@ a BASE arm that refuses the budget:
 - late API row after the family's pages of a window that reads the family:
   the changed witness keeps the re-arm, and liveness equals BASE;
 - late API row between windows: both arms hold the family identically;
-- a receipt-only disclosure of the dormant-window residual (late row and
-  member growth).
+- a receipt-only disclosure of the dormant-window residual: a late row
+  diverges from BASE, and member growth holds both arms.
 
 No local tests or builds were run. Results are CI-only.
 
 ## Residuals
 
-- **Change to a dormant family.** A family skipped at one terminal is not
-  re-read in the next window. Suppose its API rows or a member transcript
-  change after its directory was walked in that window and before its
+- **Late provider row for a dormant family.** A family skipped at one
+  terminal is not re-read in the next window. Suppose its existing API rows
+  are rewritten after its directory was walked in that window and before its
   terminal page. BASE read the family on that window's earlier pages, so its
   terminal re-proves the family from that window's pending and the new rows.
   The fix has no current pending for the family, so its next window
   reconstructs against the earlier witness and goes to RetryPending. This is
-  the existing held path for any dormant witnessed family.
+  the existing held path for any dormant witnessed family. When a member
+  transcript grows at the same point instead, BASE also holds the family in
+  the next window, so both arms behave the same.
   - Re-arming the family at that terminal would not help. The re-read
     still reconstructs against the earlier witness, as the between-windows
     control shows for BASE.
   - A sidecar change in a window that does read the family already keeps
     the BASE re-arm: the re-proved witness differs, so the unchanged-proof
     check fails.
-  - Parity would need a terminal re-proof from the carried pending, which
-    promotes stale evidence to currentness. It would also need a traversal
-    change. Neither is in this slice.
+  - Parity would need either a terminal re-proof from the carried pending,
+    which promotes stale evidence to currentness, or a traversal change that
+    reads such a family on the terminal page. Neither is in this slice.
   - The receipt test records both arms.
 - **Closed-fence reopen with other unread files.** When an unrelated
   unchanged file is also unobserved, neither arm reopens before the
