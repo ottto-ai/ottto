@@ -3181,6 +3181,31 @@ fn claude_usage_authority_preserves_pending(
         && quarantine.proven_witness_fingerprint == claude_usage_family_witness_fingerprint(witness)
 }
 
+#[cfg(test)]
+thread_local! {
+    static KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// While alive, this thread's traversal starts carry no stale Claude family,
+/// so every red retry takes the BASE whole-family re-arm.
+#[cfg(test)]
+pub(crate) struct KeepStaleClaudeFamilyRearmForTest(bool);
+
+#[cfg(test)]
+impl KeepStaleClaudeFamilyRearmForTest {
+    pub(crate) fn new() -> Self {
+        Self(KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(|cell| cell.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeepStaleClaudeFamilyRearmForTest {
+    fn drop(&mut self) {
+        KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+
 /// A demoted revision cannot progress within a traversal only while its family
 /// quarantine is terminal, bounded, bound to the retained witness, and records
 /// exactly this revision: the candidate gate then skips it until the family
@@ -32129,6 +32154,9 @@ mod tests {
     }
     mod census_convergence_tests {
         include!("snapshots/census_convergence_tests.rs");
+    }
+    mod stale_family_carry_tests {
+        include!("snapshots/stale_family_carry_tests.rs");
     }
     mod p12_base_exit_tests {
         include!("snapshots/p12_base_exit_tests.rs");
