@@ -24,9 +24,11 @@ const MODEL: &str = "fixture-model";
 /// The retained-state budget `sampled_scan` derives (its `STATE_BYTES`).
 const POLICY_STATE_BYTES: usize =
     crate::transcript_cache::CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - 1024 * 1024;
-/// About 4.9 MB charged per retained reduction (the #653 fillers measured
-/// about 4.94 KB per response), so about four entries cycle through the cache.
-const GROWING_RECORDS: usize = 1000;
+/// About 3.5 MB charged per retained reduction (about 4.96 KB per response,
+/// measured in CI), so five or six entries cycle through the cache. That
+/// fill leaves less room than one 16 MiB JSONL line, so the Codex page below
+/// can meet a zero copy budget.
+const GROWING_RECORDS: usize = 700;
 const GROWING_FILES: usize = 12;
 const ROUNDS: usize = 3;
 /// Four 1,400-response reductions (#653 T3: 27,664,691 B) fill the state
@@ -442,10 +444,11 @@ fn tail_beside_full_cache(older_tail: bool) -> TailBesideFullCache {
 
 /// G1, degrade gracefully (design §5c G1; §2 L1 and L5; §6 rows M0, M1, M2).
 ///
-/// Twelve growing Claude sessions of 1,000 responses each, sized so about four
-/// cycle through the 31 MiB state budget (`capacity = STATE / entry - 2`,
-/// design §4a). Round 0 reads every file for the first time in creation order,
-/// so the first-seen sessions fill the cache. Then three rounds of "append to
+/// Twelve growing Claude sessions of 700 responses each, sized so five or six
+/// cycle through the 31 MiB state budget (design §4a). Round 0 reads every
+/// file for the first time in creation order, so the first-seen sessions fill
+/// the cache. `capacity` is the count that round admits, which is the most an
+/// empty cache admits beside one active read of this size. Then three rounds of "append to
 /// every file (oldest first), then scan each (newest first)", with a
 /// census-incomplete Codex page before each round. Its unsampled active meets
 /// a zero copy budget (since #654 it must not wipe). Desired:
@@ -458,7 +461,7 @@ fn tail_beside_full_cache(older_tail: bool) -> TailBesideFullCache {
 /// - output byte-equal to a cacheless control.
 ///
 /// Red on main: fill-and-freeze (L5). Admission never evicts, so the
-/// first-seen files 0..4 stay resident in every round. The most recently
+/// first-seen files `0..capacity` stay resident in every round. The most recently
 /// appended files are refused (`retention_bound_refused`) and reread
 /// `Full(StateMissing)` every round.
 #[test]
@@ -533,31 +536,31 @@ fn cache_policy_g1_growing_sessions_over_capacity_degrade_gracefully() {
         .resident_bound()
         .expect("bounded resident state")
         / first_resident.len();
-    let capacity = (POLICY_STATE_BYTES / entry_bytes).saturating_sub(2);
+    let capacity = first_resident.len();
     assert!(
-        (3..=5).contains(&capacity),
-        "precondition: about four entries cycle (entry_bytes={entry_bytes} capacity={capacity})"
+        (3..=6).contains(&capacity),
+        "precondition: a handful of entries cycle (entry_bytes={entry_bytes} capacity={capacity})"
     );
-    // The Codex page's one long record must exceed the room the full cache
-    // leaves, within the 16 MiB JSONL line bound.
-    let padding = POLICY_STATE_BYTES.saturating_sub(optional_resident(&cache)) + 1024 * 1024;
-    assert!(
-        padding < MAX_JSONL_LINE_BYTES - 64 * 1024,
-        "precondition: the Codex padding fits one JSONL line (padding={padding})"
-    );
-    let codex = ScanFixture::new(SnapshotSource::Codex);
-    codex.append(&usage(SnapshotSource::Codex, 100, 0, MODEL));
-    codex.append(&json!({"type": "synthetic-padding", "text": "x".repeat(padding)}));
-    codex.append(&usage(SnapshotSource::Codex, 140, 1, MODEL));
 
     let mut receipt = format!(
-        "state_bytes={POLICY_STATE_BYTES} entry_bytes={entry_bytes} capacity={capacity} codex_padding={padding} round0_resident={first_resident:?}"
+        "state_bytes={POLICY_STATE_BYTES} entry_bytes={entry_bytes} capacity={capacity} round0_resident={first_resident:?}"
     );
     let mut wipes = 0;
     let mut round_tails = Vec::new();
     let mut round_resident = Vec::new();
     let mut last = Vec::new();
     for round in 1..=ROUNDS {
+        // The Codex page's one long record must exceed the room the cache
+        // leaves now, within the 16 MiB JSONL line bound.
+        let padding = POLICY_STATE_BYTES.saturating_sub(optional_resident(&cache)) + 1024 * 1024;
+        assert!(
+            padding < MAX_JSONL_LINE_BYTES - 64 * 1024,
+            "precondition: the Codex padding fits one JSONL line (padding={padding}); {receipt}"
+        );
+        let codex = ScanFixture::new(SnapshotSource::Codex);
+        codex.append(&usage(SnapshotSource::Codex, 100, 0, MODEL));
+        codex.append(&json!({"type": "synthetic-padding", "text": "x".repeat(padding)}));
+        codex.append(&usage(SnapshotSource::Codex, 140, 1, MODEL));
         let (page, page_counts) = observe(|| {
             observed_scan(
                 &codex,
@@ -594,7 +597,7 @@ fn cache_policy_g1_growing_sessions_over_capacity_degrade_gracefully() {
         let round_wipes = wipe_clears(&page_counts) + wipe_clears(&counts);
         wipes += round_wipes;
         receipt.push_str(&format!(
-            " round{round}:codex_clear_other_active={} codex_clear_entries_released={} wipes={round_wipes} tails={tails} state_missing={} resident={resident:?}",
+            " round{round}:codex_padding={padding} codex_clear_other_active={} codex_clear_entries_released={} wipes={round_wipes} tails={tails} state_missing={} resident={resident:?}",
             page_counts.clear_other_active,
             page_counts.clear_entries_released,
             scans.iter().map(Observed::state_missing).sum::<usize>(),
@@ -644,16 +647,20 @@ fn cache_policy_g1_growing_sessions_over_capacity_degrade_gracefully() {
 ///
 /// Four warm sessions (600 responses, current mtime) are retained through the
 /// real pipeline. Then 50 cold sessions (200 responses, mtime two days back)
-/// are read once each. Desired: no warm entry is lost, either during the
-/// flood or at the warm sessions' next append. Cold files may take free room
-/// but never evict, and every clone is admitted.
+/// are read once each. Desired:
+/// - no warm entry is lost, during the flood or at the warm sessions' next
+///   append;
+/// - cold files may take free room but never evict;
+/// - clones do not exceed free-room admissions.
 ///
-/// Red on main: the flood itself evicts nothing (admission already reserves
-/// room, so this part passes), but the cold entries take the free room for
-/// good. A warm session's next tail then refuses its own re-admission
-/// (`retention_bound_refused`), because admission never evicts lower-ranked
-/// entries (L5, fill-and-freeze). At least the first warm session is no
-/// longer resident after its tail.
+/// Red on main, twice:
+/// - Clone churn: every cold read clones its reduction (50), but only the
+///   first cold files are admitted. The rest are cloned and then dropped,
+///   for example by the finalization bound (L7). The flood evicts nothing and
+///   keeps every warm entry, so those assertions pass.
+/// - Fill-and-freeze (L5): the admitted cold entries keep the free room. A
+///   warm session's next tail then refuses its own re-admission
+///   (`retention_bound_refused`), so it is no longer resident afterwards.
 #[test]
 fn cache_policy_g2_cold_flood_never_costs_warm_sessions() {
     if unexecuted("G2_cold_flood") {
@@ -713,12 +720,15 @@ fn cache_policy_g2_cold_flood_never_costs_warm_sessions() {
         kept.push(cache.retained_checkpoint(&file.key()).is_some());
     }
     let receipt = format!(
-        "state_bytes={POLICY_STATE_BYTES} resident_after_warm={resident_after_warm} flood_insert_admitted={} flood_retention_produced={} flood_retention_bound_refused={} flood_insert_entries_evicted={} flood_insert_self_evicted={} flood_wipes={} warm_after_flood={warm_after_flood} resident_after_flood={resident_after_flood} warm_tail_modes={tail_modes:?} warm_tail_(bound_refused,admitted)={tail_counts:?} warm_kept_after_tail={kept:?}",
+        "state_bytes={POLICY_STATE_BYTES} resident_after_warm={resident_after_warm} flood_insert_admitted={} flood_retention_produced={} flood_retention_bound_refused={} flood_insert_entries_evicted={} flood_insert_self_evicted={} flood_retention_finalization_bound_refused={} flood_retention_clone_bound_refused={} flood_insert_live_reservation_refused={} flood_wipes={} warm_after_flood={warm_after_flood} resident_after_flood={resident_after_flood} warm_tail_modes={tail_modes:?} warm_tail_(bound_refused,admitted)={tail_counts:?} warm_kept_after_tail={kept:?}",
         flood.insert_admitted,
         flood.retention_produced,
         flood.retention_bound_refused,
         flood.insert_entries_evicted,
         flood.insert_self_evicted,
+        flood.retention_finalization_bound_refused,
+        flood.retention_clone_bound_refused,
+        flood.insert_live_reservation_refused,
         wipe_clears(&flood),
     );
     eprintln!("CACHE_POLICY test=G2_cold_flood {receipt}");
@@ -733,8 +743,8 @@ fn cache_policy_g2_cold_flood_never_costs_warm_sessions() {
         0,
         "G2: a cold candidate evicted; {receipt}"
     );
-    assert_eq!(
-        flood.retention_produced, flood.insert_admitted,
+    assert!(
+        flood.retention_produced <= flood.insert_admitted,
         "G2: clones exceed free-room admissions; {receipt}"
     );
     assert!(

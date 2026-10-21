@@ -15,9 +15,9 @@ copy budget is measured against that same constant. So the tests size real
 transcripts against the 32,505,856-byte state budget instead of injecting a
 smaller limit.
 
-1. **G1, degrade gracefully.** Twelve growing Claude sessions of 1,000
-   responses each, so about four cycle through the budget
-   (`capacity = STATE / entry - 2`). Round 0 reads every file for the first
+1. **G1, degrade gracefully.** Twelve growing Claude sessions of 700
+   responses each, so five or six cycle through the budget. `capacity` is
+   the count round 0 admits. Round 0 reads every file for the first
    time in creation order, so the first-seen sessions fill the cache. Then
    three rounds: append to every file, then scan each newest first. A
    census-incomplete Codex page runs before each round. Its unsampled active
@@ -36,13 +36,17 @@ smaller limit.
    cold 200-response sessions (mtime two days back) are read once. Desired:
    - no warm entry is lost during the flood;
    - cold files never evict;
-   - every clone is admitted;
+   - clones do not exceed free-room admissions;
    - each warm session's next append is a tail and keeps its entry.
 
-   Red on main: the cold entries keep the free room. A warm session's tail
-   then refuses its own re-admission (`retention_bound_refused`), so the
-   session loses its entry. The flood-time assertions are expected to pass
-   on main.
+   Red on main, twice:
+   - Every cold read clones (50), but only 16 are admitted, so the rest are
+     cloned and dropped.
+   - The admitted cold entries keep the free room, so a warm session's tail
+     refuses its own re-admission (`retention_bound_refused`) and loses its
+     entry.
+
+   The flood itself evicts nothing and keeps every warm entry.
 3. **G3, priority.** An entry ranked below every filler is read as a tail
    beside four newer fillers that fill the cache. Its long appended record
    meets a zero copy budget. Desired: no newer entry is evicted and nothing

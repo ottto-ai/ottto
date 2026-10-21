@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 732,
-  "content_sha256": "02df3b8a8be4ed1418fd361c3f51aece753f4fc201e15fa87e3d35899d34eab9",
+  "content_sha256": "e20ef4ebc4c64900e4b7a28297c49db353e4fefb7fec437c8bd5de9a975b37c5",
   "files": [
     {
       "executable": false,
@@ -1350,8 +1350,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/cache_policy_tests.rs",
-      "sha256": "73195c363a09af057abcadc0e7d7df6e6e9e69d2b5f79d3670449106508a7960",
-      "size_bytes": 35556
+      "sha256": "52eb1cdf0270e9981e77352456cd9121dcc426416d88192a24e592f78581cfd6",
+      "size_bytes": 36193
     },
     {
       "executable": false,
@@ -3338,8 +3338,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-cache-policy-harness.md",
-      "sha256": "f957012127daea2c186aae6bc2c86d01c752023dca29b21c6aee10bb25b65a99",
-      "size_bytes": 3578
+      "sha256": "2d411def179210c59b3957fbcce33ccdc45c90f1f1325a68d2f087440eb4d99b",
+      "size_bytes": 3719
     },
     {
       "executable": false,
