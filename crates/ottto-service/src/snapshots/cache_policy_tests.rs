@@ -37,18 +37,21 @@ const MODEL: &str = "fixture-model";
 /// The retained-state budget `sampled_scan` derives (its `STATE_BYTES`).
 pub(super) const POLICY_STATE_BYTES: usize =
     crate::transcript_cache::CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - 1024 * 1024;
-/// Four 1,400-response reductions (#653 T3: 27,664,691 B) fill the state
-/// budget to within a few MB without any eviction.
+/// Four filler reductions fill the state budget to within a few MB without
+/// any eviction.
 pub(super) const FILLERS: usize = 4;
-const FILLER_RECORDS: usize = 1400;
+/// One filler's charge, in thousandths of the state budget: four fill about
+/// 85% of it, as four 1,400-response reductions did before compact Claude
+/// records (#653 T3: 27,664,691 B, 6,887,051 B each), leaving about 4.8 MB.
+/// `filler_records` sizes the filler file from measured charges, so a change
+/// to the per-response charge cannot leave the zero-budget steps unreached.
+const FILLER_STATE_PERMILLE: usize = 212;
+/// The two probe files that measure a filler's charge per response.
+const FILLER_PROBE_RECORDS: [usize; 2] = [700, 1400];
 /// One appended record this long leaves the tail parser's line buffer at
 /// least this capacity at its next step start: more than the room the
 /// filled cache leaves, so the copy budget beside the tail is zero.
 const TAIL_PADDING_BYTES: usize = 8 * 1024 * 1024;
-/// About 4.96 KB charged per response (measured in CI): this many appended
-/// responses grow a tail's borrowed state past the room the fillers leave
-/// (about 4.8 MB), yet below one filler's charge (`FILLER_RECORDS`).
-const TAIL_GROWTH_RECORDS: usize = 1300;
 /// Two days: outside the one-hour audit horizon, so a file this old is cold.
 const OLD_SECONDS: u64 = 2 * 24 * 3600;
 /// Passes of the hot-file model, each one append read as a tail.
@@ -319,12 +322,68 @@ fn filler_key(number: usize) -> String {
     format!("cache-policy-filler-{number}")
 }
 
-/// Insert `FILLERS` real retained reductions of one `FILLER_RECORDS` file
+/// The charge one retained reduction of a `records`-response file adds to an
+/// empty shared cache. Its lifecycle events are kept out of any caller's.
+fn filler_charge_for(records: usize) -> usize {
+    let source = SnapshotSource::ClaudeCode;
+    let filler = ScanFixture::new(source);
+    filler.append_usage(source, 0..records);
+    observe(|| {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let empty = optional_resident(&cache);
+        let retained = retained_reduction(&filler);
+        assert!(
+            cache
+                .retained()
+                .expect("retained cache lock")
+                .insert(filler_key(0), retained),
+            "precondition: a {records}-response filler is admitted"
+        );
+        optional_resident(&cache) - empty
+    })
+    .0
+}
+
+/// The response count whose filler charges `FILLER_STATE_PERMILLE` of the
+/// state budget, within 1%: a linear estimate from two probe files, then
+/// corrected on the measured charge (vector growth is not linear). Measured
+/// once per process.
+fn filler_records() -> usize {
+    static RECORDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RECORDS.get_or_init(|| {
+        let target = POLICY_STATE_BYTES / 1000 * FILLER_STATE_PERMILLE;
+        let [low, high] = FILLER_PROBE_RECORDS;
+        let high_charge = filler_charge_for(high);
+        let slope = high_charge.saturating_sub(filler_charge_for(low)) / (high - low);
+        assert!(slope > 0, "precondition: a filler's charge grows per response");
+        let step = |records: usize, charge: usize| {
+            (records as isize + (target as isize - charge as isize) / slope as isize).max(1)
+                as usize
+        };
+        let mut records = step(high, high_charge);
+        let mut charge = filler_charge_for(records);
+        for _ in 0..4 {
+            if charge.abs_diff(target) <= target / 200 {
+                break;
+            }
+            records = step(records, charge);
+            charge = filler_charge_for(records);
+        }
+        eprintln!("CACHE_POLICY filler records={records} charge={charge} target={target} slope={slope}");
+        assert!(
+            charge.abs_diff(target) <= target / 100,
+            "precondition: a {records}-response filler charges {charge} B, not within 1% of {target} B"
+        );
+        records
+    })
+}
+
+/// Insert `FILLERS` real retained reductions of one `filler_records` file
 /// under unrelated keys, as #653 T3 does. `modified` pins the fillers' rank.
 fn insert_fillers(cache: &Arc<sampled_scan::SharedCache>, modified: Option<u64>) {
     let source = SnapshotSource::ClaudeCode;
     let filler = ScanFixture::new(source);
-    filler.append_usage(source, 0..FILLER_RECORDS);
+    filler.append_usage(source, 0..filler_records());
     if let Some(modified) = modified {
         filler.set_modified(modified);
     }
@@ -598,16 +657,25 @@ fn cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
     );
 }
 
-/// The tailed file's append for M1 (ii): `TAIL_GROWTH_RECORDS` ordinary
+/// Responses appended for M1 (ii): 13/14 of a filler's, as 1,300 beside
+/// 1,400 before compact Claude records. A tail's state is the same Claude
+/// reduction, charged per response as a filler is, so the borrowed state grows
+/// past the room the fillers leave (about 4.8 MB), yet below one filler's
+/// charge.
+fn tail_growth_records() -> usize {
+    filler_records() * 13 / 14
+}
+
+/// The tailed file's append for M1 (ii): `tail_growth_records` ordinary
 /// responses, so the borrowed tail state itself grows.
 fn append_growth(tailed: &ScanFixture) {
-    tailed.append_usage(SnapshotSource::ClaudeCode, 1..1 + TAIL_GROWTH_RECORDS);
+    tailed.append_usage(SnapshotSource::ClaudeCode, 1..1 + tail_growth_records());
 }
 
 /// M1 test (ii), evict only the overflow (design §6 row M1; §2 L1).
 ///
 /// The same full cache, but the tailed file's append is
-/// `TAIL_GROWTH_RECORDS` ordinary responses. The borrowed tail state grows
+/// `tail_growth_records` ordinary responses. The borrowed tail state grows
 /// past the room the fillers leave: a real overflow of the state budget, not
 /// a merely full cache. Desired: no wipe-all clear. The zero-budget step
 /// start evicts in victim order until the tail fits; the grown state stays
