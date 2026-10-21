@@ -11,6 +11,34 @@ pub(crate) const CACHE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const ENTRY_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const CACHE_ENTRIES: usize = 256;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ENTRY_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// `ENTRY_BYTES`, or this thread's scaled override (tests only).
+pub(crate) fn entry_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_ENTRY_BYTES.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    ENTRY_BYTES
+}
+
+/// Scale `entry_bytes()` on this thread for `run` (tests only). Caches built
+/// inside `run` keep the scaled per-entry limit.
+#[cfg(test)]
+pub(crate) fn with_test_entry_bytes<T>(bytes: usize, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_ENTRY_BYTES.with(|limit| limit.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_ENTRY_BYTES.with(|limit| limit.replace(Some(bytes))));
+    run()
+}
+
 /// Explicit adapter opt-in: a retained graph must have no externally mutable
 /// allocation. HeapLayoutBound alone also supports Arc/Mutex graphs, whose
 /// measured capacities could change without transferring ownership back out.
@@ -46,6 +74,9 @@ struct Entry<S> {
     // take transfers it out. Reinsertion always measures the mutated graph.
     heap_bytes: usize,
     modified_hint: (i64, i64),
+    /// The finalization copy's charge reserved beside this entry at its
+    /// admission (P1-RETAIN R0, Q-PR13(iii) β). Inline; it charges no heap.
+    finalization_charge: usize,
 }
 impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
@@ -54,6 +85,7 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
             used: _,
             heap_bytes,
             modified_hint: _,
+            finalization_charge: _,
         } = self;
         c.add(*heap_bytes)
     }
@@ -67,9 +99,58 @@ pub(crate) enum Release {
     CursorReservation,
     /// A copy refusal fitting the residents beside the active file (M1).
     CopyRefusal,
-    /// Room for a zero-budget tail's own copy, from entries ranked strictly
-    /// older than the tailed file only (M1 Path A).
+    /// Room for a tail's own copy, from entries ranked strictly older than
+    /// the tailed file only: a non-F tail's zero-budget step start (M1 Path
+    /// A), and a shape-F completion's exact prefix ranked below its copy's
+    /// re-admission rank after every non-budget gate (P1-RETAIN R0,
+    /// `release_older_prefix`).
     CopyAdmission,
+}
+
+/// A retained copy moved out of the cache, with the admission facts the
+/// caller's completion needs (P1-RETAIN R0).
+pub(crate) struct Taken<S> {
+    pub(crate) retained: Retained<S>,
+    /// The entry's victim-order hint as admitted: the source mtime, clipped
+    /// to admission time.
+    pub(crate) modified_hint: (i64, i64),
+    /// The finalization charge reserved beside the entry at its admission.
+    pub(crate) finalization_charge: usize,
+}
+
+/// The victim-order hint an entry modified at `modified` is admitted at,
+/// at `now`: future source timestamps are clipped to admission time, so they
+/// cannot rank an entry ahead of later live work. Every admission ranks
+/// through this; P1-RETAIN R0 ranks a completed copy once with it and carries
+/// that value to its release and its insert.
+pub(crate) fn admission_rank(modified: (i64, i64), now: std::time::Duration) -> (i64, i64) {
+    modified.min((
+        i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+        i64::from(now.subsec_nanos()),
+    ))
+}
+
+/// The wall clock an admission ranks against (`admission_rank`).
+pub(crate) fn admission_now() -> std::time::Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+/// Exactly what one entry under a key of `key_capacity` adds to the cache's
+/// bound beyond its own `heap_bytes`, and exactly what removing it frees
+/// beyond them: one B-tree node (`tree_nodes` charges `(len + 1)` nodes,
+/// linear in `len`) plus the key's heap. `Entry` (inline in the node) stays
+/// private.
+pub(crate) fn entry_slot_bytes<S>(key_capacity: usize) -> Option<usize> {
+    heap_layout_bound::tree_node_bytes::<String, Entry<S>>()?.checked_add(key_capacity)
+}
+
+/// The inline bytes `Entry` adds around a retained state and its checkpoint.
+/// The insert's entry bound charges them; a caller's own admission does not.
+pub(crate) fn entry_overhead<S>() -> usize {
+    std::mem::size_of::<Entry<S>>()
+        .saturating_sub(std::mem::size_of::<S>() + std::mem::size_of::<Checkpoint>())
 }
 
 /// One common admission/eviction mechanism for compatible native states. Uses
@@ -100,7 +181,7 @@ impl<S: HeapLayoutBound> HeapLayoutBound for TranscriptCache<S> {
 }
 impl<S: FrozenCacheState> Default for TranscriptCache<S> {
     fn default() -> Self {
-        Self::new(CACHE_BYTES, ENTRY_BYTES, CACHE_ENTRIES)
+        Self::new(CACHE_BYTES, entry_bytes(), CACHE_ENTRIES)
     }
 }
 impl<S: FrozenCacheState> TranscriptCache<S> {
@@ -114,19 +195,23 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         }
     }
     pub(crate) fn with_byte_limit(byte_limit: usize) -> Self {
-        Self::new(byte_limit, ENTRY_BYTES, CACHE_ENTRIES)
+        Self::new(byte_limit, entry_bytes(), CACHE_ENTRIES)
     }
     /// Moves state into the existing active frame: there is no cached duplicate
     /// while the provider mutates it. The active frame must count this allocation
     /// through its own existing HeapLayoutBound admission.
-    pub(crate) fn take(&mut self, key: &str) -> Option<Retained<S>> {
-        let retained = self.entries.remove(key).map(|entry| entry.retained);
-        record(if retained.is_some() {
+    pub(crate) fn take(&mut self, key: &str) -> Option<Taken<S>> {
+        let taken = self.entries.remove(key).map(|entry| Taken {
+            retained: entry.retained,
+            modified_hint: entry.modified_hint,
+            finalization_charge: entry.finalization_charge,
+        });
+        record(if taken.is_some() {
             Event::TakeHit
         } else {
             Event::TakeAbsent
         });
-        retained
+        taken
     }
     pub(crate) fn clear(&mut self) {
         add(Event::ClearEntriesReleased, self.entries.len() as u64);
@@ -192,6 +277,58 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             }
         }
     }
+    /// The shortest victim-order prefix of entries admitted with a hint
+    /// strictly older than `rank` whose removal frees at least `need`
+    /// bytes of this cache's bound: `(count, freed)`. `None` when every such
+    /// entry together frees less, or the arithmetic overflows. Each entry
+    /// frees exactly `entry_slot_bytes(key.capacity()) + heap_bytes`. Mutates
+    /// nothing.
+    pub(crate) fn release_prefix(&self, rank: (i64, i64), need: usize) -> Option<(usize, usize)> {
+        let mut order = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.modified_hint < rank)
+            .map(|(key, entry)| ((entry.modified_hint, entry.used), key, entry))
+            .collect::<Vec<_>>();
+        order.sort_unstable_by_key(|(rank, _, _)| *rank);
+        // Global victim order ranks by hint first, so the lower-ranked entries
+        // are exactly its first entries.
+        let older = order.len();
+        let mut freed = 0usize;
+        for (count, (_, key, entry)) in order.into_iter().enumerate() {
+            if freed >= need {
+                return Some((count, freed));
+            }
+            freed = freed
+                .checked_add(entry_slot_bytes::<S>(key.capacity())?)?
+                .checked_add(entry.heap_bytes)?;
+        }
+        (freed >= need).then_some((older, freed))
+    }
+    /// P1-RETAIN R0: evict exactly the `release_prefix(rank, need)` victims,
+    /// through `evict_until` restricted to entries ranked strictly below
+    /// `rank`, so an entry ranked at or above it never leaves
+    /// whatever the arithmetic says. Counted under `Release::CopyAdmission`.
+    /// `None`, with nothing evicted, when the lower-ranked entries together
+    /// cannot free `need` or the cache cannot be measured; otherwise how many
+    /// entries left.
+    pub(crate) fn release_older_prefix(&mut self, rank: (i64, i64), need: usize) -> Option<usize> {
+        let (count, freed) = self.release_prefix(rank, need)?;
+        let limit = heap_layout_bound::bound(self, usize::MAX)?.checked_sub(freed)?;
+        let before = self.entries.len();
+        let fitted = self.evict_until(limit, Release::CopyAdmission, Some(rank));
+        let evicted = before - self.entries.len();
+        // `freed` is exact (`entry_slot_bytes`), so the loop stops at the
+        // prefix end.
+        debug_assert!(fitted);
+        debug_assert_eq!(evicted, count);
+        Some(evicted)
+    }
+    /// Resident entries (tests only).
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
     /// Sealed offset of a retained entry without taking it, so a page budget
     /// can plan a tail read before the frame consumes retained state.
     pub(crate) fn sealed_offset(&self, key: &str) -> Option<u64> {
@@ -204,6 +341,24 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         self.entries
             .get(key)
             .map(|entry| entry.retained.checkpoint.clone())
+    }
+    /// Resident keys in victim order, with each admitted hint and the exact
+    /// bytes its removal frees.
+    #[cfg(test)]
+    pub(crate) fn victims(&self) -> Vec<(String, (i64, i64), usize)> {
+        let mut order = self
+            .entries
+            .iter()
+            .map(|(key, entry)| {
+                let freed = entry_slot_bytes::<S>(key.capacity()).unwrap() + entry.heap_bytes;
+                ((entry.modified_hint, entry.used), key.clone(), freed)
+            })
+            .collect::<Vec<_>>();
+        order.sort_unstable_by_key(|(rank, _, _)| *rank);
+        order
+            .into_iter()
+            .map(|((hint, _), key, freed)| (key, hint, freed))
+            .collect()
     }
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) {
@@ -230,16 +385,32 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     }
     /// `live_bytes` is an actual checked native-layout charge, not file size.
     /// Native output/active copies keep this room while entries are admitted.
+    /// Production admits through `insert_reserving_at_rank`.
+    #[cfg(test)]
     pub(crate) fn insert_reserving(
         &mut self,
         key: String,
         retained: Retained<S>,
         live_bytes: usize,
     ) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        self.insert_at(key, retained, live_bytes, now)
+        self.insert_reserving_at_rank(key, retained, live_bytes, None)
+    }
+    /// `insert_reserving`, admitting the entry at `rank` when one was computed
+    /// before (P1-RETAIN R0: the rank its completion's release ran against,
+    /// `admission_rank` of this checkpoint's mtime), so the entry's hint is
+    /// exactly the one its release ranked residents against and no later clock
+    /// read moves it. `None` ranks it now, as every other admission does.
+    pub(crate) fn insert_reserving_at_rank(
+        &mut self,
+        key: String,
+        retained: Retained<S>,
+        live_bytes: usize,
+        rank: Option<(i64, i64)>,
+    ) -> bool {
+        match rank {
+            Some(rank) => self.admit_at_rank(key, retained, live_bytes, 0, rank),
+            None => self.insert_at(key, retained, live_bytes, admission_now()),
+        }
     }
     fn insert_at(
         &mut self,
@@ -248,18 +419,48 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         live_bytes: usize,
         now: std::time::Duration,
     ) -> bool {
+        self.admit(key, retained, live_bytes, 0, now)
+    }
+    /// `live_bytes` is the whole reservation kept beside the entries;
+    /// `finalization_charge` is the part of it owned by this entry's own
+    /// finalization copy, kept on the entry for its next take (β).
+    fn admit(
+        &mut self,
+        key: String,
+        retained: Retained<S>,
+        live_bytes: usize,
+        finalization_charge: usize,
+        now: std::time::Duration,
+    ) -> bool {
+        let rank = admission_rank(retained.checkpoint.modified_hint(), now);
+        self.admit_at_rank(key, retained, live_bytes, finalization_charge, rank)
+    }
+    /// `admit` with the entry's victim-order hint already ranked
+    /// (`admission_rank`).
+    fn admit_at_rank(
+        &mut self,
+        key: String,
+        retained: Retained<S>,
+        live_bytes: usize,
+        finalization_charge: usize,
+        rank: (i64, i64),
+    ) -> bool {
         self.entries.remove(&key);
         let Some(resident_limit) = self.byte_limit.checked_sub(live_bytes) else {
             record(Event::InsertLiveReservationRefused);
             return false;
         };
         let Some(next) = self.clock.checked_add(1) else {
-            // A safe local reset; no durable debt is owned here.
+            // A safe local reset; no durable debt is owned here. Unreachable
+            // in practice (`u64` admissions), but it does clear the cache.
             self.entries.clear();
             self.clock = 0;
             record(Event::InsertClockReset);
             return false;
         };
+        // A zero count limit, or a toolchain whose layouts are not validated.
+        // Neither evicts; a P1-RETAIN R0 release needs a supported layout, so
+        // it never precedes this refusal.
         if self.count_limit == 0 || !heap_layout_bound::layout_supported() {
             record(Event::InsertDisabledOrLayoutRefused);
             return false;
@@ -274,20 +475,16 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             record(Event::InsertFrozenChargeRefused);
             return false;
         }
-        let clock_hint = (
-            i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
-            i64::from(now.subsec_nanos()),
-        );
-        // Future source timestamps are clipped to admission time, so they
-        // cannot rank an entry ahead of later live work. Only the count/byte
-        // caps and the victim order below decide residency, never idle age:
-        // under pressure, older-modified work loses to newer resident state.
-        // Neither decision suppresses a native full read or audit.
+        // Only the count/byte caps and the victim order below decide
+        // residency, never idle age: under pressure, older-modified work loses
+        // to newer resident state. Neither decision suppresses a native full
+        // read or audit.
         let entry = Entry {
-            modified_hint: retained.checkpoint.modified_hint().min(clock_hint),
+            modified_hint: rank,
             retained,
             used: next,
             heap_bytes,
+            finalization_charge,
         };
         let Some(state_bytes) = heap_layout_bound::bound(&entry, self.entry_limit) else {
             record(Event::InsertEntryBoundRefused);
@@ -355,7 +552,7 @@ mod tests {
                     at
                 ));
             }
-            let moved = cache.take("a").unwrap();
+            let moved = cache.take("a").unwrap().retained;
             assert_eq!(moved.state, "a");
             assert!(cache.insert_at("a".into(), moved, 0, at));
             assert!(!cache.insert_at("older".into(), retained_at("old".into(), Some(1)), 0, at));
@@ -532,7 +729,7 @@ mod tests {
             assert!(cache.resident_bound().unwrap() >= expected * (n + 1));
         }
         assert_eq!(cache.entries.len(), 24);
-        let mut moved = cache.take("0").unwrap();
+        let mut moved = cache.take("0").unwrap().retained;
         assert_eq!(cache.entries.len(), 23);
         moved.state[0].reserve(1024 * 1024);
         assert!(!cache.insert("0".into(), moved));
@@ -662,5 +859,121 @@ mod tests {
         ));
         value.lock().unwrap().reserve(1024 * 1024);
         assert!(cache.take("shared").is_none());
+    }
+
+    /// P1-RETAIN R0: `entry_slot_bytes` is exactly what one entry adds to the
+    /// cache's bound beyond its `heap_bytes`, and what removing it frees.
+    #[test]
+    fn entry_slot_bytes_equals_the_measured_bound_delta_of_one_insert_and_one_remove() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        assert!(cache.insert_at("resident".into(), retained_at("r".into(), Some(10)), 0, at));
+        for key in ["k", "a-much-longer-key-with-more-heap"] {
+            let before = cache.resident_bound().unwrap();
+            let key = String::from(key);
+            let capacity = key.capacity();
+            assert!(cache.insert_at(key.clone(), retained_at("x".repeat(300), Some(20)), 0, at));
+            let heap_bytes = cache.entries[&key].heap_bytes;
+            let slot = entry_slot_bytes::<String>(capacity).unwrap();
+            let after = cache.resident_bound().unwrap();
+            assert_eq!(after - before, slot + heap_bytes, "insert {key}");
+            assert_eq!(
+                cache.release_prefix((30, 0), 1),
+                Some((
+                    1,
+                    entry_slot_bytes::<String>(8).unwrap() + cache.entries["resident"].heap_bytes
+                )),
+                "the oldest resident is the whole first prefix step"
+            );
+            cache.remove(&key);
+            assert_eq!(cache.resident_bound().unwrap(), before, "remove {key}");
+        }
+        assert!(entry_overhead::<String>() > 0);
+        assert_eq!(
+            entry_overhead::<String>(),
+            std::mem::size_of::<Entry<String>>()
+                - std::mem::size_of::<String>()
+                - std::mem::size_of::<Checkpoint>()
+        );
+    }
+
+    /// The prefix is the strict older-hint start of victim order, sized by the
+    /// exact freed bytes, and mutates nothing.
+    #[test]
+    fn release_prefix_is_exact_and_strictly_older_than_the_file_hint() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        for (key, modified) in [("old", 10), ("mid", 20), ("same", 30), ("new", 40)] {
+            assert!(cache.insert_at(
+                key.into(),
+                retained_at(key.repeat(50), Some(modified)),
+                0,
+                at
+            ));
+        }
+        let freed = |key: &str| {
+            entry_slot_bytes::<String>(key.len()).unwrap() + cache.entries[key].heap_bytes
+        };
+        let (old, mid) = (freed("old"), freed("mid"));
+        let hint = cache.entries["same"].modified_hint;
+        assert_eq!(hint, (30, 0));
+        let before = cache.resident_bound();
+        assert_eq!(cache.release_prefix(hint, 0), Some((0, 0)));
+        assert_eq!(cache.release_prefix(hint, 1), Some((1, old)));
+        assert_eq!(cache.release_prefix(hint, old), Some((1, old)));
+        assert_eq!(cache.release_prefix(hint, old + 1), Some((2, old + mid)));
+        assert_eq!(cache.release_prefix(hint, old + mid), Some((2, old + mid)));
+        // `same` and `new` are never candidates: equal or newer hints.
+        assert_eq!(cache.release_prefix(hint, old + mid + 1), None);
+        assert_eq!(cache.resident_bound(), before, "nothing is mutated");
+        assert_eq!(cache.entry_count(), 4);
+        assert_eq!(cache.release_older_prefix(hint, old + mid + 1), None);
+        assert_eq!(
+            cache.resident_bound(),
+            before,
+            "an infeasible prefix evicts nothing"
+        );
+        // The release itself frees exactly the prefix, under `CopyAdmission`.
+        let resident = cache.resident_bound().unwrap();
+        let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            assert_eq!(cache.release_older_prefix(hint, old + 1), Some(2));
+        });
+        assert_eq!(counts.copy_refusal_admission_evicted, 2);
+        assert!(counts.copy_refusal_bytes_released > 0);
+        assert_eq!(counts.insert_entries_evicted, 0);
+        assert_eq!(counts.cursor_reservation_entries_evicted, 0);
+        assert_eq!(cache.resident_bound().unwrap(), resident - old - mid);
+        assert!(cache.entries.contains_key("same") && cache.entries.contains_key("new"));
+    }
+
+    /// `Taken` carries the clipped admitted hint and the reserved finalization
+    /// charge (β).
+    #[test]
+    fn take_carries_the_clipped_admission_hint_and_finalization_charge() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        assert!(cache.admit(
+            "future".into(),
+            retained_at("f".into(), Some(500)),
+            4096,
+            4096,
+            at
+        ));
+        assert!(cache.insert_at("past".into(), retained_at("p".into(), Some(50)), 0, at));
+        let future = cache.take("future").unwrap();
+        assert_eq!(future.modified_hint, (100, 0), "clipped to admission time");
+        assert_eq!(future.finalization_charge, 4096);
+        let past = cache.take("past").unwrap();
+        assert_eq!(past.modified_hint, (50, 0));
+        assert_eq!(past.finalization_charge, 0);
     }
 }

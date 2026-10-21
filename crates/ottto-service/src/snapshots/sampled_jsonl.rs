@@ -31,6 +31,13 @@ pub(crate) struct CachedJsonlReduction {
 }
 crate::heap_layout_bound::fields!(CachedJsonlReduction; accumulator, report,
     recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
+impl CachedJsonlReduction {
+    /// The copy's usage witness (`SnapshotAccumulator::usage_witness`), kept
+    /// beside a taken copy for P1-RETAIN R0's Q-PR15 guard.
+    pub(super) fn usage_witness(&self) -> u64 {
+        self.accumulator.usage_witness()
+    }
+}
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
     fn supports_frozen_charge(&self) -> bool {
         // retain_reduction removes these live, shared inputs from the copy.
@@ -43,8 +50,14 @@ impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
 pub(super) struct CompletedNativeAcquisition {
     pub(super) checkpoint: Checkpoint,
     pub(super) reduction: Option<CachedJsonlReduction>,
+    /// `Some(rank)`: this completion's deferred release ran (P1-RETAIN R0)
+    /// against `rank`, the copy's re-admission rank, so the copy is admitted
+    /// at exactly that rank and its finalization copy is limited by
+    /// `budget_after`, not the pre-release budget
+    /// (`sampled_scan::FinalizationBudget`).
+    pub(super) released: Option<(i64, i64)>,
 }
-crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction);
+crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, released);
 
 // Source-scan dependencies are refreshed on reuse and never retained in a
 // checkpoint. Keep the same exclusion for active-copy and retained-copy charges.
@@ -54,6 +67,14 @@ pub(super) struct LiveReductionInputs {
 }
 
 impl OwnedJsonlParser {
+    /// The source mtime this read's checkpoint will carry
+    /// (`ReadPlan::modified_hint`); `None` without a plan.
+    pub(super) fn planned_modified_hint(&self) -> Option<(i64, i64)> {
+        self.reader
+            .acquisition
+            .as_ref()
+            .map(crate::transcript_acquisition::ReadPlan::modified_hint)
+    }
     pub(super) fn take_live_reduction_inputs(&mut self) -> LiveReductionInputs {
         LiveReductionInputs {
             traces: self.accumulator.codex_turn_traces.take(),
@@ -188,8 +209,10 @@ impl OwnedJsonlParser {
         &mut self,
         scope: &Scope,
         now: u64,
-        remaining_copy_budget: usize,
+        budget: sampled_scan::RetainBudget,
     ) -> Result<Option<CompletedNativeAcquisition>> {
+        #[cfg(test)]
+        sampled_scan::test_hooks::record_budget(&budget);
         if !self.reader.finished
             || self.reader.failure.is_some()
             || !loss_free_source_report(
@@ -202,16 +225,40 @@ impl OwnedJsonlParser {
             record(Event::RetentionIncompleteOrLossy);
             return Ok(None);
         }
+        if let sampled_scan::RetainBudget::Deferred {
+            budget_after,
+            release,
+            ..
+        } = budget
+        {
+            return self.retain_after_release(scope, now, budget_after, release);
+        }
+        let remaining_copy_budget = budget.admission_budget();
         let admitted_copy = if !sampled_scan::compatible_reduction(&self.accumulator) {
             record(Event::RetentionIncompatible);
             false
+        } else if matches!(
+            budget,
+            sampled_scan::RetainBudget::TierOrJoinExcluded { .. }
+                | sampled_scan::RetainBudget::Unsealed { .. }
+        ) {
+            // Never retained, and not a budget refusal (packet).
+            false
         } else if self
-            .retention_bound(remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES))
+            .retention_bound(remaining_copy_budget.min(crate::transcript_cache::entry_bytes()))
             .is_some()
         {
             true
         } else {
             record(Event::RetentionBoundRefused);
+            #[cfg(test)]
+            {
+                let charge = self.retention_bound(usize::MAX);
+                sampled_scan::test_hooks::record_bucket(classify_refusal(
+                    RefusalView::of(&budget),
+                    Refusal::Admission { charge },
+                ));
+            }
             false
         };
         let Some(plan) = self.reader.acquisition.take() else {
@@ -231,25 +278,22 @@ impl OwnedJsonlParser {
             return Ok(Some(CompletedNativeAcquisition {
                 checkpoint,
                 reduction: None,
+                released: None,
             }));
         }
-        // Extend no source-wide trace/ownership allocation's lifetime in RAM.
-        // prepare_acquisition always installs this cycle's real dependencies.
-        let inputs = self.take_live_reduction_inputs();
-        let accumulator = self.accumulator.clone();
-        self.restore_live_reduction_inputs(inputs);
-        let reduction = CachedJsonlReduction {
-            accumulator,
-            report: self.reader.report,
-            recognized_usage_drop_count: self.recognized_usage_drop_count,
-            positive_recognized_usage_count: self.positive_recognized_usage_count,
-            positive_usage_evidence: self.positive_usage_evidence,
-        };
-        let reduction = crate::heap_layout_bound::bound(
-            &reduction,
-            remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES),
-        )
-        .map(|_| reduction);
+        let limit = remaining_copy_budget.min(crate::transcript_cache::entry_bytes());
+        let reduction = self.reduction_copy();
+        let charge = crate::heap_layout_bound::bound(&reduction, limit);
+        #[cfg(test)]
+        if charge.is_none() {
+            sampled_scan::test_hooks::record_bucket(classify_refusal(
+                RefusalView::of(&budget),
+                Refusal::Clone {
+                    charge: crate::heap_layout_bound::bound(&reduction, usize::MAX),
+                },
+            ));
+        }
+        let reduction = charge.map(|_| reduction);
         record(if reduction.is_some() {
             Event::RetentionProduced
         } else {
@@ -258,6 +302,139 @@ impl OwnedJsonlParser {
         Ok(Some(CompletedNativeAcquisition {
             checkpoint,
             reduction,
+            released: None,
+        }))
+    }
+
+    /// The copy a retained reduction holds: the accumulator without this
+    /// cycle's live, shared inputs, plus the report scalars.
+    fn reduction_copy(&mut self) -> CachedJsonlReduction {
+        // Extend no source-wide trace/ownership allocation's lifetime in RAM.
+        // prepare_acquisition always installs this cycle's real dependencies.
+        let inputs = self.take_live_reduction_inputs();
+        let accumulator = self.accumulator.clone();
+        self.restore_live_reduction_inputs(inputs);
+        CachedJsonlReduction {
+            accumulator,
+            report: self.reader.report,
+            recognized_usage_drop_count: self.recognized_usage_drop_count,
+            positive_recognized_usage_count: self.positive_recognized_usage_count,
+            positive_usage_evidence: self.positive_usage_evidence,
+        }
+    }
+
+    /// The charge of a copy beside its committed `checkpoint` (state,
+    /// certificate and inline bytes), if it fits `limit`.
+    fn certified_charge(&mut self, checkpoint: &Checkpoint, limit: usize) -> Option<usize> {
+        let inputs = self.take_live_reduction_inputs();
+        let charge = (|| {
+            let state = crate::heap_layout_bound::bound(&self.accumulator, limit)?;
+            let certificate =
+                crate::heap_layout_bound::bound(checkpoint, limit.checked_sub(state)?)?;
+            let inline = std::mem::size_of::<CachedJsonlReduction>()
+                .checked_sub(std::mem::size_of::<SnapshotAccumulator>())?;
+            let total = state.checked_add(certificate)?.checked_add(inline)?;
+            (total <= limit).then_some(total)
+        })();
+        self.restore_live_reduction_inputs(inputs);
+        charge
+    }
+
+    /// P1-RETAIN R0, shape F with a feasible release: every non-budget gate
+    /// first, then the commit, the checkpoint-charged admission at
+    /// `budget_after` (within the insert's entry limit), the stamp gate, and
+    /// only then the release. Any refusal before `execute` evicts nothing.
+    fn retain_after_release(
+        &mut self,
+        scope: &Scope,
+        now: u64,
+        budget_after: usize,
+        release: sampled_scan::DeferredRelease,
+    ) -> Result<Option<CompletedNativeAcquisition>> {
+        let compatible = sampled_scan::compatible_reduction(&self.accumulator);
+        if !compatible {
+            record(Event::RetentionIncompatible);
+        }
+        let Some(plan) = self.reader.acquisition.take() else {
+            record(Event::RetentionNoPlan);
+            return Ok(None);
+        };
+        let checkpoint =
+            plan.commit_after_native_completion(self.reader.reader.get_ref(), scope, now)?;
+        let unsealed = checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
+        if unsealed {
+            record(Event::RetentionUnsealedEof);
+        }
+        fn declined(checkpoint: Checkpoint) -> Result<Option<CompletedNativeAcquisition>> {
+            Ok(Some(CompletedNativeAcquisition {
+                checkpoint,
+                reduction: None,
+                released: None,
+            }))
+        }
+        if unsealed || !compatible {
+            return declined(checkpoint);
+        }
+        let limit = budget_after.min(release.entry_limit);
+        if self.certified_charge(&checkpoint, limit).is_none() {
+            record(Event::RetentionBoundRefused);
+            #[cfg(test)]
+            {
+                let charge = self.certified_charge(&checkpoint, usize::MAX);
+                sampled_scan::test_hooks::record_bucket(classify_refusal(
+                    RefusalView::deferred(budget_after, release.entry_limit),
+                    Refusal::Admission { charge },
+                ));
+            }
+            return declined(checkpoint);
+        }
+        #[cfg(test)]
+        sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeStampGate);
+        // The sealed checkpoint is not the current source: an unterminated
+        // final row, or the source changed after the commit; or it is not the
+        // mtime the release was ranked from. Conservatively decline retention.
+        if !checkpoint.stamp_matches(self.reader.reader.get_ref())?
+            || checkpoint.modified_hint() != release.modified
+        {
+            record(Event::RetentionUnsealedEof);
+            return declined(checkpoint);
+        }
+        #[cfg(test)]
+        let entry_limit = release.entry_limit;
+        let rank = release.rank;
+        let outcome = release.execute();
+        if outcome != sampled_scan::ReleaseOutcome::Released {
+            record(Event::RetentionBoundRefused);
+            #[cfg(test)]
+            sampled_scan::test_hooks::record_bucket(classify_refusal(
+                RefusalView::deferred(budget_after, entry_limit),
+                Refusal::Release(outcome),
+            ));
+            return declined(checkpoint);
+        }
+        let reduction = self.reduction_copy();
+        let charge = crate::heap_layout_bound::bound(&reduction, limit);
+        #[cfg(test)]
+        if charge.is_none() {
+            sampled_scan::test_hooks::record_bucket(classify_refusal(
+                RefusalView::deferred(budget_after, entry_limit),
+                Refusal::Clone {
+                    charge: crate::heap_layout_bound::bound(&reduction, usize::MAX),
+                },
+            ));
+        }
+        // Proven empty after a release (the clone charges at most its
+        // source); kept as the guard against a future layout impl.
+        let reduction = charge.map(|_| reduction);
+        record(if reduction.is_some() {
+            Event::RetentionProduced
+        } else {
+            Event::RetentionCloneBoundRefused
+        });
+        Ok(Some(CompletedNativeAcquisition {
+            checkpoint,
+            reduction,
+            released: Some(rank),
         }))
     }
 
@@ -268,9 +445,18 @@ impl OwnedJsonlParser {
     pub(super) fn retain_sealed_prefix(
         &mut self,
         checkpoint: Checkpoint,
-        remaining_copy_budget: usize,
+        budget: sampled_scan::RetainBudget,
     ) -> CompletedNativeAcquisition {
-        let budget = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
+        #[cfg(test)]
+        sampled_scan::test_hooks::record_budget(&budget);
+        // Never `Deferred` here: no deferred release runs on a sealed prefix,
+        // so every caller strips it first (`RetainBudget::without_release`).
+        debug_assert!(
+            !matches!(budget, sampled_scan::RetainBudget::Deferred { .. }),
+            "never Deferred after without_release"
+        );
+        let remaining_copy_budget = budget.without_release().admission_budget();
+        let budget = remaining_copy_budget.min(crate::transcript_cache::entry_bytes());
         // The job kept every turn witness (K1); a retained copy keeps the
         // cache-only caps that govern every other retained reduction.
         let witnesses_retainable = self
@@ -290,6 +476,7 @@ impl OwnedJsonlParser {
             return CompletedNativeAcquisition {
                 checkpoint,
                 reduction: None,
+                released: None,
             };
         }
         // The certificate consumed the acquisition plan, so charge the
@@ -314,6 +501,7 @@ impl OwnedJsonlParser {
             return CompletedNativeAcquisition {
                 checkpoint,
                 reduction: None,
+                released: None,
             };
         };
         let reduction = CachedJsonlReduction {
@@ -327,6 +515,118 @@ impl OwnedJsonlParser {
         CompletedNativeAcquisition {
             checkpoint,
             reduction,
+            released: None,
         }
+    }
+}
+
+/// The packet's refusal buckets: disjoint, and together every refused
+/// singleton retention (`RetentionBoundRefused` or `RetentionCloneBoundRefused`).
+/// No production counter reads them; C2 may adopt them.
+#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Bucket {
+    /// Both walks measured, and no room.
+    BudgetZero,
+    /// A walk did not measure (layout, visit limit, overflow, lock).
+    Walk,
+    /// The charge exceeds the budget.
+    OverBudget,
+    /// The charge fits the budget but not the entry limit.
+    OverEntry,
+}
+
+/// The budget a refused pass was admitted against.
+#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+#[derive(Clone, Copy)]
+pub(super) struct RefusalView {
+    granted: bool,
+    resident_measured: bool,
+    active_measured: bool,
+    /// `budget` for `Granted`, `budget_after` for `Deferred`.
+    budget: usize,
+    /// `entry_bytes()` for `Granted`, the release's `entry_limit` for
+    /// `Deferred`.
+    entry_limit: usize,
+}
+#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+impl RefusalView {
+    pub(super) fn of(budget: &sampled_scan::RetainBudget) -> Self {
+        match budget {
+            sampled_scan::RetainBudget::Granted {
+                budget,
+                resident_measured,
+                active_measured,
+            } => Self {
+                granted: true,
+                resident_measured: *resident_measured,
+                active_measured: *active_measured,
+                budget: *budget,
+                entry_limit: crate::transcript_cache::entry_bytes(),
+            },
+            sampled_scan::RetainBudget::Deferred {
+                budget_after,
+                release,
+                ..
+            } => Self::deferred(*budget_after, release.entry_limit),
+            // Never classified (packet §2.1); a zero budget files as such.
+            sampled_scan::RetainBudget::TierOrJoinExcluded { .. }
+            | sampled_scan::RetainBudget::Unsealed { .. } => Self {
+                granted: true,
+                resident_measured: true,
+                active_measured: true,
+                budget: 0,
+                entry_limit: crate::transcript_cache::entry_bytes(),
+            },
+        }
+    }
+    pub(super) fn deferred(budget_after: usize, entry_limit: usize) -> Self {
+        Self {
+            granted: false,
+            resident_measured: true,
+            active_measured: true,
+            budget: budget_after,
+            entry_limit,
+        }
+    }
+}
+
+/// What refused the pass.
+#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+#[derive(Clone, Copy)]
+pub(super) enum Refusal {
+    /// The admission check refused; `charge` is one walk at `usize::MAX`,
+    /// charged as the refusing check did.
+    Admission { charge: Option<usize> },
+    /// A deferred release did not run.
+    Release(sampled_scan::ReleaseOutcome),
+    /// The clone's bound refused; `charge` walks the refused clone.
+    Clone { charge: Option<usize> },
+}
+
+/// One bucket per refused pass (packet §2.2). Pure.
+#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+pub(super) fn classify_refusal(view: RefusalView, refusal: Refusal) -> Bucket {
+    let by_charge = |charge: Option<usize>| {
+        // A refused charge that fits both limits cannot happen; in a release
+        // build it files as `Walk`.
+        debug_assert!(
+            charge.map_or(true, |charge| charge > view.budget.min(view.entry_limit)),
+            "a refused charge fits its budget and entry limit"
+        );
+        match charge {
+            Some(charge) if charge > view.budget => Bucket::OverBudget,
+            Some(charge) if charge > view.entry_limit => Bucket::OverEntry,
+            _ => Bucket::Walk,
+        }
+    };
+    match refusal {
+        Refusal::Clone { charge } => by_charge(charge),
+        _ if view.granted && !view.resident_measured => Bucket::Walk,
+        _ if view.granted && !view.active_measured => Bucket::Walk,
+        _ if view.budget == 0 => Bucket::BudgetZero,
+        Refusal::Release(sampled_scan::ReleaseOutcome::Race) => Bucket::OverBudget,
+        Refusal::Release(_) => Bucket::Walk,
+        Refusal::Admission { charge } => by_charge(charge),
     }
 }

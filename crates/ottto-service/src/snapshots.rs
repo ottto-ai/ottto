@@ -10672,6 +10672,37 @@ struct SnapshotAccumulator {
 }
 
 impl SnapshotAccumulator {
+    /// A count that grows with every accepted usage record (its token totals
+    /// and request count) and every Claude response record: P1-RETAIN R0's
+    /// Q-PR15 guard compares it between a retained copy's take and its
+    /// completion. Saturating; no allocation.
+    fn usage_witness(&self) -> u64 {
+        let UsageTotals {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_5m_tokens,
+            cache_creation_1h_tokens,
+            reasoning_output_tokens,
+            unattributed_total_tokens,
+            request_count,
+            costs: _,
+        } = &self.accepted_usage_totals;
+        [
+            *input_tokens,
+            *output_tokens,
+            *cache_read_tokens,
+            *cache_creation_5m_tokens,
+            *cache_creation_1h_tokens,
+            *reasoning_output_tokens,
+            *unattributed_total_tokens,
+            *request_count,
+            self.claude_response_record_count as u64,
+        ]
+        .into_iter()
+        .fold(0u64, u64::saturating_add)
+    }
+
     fn new(source: SnapshotSource) -> Self {
         Self {
             source,
@@ -16436,12 +16467,38 @@ impl OwnedSourceScan {
                     pending!();
                 }
                 // E3: the completion step walks the finished job exactly,
-                // once, for the budget its retention consumes below.
-                let copy_budget = if active.cursor.is_some() {
-                    sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active)
+                // once, for the budget its retention consumes below. A group
+                // and an unsampled read keep the step-start budget. Any other
+                // sampled singleton is measured exactly at completion
+                // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
+                // A Tail/Unchanged singleton (shape F) also decides whether a
+                // release of lower-ranked residents would make its copy
+                // fit; that release is deferred into its retention, after
+                // every non-budget gate. Nothing is evicted here.
+                let retain_budget = if active.cursor.is_some() {
+                    sampled_scan::RetainBudget::granted_unclassified(
+                        sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active),
+                    )
+                } else if active.sampling.is_some()
+                    && sampled_scan::codex_cursor::byte_charged(&active)
+                {
+                    sampled_scan::RetainBudget::granted_unclassified(copy_budget)
+                } else if active.sampling.is_some() {
+                    if sampled_scan::borrows_only_retained_reduction(&active) {
+                        sampled_scan::tail_completion_budget(sampling.as_ref(), &mut active)
+                    } else {
+                        sampled_scan::RetainBudget::from(sampled_scan::copy_budget_step(
+                            sampling.as_ref(),
+                            Some(&mut *active),
+                            true,
+                        ))
+                    }
                 } else {
-                    copy_budget
+                    sampled_scan::RetainBudget::granted_unclassified(copy_budget)
                 };
+                // Taken before the budget moves into a retention call; which
+                // limit applies depends on whether a deferred release ran.
+                let finalization_budget = retain_budget.finalization();
                 // #631 review M1: the bytes this attempt read, taken before
                 // `finish_job` consumes the acquisition's start offset. An
                 // exact-stamp memo below must not cover anything past them.
@@ -16729,15 +16786,15 @@ impl OwnedSourceScan {
                     // uncertified with its prepared debt, like a lossy full read.
                     let sealed_only = parser.reader.sealed_fragment()
                         || parser.reader.consumed_bytes() == parser.reader.last_complete_line_end();
+                    let budget = if !cache_compatible {
+                        retain_budget.excluded()
+                    } else if !sealed_only {
+                        retain_budget.unsealed()
+                    } else {
+                        retain_budget
+                    };
                     certificate.map(|checkpoint| {
-                        parser.retain_sealed_prefix(
-                            checkpoint,
-                            if cache_compatible && sealed_only {
-                                copy_budget
-                            } else {
-                                0
-                            },
-                        )
+                        parser.retain_sealed_prefix(checkpoint, budget.without_release())
                     })
                 } else if let Some(acquisition) = file_sampling.as_ref() {
                     // Known dependencies and the current path are separate from the
@@ -16772,10 +16829,16 @@ impl OwnedSourceScan {
                         census.record_unreadable(cause, 1);
                         pending!();
                     }
+                    #[cfg(test)]
+                    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeRetain);
                     match parser.retain_reduction(
                         &acquisition.scope,
                         sampled_scan::now_seconds(),
-                        if cache_compatible { copy_budget } else { 0 },
+                        if cache_compatible {
+                            retain_budget
+                        } else {
+                            retain_budget.excluded()
+                        },
                     ) {
                         Ok(completed) => completed,
                         Err(_) => {
@@ -16786,6 +16849,8 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
+                #[cfg(test)]
+                sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterRetain);
                 let joined_owner = if aliases.is_empty() {
                     None
                 } else {
@@ -16902,8 +16967,15 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
+                // `budget_after` only where this completion's deferred release
+                // actually ran; otherwise the pre-release budget.
+                let finalization_budget = finalization_budget.after(
+                    completed_acquisition
+                        .as_ref()
+                        .is_some_and(|completed| completed.released.is_some()),
+                );
                 let finalization_charge =
-                    crate::heap_layout_bound::completed_bound(&parsed_file, copy_budget);
+                    crate::heap_layout_bound::completed_bound(&parsed_file, finalization_budget);
                 if finalization_charge.is_none() {
                     if let Some(completed) = completed_acquisition.as_mut() {
                         if completed.reduction.is_some() {
@@ -17559,11 +17631,16 @@ impl OwnedSourceScan {
                     }
                     if let Some(completed) = completed_acquisition {
                         if let Some(context) = sampling.as_ref() {
-                            context.cache.insert(
-                                index_key.clone(),
-                                completed,
-                                finalization_charge.unwrap_or(0),
-                            );
+                            // A clone allocates exactly its length, and is the
+                            // sampled key: R0's insert term assumes both.
+                            let key = index_key.clone();
+                            debug_assert_eq!(key.capacity(), key.len());
+                            debug_assert!(file_sampling
+                                .as_ref()
+                                .map_or(true, |sampled| sampled.key.len() == key.len()));
+                            context
+                                .cache
+                                .insert(key, completed, finalization_charge.unwrap_or(0));
                         }
                     }
                     for key in joined_keys {
@@ -18675,7 +18752,16 @@ impl OwnedSourceScan {
             let mut planned_mode = None;
             if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
-                let retained = context.cache.take(&key);
+                let taken = context.cache.take(&key);
+                // Kept beside the moved copy for R0's completion decision.
+                let taken_admission = taken.as_ref().map(|taken| {
+                    (
+                        taken.modified_hint,
+                        taken.finalization_charge,
+                        taken.retained.state.usage_witness(),
+                    )
+                });
+                let retained = taken.map(|taken| taken.retained);
                 let retained_present = retained.is_some();
                 context.admission.attempts = context.admission.attempts.saturating_add(1);
                 context.admission.retained_entry.observe(retained_present);
@@ -18814,11 +18900,21 @@ impl OwnedSourceScan {
                             .as_ref()
                             .and_then(|plan| plan.metrics().audit_due);
                         planned_mode = Some((mode, audit_due));
+                        // Only a continued copy (Tail or Unchanged) carries
+                        // its admission facts; `prepare` falls back to Full
+                        // when the old copy is filtered.
+                        let continued = taken_admission.filter(|_| {
+                            !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                        });
                         file_sampling = Some(sampled_scan::Active {
                             key,
                             scope,
                             mode,
                             audit_due,
+                            retained_hint: continued.map(|(hint, _, _)| hint),
+                            retained_finalization_charge: continued
+                                .map_or(0, |(_, charge, _)| charge),
+                            retained_usage: continued.map(|(_, _, usage)| usage),
                         });
                     }
                 } else if source == SnapshotSource::Codex
@@ -18885,6 +18981,9 @@ impl OwnedSourceScan {
                             scope,
                             mode,
                             audit_due: None,
+                            retained_hint: None,
+                            retained_finalization_charge: 0,
+                            retained_usage: None,
                         });
                     }
                 }

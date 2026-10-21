@@ -40,7 +40,9 @@ counters! {
     insert_entries_evicted: InsertEntriesEvicted,
     cursor_reservation_entries_evicted: CursorReservationEntriesEvicted,
     // M1 copy refusals. `entries_evicted` and `admission_evicted` count
-    // entries; `bytes_released` their stored charge, for both causes. The
+    // entries; `bytes_released` their stored charge, for both causes.
+    // `admission_evicted` also counts a shape-F completion's exact
+    // lower-ranked release (P1-RETAIN R0, `Release::CopyAdmission`). The
     // others count zero-budget step starts, not files or refusals: a long
     // tail beside a full cache counts once per line it reads.
     copy_refusal_entries_evicted: CopyRefusalEntriesEvicted,
@@ -87,6 +89,12 @@ pub(crate) fn snapshot() -> Counts {
 #[cfg(test)]
 thread_local! {
     static TEST_EVENTS: std::cell::Cell<Option<[u64; COUNT]>> = const { std::cell::Cell::new(None) };
+}
+/// This thread's counts so far inside `observe`, for a mid-run phase split
+/// (tests only); `None` outside `observe`.
+#[cfg(test)]
+pub(crate) fn observed() -> Option<Counts> {
+    TEST_EVENTS.with(|events| events.get().map(Counts::from_array))
 }
 /// Isolates assertions from concurrent cache fixtures without resetting or
 /// changing the production process totals. No production observer or callback.
