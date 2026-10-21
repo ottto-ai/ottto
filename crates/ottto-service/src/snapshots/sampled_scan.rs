@@ -400,10 +400,30 @@ pub(super) fn now_seconds() -> u64 {
 pub(super) fn compatible_reduction(accumulator: &SnapshotAccumulator) -> bool {
     accumulator.source != SnapshotSource::Codex
         || (accumulator.codex_observed_priority_turns.is_some()
-            && !accumulator.codex_is_fork
-            && accumulator.codex_parent_session_ref.is_none()
-            && accumulator.codex_sidecar_parent.is_none()
-            && accumulator.codex_usage_accounting_complete())
+            && accumulator.codex_usage_accounting_complete()
+            && lineage_retainable(accumulator))
+}
+
+/// Which ownership lineages a retained copy may continue (P1-RETAIN-3).
+fn lineage_retainable(accumulator: &SnapshotAccumulator) -> bool {
+    // (1) Today's class, unchanged: no fork, no header parent, no sidecar parent.
+    let today = !accumulator.codex_is_fork
+        && accumulator.codex_parent_session_ref.is_none()
+        && accumulator.codex_sidecar_parent.is_none();
+    // (2) A fork whose boundary was decided from in-file header fields only:
+    // exact_start → Ordinal, history_base → AllLocal, subagent legacy trigger
+    // → AllLocal. Not a created thread or sidecar-ambiguous file (native_only),
+    // and no parent ledger was read.
+    let in_file_fork = accumulator.codex_is_fork
+        && !accumulator.codex_created_thread_native_only
+        && !accumulator.codex_parent_ledger_consulted
+        && matches!(
+            accumulator.codex_ownership_boundary,
+            CodexOwnershipBoundary::Ordinal { .. } | CodexOwnershipBoundary::AllLocal
+        );
+    // NativeCreatedThread: false until step 2 (G-CT). Ledger-resolved
+    // AwaitingParentPrefix → AllLocal: false until U1a-2.
+    today || in_file_fork
 }
 
 #[allow(clippy::too_many_arguments)]

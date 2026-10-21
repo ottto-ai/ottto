@@ -66,6 +66,13 @@ fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
 }
 
 fn native_parser(fixture: &Fixture, source: SnapshotSource) -> (OwnedJsonlParser, String, Scope) {
+    native_parser_with(fixture, source, &CodexTitleMetadata::default())
+}
+fn native_parser_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+) -> (OwnedJsonlParser, String, Scope) {
     let mut file = File::open(&fixture.0).unwrap();
     let expected = opened_object_identity(source, &mut file).unwrap();
     let scope = Scope(format!("synthetic-native-{source:?}"));
@@ -78,7 +85,7 @@ fn native_parser(fixture: &Fixture, source: SnapshotSource) -> (OwnedJsonlParser
             SnapshotSource::ClaudeCode => apply_claude_code_line,
             _ => unreachable!(),
         },
-        Some(&CodexTitleMetadata::default()),
+        Some(metadata),
         None,
         None,
         false,
@@ -98,9 +105,37 @@ fn acquire(
     usize,
     Value,
 ) {
-    let (mut parser, expected, scope) = native_parser(fixture, source);
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    acquire_with(
+        fixture,
+        source,
+        &CodexTitleMetadata::default(),
+        &scope,
+        old,
+        now,
+        true,
+    )
+}
+/// `acquire` under explicit Codex sidecar metadata and reduction scope;
+/// `complete` is the expected `ParsedJsonlFile::complete()`.
+#[allow(clippy::too_many_arguments)]
+fn acquire_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+    scope: &Scope,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+    complete: bool,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    usize,
+    Value,
+) {
+    let (mut parser, expected, _) = native_parser_with(fixture, source, metadata);
     let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
-    let mode = parser.prepare_acquisition(old, &scope, debt, now).unwrap();
+    let mode = parser.prepare_acquisition(old, scope, debt, now).unwrap();
     let guards = parser
         .reader
         .acquisition
@@ -120,7 +155,7 @@ fn acquire(
         );
     }
     let acquisition = parser
-        .retain_reduction(&scope, now, budget)
+        .retain_reduction(scope, now, budget)
         .unwrap()
         .unwrap();
     assert_eq!(acquisition.reduction.is_some(), predicted.is_some());
@@ -134,12 +169,12 @@ fn acquire(
             &fixture.0,
             NOW,
             "native-fixture".into(),
-            Some(&CodexTitleMetadata::default()),
+            Some(metadata),
             Some(&ClaudeTitleMetadata::default()),
             None,
         )
         .unwrap();
-    assert!(parsed.complete());
+    assert_eq!(parsed.complete(), complete);
     let mut items = parsed.snapshots;
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     (retained, mode, guards, serde_json::to_value(items).unwrap())
@@ -484,6 +519,302 @@ fn sampled_native_wrong_provider_cache_refuses_reuse() {
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
         ReadMode::Full(_)
     ));
+}
+
+// P1-RETAIN-3: Codex forks whose ownership boundary is decided from in-file
+// header fields alone continue from a retained native reduction.
+fn lineage_fixture(values: &[Value]) -> Fixture {
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fs::write(
+        &fixture.0,
+        values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    fixture
+}
+/// Codex token totals: input, cached input, output, reasoning output.
+type LineageUsage = (u64, u64, u64, u64);
+fn lineage_tokens(
+    second: u64,
+    ordinal: Option<u64>,
+    total: LineageUsage,
+    last: LineageUsage,
+) -> Value {
+    let mut value = json!({"timestamp":format!("2026-10-07T10:00:{second:02}Z"), "type":"event_msg",
+        "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+        "total_token_usage":{"input_tokens":total.0,"cached_input_tokens":total.1,"output_tokens":total.2,"reasoning_output_tokens":total.3},
+        "last_token_usage":{"input_tokens":last.0,"cached_input_tokens":last.1,"output_tokens":last.2,"reasoning_output_tokens":last.3}}}});
+    if let Some(ordinal) = ordinal {
+        value["ordinal"] = json!(ordinal);
+    }
+    value
+}
+/// Appended owned usage after a fixture whose last total is (140, 110, 18, 3).
+const LINEAGE_APPENDS: [(LineageUsage, LineageUsage); 2] = [
+    ((200, 150, 30, 5), (60, 40, 12, 2)),
+    ((230, 170, 35, 6), (30, 20, 5, 1)),
+];
+/// The reduction a sampled full read retains, before `retain_reduction`.
+fn lineage_state(fixture: &Fixture, metadata: &CodexTitleMetadata) -> SnapshotAccumulator {
+    let (mut parser, _, scope) = native_parser_with(fixture, SnapshotSource::Codex, metadata);
+    parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+    while !parser.step().unwrap() {}
+    parser.accumulator.clone()
+}
+fn lineage_oracle(fixture: &Fixture, metadata: &CodexTitleMetadata) -> Value {
+    let mut items = parse_codex_jsonl_file_with_title_metadata(
+        &fixture.0,
+        NOW,
+        "native-fixture".into(),
+        metadata,
+        None,
+    )
+    .unwrap();
+    apply_upload_policy(
+        SnapshotSource::Codex,
+        &mut items,
+        SnapshotUploadPolicy::default(),
+    );
+    serde_json::to_value(items).unwrap()
+}
+#[test]
+fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let parent = "019fa111-2222-7333-8444-0000000000b1";
+    let spawn = json!({"subagent":{"thread_spawn":{"parent_thread_id":parent}}});
+    let cases = [
+        (
+            "ordinal-with-forked-from-id",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal","forked_from_id":parent,"thread_source":"subagent","source":spawn,"subagent_history_start_ordinal":2}}),
+                lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+                lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            true,
+        ),
+        (
+            "ordinal-without-forked-from-id",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal-headless","thread_source":"subagent","subagent_history_start_ordinal":2}}),
+                lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+                lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            true,
+        ),
+        (
+            "history-base",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":"lineage-history-base","forked_from_id":parent,"thread_source":"user","history_mode":"paginated","history_base":{"cursor":"provider"},"source":"cli"}}),
+                lineage_tokens(1, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            false,
+        ),
+        (
+            "legacy-trigger-subagent",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":"lineage-legacy","forked_from_id":parent,"thread_source":"subagent","source":spawn}}),
+                lineage_tokens(1, None, (100, 80, 10, 2), (100, 80, 10, 2)),
+                json!({"timestamp":"2026-10-07T10:00:02Z","type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"timestamp":"2026-10-07T10:00:03Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+                lineage_tokens(4, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            false,
+        ),
+    ];
+    for (case, values, ordinals) in cases {
+        let fixture = lineage_fixture(&values);
+        let (mut retained, mode, _, body) = acquire(&fixture, source, None, 100);
+        assert_eq!(
+            mode,
+            ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing),
+            "{case}"
+        );
+        assert_eq!(body, oracle(&fixture, source), "{case}: first read");
+        assert!(retained.is_some(), "{case}: an in-file fork is retained");
+        {
+            let accumulator = lineage_state(&fixture, &CodexTitleMetadata::default());
+            assert!(sampled_scan::compatible_reduction(&accumulator), "{case}");
+            assert!(accumulator.codex_is_fork, "{case}");
+            assert!(
+                matches!(
+                    accumulator.codex_ownership_boundary,
+                    CodexOwnershipBoundary::Ordinal { .. } | CodexOwnershipBoundary::AllLocal
+                ),
+                "{case}: {:?}",
+                accumulator.codex_ownership_boundary
+            );
+            assert!(!accumulator.codex_created_thread_native_only, "{case}");
+            assert!(!accumulator.codex_parent_ledger_consulted, "{case}");
+        }
+        for (step, (total, last)) in LINEAGE_APPENDS.into_iter().enumerate() {
+            let next_ordinal = (values.len() + step) as u64;
+            fixture.append(&lineage_tokens(
+                10 + step as u64,
+                ordinals.then_some(next_ordinal),
+                total,
+                last,
+            ));
+            let (next, mode, _, body) = acquire(&fixture, source, retained, 101 + step as u64);
+            assert_eq!(mode, ReadMode::Tail, "{case}: append {step}");
+            assert_eq!(body, oracle(&fixture, source), "{case}: append {step}");
+            assert!(next.is_some(), "{case}: append {step} stays retained");
+            retained = next;
+        }
+        assert_eq!(
+            acquire(&fixture, source, retained, 200).3,
+            oracle(&fixture, source),
+            "{case}"
+        );
+    }
+}
+#[test]
+fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retained() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let metadata = CodexTitleMetadata::default();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    // After a retained `Ordinal` copy, a gap or a backward step breaks the
+    // ordinal stream: the tail is held exactly as a full parse holds it, no
+    // copy is retained, and the next change is a full read.
+    for (case, broken) in [("gap", 4), ("backward", 1)] {
+        let fixture = lineage_fixture(&[
+            json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal-break","forked_from_id":"019fa111-2222-7333-8444-0000000000b1","thread_source":"subagent","subagent_history_start_ordinal":2}}),
+            lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+            lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+        ]);
+        let (retained, _, _, _) = acquire(&fixture, source, None, 100);
+        assert!(retained.is_some(), "{case}: the fork is retained first");
+        let (total, last) = LINEAGE_APPENDS[0];
+        fixture.append(&lineage_tokens(10, Some(broken), total, last));
+        let (next, mode, _, body) =
+            acquire_with(&fixture, source, &metadata, &scope, retained, 101, false);
+        assert_eq!(mode, ReadMode::Tail, "{case}");
+        assert_eq!(body, oracle(&fixture, source), "{case}: tail parity");
+        assert_eq!(body, json!([]), "{case}: held, never partial");
+        assert!(next.is_none(), "{case}: no copy after the break");
+        let (total, last) = LINEAGE_APPENDS[1];
+        fixture.append(&lineage_tokens(11, Some(broken + 1), total, last));
+        let (next, mode, _, body) =
+            acquire_with(&fixture, source, &metadata, &scope, next, 102, false);
+        assert_eq!(
+            mode,
+            ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing),
+            "{case}"
+        );
+        assert_eq!(body, oracle(&fixture, source), "{case}: full parity");
+        assert!(next.is_none(), "{case}");
+    }
+}
+#[test]
+fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_changes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let child = format!(
+        "019fa111-2222-7333-8444-{:012x}",
+        (u64::from(std::process::id()) << 16) | NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+    );
+    let parent = "019fa111-2222-7333-8444-0000000000c1";
+    let grandparent = "019fa111-2222-7333-8444-0000000000c2";
+    // The sidecar parent binds only through a rollout path that names the child.
+    let fixture = Fixture(std::env::temp_dir().join(format!("rollout-{child}.jsonl")));
+    let _ = fs::remove_file(&fixture.0);
+    for value in [
+        json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":child,"forked_from_id":parent,"thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":parent}}}}}),
+        lineage_tokens(1, None, (100, 80, 10, 2), (100, 80, 10, 2)),
+        json!({"timestamp":"2026-10-07T10:00:02Z","type":"event_msg","payload":{"type":"task_started"}}),
+        json!({"timestamp":"2026-10-07T10:00:03Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+        lineage_tokens(4, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+    ] {
+        fixture.append(&value);
+    }
+    let mut family = CodexTitleMetadata::default();
+    family
+        .spawn_parents
+        .insert(child.clone(), parent.to_string());
+    // The production reduction scope folds in this fingerprint, which carries
+    // the family position (`reduction_dependencies`, `file_scope`).
+    let scope =
+        |metadata: &CodexTitleMetadata| Scope(metadata.path_reduction_fingerprint(&fixture.0));
+
+    let (retained, mode, _, body) =
+        acquire_with(&fixture, source, &family, &scope(&family), None, 100, true);
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
+    );
+    assert_eq!(body, lineage_oracle(&fixture, &family));
+    assert!(
+        retained.is_some(),
+        "a legacy-trigger subagent with a sidecar parent is retained"
+    );
+    {
+        let accumulator = lineage_state(&fixture, &family);
+        assert!(sampled_scan::compatible_reduction(&accumulator));
+        assert_eq!(
+            accumulator
+                .codex_sidecar_parent
+                .as_ref()
+                .map(|(_, parent)| parent.as_str()),
+            Some(parent)
+        );
+        assert_eq!(
+            accumulator.codex_ownership_boundary,
+            CodexOwnershipBoundary::AllLocal
+        );
+        assert!(accumulator.codex_legacy_trigger_seen);
+    }
+
+    let (total, last) = LINEAGE_APPENDS[0];
+    fixture.append(&lineage_tokens(10, None, total, last));
+    let (retained, mode, _, body) = acquire_with(
+        &fixture,
+        source,
+        &family,
+        &scope(&family),
+        retained,
+        101,
+        true,
+    );
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body, lineage_oracle(&fixture, &family));
+    assert!(retained.is_some());
+
+    // A family change (a newly recorded grandparent) changes the reduction
+    // scope, so the retained copy is not continued.
+    let mut changed = family.clone();
+    changed
+        .spawn_parents
+        .insert(parent.to_string(), grandparent.to_string());
+    assert_ne!(scope(&changed), scope(&family));
+    let (total, last) = LINEAGE_APPENDS[1];
+    fixture.append(&lineage_tokens(11, None, total, last));
+    let (retained, mode, _, body) = acquire_with(
+        &fixture,
+        source,
+        &changed,
+        &scope(&changed),
+        retained,
+        102,
+        true,
+    );
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::ScopeChanged)
+    );
+    assert_eq!(body, lineage_oracle(&fixture, &changed));
+    assert!(retained.is_some());
 }
 
 struct ScanFixture {
