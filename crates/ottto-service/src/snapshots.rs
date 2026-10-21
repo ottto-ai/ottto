@@ -53,6 +53,8 @@ mod codex_counting_v2_tests;
 mod codex_counting_version;
 mod codex_file_join;
 #[cfg(test)]
+mod codex_parent_proof_tests;
+#[cfg(test)]
 mod codex_parent_side_tests;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
@@ -15548,6 +15550,32 @@ impl CodexParentUnresolvable {
     pub(in crate::snapshots) fn index(self) -> usize {
         self as usize
     }
+    /// U1a: every cause in ordinal order (`ALL[i].index() == i`).
+    #[allow(dead_code)] // first production caller is the proof map decode
+    pub(in crate::snapshots) const ALL: [Self; Self::COUNT] = [
+        Self::Absent,
+        Self::Duplicated,
+        Self::NotRegular,
+        Self::Oversize,
+        Self::NoLedger,
+        Self::LedgerCapped,
+        Self::ParentHeld,
+        Self::ParentLossy,
+        Self::OutOfWindow,
+        Self::ForkCycle,
+        Self::DeferredRef,
+        Self::DeferredRestart,
+    ];
+    /// U1a: the persisted ordinal's inverse; `None` for an unknown ordinal.
+    #[allow(dead_code)] // first production caller is the proof map decode
+    pub(in crate::snapshots) fn from_index(index: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(index)).copied()
+    }
+    /// U1a: held for want of parent evidence a prefix proof supplies.
+    #[allow(dead_code)] // first production caller is the owe
+    pub(in crate::snapshots) fn proof_owed(self) -> bool {
+        self.cap() || self.deferred()
+    }
     /// The once-per-process log line of this cause's class (no ids).
     fn held_log_line(self) -> &'static str {
         use CodexParentUnresolvable::*;
@@ -16018,6 +16046,272 @@ fn codex_parent_owed(shared: Option<&CodexStepMap>, parent: &str) -> bool {
                             .is_some_and(CodexParentUnresolvable::settles_owed)
                 })
         })
+}
+
+/// U1a: chained digest over a child's ownership signatures.
+#[allow(dead_code)] // first production callers are the proof job and finish
+pub(in crate::snapshots) type PrefixDigest = [u8; 32];
+
+/// U1a: the chain's format tag (and its seed).
+#[allow(dead_code)] // first production callers are the proof job and finish
+const CODEX_PARENT_PROOF_FORMAT: &str = "codex_parent_prefix_proof:v1";
+
+/// U1a: a persisted parent-prefix proof for one fork child (local index
+/// key). Only divergence outcomes are stored. Never authoritative alone:
+/// installed only when `installable`, and fenced at every use.
+#[allow(dead_code)] // first production callers are the proof job and finish
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::snapshots) struct CodexParentPrefixProof {
+    /// Resolved parent session id (the child's `forked_from_id`).
+    pub(in crate::snapshots) parent: String,
+    /// P1's certificate of P's sealed prefix `[0, s)`; s covers every p_m.
+    pub(in crate::snapshots) parent_seal: crate::transcript_acquisition::PrefixSeal,
+    /// m: parent signatures matched before the deciding record.
+    pub(in crate::snapshots) matched: u64,
+    /// 64-hex chain over the child's s_0..s_m.
+    pub(in crate::snapshots) child_digest: String,
+    /// Owned from s_m (m > 0) or held at index 0 (m == 0).
+    pub(in crate::snapshots) owned: bool,
+    /// An outlived seal's one publication was used. Meaningless without
+    /// staged debt.
+    #[serde(default)]
+    pub(in crate::snapshots) published: bool,
+}
+crate::heap_layout_bound::fields!(CodexParentPrefixProof; parent, parent_seal, matched, child_digest, owned, published);
+
+#[allow(dead_code)] // first production callers are the proof job and finish
+impl CodexParentPrefixProof {
+    /// Install checks, no I/O: the mislabel guard, the seal's scope (a
+    /// subset of `select_mode`'s refusals, to avoid a doomed parse; it never
+    /// admits) and a decodable digest. Horizon, debt and clock are decided
+    /// only by `PrefixSeal::admits` at the fence.
+    pub(in crate::snapshots) fn installable(
+        &self,
+        scope: &crate::transcript_acquisition::Scope,
+    ) -> Option<PrefixDigest> {
+        if self.owned != (self.matched > 0) || !self.parent_seal.scope_is(scope) {
+            return None;
+        }
+        codex_digest_from_hex(&self.child_digest)
+    }
+}
+
+/// U1a: the stamp a wake compares with `OpenStamp::append_compatible`.
+#[allow(dead_code)] // first production callers are the proof job and finish
+pub(in crate::snapshots) type WakeStamp = sampled_scan::codex_cursor::OpenStamp;
+
+/// U1a: the change that can cure the last outcome. Gated by
+/// `not_before_unix_seconds`, except `Due`.
+#[allow(dead_code)] // first production callers are the proof job and finish
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(in crate::snapshots) enum ProofWake {
+    /// No finished attempt yet (new, lost, evicted).
+    Due,
+    /// ParentExhausted, ParentLossy, BeyondSeal: P changed at all, or C is
+    /// not append-compatible.
+    ParentChanged { parent: WakeStamp, child: WakeStamp },
+    /// ChildExhausted: C changed at all, or P is not append-compatible.
+    ChildChanged { parent: WakeStamp, child: WakeStamp },
+    /// Undecidable, NotAFork, NoLedger: a non-append change of C, or of P
+    /// when `parent` is set. Growth cannot cure these.
+    Rewritten {
+        parent: Option<WakeStamp>,
+        child: WakeStamp,
+    },
+    /// Identity: the census fingerprint of P's id changed, or C rewritten.
+    Census { matches: String, child: WakeStamp },
+    /// P not settled, unknown or stale: P's side record changed generation
+    /// or is absent, P's own proof entry changed, or P's stamp changed.
+    ParentHeld {
+        parent_key: String,
+        generation: u64,
+        parent_entry: String,
+        parent: WakeStamp,
+        lineage: bool,
+        /// The sealed offset P's record must cover (0 when not stale).
+        needed_extent: u64,
+    },
+    /// Global memory pressure, or invalidated mid-run: time only.
+    Backoff,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ProofWake {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound as H;
+        match self {
+            Self::Due | Self::Backoff => c.add(0),
+            Self::ParentChanged { parent, child } | Self::ChildChanged { parent, child } => {
+                H::heap_bound(parent, c)?;
+                H::heap_bound(child, c)
+            }
+            Self::Rewritten { parent, child } => {
+                H::heap_bound(parent, c)?;
+                H::heap_bound(child, c)
+            }
+            Self::Census { matches, child } => {
+                H::heap_bound(matches, c)?;
+                H::heap_bound(child, c)
+            }
+            Self::ParentHeld {
+                parent_key,
+                parent_entry,
+                parent,
+                ..
+            } => {
+                H::heap_bound(parent_key, c)?;
+                H::heap_bound(parent_entry, c)?;
+                H::heap_bound(parent, c)
+            }
+        }
+    }
+}
+
+/// U1a: the last finished attempt's outcome kind (counter index and
+/// backoff key), persisted as its `u8`; 0 = none.
+#[allow(dead_code)] // first production callers are the proof job and finish
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(in crate::snapshots) enum ProofOutcome {
+    Owned = 1,
+    Hold,
+    ParentExhausted,
+    ChildExhausted,
+    ParentLossy,
+    NoLedger,
+    Undecidable,
+    BeyondSeal,
+    NotAFork,
+    ParentHeld,
+    LineageHeld,
+    Identity,
+    Invalidated,
+    MemoryRefused,
+    /// P's record covers less than the children need; the wake keeps the
+    /// needed offset (`ProofWake::ParentHeld::needed_extent`).
+    SideStale,
+    FileCapHeld,
+    /// Counted; no outcome change while the job is live.
+    StepRefusedMemory,
+    SideUnreadable,
+}
+#[allow(dead_code)] // first production callers are the proof job and finish
+impl ProofOutcome {
+    pub(in crate::snapshots) const LAST: u8 = Self::SideUnreadable as u8;
+}
+
+/// U1a: who owes the proof. `Child`: the child's own proof-owed PR-P cause.
+/// `Lineage`: a P owed by a child's job (P's in-job cause, or
+/// `CAUSE_NO_EVIDENCE`).
+#[allow(dead_code)] // first production caller is the owe
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::snapshots) enum OwedOrigin {
+    #[default]
+    Child,
+    Lineage,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for OwedOrigin {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// U1a: proof work a held fork child (or a lineage parent) is owed.
+#[allow(dead_code)] // first production callers are the owe and finish
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::snapshots) struct CodexParentProofOwed {
+    /// The resolved parent id the proof is against.
+    pub(in crate::snapshots) parent: String,
+    /// `++ScanIndex::codex_parent_proof_seq` at each owe; a finish delta
+    /// applies only to an entry with an equal `seq`.
+    #[serde(default)]
+    pub(in crate::snapshots) seq: u64,
+    /// `CodexParentUnresolvable::index()` (an ordinal, never a name), or
+    /// `CAUSE_NO_EVIDENCE` (only with `origin == Lineage`).
+    pub(in crate::snapshots) cause: u8,
+    #[serde(default)]
+    pub(in crate::snapshots) origin: OwedOrigin,
+    pub(in crate::snapshots) wake: ProofWake,
+    /// `ProofOutcome as u8` of the last finished attempt; 0 = none.
+    #[serde(default)]
+    pub(in crate::snapshots) outcome: u8,
+    /// Consecutive attempts with this outcome kind (≤ 6).
+    pub(in crate::snapshots) attempts: u8,
+    pub(in crate::snapshots) not_before_unix_seconds: u64,
+    /// A proof refused only because P's side was held or unknown; re-fenced
+    /// (no job) when the wake fires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::snapshots) kept: Option<Box<CodexParentPrefixProof>>,
+}
+crate::heap_layout_bound::fields!(CodexParentProofOwed; parent, seq, cause, origin, wake, outcome, attempts, not_before_unix_seconds, kept);
+
+#[allow(dead_code)] // first production callers are the owe and finish
+impl CodexParentProofOwed {
+    pub(in crate::snapshots) fn new(
+        parent: String,
+        seq: u64,
+        cause: u8,
+        origin: OwedOrigin,
+    ) -> Self {
+        Self {
+            parent,
+            seq,
+            cause,
+            origin,
+            wake: ProofWake::Due,
+            outcome: 0,
+            attempts: 0,
+            not_before_unix_seconds: 0,
+            kept: None,
+        }
+    }
+    /// Backed off until `not_before`, unless the clock went back past the
+    /// cap (then due: never parked by a regression).
+    pub(in crate::snapshots) fn backed_off(&self, now: u64) -> bool {
+        now < self.not_before_unix_seconds
+            && now.saturating_add(crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS)
+                >= self.not_before_unix_seconds
+    }
+    /// After a finished attempt: 112 s, 225 s, ... capped at
+    /// `AUDIT_INTERVAL_SECONDS`. `attempts` resets to 1 only when the
+    /// outcome kind changes.
+    pub(in crate::snapshots) fn after_attempt(
+        &mut self,
+        outcome: ProofOutcome,
+        wake: ProofWake,
+        now: u64,
+    ) {
+        let kind = outcome as u8;
+        self.attempts = if kind == self.outcome {
+            self.attempts.saturating_add(1).min(6)
+        } else {
+            1
+        };
+        self.outcome = kind;
+        self.not_before_unix_seconds = now.saturating_add(
+            crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS >> (6 - u32::from(self.attempts)),
+        );
+        self.wake = wake;
+    }
+}
+
+/// U1a: one child's proof state.
+#[allow(dead_code)] // first production callers are the owe and finish
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(in crate::snapshots) enum CodexParentProofState {
+    Proven(CodexParentPrefixProof),
+    Owed(CodexParentProofOwed),
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CodexParentProofState {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Proven(proof) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(proof, c),
+            Self::Owed(owed) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(owed, c),
+        }
+    }
 }
 
 /// PR-P: the referenced ids of this path whose parse can still produce new
@@ -34646,6 +34940,40 @@ fn sha256_hex(parts: &[&str]) -> String {
 fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u32).to_be_bytes());
     digest.update(bytes);
+}
+
+/// U1a: the proof chain's seed, `d_0`.
+#[allow(dead_code)] // first production callers are the proof job and finish
+fn codex_parent_prefix_seed() -> PrefixDigest {
+    Sha256::digest(CODEX_PARENT_PROOF_FORMAT.as_bytes()).into()
+}
+/// U1a: `d_{k+1} = sha256(d_k || len(s_k) || s_k)`.
+#[allow(dead_code)] // first production callers are the proof job and finish
+fn codex_parent_prefix_chain(previous: &PrefixDigest, signature: &str) -> PrefixDigest {
+    let mut digest = Sha256::new();
+    digest.update(previous);
+    update_length_prefixed(&mut digest, signature.as_bytes());
+    digest.finalize().into()
+}
+#[allow(dead_code)] // first production callers are the proof job and finish
+fn codex_digest_hex(digest: &PrefixDigest) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+/// U1a: lower-case 64-hex only.
+#[allow(dead_code)] // first production callers are the proof map decode
+fn codex_digest_from_hex(hex: &str) -> Option<PrefixDigest> {
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (at, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn sha256_hex_owned(parts: &[String]) -> String {
