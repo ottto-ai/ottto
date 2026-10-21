@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 734,
-  "content_sha256": "5fc6b0ead0df8422babfc35dab8582865d4eabdd04229ff78235bca8e84881ee",
+  "candidate_file_count": 736,
+  "content_sha256": "206f253bf8c10673d954bd9e32b88d64c262bca131880842e84a3803dc784f4d",
   "files": [
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "10926107abe6af1a1d5267bd97c676953974bfacd53e562fd759af889cbd03d4",
-      "size_bytes": 843577
+      "sha256": "293d0c2342695288328fba631e2e2247e52247bfd69ded558328715296b9bca0",
+      "size_bytes": 844013
     },
     {
       "executable": false,
@@ -1286,6 +1286,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs",
+      "sha256": "e924adf5a064197de09785e40d339f02004ccd1c45e7d42db5123c9d4d92426c",
+      "size_bytes": 74728
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/rejection_log.rs",
       "sha256": "24a44a5fa61ea4a309352447bf5c04fdbb63cdee1820a814065bc4afb6840ce1",
       "size_bytes": 3307
@@ -1308,8 +1315,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "00adf702920ba63deed9cd361884793d9f1382f8b636ee05bff791bda23da03e",
-      "size_bytes": 2936255
+      "sha256": "12d5e8c96d2c93151435f73b878760b923d729098a7ef59c7743a707ffb1f1cb",
+      "size_bytes": 2963684
     },
     {
       "executable": false,
@@ -1406,15 +1413,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_accounts.rs",
-      "sha256": "4e203c130f4890733218f4d7228ff141e4e481afdf56717b39592629ffed70bc",
-      "size_bytes": 21485
+      "sha256": "c638d2f1e34ec37e05542919d2fd6f5c8aafae7fb3e1db10feca5d40a5d6d4f1",
+      "size_bytes": 21859
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity.rs",
-      "sha256": "e9821f1165c4161e50aa843637eaff59fb9fe596d6529fb0c5337bad2cf40c49",
-      "size_bytes": 83976
+      "sha256": "523aca257e03e02930203a776b24d72d0e7604ecbd1319ccf6199b1c926497d9",
+      "size_bytes": 85407
     },
     {
       "executable": false,
@@ -3351,6 +3358,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-21-c1a-closed-fence-proof-rearm.md",
+      "sha256": "8c21ec9b45ca053c0cbf244e26dfbf0ed98985d805e82690422f80d732e4debd",
+      "size_bytes": 10806
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-21-codex-in-file-fork-tail-retention.md",
       "sha256": "72083eb0b755be5df1af28c30a4823f8f8f44a56e7a41b70b7becbdfec8a7a99",
       "size_bytes": 3560
@@ -5141,9 +5155,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T11:16:26+00:00",
+  "generated_at": "2026-10-21T15:37:57+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 735,
+  "output_file_count": 737,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5180,5 +5194,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "8129944580d5d5a16603cc7bae49ddececfe18e8"
+  "source_commit": "d91a46a1ab61b909e1b437e81ffb4e3dc85554cc"
 }
