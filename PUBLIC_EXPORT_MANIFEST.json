@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 811,
-  "content_sha256": "f4ad87090c4a597c50a95cb87e9140c76c1e0445be2c5249d2f5b6feb9e4b0c7",
+  "content_sha256": "a289b4111f55b045429b5ce090fa177710c7abef4a1619f29090b9ebd4983168",
   "files": [
     {
       "executable": false,
@@ -1448,7 +1448,7 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "8ee6df7414ed9625cbbcb72ae6e3c71401b93fb706a3546bbc1341cc5c2a8e78",
+      "sha256": "a59f7d27f426b071141b6f2ec011c3c98906842cd254e01c1e24f289a4cf4428",
       "size_bytes": 876813
     },
     {
@@ -1574,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "f4175dec0642971f8ff941f79f27fae5b999ac230b07dda0e1cbe46f910de047",
-      "size_bytes": 3152923
+      "sha256": "ab703fdf2287047164078aefa8382fc9a7999a03c2a38f039cfd23537d5ed36b",
+      "size_bytes": 3155416
     },
     {
       "executable": false,
@@ -1791,8 +1791,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_sidecar_reduction_tests.rs",
-      "sha256": "0f0e18de949d10332681b54bb8252889ee34d602d26a9304e2a9ed2ade0e8300",
-      "size_bytes": 28999
+      "sha256": "ff350846f6deee746ec0706ac6ce3718b7918b5f291127d3c11314ca7b1f971d",
+      "size_bytes": 29041
     },
     {
       "executable": false,
@@ -1847,8 +1847,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_parent_side_tests.rs",
-      "sha256": "2dddfc596dea02871a865e013f4c889d4d5e3b38a2987f78c0515f04946a372c",
-      "size_bytes": 10374
+      "sha256": "bba98971dd9cd07a62cb9b8fee10299f41f34c29e6572e027571b90fa27931b9",
+      "size_bytes": 19990
     },
     {
       "executable": false,
@@ -1980,8 +1980,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "985908fb6f2aad8423fcd96a4b0fda50ace21178b5b27a7c1f597c799948bc7d",
-      "size_bytes": 193430
+      "sha256": "0e2ac6568721ca0c3858c81e38bcee4477e0f2863a8a5239fb50f3391f1e6e10",
+      "size_bytes": 193454
     },
     {
       "executable": false,
@@ -1994,8 +1994,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/side_ledger.rs",
-      "sha256": "6deecd25796882e6a09ba4c3d9148f342afe12a7af1333b71bd224f2f4bd3ab1",
-      "size_bytes": 34386
+      "sha256": "f50f8999ec62e5881daeea82c08cdb2e101757cb3dcb5418d7ee5dc88b374624",
+      "size_bytes": 34388
     },
     {
       "executable": false,

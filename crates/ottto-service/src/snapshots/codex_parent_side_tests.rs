@@ -301,3 +301,278 @@ fn codex_side_pass_gates_on_the_previous_selected_save() {
     assert!(next.gate.side_allowed && !next.gate.first_in_process);
     assert_eq!(index.codex_parent_side_requests, BTreeMap::new());
 }
+
+fn temp_path(name: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "ottto-u1a2a-{name}-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir.join("index.json")
+}
+
+fn open_stamp(value: serde_json::Value) -> sampled_scan::codex_cursor::OpenStamp {
+    serde_json::from_value(value).unwrap()
+}
+
+/// `PrefixSeal` and `OpenStamp` at field extremes.
+fn extreme_record() -> CodexParentSide {
+    let seal = serde_json::json!({
+        "stamp": {
+            "length": u64::MAX,
+            "device": u64::MAX,
+            "inode": u64::MAX,
+            "modified": [i64::MIN, i64::MIN],
+            "changed": [i64::MIN, i64::MIN],
+        },
+        "scope": "f".repeat(64),
+        "sample_len": u32::MAX,
+        "head_sha256": "f".repeat(64),
+        "boundary_sha256": "f".repeat(64),
+        "verified_unix_seconds": u64::MAX,
+        "sealed_unix_seconds": u64::MAX,
+        "audit_debt_unix_seconds": u64::MAX,
+    });
+    CodexParentSide {
+        verdict: SideVerdict::Held {
+            lineage: false,
+            cause: u8::MAX,
+        },
+        seal: serde_json::from_value(seal).unwrap(),
+        parsed: open_stamp(serde_json::json!({
+            "dev": u64::MAX,
+            "ino": u64::MAX,
+            "extent": u64::MAX,
+            "modified": [i64::MIN, i64::MIN],
+            "changed": [i64::MIN, i64::MIN],
+        })),
+        pace: Some(SidePace {
+            not_before_unix_seconds: u64::MAX,
+            attempts_floor: u8::MAX,
+        }),
+        generation: u64::MAX,
+        referenced_epoch: u64::MAX,
+    }
+}
+
+/// A realistic record: the real side scope and a captured stamp.
+fn record(parsed: sampled_scan::codex_cursor::OpenStamp) -> CodexParentSide {
+    let seal = serde_json::json!({
+        "stamp": {
+            "length": 4096,
+            "device": 16_777_232,
+            "inode": 123_456_789,
+            "modified": [1_792_540_800, 5],
+            "changed": [1_792_540_800, 5],
+        },
+        "scope": codex_parent_side_scope().0,
+        "sample_len": 4096,
+        "head_sha256": sha256_hex(&["head"]),
+        "boundary_sha256": sha256_hex(&["boundary"]),
+        "verified_unix_seconds": 1_792_540_800,
+        "sealed_unix_seconds": 1_792_540_800,
+    });
+    CodexParentSide {
+        verdict: SideVerdict::Settled,
+        seal: serde_json::from_value(seal).unwrap(),
+        parsed,
+        pace: None,
+        generation: 1,
+        referenced_epoch: 0,
+    }
+}
+
+const SIDE_RECORD_KEYS: &[&str] = &[
+    // CodexParentSide
+    "verdict",
+    "seal",
+    "parsed",
+    "pace",
+    "generation",
+    "referenced_epoch",
+    // SideVerdict
+    "kind",
+    "lineage",
+    "cause",
+    // PrefixSeal
+    "stamp",
+    "scope",
+    "sample_len",
+    "head_sha256",
+    "boundary_sha256",
+    "verified_unix_seconds",
+    "sealed_unix_seconds",
+    "audit_debt_unix_seconds",
+    // FileStamp
+    "length",
+    "device",
+    "inode",
+    // FileStamp and OpenStamp
+    "modified",
+    "changed",
+    // OpenStamp
+    "dev",
+    "ino",
+    "extent",
+    // SidePace
+    "not_before_unix_seconds",
+    "attempts_floor",
+];
+
+/// U-T53: every key is allowlisted, the only arrays are the 2-integer
+/// `modified`/`changed` times, and every string is an enum tag or a
+/// SHA-256 digest.
+fn assert_content_free(value: &serde_json::Value, key: Option<&str>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (name, value) in map {
+                assert!(SIDE_RECORD_KEYS.contains(&name.as_str()), "key {name}");
+                assert_content_free(value, Some(name));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            assert!(matches!(key, Some("modified" | "changed")), "array {key:?}");
+            assert_eq!(items.len(), 2, "{key:?}");
+            assert!(items.iter().all(serde_json::Value::is_i64), "{key:?}");
+        }
+        serde_json::Value::String(text) => assert!(
+            (key == Some("kind") && ["settled", "held"].contains(&text.as_str()))
+                || sha256_hex_is_well_formed(text),
+            "{key:?}"
+        ),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {}
+        serde_json::Value::Null => panic!("null at {key:?}"),
+    }
+}
+
+#[test]
+fn open_stamp_round_trips_as_content_free_scalars() {
+    let path = temp_path("open-stamp").with_extension("jsonl");
+    fs::write(&path, b"{}\n").unwrap();
+    let stamp =
+        sampled_scan::codex_cursor::OpenStamp::capture(&File::open(&path).unwrap()).unwrap();
+    let value = serde_json::to_value(&stamp).unwrap();
+    let keys = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["changed", "dev", "extent", "ino", "modified"])
+    );
+    assert_eq!(value["extent"], 3);
+    assert_eq!(
+        serde_json::from_value::<sampled_scan::codex_cursor::OpenStamp>(value.clone()).unwrap(),
+        stamp
+    );
+
+    // Fail-closed: a missing field or a malformed time is an error.
+    let mut missing = value.clone();
+    missing.as_object_mut().unwrap().remove("ino");
+    assert!(serde_json::from_value::<sampled_scan::codex_cursor::OpenStamp>(missing).is_err());
+    let mut malformed = value;
+    malformed["changed"] = serde_json::json!([1, 2, 3]);
+    assert!(serde_json::from_value::<sampled_scan::codex_cursor::OpenStamp>(malformed).is_err());
+}
+
+#[test]
+fn side_record_is_content_free_and_bounded() {
+    // U-T53 / U-T40: compact ≤ 1.10 KiB per record at field extremes, key
+    // excluded; the on-disk (pretty) difference at the record's real depth
+    // ≤ 1.8 KiB.
+    let extreme = extreme_record();
+    let text = serde_json::to_string(&extreme).unwrap();
+    assert!(text.len() <= 1126, "{} {text}", text.len());
+    assert_eq!(
+        serde_json::from_str::<CodexParentSide>(&text).unwrap(),
+        extreme
+    );
+    assert_content_free(&serde_json::to_value(&extreme).unwrap(), None);
+
+    let key = "/Users/someone/.codex/sessions/2026/10/21/\
+               rollout-2026-10-21T05-43-00-0199f0a1-2b3c-7d4e-8f90-a1b2c3d4e5f6.jsonl";
+    let mut index = ScanIndex::default();
+    let without = serde_json::to_vec_pretty(&index).unwrap().len();
+    index.codex_parent_side.insert(key.into(), extreme);
+    let with = serde_json::to_vec_pretty(&index).unwrap().len();
+    assert!(with - without <= 1843, "{}", with - without);
+
+    let path = temp_path("record").with_extension("jsonl");
+    fs::write(&path, b"{}\n").unwrap();
+    let parsed =
+        sampled_scan::codex_cursor::OpenStamp::capture(&File::open(&path).unwrap()).unwrap();
+    let realistic = record(parsed);
+    let value = serde_json::to_value(&realistic).unwrap();
+    assert!(value.get("pace").is_none());
+    assert_content_free(&value, None);
+    assert_eq!(
+        serde_json::from_value::<CodexParentSide>(value).unwrap(),
+        realistic
+    );
+    assert_eq!(
+        crate::heap_layout_bound::bound(&realistic, usize::MAX).is_some(),
+        crate::heap_layout_bound::layout_supported()
+    );
+}
+
+#[test]
+fn side_records_persist_fail_closed_and_follow_the_index_lifecycle() {
+    // No side state: none of the new keys, so the file is what a pre-2a
+    // daemon writes.
+    let empty = serde_json::to_value(ScanIndex::default()).unwrap();
+    for key in [
+        "codex_parent_side",
+        "codex_parent_side_generation",
+        "codex_parent_proof_wrap_epoch",
+    ] {
+        assert!(empty.get(key).is_none(), "{key}");
+    }
+
+    let mut index = ScanIndex::default();
+    index
+        .codex_parent_side
+        .insert("/p.jsonl".into(), extreme_record());
+    index.codex_parent_side_generation = 3;
+    index.codex_parent_proof_wrap_epoch = 2;
+    let path = temp_path("side-records");
+    index.save(&path).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(loaded.codex_parent_side, index.codex_parent_side);
+    assert_eq!(loaded.codex_parent_side_generation, 3);
+    assert_eq!(loaded.codex_parent_proof_wrap_epoch, 2);
+    if crate::heap_layout_bound::layout_supported() {
+        assert!(
+            crate::heap_layout_bound::bound(&index, usize::MAX).unwrap()
+                > crate::heap_layout_bound::bound(&ScanIndex::default(), usize::MAX).unwrap()
+        );
+    }
+
+    // A malformed record fails the whole load closed: the index is
+    // quarantined and rebuilt, never partly trusted.
+    let mut value = serde_json::to_value(&loaded).unwrap();
+    value["codex_parent_side"]["/p.jsonl"]["parsed"]["modified"] = serde_json::json!([1]);
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let rebuilt = ScanIndex::load(&path).unwrap();
+    assert!(rebuilt.codex_parent_side.is_empty());
+    assert_eq!(rebuilt.generation, 0);
+    assert!(!path.exists());
+
+    // A partial checkpoint carries the working records and counters.
+    let subset =
+        index.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(subset.codex_parent_side, index.codex_parent_side);
+    assert_eq!(subset.codex_parent_side_generation, 3);
+    assert_eq!(subset.codex_parent_proof_wrap_epoch, 2);
+
+    // Replay clears the records, never the monotone counters.
+    index.prepare_historical_replay("replay-1".into());
+    assert!(index.codex_parent_side.is_empty());
+    assert_eq!(index.codex_parent_side_generation, 3);
+    assert_eq!(index.codex_parent_proof_wrap_epoch, 2);
+}

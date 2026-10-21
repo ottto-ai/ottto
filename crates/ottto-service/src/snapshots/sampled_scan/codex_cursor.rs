@@ -274,7 +274,7 @@ impl PageBudget {
 }
 
 /// Opened-object facts of the held descriptor, captured at job open.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::snapshots) struct OpenStamp {
     dev: u64,
     ino: u64,
