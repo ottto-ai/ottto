@@ -6364,7 +6364,8 @@ fn hopeless_admission_evicts_nothing() {
         }
         let copy = cache
             .take(&key)
-            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+            .retained;
         // Measured with no retained copy and no provenance: the least an
         // admission could ever evict down to.
         let floor = retained_floor(&cache);
@@ -6444,7 +6445,8 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         }
         let copy = cache
             .take(&key)
-            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+            .retained;
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
@@ -6457,7 +6459,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         let with_copy = retained_floor(&cache);
         let state = cache.cursor_resident();
         assert!(with_copy + state <= STATE_BYTES);
-        let copy = cache.take(&key).expect("retained");
+        let copy = cache.take(&key).expect("retained").retained;
         // A claim that leaves one byte too few for it.
         let claim = STATE_BYTES - state - with_copy + 1;
         let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
@@ -6979,7 +6981,8 @@ fn witness_admission() -> WitnessAdmission {
     }
     let copy = cache
         .take(&key)
-        .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+        .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+        .retained;
     let floor = retained_floor(&cache);
     let empty = cache.cursor_resident();
     // A single-session root has no parent refs: no `parents` entry exists.
