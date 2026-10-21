@@ -811,6 +811,26 @@ pub struct ActiveSession {
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_timestamps: Vec<Rfc3339Timestamp>,
+    /// Context sizes around each compaction: the same newest-64 list as
+    /// `compaction_timestamps`, `at` byte-identical to an entry of it. Sizes
+    /// use the measure of the first/latest context fields below. Empty when
+    /// the source states no sizes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_events: Vec<ActiveSessionCompaction>,
+    /// Prompt size of the session's first counted request (session start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_turn_context_tokens: Option<u64>,
+    /// Prompt size of the session's latest counted request ("now").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_context_tokens: Option<u64>,
+    /// Recorded context points for the Sessions graph, oldest first, unique
+    /// by time: the first and latest request exactly, the last request of each
+    /// 15-minute slot, and big changes in between; at most 64, thinned evenly
+    /// so the whole session span stays visible. Not every request. Local only,
+    /// never uploaded; present only while the session was active within the
+    /// last 75 minutes when it was read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_points: Vec<ActiveSessionContextPoint>,
     /// Cumulative observed session counters. Optional keeps older daemons and
     /// sources that cannot prove a counter honest in the Companion UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -875,6 +895,29 @@ pub struct ActiveSession {
     /// configured default standing in for observed evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_reasoning_effort: Option<String>,
+}
+
+/// One compaction of an active session. Sizes are prompt sizes, never billed
+/// tokens: `before_tokens` is the last owned request before the compaction,
+/// `after_tokens` the first owned request after it (absent until seen).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionCompaction {
+    pub at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_tokens: Option<u64>,
+    /// Closed values `auto`, `manual` or `idle` when the source states them
+    /// (Claude Code). Codex states none. Apps must hide an unknown value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
+/// One recorded prompt size of an active session at the request's own time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionContextPoint {
+    pub at: Rfc3339Timestamp,
+    pub tokens: u64,
 }
 
 /// One detected billing destination for a source, as observed from local
@@ -8219,6 +8262,32 @@ mod tests {
                     "2026-07-19T17:30:00Z".to_string(),
                     "2026-07-19T17:50:00Z".to_string(),
                 ],
+                compaction_events: vec![
+                    ActiveSessionCompaction {
+                        at: "2026-07-19T17:30:00Z".to_string(),
+                        before_tokens: Some(186_000),
+                        after_tokens: Some(41_000),
+                        trigger: Some("auto".to_string()),
+                    },
+                    ActiveSessionCompaction {
+                        at: "2026-07-19T17:50:00Z".to_string(),
+                        before_tokens: Some(120_000),
+                        after_tokens: None,
+                        trigger: None,
+                    },
+                ],
+                first_turn_context_tokens: Some(24_000),
+                last_turn_context_tokens: Some(120_000),
+                context_points: vec![
+                    ActiveSessionContextPoint {
+                        at: "2026-07-19T17:00:00Z".to_string(),
+                        tokens: 24_000,
+                    },
+                    ActiveSessionContextPoint {
+                        at: "2026-07-19T17:59:00Z".to_string(),
+                        tokens: 120_000,
+                    },
+                ],
                 input_tokens: Some(1_000),
                 cache_read_tokens: Some(800),
                 cache_creation_5m_tokens: Some(50),
@@ -8255,6 +8324,22 @@ mod tests {
             "2026-07-19T17:50:00Z"
         );
         // Snake-case keys the Swift Companion decodes for the session card.
+        assert_eq!(
+            value["sessions"][0]["compaction_events"],
+            serde_json::json!([
+                {"at": "2026-07-19T17:30:00Z", "before_tokens": 186_000, "after_tokens": 41_000, "trigger": "auto"},
+                {"at": "2026-07-19T17:50:00Z", "before_tokens": 120_000}
+            ])
+        );
+        assert_eq!(value["sessions"][0]["first_turn_context_tokens"], 24_000);
+        assert_eq!(value["sessions"][0]["last_turn_context_tokens"], 120_000);
+        assert_eq!(
+            value["sessions"][0]["context_points"],
+            serde_json::json!([
+                {"at": "2026-07-19T17:00:00Z", "tokens": 24_000},
+                {"at": "2026-07-19T17:59:00Z", "tokens": 120_000}
+            ])
+        );
         assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
         assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");
         // Absent, not null, when the daemon has no withheld reason.
@@ -8279,6 +8364,27 @@ mod tests {
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize withheld reconciliation");
         assert_eq!(round_tripped, withheld);
+
+        // Empty lists and unknown sizes are absent, never `[]` or null, and an
+        // older daemon's row without the keys decodes to empty.
+        let mut bare = reconciliation.clone();
+        bare.sessions[0].compaction_events.clear();
+        bare.sessions[0].context_points.clear();
+        bare.sessions[0].first_turn_context_tokens = None;
+        bare.sessions[0].last_turn_context_tokens = None;
+        let value = serde_json::to_value(&bare).expect("serialize bare reconciliation");
+        let session = value["sessions"][0].as_object().expect("session object");
+        for key in [
+            "compaction_events",
+            "context_points",
+            "first_turn_context_tokens",
+            "last_turn_context_tokens",
+        ] {
+            assert!(!session.contains_key(key), "{key}");
+        }
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize bare reconciliation");
+        assert_eq!(round_tripped, bare);
     }
 
     #[test]
