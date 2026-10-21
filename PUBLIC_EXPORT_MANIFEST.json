@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 734,
-  "content_sha256": "4a3767f23b53dea9897f9c9b6410f94968686666bc0572a7a4c7663c7c814b44",
+  "candidate_file_count": 736,
+  "content_sha256": "06ad58921acbeb055c36d646df460f3cece423b7bf19a7848fc0c8f6b5f9dcc2",
   "files": [
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "434b2d7eee5ef7524c41fa9dd4093a1c39f4b364e5c1448c8f9ae6187ebeb58e",
-      "size_bytes": 2936263
+      "sha256": "b836a96fe40a56b9cdc1b900cec83562cc68ca7b994a7d065eef4e61f728c5e2",
+      "size_bytes": 2937338
     },
     {
       "executable": false,
@@ -1555,6 +1555,13 @@
       "path": "crates/ottto-service/src/snapshots/p12_usage_original_tests.rs",
       "sha256": "458e8f100325dc120972ed90ee1f0b3a9b0787032419830ec2fb1f287b1e09e6",
       "size_bytes": 22624
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/paged_claude_s0_baseline_tests.rs",
+      "sha256": "a019ad48d01f3eb8d8195317ed056bb6bce2f5cb77606d2fc5a398c65f774fc5",
+      "size_bytes": 33266
     },
     {
       "executable": false,
@@ -3379,6 +3386,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-21-paged-claude-s0-red-baselines.md",
+      "sha256": "d0e30a5f8f12f2a855207e1937a71f52d1a8d0506fe4e630155295503a41d94b",
+      "size_bytes": 2720
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-21-tls-webpki-advisory-repair.md",
       "sha256": "ef62b022edc9e5a419dcd1e24d4509ae26d04a99355d05799cc8e87178ccd083",
       "size_bytes": 3566
@@ -5141,9 +5155,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T11:16:26+00:00",
+  "generated_at": "2026-10-21T13:58:06+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 735,
+  "output_file_count": 737,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5180,5 +5194,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "8129944580d5d5a16603cc7bae49ddececfe18e8"
+  "source_commit": "b8f89dcc504a62cee2b56593ea5849b0768067da"
 }
