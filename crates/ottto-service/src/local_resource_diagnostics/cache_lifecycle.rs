@@ -39,6 +39,16 @@ counters! {
     insert_poisoned_lock: InsertPoisonedLock,
     insert_entries_evicted: InsertEntriesEvicted,
     cursor_reservation_entries_evicted: CursorReservationEntriesEvicted,
+    // M1 copy refusals. `entries_evicted` and `admission_evicted` count
+    // entries; `bytes_released` their stored charge, for both causes. The
+    // others count zero-budget step starts, not files or refusals: a long
+    // tail beside a full cache counts once per line it reads.
+    copy_refusal_entries_evicted: CopyRefusalEntriesEvicted,
+    copy_refusal_bytes_released: CopyRefusalBytesReleased,
+    copy_refusal_remeasured: CopyRefusalRemeasured,
+    copy_refusal_kept: CopyRefusalKept,
+    copy_refusal_walk_visit_limit: CopyRefusalWalkVisitLimit,
+    copy_refusal_admission_evicted: CopyRefusalAdmissionEvicted,
     clear_metadata_unsupported: ClearMetadataUnsupported,
     clear_full_resident_bound_unknown: ClearFullResidentBoundUnknown,
     clear_no_active: ClearNoActive,
