@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 738,
-  "content_sha256": "0df829ec3e8f69821943a06f38ec294d7c624502dd89569a8a978f26d05b7071",
+  "content_sha256": "969489c166b1a34ad92cef7772daf35e6a7d94ddce756b1190b71eacc452c534",
   "files": [
     {
       "executable": false,
@@ -1245,8 +1245,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/claude_request_census_pipeline_tests.rs",
-      "sha256": "6a782b044a8126f7cfe39a32152da59520aae0f84edbe612007ba51601ea4d9b",
-      "size_bytes": 9386
+      "sha256": "8a544989468e7037c3986d7d557f49e5cc8454c613b91225d9293d0eccabff79",
+      "size_bytes": 19029
     },
     {
       "executable": false,
@@ -3373,8 +3373,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-claude-request-census-records.md",
-      "sha256": "324df817c031c810357497e52cc7651401db2bc85c53d86769561db86a2e4585",
-      "size_bytes": 6849
+      "sha256": "d9ab506a8f985d39d2205fe8b46d4ae48fe0326c15d1b9561c02f649a92d0de1",
+      "size_bytes": 7498
     },
     {
       "executable": false,
@@ -5169,7 +5169,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T14:03:19+00:00",
+  "generated_at": "2026-10-21T15:22:36+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 739,
   "public_roots": [
@@ -5208,5 +5208,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "332759d046778b065496368b414e092245369940"
+  "source_commit": "6138cc77d43ef9f0aa078d2c978b1186a6b4345a"
 }

@@ -25,8 +25,9 @@ replaces the key's record:
   consumes the parser. They are kept as `identity_incomplete`.
 - Any loss, an incomplete or residue parse, or more than one item is `lossy`,
   and keeps the ids it saw.
-- A failed finish and a native comparison target remove the record. An older
-  revision's record never survives a newer parse.
+- Failed parser/acquisition construction, read, attribution preparation, source
+  revalidation, reduction or finish, and a native comparison target remove the
+  record. Ordinary in-progress continuations preserve it.
 
 **Ownership.** Records follow the working index through `committable_subset`
 and the held-key reverts, never `previous`. A held key therefore keeps the
@@ -135,8 +136,15 @@ comparison targets continue to invalidate records.
 
 Parity compares semantic fingerprints plus additive-body witnesses for every
 offered item, full retained proof witnesses and correction grants/owed members.
-A live, nonempty correction is explicitly checked across historical replay
-reset, and the corpus also traverses the reset pipeline. An old-shape decoder
+The append-only `census_every_offered_and_held_body_matches_control` observes
+the same persisted page input before hold filtering, compares every semantic
+fingerprint plus additive-body witness, and checks that selection, holds and
+uploadable bodies match the actual upload/settlement/save page. It requires
+nonzero held bodies. A live correction grant with nonempty owed members is
+seeded immediately before replay. The reset boundary explicitly preserves its
+grant, owed members, source revisions and retained proof binding; both arms
+require a nonzero preserved-member count. The earlier decision parity also
+compares full correction and witness contents across the real replay pipeline. An old-shape decoder
 control actually ignores the added fields.
 
 The maximal shadow row uses `false`, the longest boolean spelling. Including
