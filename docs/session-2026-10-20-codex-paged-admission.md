@@ -99,8 +99,26 @@ keys CI printed. Only then were the keys written to
 ## Latency and shared-resource cost
 
 This change needs no flag: a build that contains it behaves this way. It
-does **not** promise unchanged publication latency system-wide: newly
-admitted files over 2 GiB can delay smaller jobs and census completion.
+does **not** promise unchanged publication latency system-wide: a newly
+admitted file over 2 GiB holds the single large-file cursor slot, and other
+Codex whole reads over 64 MiB wait behind it (below).
+
+**Census: main is already blocked; FC1 removes that blocker conditionally.**
+On main, any Codex file over 2 GiB in the discovery window is counted
+oversized at discovery in every generation; `oversized_file_count > 0` is a
+retryable problem, so the traversal is unhealthy and the Codex raw census is never
+complete while the file stays in the window (main s:26640-26643 →
+s:2036/s:2054 → `traversal_healthy` s:17824 → `raw_census_complete`
+s:17881-17887; at this head s:26887 no longer counts Codex, whose discovery
+cap is `u64::MAX`). So on a machine with such a file, the census-gated steps
+(source manifest re-publication, `backfill_succeeded`, context-curve
+settlement, reconciliation) never run on main. Under FC1 that blocker is
+gone, but completion is still conditional on the other losses, holds and
+coverage, and the census-gated steps wait while the huge file's attempt is
+in flight (its candidate stays pending). That is a wait during each
+attempt, against "unhealthy every generation" on main, not a new blanket
+census regression. A scan that cannot page the file (unsampled or an
+unsupported layout) still counts it oversized, as on main.
 
 **What stays as on main, per file.** Direct O7 routing for descriptors at or
 below 2 GiB at the admission check, and every other route for files at or
@@ -123,19 +141,25 @@ A cursor reduction is retained only with at most 256 distinct usage turns
 change is a full cursor read
 (`over_limit_file_with_257_usage_turns_is_not_retained`).
 
-**Interference with smaller files (slot and census).** There is one cursor
-slot, rotated by whole attempts and non-preemptive, and a cursor job or a
-deferred waiter holds the strict census. One 4 GiB file therefore holds the
-slot for 64 pages per attempt (5.3 h at the 5-minute cadence, 10.7 h idle):
-every other read over 64 MiB that arrives meanwhile (a first read, a
-protected change's Full read, a replaced file) waits up to that long, and the
-census generation grows by 64 pages each time the file is due, which delays
-the census-gated steps (manifest re-publication, backfill completion,
-context-curve settlement, reconciliation). While its job is resident,
-retained copies of small files can be evicted to make room, so their next
-read is a Full read. On main the same mechanisms apply with files of at most
-2 GiB (at most 32 pages per attempt); FC1 removes that ceiling. With no
-Codex file over 2 GiB on the machine, nothing here changes.
+**Interference with smaller files (slot and retention).** There is one
+cursor slot, rotated by whole attempts and non-preemptive. One 4 GiB file
+therefore holds the slot for 64 pages per attempt (5.3 h at the 5-minute
+cadence, 10.7 h idle): every other Codex whole read over 64 MiB that arrives
+meanwhile (a first read, a protected or non-retained change's Full read, a
+replaced file) waits up to that long. While its job is resident, retained
+copies of small files can be evicted to make room, so their next read is a
+Full read. On main the same mechanisms apply with files of at most 2 GiB (at
+most 32 pages per attempt); FC1 removes that ceiling. With no Codex file
+over 2 GiB on the machine, nothing here changes.
+
+*Conditional illustration, not a prediction.* Assume the 5-minute cadence
+(10-minute when idle), no directive, no other slot load, and an active
+non-retained 4 GiB session that changes between its attempts. A 500 MiB
+non-retained active session on the same machine (8 pages per whole read)
+updates about every 45–90 min on main. Under FC1-narrow each of its updates
+can wait for one in-flight 64-page attempt first: about 6–13 h. Other
+cadences, directives, slot load or a quiescent large file give different
+figures.
 
 **The generation fence (K7).** A file whose cursor attempt already completed
 in the current census generation is `Fenced`: its next large read waits for
@@ -216,4 +240,7 @@ On an installed build with the cursor enabled:
 - `cursor_disabled_unsupported_layout == 0`;
 - Codex `oversized_file_count == 0`.
 
-Merging the source is not activating the installed runtime.
+Merging the source is not activating the installed runtime. Publication is
+intended together with Stage 1 prompt continuation (the StateMissing
+investigation's recommendation) and is held on the validator's v5 support
+landing, Q-F3 and the disposition of the system effects.
