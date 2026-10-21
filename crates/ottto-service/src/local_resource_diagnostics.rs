@@ -54,7 +54,6 @@ pub(crate) fn codex_side_lifecycle_totals(source: &str) {
 }
 
 /// The two point lines of one side read (`codex_side_lifecycle::SideReadGuard`).
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side read
 pub(crate) enum SideReadPoint {
     Start { pseq: u64, attempts: u8 },
     End { pseq: u64, abandoned: bool },
@@ -64,7 +63,6 @@ pub(crate) enum SideReadPoint {
 /// best-effort stderr carrier. With `process_id`, a start that has no matching
 /// end before a new `process_id` is the only crash evidence; nothing is
 /// persisted, and no CPU/RSS sample is taken.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side read
 pub(crate) fn side_read_point(point: SideReadPoint) {
     #[derive(Serialize)]
     struct Start {

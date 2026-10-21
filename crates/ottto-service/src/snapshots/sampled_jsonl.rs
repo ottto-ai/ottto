@@ -52,7 +52,6 @@ pub(super) struct CompletedNativeAcquisition {
 crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, unsealed);
 
 /// A side read's certificate (U1a-2a): no retained copy and no cache event.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side exit
 #[allow(clippy::large_enum_variant)] // Moved once to the side exit; never stored.
 pub(super) enum SideCertificate {
     /// `len` is the held file's length when the certificate was committed.
@@ -286,7 +285,6 @@ impl OwnedJsonlParser {
     /// A side read's certificate: `retain_reduction`'s completion gate and
     /// commit, without a retained copy or any `cache_lifecycle` event. It never
     /// touches main's cache; the caller mints the side seal from it.
-    #[cfg_attr(not(test), allow(dead_code))] // first production caller is the side exit
     pub(super) fn certify_without_retention(
         &mut self,
         scope: &Scope,

@@ -57,6 +57,8 @@ mod codex_parent_proof_tests;
 #[cfg(test)]
 mod codex_parent_side_fence_tests;
 #[cfg(test)]
+mod codex_parent_side_read_tests;
+#[cfg(test)]
 mod codex_parent_side_tests;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
@@ -2331,7 +2333,6 @@ pub(in crate::snapshots) struct SideRequest {
     pub(in crate::snapshots) needed_charge: Option<usize>,
 }
 crate::heap_layout_bound::fields!(SideRequest; dev_ino, needed_extent, state, state_extent, state_ctime, attempt_extent, attempt_ctime, attempts, not_before_unix_seconds, needed_charge);
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side charge
 impl SideRequest {
     /// The backoff after the `attempts`-th charged attempt: 60 s doubling,
     /// capped at one hour.
@@ -2389,7 +2390,6 @@ pub(in crate::snapshots) fn codex_parent_side_live(
 /// and G7 must exclude Stage 1 continuation pages (due only when
 /// `gate.side_allowed` and the page is not a continuation). The
 /// continuation hook is the Stage 1 lease's, not added here.
-#[cfg_attr(not(test), allow(dead_code))] // first readers are the side due and G7
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CodexSidePass {
     pub(in crate::snapshots) ns: u128,
@@ -17207,8 +17207,7 @@ enum SideNewObject {
     Rewrite,
 }
 
-/// U1a-2a fence: P as one held FD sees it now.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
+/// U1a-2a fence and side due: P as one held FD sees it now.
 #[derive(Clone, Copy)]
 struct SideNow {
     dev_ino: (u64, u64),
@@ -17645,9 +17644,231 @@ impl ScanIndex {
     }
 }
 
+/// U1a-2a (row 5): the due terms the scan holds for P (rev 16/17 §2.3).
+#[derive(Clone, Copy)]
+pub(in crate::snapshots) struct SideDueTerms {
+    /// The state and sidecar censuses are complete.
+    pub(in crate::snapshots) census_complete: bool,
+    /// P's owning header is current in a complete inventory.
+    pub(in crate::snapshots) header_current: bool,
+    /// Members of P's owner group (≤ 1: not a joined group).
+    pub(in crate::snapshots) owner_members: usize,
+    /// P's reduction dependencies are available.
+    pub(in crate::snapshots) dependencies: bool,
+}
+
+/// U1a-2a (row 16): P's side read in flight. 2a: singleton only.
+pub(in crate::snapshots) struct SideOrigin {
+    /// One `side_read_start` at G7; one `side_read_end` at the exit (or
+    /// `abandoned` if dropped armed).
+    guard: crate::local_resource_diagnostics::codex_side_lifecycle::SideReadGuard,
+    /// P's (dev, ino) when the attempt was charged.
+    dev_ino: (u64, u64),
+}
+crate::heap_layout_bound::fields!(SideOrigin; guard, dev_ino);
+impl SideOrigin {
+    /// A handled exit: the attempt was charged at G7, so nothing else is
+    /// written (rev 16 row 6).
+    pub(in crate::snapshots) fn end(self) {
+        self.guard.end();
+    }
+}
+
+/// U1a-2a (row 29): how P's side read ended.
+pub(in crate::snapshots) enum SideReadEnd {
+    /// Rows 1–3: a certificate, the side seal minted from it, and the held
+    /// file's length at the commit.
+    Certified { parse: SideMainParse, len: u64 },
+    /// Row 5: the source report showed data loss.
+    Lossy,
+    /// Row 6: no certificate otherwise (already charged).
+    Failed,
+}
+
+impl ScanIndex {
+    /// The authoritative view of P's request for object `dev_ino`: the
+    /// current key's ledger entry when it exists (`Removed`/`Gone` = none),
+    /// else the loaded request for the same object.
+    fn side_request_view(
+        &self,
+        p_key: &str,
+        dev_ino: (u64, u64),
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) -> Option<SideRequest> {
+        match side_ledger_entry(side, p_key, dev_ino) {
+            Some(entry) => entry.request(dev_ino),
+            None => self
+                .codex_parent_side_requests
+                .get(p_key)
+                .copied()
+                .filter(|request| request.dev_ino == dev_ino),
+        }
+    }
+
+    /// U1a-2a (rows 5, 9; SCHED): whether P's side request is due now, on
+    /// the authoritative view for P's current object `at`. Reads 0
+    /// transcript bytes. Its only write: a `Live` view worn to
+    /// `SIDE_REQUEST_EVICT_ATTEMPTS` becomes `Evicted` (both stores). Every
+    /// other false term counts `side_not_due`. `terms` is evaluated only
+    /// when P has a `Live` view.
+    ///
+    /// TODO(U1a-2a; `stage1/c14c15-answer.md` §2): a Stage 1 continuation
+    /// page must not be a side due. That hook is the Stage 1 lease's and is
+    /// not added here.
+    pub(in crate::snapshots) fn codex_parent_side_request_due(
+        &mut self,
+        p_key: &str,
+        at: SideNow,
+        now: u64,
+        cache: &sampled_scan::SharedCache,
+        pass: CodexSidePass,
+        terms: impl FnOnce() -> SideDueTerms,
+    ) -> bool {
+        use crate::local_resource_diagnostics::codex_side_lifecycle::{record as count, Event};
+        let side = Some((cache, pass.ns));
+        let entry =
+            side_ledger_entry(side, p_key, at.dev_ino).filter(|e| e.state_extent <= at.size);
+        let view = match entry {
+            Some(entry) => entry.request(at.dev_ino),
+            None => self.codex_parent_side_requests.get(p_key).copied(),
+        };
+        let Some(mut request) = view else {
+            return false;
+        };
+        let same_object = request.dev_ino == at.dev_ino && at.size >= request.state_extent;
+        if request.state != SideRequestState::Live || !same_object {
+            count(Event::NotDue);
+            return false;
+        }
+        if request.attempts >= SIDE_REQUEST_EVICT_ATTEMPTS {
+            request.state = SideRequestState::Evicted;
+            request.state_extent = request.attempt_extent;
+            request.state_ctime = request.attempt_ctime;
+            self.write_side_request(p_key, request, side);
+            count(Event::RequestTombstoned);
+            return false;
+        }
+        let due = pass.gate.side_allowed
+            && request.not_before_unix_seconds <= now
+            && at.size >= request.needed_extent
+            // 2a: singleton only.
+            && at.size <= sampled_scan::codex_cursor::Limits::current().singleton()
+            && {
+                let terms = terms();
+                terms.census_complete
+                    && terms.header_current
+                    && terms.owner_members <= 1
+                    && terms.dependencies
+            };
+        if !due {
+            count(Event::NotDue);
+        }
+        due
+    }
+
+    /// U1a-2a (row 15, G7): charge P's side read at its start, before any
+    /// transcript byte: `attempts += 1`, the backoff, and P's extent and
+    /// ctime now, written to the ledger (the only creator; the caller's
+    /// namespace is never evicted) and then to the index. A refused charge
+    /// (ledger full, layout unsupported) writes nothing and is not due.
+    /// Returns the charged attempts.
+    pub(in crate::snapshots) fn charge_codex_parent_side_read(
+        &mut self,
+        p_key: &str,
+        at: SideNow,
+        now: u64,
+        cache: &sampled_scan::SharedCache,
+        pass: CodexSidePass,
+    ) -> Option<u8> {
+        use crate::local_resource_diagnostics::codex_side_lifecycle::{record as count, Event};
+        let side = Some((cache, pass.ns));
+        let loaded_attempts = self
+            .codex_parent_side_requests
+            .get(p_key)
+            .filter(|request| request.dev_ino == at.dev_ino)
+            .map_or(0, |request| request.attempts);
+        let mut request = self
+            .side_request_view(p_key, at.dev_ino, side)
+            .filter(|request| request.state == SideRequestState::Live)?;
+        request.attempts = request.attempts.saturating_add(1);
+        request.not_before_unix_seconds =
+            now.saturating_add(SideRequest::backoff_seconds(request.attempts));
+        request.attempt_extent = at.size;
+        request.attempt_ctime = at.ctime;
+        let charged = cache.side_ledger().charge(
+            side_ledger_key(pass.ns, p_key, at.dev_ino),
+            sampled_scan::side_ledger::LedgerEntry::of_request(&request),
+            now,
+        );
+        match charged {
+            Err(_) => {
+                count(Event::NotDue);
+                return None;
+            }
+            // `rearm{first_start_in_process}`: a pacing the process had not
+            // seen restarts from the loaded attempts.
+            Ok(true) if pass.gate.first_in_process && loaded_attempts > 0 => {
+                count(Event::RequestRearmed)
+            }
+            Ok(_) => {}
+        }
+        if self.codex_parent_side_requests.get(p_key) != Some(&request) {
+            self.codex_parent_side_requests
+                .insert(p_key.to_owned(), request);
+        }
+        Some(request.attempts)
+    }
+
+    /// U1a-2a (row 29): the side exit's outcome, first match wins (rev 16
+    /// §2.3; row 4 is 2b). A certificate writes P's record through main's
+    /// writer (sealed or held; it cures a covered request: row 1), else
+    /// the request becomes `Unsealed` (row 2) or `Short{covered}` (row 3)
+    /// at the certificate's length. Data loss → `Lossy` (row 5); otherwise
+    /// nothing (row 6: already charged). Every request write is mirrored.
+    pub(in crate::snapshots) fn finish_codex_parent_side_read(
+        &mut self,
+        p_key: &str,
+        dev_ino: (u64, u64),
+        end: SideReadEnd,
+        side: Option<(&sampled_scan::SharedCache, u128)>,
+    ) {
+        use crate::local_resource_diagnostics::codex_side_lifecycle::{record as count, Event};
+        let tombstone = match end {
+            SideReadEnd::Certified { parse, len } => {
+                let covered = parse.seal.sealed_offset();
+                let written = self.write_codex_parent_side_from_main(p_key, &[], parse, side);
+                self.side_request_view(p_key, dev_ino, side)
+                    .map(|mut request| {
+                        request.state = if written {
+                            SideRequestState::Short { covered }
+                        } else {
+                            SideRequestState::Unsealed
+                        };
+                        request.state_extent = len;
+                        request.state_ctime = request.attempt_ctime;
+                        request
+                    })
+            }
+            SideReadEnd::Lossy => {
+                self.side_request_view(p_key, dev_ino, side)
+                    .map(|mut request| {
+                        request.state = SideRequestState::Lossy;
+                        request.state_extent = request.attempt_extent;
+                        request.state_ctime = request.attempt_ctime;
+                        request
+                    })
+            }
+            SideReadEnd::Failed => None,
+        };
+        if let Some(request) = tombstone {
+            self.write_side_request(p_key, request, side);
+            count(Event::RequestTombstoned);
+        }
+    }
+}
+
 /// U1a-2a fence: P's stamp from one fstat of the held FD, cross-checked
 /// against the `OpenStamp` capture (a change in between is unreadable).
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
 fn side_now(file: &File) -> Option<SideNow> {
     let metadata = file.metadata().ok()?;
     let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
@@ -18007,6 +18228,9 @@ struct OwnedActiveFile {
     hold_offset: Option<u64>,
     /// Present while this job replays a Codex file group (P2).
     group: Option<Box<codex_file_join::GroupJob>>,
+    /// U1a-2a (row 16): present while this file is P's side read. Every
+    /// main write on its path is gated; it ends at the side exit.
+    side_origin: Option<SideOrigin>,
 }
 #[allow(clippy::large_enum_variant)] // One active context moves between native collection steps.
 pub(crate) enum OwnedSourceScanStep {
@@ -18959,6 +19183,22 @@ impl OwnedSourceScan {
         }
         let (copy_budget, step_measure) = self.sampled_copy_step();
         if copy_budget == 0 {
+            // U1a-2a G15a: a side read wants no copy. It ends (a charged
+            // attempt), and main's release then runs as it would with no
+            // active file, since main never started P.
+            if self
+                .active_file
+                .as_deref()
+                .is_some_and(|active| active.side_origin.is_some())
+            {
+                if let Some(side) = self
+                    .active_file
+                    .take()
+                    .and_then(|mut active| active.side_origin.take())
+                {
+                    side.end();
+                }
+            }
             // L-A1, M1: the resident bound and active charge from this same
             // walk, before any parse progress, admission or await; never
             // carried to another step.
@@ -19869,6 +20109,12 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(error) => {
+                        // U1a-2a G14a: a side read error is its charged
+                        // attempt; no census line, no dequeue.
+                        if let Some(side) = active.side_origin.take() {
+                            side.end();
+                            pending!();
+                        }
                         // Static reader text only, never a path or content. A
                         // live rollout appended while it is read reports
                         // "acquisition exceeds stable source"; that file is
@@ -19917,7 +20163,10 @@ impl OwnedSourceScan {
                     // that member's proof ends (R2-N1).
                     sampled_scan::codex_cursor::apply_eof_record(&mut active);
                 }
-                if let Some(context) = attribution_context {
+                // U1a-2a B8′: a side read demands no launch workers (its
+                // finish takes no attribution context), so G14b cannot fire.
+                if let Some(context) = attribution_context.filter(|_| active.side_origin.is_none())
+                {
                     let workers = launch_workers_for_parsed(
                         source,
                         active.parser.accumulator.source_session_id.as_deref(),
@@ -19941,7 +20190,8 @@ impl OwnedSourceScan {
                         Ok(true) => {}
                     }
                 }
-                if let Some(context) = sampling.as_mut() {
+                // U1a-2a G10b: a side read is not main's input.
+                if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
                     }
@@ -20175,6 +20425,8 @@ impl OwnedSourceScan {
                         source == SnapshotSource::Codex
                             && active.aliases.is_empty()
                             && sampling.is_some()
+                            // U1a-2a G17a: a side read keeps no memo.
+                            && active.side_origin.is_none()
                     });
                 if memo_offset.is_some() {
                     // The live witness reads two samples of the held file (M3).
@@ -20243,6 +20495,7 @@ impl OwnedSourceScan {
                     charged_bytes: _,
                     hold_offset: _,
                     group,
+                    side_origin,
                 } = *active;
                 if let Some(mut group) = group {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
@@ -20252,6 +20505,13 @@ impl OwnedSourceScan {
                     match replay.finish() {
                         Ok(receipt) => {
                             applied_receipts.insert(local_index_key(&candidate.path), receipt);
+                        }
+                        // U1a-2a G17a: the side read's charged attempt.
+                        Err(_) if side_origin.is_some() => {
+                            if let Some(side) = side_origin {
+                                side.end();
+                            }
+                            pending!();
                         }
                         Err(_) => {
                             if let Some((context, publication)) =
@@ -20283,8 +20543,10 @@ impl OwnedSourceScan {
                     .flatten()
                     .map(|receipt| receipt.retained_bytes())
                     .sum::<usize>();
-                if retained_bytes.saturating_add(incoming_bytes)
-                    > codex_file_join::MAX_RECEIPT_BYTES
+                // U1a-2a G17a: a side read's receipts are never retained.
+                if side_origin.is_none()
+                    && retained_bytes.saturating_add(incoming_bytes)
+                        > codex_file_join::MAX_RECEIPT_BYTES
                 {
                     if let Some((context, publication)) =
                         sampling.as_ref().zip(cursor_publication.take())
@@ -20337,7 +20599,9 @@ impl OwnedSourceScan {
                             },
                         )
                     })
-                } else if let Some(acquisition) = file_sampling.as_ref() {
+                } else if let Some(acquisition) =
+                    file_sampling.as_ref().filter(|_| side_origin.is_none())
+                {
                     // Known dependencies and the current path are separate from the
                     // sampled prefix promise. Neither may be stale at completion.
                     let current_scope = sampled_scan::reduction_dependencies(
@@ -20396,6 +20660,39 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
+                // U1a-2a G17b + C9′: a side read's certificate, without
+                // retention or any cache event; the same path must still name
+                // the object. Its failures are its charged attempt.
+                let mut side_certificate = None;
+                if let Some(acquisition) = file_sampling.as_ref().filter(|_| side_origin.is_some())
+                {
+                    let mut current_path = candidate.clone();
+                    let same_object =
+                        open_candidate_file(source, &mut current_path).is_ok_and(|_| {
+                            current_path.opened_object_identity == candidate.opened_object_identity
+                        });
+                    let certified = same_object
+                        .then(|| {
+                            parser
+                                .certify_without_retention(
+                                    &acquisition.scope,
+                                    sampled_scan::now_seconds(),
+                                )
+                                .ok()
+                        })
+                        .flatten();
+                    let Some(certified) = certified else {
+                        if let Some(side) = side_origin {
+                            side.end();
+                        }
+                        pending!();
+                    };
+                    let stamp = sampled_scan::codex_cursor::OpenStamp::capture(
+                        parser.reader.reader.get_ref(),
+                    )
+                    .ok();
+                    side_certificate = Some((certified, stamp));
+                }
                 // U1a-2a (row 8): the held FD's stamp for P's side record, at or
                 // after the commit.
                 let side_parsed_stamp = completed_acquisition
@@ -20453,7 +20750,8 @@ impl OwnedSourceScan {
                     source_file_fingerprint.clone(),
                     (source == SnapshotSource::Codex).then_some(&codex_title_metadata),
                     (source == SnapshotSource::ClaudeCode).then_some(&claude_title_metadata),
-                    attribution_context,
+                    // U1a-2a B8′: a side read takes no attribution context.
+                    attribution_context.filter(|_| side_origin.is_none()),
                 );
                 // A committed cursor attempt counts as published only now (M4).
                 if let Some((context, publication)) =
@@ -20465,6 +20763,13 @@ impl OwnedSourceScan {
                 }
                 let mut parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
+                    // U1a-2a G17b: the side read's charged attempt.
+                    Err(_) if side_origin.is_some() => {
+                        if let Some(side) = side_origin {
+                            side.end();
+                        }
+                        pending!();
+                    }
                     Err(_) => {
                         if source == SnapshotSource::ClaudeCode {
                             claude_request_census::invalidate_claude_request_census(
@@ -20476,6 +20781,42 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
+                // U1a-2a (row 29) side exit, before any main write of the
+                // completion: P's record or request only, from the first
+                // matching outcome row; then the read's end line.
+                if let Some(side) = side_origin {
+                    use sampled_jsonl::SideCertificate;
+                    let end = match side_certificate {
+                        Some((SideCertificate::Certified { completed, len }, Some(parsed))) => {
+                            SideReadEnd::Certified {
+                                parse: SideMainParse {
+                                    seal: completed.checkpoint.seal_as(
+                                        sampled_scan::now_seconds(),
+                                        &codex_parent_side_scope(),
+                                    ),
+                                    parsed,
+                                    verdict: codex_parent_side_verdict(&parsed_file),
+                                    unsealed: completed.unsealed,
+                                },
+                                len,
+                            }
+                        }
+                        Some((SideCertificate::Lossy, _)) => SideReadEnd::Lossy,
+                        _ => SideReadEnd::Failed,
+                    };
+                    let ledger = sampling
+                        .as_ref()
+                        .zip(codex_side_pass)
+                        .map(|(context, pass)| (&*context.cache, pass.ns));
+                    index.finish_codex_parent_side_read(
+                        &local_index_key(&candidate.path),
+                        side.dev_ino,
+                        end,
+                        ledger,
+                    );
+                    side.end();
+                    pending!();
+                }
                 if let Some(receipts) = codex_counting_receipts {
                     census.codex_counting_v2 = Some(receipts);
                 }
@@ -22133,10 +22474,62 @@ impl OwnedSourceScan {
                     &identified_candidates,
                 );
             }
+            // U1a-2a (row 9): P's side read, when main skips an unchanged P
+            // that owes no PR-P reparse and its side request is due. Every
+            // main write on its path is gated (G2–G17); it ends at the side
+            // exit.
+            let mut side_plan = None;
             if source == SnapshotSource::Codex && decision == CandidateDecision::Skip {
                 let shared = codex_parent_ownership_ledgers.as_ref();
                 let owed = codex_parent_reparse_owed_ids(index, shared, &candidate.path);
-                if !owed.is_empty() && index.terminal_jsonl_loss(&candidate).is_none() {
+                if owed.is_empty()
+                    && index
+                        .codex_parent_side_requests
+                        .contains_key(&local_index_key(&candidate.path))
+                    && index.terminal_jsonl_loss(&candidate).is_none()
+                {
+                    if let Some(((context, pass), at)) = sampling
+                        .as_ref()
+                        .zip(codex_side_pass)
+                        .zip(side_now(&opened_file))
+                    {
+                        let terms = || SideDueTerms {
+                            census_complete: state_census_complete && sidecar_census_complete,
+                            header_current: codex_join_inventory.as_ref().is_some_and(
+                                |inventory| {
+                                    inventory.complete
+                                        && inventory
+                                            .headers
+                                            .iter()
+                                            .any(|header| header.candidate.path == candidate.path)
+                                },
+                            ),
+                            owner_members: sampled_scan::codex_cursor::owner_members(
+                                codex_join_inventory.as_ref(),
+                                &candidate.path,
+                            ),
+                            dependencies: sampled_scan::reduction_dependencies(
+                                source,
+                                &candidate,
+                                &codex_title_metadata,
+                                &claude_title_metadata,
+                                claude_effort_support_dir_ref,
+                            )
+                            .is_some(),
+                        };
+                        if index.codex_parent_side_request_due(
+                            &local_index_key(&candidate.path),
+                            at,
+                            sampled_scan::now_seconds(),
+                            &context.cache,
+                            pass,
+                            terms,
+                        ) {
+                            side_plan = Some(at);
+                            decision = CandidateDecision::Parse;
+                        }
+                    }
+                } else if !owed.is_empty() && index.terminal_jsonl_loss(&candidate).is_none() {
                     // An unresolved child requested this unchanged parent after
                     // its earlier page had already passed. Reparse only that
                     // parent to populate bounded structural evidence.
@@ -22228,7 +22621,12 @@ impl OwnedSourceScan {
                     &candidate.path,
                 )
                 .is_empty();
-                let entry = context.cache.memo_lookup(&memo_key);
+                // U1a-2a G2: a side read makes no memo lookup or event.
+                let entry = if side_plan.is_some() {
+                    None
+                } else {
+                    context.cache.memo_lookup(&memo_key)
+                };
                 // PR-P widens PR-1's `has_own_ledger()` condition to every
                 // entry: a held parent without its own ledger must also fire
                 // event (b).
@@ -22360,18 +22758,24 @@ impl OwnedSourceScan {
                 // A parked `JoinStateBound` file is not read again until it
                 // is replaced, shrunk or edited, or its reduction dependencies
                 // change; growth cannot cure it (§c.2, M-2).
-                let parked = context.cache.cursor_parked(
-                    &key,
-                    &opened_file,
-                    sampled_scan::reduction_dependencies(
-                        source,
-                        &candidate,
-                        &codex_title_metadata,
-                        &claude_title_metadata,
-                        claude_effort_support_dir_ref,
-                    )
-                    .as_deref(),
-                );
+                // U1a-2a G3: a side read never touches the parked set.
+                let parked = side_plan
+                    .is_none()
+                    .then(|| {
+                        context.cache.cursor_parked(
+                            &key,
+                            &opened_file,
+                            sampled_scan::reduction_dependencies(
+                                source,
+                                &candidate,
+                                &codex_title_metadata,
+                                &claude_title_metadata,
+                                claude_effort_support_dir_ref,
+                            )
+                            .as_deref(),
+                        )
+                    })
+                    .flatten();
                 if let Some(disclosure) = parked {
                     let keep_previous = decision != CandidateDecision::ReconcileLegacy
                         && !index.effective_upload_body_witness_revision_requires_adoption(&key);
@@ -22409,8 +22813,18 @@ impl OwnedSourceScan {
                 // consumed: the optimistic read is the tail extent when a
                 // retained entry exists, the whole file otherwise.
                 let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
-                let expected =
-                    extent.saturating_sub(context.cache.retained_sealed_offset(&key).unwrap_or(0));
+                // U1a-2a G4a: a side read is a full read with no retained
+                // state, and 2a reads only a singleton (otherwise main's Skip).
+                let expected = if side_plan.is_some() {
+                    extent
+                } else {
+                    extent.saturating_sub(context.cache.retained_sealed_offset(&key).unwrap_or(0))
+                };
+                if side_plan.is_some()
+                    && expected > sampled_scan::codex_cursor::Limits::current().singleton()
+                {
+                    pending!();
+                }
                 match context.cache.cursor_plan(
                     &mut codex_page,
                     sampled_scan::codex_cursor::Limits::current(),
@@ -22421,6 +22835,10 @@ impl OwnedSourceScan {
                     &key,
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
                 ) {
+                    // U1a-2a G4a: a side deferral writes nothing (uncharged).
+                    sampled_scan::codex_cursor::StartPlan::Defer if side_plan.is_some() => {
+                        pending!()
+                    }
                     sampled_scan::codex_cursor::StartPlan::Defer => {
                         context.cache.cursor_note_deferred();
                         sampled_scan::codex_cursor::requeue(
@@ -22466,7 +22884,34 @@ impl OwnedSourceScan {
             } else {
                 None
             };
-            scanned_file_count += 1;
+            // U1a-2a G5: a side read is not a scanned file.
+            if side_plan.is_none() {
+                scanned_file_count += 1;
+            }
+            // U1a-2a G7 (row 15): the side read's charge and start line,
+            // before the parser or any acquisition reads P. A refused charge
+            // is main's Skip (nothing written).
+            let mut side_origin = None;
+            if let Some(at) = side_plan {
+                let Some((context, pass)) = sampling.as_ref().zip(codex_side_pass) else {
+                    pending!();
+                };
+                let Some(attempts) = index.charge_codex_parent_side_read(
+                    &local_index_key(&candidate.path),
+                    at,
+                    sampled_scan::now_seconds(),
+                    &context.cache,
+                    pass,
+                ) else {
+                    pending!();
+                };
+                side_origin = Some(SideOrigin {
+                    guard: crate::local_resource_diagnostics::codex_side_lifecycle::SideReadGuard::start(
+                        attempts,
+                    ),
+                    dev_ino: at.dev_ino,
+                });
+            }
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
             let projection_adoption_required = index
@@ -22494,6 +22939,13 @@ impl OwnedSourceScan {
                 index,
             ) {
                 Ok(parser) => parser,
+                // U1a-2a G6: the side read's charged attempt; no census line.
+                Err(_) if side_origin.is_some() => {
+                    if let Some(side) = side_origin {
+                        side.end();
+                    }
+                    pending!();
+                }
                 Err(_) => {
                     if source == SnapshotSource::ClaudeCode {
                         claude_request_census::invalidate_claude_request_census(
@@ -22510,7 +22962,37 @@ impl OwnedSourceScan {
             // Counted once the page actually reads the file (R2-M3): a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
-            if let Some(context) = sampling.as_mut() {
+            // U1a-2a G7: a side read's acquisition is a fresh `Full` read
+            // under the side scope: no retained take, no admission observes
+            // or counters, no debt. Failures are its charged attempt.
+            if side_origin.is_some() {
+                // Defensive: a compressed input has no physical offsets or
+                // samples (no production open builds one today).
+                if parser.reader.reader.is_compressed() {
+                    if let Some(side) = side_origin {
+                        side.end();
+                    }
+                    pending!();
+                }
+                let scope = codex_parent_side_scope();
+                match parser.prepare_acquisition(None, &scope, None, sampled_scan::now_seconds()) {
+                    Ok(mode) => {
+                        sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
+                        file_sampling = Some(sampled_scan::Active {
+                            key: local_index_key(&candidate.path),
+                            scope,
+                            mode,
+                            audit_due: None,
+                        });
+                    }
+                    Err(_) => {
+                        if let Some(side) = side_origin {
+                            side.end();
+                        }
+                        pending!();
+                    }
+                }
+            } else if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
                 let retained = context.cache.take(&key);
                 let retained_present = retained.is_some();
@@ -22748,6 +23230,7 @@ impl OwnedSourceScan {
                 charged_bytes: 0,
                 hold_offset: None,
                 group: None,
+                side_origin,
             });
             if let Some(context) = sampling
                 .as_ref()
@@ -22767,6 +23250,33 @@ impl OwnedSourceScan {
                     }
                     _ => extent,
                 };
+                // U1a-2a (row 18): a side read is a singleton read (2a); any
+                // other plan is its charged attempt, with no counter,
+                // requeue or census write (G4b, G5, G9, A20).
+                if active.side_origin.is_some() {
+                    let plan = (expected
+                        <= sampled_scan::codex_cursor::Limits::current().singleton())
+                    .then(|| {
+                        context.cache.cursor_plan(
+                            &mut codex_page,
+                            sampled_scan::codex_cursor::Limits::current(),
+                            expected,
+                            false,
+                            crate::heap_layout_bound::layout_supported(),
+                            &context.namespace,
+                            &local_index_key(&active.candidate.path),
+                            sampled_scan::codex_cursor::census_token(index).as_deref(),
+                        )
+                    });
+                    if plan != Some(sampled_scan::codex_cursor::StartPlan::Singleton) {
+                        if let Some(side) = active.side_origin.take() {
+                            side.end();
+                        }
+                        pending!();
+                    }
+                    active_file = Some(active);
+                    pending!();
+                }
                 let defer = match context.cache.cursor_plan(
                     &mut codex_page,
                     sampled_scan::codex_cursor::Limits::current(),
@@ -72698,7 +73208,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_only_bytes, body_witness_adoption_deferred, body_witness_adoption_excluded, body_witness_adoption_held_no_list, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
