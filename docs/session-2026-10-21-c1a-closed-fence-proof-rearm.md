@@ -115,17 +115,34 @@ a BASE arm that refuses the budget:
 - shed and lost-ACK traversals, including an interrupted full re-arm
   terminal page, keep the latch;
 - late copied import with the skip active;
-- a receipt-only disclosure of the late-row-after-family-pages residual.
+- late API row after the family's pages of a window that reads the family:
+  the changed witness keeps the re-arm, and liveness equals BASE;
+- late API row between windows: both arms hold the family identically;
+- a receipt-only disclosure of the dormant-window residual (late row and
+  member growth).
 
 No local tests or builds were run. Results are CI-only.
 
 ## Residuals
 
-- **Late change after a skip.** A family skipped at one terminal is not
-  re-read in the next window. If its evidence changes after its pages in that
-  window, BASE would re-prove it at the terminal. The fix instead reconstructs
-  it against the earlier witness in the following window. The receipt test
-  records both arms.
+- **Change to a dormant family.** A family skipped at one terminal is not
+  re-read in the next window. Suppose its API rows or a member transcript
+  change after its directory was walked in that window and before its
+  terminal page. BASE read the family on that window's earlier pages, so its
+  terminal re-proves the family from that window's pending and the new rows.
+  The fix has no current pending for the family, so its next window
+  reconstructs against the earlier witness and goes to RetryPending. This is
+  the existing held path for any dormant witnessed family.
+  - Re-arming the family at that terminal would not help. The re-read
+    still reconstructs against the earlier witness, as the between-windows
+    control shows for BASE.
+  - A sidecar change in a window that does read the family already keeps
+    the BASE re-arm: the re-proved witness differs, so the unchanged-proof
+    check fails.
+  - Parity would need a terminal re-proof from the carried pending, which
+    promotes stale evidence to currentness. It would also need a traversal
+    change. Neither is in this slice.
+  - The receipt test records both arms.
 - **Closed-fence reopen with other unread files.** When an unrelated
   unchanged file is also unobserved, neither arm reopens before the
   closed-fence full re-arm. The late-copy test checks that both arms reopen in

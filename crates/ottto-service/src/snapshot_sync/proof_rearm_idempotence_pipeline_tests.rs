@@ -1070,78 +1070,195 @@ fn c1a_late_copied_import_stays_suppressed_while_skip_active() {
     assert_eq!(postures, base_postures);
 }
 
-/// Disclosure, not a pass/fail claim on either arm: the liveness residual.
-/// With the skip active, the family's root API rows change (account evidence
-/// added) either after the family's pages of a multi-page window and before
-/// its terminal page (`mid_window`), or between two windows
-/// (`between_windows`). Mid-window, BASE re-read the family in that window and
-/// re-proves it at the terminal; the fix did not read it, so its next window
-/// reconstructs against the earlier witness. The receipts record both arms'
-/// RetryPending and census state per window for the report.
+/// Rewrite the root API sidecar so that every row gains account evidence.
+/// The reduced evidence fingerprint changes, so a retained witness no longer
+/// reconstructs, and the sidecar stats change, so M1 re-selects the family.
+fn c1a_late_account_row(fixture: &RearmFixture) {
+    use sha2::{Digest, Sha256};
+    let path = fixture.sidecar_path("claude-code-effort");
+    let rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+                serde_json::from_str(line).unwrap();
+            row.account_identity_checked = true;
+            row.account_identifier_hash = Some("a".repeat(64));
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            serde_json::to_string(&row).unwrap() + "\n"
+        })
+        .collect::<String>();
+    std::fs::write(&path, rows).unwrap();
+}
+
+/// Each window's liveness state: RetryPending, census completion and family
+/// bodies offered.
+fn c1a_liveness(windows: &[C1aWindow]) -> Vec<(bool, bool, usize)> {
+    windows
+        .iter()
+        .map(|window| {
+            (
+                window.retry_pending,
+                window.census_complete,
+                window.family_offered,
+            )
+        })
+        .collect()
+}
+
+/// Liveness control, option (c)'s case: the root API rows change after the
+/// family's pages and before the terminal page of a window that reads the
+/// family. That terminal re-proves the family from this window's pending and
+/// the new rows, so its witness changes and the unchanged-proof check keeps
+/// the BASE re-arm; the next window reconstructs against the new witness. No
+/// arm goes to RetryPending and every window is complete, as under BASE.
 #[test]
 #[serial(source_manifests)]
-fn c1a_residual_late_row_after_family_pages_receipt() {
-    use sha2::{Digest, Sha256};
-    if !c1a_layout_supported("c1a_residual_late_row") {
+fn c1a_late_row_in_read_window_rearms_like_base() {
+    if !c1a_layout_supported("c1a_late_row_in_read_window") {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let late_row = |fixture: &RearmFixture| {
-        let path = fixture.sidecar_path("claude-code-effort");
-        let rows = std::fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| {
-                let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
-                    serde_json::from_str(line).unwrap();
-                row.account_identity_checked = true;
-                row.account_identifier_hash = Some("a".repeat(64));
-                row.fingerprint.clear();
-                row.fingerprint = format!(
-                    "sha256:{:x}",
-                    Sha256::digest(serde_json::to_vec(&row).unwrap())
-                );
-                serde_json::to_string(&row).unwrap() + "\n"
-            })
-            .collect::<String>();
-        std::fs::write(&path, rows).unwrap();
+    let family = rearm_family_sessions().len();
+    let run = |fixture: &RearmFixture, arm: &str| {
+        let closing = c1a_window(&c1a_generation(fixture, arm, (8, 0)));
+        assert!(closing.fence_after && closing.full_rearm, "{arm}");
+        let changed = c1a_window(&c1a_generation_with(
+            fixture,
+            arm,
+            (8, 10),
+            None,
+            |number| {
+                // After both family pages, before the terminal page.
+                if number == 2 {
+                    c1a_late_account_row(fixture);
+                }
+            },
+        ));
+        let [next, after] =
+            [(8, 20), (8, 30)].map(|clock| c1a_window(&c1a_generation(fixture, arm, clock)));
+        [changed, next, after]
     };
-    let run = |fixture: &RearmFixture, arm: &str, mid_window: bool| {
+    let fixture = c1a_fixture("c1a-late-row-read-window");
+    let windows = run(&fixture, "fix");
+    let base = c1a_fixture("c1a-late-row-read-window-base");
+    let base_windows = {
+        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
+        run(&base, "base")
+    };
+    // The changed window equals BASE, re-arm included.
+    assert_eq!(windows[0], base_windows[0]);
+    assert!(windows[0].fence_before && windows[0].fence_after);
+    assert_eq!(windows[0].family_reads, family);
+    assert_eq!(windows[0].debt, family, "a changed witness never skips");
+    assert_eq!(c1a_liveness(&windows), c1a_liveness(&base_windows));
+    assert!(
+        windows
+            .iter()
+            .all(|window| !window.retry_pending && window.census_complete),
+        "no RetryPending entry and every census completes"
+    );
+    assert_eq!(windows[1].family_offered, family, "re-emitted at once");
+}
+
+/// Liveness control, between windows: with the skip active, the root API
+/// rows change after one terminal and before the next window. Both arms
+/// re-select the family through M1 and reconstruct it against the witness the
+/// earlier terminal proved, so both hold it identically. Only the re-arm debt
+/// differs: BASE re-armed the family at that terminal and the fix skipped it.
+#[test]
+#[serial(source_manifests)]
+fn c1a_late_row_between_windows_equals_base() {
+    if !c1a_layout_supported("c1a_late_row_between_windows") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let run = |fixture: &RearmFixture, arm: &str| {
         c1a_close_and_reprove(fixture, arm);
-        if !mid_window {
-            late_row(fixture);
-        }
+        c1a_late_account_row(fixture);
+        [(8, 20), (8, 30), (8, 40)].map(|clock| c1a_window(&c1a_generation(fixture, arm, clock)))
+    };
+    let fixture = c1a_fixture("c1a-late-row-between");
+    let windows = run(&fixture, "fix");
+    let base = c1a_fixture("c1a-late-row-between-base");
+    let base_windows = {
+        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
+        run(&base, "base")
+    };
+    for (window, base_window) in windows.iter().zip(&base_windows) {
+        assert_eq!(
+            C1aWindow {
+                debt: base_window.debt,
+                ..window.clone()
+            },
+            *base_window
+        );
+    }
+    assert_eq!(windows[0].family_reads, rearm_family_sessions().len());
+}
+
+/// Disclosure, not a pass/fail claim on either arm: the dormant-window
+/// residual. The skip at 08:10 leaves the family unread at 08:20. A change
+/// to it then lands after its directory was walked and before the 08:20
+/// terminal page: the root API rows gain account evidence (`late_row`), or
+/// one subagent gains a request in its transcript and both sidecars
+/// (`member_growth`). BASE read the family on 08:20's earlier pages, so its
+/// terminal re-proves the family from that window's pending and the new rows.
+/// The fix has no 08:20 pending for the family, so its next window
+/// reconstructs against the 08:10 witness. A re-arm at the 08:20 terminal
+/// would not change that: the between-windows control shows a re-armed
+/// family going to RetryPending the same way. The receipts record both arms'
+/// state per window for the report.
+#[test]
+#[serial(source_manifests)]
+fn c1a_residual_dormant_family_change_receipt() {
+    if !c1a_layout_supported("c1a_residual_dormant_change") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let run = |fixture: &RearmFixture, arm: &str, member_growth: bool| {
+        c1a_close_and_reprove(fixture, arm);
         [(8, 20), (8, 30), (8, 40)].map(|clock| {
             c1a_window(&c1a_generation_with(fixture, arm, clock, None, |number| {
-                if mid_window && clock == (8, 20) && number == 2 {
-                    late_row(fixture);
+                if clock == (8, 20) && number == 2 {
+                    if member_growth {
+                        fixture.append_family_request(Some(REARM_AGENTS[0]), "req_agent_a_2", 4, 5);
+                    } else {
+                        c1a_late_account_row(fixture);
+                    }
                 }
             }))
         })
     };
-    for (timing, mid_window) in [("mid_window", true), ("between_windows", false)] {
-        let fixture = c1a_fixture(if mid_window {
-            "c1a-residual-late-row"
+    for (change, member_growth) in [("late_row", false), ("member_growth", true)] {
+        let fixture = c1a_fixture(if member_growth {
+            "c1a-residual-dormant-growth"
         } else {
-            "c1a-residual-late-row-between"
+            "c1a-residual-dormant-row"
         });
-        let fix = run(&fixture, "fix", mid_window);
-        let base = c1a_fixture(if mid_window {
-            "c1a-residual-late-row-base"
+        let fix = run(&fixture, "fix", member_growth);
+        let base = c1a_fixture(if member_growth {
+            "c1a-residual-dormant-growth-base"
         } else {
-            "c1a-residual-late-row-between-base"
+            "c1a-residual-dormant-row-base"
         });
         let base = {
             let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-            run(&base, "base", mid_window)
+            run(&base, "base", member_growth)
         };
         writeln!(
             std::io::stderr().lock(),
-            "C1A_PROOF_REARM residual=late_row timing={timing} fix_retry_pending={:?} base_retry_pending={:?} fix_census_complete={:?} base_census_complete={:?} fix_family_offered={:?} base_family_offered={:?}",
+            "C1A_PROOF_REARM residual=dormant_change change={change} fix_retry_pending={:?} base_retry_pending={:?} fix_census_complete={:?} base_census_complete={:?} fix_family_reads={:?} base_family_reads={:?} fix_family_offered={:?} base_family_offered={:?}",
             fix.each_ref().map(|window| window.retry_pending),
             base.each_ref().map(|window| window.retry_pending),
             fix.each_ref().map(|window| window.census_complete),
             base.each_ref().map(|window| window.census_complete),
+            fix.each_ref().map(|window| window.family_reads),
+            base.each_ref().map(|window| window.family_reads),
             fix.each_ref().map(|window| window.family_offered),
             base.each_ref().map(|window| window.family_offered),
         )
