@@ -571,6 +571,18 @@ fn main_writes_p_side_record_only_when_live_or_present() {
     index.codex_parent_ownership_refs.insert(ids[0].clone());
     // Unsealed and settled: nothing, even when live.
     assert!(!write(&mut index, main_parse(&parent, SideVerdict::Settled, true)).0);
+    // A group certificate that gave no unsealed bit is unsealed
+    // (increment-14 disclosure 4): a settled group write is then refused.
+    assert!(codex_group_side_unsealed(None));
+    assert!(!codex_group_side_unsealed(Some(false)));
+    let missing = codex_group_side_unsealed(None);
+    assert!(
+        !write(
+            &mut index,
+            main_parse(&parent, SideVerdict::Settled, missing)
+        )
+        .0
+    );
     let (written, counts) = write(&mut index, main_parse(&parent, SideVerdict::Settled, false));
     assert!(written);
     assert_eq!(counts.side_records_written, 1);
@@ -706,6 +718,14 @@ fn a_terminal_disclosure_refreshes_an_existing_record_to_held_only() {
     assert!(!written);
     assert_eq!(counts, Counts::default());
     assert!(index.codex_parent_side.is_empty());
+    // Update-only hides no owed work: without a record the next use of P
+    // is `Unknown` and arms P's request, as without the disclosure.
+    let mut fenced = Parent::new("disclosed-absent", 9_000);
+    assert_eq!(fenced.fence(&mut index, 1, now()).0, SideFence::Unknown);
+    assert_eq!(
+        index.codex_parent_side_requests[KEY].state,
+        SideRequestState::Live
+    );
     // Not live: the verdict flips and takes a new generation; the epoch is kept.
     let mut index = with_record(parent.record(SideVerdict::Settled, now()));
     index.codex_parent_proof_wrap_epoch = 4;

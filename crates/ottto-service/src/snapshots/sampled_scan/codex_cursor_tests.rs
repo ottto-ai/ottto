@@ -8436,7 +8436,11 @@ fn proof_drops(counts: crate::local_resource_diagnostics::codex_side_lifecycle::
 }
 
 fn next_page(cache: &SharedCache) {
-    PageBudget::default().note_page(cache);
+    next_page_in(cache, "ns");
+}
+
+fn next_page_in(cache: &SharedCache, namespace: &str) {
+    PageBudget::default().note_page(cache, &Scope(namespace.into()));
 }
 
 /// cc rows 1–2: a suspended proof is charged exactly its walked bound, and
@@ -8639,13 +8643,14 @@ fn proof_take_is_mine_busy_stale_or_mismatched() {
 fn a_due_page_that_missed_the_proof_hook_is_counted_at_the_next_tick() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
     let cache = Arc::new(SharedCache::default());
+    let ns = Scope("ns".into());
     next_page(&cache);
-    cache.note_proof_hook(true);
+    cache.note_proof_hook(&ns, true);
     let ((), counts) = observe(|| next_page(&cache));
     assert_eq!(proof_drops(counts), 0, "the hook ran on that page");
     let ((), counts) = observe(|| next_page(&cache));
     assert_eq!(proof_drops(counts), 1, "due, hook missed");
-    cache.note_proof_hook(false);
+    cache.note_proof_hook(&ns, false);
     let ((), counts) = observe(|| {
         next_page(&cache);
         next_page(&cache);
@@ -8653,10 +8658,43 @@ fn a_due_page_that_missed_the_proof_hook_is_counted_at_the_next_tick() {
     assert_eq!(proof_drops(counts), 0, "nothing due");
     // One tick per scan object, as the page clock.
     let mut page = PageBudget::default();
-    cache.note_proof_hook(true);
-    page.note_page(&cache);
-    let ((), counts) = observe(|| page.note_page(&cache));
+    cache.note_proof_hook(&ns, true);
+    page.note_page(&cache, &ns);
+    let ((), counts) = observe(|| page.note_page(&cache, &ns));
     assert_eq!(proof_drops(counts), 0);
+}
+
+/// Increment-14 disclosure: the due flag never crosses namespaces. Another
+/// namespace's pages neither count nor clear it, its own "nothing due" hook
+/// leaves it, and it gates nothing but the diagnostic count (no pacing or
+/// admission reads it; per-request pacing stays in the index entries).
+#[test]
+fn the_proof_due_flag_is_per_namespace() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    let cache = Arc::new(SharedCache::default());
+    let (x, y) = (Scope("x".into()), Scope("y".into()));
+    cache.note_proof_hook(&x, true);
+    let ((), counts) = observe(|| {
+        next_page_in(&cache, "y");
+        next_page_in(&cache, "y");
+    });
+    assert_eq!(proof_drops(counts), 0, "y never had due work");
+    cache.note_proof_hook(&y, false);
+    let ((), counts) = observe(|| next_page_in(&cache, "x"));
+    assert_eq!(proof_drops(counts), 0, "x's page reached its hook");
+    let ((), counts) = observe(|| next_page_in(&cache, "x"));
+    assert_eq!(proof_drops(counts), 1, "x due, x's hook missed");
+    cache.note_proof_hook(&x, false);
+    let ((), counts) = observe(|| next_page_in(&cache, "x"));
+    assert_eq!(proof_drops(counts), 0);
+    // A due hook in y replaces x's entry: x is then never counted.
+    cache.note_proof_hook(&x, true);
+    cache.note_proof_hook(&y, true);
+    let ((), counts) = observe(|| {
+        next_page_in(&cache, "x");
+        next_page_in(&cache, "x");
+    });
+    assert_eq!(proof_drops(counts), 0, "under-count only");
 }
 
 /// cc row 4: the step needs `PROOF_STEP_HEADROOM_BYTES` beside the context

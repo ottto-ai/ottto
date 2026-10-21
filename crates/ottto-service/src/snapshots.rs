@@ -17557,6 +17557,13 @@ impl ScanIndex {
     }
 }
 
+/// U1a-2a (row 8, group live member): the unsealed bit of a certified
+/// group job's side write. A certificate that gave none is unsealed
+/// (fail-closed: an unsealed settled parse writes no record).
+pub(in crate::snapshots) fn codex_group_side_unsealed(certified: Option<bool>) -> bool {
+    certified.unwrap_or(true)
+}
+
 /// U1a-2a (row 8): one of main's certified parses of P, as P's side writer
 /// sees it.
 pub(in crate::snapshots) struct SideMainParse {
@@ -19980,7 +19987,7 @@ impl OwnedSourceScan {
                 // on an error path; dropping the lease frees the slot.
                 codex_cursor_lease = None;
                 if let Some(context) = sampling.as_ref() {
-                    codex_page.note_page(&context.cache);
+                    codex_page.note_page(&context.cache, &context.namespace);
                 }
                 // E2: at most one resume attempt per page, and none on a page
                 // that selected no candidates (no header inventory: no
@@ -21039,7 +21046,11 @@ impl OwnedSourceScan {
                     })
                     .or_else(|| {
                         side_group_parse.map(|(seal, parsed)| {
-                            (seal, parsed, cursor_side_unsealed.unwrap_or(true))
+                            (
+                                seal,
+                                parsed,
+                                codex_group_side_unsealed(cursor_side_unsealed),
+                            )
                         })
                     });
                 if let Some((seal, parsed, unsealed)) = side_seal {

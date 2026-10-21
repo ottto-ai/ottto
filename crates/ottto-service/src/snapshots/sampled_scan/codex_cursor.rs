@@ -278,13 +278,19 @@ impl PageBudget {
 
     /// Advance the cursor page clock once per scan object (K7, K10). The
     /// diagnostics window opens under this same lock (no extra lock).
-    pub(in crate::snapshots) fn note_page(&mut self, cache: &SharedCache) {
+    pub(in crate::snapshots) fn note_page(&mut self, cache: &SharedCache, namespace: &Scope) {
         if !std::mem::replace(&mut self.page_noted, true) {
             let mut skipped = false;
             self.window_start = cache.with_cursor(|cursor| {
-                // U1a-2a (cc row 8): the page that just ended had proof work
-                // due but never reached the proof hook.
-                skipped = cursor.proof_due && cursor.proof_hook_page != Some(cursor.rotation.page);
+                // U1a-2a (cc row 8): this namespace's previous page had proof
+                // work due but never reached the proof hook. Another
+                // namespace's page neither counts nor clears it. The count is
+                // diagnostic only: no pacing or admission reads it.
+                if let Some((due_namespace, reached)) = cursor.proof_due.as_mut() {
+                    if *due_namespace == namespace.0 {
+                        skipped = !std::mem::replace(reached, false);
+                    }
+                }
                 cursor.rotation.page = cursor.rotation.page.saturating_add(1);
                 cursor.proof_rotation.page = cursor.rotation.page;
                 Box::new(cursor.counters)
@@ -1322,10 +1328,10 @@ pub(in crate::snapshots) struct CursorState {
     /// U1a-2a (cc row 1): proof batches' rotation (the `Rotation` shape;
     /// its page follows `rotation.page`).
     proof_rotation: Rotation,
-    /// U1a-2a (cc row 8): the page the proof hook last ran on, and whether
-    /// it found proof work due.
-    proof_hook_page: Option<u64>,
-    proof_due: bool,
+    /// U1a-2a (cc row 8): the namespace whose proof hook last found proof
+    /// work due, and whether its current page reached the hook. One entry:
+    /// a later namespace's due hook replaces it (under-counting only).
+    proof_due: Option<(String, bool)>,
 }
 
 impl Default for CursorState {
@@ -1350,8 +1356,7 @@ impl Default for CursorState {
             parent_restarts: ParentRestarts::default(),
             proof: ProofHolder::None,
             proof_rotation: Rotation::default(),
-            proof_hook_page: None,
-            proof_due: false,
+            proof_due: None,
         }
     }
 }
@@ -1378,7 +1383,6 @@ impl HeapLayoutBound for CursorState {
             parent_restarts,
             proof,
             proof_rotation,
-            proof_hook_page,
             proof_due,
         } = self;
         // The paused job was walked once when it paused; its charge stays
@@ -1407,7 +1411,6 @@ impl HeapLayoutBound for CursorState {
         // U1a-2a: a suspended proof is charged its walked bound.
         proof.heap_bound(c)?;
         proof_rotation.heap_bound(c)?;
-        proof_hook_page.heap_bound(c)?;
         proof_due.heap_bound(c)
     }
 }
@@ -2885,14 +2888,21 @@ impl SharedCache {
         }
     }
 
-    /// U1a-2a (cc row 8, rev 10 §6.1): the proof hook ran on this page and
-    /// found proof work `due` (or none). `note_page` counts a page with due
-    /// work that never reached the hook.
+    /// U1a-2a (cc row 8, rev 10 §6.1): `namespace`'s proof hook ran on this
+    /// page and found proof work `due` (or none). `note_page` counts a page
+    /// of the same namespace with due work that never reached the hook.
     #[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
-    pub(in crate::snapshots) fn note_proof_hook(&self, due: bool) {
+    pub(in crate::snapshots) fn note_proof_hook(&self, namespace: &Scope, due: bool) {
         self.with_cursor(|cursor| {
-            cursor.proof_hook_page = Some(cursor.rotation.page);
-            cursor.proof_due = due;
+            if due {
+                cursor.proof_due = Some((namespace.0.clone(), true));
+            } else if cursor
+                .proof_due
+                .as_ref()
+                .is_some_and(|(due_namespace, _)| *due_namespace == namespace.0)
+            {
+                cursor.proof_due = None;
+            }
         });
     }
 
@@ -3583,7 +3593,7 @@ impl SharedCache {
         if !matches!(plan, StartPlan::Cursor | StartPlan::Defer) || expected <= limits.singleton {
             return plan;
         }
-        page.note_page(self);
+        page.note_page(self, namespace);
         let key = rotation_key(&namespace.0, key);
         self.with_cursor(|cursor| {
             if cursor.rotation.fenced(&key, fence) {
