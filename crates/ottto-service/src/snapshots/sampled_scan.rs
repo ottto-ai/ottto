@@ -14,6 +14,7 @@ const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
 pub(super) mod codex_cursor;
+pub(super) mod side_ledger;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<sampled_jsonl::CachedJsonlReduction>;
@@ -23,12 +24,17 @@ pub(crate) struct SharedCache {
     /// The resumable Codex job slot and held-singleton memo. Charged once,
     /// here; copy budgets and insert admission see it through this cache.
     cursor: Mutex<codex_cursor::CursorState>,
+    /// Codex parent side-request pacing (U1a-2a), process lifetime. A leaf
+    /// lock (retained, then cursor, then side; nothing is locked under it).
+    /// Charged as the fixed `side_ledger::SIDE_LEDGER_BYTES`, never walked.
+    side: Mutex<side_ledger::SideLedger>,
 }
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
+            side: Mutex::new(side_ledger::SideLedger::default()),
         }
     }
 }
@@ -40,7 +46,11 @@ impl std::fmt::Debug for SharedCache {
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         self.inner.heap_bound(c)?;
-        self.cursor.heap_bound(c)
+        self.cursor.heap_bound(c)?;
+        // Never `side`'s lock: a busy lock would read as unbounded and zero
+        // every copy budget. The ledger's whole heap is this proved constant;
+        // its inline tables are inside `size_of::<SharedCache>()`.
+        c.add(side_ledger::SIDE_LEDGER_BYTES)
     }
 }
 impl SharedCache {
@@ -126,10 +136,13 @@ impl SharedCache {
         if let Some(state) = completed.reduction {
             if let Ok(mut cache) = self.retained() {
                 // The whole cursor state (paused job, memo, parked and rotation
-                // records, outstanding claims) keeps its charge: admission may
-                // not fill the state budget underneath it. Measured under the
-                // retained lock, so every claim made before this insert is seen.
-                let live_bytes = live_bytes.saturating_add(self.cursor_resident());
+                // records, outstanding claims) and the side ledger's fixed charge
+                // keep their charge: admission may not fill the state budget
+                // underneath them. Measured under the retained lock, so every
+                // claim made before this insert is seen.
+                let live_bytes = live_bytes
+                    .saturating_add(self.cursor_resident())
+                    .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
                 cache.insert_reserving(
                     key,
                     crate::transcript_cache::Retained {

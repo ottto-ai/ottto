@@ -4749,6 +4749,12 @@ fn prepare_sync_source(
         snapshot_quarantine_witness(source),
     )?;
     let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
+    // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
+    // and eager hydrate run against the index exactly as loaded, namespaced
+    // by this index file. They touch only side requests and side records.
+    let codex_side_pass = (source == SnapshotSource::Codex).then(|| {
+        crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
+    });
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -4919,7 +4925,8 @@ fn prepare_sync_source(
             "{:x}",
             Sha256::digest(sampled_scope.as_bytes())
         )),
-    );
+    )
+    .with_codex_side_pass(codex_side_pass);
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
     }
@@ -5012,6 +5019,19 @@ fn capture_codex_recovery_evidence(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// U1a-2a (C15): this pass's side-ledger entries are now on disk (a full
+/// save, or a partial checkpoint that carries every side field).
+fn note_codex_side_saved(
+    daemon: &LocalDaemon,
+    source: SnapshotSource,
+    index_path: &Path,
+    full: bool,
+) {
+    if source == SnapshotSource::Codex {
+        crate::snapshots::note_codex_side_pass_saved(&daemon.transcript_cache, index_path, full);
+    }
+}
+
 fn finish_sync_source(
     preparation: SourcePreparation,
     mut index: ScanIndex,
@@ -5732,7 +5752,10 @@ fn finish_sync_source(
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
             ) {
-                Ok(committable) => committable,
+                Ok(committable) => {
+                    note_codex_side_saved(daemon, source, &index_path, false);
+                    committable
+                }
                 Err(error) => {
                     checkpoint_succeeded = false;
                     eprintln!(
@@ -5847,7 +5870,10 @@ fn finish_sync_source(
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
                 ) {
-                    Ok(committable) => index = committable,
+                    Ok(committable) => {
+                        index = committable;
+                        note_codex_side_saved(daemon, source, &index_path, false);
+                    }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
@@ -6073,6 +6099,7 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    note_codex_side_saved(daemon, source, &index_path, true);
     if upload_fully_settled
         && native_comparison_lease
             .as_ref()

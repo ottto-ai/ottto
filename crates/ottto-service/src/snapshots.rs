@@ -53,6 +53,8 @@ mod codex_counting_v2_tests;
 mod codex_counting_version;
 mod codex_file_join;
 #[cfg(test)]
+mod codex_parent_side_tests;
+#[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
 #[cfg(test)]
 mod claude_response_compaction_tests;
@@ -2161,6 +2163,230 @@ struct CodexParentOwnershipLedger {
     unresolvable: Option<CodexParentUnresolvable>,
 }
 
+/// U1a-2a: the `cause` of a held side verdict (and of a lineage owe) with no
+/// `CodexParentUnresolvable`: P's own fork lineage is still pending. Outside
+/// every ordinal (`CodexParentUnresolvable::COUNT` is 12).
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
+pub(in crate::snapshots) const CAUSE_NO_EVIDENCE: u8 = 255;
+/// U1a-2a: a side request is evicted at this many charged attempts.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side due
+pub(in crate::snapshots) const SIDE_REQUEST_EVICT_ATTEMPTS: u8 = 7;
+const _: () = assert!(CodexParentUnresolvable::COUNT < CAUSE_NO_EVIDENCE as usize);
+
+/// U1a-2a: the verdict of a parent rollout P's latest certified parse, as
+/// the parent of forks whose boundary needs P's prefix. It says whether P's
+/// own parse settled; it is never ownership evidence for P or a child.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(in crate::snapshots) enum SideVerdict {
+    Settled,
+    /// `lineage`: held because P's own fork lineage is unresolved. `cause`:
+    /// P's own `CodexParentUnresolvable` ordinal, else `CAUSE_NO_EVIDENCE`.
+    Held {
+        lineage: bool,
+        cause: u8,
+    },
+}
+impl crate::heap_layout_bound::HeapLayoutBound for SideVerdict {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// U1a-2a: the one side verdict of a parse of P, used by every side writer.
+/// Held iff the parse is not complete in PR-P's raw terms.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
+fn codex_parent_side_verdict(parsed: &ParsedJsonlFile) -> SideVerdict {
+    let held = parsed.ownership_incomplete_file_count > 0
+        || parsed.codex_parent_resolution_pending
+        || !parsed.report.complete()
+        || parsed.recognized_usage_drop_count > 0;
+    if !held {
+        return SideVerdict::Settled;
+    }
+    SideVerdict::Held {
+        lineage: parsed.codex_parent_session_ref.is_some()
+            && (parsed.codex_parent_unresolvable.is_some()
+                || parsed.codex_parent_resolution_pending),
+        cause: codex_parent_side_cause(parsed),
+    }
+}
+
+/// U1a-2a: the verdict without P's lineage term, for the invalid-census keep
+/// only. It discounts the ownership hold that lineage itself sets
+/// (`defer_parent_resolution`), so a real downgrade still overwrites.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
+fn codex_parent_side_verdict_without_lineage(parsed: &ParsedJsonlFile) -> SideVerdict {
+    let held = !parsed.report.complete()
+        || parsed.recognized_usage_drop_count > 0
+        || parsed.dropped_usage_record_count > 0
+        || (parsed.ownership_incomplete_file_count > 0
+            && parsed.codex_parent_unresolvable.is_none()
+            && !parsed.codex_parent_resolution_pending);
+    if !held {
+        return SideVerdict::Settled;
+    }
+    SideVerdict::Held {
+        lineage: false,
+        cause: codex_parent_side_cause(parsed),
+    }
+}
+
+fn codex_parent_side_cause(parsed: &ParsedJsonlFile) -> u8 {
+    parsed
+        .codex_parent_unresolvable
+        .map_or(CAUSE_NO_EVIDENCE, |cause| cause.index() as u8)
+}
+
+/// U1a-2a: the scope every side seal is minted and admitted under. It changes
+/// with Codex's parser or scan-identity version, so an older seal refuses
+/// `ScopeChanged`. Independent of the scan's curve/identity `Scope`.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side exit
+fn codex_parent_side_scope() -> crate::transcript_acquisition::Scope {
+    crate::transcript_acquisition::Scope(sha256_hex(&[
+        "codex_parent_side:v1",
+        SnapshotSource::Codex.parser_version(),
+        SnapshotSource::Codex.scan_identity_version(),
+    ]))
+}
+
+/// U1a-2a: P is over main's Codex file cap, so no side record is kept for it.
+/// The same predicate main's cap sites use.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the fence
+fn codex_parent_over_cap(len: u64) -> bool {
+    len > max_jsonl_file_bytes(SnapshotSource::Codex)
+}
+
+/// U1a-2a: the pacing a covering side record keeps after its request is
+/// removed, so a re-request for the same object inherits it.
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::snapshots) struct SidePace {
+    pub(in crate::snapshots) not_before_unix_seconds: u64,
+    pub(in crate::snapshots) attempts_floor: u8,
+}
+crate::heap_layout_bound::fields!(SidePace; not_before_unix_seconds, attempts_floor);
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
+impl SidePace {
+    /// `max(existing, new)` per field: a stub never loosens.
+    pub(in crate::snapshots) fn merged(existing: Option<Self>, new: Self) -> Self {
+        existing.map_or(new, |old| Self {
+            not_before_unix_seconds: old.not_before_unix_seconds.max(new.not_before_unix_seconds),
+            attempts_floor: old.attempts_floor.max(new.attempts_floor),
+        })
+    }
+}
+
+/// U1a-2a: a side request's state. `Live` is pending; the others are
+/// tombstones that only a cure (growth, a new object, a stamp change for the
+/// byte-determined ones) re-arms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(in crate::snapshots) enum SideRequestState {
+    Live,
+    /// Seven charged attempts ended without a record.
+    Evicted,
+    /// A certified read covered less than the children need.
+    Short {
+        covered: u64,
+    },
+    /// The source report showed data loss.
+    Lossy,
+    /// A certified read ended on an unsealed row with a settled verdict.
+    Unsealed,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for SideRequestState {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// U1a-2a: one paced request that main also parses an unchanged parent P,
+/// so that P's side verdict can be recorded. Keyed by P's index key.
+/// Persisted at the next successful save; the process side ledger holds
+/// unsaved charges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::snapshots) struct SideRequest {
+    /// P's real (dev, ino); the side path is unix-only.
+    pub(in crate::snapshots) dev_ino: (u64, u64),
+    /// The largest sealed offset any fencing child needs.
+    pub(in crate::snapshots) needed_extent: u64,
+    pub(in crate::snapshots) state: SideRequestState,
+    /// P's extent and ctime when `state` was decided.
+    pub(in crate::snapshots) state_extent: u64,
+    pub(in crate::snapshots) state_ctime: (i64, i64),
+    /// P's extent and ctime at the last charged attempt.
+    pub(in crate::snapshots) attempt_extent: u64,
+    pub(in crate::snapshots) attempt_ctime: (i64, i64),
+    /// Charged at the start of each read; `Evicted` at
+    /// `SIDE_REQUEST_EVICT_ATTEMPTS`.
+    pub(in crate::snapshots) attempts: u8,
+    pub(in crate::snapshots) not_before_unix_seconds: u64,
+    /// A capacity loss's reservation (U1a-2b). Always `None` for a singleton.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::snapshots) needed_charge: Option<usize>,
+}
+crate::heap_layout_bound::fields!(SideRequest; dev_ino, needed_extent, state, state_extent, state_ctime, attempt_extent, attempt_ctime, attempts, not_before_unix_seconds, needed_charge);
+#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side charge
+impl SideRequest {
+    /// The backoff after the `attempts`-th charged attempt: 60 s doubling,
+    /// capped at one hour.
+    pub(in crate::snapshots) fn backoff_seconds(attempts: u8) -> u64 {
+        let exponent = u32::from(attempts.max(1) - 1).min(6);
+        (60_u64 << exponent).min(3600)
+    }
+}
+
+/// U1a-2a: what one Codex pass carries from C14: its side-ledger namespace
+/// (the destination index file) and its outage gate.
+#[cfg_attr(not(test), allow(dead_code))] // first readers are the side due and G7
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CodexSidePass {
+    pub(in crate::snapshots) ns: u128,
+    pub(in crate::snapshots) gate: sampled_scan::side_ledger::GateOpen,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// U1a-2a (C14), Codex only: open the pass's side-ledger gate, then prune
+/// and hydrate this index's ledger entries into the index as loaded. Touches
+/// only side requests.
+pub(crate) fn begin_codex_side_pass(
+    cache: &sampled_scan::SharedCache,
+    index_path: &Path,
+    index: &mut ScanIndex,
+) -> CodexSidePass {
+    let ns = sampled_scan::side_ledger::namespace_of(index_path);
+    let gate = cache
+        .side_ledger()
+        .begin_index_pass(ns, sampled_scan::now_seconds(), index);
+    CodexSidePass { ns, gate }
+}
+
+/// U1a-2a (C15), Codex only: the pass's selected save, carrying every side
+/// field, succeeded. `full` only for the full save; never an ACK.
+pub(crate) fn note_codex_side_pass_saved(
+    cache: &sampled_scan::SharedCache,
+    index_path: &Path,
+    full: bool,
+) {
+    cache.side_ledger().note_saved(
+        sampled_scan::side_ledger::namespace_of(index_path),
+        sampled_scan::now_seconds(),
+        full,
+    );
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanIndex {
     #[serde(default = "scan_index_schema_version")]
@@ -2240,6 +2466,11 @@ pub struct ScanIndex {
     /// Missing, overflowed, or incomplete ledgers are never authoritative.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     codex_parent_ownership_ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
+    /// U1a-2a: paced side requests for unchanged parent rollouts, keyed by
+    /// the parent's index key. Pacing only, never evidence; the process side
+    /// ledger holds any charge made since the last save.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    codex_parent_side_requests: BTreeMap<String, SideRequest>,
     /// Durable, local-only index of Claude Desktop naming sidecars. Paging the
     /// store without retaining these safe extracted fields would make titles
     /// disappear whenever their file was outside the current bounded page.
@@ -2481,6 +2712,7 @@ impl Default for ScanIndex {
             codex_state_only_blocked_attributed: false,
             codex_parent_ownership_refs: BTreeSet::new(),
             codex_parent_ownership_ledgers: BTreeMap::new(),
+            codex_parent_side_requests: BTreeMap::new(),
             claude_desktop_title_files: BTreeMap::new(),
             claude_account_family_witnesses: BTreeMap::new(),
             claude_account_family_pending: BTreeMap::new(),
@@ -16315,6 +16547,8 @@ pub(crate) struct OwnedSourceScan {
     /// Selection flags of this page's Codex candidates, so a budget deferral
     /// returns a file to `pending_candidates` with its original priority.
     codex_selected_flags: BTreeMap<String, (bool, bool)>,
+    /// U1a-2a: this Codex pass's side-ledger namespace and gate (C14).
+    codex_side_pass: Option<CodexSidePass>,
 }
 struct OwnedActiveFile {
     comparison_target: bool,
@@ -17202,7 +17436,13 @@ impl OwnedSourceScan {
             codex_legacy_join_baselines: Vec::new(),
             codex_page: Default::default(),
             codex_selected_flags,
+            codex_side_pass: None,
         }
+    }
+    /// U1a-2a: the pass's C14 namespace and gate (`None` for other sources).
+    pub(crate) fn with_codex_side_pass(mut self, pass: Option<CodexSidePass>) -> Self {
+        self.codex_side_pass = pass;
+        self
     }
     pub(crate) fn step(
         self,
@@ -17342,6 +17582,7 @@ impl OwnedSourceScan {
             mut codex_legacy_join_baselines,
             mut codex_page,
             codex_selected_flags,
+            codex_side_pass,
         } = self;
         // Held while this scan object runs the shared cursor job.
         let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
@@ -21179,6 +21420,7 @@ impl OwnedSourceScan {
             codex_legacy_join_baselines,
             codex_page,
             codex_selected_flags,
+            codex_side_pass,
         }))
     }
 }
@@ -31011,6 +31253,7 @@ impl ScanIndex {
         self.codex_state_only_snapshot_fingerprints.clear();
         self.codex_parent_ownership_refs.clear();
         self.codex_parent_ownership_ledgers.clear();
+        self.codex_parent_side_requests.clear();
         self.claude_owned_start_census.clear();
         self.resume_after_path = None;
         self.resume_upper_bound_path = None;
@@ -32475,6 +32718,7 @@ impl ScanIndex {
             codex_state_only_blocked_attributed: self.codex_state_only_blocked_attributed,
             codex_parent_ownership_refs: self.codex_parent_ownership_refs.clone(),
             codex_parent_ownership_ledgers: self.codex_parent_ownership_ledgers.clone(),
+            codex_parent_side_requests: self.codex_parent_side_requests.clone(),
             claude_desktop_title_files: self.claude_desktop_title_files.clone(),
             claude_account_family_witnesses: self.claude_account_family_witnesses.clone(),
             claude_account_family_pending: self.claude_account_family_pending.clone(),
@@ -70866,12 +71110,12 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_only_bytes, body_witness_adoption_deferred, body_witness_adoption_excluded, body_witness_adoption_held_no_list, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_only_bytes, body_witness_adoption_deferred, body_witness_adoption_excluded, body_witness_adoption_held_no_list, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
