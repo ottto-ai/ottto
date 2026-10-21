@@ -5104,6 +5104,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     scan: &mut SourceScanResult,
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
