@@ -3594,20 +3594,6 @@ fn claude_runtime_defaults_from_paths(
                 diagnostic: None,
             }
         }
-        crate::snapshots::ClaudeConfigDefaultsOutcome::NothingConfigured => {
-            ClaudeRuntimeDefaultsCapture {
-                defaults: None,
-                capability: unsupported_capability(
-                    "runtime_defaults",
-                    "Claude Code settings were read, but none set a display-safe default (model, effort level, permission mode, fast mode, or sandbox).",
-                ),
-                diagnostic: Some(AgentStatusDiagnostic::source(
-                    "claude_runtime_defaults_not_configured",
-                    AgentDiagnosticSeverity::Info,
-                    "Claude Code settings parsed cleanly and configure none of the defaults Ottto displays.",
-                )),
-            }
-        }
         crate::snapshots::ClaudeConfigDefaultsOutcome::Unreadable => ClaudeRuntimeDefaultsCapture {
             defaults: None,
             capability: unsupported_capability(
@@ -34598,22 +34584,24 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
     }
 
     #[test]
-    fn claude_runtime_defaults_absent_marks_not_configured_and_unreadable_apart() {
+    fn claude_runtime_defaults_report_fast_off_for_readable_settings_only() {
         let (configured_root, configured_paths) =
             claude_settings_fixture("not-configured", "{\"agentPushNotifEnabled\": true}\n");
         let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &configured_paths);
-        assert!(
-            capture.defaults.is_none(),
-            "an empty struct must not be attached when nothing is configured"
-        );
+        let defaults = capture
+            .defaults
+            .expect("readable settings report the Fast default");
+        assert_eq!(defaults.fast_mode_enabled, Some(false));
+        assert_eq!(defaults.model, None);
         assert_eq!(
-            capture.capability.status,
-            AgentCapabilityStatus::Unsupported
+            defaults
+                .selector_sources
+                .get("fast_mode_enabled")
+                .map(String::as_str),
+            Some("claude_code.default.fastMode")
         );
-        assert_eq!(
-            capture.diagnostic.as_ref().map(|entry| entry.code.as_str()),
-            Some("claude_runtime_defaults_not_configured")
-        );
+        assert_eq!(capture.capability.status, AgentCapabilityStatus::Supported);
+        assert!(capture.diagnostic.is_none());
         let _ = std::fs::remove_dir_all(configured_root);
 
         let (missing_root, missing_paths) = claude_settings_fixture("unreadable", "");

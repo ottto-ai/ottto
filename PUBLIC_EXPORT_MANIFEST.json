@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 732,
-  "content_sha256": "b104cd51f8770caba11cf61c1613ddeb592c61a6da528d5842492ae293745eab",
+  "candidate_file_count": 731,
+  "content_sha256": "523e1187f702afb96f2a762d05d37ea1d5f947d142f4094b05cf2bdc1f1f8157",
   "files": [
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "d34e0736e502a0b8770c0cda6d1a889d3ad0413e6fbe1a2b7310e24ead90c3dc",
-      "size_bytes": 1632457
+      "sha256": "7cec19f9fefbda9edba491ee6d99a8324026c9115478949c8184c6201e89c989",
+      "size_bytes": 1631840
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "15cb1983da9e752192a4a340f372362a3f4ee283fbfc5e2eee024eaf25f51758",
-      "size_bytes": 844406
+      "sha256": "10926107abe6af1a1d5267bd97c676953974bfacd53e562fd759af889cbd03d4",
+      "size_bytes": 843577
     },
     {
       "executable": false,
@@ -1308,8 +1308,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "677a7bece914eb41a6fd2e5e2a00ee40bae678b87500e36d124b3934bc089b20",
-      "size_bytes": 2973534
+      "sha256": "7d5f21d8dfb674ceff073e7d1e28b3bd72226a37e69b75e0295ec8264c7635b0",
+      "size_bytes": 2936210
     },
     {
       "executable": false,
@@ -1356,16 +1356,9 @@
     {
       "executable": false,
       "mode": "0644",
-      "path": "crates/ottto-service/src/snapshots/claude_fresh_start_census_tests.rs",
-      "sha256": "77b12083ca035049beb3ad3638b2e83d398028087d69e6652732fd487e1d51ea",
-      "size_bytes": 65709
-    },
-    {
-      "executable": false,
-      "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison.rs",
-      "sha256": "e9687d2f4e8c0d92fc4f89b7e2820d0ba0c47368416b5346386cb3ce732acd7a",
-      "size_bytes": 124402
+      "sha256": "df3878cff2f6c0bc72aea633fed44ddc2dcb648b1039336e460ec15b81ca639a",
+      "size_bytes": 122740
     },
     {
       "executable": false,
@@ -1385,8 +1378,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
-      "sha256": "95c7bf2673e79376af761d0f4e1f701404216705482960f8267f3940336f93db",
-      "size_bytes": 60725
+      "sha256": "c4c6a22805129de08b9f721cae4c33bee598a6d27b78488e4ea77b41a20b0bae",
+      "size_bytes": 59711
     },
     {
       "executable": false,
@@ -1553,8 +1546,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/p12_usage_original_tests.rs",
-      "sha256": "40336344855d17565b12a1b06ca872f87f9445b79070569242c6b7787e1f1198",
-      "size_bytes": 22654
+      "sha256": "458e8f100325dc120972ed90ee1f0b3a9b0787032419830ec2fb1f287b1e09e6",
+      "size_bytes": 22624
     },
     {
       "executable": false,
@@ -2351,8 +2344,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-30-claude-owned-context-posture.md",
-      "sha256": "634851052dd4573fbef94839b73f5cfa6830ddd74b4936d236f025d4539eb928",
-      "size_bytes": 6617
+      "sha256": "c35e7ada03f56bfbfa91d703b8280cab0842f86a571a7e190efdcf9699007815",
+      "size_bytes": 6356
     },
     {
       "executable": false,
@@ -3309,6 +3302,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-20-claude-fast-mode-default-off.md",
+      "sha256": "55ea86718f08cdccd8379865d53ad766428127bb09e353bd72de149a031ebb85",
+      "size_bytes": 2020
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-20-claude-posture-member-waiver.md",
       "sha256": "cd7631b55991ee290c814fb69432c3ef67ee50022c283a576ea7b5d2dcccc052",
       "size_bytes": 6246
@@ -3333,13 +3333,6 @@
       "path": "docs/session-2026-10-20-permanent-source-finish.md",
       "sha256": "574cd6b52d2dc5f61cacbd7c4c0ea8fb07627e4872029f812f20e7300fd539eb",
       "size_bytes": 3377
-    },
-    {
-      "executable": false,
-      "mode": "0644",
-      "path": "docs/session-2026-10-21-claude-census-verified-fresh-start.md",
-      "sha256": "f3242bbae49902669b872a486f6c1ca84f9fe6a3d6c76d4fef634a02cf0ebeb8",
-      "size_bytes": 7144
     },
     {
       "executable": false,
@@ -5127,9 +5120,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-21T08:46:15+00:00",
+  "generated_at": "2026-10-21T08:15:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 733,
+  "output_file_count": 732,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5166,5 +5159,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "1b6e7001ef2448f6fd5af9e9d6c0f209cfd424b1"
+  "source_commit": "1a67c696b034f42b70c664fb7a227ac87fd54d24"
 }
