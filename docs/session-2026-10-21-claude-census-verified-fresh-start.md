@@ -48,7 +48,9 @@ revision, and a state.
   telemetry row that contradicts this root. Never re-armed.
 - `revoked`: a duplicate request (persisted owner, visibly shared pending, or
   the same root id under two indexed paths). An emitted revision is re-armed
-  once so its next body uploads without numbers.
+  once so its next body uploads without numbers. A parse that replaces or
+  removes an emitted witness from another path of the same root re-arms the
+  emitted path the same way.
 
 Every re-arm is spent by its transition. A `verified` revision is never
 re-armed again, so repeated closed and open windows cannot replay a file.
@@ -56,7 +58,7 @@ re-armed again, so repeated closed and open windows cannot replay a file.
 A census window is accepted only when the census is complete, the duplicate
 census is valid, the persisted fence is not overflowed, every indexed family
 member was observed this window, reports are healthy and the fold does not
-carry a native completion. The predicate uses today's census composition: an
+carry a native completion or a selected fallback. The predicate uses today's census composition: an
 indexed member without usable request identity (for example an API-error-only
 session) leaves the window unaccepted, so nothing verifies on that Mac.
 
@@ -67,7 +69,8 @@ current (same fingerprint and revision) and in `verified`, `reparse_owed` or
 `emitted`; the item has no contract, no owned start and no excluded prefix;
 its request identity is complete; no request is a persisted or visible
 duplicate; no telemetry row assigns one of its requests to another root,
-another session or a subagent; reports are healthy; its own family pending is
+another session or a subagent, and no report holds two rows for one of its
+requests; reports are healthy; its own family pending is
 current, valid and holds exactly its requests; and its telemetry is settled.
 Telemetry is settled when both sidecars are confirmed absent by the existing
 absence check or both were read completely. An unknown, unreadable, present
@@ -94,12 +97,16 @@ body uploads without numbers, and drops every witness.
   selected restore before allocation; partial commits and per-key reverts
   restore the previous witness.
 - The parse-time observation is a fixed-size scalar struct. The birth time
-  costs one `symlink_metadata` call per parsed Claude transcript while
-  enabled, and is used only if size and modification time still match.
+  costs one `symlink_metadata` call per root transcript that passed every
+  other candidate check while enabled, and is used only if size and
+  modification time still match.
 - Fold evidence is built once per fold, only for page roots with an
   admissible witness, and is refused before allocation above the existing
-  pending-occurrence cap. The census step walks the index once and borrows
-  every key.
+  pending-occurrence cap. The census step walks the index once, borrowing its
+  keys, and copies only its witnesses' own request hashes. Partial commits
+  copy the witness map like the sibling census maps.
+- Replacing an emitted witness walks the index once to re-arm another path
+  of the same root. That happens only on that transition.
 - The settled-telemetry root set holds only roots with an admissible witness,
   so it is bounded by the witness map.
 - No audit schema change, no scan or parser version bump, no wire field.
@@ -111,5 +118,15 @@ body uploads without numbers, and drops every witness.
 - A duplicate always revokes, including for the original session when a later
   copy shares its requests.
 - Admission and refusal counts are not yet in the local audit.
+- The settled-telemetry check reuses the existing absence check, which runs
+  only when the pass may emit request identity. Without that permit no root
+  settles, so an emitted root re-parsed in such a pass loses its numbers
+  until the next accepted window.
+- A root whose earlier upload carried a telemetry contract is refused only
+  while its family witness or quarantine record remains.
+- Foreign rows veto only when loaded: rows of a root whose sidecars are not
+  paired and complete are not seen.
+- A family with a confirmed-empty member never verifies.
+- A historical replay clears every witness, so verification starts again.
 - Enabling the feature, and any historical re-parse it implies, needs a
   separate decision.

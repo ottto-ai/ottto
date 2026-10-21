@@ -1227,6 +1227,7 @@ fn claude_fresh_start_evidence<'s, 'r>(
     let api_rows = api_report.evidence.iter().flat_map(|(root, rows)| {
         rows.iter().map(move |row| {
             (
+                false,
                 root.as_str(),
                 row.session_id.as_str(),
                 row.request_id.as_str(),
@@ -1237,6 +1238,7 @@ fn claude_fresh_start_evidence<'s, 'r>(
     let trace_rows = trace_report.evidence.iter().flat_map(|(root, rows)| {
         rows.iter().map(move |row| {
             (
+                true,
                 root.as_str(),
                 row.session_id.as_str(),
                 row.request_id.as_str(),
@@ -1244,11 +1246,18 @@ fn claude_fresh_start_evidence<'s, 'r>(
             )
         })
     });
-    for (root, session_id, request_id, agent_id) in api_rows.chain(trace_rows) {
+    // At most one API and one trace row per candidate request: a second row
+    // is the reducer's duplicate-request refusal (SOURCE S1).
+    let mut reported = BTreeSet::<(bool, &str)>::new();
+    for (trace, root, session_id, request_id, agent_id) in api_rows.chain(trace_rows) {
         let Some(candidate_root) = candidate_roots.get(request_id) else {
             continue;
         };
-        if *candidate_root != Some(root) || session_id != root || !agent_id.is_empty() {
+        if *candidate_root != Some(root)
+            || session_id != root
+            || !agent_id.is_empty()
+            || !reported.insert((trace, request_id))
+        {
             contradicted.insert(request_id);
         }
     }
@@ -1370,7 +1379,9 @@ fn claude_fresh_start_admission(
 /// Parse-time candidate witness (slice 2c, root transcripts only). A new
 /// fingerprint or revision restarts at `Candidate`; the same revision keeps
 /// its state. Anything short of a fresh, loss-free, single-session root with
-/// complete request identity removes the witness.
+/// complete request identity removes the witness. Returns the fingerprint of
+/// a replaced or removed `Emitted` revision, which the caller re-arms on any
+/// other indexed path of the root so its numbers are withdrawn.
 #[allow(clippy::too_many_arguments)]
 fn record_claude_fresh_start_candidate(
     census: &mut BTreeMap<String, ClaudeFreshStartCensusWitness>,
@@ -1378,15 +1389,13 @@ fn record_claude_fresh_start_candidate(
     parsed: &[SnapshotItem],
     observation: &ClaudeCopySignatureObservation,
     source_verified: bool,
-    birth_unix_ms: Option<i64>,
+    birth_unix_ms: impl FnOnce() -> Option<i64>,
     source_file_fingerprint: &str,
     collected_at: &str,
-) {
-    let Some(identity) = claude_index_path_member_ref(path) else {
-        return;
-    };
+) -> Option<String> {
+    let identity = claude_index_path_member_ref(path)?;
     if identity.subagent_stem.is_some() {
-        return;
+        return None;
     }
     let member = identity.root;
     let now_unix_ms =
@@ -1400,9 +1409,11 @@ fn record_claude_fresh_start_candidate(
                 && !item.claude_usage_occurrences.is_empty()
                 && item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len()
                 && now_unix_ms.is_some_and(|now| {
+                    // Read last: only a file that passed every cheap check
+                    // costs the birth stat.
                     claude_copy_signature(
                         observation,
-                        birth_unix_ms,
+                        birth_unix_ms(),
                         member,
                         observation
                             .session_id_seen
@@ -1413,9 +1424,16 @@ fn record_claude_fresh_start_candidate(
         }
         _ => false,
     };
+    // The fingerprint of an emitted revision this parse replaces: another
+    // indexed path of the same root may still serve its numbers.
+    let emitted = |witness: &ClaudeFreshStartCensusWitness| {
+        (witness.state == ClaudeFreshStartState::Emitted)
+            .then(|| witness.candidate_source_file_fingerprint.clone())
+    };
     if !candidate {
-        census.remove(member);
-        return;
+        return census
+            .remove(member)
+            .and_then(|previous| emitted(&previous));
     }
     let fresh = || ClaudeFreshStartCensusWitness {
         candidate_source_file_fingerprint: source_file_fingerprint.to_string(),
@@ -1426,12 +1444,14 @@ fn record_claude_fresh_start_candidate(
         if witness.candidate_source_file_fingerprint != source_file_fingerprint
             || !claude_fresh_start_revision_is_current(&witness.derivation_revision)
         {
-            *witness = fresh();
+            let previous = std::mem::replace(witness, fresh());
+            return emitted(&previous);
         }
     } else if census.len() < MAX_CLAUDE_FRESH_START_WITNESSES {
         // At the bound a new root is simply not a candidate (strict form).
         census.insert(member.to_string(), fresh());
     }
+    None
 }
 
 /// File birth for the copy signature, read only while the path still names
@@ -18024,20 +18044,34 @@ impl OwnedSourceScan {
                         }
                     }
                     if claude_census_verified_fresh_start_enabled() {
-                        record_claude_fresh_start_candidate(
+                        let replaced = record_claude_fresh_start_candidate(
                             &mut index.claude_fresh_start_census,
                             &candidate.path,
                             &parsed,
                             &claude_copy_signature,
                             source_verified,
-                            claude_transcript_birth_unix_ms(
-                                &candidate.path,
-                                candidate.size_bytes,
-                                candidate.modified_unix_nanos,
-                            ),
+                            || {
+                                claude_transcript_birth_unix_ms(
+                                    &candidate.path,
+                                    candidate.size_bytes,
+                                    candidate.modified_unix_nanos,
+                                )
+                            },
                             &source_file_fingerprint,
                             collected_at.as_str(),
                         );
+                        // Rare: an emitted revision was replaced. Re-arm any
+                        // other path still holding it (a same-id copy under
+                        // another root), once, so it uploads without numbers.
+                        if let Some(replaced) = replaced {
+                            let current_key = local_index_key(&candidate.path);
+                            for (key, entry) in index.files.iter_mut() {
+                                if *key != current_key && entry.source_file_fingerprint == replaced
+                                {
+                                    entry.source_file_fingerprint.clear();
+                                }
+                            }
+                        }
                     }
                 }
                 if source == SnapshotSource::Codex {

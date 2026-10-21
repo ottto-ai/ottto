@@ -682,6 +682,52 @@ fn same_id_slot_copy_under_two_config_roots_is_never_verified() {
 }
 
 #[test]
+fn a_same_id_path_appearing_after_emission_withdraws_the_emitted_numbers() {
+    // Review F1: a second path of an emitted root replaces its witness. The
+    // emitted path is re-armed once so it uploads without numbers, and the
+    // two-path root is revoked.
+    let fixture = Fixture::on(&[(FRESH, "2026-08-20T10:00:00Z")]);
+    let first = temp_dir("claude-2c-late-slot-a");
+    let second = temp_dir("claude-2c-late-slot-b");
+    let emitted_path = write(&first, FRESH, &fresh_lines(FRESH, 0));
+    let mut machine = Machine::new(vec![first.clone(), second.clone()], &[FRESH]);
+    let _ = machine.pass("2026-08-20T10:30:00Z");
+    let (admitted, _) = machine.pass("2026-08-20T10:40:00Z");
+    assert_fresh_scalars(item(&admitted, FRESH));
+    assert_eq!(
+        state(&machine.index, FRESH),
+        Some(ClaudeFreshStartState::Emitted)
+    );
+    assert!(!indexed_fingerprint(&machine.index, &emitted_path).is_empty());
+
+    write(&second, FRESH, &fresh_lines(FRESH, 0));
+    let mut withheld = Vec::new();
+    for collected_at in ["2026-08-20T10:50:00Z", "2026-08-20T10:55:00Z"] {
+        let (items, _) = machine.pass(collected_at);
+        withheld.extend(items);
+    }
+    // The new path and the re-armed emitted path were both parsed, and
+    // neither carries numbers.
+    assert!(
+        withheld
+            .iter()
+            .filter(|item| item.source_session_id == FRESH)
+            .count()
+            >= 2
+    );
+    for item in &withheld {
+        assert_cleared(item);
+    }
+    assert_eq!(
+        state(&machine.index, FRESH),
+        Some(ClaudeFreshStartState::Revoked)
+    );
+    drop(fixture);
+    let _ = fs::remove_dir_all(first);
+    let _ = fs::remove_dir_all(second);
+}
+
+#[test]
 fn first_install_with_mixed_history_admits_only_fresh_roots_without_contradiction() {
     let births = [
         (FRESH, "2026-08-20T10:00:00Z"),
@@ -1115,6 +1161,22 @@ fn telemetry_verdicts_and_contradicting_rows_refuse_and_never_rearm() {
     );
     assert!(!indexed_fingerprint(&index, &path).is_empty());
 
+    // Two rows for one request are the reducer's duplicate refusal (S1).
+    let (item, index) = refused(
+        rows(&[(FRESH, FRESH, "req_f1"), (FRESH, FRESH, "req_f1")], &[]),
+        &none,
+    );
+    assert_cleared(&item);
+    assert_eq!(state(&index, FRESH), Some(ClaudeFreshStartState::Refused));
+    let (item, _) = refused(
+        rows(
+            &[],
+            &[(FRESH, FRESH, "req_f1", ""), (FRESH, FRESH, "req_f1", "")],
+        ),
+        &none,
+    );
+    assert_cleared(&item);
+
     // Agreeing rows (this root and session, no agent) refuse nothing (S1).
     let (item, index) = refused(
         rows(&[(FRESH, FRESH, "req_f1")], &[(FRESH, FRESH, "req_f1", "")]),
@@ -1291,7 +1353,7 @@ fn a_growing_session_restarts_at_candidate_and_waits_for_a_later_window() {
             std::slice::from_ref(&item),
             &observation(&lines),
             true,
-            Some(ms("2026-08-20T10:00:00Z")),
+            || Some(ms("2026-08-20T10:00:00Z")),
             fingerprint,
             WINDOW,
         );
@@ -1321,7 +1383,7 @@ fn a_growing_session_restarts_at_candidate_and_waits_for_a_later_window() {
         std::slice::from_ref(&item),
         &observation(&lines),
         false,
-        Some(ms("2026-08-20T10:00:00Z")),
+        || Some(ms("2026-08-20T10:00:00Z")),
         "fp-2",
         WINDOW,
     );
@@ -1333,7 +1395,7 @@ fn a_growing_session_restarts_at_candidate_and_waits_for_a_later_window() {
         std::slice::from_ref(&item),
         &observation(&lines),
         true,
-        Some(ms("2026-08-20T10:00:00Z")),
+        || Some(ms("2026-08-20T10:00:00Z")),
         "fp-3",
         WINDOW,
     );

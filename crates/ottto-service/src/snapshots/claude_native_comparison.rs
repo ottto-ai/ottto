@@ -44,6 +44,9 @@ pub(crate) struct FoldView<'a> {
     pub(super) negatives: Option<NegativeView<'a>>,
     native_window: Option<&'a str>,
     pub(super) lease: Option<&'a lifecycle::Lease>,
+    /// A selected fallback withdraws `transcript_ownership_complete` after
+    /// this fold.
+    selected_fallback: bool,
 }
 impl<'a> FoldView<'a> {
     /// Observe an executed BASE fold even without a native completion. This
@@ -53,13 +56,14 @@ impl<'a> FoldView<'a> {
             negatives: None,
             native_window: None,
             lease: Some(lease),
+            selected_fallback: false,
         }
     }
-    /// A native completion or negative view may be followed by a selected
-    /// fallback that withdraws `transcript_ownership_complete` after the fold,
-    /// so slice 2c never verifies in such a fold.
+    /// A native completion, a negative view or a selected fallback may
+    /// withdraw `transcript_ownership_complete` after the fold, so slice 2c
+    /// never verifies in such a fold.
     pub(super) fn carries_native_completion(&self) -> bool {
-        self.native_window.is_some() || self.negatives.is_some()
+        self.selected_fallback || self.native_window.is_some() || self.negatives.is_some()
     }
     pub(super) fn native_census_complete(&self, scan: &SourceScanResult) -> bool {
         self.native_window.is_some_and(|window| {
@@ -76,6 +80,7 @@ impl Completion {
             negatives: self.negatives(lease),
             native_window: self.native_window(),
             lease,
+            selected_fallback: self.fallback.is_some(),
         }
     }
     pub(crate) fn negatives<'a>(
