@@ -513,6 +513,14 @@ impl UploadFailureDiagnostics {
             && (self.status_family == "transport_timeout" || self.http_status == Some(504))
     }
 
+    /// The status of a snapshot-batch server error that a prompt resend of
+    /// the same idempotent page may clear: 500 or 502 only. Other endpoints,
+    /// other statuses and transport failures never qualify.
+    pub(crate) fn transient_batch_status(&self) -> Option<u16> {
+        self.http_status
+            .filter(|status| self.endpoint == "snapshot_batch" && matches!(status, 500 | 502))
+    }
+
     pub fn safe_message(&self) -> String {
         format!(
             "{} failed (endpoint={}, status_family={}, retryable={}, request_id={})",
