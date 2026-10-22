@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 835,
-  "content_sha256": "a5176bfbdd260b3da14f76f53751ddd48b360b8a43eb99a7980f44c63e476dd5",
+  "candidate_file_count": 838,
+  "content_sha256": "1ec4840bca8247ced5169e7d77b6bdbf8d1205c525099285a67ad2608180b86d",
   "files": [
     {
       "executable": false,
@@ -867,8 +867,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/codex_prelude_footprint.rs",
-      "sha256": "f7e8c50af7a3940aca7f85578cedb1dde6698a610cae68c1d8bd6879e40fce7a",
-      "size_bytes": 52323
+      "sha256": "a67d65b4b8ada98816f956889686dc71a0bd322f581d606b0f80397032f2d493",
+      "size_bytes": 52360
     },
     {
       "executable": false,
@@ -1140,8 +1140,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "f4e65234a2e0c05faea030c24c5f7e8c6969bc65468392d214621f17737c29a2",
-      "size_bytes": 94568
+      "sha256": "e9a696e3ac2710eeb9f8347e00989f8317903813e62c3784ab8f033541be8036",
+      "size_bytes": 105571
     },
     {
       "executable": false,
@@ -1202,6 +1202,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/instruction_inventory.rs",
+      "sha256": "de95b6c5e92b5404966340f7b3bbb5ec05ec38ec7a878c23e1eb2b0ae8206f60",
+      "size_bytes": 32338
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/keychain.rs",
       "sha256": "fbae2593cccf184ba0cc8ea6cc5edc230985a33a35dc5f0afdcfa2c1cfb321ea",
       "size_bytes": 29973
@@ -1231,8 +1238,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "da81c3440d4a241f32e61584a5ae48043a99e51e053832a7ab074a8817ad3545",
-      "size_bytes": 372562
+      "sha256": "0b6f3b55317fe22874b786928314fce9fe032eb22ee6f1dda82918a3f406b06f",
+      "size_bytes": 372589
     },
     {
       "executable": false,
@@ -1441,8 +1448,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "30a591317e4b6cae248f127cc38696a8ce73e264d2832f39a4571525ba873a37",
-      "size_bytes": 205812
+      "sha256": "7ecd52b5483cb1690fe26ae2e0ba4902aa1145772c65b9db5dc05d114a088857",
+      "size_bytes": 206643
     },
     {
       "executable": false,
@@ -1630,8 +1637,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "cfde0e178d5e508a9c78029f72a5fe6861f1f25d225474e3c3a9b02e7d3fde30",
-      "size_bytes": 3438198
+      "sha256": "ab1b10f2921c3f69d28729d58c110824ba251ec1fd25dd7cc9240891848ea501",
+      "size_bytes": 3439270
     },
     {
       "executable": false,
@@ -3995,6 +4002,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-22-claude-instruction-inventory.md",
+      "sha256": "4f6217b54a035c80d755083c49c825b523d8ba1e8946bd87d4f42ab279c19574",
+      "size_bytes": 3648
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-22-codex-compaction-sizes-and-local-points.md",
       "sha256": "f4e508993982c94c9f151eb6259882a4209c3fc2b26a5b05f3d3409fcec67d5a",
       "size_bytes": 7228
@@ -4663,6 +4677,13 @@
       "path": "fixtures/context-footprint/file-counts-v1.json",
       "sha256": "148fd3730fd604ddcd1f93e43737696a92b126173d4476358d3f197c078226af",
       "size_bytes": 677
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/context-footprint/instruction-inventory-v1.json",
+      "sha256": "d46366d8c4de6a3068c138ad0fb703d158fe35a69eb84e833f33ac5125accad0",
+      "size_bytes": 8045
     },
     {
       "executable": false,
@@ -5848,9 +5869,9 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T07:53:41+00:00",
+  "generated_at": "2026-10-24T09:13:46+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 836,
+  "output_file_count": 839,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5887,5 +5908,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "98bcfb5cebaa9ebee4c8b168b9666c666bd3d7b3"
+  "source_commit": "cc6f4a3439b11a965296ba5f35d2503cb8e1ffbc"
 }

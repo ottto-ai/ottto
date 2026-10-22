@@ -756,7 +756,6 @@ pub(crate) fn repository_main_checkout(workspace: &Path) -> Option<PathBuf> {
 pub(crate) fn git_toplevel(workspace: &Path) -> Option<PathBuf> {
     git_stdout(workspace, &["rev-parse", "--show-toplevel"])
         .map(|raw| absolutize_git_path(workspace, &raw))
-
 }
 
 fn git_stdout(workspace: &Path, args: &[&str]) -> Option<String> {
