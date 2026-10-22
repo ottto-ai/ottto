@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 781,
-  "content_sha256": "e7eccd76de2b92d40994a160762ec531c9ffe8ea24d31c80584b2ef203b600f3",
+  "content_sha256": "6185f70684b992008ddc353faa1bfd0a2cb62ba9ad2497474e3c04911290e052",
   "files": [
     {
       "executable": false,
@@ -34,8 +34,8 @@
       "executable": false,
       "mode": "0644",
       "path": "AGENTS.md",
-      "sha256": "a6d20cc05a79d43c158207a0f9f34a606ef49b9e93ae6f088fcafe550821280d",
-      "size_bytes": 2899
+      "sha256": "1cbe0eb2888b19cc0b47eec38c95027b56856a2302da14f59ef7071372b36338",
+      "size_bytes": 3088
     },
     {
       "executable": false,
@@ -5470,7 +5470,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T18:48:06+00:00",
+  "generated_at": "2026-10-22T19:37:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 782,
   "public_roots": [
@@ -5509,5 +5509,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "8136015a321cdb69e850d4c6081f7d894ca3c4ca"
+  "source_commit": "e4623b34a4a8b1fea4efc8ae0b295e662acf4572"
 }
