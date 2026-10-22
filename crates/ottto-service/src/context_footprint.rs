@@ -11,7 +11,9 @@ use crate::context_file_counts::{load_or_create_salt, measure_file, FileCounts};
 use crate::instruction_inventory::{
     build_instruction_inventory, default_login_claude_mode, InstructionInventory, InventoryPaths,
 };
-use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
+use crate::snapshot_client::{
+    load_snapshot_device_credentials, ActivityHintResponse, SnapshotApiClient,
+};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
 use ottto_core::{compiled_release_version, default_support_dir, LocalDeviceBinding};
@@ -313,7 +315,7 @@ fn harvest_source(
                 home,
                 machine_id,
                 workspace_labels_enabled,
-                inventory_paths_for_hint(Some(workspace_labels_enabled)),
+                inventory_paths(Some(&hint)),
             );
         }
         Err(_) if read_marker(&marker).as_deref() == Some(identity.as_str()) => {
@@ -330,21 +332,18 @@ fn harvest_source(
         home,
         machine_id,
         true,
-        inventory_paths_for_hint(None),
+        inventory_paths(None),
     )
 }
 
-/// Instruction paths leave the machine only when the hint explicitly says
-/// workspace labels are on. Without a hint the policy is unknown, so no
-/// inventory block is built at all.
-fn inventory_paths_for_hint(workspace_labels_enabled: Option<bool>) -> Option<InventoryPaths> {
-    workspace_labels_enabled.map(|enabled| {
-        if enabled {
-            InventoryPaths::Collect
-        } else {
-            InventoryPaths::Withhold
-        }
-    })
+/// Instruction paths leave the machine only when the hint explicitly sent
+/// `workspace_labels_enabled: true`. Without a hint, or without that field,
+/// the policy is unknown, so no inventory block is built at all.
+fn inventory_paths(hint: Option<&ActivityHintResponse>) -> Option<InventoryPaths> {
+    match hint?.workspace_labels_explicit? {
+        true => Some(InventoryPaths::Collect),
+        false => Some(InventoryPaths::Withhold),
+    }
 }
 
 fn harvest_recent_workspaces(
@@ -2656,6 +2655,38 @@ mod tests {
     #[test]
     fn instruction_inventory_rides_upload_digest_only_when_present() {
         let without = sample_request();
+        // Without a block the digest is the previous algorithm's, unchanged.
+        let previous = serde_json::to_vec(&json!({
+            "cache_schema": "context_footprint_request_v3",
+            "agent_source": &without.agent_source,
+            "machine_id": &without.machine_id,
+            "workspace_hash": &without.workspace_hash,
+            "workspace_label": &without.workspace_label,
+            "workspace_label_source": &without.workspace_label_source,
+            "repository_hash": &without.repository_hash,
+            "repository_label": &without.repository_label,
+            "repository_label_source": &without.repository_label_source,
+            "repository_identity_source": &without.repository_identity_source,
+            "workspace_kind": &without.workspace_kind,
+            "config_hash": &without.config_hash,
+            "collector_version": &without.collector_version,
+            "counter_source": &without.counter_source,
+            "model": &without.model,
+            "used_tokens": without.used_tokens,
+            "context_window_tokens": without.context_window_tokens,
+            "pct_context": without.pct_context,
+            "free_space_tokens": without.free_space_tokens,
+            "categories": &without.categories,
+            "memory_files": &without.memory_files,
+            "skills": &without.skills,
+            "custom_agents": &without.custom_agents,
+            "mcp_tools": &without.mcp_tools,
+        }))
+        .unwrap();
+        assert_eq!(
+            request_content_hash_for_request(&without).unwrap(),
+            sha256_bytes(&previous)
+        );
         let encoded = serde_json::to_value(&without).unwrap();
         assert!(encoded.get("instruction_inventory").is_none());
         let fixture: Value = serde_json::from_str(include_str!(
@@ -2684,20 +2715,49 @@ mod tests {
             .map(|request| request_content_hash_for_request(request).unwrap());
         assert_ne!(hashes[0], hashes[1]);
         assert_ne!(hashes[1], hashes[2]);
+        // Identical captures keep one digest; each state change uploads once.
         assert_eq!(hashes[1], request_content_hash_for_request(&with).unwrap());
+        let mut withheld = without.clone();
+        withheld.instruction_inventory = Some(
+            serde_json::from_value(
+                fixture["variants"]["labels_off"]["instruction_inventory"].clone(),
+            )
+            .unwrap(),
+        );
+        let withheld_hash = request_content_hash_for_request(&withheld).unwrap();
+        assert_eq!(
+            withheld_hash,
+            request_content_hash_for_request(&withheld).unwrap()
+        );
+        assert!(!hashes.contains(&withheld_hash));
     }
 
     #[test]
     fn instruction_paths_need_an_explicit_labels_on_hint() {
-        assert_eq!(inventory_paths_for_hint(None), None);
+        let hint = |extra: &str| {
+            crate::snapshot_client::decode_activity_hint(
+                serde_json::from_str(&format!(
+                    r#"{{"source":"claude_code","server_time":"2026-10-22T10:00:00Z","last_data_at":null,
+                    "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
+                    "backfill_window_days":183,"recommended_scan_after":"2026-10-22T10:05:00Z"{extra}}}"#
+                ))
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let omitted = hint("");
+        // Labels keep their legacy default; the inventory does not.
+        assert!(omitted.workspace_labels_enabled);
+        assert_eq!(inventory_paths(Some(&omitted)), None);
         assert_eq!(
-            inventory_paths_for_hint(Some(false)),
+            inventory_paths(Some(&hint(r#","workspace_labels_enabled":false"#))),
             Some(InventoryPaths::Withhold)
         );
         assert_eq!(
-            inventory_paths_for_hint(Some(true)),
+            inventory_paths(Some(&hint(r#","workspace_labels_enabled":true"#))),
             Some(InventoryPaths::Collect)
         );
+        assert_eq!(inventory_paths(None), None);
     }
 
     #[test]
@@ -2726,6 +2786,27 @@ mod tests {
         assert_eq!(
             git_stdout_capped(&repo, &["cat-file", "-p", "missing"], 1024),
             Err(GitOutputError::Failed)
+        );
+        // A descendant still holding stdout cannot hold the caller past the
+        // timeout; the reader thread finishes once the pipe closes.
+        let started = Instant::now();
+        assert_eq!(
+            git_stdout_capped(&repo, &["-c", "alias.slow=!sleep 4", "slow"], 1024),
+            Err(GitOutputError::TimedOut)
+        );
+        assert!(started.elapsed() < GIT_COMMAND_TIMEOUT + Duration::from_secs(1));
+        // Non-ASCII output keeps the 4,096-character (not byte) result.
+        fs::write(repo.join("wide"), "\u{e9}".repeat(5000)).unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["hash-object", "-w", "wide"])
+            .output()
+            .unwrap();
+        let wide = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        assert_eq!(
+            git_stdout(&repo, &["cat-file", "-p", wide.as_str()]),
+            Some("\u{e9}".repeat(4096))
         );
         fs::remove_dir_all(repo).unwrap();
     }

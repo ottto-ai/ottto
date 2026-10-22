@@ -26,6 +26,11 @@ const NON_ENTRY_RESERVE_BYTES: usize = 512;
 /// Backend `relative_path` bound, in characters.
 const MAX_RELATIVE_PATH_CHARS: usize = 512;
 const LS_FILES_MAX_BYTES: usize = 1024 * 1024;
+/// Scratch bounds: nested AGENTS.md paths kept from `ls-files` (the index is
+/// sorted, so these are the first in order) and folders memoized for the
+/// CLAUDE-file chain. Past either, the list is partial (`file_cap`).
+const MAX_NESTED_CANDIDATES: usize = 1000;
+const MAX_CHAIN_FOLDERS: usize = 2000;
 /// Checked between stats; one blocked `stat` cannot be interrupted.
 const TIME_BUDGET: Duration = Duration::from_secs(1);
 
@@ -228,9 +233,14 @@ fn collect_files(
                 }
                 let mut folder = Path::new(&agents).parent();
                 while let Some(dir) = folder.filter(|dir| !dir.as_os_str().is_empty()) {
-                    if !chain_checked.insert(dir.to_path_buf()) {
+                    if chain_checked.contains(dir) {
                         break;
                     }
+                    if chain_checked.len() == MAX_CHAIN_FOLDERS {
+                        reasons.insert(PartialReason::FileCap);
+                        break 'nested;
+                    }
+                    chain_checked.insert(dir.to_path_buf());
                     if Instant::now() >= deadline {
                         reasons.insert(PartialReason::TimeBudget);
                         break 'nested;
@@ -330,6 +340,10 @@ fn nested_agents_paths(
             name == "AGENTS.md" && !dir.split('/').any(|part| part == ".claude")
         });
         if nested {
+            if paths.len() == MAX_NESTED_CANDIDATES {
+                reasons.insert(PartialReason::FileCap);
+                break;
+            }
             paths.insert(path.to_string());
         }
     }
@@ -459,6 +473,12 @@ mod tests {
             expected,
             "{variant}"
         );
+        // Same compact UTF-8 payload size as the fixture (key order aside).
+        assert_eq!(
+            serde_json::to_vec(inventory).unwrap().len(),
+            serde_json::to_vec(&expected).unwrap().len(),
+            "{variant} bytes"
+        );
         let decoded: InstructionInventory = serde_json::from_value(expected).unwrap();
         assert_eq!(&decoded, inventory, "{variant} round trip");
     }
@@ -570,6 +590,18 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.relative_path == "backend/AGENTS.md"));
+
+        // Non-ASCII folder names are sent as UTF-8, sized in bytes.
+        write_sized(&repo.join("d\u{e9}j\u{e0}/AGENTS.md"), 7);
+        git(&repo, &["add", "."]);
+        let unicode =
+            build_instruction_inventory(&repo, &none, mode, InventoryPaths::Collect).unwrap();
+        assert!(unicode.files.complete);
+        assert!(unicode
+            .files
+            .entries
+            .iter()
+            .any(|entry| !entry.relative_path.is_ascii() && entry.file_bytes == 7));
 
         // A path the backend would reject is withheld, never sent.
         write_sized(&repo.join("a/home/x/AGENTS.md"), 5);

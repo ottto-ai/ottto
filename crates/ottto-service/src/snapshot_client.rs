@@ -650,6 +650,11 @@ pub struct ActivityHintResponse {
     pub session_titles_enabled: bool,
     #[serde(default = "default_true")]
     pub workspace_labels_enabled: bool,
+    /// `workspace_labels_enabled` exactly as sent; `None` when the response
+    /// omitted it (the field above then defaults to on). Set only by
+    /// `decode_activity_hint`. Instruction-file paths need `Some(true)`.
+    #[serde(skip)]
+    pub workspace_labels_explicit: Option<bool>,
     #[serde(default)]
     pub session_artifacts_enabled: bool,
     // Opt-out (default on). The backend resolves the full cascade (telemetry-off
@@ -700,6 +705,17 @@ pub struct ActivityHintResponse {
     #[serde(default)]
     pub session_request_identity_contract: Option<String>,
     pub recommended_scan_after: String,
+}
+
+/// Decodes an activity hint and records whether `workspace_labels_enabled`
+/// was actually sent.
+pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse> {
+    let mut hint = ActivityHintResponse::deserialize(&value)
+        .map_err(|error| anyhow!("parse activity hint response failed: {error}"))?;
+    hint.workspace_labels_explicit = value
+        .get("workspace_labels_enabled")
+        .and_then(Value::as_bool);
+    Ok(hint)
 }
 
 fn default_true() -> bool {
@@ -1901,8 +1917,9 @@ impl SnapshotApiClient {
                     &other,
                 )),
             })?
-            .into_json()
+            .into_json::<Value>()
             .map_err(|error| anyhow!("parse activity hint response failed: {error}"))
+            .and_then(decode_activity_hint)
     }
 
     pub fn upload_batch(
@@ -4971,7 +4988,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
