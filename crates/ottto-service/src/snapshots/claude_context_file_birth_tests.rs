@@ -11,7 +11,7 @@ const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
 const SECOND: &str = "b0000000-0000-4000-8000-00000000000b";
 const OTHER_ROOT: &str = "c0000000-0000-4000-8000-00000000000c";
 const COPIED: i64 = -2 * 24 * 60 * 60;
-const CONTEXT_KEYS: [&str; 10] = [
+const CONTEXT_KEYS: [&str; 11] = [
     "compaction_count",
     "compaction_events",
     "compaction_timestamps",
@@ -19,6 +19,7 @@ const CONTEXT_KEYS: [&str; 10] = [
     "compaction_total_duration_ms",
     "compaction_total_post_tokens",
     "compaction_total_pre_tokens",
+    "first_own_request_at",
     "first_turn_context_tokens",
     "last_turn_context_tokens",
     "peak_context_fill_tokens",
@@ -176,6 +177,7 @@ fn assert_cleared(item: &SnapshotItem) {
     assert_eq!(item.compaction_total_duration_ms, None);
     assert!(item.compaction_events.is_empty());
     assert!(item.local_context_points.is_empty());
+    assert_eq!(item.first_own_request_at, None);
 }
 
 /// Prompt sizes of the item's Mac-local points, oldest first.
@@ -2776,5 +2778,294 @@ fn folded_sizes_and_points_leave_every_identity_unchanged() {
         serde_json::json!([{"at": stamp(now, -28), "before": 300, "after": 200, "trigger": "auto"}])
     );
     assert!(wire.get("local_context_points").is_none());
+    let _ = fs::remove_dir_all(dir);
+}
+
+// ---- first_own_request_at (SOURCE ruling, Ron's go) -------------------------
+
+/// A measured root file: the first own request's end time, even when copied
+/// records with older timestamps (which set `source_started_at`) follow it.
+#[test]
+fn measured_file_carries_its_first_own_request_time() {
+    let dir = temp_dir("claude-file-birth-first-own");
+    let now = OffsetDateTime::now_utc();
+    let (path, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            assistant(ROOT, "req_c1", &stamp(now, COPIED), 900_000),
+            boundary(ROOT, &stamp(now, COPIED + 1), 900_010, 100_000),
+            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
+        ],
+    );
+    assert_eq!(parsed.first_own_request_at, None, "the fold sets it");
+    let mut items = vec![parsed.clone()];
+    let mut index = indexed(&[&path], true);
+    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
+    let counts = &disposition.context_file_birth.total;
+    assert_eq!(counts.partially_pre_birth_session_count, 0);
+    let item = &items[0];
+    assert_eq!(item.first_own_request_at, Some(stamp(now, -30)));
+    // The earlier copied record never wins, and the field is not started_at.
+    assert_eq!(item.source_started_at, Some(stamp(now, COPIED)));
+    let wire = serde_json::to_value(item).expect("serialize body");
+    assert_eq!(
+        wire["first_own_request_at"],
+        serde_json::json!(stamp(now, -30))
+    );
+    let wire = serde_json::to_value(&parsed).expect("serialize body");
+    assert!(wire.get("first_own_request_at").is_none());
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Absent unless the birth was measured: a file whose first own request
+/// follows copied records (partially pre-birth), withheld or unknown birth,
+/// a subagent (exempt, not measured) and an id-less first own response. A
+/// stale value is cleared, never kept.
+#[test]
+fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
+    let dir = temp_dir("claude-file-birth-first-own-absent");
+    let now = OffsetDateTime::now_utc();
+    let stale = Some(stamp(now, -3_600));
+    let run = |path: &PathBuf, mut item: SnapshotItem| {
+        item.first_own_request_at = stale.clone();
+        let session = item.source_session_id.clone();
+        let mut items = vec![item];
+        let mut index = indexed(&[path.as_path()], true);
+        let disposition = fold(&mut items, &no_reports(), &mut index, true);
+        let admission = disposition.posture_admission(&session);
+        let partially = disposition
+            .context_file_birth
+            .total
+            .partially_pre_birth_session_count;
+        (admission, partially, items.remove(0))
+    };
+
+    let (path, partial) = root_session(
+        &dir.join("partial"),
+        ROOT,
+        &[
+            assistant(ROOT, "req_c1", &stamp(now, COPIED), 900_000),
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
+        ],
+    );
+    let (admission, partially, item) = run(&path, partial);
+    assert_eq!(admission, Some("file_birth_rule"));
+    assert_eq!(partially, 1);
+    assert_eq!(posture(&item), (Some(100), Some(300), Some(300), Some(0)));
+    assert_eq!(item.first_own_request_at, None, "partially pre-birth");
+
+    let own = [
+        assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+        assistant(ROOT, "req_a2", &stamp(now, -29), 300),
+    ];
+    let (path, mut unknown) = root_session(&dir.join("unknown"), ROOT, &own);
+    unknown.claude_file_birth.forget_birth_for_test();
+    let (admission, _, item) = run(&path, unknown);
+    assert_eq!(admission, Some("withheld_unknown_birth"));
+    assert_cleared(&item);
+
+    let (path, copied) = root_session(
+        &dir.join("all-copied"),
+        ROOT,
+        &[assistant(ROOT, "req_c1", &stamp(now, COPIED), 900_000)],
+    );
+    let (admission, _, item) = run(&path, copied);
+    assert_eq!(admission, Some("withheld_all_copied"));
+    assert_cleared(&item);
+
+    let (path, id_less) = root_session(
+        &dir.join("id-less"),
+        ROOT,
+        &[
+            id_less_assistant(ROOT, &stamp(now, -30), 50),
+            assistant(ROOT, "req_a1", &stamp(now, -29), 100),
+        ],
+    );
+    let (admission, _, item) = run(&path, id_less);
+    assert_eq!(admission, Some("file_birth_rule"));
+    assert_eq!(item.first_own_request_at, None, "no occurrence to read");
+
+    // A stamped partial, then the same response's unstamped final record:
+    // the kept timestamp is the partial's, not the request's end.
+    let unstamped_end = assistant(ROOT, "req_a1", "", 100)
+        .replace("\"timestamp\":\"\",", "")
+        .replace("\"output_tokens\":1}", "\"output_tokens\":5}");
+    let (path, unstamped) = root_session(
+        &dir.join("unstamped-end"),
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            unstamped_end,
+        ],
+    );
+    let (admission, _, item) = run(&path, unstamped);
+    assert_eq!(admission, Some("file_birth_rule"));
+    assert_eq!(item.first_own_request_at, None, "end time not proven");
+
+    let agent = "a4d1585d310070d0f";
+    let child_dir = dir.join("subagent").join(ROOT).join("subagents");
+    fs::create_dir_all(&child_dir).expect("create subagent dir");
+    let path = child_dir.join(format!("agent-{agent}.jsonl"));
+    fs::write(
+        &path,
+        subagent_assistant(ROOT, agent, "req_s1", &stamp(now, -30)),
+    )
+    .expect("write subagent fixture");
+    let subagent = parse(&path, now);
+    assert!(subagent.claude_file_birth.is_subagent_for_test());
+    let (admission, _, item) = run(&path, subagent);
+    assert_eq!(admission, Some("file_birth_rule"));
+    assert_eq!(item.first_own_request_at, None, "exempt is not measured");
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The strict rule never carries design E's first own request time, even
+/// for the same file the birth rule measures.
+#[test]
+fn strict_path_has_no_first_own_request_time() {
+    let dir = temp_dir("claude-file-birth-first-own-strict");
+    let now = OffsetDateTime::now_utc();
+    let (path, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
+        ],
+    );
+    let evidence = reports(&[(ROOT, "req_a1", 1, 100), (ROOT, "req_a2", 2, 300)], true);
+    let run = |fence_closed: bool| {
+        let mut item = parsed.clone();
+        item.first_own_request_at = Some(stamp(now, -3_600));
+        let mut items = vec![item];
+        let mut index = indexed(&[&path], fence_closed);
+        let disposition = fold(&mut items, &evidence, &mut index, true);
+        (disposition.posture_admission(ROOT), items.remove(0))
+    };
+    let (strict_admission, strict) = run(false);
+    let (birth_admission, birth) = run(true);
+    assert_eq!(strict_admission, Some("strict"));
+    assert_eq!(birth_admission, Some("file_birth_rule"));
+    assert_eq!(posture(&strict), posture(&birth));
+    assert_eq!(strict.first_own_request_at, None);
+    assert_eq!(birth.first_own_request_at, Some(stamp(now, -30)));
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Display-only: the field never moves semantic identity, the content hash,
+/// the revision or revision v2 input, the envelope or the body witness.
+#[test]
+fn first_own_request_time_leaves_every_identity_unchanged() {
+    let dir = temp_dir("claude-file-birth-first-own-identity");
+    let now = OffsetDateTime::now_utc();
+    let (path, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
+        ],
+    );
+    let mut items = vec![parsed];
+    let mut index = indexed(&[&path], true);
+    fold(&mut items, &no_reports(), &mut index, true);
+    let item = items.remove(0);
+    assert_eq!(item.first_own_request_at, Some(stamp(now, -30)));
+    let mut bare = item.clone();
+    bare.first_own_request_at = None;
+    let claude = SnapshotSource::ClaudeCode;
+    let policy = valid_v6_batch_request().upload_policy;
+    let hashes = snapshot_semantic_component_hashes(claude, &item);
+    assert_eq!(hashes, snapshot_semantic_component_hashes(claude, &bare));
+    assert_eq!(
+        snapshot_fingerprint(claude, &item),
+        snapshot_fingerprint(claude, &bare)
+    );
+    assert_eq!(
+        snapshot_revision_v2_body(claude, &item, policy, &hashes),
+        snapshot_revision_v2_body(claude, &bare, policy, &hashes)
+    );
+    assert_eq!(
+        snapshot_semantic_envelope(claude, &item, policy),
+        snapshot_semantic_envelope(claude, &bare, policy)
+    );
+    assert_eq!(
+        snapshot_upload_body_witness(&item),
+        snapshot_upload_body_witness(&bare)
+    );
+    assert_eq!(
+        snapshot_upload_body_witness_version(&item),
+        snapshot_upload_body_witness_version(&bare)
+    );
+    assert_eq!(
+        differing_keys(&item, &bare),
+        BTreeSet::from(["first_own_request_at".to_string()])
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The tail path and a full read give the same first own request time at
+/// every append boundary.
+#[test]
+fn tail_and_full_read_give_the_same_first_own_request_time() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let dir = temp_dir("claude-file-birth-first-own-tail");
+    fs::create_dir_all(&dir).expect("create project dir");
+    let now = OffsetDateTime::now_utc();
+    let collected_at = stamp(now, 0);
+    let rows = [
+        assistant(ROOT, "req_a1", &stamp(now, -9), 100),
+        assistant(ROOT, "req_a2", &stamp(now, -8), 300),
+        assistant(ROOT, "req_c0", &stamp(now, COPIED), 900_000),
+        assistant(ROOT, "req_a3", &stamp(now, -7), 200),
+    ];
+    let path = dir.join(format!("{ROOT}.jsonl"));
+    for split in 1..rows.len() {
+        let _ = fs::remove_file(&path);
+        fs::write(&path, rows[..split].concat()).expect("write prefix");
+        let (retained, _, _) = native_read(&path, None, 100, &collected_at);
+        assert!(retained.is_some(), "split {split}: prefix retained");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for append");
+        std::io::Write::write_all(&mut file, rows[split..].concat().as_bytes())
+            .expect("append rest");
+        drop(file);
+        let (_, mode, tailed) = native_read(&path, retained, 101, &collected_at);
+        assert_eq!(
+            mode,
+            crate::transcript_acquisition::ReadMode::Tail,
+            "split {split}"
+        );
+        let (_, _, full) = native_read(&path, None, 102, &collected_at);
+        let mut folded = Vec::new();
+        for item in [tailed, full] {
+            let mut items = vec![item];
+            let mut index = indexed(&[&path], true);
+            let disposition = fold(&mut items, &no_reports(), &mut index, true);
+            assert_eq!(
+                disposition.posture_admission(ROOT),
+                Some("file_birth_rule"),
+                "split {split}"
+            );
+            folded.push(items.remove(0));
+        }
+        assert_eq!(
+            folded[0].first_own_request_at, folded[1].first_own_request_at,
+            "split {split}"
+        );
+        assert_eq!(
+            folded[0].first_own_request_at,
+            Some(stamp(now, -9)),
+            "split {split}"
+        );
+    }
     let _ = fs::remove_dir_all(dir);
 }

@@ -98,3 +98,37 @@ stable sort by sequence.
   The existing `compaction_before` check per response is unchanged.
 - Upload: about 84 bytes per Claude event; outside the content hash, semantic
   fingerprint, envelope component hashes, revision v2 input and body witness.
+
+## First own request time (`first_own_request_at`)
+
+An optional Claude Code snapshot field: when the session's first own request
+(design E's first own response) ended, RFC 3339 UTC, the same string the
+transcript gave that response. Display-only: the web hides context hours that
+end before it; money, cost, identity, family and proofs never read it.
+
+- Set only by the file-birth admission, from values the fold already holds:
+  `first_own_sequence` -> the occurrence with that sequence -> its terminal
+  timestamp. No new reads, no new state, no parser or scan identity bump.
+- Only when the birth was measured: a root transcript with a usable file
+  birth, admitted, and not partially pre-birth (no copied response or copied
+  boundary at or before the first own request). Absent otherwise: withheld
+  verdicts, unknown birth, partially pre-birth, subagent files (exempt from
+  the rule, so not measured), the strict path (with or without design E),
+  Codex and Pi. Also absent when the first own response had no request id (no
+  occurrence), any of its records was unstamped (the kept timestamp could be
+  an earlier partial's) or its timestamp is not UTC. Never a guess, never
+  `source_started_at`.
+- Copied records later in the file with older timestamps never win: the
+  value follows sequence, not the earliest timestamp.
+- `clear_claude_context_posture` clears it with the other context scalars;
+  the strict branch clears it too; `finish()` never sets it.
+- Outside the content hash, semantic fingerprint, envelope component hashes,
+  revision v2 input and body witness, so a change alone does not re-upload
+  and old idle sessions keep today's behaviour until they upload for another
+  reason (no backfill).
+- Weight: about 30 bytes on the upload when present; charged like the other
+  optional strings in `heap_layout_bound` and `retry_retention_bound`; the
+  retry copy keeps it. Per admitted item, one pass over its request map to
+  find the first own occurrence and one timestamp parse.
+- The backend must accept the field (optional timestamp, malformed -> null)
+  before a Mac release that sends it.

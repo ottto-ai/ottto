@@ -264,6 +264,32 @@ pub(super) fn apply_own_context_scalars(
         .saturating_add(id_less.after);
 }
 
+/// When the session's first own request ended (SOURCE ruling on
+/// `first_own_request_at`): only for a root file whose birth was measured and
+/// whose first own request follows no copied record. Read from values the
+/// fold already holds; `None` when that request carried no request id (no
+/// occurrence), any of its records was unstamped (the kept timestamp may be
+/// an earlier partial's, not its end) or its timestamp is not RFC 3339 UTC.
+/// Never a guess.
+fn measured_first_own_request_at(item: &SnapshotItem) -> Option<String> {
+    let birth = &item.claude_file_birth;
+    if !birth.root_with_birth() || birth.partially_pre_birth(&item.claude_context_curve_boundaries)
+    {
+        return None;
+    }
+    let first_own = birth.first_own_sequence?;
+    let timestamp = item
+        .claude_usage_occurrences
+        .values()
+        .find(|occurrence| occurrence.sequence == first_own)
+        .filter(|occurrence| occurrence.event_clock_complete)?
+        .timestamp
+        .as_deref()?;
+    let utc = OffsetDateTime::parse(timestamp, &Rfc3339)
+        .is_ok_and(|at| at.offset() == time::UtcOffset::UTC);
+    (utc && birth.copied(Some(timestamp)) == Some(false)).then(|| timestamp.to_string())
+}
+
 /// Why an item without a provider-proven start kept or lost its scalars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeFileBirthVerdict {
@@ -933,6 +959,7 @@ pub(super) fn admit_claude_file_birth_posture(
     match verdict {
         ClaudeFileBirthVerdict::Admitted => {
             apply_own_context_scalars(item, counts);
+            item.first_own_request_at = measured_first_own_request_at(item);
             if birth.tagged_in_opening {
                 // A copied opening did not start fresh here: keep the
                 // version only. A second file for the id withholds above.
