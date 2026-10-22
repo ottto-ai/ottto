@@ -45,6 +45,8 @@ pub(crate) use tests::claude_request_account_mixed_fixture;
 pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
 #[cfg(test)]
+mod codex_context_window_tests;
+#[cfg(test)]
 mod codex_counting_v2_tests;
 mod codex_counting_version;
 mod codex_file_join;
@@ -319,7 +321,12 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // codex v39 finds SKILL.md references with the shared path extractor (any
 // skills root, nested `.system`/synced layouts, relative paths, filename
 // boundaries) and emits capability marker v2 when every reference was named.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v39";
+// codex v40 pairs `model_context_window` with each context watermark (first,
+// peak, last turn), read from the same owned token_count record. Scan identity
+// is unchanged: an unchanged rollout is not selected. A changed rollout
+// re-reads Full once, because retained Tail reductions and group receipts are
+// scoped by this version. The windows stay outside every hash.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v40";
 const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
@@ -1527,6 +1534,19 @@ pub struct SnapshotItem {
     pub first_turn_context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_turn_context_tokens: Option<u64>,
+    // Codex only: `model_context_window` from the SAME owned `token_count`
+    // record that set the matching watermark above, so watermark / window is
+    // exact even when the window changed mid-session. Each is present only
+    // when its own watermark is, and is never 0. None = not recorded (that
+    // record carried no window, or another source). Wire-only: these stay out
+    // of every semantic component, the fingerprint and the body witness, so
+    // shipping them re-mints no identity and starts no re-upload wave.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_turn_context_window_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_context_fill_window_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_context_window_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -12398,6 +12418,13 @@ struct SnapshotAccumulator {
     peak_context_fill_tokens: u64,
     first_turn_context_tokens: Option<u64>,
     last_turn_context_tokens: Option<u64>,
+    // Codex only: the `model_context_window` of the record that set each
+    // watermark above (see the SnapshotItem field docs). Set in the same
+    // owned-record step as the watermarks, so a retained Tail continuation
+    // carries them exactly as a full read would.
+    first_turn_context_window_tokens: Option<u64>,
+    peak_context_fill_window_tokens: Option<u64>,
+    last_turn_context_window_tokens: Option<u64>,
     compaction_count: u64,
     compaction_timestamps: crate::owned_heap::OwnedVec<String>,
     claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
@@ -12540,6 +12567,9 @@ impl SnapshotAccumulator {
             peak_context_fill_tokens: 0,
             first_turn_context_tokens: None,
             last_turn_context_tokens: None,
+            first_turn_context_window_tokens: None,
+            peak_context_fill_window_tokens: None,
+            last_turn_context_window_tokens: None,
             compaction_count: 0,
             compaction_timestamps: crate::owned_heap::OwnedVec::new(),
             claude_compaction_observations: crate::owned_heap::OwnedVec::new(),
@@ -14659,6 +14689,16 @@ impl SnapshotAccumulator {
             } else {
                 None
             },
+            // Codex only, and each only beside its own emitted watermark.
+            first_turn_context_window_tokens: self.first_turn_context_window_tokens.filter(|_| {
+                self.source == SnapshotSource::Codex && self.first_turn_context_tokens.is_some()
+            }),
+            peak_context_fill_window_tokens: self.peak_context_fill_window_tokens.filter(|_| {
+                self.source == SnapshotSource::Codex && self.peak_context_fill_tokens > 0
+            }),
+            last_turn_context_window_tokens: self.last_turn_context_window_tokens.filter(|_| {
+                self.source == SnapshotSource::Codex && self.last_turn_context_tokens.is_some()
+            }),
             compaction_count: self
                 .source
                 .derives_context_posture()
@@ -21422,6 +21462,9 @@ fn codex_state_only_snapshot(
         peak_context_fill_tokens: None,
         first_turn_context_tokens: None,
         last_turn_context_tokens: None,
+        first_turn_context_window_tokens: None,
+        peak_context_fill_window_tokens: None,
+        last_turn_context_window_tokens: None,
         compaction_count: None,
         compaction_timestamps: Vec::new(),
         compaction_total_pre_tokens: None,
@@ -24404,12 +24447,29 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         // The `token_count` event Codex emits at a compaction reports zero
         // usage; it observed no context, so it must not become the baseline.
         if context_tokens > 0 {
+            // The window that bounded THIS prompt, read off the same record,
+            // so each watermark keeps its own window when Codex changes it
+            // mid-session. One lookup on the already parsed record.
+            let window = codex_model_context_window(value);
             if accumulator.first_turn_context_tokens.is_none() {
                 accumulator.first_turn_context_tokens = Some(context_tokens);
+                accumulator.first_turn_context_window_tokens = window;
+            }
+            // Peak ties: the first record that reached the peak keeps its
+            // window; a later equal record only fills a window that is still
+            // missing, and never replaces a known one.
+            if context_tokens > accumulator.peak_context_fill_tokens
+                || (context_tokens == accumulator.peak_context_fill_tokens
+                    && accumulator.peak_context_fill_window_tokens.is_none())
+            {
+                accumulator.peak_context_fill_window_tokens = window;
             }
             accumulator.peak_context_fill_tokens =
                 accumulator.peak_context_fill_tokens.max(context_tokens);
             accumulator.last_turn_context_tokens = Some(context_tokens);
+            // As-is, including None: a later record without a window must not
+            // keep an older record's window under its own watermark.
+            accumulator.last_turn_context_window_tokens = window;
         }
     }
     // Usage-counting V2 (configured parsers only): version decision on the
@@ -44006,6 +44066,9 @@ mod tests {
             peak_context_fill_tokens: None,
             first_turn_context_tokens: None,
             last_turn_context_tokens: None,
+            first_turn_context_window_tokens: None,
+            peak_context_fill_window_tokens: None,
+            last_turn_context_window_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
             compaction_total_pre_tokens: None,
@@ -66727,6 +66790,9 @@ mod tests {
             "peak_context_fill_tokens",
             "first_turn_context_tokens",
             "last_turn_context_tokens",
+            "first_turn_context_window_tokens",
+            "peak_context_fill_window_tokens",
+            "last_turn_context_window_tokens",
             "compaction_count",
             "compaction_timestamps",
             "compaction_total_pre_tokens",
@@ -66910,6 +66976,9 @@ mod tests {
             peak_context_fill_tokens: Some(115),
             first_turn_context_tokens: Some(105),
             last_turn_context_tokens: None,
+            first_turn_context_window_tokens: None,
+            peak_context_fill_window_tokens: None,
+            last_turn_context_window_tokens: None,
             compaction_count: Some(0),
             compaction_timestamps: Vec::new(),
             compaction_total_pre_tokens: None,
@@ -68353,6 +68422,9 @@ mod tests {
                 peak_context_fill_tokens: None,
                 first_turn_context_tokens: None,
                 last_turn_context_tokens: None,
+                first_turn_context_window_tokens: None,
+                peak_context_fill_window_tokens: None,
+                last_turn_context_window_tokens: None,
                 compaction_count: None,
                 compaction_timestamps: Vec::new(),
                 compaction_total_pre_tokens: None,
@@ -70515,13 +70587,13 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, claude_compaction_link_tip, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, claude_compaction_link_tip, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
+crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
 crate::heap_layout_bound::fields!(SnapshotModelUsage; model, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, reasoning_effort, unattributed_total_tokens, request_count, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);

@@ -1200,6 +1200,96 @@ fn paged_singleton_matches_unpaged_read_across_scan_objects() {
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
+/// D1: a paged (paused and resumed) read pairs each context watermark with
+/// the same Codex window an unpaged read does, across page boundaries where
+/// the window changes, ties at the peak and goes missing.
+#[test]
+fn paged_singleton_carries_context_windows_like_unpaged_read() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(0);
+    let mut total = 0;
+    for n in 1..=80_u64 {
+        let context = if n == 40 || n == 60 { 9_000 } else { 100 + n };
+        let window = match n {
+            1..=20 => Some(258_400),
+            60 => Some(475_000),
+            80 => None,
+            _ => Some(400_000),
+        };
+        total += context;
+        let mut line = json!({"timestamp": "2026-10-07T10:30:00Z", "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"model": "fixture-model",
+            "total_token_usage": {"input_tokens": total, "cached_input_tokens": total / 2,
+                "output_tokens": n * 10},
+            "last_token_usage": {"input_tokens": context, "cached_input_tokens": context / 2,
+                "output_tokens": 10}}}});
+        if let Some(window) = window {
+            line["payload"]["info"]["model_context_window"] = json!(window);
+        }
+        fixture.append(SESSION, &codex_line(line));
+    }
+    let windows = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .map(|item| {
+                (
+                    item.first_turn_context_window_tokens,
+                    item.peak_context_fill_window_tokens,
+                    item.last_turn_context_window_tokens,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let (recorded, unpaged) = page(&fixture, ScanIndex::default(), None);
+    // First turn under the first window; the peak (tied at records 40 and
+    // 60) keeps record 40's window; the last record carried none.
+    assert_eq!(
+        windows(&unpaged),
+        vec![(Some(258_400), Some(400_000), None)]
+    );
+    // Unchanged-file control: the file the windows came from is not selected
+    // again while its bytes are unchanged (the parser version is not part of
+    // the scan fingerprint).
+    assert_eq!(
+        recorded.candidate_decision(&unchanged_candidate(&fixture, &recorded)),
+        CandidateDecision::Skip
+    );
+    let cache = Arc::new(SharedCache::default());
+    let paged = with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if cache
+                .with_cursor(|cursor| cursor.counters.jobs_certified)
+                .unwrap()
+                > 0
+            {
+                return scan;
+            }
+            assert!(scan.snapshots.is_empty());
+        }
+        panic!("cursor job did not complete within 64 pages");
+    });
+    let (_, paused, resumed, _, _, _) = cache
+        .with_cursor(|cursor| {
+            (
+                cursor.counters.jobs_started,
+                cursor.counters.jobs_paused,
+                cursor.counters.jobs_resumed,
+                cursor.counters.jobs_certified,
+                cursor.counters.jobs_invalidated,
+                cursor.counters.jobs_lost,
+            )
+        })
+        .unwrap();
+    assert!(paused > 0 && resumed == paused, "the read really paged");
+    assert_eq!(windows(&paged), windows(&unpaged));
+    assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
+}
+
 #[test]
 fn uncached_scan_never_pages() {
     let fixture = ScanRoot::new(40);

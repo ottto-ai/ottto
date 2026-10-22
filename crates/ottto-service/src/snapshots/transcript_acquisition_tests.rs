@@ -303,6 +303,70 @@ fn sampled_native_claude_compaction_pairs_across_tail_passes() {
     assert_eq!(body[0]["compaction_count"], json!(1));
     assert_eq!(body, oracle(&fixture, source));
 }
+/// D1: the Codex context windows ride the retained accumulator, so every
+/// real incremental Tail pass (one record per pass, so each window rule meets
+/// a record boundary: change, equal-peak tie, missing window, fill) renders
+/// what a full re-read renders.
+#[test]
+fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    // (last-turn context, window) per record; cumulative input grows.
+    let records: [(u64, Option<u64>); 7] = [
+        (100, Some(1_000)),
+        (200, Some(1_000)),
+        (200, Some(2_000)),
+        (150, None),
+        (300, None),
+        (300, Some(3_000)),
+        (120, Some(2_000)),
+    ];
+    let expected = [
+        // (first, peak, last) windows after each record.
+        (Some(1_000), Some(1_000), Some(1_000)),
+        (Some(1_000), Some(1_000), Some(1_000)),
+        (Some(1_000), Some(1_000), Some(2_000)),
+        (Some(1_000), Some(1_000), None),
+        (Some(1_000), None, None),
+        (Some(1_000), Some(3_000), Some(3_000)),
+        (Some(1_000), Some(3_000), Some(2_000)),
+    ];
+    let mut total = 0;
+    let mut retained = None;
+    for (step, ((context, window), want)) in records.into_iter().zip(expected).enumerate() {
+        total += context;
+        let mut record = json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"type":"token_count", "info":{"model":"gpt-6",
+            "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":step},
+            "last_token_usage":{"input_tokens":context,"cached_input_tokens":context/2,"output_tokens":1}}}});
+        if let Some(window) = window {
+            record["payload"]["info"]["model_context_window"] = json!(window);
+        }
+        fixture.append(&record);
+        let (next, mode, _, body) = acquire(&fixture, source, retained, 100 + step as u64);
+        // The first pass builds the retained state; every later pass is a
+        // real incremental Tail from it.
+        if step > 0 {
+            assert_eq!(mode, ReadMode::Tail, "step {step}");
+        }
+        assert!(next.is_some(), "step {step}: the reduction is retained");
+        assert_eq!(body, oracle(&fixture, source), "step {step}");
+        let window = |key: &str| body[0].get(key).and_then(Value::as_u64);
+        assert_eq!(
+            (
+                window("first_turn_context_window_tokens"),
+                window("peak_context_fill_window_tokens"),
+                window("last_turn_context_window_tokens"),
+            ),
+            want,
+            "step {step}"
+        );
+        retained = next;
+    }
+}
 #[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
     if !crate::heap_layout_bound::layout_supported() {

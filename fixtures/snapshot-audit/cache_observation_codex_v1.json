@@ -1,5 +1,5 @@
 {
-  "body_witness_digest": "4d4c692a010c46a46c80d735f5b83ae7ef8af08e0b7c95212e32f069a5d08985",
+  "body_witness_digest": "8e5f2ffcdce04a1ce5bd5c0faa83dd0845ee13507ad325993be7a62a06ea60c6",
   "body_witness_version": 20,
   "cache_observations_state": {
     "coverage": "complete",
@@ -146,7 +146,7 @@
         }
       ],
       "ownership_revision": "codex_owned_rollout_occurrences:v1",
-      "parser_revision": "codex_jsonl:v39",
+      "parser_revision": "codex_jsonl:v40",
       "points": [
         {
           "compaction_after_request_boundary_index": null,
@@ -232,11 +232,11 @@
       "content_hash": "19fd8fb2e372459f7ac670cad4cfd15accdb70668f82174622d82adb007a046b",
       "hash_epoch": 1,
       "revision_contract_version": "snapshot_revision:v1",
-      "revision_hash": "0e9d072c6c73bf636e8b5bf835b984bed55866bf71e9cf7d0a5886c6625d57a6",
+      "revision_hash": "5b5798d0b8445224846d47dd57a851d809e8008744a04722ae14d40f98fea210",
       "revision_v2_canonicalization": "rfc8785:integers-only:v1",
       "revision_v2_contract_version": "snapshot_revision:v2",
-      "revision_v2_hash": "c95258dad51f2072def13dc6bdb5cbe156fb31d7d470e41acef9a146b128c093",
-      "revision_v2_parser_version": "codex_jsonl:v39",
+      "revision_v2_hash": "3fe0d6bdcf00651e6875705762d75e2082307bc674258af5d6d860f605eb668f",
+      "revision_v2_parser_version": "codex_jsonl:v40",
       "revision_v2_scan_identity_version": "codex_jsonl:v34",
       "upload_policy": {
         "session_artifacts_enabled": false,
