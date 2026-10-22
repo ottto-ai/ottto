@@ -2514,28 +2514,83 @@ struct PermanentRefusalCounts {
 }
 
 impl PermanentRefusalCounts {
+    /// A refusal counts as dominated only while its quarantine record is still
+    /// the terminal record for the same refused body. A newer body of that
+    /// entity with a pending outcome, such as a retryable conflict, owes its
+    /// own result, so the older refusal then counts as other.
     fn of(progress: &SnapshotUploadProgress) -> Self {
-        progress
-            .permanent_rejections
-            .values()
-            .fold(Self::default(), |mut counts, refusal| {
+        progress.permanent_rejections.iter().fold(
+            Self::default(),
+            |mut counts, (fingerprint, refusal)| {
                 counts.total += 1;
-                if refusal.reason.is_dominated() {
+                let terminal_for_refused_body = progress
+                    .quarantined_fingerprints
+                    .get(fingerprint)
+                    .is_some_and(|record| {
+                        matches!(
+                            record.disposition,
+                            SnapshotQuarantineDisposition::UnprovenTerminal
+                                | SnapshotQuarantineDisposition::SupersededTerminal
+                        ) && record.upload_body_witness.as_deref()
+                            == Some(refusal.body_witness.as_str())
+                    });
+                if refusal.reason.is_dominated() && terminal_for_refused_body {
                     counts.dominated += 1;
                 }
                 counts
-            })
+            },
+        )
     }
+}
+
+/// Last retained-refusal log line per source. A quiet cycle that re-discloses
+/// the same list does not log it again.
+static SOURCE_REFUSAL_LOGS: OnceLock<Mutex<BTreeMap<&'static str, RefusalLogLine>>> =
+    OnceLock::new();
+
+/// Retained refusal counts, and whether they were reported as settled residue.
+type RefusalLogLine = (PermanentRefusalCounts, bool);
+
+/// Content-free, local-only: counts of the refusals retained this cycle, and
+/// whether the cycle reported them as settled residue. Logs on change only.
+fn log_retained_permanent_refusals(
+    source: SnapshotSource,
+    retained: PermanentRefusalCounts,
+    settled_residue: bool,
+) {
+    let line = (retained, settled_residue);
+    let changed = match SOURCE_REFUSAL_LOGS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        Ok(mut logged) => logged.insert(source.api_slug(), line) != Some(line),
+        Err(_) => true,
+    };
+    if !changed || retained.dominated == 0 {
+        return;
+    }
+    eprintln!(
+        "local snapshot sync retains {} dominated and {} other permanent refusal(s) for {}{}",
+        retained.dominated,
+        retained.total - retained.dominated,
+        source.api_slug(),
+        if settled_residue {
+            "; reported as settled residue the backend already owns"
+        } else {
+            ""
+        }
+    );
 }
 
 /// Terminal state for a cycle that ends with deferred or refused entities.
 ///
 /// A settled cycle whose every retained permanent refusal is dominated lost
 /// no usage the backend does not already own. It reports `Success`: each
-/// refused body is still disclosed through its unproven-terminal quarantine
-/// count, so the receipt builder names it as settled `census_residue` under
-/// the backend's admission and in the legacy shape otherwise. No refused body
-/// becomes accepted. Any other refusal, a hold, or a conflict is unchanged.
+/// refused body is still bound to, and disclosed through, its terminal
+/// quarantine record, so the receipt builder names it as settled
+/// `census_residue` under the backend's admission and in the legacy shape
+/// otherwise. No refused body becomes accepted. Any other refusal, a hold, a
+/// conflict, or a refusal whose entity has a pending newer body is unchanged.
 fn refused_entity_state(
     permanent: bool,
     refusals: PermanentRefusalCounts,
@@ -6022,16 +6077,21 @@ fn finish_sync_source(
     upload_progress
         .permanent_rejections
         .retain(|fingerprint, _| current_entities.contains(fingerprint));
+    // Before `finish_cycle` retires this cycle's quarantine records.
+    let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_count {
-        if resolved_permanent_rejections && permanent_refusals.dominated > 0 {
-            eprintln!(
-                "local snapshot sync retains {} dominated and {} other permanent refusal(s) \
-                 for {}; dominated refusals are settled residue the backend already owns",
-                permanent_refusals.dominated,
-                permanent_refusals.total - permanent_refusals.dominated,
-                source.api_slug()
+        let state = refused_entity_state(
+            resolved_permanent_rejections,
+            permanent_refusals,
+            upload_fully_settled,
+        );
+        if resolved_permanent_rejections {
+            log_retained_permanent_refusals(
+                source,
+                retained_refusals,
+                matches!(state, CollectorState::Success),
             );
         }
         // The uploader drained its frozen, scan-capped queue before returning
@@ -6057,11 +6117,7 @@ fn finish_sync_source(
                 scan_started_at: terminal_scan_started_at,
                 counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
                     .with_snapshot_terminal_counts(&index),
-                state: refused_entity_state(
-                    resolved_permanent_rejections,
-                    permanent_refusals,
-                    upload_fully_settled,
-                ),
+                state,
             },
             scan_result.codex_counting_v2.as_deref(),
         );
