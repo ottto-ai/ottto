@@ -241,7 +241,16 @@ fn with_bootstrap_deferred(
 }
 
 // Local index projection producer revision; independent of semantic/wire identity.
-const EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION: u64 = 1;
+// Each indexed file whose stored revision differs is re-read once; the stamp is
+// written only when its upload settles, so an interrupted pass resumes. Claude
+// Code 2 re-reads its history once so the newer context numbers fill in. Bump a
+// source at most once per release; Codex and Pi stay unchanged.
+pub(crate) fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
+    match source {
+        SnapshotSource::ClaudeCode => 2,
+        SnapshotSource::Codex | SnapshotSource::Pi => 1,
+    }
+}
 
 fn exclude_held_effective_body_witness_revision(
     index: &mut ScanIndex,
@@ -408,10 +417,18 @@ fn settle_completed_upload(
     }
 }
 
+/// Process-local, content-free count of `Rejected` pages whose local holds
+/// were all terminal-bound and settled through the `Completed` restore path.
+static CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
 /// entities keep replay pending and owe a clean follow-up. A validated
 /// permanent refusal settles transport and traversal; its separate health
-/// still discloses the rejected usage.
+/// still discloses the rejected usage. Its holds settle exactly as on a
+/// `Completed` page: when every hold is non-progressing (no RetryPending
+/// family anywhere) and restorable, held keys keep their committed revision
+/// and the traversal may settle; backfill and replay stay pending.
 fn settle_checkpointed_upload(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -419,7 +436,23 @@ fn settle_checkpointed_upload(
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
 ) -> UploadIndexSettlement {
-    let mut index = if holds.any() {
+    let terminal_bound_holds = resolved_permanent_rejections
+        && holds.any()
+        && !holds.progress_blocking
+        && index.locally_held_keys_restorable(
+            committed_index,
+            &holds.held_fingerprints,
+            &holds.account_deferred_fingerprints,
+        );
+    let mut index = if terminal_bound_holds {
+        CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        index.into_locally_held_keys_reverted(
+            committed_index,
+            &holds.held_fingerprints,
+            &holds.account_deferred_fingerprints,
+        )
+    } else if holds.any() {
         let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
@@ -428,11 +461,11 @@ fn settle_checkpointed_upload(
     } else {
         index
     };
-    let settled = resolved_permanent_rejections && !holds.any();
+    let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
     if !settled {
         index.mark_bounded_sweep_unsettled();
     }
-    let fully_settled = upload_settled_without_account_holds(&index, settled);
+    let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
     UploadIndexSettlement {
         index,
         fully_settled,
@@ -3356,6 +3389,8 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         last_turn_context_tokens: item.last_turn_context_tokens,
         compaction_count: item.compaction_count,
         compaction_timestamps: item.compaction_timestamps.clone(),
+        compaction_events: item.compaction_events.clone(),
+        local_context_points: Vec::new(),
         compaction_total_pre_tokens: item.compaction_total_pre_tokens,
         compaction_total_post_tokens: item.compaction_total_post_tokens,
         compaction_total_cumulative_dropped_tokens: item.compaction_total_cumulative_dropped_tokens,
@@ -4713,7 +4748,7 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load(&index_path)?;
+    let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -4816,7 +4851,13 @@ fn prepare_sync_source(
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
-    index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        source,
+    ));
+    if source == SnapshotSource::ClaudeCode {
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(support_dir);
+    }
     let committed_index = index.clone();
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
@@ -5661,8 +5702,11 @@ fn finish_sync_source(
             deferred_entity_count = Some(count);
             eprintln!(
                 "local snapshot upload checkpointed accepted siblings but left {count} \
-                 unsettled entity(ies) pending for {}; a clean follow-up scan is required",
-                source.api_slug()
+                 unsettled entity(ies) pending for {}; a clean follow-up scan is required \
+                 ({} page(s) settled with terminal-bound holds)",
+                source.api_slug(),
+                CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+                    .load(std::sync::atomic::Ordering::Relaxed)
             );
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
@@ -9065,6 +9109,45 @@ mod tests {
     use super::*;
     use crate::snapshots::finalize_scan_after_policy;
     #[test]
+    fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
+        let root = crate::test_scratch::ScratchDir::new("retry-compaction-events");
+        let path = root.join("rollout-retry-compaction.jsonl");
+        let token = |at: &str, total: u64, last: u64| {
+            serde_json::json!({"type":"event_msg", "timestamp":at,
+            "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+            "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":total/10},
+            "last_token_usage":{"input_tokens":last,"cached_input_tokens":last/2,"output_tokens":last/10}}}})
+        };
+        let lines = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"retry-compaction"}}),
+            token("2026-10-07T11:00:00Z", 240_000, 240_000),
+            serde_json::json!({"timestamp":"2026-10-07T11:10:00Z","type":"compacted","payload":{"replacement_history":[]}}),
+            token("2026-10-07T11:20:00Z", 299_000, 59_000),
+        ];
+        let body = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, body).unwrap();
+        let mut item =
+            crate::snapshots::parse_codex_jsonl_file(&path, "2026-10-07T12:00:00Z", "fp".into())
+                .unwrap()
+                .remove(0);
+        item.cache_observations = None;
+        item.cache_base_head_etag = None;
+        assert_eq!(item.compaction_events.len(), 1);
+        assert!(!item.local_context_points.is_empty());
+
+        let copy = retry_ordinary_owned(&item).expect("ordinary item copies");
+
+        assert_eq!(copy.compaction_events, item.compaction_events);
+        assert!(copy.local_context_points.is_empty());
+        assert_eq!(
+            serde_json::to_value(&copy).unwrap()["compaction_events"],
+            serde_json::to_value(&item).unwrap()["compaction_events"]
+        );
+    }
+    #[test]
     fn native_comparison_decision_records_bounded_base_fold_without_completion() {
         use crate::snapshots::claude_native_comparison::{lifecycle, Completion};
         let root = crate::test_scratch::ScratchDir::new("native-decision-base-fold");
@@ -9856,7 +9939,7 @@ mod tests {
             let mut index = ScanIndex::load(&index_path).unwrap();
             index.activate_upload_context("cache-on".into());
             index.activate_effective_upload_body_witness_revision(
-                EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+                effective_upload_body_witness_revision(SnapshotSource::Codex),
             );
             index
         };
@@ -10205,7 +10288,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let mut baseline = ScanIndex::default();
         baseline.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let raw = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10323,7 +10406,7 @@ mod tests {
                 if held {
                     0
                 } else {
-                    EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION
+                    effective_upload_body_witness_revision(SnapshotSource::Codex)
                 },
                 "caller excludes raw held file from effective adoption"
             );
@@ -10431,7 +10514,7 @@ mod tests {
         };
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-off".into());
         let mut progress = test_upload_progress();
@@ -10575,7 +10658,7 @@ mod tests {
         let mut loaded = ScanIndex::load(&index_path).unwrap();
         loaded.activate_upload_context("cache-on-mandatory".into());
         loaded.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let mut progress = SnapshotUploadProgress::load(
             &progress_path,
@@ -10663,7 +10746,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let (mut index, _) = cache_effective_wire_released143_index(&root);
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let next = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10697,7 +10780,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let (mut index, mut progress) = cache_effective_wire_released143_index(&root);
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-on-new-context-same-effective-body".into());
         let previous = index.clone();
@@ -10777,7 +10860,7 @@ mod tests {
         let mut retry_index = ScanIndex::load(&path).unwrap();
         retry_index.activate_upload_context("cache-on-new-context-same-effective-body".into());
         retry_index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let mut retry = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10861,10 +10944,10 @@ mod tests {
             .files
             .values()
             .all(|entry| entry.effective_upload_body_witness_revision
-                == EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION));
+                == effective_upload_body_witness_revision(SnapshotSource::Codex)));
         loaded.activate_upload_context("cache-on-new-context-same-effective-body".into());
         loaded.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let stable = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10888,7 +10971,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-off".into());
         let scan = |index: &mut ScanIndex| {

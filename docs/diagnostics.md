@@ -313,3 +313,11 @@ ottto diagnostics collect --json
 
 If support requests an upload, rerun with the upload flags after the user has
 approved the disclosure.
+
+## Checkpointed Hold Settlement Total
+
+The checkpointed-upload log includes a process-lifetime count of settlement
+decisions for Rejected pages with non-progressing, restorable local holds.
+Recorded Claude account holds are included. It increments before the index
+save, so it does not count durable-save successes or unique pages; restarts
+reset it. See [counter scope and hold semantics](session-2026-10-22-terminal-bound-hold-settlement.md).
