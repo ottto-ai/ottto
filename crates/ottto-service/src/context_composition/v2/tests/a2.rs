@@ -90,7 +90,10 @@ fn audit_rereads_a_whole_file_and_keeps_matching_numbers() {
         (0, 0, 0)
     );
     assert_eq!(stats.scopes_committed, 0);
-    assert_eq!(audit.left, AUDIT_BYTES_PER_DAY - size);
+    assert_eq!(
+        audit.left,
+        AUDIT_BYTES_PER_DAY - audit::read_allowance(size)
+    );
     let after = env.scope(Source::Claude);
     assert_eq!(after.generation, before.generation);
     assert_eq!(after.agg.days, before.agg.days);
@@ -126,7 +129,10 @@ fn audit_samples_files_created_after_install_and_recovers_their_pins() {
     let after = env.scope(Source::Claude);
     assert_eq!(after.generation, before.generation);
     assert_eq!(after.agg.days, before.agg.days);
-    assert_eq!(audit.left, AUDIT_BYTES_PER_DAY - size);
+    assert_eq!(
+        audit.left,
+        AUDIT_BYTES_PER_DAY - audit::read_allowance(size)
+    );
     env.cleanup();
 }
 
@@ -190,28 +196,37 @@ fn audit_stays_within_budget_and_rotates_through_every_file() {
         .iter()
         .all(|path| fs::metadata(path).unwrap().len() == size));
 
-    // A day's budget for two files: two samples, the third waits.
+    let allowance = audit::read_allowance(size);
+    // A day's budget for two complete audits, including auxiliary reads.
     let mut sampled = BTreeSet::new();
-    let mut audit = AuditRun::with_budget(2 * size + 1, BTreeMap::new());
+    let mut audit = AuditRun::with_budget(2 * allowance + 1, BTreeMap::new());
+    harvest::tests::AUDIT_READ_BYTES.with(|bytes| bytes.set(0));
     let stats = env.run_audited(Source::Claude, now + time::Duration::hours(1), &mut audit);
+    let actual = harvest::tests::AUDIT_READ_BYTES.with(|bytes| bytes.get());
+    assert!(
+        actual > stats.bytes_audit,
+        "includes head and fingerprint reads"
+    );
+    assert!(actual <= 2 * allowance + 1, "combined audit I/O: {actual}");
+    assert!(actual <= AUDIT_BYTES_PER_DAY);
     assert_eq!(stats.audit_files, 2);
-    assert!(stats.bytes_audit <= 2 * size + 1);
+    assert!(stats.bytes_audit + stats.bytes_head <= 2 * allowance + 1);
     assert_eq!(audit.left, 1);
     sampled.insert(audit.after["claude-code"].clone());
 
     // Too little budget for any file: no read, the cursor stays.
     let cursor = audit.after.clone();
-    let mut short = AuditRun::with_budget(size - 1, cursor.clone());
+    let mut short = AuditRun::with_budget(allowance - 1, cursor.clone());
     let none = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut short);
     assert_eq!((none.audit_files, none.bytes_audit), (0, 0));
     assert_eq!(short.after, cursor);
 
     // The next day starts after the last pick: the third file, then around.
-    let mut next = AuditRun::with_budget(size, cursor);
+    let mut next = AuditRun::with_budget(allowance, cursor);
     let stats = env.run_audited(Source::Claude, now + time::Duration::hours(3), &mut next);
     assert_eq!(stats.audit_files, 1);
     sampled.insert(next.after["claude-code"].clone());
-    let mut wrap = AuditRun::with_budget(size, next.after.clone());
+    let mut wrap = AuditRun::with_budget(allowance, next.after.clone());
     env.run_audited(Source::Claude, now + time::Duration::hours(4), &mut wrap);
     sampled.insert(wrap.after["claude-code"].clone());
     assert_eq!(sampled.len(), 3, "every file sampled in turn");
@@ -316,7 +331,7 @@ fn audit_eligibility_needs_a_whole_read_under_this_parser_and_a_recorded_verdict
 }
 
 #[test]
-fn audit_compares_per_day_and_kind_and_per_kind_for_undated_lines() {
+fn audit_compares_dated_contributions_per_day_and_kind() {
     use super::super::aggregate::{Bucket, Contribution};
     let slot = Slot::plain(Kind::CommandOutput, Part::Git);
     let other = Slot::plain(Kind::CommandOutput, Part::Search);
@@ -331,16 +346,15 @@ fn audit_compares_per_day_and_kind_and_per_kind_for_undated_lines() {
     // Same kind and day, split over parts differently: no difference.
     let mut split = Contribution::default();
     split.parts.insert((1, other.clone()), bucket(10));
-    assert!(!audit::differs(Some(&stored), &split, false));
-    // Another day: a difference, unless undated lines moved it.
+    assert!(!audit::differs(Some(&stored), &split));
+    // Moving a dated contribution to another day is always a difference.
     let mut moved = Contribution::default();
     moved.parts.insert((2, slot.clone()), bucket(10));
-    assert!(audit::differs(Some(&stored), &moved, false));
-    assert!(!audit::differs(Some(&stored), &moved, true));
+    assert!(audit::differs(Some(&stored), &moved));
     let mut more = Contribution::default();
     more.parts.insert((1, slot), bucket(11));
-    assert!(audit::differs(Some(&stored), &more, true));
-    assert!(audit::differs(None, &more, false));
+    assert!(audit::differs(Some(&stored), &more));
+    assert!(audit::differs(None, &more));
 }
 
 // -------------------------------------------------------------------------
@@ -1022,10 +1036,332 @@ fn audit_does_not_restore_expired_undated_records() {
         ),
         (1, 1, 0)
     );
+    assert_eq!(stats.audit_skipped_undated, 1);
     assert_eq!(stats.scopes_committed, 0);
     let after = env.scope(Source::Claude);
     assert_eq!(after.generation, before.generation);
     assert_eq!(after.agg, before.agg);
     assert_eq!(stats.bytes_audit, fs::metadata(&path).unwrap().len());
+    env.cleanup();
+}
+
+#[test]
+fn audit_mixed_dated_and_undated_contributions_never_move_days() {
+    let env = Env::new("composition-audit-mixed-days");
+    let now = base_now();
+    let path = env.root.join("p/a.jsonl");
+    write_records(
+        &path,
+        &[
+            json!({"type":"user","sessionId":"s1","cwd":env.cwd(),"message":{"content":"undated opening"}}),
+            json!({"type":"assistant","sessionId":"s1","timestamp":ts(now.date(),1),"message":{"id":"m"}}),
+        ],
+    );
+    env.run(Source::Claude, now, None);
+    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
+    // Force a total difference too: this must still never permit replacement.
+    set_skew_forward(Some(&path), 1000);
+    env.run(Source::Claude, now + time::Duration::hours(1), None);
+    set_skew_forward(None, 0);
+    let before = env.scope(Source::Claude);
+    assert!(total_tokens(&before.agg) > 1000);
+    let checkpoints = serde_json::to_value(&before.files).unwrap();
+    for days in [1, 2] {
+        let later = now + time::Duration::days(days);
+        let mut audit = full_budget();
+        let stats = env.run_audited(Source::Claude, later, &mut audit);
+        assert_eq!((stats.audit_files, stats.audit_skipped_undated), (1, 1));
+        assert!(stats.lines.undated > 0);
+        assert_eq!((stats.audit_differences, stats.scopes_committed), (0, 0));
+        let after = env.scope(Source::Claude);
+        assert_eq!(after.agg, before.agg, "no dated or undated day moves");
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(serde_json::to_value(&after.files).unwrap(), checkpoints);
+        assert!(!after
+            .agg
+            .days
+            .keys()
+            .any(|(day, _)| *day == day_of(later.date())));
+    }
+    env.cleanup();
+}
+
+fn health_device() -> ottto_core::LocalDeviceBinding {
+    ottto_core::LocalDeviceBinding {
+        device_id: "synthetic".into(),
+        machine_id: Some("a".repeat(64)),
+        sources: vec!["codex".into()],
+    }
+}
+
+#[test]
+fn run_health_token_bounds_a_slow_progressing_tls_handshake() {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client = crate::snapshot_client::SnapshotApiClient::new(format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    ));
+    let server = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut seen = 0;
+        while Instant::now() < until {
+            if let Ok((mut socket, _)) = listener.accept() {
+                seen += 1;
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let _ = socket.read(&mut [0; 4096]);
+                // Drip a TLS record, keeping every read below the socket's
+                // timeout while the complete handshake exceeds the deadline.
+                let _ = socket.write_all(&[22, 3, 3, 0x40, 0]);
+                let drip_end = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < drip_end {
+                    if socket.write_all(&[0]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Any retry would still be queued on the listener.
+        assert!(listener.accept().is_err());
+        seen
+    });
+    let start = Instant::now();
+    let result = client.issue_composition_health_relay_token(
+        &health_device(),
+        "synthetic-secret",
+        crate::snapshots::SnapshotSource::Codex,
+        Duration::from_millis(300),
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(server.join().unwrap(), 1);
+    assert!(result.is_err());
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "token handshake took {elapsed:?}"
+    );
+}
+
+#[test]
+fn run_health_token_caps_an_oversized_response_without_retry() {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client = crate::snapshot_client::SnapshotApiClient::new(format!(
+        "http://{}",
+        listener.local_addr().unwrap()
+    ));
+    let (release, wait) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut seen = 0;
+        while Instant::now() < until {
+            if let Ok((mut socket, _)) = listener.accept() {
+                seen += 1;
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000000000\r\n\r\n").unwrap();
+                // A valid JSON prefix that cannot finish until far beyond the cap.
+                socket.write_all(b"{\"token\":\"").unwrap();
+                socket
+                    .write_all(&vec![b'x'; crate::snapshot_retry::TOKEN_RESPONSE_BYTES + 1])
+                    .unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(3));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(listener.accept().is_err());
+        seen
+    });
+    let start = Instant::now();
+    let result = client.issue_composition_health_relay_token(
+        &health_device(),
+        "synthetic-secret",
+        crate::snapshots::SnapshotSource::Codex,
+        Duration::from_secs(2),
+    );
+    let elapsed = start.elapsed();
+    let _ = release.send(());
+    assert_eq!(server.join().unwrap(), 1);
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("admission limit"), "{error}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "token decode took {elapsed:?}"
+    );
+}
+
+#[test]
+#[ignore = "private subprocess fixture"]
+fn health_pre_scan_worker_fixture() {
+    let Some(mode) = std::env::var_os("COMPOSITION_HEALTH_SETUP_FIXTURE") else {
+        return;
+    };
+    let dir: PathBuf = serde_json::from_reader(std::io::stdin().lock()).unwrap();
+    let _lease = harvest::lock_state(&dir).unwrap().unwrap();
+    let now = base_now();
+    // Exactly the production initialization, before any run_source call.
+    let _health = harvest::begin_run_health(
+        &dir,
+        &dir,
+        day_of(now.date()),
+        "device|machine|api",
+        &[
+            crate::snapshots::SnapshotSource::ClaudeCode,
+            crate::snapshots::SnapshotSource::Codex,
+        ],
+        now,
+    );
+    if mode == "fail" {
+        std::process::exit(7);
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn health_parent_reports_workers_stopped_before_run_source_and_keeps_opt_out() {
+    use crate::snapshots::SnapshotSource;
+    for (mode, worker) in [
+        (
+            "stall",
+            WorkerCounts {
+                timeouts: 1,
+                failures: 0,
+            },
+        ),
+        (
+            "fail",
+            WorkerCounts {
+                timeouts: 0,
+                failures: 1,
+            },
+        ),
+    ] {
+        let dir = scratch("composition-health-pre-scan");
+        let marker = crate::context_composition::harvest::org_disabled_marker_path(
+            &dir,
+            SnapshotSource::Codex,
+        );
+        crate::context_composition::harvest::write_marker(&marker, "device|machine|api");
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "context_composition::v2::tests::a2::health_pre_scan_worker_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("COMPOSITION_HEALTH_SETUP_FIXTURE", mode);
+        let result: anyhow::Result<Value> =
+            harvest::run_worker_process_timeout(&mut cmd, &dir, Duration::from_secs(2));
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<harvest::WorkerError>(),
+            Some(if mode == "stall" {
+                &harvest::WorkerError::Timeout
+            } else {
+                &harvest::WorkerError::Failed
+            })
+        );
+        let day = day_of(base_now().date());
+        let record = harvest::take_run_health(&dir, day).unwrap();
+        assert_eq!(
+            record.entries.len(),
+            1,
+            "known org opt-out stays suppressed"
+        );
+        assert_eq!(record.entries[0].agent_source, "claude-code");
+        assert!(!record.entries[0].finished);
+        let mut poster = Poster::default();
+        let counts = health::send(
+            &record,
+            "device|machine|api",
+            "machine-test",
+            worker,
+            &mut poster,
+        );
+        assert_eq!(counts.sent, 1);
+        assert_eq!(poster.calls[0].1["worker_timeouts"], worker.timeouts);
+        assert_eq!(poster.calls[0].1["worker_failures"], worker.failures);
+        assert_eq!(poster.calls[0].1["bytes_read"], 0);
+        assert!(harvest::take_run_health(&dir, day).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn health_fresh_org_opt_out_removes_the_attempt_before_parent_post() {
+    let dir = scratch("composition-health-opt-out");
+    let now = base_now();
+    let day = day_of(now.date());
+    let mut health = harvest::begin_run_health(
+        &dir,
+        &dir,
+        day,
+        "device|machine|api",
+        &[crate::snapshots::SnapshotSource::Codex],
+        now,
+    );
+    health.remove("codex");
+    assert!(harvest::take_run_health(&dir, day).is_none());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn audit_daily_cap_includes_full_identity_head_and_all_fingerprint_reads() {
+    use std::io::{Seek, SeekFrom};
+    let env = Env::new("composition-audit-total-read-cap");
+    let now = base_now();
+    let mut sample_bytes = 0;
+    for name in ["a", "b", "c"] {
+        let path = env.root.join(format!("p/{name}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = File::create(&path).unwrap();
+        // Sparse oversized line: no early identity, so each audit must pay
+        // for its entire 8 MiB head probe as well as the full sample.
+        file.write_all(format!("{}\n", json!({"type":"progress","cwd":env.cwd()})).as_bytes())
+            .unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.write_all(body(&claude_turn(&env.cwd(), now.date(), 1)).as_bytes())
+            .unwrap();
+        sample_bytes += file.metadata().unwrap().len();
+    }
+    assert!(sample_bytes > 100_000_000);
+    env.run(Source::Claude, now, None);
+    let mut audit = full_budget();
+    harvest::tests::AUDIT_READ_BYTES.with(|bytes| bytes.set(0));
+    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(1), &mut audit);
+    let actual = harvest::tests::AUDIT_READ_BYTES.with(|bytes| bytes.get());
+    assert_eq!(
+        stats.audit_files, 2,
+        "third sample cannot fit with its overhead"
+    );
+    assert!(
+        actual > stats.bytes_audit + 16 * 1024 * 1024,
+        "head and both fingerprint passes: {actual}"
+    );
+    assert!(
+        actual <= AUDIT_BYTES_PER_DAY,
+        "combined audit reads: {actual}"
+    );
+    assert!(actual <= AUDIT_BYTES_PER_DAY - audit.left);
+    assert!(audit.left > 0);
     env.cleanup();
 }

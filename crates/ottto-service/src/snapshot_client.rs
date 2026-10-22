@@ -1646,6 +1646,7 @@ impl SnapshotApiClient {
             device_secret,
             source,
             SNAPSHOT_HTTP_READ_TIMEOUT,
+            None,
         )
     }
 
@@ -1657,7 +1658,34 @@ impl SnapshotApiClient {
         timeout: Duration,
     ) -> Result<String> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        self.issue_relay_token_with_agent(&agent, device, device_secret, source, request_timeout)
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            None,
+        )
+    }
+
+    /// One optional parent-side token request, with the same DNS, TLS and
+    /// request deadline and response admission bound as the health transport.
+    pub(crate) fn issue_composition_health_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+    ) -> Result<String> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
+        )
     }
 
     fn issue_relay_token_with_agent(
@@ -1667,6 +1695,7 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
         timeout: Duration,
+        response_cap: Option<usize>,
     ) -> Result<String> {
         let url = self.api_url(&format!(
             "/api/v1/telemetry/devices/{}/relay-token",
@@ -1696,10 +1725,13 @@ impl SnapshotApiClient {
                     &other,
                 )),
             })?;
-        let response: RelayTokenResponse =
-            require_cloud_session_success(response, "relay token request", "relay_token")?
-                .into_json()
-                .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+        let response =
+            require_cloud_session_success(response, "relay token request", "relay_token")?;
+        let response: RelayTokenResponse = match response_cap {
+            Some(cap) => bounded_response_json(response, cap),
+            None => response.into_json().map_err(anyhow::Error::from),
+        }
+        .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         Ok(response.token)
     }
 

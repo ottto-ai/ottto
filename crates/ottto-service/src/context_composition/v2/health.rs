@@ -119,8 +119,18 @@ pub(super) struct HealthLog {
 }
 
 impl HealthLog {
-    /// Start today's record (replacing the previous run's).
+    #[cfg(test)]
     pub(super) fn begin(state_dir: &Path, run_day: Day, destination: &str) -> Self {
+        Self::begin_attempts(state_dir, run_day, destination, Vec::new())
+    }
+
+    /// Persist all attempts atomically, replacing the previous run's record.
+    pub(super) fn begin_attempts(
+        state_dir: &Path,
+        run_day: Day,
+        destination: &str,
+        entries: Vec<HealthEntry>,
+    ) -> Self {
         let log = Self {
             path: health_path(state_dir),
             record: HealthRecord {
@@ -128,7 +138,7 @@ impl HealthLog {
                 run_day,
                 destination: destination.to_string(),
                 posted: false,
-                entries: Vec::new(),
+                entries,
             },
         };
         log.save();
@@ -146,6 +156,14 @@ impl HealthLog {
             Some(old) => *old = entry,
             None => self.record.entries.push(entry),
         }
+        self.save();
+    }
+
+    /// A fresh organization policy disabled this source during setup.
+    pub(super) fn remove(&mut self, agent: &str) {
+        self.record
+            .entries
+            .retain(|entry| entry.agent_source != agent);
         self.save();
     }
 

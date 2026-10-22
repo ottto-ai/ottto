@@ -19,7 +19,9 @@
 //! counted on their own.
 
 use super::aggregate::{Bucket, Contribution, Day};
-use super::checkpoint::{file_identity, stamp, Checkpoint, Index, Pin, Status, COLD_AFTER_SECS};
+use super::checkpoint::{
+    file_identity, stamp, Checkpoint, Index, Pin, Status, COLD_AFTER_SECS, FINGERPRINT_BYTES,
+};
 use super::{AUDIT_BYTES_PER_DAY, AUDIT_FILES_PER_DAY, PARSER_VERSION};
 use crate::composition_kinds::Kind;
 use std::collections::{BTreeMap, BTreeSet};
@@ -90,12 +92,13 @@ pub(super) fn pick(
         if !pin_eligible(pin, now_secs) || busy.contains(key.as_str()) {
             continue;
         }
-        if pin.start > AUDIT_BYTES_PER_DAY {
+        let reservation = read_allowance(pin.start);
+        if reservation > AUDIT_BYTES_PER_DAY {
             // Never fits a day's audit: passed over for good.
             cursor = Some(key.clone());
             continue;
         }
-        if pin.start > audit.left {
+        if reservation > audit.left {
             // First in line tomorrow, with a whole day's budget.
             break;
         }
@@ -110,7 +113,7 @@ pub(super) fn pick(
             // Changed since its last commit: the next run reads it forward.
             continue;
         }
-        audit.left -= pin.start;
+        audit.left -= reservation;
         audit.files += 1;
         picks.push((key.clone(), std::path::PathBuf::from(&pin.path), metadata));
     }
@@ -130,27 +133,33 @@ pub(super) fn eligible(checkpoint: &Checkpoint, reserved: u64) -> Option<bool> {
         && checkpoint.status == Status::Live
         && checkpoint.cold.is_none()
         && !checkpoint.skipping
-        && checkpoint.ids_known();
+        && checkpoint.ids_known()
+        && u64::from(checkpoint.head.len) <= checkpoint.offset.min(FINGERPRINT_BYTES)
+        && u64::from(checkpoint.tail.len) <= checkpoint.offset.min(FINGERPRINT_BYTES);
     if !(fits && whole) {
         return None;
     }
     checkpoint.parse.request1_verdict()
 }
 
-/// Whether a re-read's share differs from the stored one per (day, kind):
-/// events, tokens, residency and images. Lines with no timestamp count on
-/// the day they are read, so when the re-read met any, the days cannot
-/// match and the numbers are compared per kind over all days instead.
-pub(super) fn differs(stored: Option<&Contribution>, reread: &Contribution, undated: bool) -> bool {
-    let empty = Contribution::default();
-    by_kind(stored.unwrap_or(&empty), undated) != by_kind(reread, undated)
+/// Reserve the sample, its identity head probe and both pairs of fingerprints.
+/// Reservations are conservative and never refunded, including failed probes.
+pub(super) fn read_allowance(size: u64) -> u64 {
+    size.saturating_add(size.min(super::file::HEAD_BYTES))
+        .saturating_add(4 * size.min(FINGERPRINT_BYTES))
 }
 
-fn by_kind(share: &Contribution, undated: bool) -> BTreeMap<(Day, Kind), Bucket> {
+/// Whether a dated re-read differs from the stored share per (day, kind).
+/// Callers must skip undated samples before comparing or replacing them.
+pub(super) fn differs(stored: Option<&Contribution>, reread: &Contribution) -> bool {
+    let empty = Contribution::default();
+    by_kind(stored.unwrap_or(&empty)) != by_kind(reread)
+}
+
+fn by_kind(share: &Contribution) -> BTreeMap<(Day, Kind), Bucket> {
     let mut totals: BTreeMap<(Day, Kind), Bucket> = BTreeMap::new();
     for ((day, slot), bucket) in &share.parts {
-        let day = if undated { 0 } else { *day };
-        let total = totals.entry((day, slot.kind)).or_default();
+        let total = totals.entry((*day, slot.kind)).or_default();
         total.events += bucket.events;
         total.tokens += bucket.tokens;
         total.residency += bucket.residency;

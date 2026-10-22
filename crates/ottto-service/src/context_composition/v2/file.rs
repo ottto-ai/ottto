@@ -307,7 +307,7 @@ pub(super) fn read_lines(
 }
 
 const HEAD_LINES: usize = 64;
-const HEAD_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const HEAD_BYTES: u64 = 8 * 1024 * 1024;
 const HEAD_LINE_GUARD: usize = 4 * 1024 * 1024;
 
 /// The first complete lines of a transcript (at most `HEAD_LINES` within
@@ -316,6 +316,7 @@ const HEAD_LINE_GUARD: usize = 4 * 1024 * 1024;
 fn head_scan(
     path: &Path,
     deadline: Option<Instant>,
+    byte_limit: u64,
     mut each: impl FnMut(&str) -> bool,
 ) -> std::io::Result<u64> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -326,8 +327,14 @@ fn head_scan(
     }
     let file = File::open(path)?;
     let len = file.metadata()?.len();
-    let mut reader =
-        LineReader::with_buffer(file, 0, len.min(HEAD_BYTES), false, HEAD_LINE_GUARD, 8192)?;
+    let mut reader = LineReader::with_buffer(
+        file,
+        0,
+        len.min(HEAD_BYTES).min(byte_limit),
+        false,
+        HEAD_LINE_GUARD,
+        8192,
+    )?;
     let mut lines = 0usize;
     while lines < HEAD_LINES {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -358,16 +365,17 @@ fn head_scan(
 /// The first complete lines of a transcript (bounded), for its identity,
 /// and the bytes read.
 pub(super) fn head_lines(source: Source, path: &Path) -> std::io::Result<(Vec<String>, u64)> {
-    head_lines_before(source, path, None)
+    head_lines_before(source, path, None, HEAD_BYTES)
 }
 
 fn head_lines_before(
     source: Source,
     path: &Path,
     deadline: Option<Instant>,
+    byte_limit: u64,
 ) -> std::io::Result<(Vec<String>, u64)> {
     let mut lines = Vec::new();
-    let bytes = head_scan(path, deadline, |text| {
+    let bytes = head_scan(path, deadline, byte_limit, |text| {
         lines.push(text.to_string());
         // Stop once the first-sight identity is complete. Large outputs
         // following a metadata row are never needed for identity.
@@ -390,7 +398,7 @@ fn head_lines_before(
 /// `head_lines`), in order and without repeats, and the bytes read.
 pub(super) fn head_cwds(path: &Path, deadline: Instant) -> std::io::Result<(Vec<String>, u64)> {
     let mut cwds: Vec<String> = Vec::new();
-    let bytes = head_scan(path, Some(deadline), |text| {
+    let bytes = head_scan(path, Some(deadline), HEAD_BYTES, |text| {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
             return true;
         };
@@ -430,7 +438,18 @@ pub(super) fn new_parse_state_before(
     path: &Path,
     deadline: Instant,
 ) -> std::io::Result<(ParseState, u64)> {
-    let (lines, bytes) = head_lines_before(source, path, Some(deadline))?;
+    let (lines, bytes) = head_lines_before(source, path, Some(deadline), HEAD_BYTES)?;
+    Ok((parse_head(source, path, 0, &lines), bytes))
+}
+
+/// An audit identity probe cannot prefetch beyond the reserved transcript end.
+pub(super) fn new_audit_parse_state(
+    source: Source,
+    path: &Path,
+    end: u64,
+    deadline: Instant,
+) -> std::io::Result<(ParseState, u64)> {
+    let (lines, bytes) = head_lines_before(source, path, Some(deadline), end)?;
     Ok((parse_head(source, path, 0, &lines), bytes))
 }
 

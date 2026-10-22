@@ -7,7 +7,9 @@ what each upload cost. The changed-days reader switch remains off.
 ## Run health
 
 The worker records each agent's counts in `health.json` under the reader's state
-folder: once when the agent starts and again after its scopes have committed.
+folder: enabled-source attempts are saved before worktree mapping, Keychain,
+root discovery, verdict loading or network setup, then updated after scopes commit.
+Known organization opt-outs are omitted; a fresh opt-out removes its attempt.
 After the worker process exits, the daemon side posts each agent's entry to
 `/api/v1/context-composition/run-health`, with the same device credentials and
 relay token as the composition upload. The daemon adds the counts only it knows,
@@ -29,8 +31,9 @@ bytes grew (kept in `run.json`).
 The record names the device, machine and server the run uploaded to; if they
 changed before the post, the record is dropped unsent. The record is marked
 sent before the first request, then the state lease is released before credential
-or network work. Relay-token and health requests each use a bounded DNS/request
-budget of ten seconds; successful health responses have a 64 KiB byte cap.
+or network work. Relay-token and health requests each use the same absolute
+DNS/TLS/request deadline of ten seconds, with no retries. Successful token
+responses have a 16 KiB byte cap; health responses have a 64 KiB byte cap.
 A refused or failed post is logged once and counted in the daemon's metrics
 line, and is never retried within the day; the next daily run reports again. A record older than yesterday is dropped rather
 than sent late.
@@ -53,7 +56,9 @@ the skipped prefix's provenance.
 The re-read covers exactly the bytes the checkpoint counted and compares events,
 tokens, residency and images per (day, kind) with the file's stored share.
 Lines without a timestamp count on the day they are read, so when the re-read
-meets any, the comparison is per kind over all days. A match changes nothing
+meets any, the entire file is skipped before comparison or replacement and
+counted in `audit_skipped_undated`. Its original day attribution stays unchanged.
+A match for a dated file changes nothing
 and commits nothing. A re-read stopped by the run's wall cap proves nothing and
 also changes nothing (counted as an audit failure). A re-read that ends at a
 different offset is counted as a difference but cannot replace bytes it did not
@@ -62,10 +67,10 @@ re-read's result, as a budgeted full read would, and counts it in
 `audit_differences`. No other file is read because of it. Picks rotate through
 the pins in key order from where the previous audit stopped, kept in
 `run.json`, so every eligible file is sampled in turn. Audit bytes are counted
-separately from new and repair bytes. A sample with undated records is not
-compared or used for replacement when the file's counting may have begun before
-the retention floor: its original read-day attribution is no longer available,
-and assigning those old records to today would count them again.
+separately from new and repair bytes. The daily allowance reserves all
+transcript I/O caused by each audit: the sample, its bounded identity head probe,
+and both pairs of fingerprints. Buffered reads cannot pass the reserved end;
+failed probes retain their reservation. Unused reserved bytes are not refunded.
 
 ## Metrics
 

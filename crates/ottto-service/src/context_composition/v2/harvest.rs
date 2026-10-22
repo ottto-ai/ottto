@@ -40,8 +40,8 @@ use super::checkpoint::{
     Pin, RunRecord, Stamp, Status, StoredParse, COLD_AFTER_SECS,
 };
 use super::file::{
-    head_cwds, new_parse_state, new_parse_state_before, read_lines, LineSink, LineStats, Names,
-    Source,
+    head_cwds, new_audit_parse_state, new_parse_state, new_parse_state_before, read_lines,
+    LineSink, LineStats, Names, Source,
 };
 use super::health::{HealthEntry, HealthLog, HealthPoster, PostCounts, WorkerCounts};
 use super::scope::{
@@ -157,7 +157,18 @@ fn post_run_health(worker: WorkerCounts) -> PostCounts {
 /// Mark the daily record while holding the state lease, then release it
 /// before credentials, DNS or network work can block another worker.
 pub(super) fn take_run_health(dir: &Path, today: Day) -> Option<super::health::HealthRecord> {
-    let _lease = lock_state(dir).ok()??;
+    // SIGKILL is asynchronous: allow the OS to release the dead worker's
+    // lease without turning an optional health report into an unbounded wait.
+    let until = Instant::now() + std::time::Duration::from_secs(1);
+    let _lease = loop {
+        if let Some(lease) = lock_state(dir).ok()? {
+            break lease;
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     super::health::take_pending(dir, today)
 }
 
@@ -193,7 +204,7 @@ impl HealthPoster for ClientHealthPoster {
             .into_iter()
             .find(|source| agent_source_label(*source) == agent_source)
             .ok_or_else(|| anyhow!("unknown agent source"))?;
-        let token = self.client.issue_relay_token_with_timeout(
+        let token = self.client.issue_composition_health_relay_token(
             &self.device,
             &self.device_secret,
             source,
@@ -420,11 +431,7 @@ pub fn run_context_composition_worker() -> Result<()> {
     start_watchdog(WORKER_CAP);
     let mut worktrees: WorktreeCache = serde_json::from_reader(std::io::stdin().lock())?;
     let home = crate::snapshot_sync::home_dir()?;
-    if !local_harvest_disabled(&support_dir) {
-        let today = day_of(OffsetDateTime::now_utc().date());
-        map_worktrees(&state_dir(&support_dir), today, &mut worktrees);
-    }
-    if let Err(error) = run_if_due(&home, &support_dir) {
+    if let Err(error) = run_if_due(&home, &support_dir, &mut worktrees) {
         eprintln!(
             "context composition run skipped: {}",
             crate::snapshot_sync::safe_error(&error)
@@ -478,23 +485,37 @@ pub(super) fn source_order(today: Day) -> [(SnapshotSource, Source); 2] {
 }
 
 /// Run once if today's run has not started yet.
-fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
+fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) -> Result<()> {
     if local_harvest_disabled(support_dir) {
         return Ok(());
     }
     let now = OffsetDateTime::now_utc();
     let dir = state_dir(support_dir);
+    let today = day_of(now.date());
     let Some(mut record) = begin_run(&dir, now)? else {
+        map_worktrees(&dir, today, worktrees);
         return Ok(());
     };
-    let (device, device_secret) = load_snapshot_device_credentials()?;
+    // Read only the non-secret destination metadata needed to fence health.
+    // Keychain access and all scanning setup follow the durable attempts.
+    let device = ottto_core::FileDeviceStore::default()
+        .load()?
+        .ok_or_else(|| anyhow!("relay device binding is missing"))?;
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
     let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
-    let client = SnapshotApiClient::new(api_base_url.clone());
     let enabled = crate::snapshot_sync::enabled_snapshot_sources(&device);
     let destination = destination_identity(&device, &machine_id, &api_base_url);
+    // Persist attempts before root discovery, identity-state loading or network
+    // setup. A worker killed there must still leave a report for the parent.
+    let mut health = begin_run_health(support_dir, &dir, today, &destination, &enabled, now);
+    map_worktrees(&dir, today, worktrees);
+    let (current_device, device_secret) = load_snapshot_device_credentials()?;
+    if current_device != device {
+        return Err(anyhow!("relay device binding changed during setup"));
+    }
+    let client = SnapshotApiClient::new(api_base_url.clone());
     let mut resolver = GitScopeResolver;
     let start_destination = crate::snapshots::start_verdict_store::destination(
         &crate::snapshot_sync::snapshot_upload_destination_namespace(&device, &device_secret),
@@ -517,8 +538,6 @@ fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
             std::mem::take(&mut record.audit_after),
         ),
     };
-    let today = day_of(now.date());
-    let mut health = HealthLog::begin(&dir, today, &destination);
     for (snapshot_source, source) in source_order(today) {
         if !enabled.contains(&snapshot_source) || Instant::now() >= run.deadline {
             continue;
@@ -545,16 +564,21 @@ fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
             match client.get_activity_hint(token) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
                     write_marker(&marker, &destination);
+                    health.remove(agent_source_label(snapshot_source));
                     continue;
                 }
                 Ok(hint) => {
                     let _ = fs::remove_file(&marker);
                     labels_enabled = hint.workspace_labels_enabled;
                 }
-                Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => continue,
+                Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => {
+                    health.remove(agent_source_label(snapshot_source));
+                    continue;
+                }
                 Err(_) => {}
             }
         } else if read_marker(&marker).as_deref() == Some(destination.as_str()) {
+            health.remove(agent_source_label(snapshot_source));
             continue;
         }
         let mut uploader = relay_token.map(|token| ClientUploader {
@@ -588,6 +612,27 @@ fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
     record.audit_after = std::mem::take(&mut run.audit.after);
     let _ = write_json(&dir.join("run.json"), &record);
     Ok(())
+}
+
+/// Seed enabled attempts, excluding the destination's known organization opt-outs.
+pub(super) fn begin_run_health(
+    support_dir: &Path,
+    dir: &Path,
+    today: Day,
+    destination: &str,
+    enabled: &[SnapshotSource],
+    now: OffsetDateTime,
+) -> HealthLog {
+    let mut entries = Vec::new();
+    for (source, _) in source_order(today) {
+        if enabled.contains(&source)
+            && read_marker(&org_disabled_marker_path(support_dir, source)).as_deref()
+                != Some(destination)
+        {
+            entries.push(HealthEntry::started(agent_source_label(source), now));
+        }
+    }
+    HealthLog::begin_attempts(dir, today, destination, entries)
 }
 
 /// Start today's run: `None` when it already started. The day is saved
@@ -643,7 +688,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} bytes_audit={} audit_files={} audit_differences={} audit_skipped={} audit_failed={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} bytes_audit={} audit_files={} audit_differences={} audit_skipped={} audit_skipped_undated={} audit_failed={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -695,6 +740,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.audit_files,
         stats.audit_differences,
         stats.audit_skipped,
+        stats.audit_skipped_undated,
         stats.audit_failed,
         stats.files_checked,
         stats.full_read_waiting_files,
@@ -849,6 +895,7 @@ pub(super) struct SourceStats {
     pub(super) audit_differences: u64,
     /// Ineligible picks or samples whose retained history cannot be compared.
     pub(super) audit_skipped: u64,
+    pub(super) audit_skipped_undated: u64,
     pub(super) audit_failed: u64,
     /// Transcripts the walk found (one per copy key and copy).
     pub(super) files_checked: u64,
@@ -2322,6 +2369,8 @@ fn read_file(
     stats: &mut SourceStats,
 ) -> Result<Option<Outcome>, ReadFailed> {
     #[cfg(test)]
+    let _audit_reads = (item.mode == Mode::Audit).then(tests::AuditReads::begin);
+    #[cfg(test)]
     tests::before_open(&item.found.path);
     let opened = File::open(&item.found.path)
         .and_then(|file| Ok((file.metadata()?, file.try_clone()?, file)));
@@ -2343,6 +2392,9 @@ fn read_file(
     let audit = if mode == Mode::Audit {
         let checked = existing.as_ref().and_then(|checkpoint| {
             let measured = super::audit::eligible(checkpoint, item.reserved?)?;
+            // Both fingerprint passes were reserved with the sample. Account
+            // their maximum I/O even when a probe fails partway through.
+            stats.bytes_head += u64::from(checkpoint.head.len) + u64::from(checkpoint.tail.len);
             (size >= checkpoint.offset && fingerprints_match(&file, checkpoint))
                 .then_some((measured, checkpoint.offset))
         });
@@ -2459,6 +2511,10 @@ fn read_file(
             }
             let (state, head_bytes) = match restart_state {
                 Some(state) => (state, 0),
+                None if mode == Mode::Audit => {
+                    new_audit_parse_state(source, &item.found.path, end_at, run.deadline)
+                        .map_err(|_| ReadFailed)?
+                }
                 None => new_parse_state(source, &item.found.path, offset),
             };
             stats.bytes_head += head_bytes;
@@ -2549,6 +2605,9 @@ fn read_file(
         stats.bytes_failed += end.bytes;
         return Err(ReadFailed);
     }
+    if mode == Mode::Audit {
+        stats.bytes_head += 2 * end.offset.min(super::checkpoint::FINGERPRINT_BYTES);
+    }
     let Ok((head, tail)) = fingerprints(&file, end.offset) else {
         stats.scan_errors += 1;
         stats.bytes_failed += end.bytes;
@@ -2575,19 +2634,15 @@ fn read_file(
             return Ok(None);
         }
         let undated = stats.lines.undated > undated_before;
-        if undated
-            && OffsetDateTime::from_unix_timestamp(checkpoint.created)
-                .ok()
-                .map_or(true, |created| day_of(created.date()) < window.floor)
-        {
-            // Undated records were attributed when first read. Once that
-            // day may have expired, a reread cannot safely restore them on
-            // today's date or add them to all-history totals a second time.
+        if undated {
+            // Without original per-record day provenance, a reread cannot
+            // compare or replace any part of this file without moving days.
             stats.audit_skipped += 1;
+            stats.audit_skipped_undated += 1;
             return Ok(None);
         }
         let same_end = end.offset == audited_end;
-        if same_end && !super::audit::differs(old_share.as_ref(), &contribution, undated) {
+        if same_end && !super::audit::differs(old_share.as_ref(), &contribution) {
             // Same numbers: the stored checkpoint stays as it was.
             return Ok(None);
         }
@@ -2721,12 +2776,26 @@ pub(super) mod tests {
     use std::path::{Path, PathBuf};
 
     thread_local! {
+        pub(in super::super) static AUDIT_READ_BYTES: Cell<u64> = const { Cell::new(0) };
         static FAIL_SCOPE_COMMIT: Cell<bool> = const { Cell::new(false) };
         static FAIL_READ: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         static CRASH_AFTER: Cell<Option<u64>> = const { Cell::new(None) };
         static GROW: RefCell<Option<(PathBuf, Vec<u8>)>> = const { RefCell::new(None) };
         static SKEW: RefCell<Option<(PathBuf, u64)>> = const { RefCell::new(None) };
         static CUT_AUDIT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct AuditReads(u64);
+    impl AuditReads {
+        pub(super) fn begin() -> Self {
+            Self(super::super::checkpoint::IO_BYTES.with(|io| io.get().0))
+        }
+    }
+    impl Drop for AuditReads {
+        fn drop(&mut self) {
+            let read = super::super::checkpoint::IO_BYTES.with(|io| io.get().0) - self.0;
+            AUDIT_READ_BYTES.with(|total| total.set(total.get() + read));
+        }
     }
 
     /// Simulate the wall cap stopping a read of `path` (meant for audits).

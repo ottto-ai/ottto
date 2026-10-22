@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 808,
-  "content_sha256": "2684fc9af888cf880aec470adf25c03625626e3eb9c5143dd774da692a371dca",
+  "content_sha256": "930c2948f0995f3003fb36135d8f3fda3c013f9feceab014b3474a4ec5c8e624",
   "files": [
     {
       "executable": false,
@@ -1021,8 +1021,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/audit.rs",
-      "sha256": "20054a36d6f74c1d887206c9b5a00f0121716cdbdcdd689f8327852f7e429bc0",
-      "size_bytes": 6488
+      "sha256": "991f00bc946a1915382834bed5f16736373c4d564f6e2a3de961d21ef2037cd0",
+      "size_bytes": 6831
     },
     {
       "executable": false,
@@ -1056,22 +1056,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/file.rs",
-      "sha256": "769b4fed36a4e5d66001763351955f01fbd0fd816a3105a4301d971738dc0447",
-      "size_bytes": 15512
+      "sha256": "4d49679bbe2fe64989d7b3165be9c997b1b85c1c5a1e702afb2952781105dd16",
+      "size_bytes": 16045
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/harvest.rs",
-      "sha256": "04deadf2d9019e794b8a5530c573ae3fe8226e772506d564f41dcfe235a992ba",
-      "size_bytes": 107315
+      "sha256": "ae8d0f0976f1f0373e54a288bd50cf6a03579cacb77959536f6a5ec64584035c",
+      "size_bytes": 110350
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/health.rs",
-      "sha256": "3222a1aad1ce07b940b1fab0d2bd601197f9348118ffec0cafaea4efe2be7ba5",
-      "size_bytes": 9779
+      "sha256": "ad8616baf8745250349522259d979b5b986f9dc0809907fc415fab87589d52ae",
+      "size_bytes": 10291
     },
     {
       "executable": false,
@@ -1084,8 +1084,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/reader.rs",
-      "sha256": "ca861d044e15f0a218d15144218a04da896d95c651019c5773a1a762dec843f4",
-      "size_bytes": 5108
+      "sha256": "3021d859fafdb5defd61459b30019d98987105aac00450817cf38e56bdf2880c",
+      "size_bytes": 5272
     },
     {
       "executable": false,
@@ -1105,8 +1105,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/tests/a2.rs",
-      "sha256": "7430ec6d6588854f9048ad63edc797be2438d136e553d5226768d0f61bf05676",
-      "size_bytes": 37721
+      "sha256": "7b2dbe83841c04cd98a4304ea1ea23ee2e943aed365cdeeb4ec027e445cfdea3",
+      "size_bytes": 50216
     },
     {
       "executable": false,
@@ -1420,8 +1420,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "d7d9e16934b2c08912e7cfb7939b64616d0ad85d1f70dd88fa88fa764acac610",
-      "size_bytes": 200229
+      "sha256": "b000f976e7166433cb0c0d83a0e34be0f1b3ba43d13d93cf21663de247cbf5ab",
+      "size_bytes": 201239
     },
     {
       "executable": false,
@@ -3863,8 +3863,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-composition-run-health-audit.md",
-      "sha256": "99cf2eb34a9b2347559cfa9ee819d39b93501619059b868c4751a04523195c88",
-      "size_bytes": 4838
+      "sha256": "f0480982e4c901677208c19cee09c929f8d5b4e6fcb54c8265bb27d25c2ecf33",
+      "size_bytes": 5202
     },
     {
       "executable": false,
@@ -5659,7 +5659,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T22:41:51+00:00",
+  "generated_at": "2026-10-22T22:51:00+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 809,
   "public_roots": [
@@ -5698,5 +5698,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "03d6b46389e3fdd583c180c6edc4bc13007872d7"
+  "source_commit": "d5b643e960e2af4ffb8bbaac30fd512f4b824944"
 }
