@@ -1,0 +1,799 @@
+// Reason-scoped daily re-offer through the real prepare/finish pipeline.
+// One synthetic Claude session, a synthetic backend whose answer changes per
+// cycle, and a test-thread wall clock for the local re-offer schedule only.
+// Nothing waits 24 hours; no provider, credential or runtime state is read.
+use super::*;
+use std::cell::Cell;
+
+const DAY: u64 = 86_400;
+const ORIGINAL_PAIR: &str = "original_pair_candidate_unproved";
+
+thread_local! {
+    static CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// The synthetic local scheduling clock of this test thread, if set.
+#[allow(dead_code)] // read by the re-offer clock once it exists
+pub(crate) fn clock() -> Option<u64> {
+    CLOCK.with(Cell::get)
+}
+
+struct ClockGuard;
+
+impl ClockGuard {
+    fn start(now: u64) -> Self {
+        CLOCK.with(|clock| clock.set(Some(now)));
+        Self
+    }
+
+    fn set(&self, now: u64) {
+        CLOCK.with(|clock| clock.set(Some(now)));
+    }
+}
+
+impl Drop for ClockGuard {
+    fn drop(&mut self) {
+        CLOCK.with(|clock| clock.set(None));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    /// Permanent refusal with this wire reason.
+    Refuse(&'static str),
+    Accept,
+    /// `unchanged` with an `unchanged_basis`: the server did not store it.
+    Unstored,
+    Conflict,
+}
+
+struct ReofferServer {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    answer: Arc<Mutex<Answer>>,
+    offered: Arc<Mutex<Vec<serde_json::Value>>>,
+    terminal: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    for key in [
+        "session_account_evidence",
+        "tool_usage",
+        "tool_usage_truncated",
+    ] {
+        if let Some(value) = item.get(key) {
+            payload.insert(key.into(), value.clone());
+        }
+    }
+    let exclusive = item
+        .get("usage_accounting_contract")
+        .and_then(|value| value.as_str())
+        == Some("session_exclusive_reported_usage:v1");
+    let version = item
+        .get("session_account_evidence")
+        .is_some()
+        .then_some(if exclusive { 8u64 } else { 7u64 });
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(
+            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()
+        )
+    );
+    serde_json::json!({"source_session_id":item["source_session_id"],
+        "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
+        "body_witness_version":version,"body_witness_digest":version.map(|_| digest)})
+}
+
+impl ReofferServer {
+    fn new(first: Answer) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let answer = Arc::new(Mutex::new(first));
+        let current = answer.clone();
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let bodies = offered.clone();
+        let terminal = Arc::new(Mutex::new(Vec::new()));
+        let statuses = terminal.clone();
+        let worker = std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("synthetic re-offer accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_complete_http_request(&mut stream);
+                assert!(http_request_complete(request.as_bytes()));
+                let raw = request.split_once("\r\n\r\n").unwrap().1;
+                let value: serde_json::Value = if raw.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(raw).unwrap()
+                };
+                let response = if request.contains("/relay-token") {
+                    serde_json::json!({"token":"synthetic-reoffer-token","expires_at":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/activity-hints") {
+                    serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+                        "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/agent-status/snapshots") {
+                    serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
+                } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
+                    assert!(!items.is_empty());
+                    bodies.lock().unwrap().extend(items.iter().cloned());
+                    let references = items
+                        .iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "source_session_id":item["source_session_id"],
+                                "snapshot_fingerprint":item["snapshot_fingerprint"],
+                                "occurrence_count":1
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let mut outcome = serde_json::json!({"accepted":0,"sessions_reconciled":0,
+                        "session_ids":[],"disabled":false,"disabled_reason":null,
+                        "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],
+                        "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]});
+                    match *current.lock().unwrap() {
+                        Answer::Refuse(reason) => {
+                            outcome["rejected_entities"] = items
+                                .iter()
+                                .map(|item| {
+                                    serde_json::json!({
+                                        "source_session_id":item["source_session_id"],
+                                        "snapshot_fingerprint":item["snapshot_fingerprint"],
+                                        "reason":reason,"detail":"synthetic re-offer refusal",
+                                        "permanent":true,"occurrence_count":1
+                                    })
+                                })
+                                .collect();
+                        }
+                        Answer::Accept => {
+                            outcome["accepted"] = items.len().into();
+                            outcome["sessions_reconciled"] = items.len().into();
+                            outcome["accepted_entities"] = items.iter().map(entity_ack).collect();
+                        }
+                        Answer::Unstored => {
+                            outcome["accepted"] = items.len().into();
+                            outcome["unchanged_entities"] = items
+                                .iter()
+                                .map(|item| {
+                                    let mut reference = entity_ack(item);
+                                    reference["unchanged_basis"] = "usage_identical".into();
+                                    reference
+                                })
+                                .collect();
+                        }
+                        Answer::Conflict => {
+                            outcome["conflict_entities"] = references.into();
+                        }
+                    }
+                    outcome
+                } else {
+                    if value["report_kind"] == "scan_status" {
+                        statuses.lock().unwrap().push(value.clone());
+                    }
+                    serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
+                };
+                bounded_native_response(&mut stream, "200 OK", &response.to_string());
+            }
+        });
+        Self {
+            url,
+            stop,
+            worker: Some(worker),
+            answer,
+            offered,
+            terminal,
+        }
+    }
+
+    fn answer(&self, answer: Answer) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
+    fn offered(&self) -> Vec<serde_json::Value> {
+        self.offered.lock().unwrap().clone()
+    }
+
+    fn last_terminal(&self) -> serde_json::Value {
+        self.terminal.lock().unwrap().last().cloned().unwrap()
+    }
+}
+
+impl Drop for ReofferServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = self.worker.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
+
+struct CycleResult {
+    result: Result<()>,
+    index: ScanIndex,
+    progress: SnapshotUploadProgress,
+    /// The saved upload ledger as JSON, to read the exact disk form.
+    progress_json: serde_json::Value,
+    progress_path: PathBuf,
+}
+
+struct ReofferPipeline {
+    server: ReofferServer,
+    clock: ClockGuard,
+    fixture: IdentityPipelineHome,
+    support: PathBuf,
+    device: LocalDeviceBinding,
+    client: SnapshotApiClient,
+    daemon: LocalDaemon,
+    cadence: IdentityPipelineCadence,
+    transport: crate::net_resilience::TransportCycleOutcome,
+    retry: live_snapshot_retry::LiveRetryOwner,
+    _guards: Vec<EnvVarGuard>,
+    _native: crate::snapshots::claude_native_comparison::TestScope,
+}
+
+impl ReofferPipeline {
+    fn new(name: &str, first: Answer, start: u64) -> Self {
+        let fixture = IdentityPipelineHome::new();
+        let native = crate::snapshots::claude_native_comparison::enable_for_test();
+        let cadence = IdentityPipelineCadence::new();
+        let support = fixture.base.join(format!("{name}-support"));
+        let secrets = fixture.base.join(format!("{name}-secrets"));
+        std::fs::create_dir_all(&support).unwrap();
+        std::fs::create_dir_all(&secrets).unwrap();
+        let server = ReofferServer::new(first);
+        let guards = vec![
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+            EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url),
+        ];
+        let device = LocalDeviceBinding {
+            device_id: format!("{name}-device"),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["claude_code".into()],
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        std::fs::write(
+            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .unwrap();
+        write_native_bootstrap_sidecars(&fixture, &support);
+        let client = SnapshotApiClient::new(server.url.clone());
+        Self {
+            server,
+            clock: ClockGuard::start(start),
+            fixture,
+            support,
+            device,
+            client,
+            daemon: test_daemon("otm_test"),
+            cadence,
+            transport: crate::net_resilience::TransportCycleOutcome::default(),
+            retry: live_snapshot_retry::LiveRetryOwner::closed(),
+            _guards: guards,
+            _native: native,
+        }
+    }
+
+    /// One real due cycle at local time `now`.
+    fn cycle(&mut self, now: u64) -> CycleResult {
+        self.clock.set(now);
+        assert_eq!(clock(), Some(now));
+        self.cadence.next_due_cycle();
+        let collection = || AgentStatusCollection {
+            snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+            source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+        };
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &self.client,
+                &self.device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &self.fixture.home,
+                &self.support,
+                &self.daemon,
+                &mut self.transport,
+                self.daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        })
+        .unwrap()
+        .expect("real due preparation");
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(scan.census_complete, "synthetic census is complete");
+        let index_path = preparation.index_path.clone();
+        let progress_path = preparation.upload_progress_path.clone();
+        let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &self.client,
+                &self.device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &self.fixture.home,
+                &self.support,
+                &self.daemon,
+                &mut self.transport,
+                &mut self.retry,
+            )
+        });
+        let progress_json = std::fs::read(&progress_path)
+            .ok()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .unwrap_or(serde_json::Value::Null);
+        CycleResult {
+            result,
+            index: ScanIndex::load(&index_path).unwrap(),
+            progress: SnapshotUploadProgress::load(
+                &progress_path,
+                &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .unwrap(),
+            progress_json,
+            progress_path,
+        }
+    }
+}
+
+fn supported(name: &str) -> bool {
+    let supported = crate::heap_layout_bound::layout_supported();
+    if !supported {
+        writeln!(
+            std::io::stderr().lock(),
+            "{name}: supported_positive=UNEXECUTED layout_supported=false"
+        )
+        .unwrap();
+    }
+    supported
+}
+
+fn fingerprint_of(offer: &serde_json::Value) -> String {
+    offer["snapshot_fingerprint"].as_str().unwrap().to_string()
+}
+
+fn usage_of(offer: &serde_json::Value) -> (u64, u64, u64) {
+    (
+        offer["request_count"].as_u64().unwrap_or_default(),
+        offer["input_tokens"].as_u64().unwrap_or_default(),
+        offer["output_tokens"].as_u64().unwrap_or_default(),
+    )
+}
+
+fn reoffer_json<'a>(cycle: &'a CycleResult, fingerprint: &str) -> &'a serde_json::Value {
+    &cycle.progress_json["permanent_rejections"][fingerprint]["reoffer"]
+}
+
+/// Old daemon rewrite: the record keeps `reason: other` and loses the
+/// extension it does not know.
+fn strip_reoffer_extension(path: &Path, fingerprint: &str) {
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    json["permanent_rejections"][fingerprint]
+        .as_object_mut()
+        .unwrap()
+        .remove("reoffer");
+    std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+}
+
+/// R1/R2/R7: an unchanged finished session refused for
+/// `original_pair_candidate_unproved` is offered once a day, exactly, until
+/// the server accepts it. Repeat refusals settle the census while health
+/// stays red, and the clock restarts on each refusal.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn original_pair_refusal_is_reoffered_once_a_day_until_accepted() {
+    if !supported("original_pair_refusal_is_reoffered_once_a_day_until_accepted") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("reoffer-daily", Answer::Refuse(ORIGINAL_PAIR), t0);
+
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let fingerprint = fingerprint_of(&offered[0]);
+    let refused_body = first.progress.permanent_rejections[&fingerprint]
+        .body_witness
+        .clone();
+    assert_eq!(
+        first.progress_json["permanent_rejections"][&fingerprint]["reason"], "other",
+        "the new reason keeps the old enum disk form"
+    );
+    assert_eq!(
+        pipeline.server.last_terminal()["last_error_code"],
+        "backend_validation_error"
+    );
+
+    // Hours later, and just before the day ends: no offer.
+    for now in [t0 + 3_600, t0 + 13 * 3_600, t0 + DAY - 1] {
+        let quiet = pipeline.cycle(now);
+        assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+        assert_eq!(
+            pipeline.server.offered().len(),
+            1,
+            "no offer before t0 + 24 h (at +{}s)",
+            now - t0
+        );
+    }
+
+    // Day 1: exactly one offer of the exact refused body; refused again.
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert!(day1.result.is_ok(), "{:?}", day1.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(
+        offered.len(),
+        2,
+        "a due original-pair refusal is re-offered once, through the real scan"
+    );
+    assert_eq!(fingerprint_of(&offered[1]), fingerprint);
+    assert_eq!(usage_of(&offered[1]), usage_of(&offered[0]));
+    let refusal = &day1.progress.permanent_rejections[&fingerprint];
+    assert_eq!(refusal.body_witness, refused_body, "same exact body");
+    assert_eq!(
+        reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"],
+        t1 + DAY,
+        "the repeat refusal restarts the 24 h clock"
+    );
+    assert_eq!(reoffer_json(&day1, &fingerprint)["reason"], ORIGINAL_PAIR);
+    assert_eq!(
+        day1.progress_json["permanent_rejections"][&fingerprint]["reason"],
+        "other"
+    );
+    // R7: the repeat refusal settles the traversal; health stays red.
+    assert!(!day1.index.bounded_sweep_had_unsettled_upload());
+    assert!(!day1
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert_eq!(
+        day1.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    let terminal = pipeline.server.last_terminal();
+    assert_eq!(terminal["last_error_code"], "backend_validation_error");
+    assert_eq!(terminal["last_census_complete"], true);
+
+    // No 6-12 h ordinary retry and no second offer the same day.
+    for now in [t1 + 300, t1 + 13 * 3_600] {
+        let quiet = pipeline.cycle(now);
+        assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+        assert_eq!(pipeline.server.offered().len(), 2);
+        assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            pipeline.server.last_terminal()["last_error_code"],
+            "backend_validation_error"
+        );
+    }
+
+    // Day 2: SOURCE is ready; the normal ACK clears the refusal.
+    pipeline.server.answer(Answer::Accept);
+    let t2 = t1 + DAY + 60;
+    let day2 = pipeline.cycle(t2);
+    assert!(day2.result.is_ok(), "{:?}", day2.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 3);
+    assert_eq!(fingerprint_of(&offered[2]), fingerprint);
+    assert!(!day2
+        .progress
+        .permanent_rejections
+        .contains_key(&fingerprint));
+    assert!(day2
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert!(!day2
+        .index
+        .quarantined_snapshot_fingerprints
+        .contains_key(&fingerprint));
+
+    // Accepted: nothing left to re-offer, and the next receipt is clean.
+    let after = pipeline.cycle(t2 + 2 * DAY);
+    assert!(after.result.is_ok(), "{:?}", after.result);
+    assert_eq!(pipeline.server.offered().len(), 3);
+    let terminal = pipeline.server.last_terminal();
+    assert_ne!(
+        terminal["last_error_code"], "backend_validation_error",
+        "{terminal}"
+    );
+    assert_eq!(terminal["last_census_complete"], true);
+    assert!(!after.index.bounded_sweep_had_unsettled_upload());
+}
+
+/// SOURCE ruling 6: a legacy `other` refusal, as every older daemon wrote
+/// this reason, is re-offered once. The server's answer re-classifies it:
+/// `other` again is final; the exact reason joins the daily cycle.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn legacy_other_refusal_is_reclassified_by_one_offer() {
+    if !supported("legacy_other_refusal_is_reclassified_by_one_offer") {
+        return;
+    }
+    for (name, second_answer) in [
+        ("legacy-final", Answer::Refuse("future_unknown_reason")),
+        ("legacy-daily", Answer::Refuse(ORIGINAL_PAIR)),
+    ] {
+        let t0 = current_unix_seconds();
+        let mut pipeline = ReofferPipeline::new(name, Answer::Refuse("future_unknown_reason"), t0);
+        let first = pipeline.cycle(t0);
+        assert!(first.result.is_ok(), "{name}: {:?}", first.result);
+        let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+        assert_eq!(
+            first.progress_json["permanent_rejections"][&fingerprint]["reason"],
+            "other"
+        );
+        strip_reoffer_extension(&first.progress_path, &fingerprint);
+
+        pipeline.server.answer(second_answer);
+        let reclassified = pipeline.cycle(t0 + 600);
+        assert!(
+            reclassified.result.is_ok(),
+            "{name}: {:?}",
+            reclassified.result
+        );
+        assert_eq!(
+            pipeline.server.offered().len(),
+            2,
+            "{name}: a legacy `other` refusal is re-offered once"
+        );
+        assert_eq!(fingerprint_of(&pipeline.server.offered()[1]), fingerprint);
+        assert!(!reclassified.index.bounded_sweep_had_unsettled_upload());
+
+        // Never repeated within the day, whatever the answer.
+        let quiet = pipeline.cycle(t0 + 1_200);
+        assert!(quiet.result.is_ok(), "{name}: {:?}", quiet.result);
+        assert_eq!(pipeline.server.offered().len(), 2, "{name}");
+
+        let later = pipeline.cycle(t0 + 600 + DAY + 60);
+        assert!(later.result.is_ok(), "{name}: {:?}", later.result);
+        match second_answer {
+            Answer::Refuse(ORIGINAL_PAIR) => {
+                assert_eq!(
+                    pipeline.server.offered().len(),
+                    3,
+                    "{name}: the exact reason joins the 24 h cycle"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    pipeline.server.offered().len(),
+                    2,
+                    "{name}: a server `other` is final; the done marker is per record"
+                );
+                assert_eq!(reoffer_json(&later, &fingerprint)["reason"], "classified");
+            }
+        }
+        assert!(later
+            .progress
+            .permanent_rejections
+            .contains_key(&fingerprint));
+    }
+}
+
+/// COST (b): a validated `unchanged` answer that did not store the body
+/// retires the old refusal and its schedule, keeps the unstored-body hold,
+/// and records no stored body.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn unstored_unchanged_reoffer_retires_the_refusal_and_keeps_the_hold() {
+    if !supported("unstored_unchanged_reoffer_retires_the_refusal_and_keeps_the_hold") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("reoffer-unstored", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+    let refused_body = first.progress.permanent_rejections[&fingerprint]
+        .body_witness
+        .clone();
+
+    pipeline.server.answer(Answer::Unstored);
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert!(day1.result.is_ok(), "{:?}", day1.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        2,
+        "due offer reached the server"
+    );
+    assert!(
+        !day1
+            .progress
+            .permanent_rejections
+            .contains_key(&fingerprint),
+        "the unstored verdict replaced the refusal"
+    );
+    assert!(!day1.progress.accepted_fingerprints.contains(&fingerprint));
+    assert!(!day1
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    let hold = &day1.index.quarantined_snapshot_fingerprints[&fingerprint];
+    assert_eq!(
+        hold.disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    assert_eq!(
+        hold.upload_body_witness.as_deref(),
+        Some(refused_body.as_str())
+    );
+
+    // The retired reason schedules nothing more.
+    let later = pipeline.cycle(t1 + DAY + 60);
+    assert!(later.result.is_ok(), "{:?}", later.result);
+    assert_eq!(pipeline.server.offered().len(), 2);
+}
+
+/// R8: a conflict on the daily offer keeps today's unsettled/follow-up
+/// behavior, keeps the refusal and its cooldown, and the conflict's
+/// RetryPending state cannot let the refused body escape the 24 h gate.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
+    if !supported("conflicting_reoffer_keeps_refusal_cooldown_and_follow_up") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("reoffer-conflict", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+
+    pipeline.server.answer(Answer::Conflict);
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        2,
+        "due offer reached the server"
+    );
+    assert!(day1.result.is_err(), "a conflict still owes a follow-up");
+    assert_eq!(
+        pipeline.server.last_terminal()["last_error_code"],
+        "server_error"
+    );
+    assert!(day1.index.bounded_sweep_had_unsettled_upload());
+    assert!(day1
+        .progress
+        .permanent_rejections
+        .contains_key(&fingerprint));
+    assert!(
+        reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"]
+            .as_u64()
+            .is_some_and(|retry_after| retry_after >= t1 + DAY),
+        "{}",
+        day1.progress_json
+    );
+
+    // Even with the conflict's ordinary retry due, the refused body waits.
+    pipeline.server.answer(Answer::Accept);
+    let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+        &snapshot_index_path(&pipeline.support, SnapshotSource::ClaudeCode),
+        &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
+    ));
+    let mut index = ScanIndex::load(&index_path).unwrap();
+    if let Some(record) = index
+        .quarantined_snapshot_fingerprints
+        .get_mut(&fingerprint)
+    {
+        record.retry_after_unix_seconds = 0;
+    }
+    index.save(&index_path).unwrap();
+    let quiet = pipeline.cycle(t1 + 3_600);
+    let _ = quiet.result;
+    assert_eq!(
+        pipeline.server.offered().len(),
+        2,
+        "no ordinary 6-12 h retry of the refused body"
+    );
+}
+
+/// COST (a): once the session's head moved past the refused body, the old
+/// body is never re-offered and no re-admission raises the session's usage.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn superseded_refused_body_is_never_reoffered_after_the_head_moved() {
+    if !supported("superseded_refused_body_is_never_reoffered_after_the_head_moved") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::new("reoffer-head-moved", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let refused = pipeline.server.offered()[0].clone();
+    let refused_fingerprint = fingerprint_of(&refused);
+
+    // The session grows: one more request moves its head to body B.
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let grown = serde_json::json!({"timestamp": at, "type": "assistant",
+        "sessionId": IDENTITY_PIPELINE_ROOT, "requestId": "req_3",
+        "message": {"id": "m3", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 30, "output_tokens": 3}}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(format!("{grown}\n").as_bytes())
+        .unwrap();
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    pipeline.server.answer(Answer::Accept);
+    let moved = pipeline.cycle(t0 + 3_600);
+    assert!(moved.result.is_ok(), "{:?}", moved.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(
+        offered.len(),
+        2,
+        "body B is offered through the normal path"
+    );
+    let head = offered[1].clone();
+    assert_ne!(fingerprint_of(&head), refused_fingerprint);
+
+    // Days later: the superseded refused body is not current; nothing is
+    // re-offered and the accepted head is not rewritten.
+    for day in 1..=2 {
+        let later = pipeline.cycle(t0 + day * DAY + 120);
+        assert!(later.result.is_ok(), "{:?}", later.result);
+        let offered = pipeline.server.offered();
+        assert_eq!(offered.len(), 2, "day {day}: no re-admission of body A");
+        assert!(later
+            .index
+            .accepted_snapshot_fingerprint_recorded(&fingerprint_of(&head)));
+        assert!(!later
+            .progress
+            .permanent_rejections
+            .contains_key(&refused_fingerprint));
+    }
+    let uploaded_after_refusal = pipeline.server.offered()[1..]
+        .iter()
+        .map(usage_of)
+        .fold((0, 0, 0), |sum, usage| {
+            (sum.0 + usage.0, sum.1 + usage.1, sum.2 + usage.2)
+        });
+    assert_eq!(
+        uploaded_after_refusal,
+        usage_of(&head),
+        "only the current head's usage is ever offered after the refusal"
+    );
+}
