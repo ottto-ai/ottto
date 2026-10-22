@@ -90,6 +90,13 @@ the server are unchanged.
   body is independent, the same as when only one member changes.
 - If 2,000 or more adoption-only files never settle, they keep using the budget
   and the rest wait. Nothing is lost; the log line shows the deferred count.
+- Reach: the re-read covers the files the index holds, which are the Claude
+  files inside the ordinary receipt window (at most 183 days). Older files are
+  not walked by ordinary cycles and their entries were already retired from the
+  index, so they are not re-read. Reaching them needs a durable completion
+  marker plus pacing and the exclusion list for files discovered as new; that
+  is a separate decision. A listed file that ages out of the window before its
+  line is removed is also not re-read.
 
 ## Tests (CI)
 
