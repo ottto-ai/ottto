@@ -108,6 +108,20 @@ enum Command {
         #[arg(long = "private-upload-payload-out")]
         private_upload_payload_out: Option<PathBuf>,
     },
+    /// Inspect (`--plan`, read-only) or remove (`--apply`) abandoned snapshot
+    /// checkpoint temp files under a support directory. `--apply` refuses the
+    /// daemon's own support directory, which the daemon cleans at startup.
+    #[command(hide = true)]
+    LocalStateSweep {
+        #[arg(long)]
+        support_dir: PathBuf,
+        #[arg(long, conflicts_with = "apply", required_unless_present = "apply")]
+        plan: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,6 +255,20 @@ fn main() -> Result<()> {
                 &mut output,
             )?;
         }
+        Command::LocalStateSweep {
+            support_dir,
+            plan: _,
+            apply,
+            json,
+        } => {
+            #[cfg(unix)]
+            ottto_service::run_local_state_sweep_command(&support_dir, apply, json)?;
+            #[cfg(not(unix))]
+            {
+                let _ = (support_dir, apply, json);
+                anyhow::bail!("local-state-sweep is supported only on unix");
+            }
+        }
         Command::Status { json } => {
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
@@ -276,6 +304,10 @@ fn main() -> Result<()> {
                 }
                 ottto_service::claude_browser_auth::recover_at_startup();
                 ottto_service::codex_sign_in::recover_at_startup();
+                // Before any snapshot worker can start a save.
+                if !once {
+                    ottto_service::sweep_local_state_at_startup();
+                }
                 let token = load_or_create_control_token()?;
                 let daemon = LocalDaemon::new(
                     local_machine(),
@@ -319,6 +351,9 @@ fn main() -> Result<()> {
             }
             ottto_service::claude_browser_auth::recover_at_startup();
             ottto_service::codex_sign_in::recover_at_startup();
+            // Before any snapshot worker can start a save.
+            #[cfg(unix)]
+            ottto_service::sweep_local_state_at_startup();
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
                 local_machine(),
