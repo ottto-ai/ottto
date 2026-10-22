@@ -1246,6 +1246,49 @@ fn deferred_opening_preserves_a_cached_deleted_folder_scope() {
 }
 
 #[test]
+fn deferred_opening_caches_an_unseen_workspace_before_removal() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-verdict-unseen-workspace-{source:?}"));
+        let (path, born, _) = opening_verdict_fixture(&env, source);
+        let stats = env.run(source, born, None);
+        assert_eq!((stats.verdict_deferred, stats.files_read), (1, 0));
+        let index = read_index(&env.state, source);
+        assert!(index.files.is_empty(), "no file pin for a deferred opening");
+        assert!(
+            index.scope_generations.is_empty(),
+            "no checkpoint committed"
+        );
+        let scope_id = index.cwd_scopes.get(&env.cwd()).unwrap().clone();
+        assert_eq!(index.scope_info.len(), 1);
+        fs::remove_dir_all(&env.workspace).unwrap();
+        let stats = env.run_with(
+            source,
+            born + time::Duration::days(1),
+            None,
+            0,
+            &mut FolderResolver::default(),
+        );
+        assert_eq!(
+            (
+                stats.verdict_deferred,
+                stats.files_read,
+                stats.unscoped,
+                stats.scan_errors
+            ),
+            (0, 1, 0, 0)
+        );
+        assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+        let index = read_index(&env.state, source);
+        assert_eq!(
+            index.files.values().next().unwrap().scope.as_ref(),
+            Some(&scope_id)
+        );
+        assert!(opening_tokens(&env.scope(source).agg) > 0);
+        env.cleanup();
+    }
+}
+
+#[test]
 fn opening_verdict_probe_respects_expired_deadline_and_keeps_new_bytes() {
     for source in [Source::Claude, Source::Codex] {
         let env = Env::new(&format!("composition-verdict-deadline-{source:?}"));
