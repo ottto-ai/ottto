@@ -1325,3 +1325,349 @@ fn money_restore_files(dir: &Path, saved: &BTreeMap<PathBuf, Vec<u8>>) {
         }
     }
 }
+
+// P2 literal bodies go through the production resumable upload/ACK loop.
+// Typed synthetic bodies avoid live provider state while preserving every
+// ownership byte whose downgrade/stripping would invalidate the contract.
+fn p2a_wire_body(id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "source_session_id":format!("session-{id}"),
+        "snapshot_fingerprint":format!("{id:064x}"),
+        "usage_accounting_contract":"claude_request_owned_usage:v1",
+        "removed_request_count":1,
+        "removed_usage":{"input_tokens":11,"output_tokens":2,"cache_read_tokens":3,
+            "cache_creation_5m_tokens":5,"cache_creation_1h_tokens":7,
+            "unattributed_total_tokens":0,"reasoning_output_tokens":0},
+        "telemetry_owned_complete":true,
+        "input_tokens":13,"output_tokens":2,"request_count":1,
+        "usage_buckets":[{"bucket_start":"2026-08-02T08:00:00Z","model_usage":[{
+            "model":"claude-haiku-4-5","input_tokens":13,"output_tokens":2,"request_count":1,
+            "selector_context":{"request_usage_origin":"telemetry_matched"},
+            "selector_sources":{"request_usage_origin":"claude_api_request"},"cost_usd":"0.000100"}]}]
+    })
+}
+fn p2a_fp(item: &serde_json::Value) -> &str {
+    item["snapshot_fingerprint"].as_str().unwrap()
+}
+fn p2a_witness(item: &serde_json::Value) -> String {
+    format!("{:x}", Sha256::digest(serde_json::to_vec(item).unwrap()))
+}
+
+#[test]
+#[serial(client_report)]
+fn p2a_literal_503_resends_byte_identical_after_progress_restart() {
+    let scratch = crate::test_scratch::ScratchDir::new("p2a-literal-503");
+    let path = scratch.join("progress.json");
+    let scope = unique_poison_scope();
+    let items = vec![p2a_wire_body(1), p2a_wire_body(2)];
+    let original = serde_json::to_vec(&items).unwrap();
+    let mut progress = test_upload_progress();
+    let namespace = progress.destination_namespace_hash.clone();
+    let mut accepted = 0;
+    let mut first = Vec::new();
+    let result = upload_resumable_batches_with_body_witness(
+        &items,
+        &scope,
+        &mut progress,
+        &mut accepted,
+        p2a_fp,
+        p2a_witness,
+        |batch| {
+            first = serde_json::to_vec(&batch).unwrap();
+            Err(anyhow::Error::new(UploadShed {
+                request_owned_route_unavailable: true,
+                status: 503,
+                retry_after: Some(Duration::from_secs(60)),
+            }))
+        },
+        |progress| progress.save(&path),
+    )
+    .unwrap();
+    assert!(matches!(result, ResumableUploadResult::Shed { .. }));
+    assert_eq!(accepted, 0);
+    assert!(progress.accepted_fingerprints.is_empty());
+    assert!(progress.permanent_rejections.is_empty());
+    // A shed request does not require a checkpoint write, so save the unchanged
+    // state as orderly shutdown would, then reload the actual progress codec.
+    progress.save(&path).unwrap();
+    let mut progress = SnapshotUploadProgress::load(
+        &path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
+    let mut retried = Vec::new();
+    upload_resumable_batches_with_body_witness(
+        &items,
+        &scope,
+        &mut progress,
+        &mut accepted,
+        p2a_fp,
+        p2a_witness,
+        |batch| {
+            retried = serde_json::to_vec(&batch).unwrap();
+            Ok(accepted_batch(batch.len()))
+        },
+        |progress| progress.save(&path),
+    )
+    .unwrap();
+    assert_eq!(first, original);
+    assert_eq!(
+        retried, original,
+        "503 cannot strip the literal, removals or origin"
+    );
+    assert_eq!(accepted, 2);
+    assert_eq!(progress.accepted_fingerprints.len(), 2);
+}
+
+#[test]
+#[serial(client_report)]
+fn p2a_literal_422_is_persisted_retry_debt_without_bisect_or_poison() {
+    use crate::client_report::{observe, reset_for_test, ClientReportReason};
+    reset_for_test();
+    let scratch = crate::test_scratch::ScratchDir::new("p2a-literal-422");
+    let path = scratch.join("progress.json");
+    let scope = unique_poison_scope();
+    let items = vec![p2a_wire_body(1), p2a_wire_body(2)];
+    let mut progress = test_upload_progress();
+    let namespace = progress.destination_namespace_hash.clone();
+    let mut accepted = 0;
+    let mut attempts = 0;
+    let result=upload_resumable_batches_with_body_witness(&items,&scope,&mut progress,&mut accepted,
+        p2a_fp,p2a_witness,|batch| {
+            attempts+=1; assert_eq!(serde_json::to_vec(&batch).unwrap(),serde_json::to_vec(&items).unwrap());
+            Err(anyhow::Error::new(BatchRejected {status:422,body_excerpt:Some(
+                r#"{"errors":[{"loc":["body","snapshots",0,"usage_accounting_contract"],"type":"literal_error"}]}"#.into())}))
+        },|progress|progress.save(&path)).unwrap();
+    assert!(
+        matches!(result,ResumableUploadResult::Shed {retry_after:Some(delay)} if delay==Duration::from_secs(1800))
+    );
+    assert_eq!(
+        attempts, 1,
+        "literal skew must be classified before singleton poison isolation"
+    );
+    assert_eq!(accepted, 0);
+    assert!(progress.accepted_fingerprints.is_empty());
+    assert!(progress.permanent_rejections.is_empty());
+    assert_eq!(observe().quantity(ClientReportReason::Poisoned), 0);
+    assert!(counted_poison_fingerprints_for_test(&scope).is_empty());
+    let loaded = SnapshotUploadProgress::load(
+        &path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
+    assert_eq!(loaded.quarantined_fingerprints.len(), items.len());
+    for item in &items {
+        let debt = &loaded.quarantined_fingerprints[p2a_fp(item)];
+        assert_eq!(debt.version_skew_attempts, 1);
+        assert_eq!(
+            debt.upload_body_witness.as_deref(),
+            Some(p2a_witness(item).as_str())
+        );
+    }
+    reset_for_test();
+}
+
+#[test]
+#[serial(client_report)]
+fn p2a_restart_at_each_ack_save_boundary_replays_exact_body_until_durable_ack() {
+    // 0: before request; 1: server accepted but ACK lost; 2: ACK received but
+    // local save failed; 3: ACK durably saved. An ACK lost in transit and one
+    // lost to a failed local save must both replay. A durable ACK must not.
+    for boundary in 0..4 {
+        let scratch = crate::test_scratch::ScratchDir::new("p2a-ack-boundary");
+        let path = scratch.join("progress.json");
+        let scope = unique_poison_scope();
+        let items = vec![p2a_wire_body(1)];
+        let original = serde_json::to_vec(&items).unwrap();
+        let mut progress = test_upload_progress();
+        let namespace = progress.destination_namespace_hash.clone();
+        progress.save(&path).unwrap();
+        let mut accepted = 0;
+        if boundary > 0 {
+            let outcome = upload_resumable_batches_with_body_witness(
+                &items,
+                &scope,
+                &mut progress,
+                &mut accepted,
+                p2a_fp,
+                p2a_witness,
+                |batch| {
+                    assert_eq!(serde_json::to_vec(&batch).unwrap(), original);
+                    if boundary == 1 {
+                        Err(anyhow!("synthetic lost ACK"))
+                    } else {
+                        Ok(accepted_batch(batch.len()))
+                    }
+                },
+                |progress| {
+                    if boundary == 2 {
+                        Err(anyhow!("synthetic failed ACK save"))
+                    } else {
+                        progress.save(&path)
+                    }
+                },
+            );
+            assert_eq!(outcome.is_ok(), boundary == 3);
+        }
+        let mut progress = SnapshotUploadProgress::load(
+            &path,
+            &namespace,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .unwrap();
+        let mut calls = 0;
+        upload_resumable_batches_with_body_witness(
+            &items,
+            &scope,
+            &mut progress,
+            &mut accepted,
+            p2a_fp,
+            p2a_witness,
+            |batch| {
+                calls += 1;
+                assert_eq!(serde_json::to_vec(&batch).unwrap(), original);
+                Ok(accepted_batch(batch.len()))
+            },
+            |progress| progress.save(&path),
+        )
+        .unwrap();
+        assert_eq!(calls, usize::from(boundary != 3), "boundary {boundary}");
+        assert!(progress.contains_body(p2a_fp(&items[0]), &p2a_witness(&items[0])));
+    }
+}
+
+#[test]
+#[serial(client_report)]
+fn p2a_old_v1_head_is_replaced_by_literal_and_exact_ack_is_not_old_settlement() {
+    let scope = unique_poison_scope();
+    let literal = p2a_wire_body(1);
+    let mut old = literal.clone();
+    old["usage_accounting_contract"] = serde_json::json!("session_exclusive_reported_usage:v1");
+    old["snapshot_fingerprint"] = serde_json::json!(format!("{:064x}", 3));
+    for key in [
+        "removed_request_count",
+        "removed_usage",
+        "telemetry_owned_complete",
+    ] {
+        old.as_object_mut().unwrap().remove(key);
+    }
+    old["input_tokens"] = serde_json::json!(24);
+    old["request_count"] = serde_json::json!(2);
+    let mut progress = test_upload_progress();
+    let mut accepted = 0;
+    upload_resumable_batches_with_body_witness(
+        &[old.clone()],
+        &scope,
+        &mut progress,
+        &mut accepted,
+        p2a_fp,
+        p2a_witness,
+        |batch| Ok(accepted_batch(batch.len())),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut offered = Vec::new();
+    upload_resumable_batches_with_body_witness(
+        &[literal.clone()],
+        &scope,
+        &mut progress,
+        &mut accepted,
+        p2a_fp,
+        p2a_witness,
+        |batch| {
+            offered = batch;
+            Ok(accepted_batch(1))
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(offered, vec![literal.clone()]);
+    assert_eq!(accepted, 2);
+    assert_eq!(
+        literal["request_count"].as_u64().unwrap()
+            + literal["removed_request_count"].as_u64().unwrap(),
+        old["request_count"].as_u64().unwrap()
+    );
+    assert_eq!(
+        literal["input_tokens"].as_u64().unwrap()
+            + literal["removed_usage"]["input_tokens"].as_u64().unwrap(),
+        old["input_tokens"].as_u64().unwrap()
+    );
+    assert!(progress.contains_body(p2a_fp(&literal), &p2a_witness(&literal)));
+}
+
+#[test]
+#[serial(source_manifests)]
+#[serial(claude_request_money_shadow)]
+fn p2a_whole_file_copy_same_session_emits_one_union_with_mac_wide_distinct_ids() {
+    let fixture = PipelineFixture::new("p2a-whole-file-union");
+    money::enable_shadow_for_test(&fixture.support);
+    let original = fixture.root.join(format!("{}.jsonl", PIPELINE_SESSIONS[1]));
+    let duplicate = fixture.root.join(format!("{MONEY_PIPELINE_COPY}.jsonl"));
+    std::fs::copy(&original, &duplicate).unwrap(); // preserve the content session id
+    let mut index = ScanIndex::default();
+    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        "2026-08-02T09:00:00Z",
+        183,
+        16,
+        true,
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.support.join("snapshots")).unwrap();
+    std::fs::write(fixture.support.join("snapshots/claude_code-reemission-exclusions.txt"), b"").unwrap();
+    index.load_claude_reemission_exclusions(&fixture.support);
+    money::store::reload_for_test(&fixture.support);
+    // The normal page builds from actual multi-file membership, not a test
+    // supplied union key. This intentionally pins the unfinished P2 union seam.
+    let held = money::live_page(
+        &fixture.support,
+        &mut scan.snapshots,
+        &index,
+        &Default::default(),
+        &Default::default(),
+        true,
+        None,
+        &mut BTreeMap::new(),
+    );
+    money::store::flush();
+    money::disable_shadow_for_test(&fixture.support);
+    assert!(
+        held.is_empty(),
+        "a whole-file duplicate must have a buildable union: {held:?}"
+    );
+    let mut sessions = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    let mut requests = 0;
+    for item in &scan.snapshots {
+        assert!(
+            sessions.insert(item.source_session_id.clone()),
+            "one upload per logical session"
+        );
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some(money::REQUEST_OWNED_CONTRACT)
+        );
+        assert_eq!(item.removed_request_count, Some(0));
+        assert_eq!(item.request_count, 1, "per session union total");
+        assert_eq!(
+            item.usage_buckets
+                .iter()
+                .flat_map(|b| &b.model_usage)
+                .map(|r| r.request_count)
+                .sum::<u64>(),
+            1,
+            "per hour union total"
+        );
+        requests += item.request_count;
+        for id in &item.claude_usage_request_ids {
+            assert!(ids.insert(id.clone()), "Mac-wide distinct request");
+        }
+    }
+    assert_eq!(requests, PIPELINE_SESSIONS.len() as u64);
+    assert_eq!(ids.len(), PIPELINE_SESSIONS.len());
+}

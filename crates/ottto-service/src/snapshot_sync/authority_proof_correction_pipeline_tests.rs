@@ -458,7 +458,7 @@ impl ApcFixture {
         let mut index = before.clone();
         index.activate_upload_context("upload-context-apc".to_string());
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
         let committed_index = index.clone();
         let (mut scan, mut native_completion) = if self.retain_native_terminal.get() {
@@ -673,6 +673,8 @@ impl ApcFixture {
                         Ok(accepted_batch(items.len()))
                     }
                     ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
+                        request_owned_route_unavailable: false,
+
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
                     })),

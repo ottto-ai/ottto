@@ -107,15 +107,11 @@ impl ClaudeFileBirth {
     /// Bind the rule to the opened physical file. `metadata` comes from the
     /// open descriptor; subagent identity uses the same path rule as the
     /// family census, so an alias cannot reach the exemption another way.
-    pub(super) fn observe(path: &Path, metadata: Option<&fs::Metadata>) -> Self {
+    pub(super) fn observe(path: &Path, created: Option<SystemTime>) -> Self {
         let scope = match claude_index_path_member_ref(path) {
             None => ClaudeBirthScope::NotObserved,
             Some(member) if member.subagent_stem.is_some() => ClaudeBirthScope::Subagent,
-            Some(_) => root_birth_scope(
-                metadata
-                    .and_then(|metadata| metadata.created().ok())
-                    .and_then(system_time_unix_nanos_i128),
-            ),
+            Some(_) => root_birth_scope(created.and_then(system_time_unix_nanos_i128)),
         };
         Self {
             scope,
@@ -449,6 +445,12 @@ impl ClaudeTelemetryTripwire {
             over_bound_roots,
             refused: false,
         }
+    }
+
+    /// Family roots over their own evidence bound this fold. Read-only, for
+    /// #677's local stop alarm (hashed there; never logged raw).
+    pub(super) fn over_bound_roots(&self) -> &BTreeSet<String> {
+        &self.over_bound_roots
     }
 
     /// `None` when this page could not judge the item (fail closed);

@@ -5,6 +5,7 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 enum FinishOutcome {
     Accept,
+    MoneyHeld,
     Permanent,
     Retryable,
     PermanentStatusFailure,
@@ -105,6 +106,7 @@ impl FinishServer {
                         .collect::<Vec<_>>();
                     let reason = match outcome {
                         FinishOutcome::Dominated { reason, .. } => reason,
+                        FinishOutcome::MoneyHeld => "usage_decrease_held_for_review",
                         _ => "invalid",
                     };
                     let rejected = items
@@ -114,7 +116,7 @@ impl FinishServer {
                                 "source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],
                                 "reason":reason,"detail":"synthetic finish refusal",
-                                "permanent":true,"occurrence_count":1
+                                "permanent":!matches!(outcome, FinishOutcome::MoneyHeld),"occurrence_count":1
                             })
                         })
                         .collect::<Vec<_>>();
@@ -621,3 +623,5 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
 pub(crate) mod prior_index_lifetime_tests {
     include!("prior_index_lifetime_tests.rs");
 }
+
+include!("p2a_round3_tests.rs");

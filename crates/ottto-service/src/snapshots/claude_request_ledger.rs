@@ -99,6 +99,8 @@ pub(crate) enum ClaudeUndecidedBy {
     StaleHolder,
     /// First-seen births are partly unknown.
     Births,
+    /// An older or unknown-birth unbuilt file in the same project group.
+    UnbuiltOlder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,9 +278,14 @@ impl<'a> ClaudeRequestHolders<'a> {
     }
 
     /// A transcript record of family `root` holds the hash.
-    pub(crate) fn has_transcript_holder_in(&self, hash: u64, root: &str) -> bool {
+    pub(crate) fn has_transcript_holder_in(
+        &self,
+        index: &ScanIndex,
+        hash: u64,
+        root: &str,
+    ) -> bool {
         self.transcript_holders(hash).iter().any(|key| {
-            claude_index_path_family_member(Path::new(key))
+            super::claude_request_money::logical_family_member(index, key)
                 .is_some_and(|(holder_root, _)| holder_root == root)
         })
     }
@@ -404,6 +411,7 @@ pub(crate) struct ClaudeLedgerScope {
     families: BTreeMap<String, ClaudeScopeDebt>,
     /// The page total (each file once).
     pub(crate) debt: ClaudeScopeDebt,
+    blocking_files: std::cell::RefCell<BTreeSet<String>>,
 }
 
 /// Bytes `ClaudeLedgerScope::build` may allocate for `files` index keys of
@@ -441,7 +449,8 @@ impl ClaudeLedgerScope {
             if index.confirmed_empty_files.contains(key) {
                 continue;
             }
-            let Some((root, _)) = claude_index_path_family_member(Path::new(key)) else {
+            let Some((root, _)) = super::claude_request_money::logical_family_member(index, key)
+            else {
                 continue;
             };
             let group = claude_project_group(key);
@@ -494,6 +503,10 @@ impl ClaudeLedgerScope {
         (message && message_unknown).then_some(ClaudeUndecidedBy::MessageUnknown)
     }
 
+    pub(crate) fn blocking_files(&self) -> BTreeSet<String> {
+        self.blocking_files.borrow().clone()
+    }
+
     /// SOURCE's held-unbuilt-older rule, counted only: an unbuilt file of
     /// `own_key`'s group (its own file aside) has an unknown birth or one
     /// earlier than `holder_birth` (the winning holder's; None: unknown).
@@ -502,13 +515,20 @@ impl ClaudeLedgerScope {
         else {
             return false;
         };
-        files
-            .iter()
-            .filter(|(key, debt, _)| key != own_key && debt.new_unrecorded > 0)
-            .any(|(_, _, birth)| match (birth, holder_birth) {
+        let mut blocked = false;
+        for (key, debt, birth) in files {
+            if key == own_key || debt.new_unrecorded == 0 {
+                continue;
+            }
+            if match (birth, holder_birth) {
                 (Some(birth), Some(holder)) => *birth < holder,
                 _ => true,
-            })
+            } {
+                self.blocking_files.borrow_mut().insert(key.clone());
+                blocked = true;
+            }
+        }
+        blocked
     }
 
     /// Every indexed file of `root`'s family is recorded (a new file aside):
@@ -534,7 +554,8 @@ pub(crate) struct ClaudeClassifyContext<'a, 'b> {
     /// telemetry key (beside the ledger records' own).
     pub(crate) first_event: &'b BTreeMap<String, u64>,
     /// The page roots' session ids, per telemetry key (beside the session
-    /// the ledger records' facts name).
+    /// the ledger records' facts name). Physical file keys map to the page's
+    /// globally consistent logical-holder representative.
     pub(crate) sessions: &'b BTreeMap<String, String>,
     /// Per root whose trace was read: request hash -> trace-named member.
     pub(crate) trace: &'b BTreeMap<String, BTreeMap<u64, String>>,
@@ -622,7 +643,7 @@ impl ClaudeClassifyContext<'_, '_> {
 
     /// Count a T-empty verdict SOURCE's rule would hold: `winner` is the
     /// earliest-born holder that took (or kept) the id.
-    fn note_unbuilt_older(&self, own_key: &str, winner: &str) {
+    fn note_unbuilt_older(&self, own_key: &str, winner: &str) -> bool {
         let birth = self
             .index
             .claude_request_census
@@ -631,7 +652,9 @@ impl ClaudeClassifyContext<'_, '_> {
             .map(|birth| birth.unix_seconds);
         if self.scope.unbuilt_older(own_key, birth) {
             self.unbuilt_older.set(self.unbuilt_older.get() + 1);
+            return true;
         }
+        false
     }
 
     fn telemetry_swept(&self, clock: u64) -> bool {
@@ -647,6 +670,7 @@ impl ClaudeClassifyContext<'_, '_> {
         own_key: &str,
         own_root: &str,
     ) -> ClaudeRequestVerdict {
+        let own_key = self.canonical_file(own_key);
         if self.holders.overflowed(hash) {
             return ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Overflow);
         }
@@ -660,7 +684,7 @@ impl ClaudeClassifyContext<'_, '_> {
                 None => return ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::TelemetryOrder),
             },
         };
-        let holders = holders_with(self.holders.transcript_holders(hash), own_key);
+        let holders = self.logical_holders(self.holders.transcript_holders(hash), own_key);
         let Some(claimant) = claimant else {
             // No telemetry owner: a negative claim about every root's
             // telemetry and every other file of the group.
@@ -693,7 +717,7 @@ impl ClaudeClassifyContext<'_, '_> {
             .iter()
             .copied()
             .filter(|key| {
-                claude_index_path_family_member(Path::new(key))
+                super::claude_request_money::logical_family_member(self.index, key)
                     .is_some_and(|(root, _)| root == own_root)
             })
             .collect::<Vec<_>>();
@@ -711,7 +735,7 @@ impl ClaudeClassifyContext<'_, '_> {
                 .iter()
                 .copied()
                 .filter(|key| {
-                    claude_index_path_family_member(Path::new(key))
+                    super::claude_request_money::logical_family_member(self.index, key)
                         .is_some_and(|(_, member)| member == *named)
                 })
                 .collect::<Vec<_>>();
@@ -735,14 +759,30 @@ impl ClaudeClassifyContext<'_, '_> {
     /// Classify one message-only (`M`) unit. No telemetry row names a
     /// message id, so only the transcript holders decide.
     pub(crate) fn classify_message(&self, hash: u64, own_key: &str) -> ClaudeRequestVerdict {
+        let own_key = self.canonical_file(own_key);
         if self.holders.overflowed(hash) {
             return ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Overflow);
         }
         if let Some(reason) = self.scope.group_blocks(own_key, true) {
             return ClaudeRequestVerdict::Undecided(reason);
         }
-        let holders = holders_with(self.holders.message_holders(hash), own_key);
+        let holders = self.logical_holders(self.holders.message_holders(hash), own_key);
         self.t_empty_verdict(&holders, own_key)
+    }
+
+    // The page computes one birth-ranked physical representative per logical
+    // holder, including holders outside the page. Every claimant uses it.
+    fn canonical_file<'k>(&'k self, key: &'k str) -> &'k str {
+        self.sessions.get(key).map(String::as_str).unwrap_or(key)
+    }
+    fn logical_holders<'k>(&'k self, holders: &[&'k str], own_key: &'k str) -> Vec<&'k str> {
+        let mut logical = holders_with(holders, own_key)
+            .into_iter()
+            .map(|key| self.canonical_file(key))
+            .collect::<Vec<_>>();
+        logical.sort_unstable();
+        logical.dedup();
+        logical
     }
 
     /// No telemetry owner (T-empty): the only holder, else birth policy.
@@ -755,7 +795,11 @@ impl ClaudeClassifyContext<'_, '_> {
             Ok(winner) => winner,
             Err(reason) => return ClaudeRequestVerdict::Undecided(reason),
         };
-        self.note_unbuilt_older(own_key, winner);
+        if self.note_unbuilt_older(own_key, winner)
+            && self.index.active_effective_upload_body_witness_revision == 3
+        {
+            return ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::UnbuiltOlder);
+        }
         if holders.len() == 1 {
             ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned)
         } else if winner == own_key {
@@ -798,7 +842,7 @@ fn birth_policy<'k>(
             })
             .map(|(_, record)| record)
             .ok_or(ClaudeUndecidedBy::StaleHolder)?;
-        let member = claude_index_path_family_member(Path::new(key))
+        let member = super::claude_request_money::logical_family_member(index, key)
             .map(|(_, member)| member)
             .unwrap_or_default();
         ranked.push((record.birth().map(|birth| birth.unix_seconds), member, *key));
@@ -843,6 +887,10 @@ pub(crate) struct ClaudeLedgerStateCounts {
     pub(crate) telemetry_records: u64,
     pub(crate) telemetry_retired_records: u64,
     pub(crate) telemetry_hashes: u64,
+    /// Persisted tail extents not yet covered by a sampled audit, and the
+    /// oldest audit age. Retirement count discloses the associated drift risk.
+    pub(crate) audit_backlog_bytes: u64,
+    pub(crate) audit_oldest_age_s: u64,
     pub(crate) message_records: u64,
     pub(crate) message_hashes: u64,
     pub(crate) family_memos: u64,
@@ -901,6 +949,19 @@ pub(crate) fn ledger_state_counts(
         counts.telemetry_records += 1;
         counts.telemetry_retired_records += u64::from(record.retired().is_some());
         counts.telemetry_hashes += record.request_hashes().len() as u64;
+        if let Some(tail) = record.tail() {
+            let pending = tail.offset.saturating_sub(tail.audited_offset);
+            counts.audit_backlog_bytes = counts.audit_backlog_bytes.saturating_add(pending);
+            if pending > 0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|time| time.as_secs())
+                    .unwrap_or(0);
+                counts.audit_oldest_age_s = counts
+                    .audit_oldest_age_s
+                    .max(now.saturating_sub(tail.audited_unix));
+            }
+        }
     }
     for (_, record) in records.records_with_prefix(MESSAGE_KEY_PREFIX) {
         if late() {
@@ -947,6 +1008,39 @@ fn pressure(ledger: &ClaudeLedger, percent: usize) -> bool {
             >= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES * percent
 }
 
+/// Remove idle telemetry with no indexed transcript. It cannot establish a
+/// permanent ownership claim after the transcript retention window has passed.
+pub(crate) fn retire_idle_telemetry(ledger: &mut ClaudeLedger, index: &ScanIndex, now: u64) -> u64 {
+    let roots = index
+        .files
+        .keys()
+        .filter_map(|key| {
+            super::claude_request_money::logical_family_member(index, key).map(|(root, _)| root)
+        })
+        .collect::<BTreeSet<_>>();
+    let keys = ledger
+        .census()
+        .records_with_prefix(TELEMETRY_KEY_PREFIX)
+        .filter_map(|(key, record)| {
+            let tail = record.tail()?;
+            if now.saturating_sub(tail.last_append_unix) <= 35 * 86_400 {
+                return None;
+            }
+            let facts = super::claude_request_money::facts::ClaudeFacts::open(record.facts()?)?;
+            (!roots.contains(&facts.header.session)).then(|| key.clone())
+        })
+        .collect::<Vec<_>>();
+    for key in &keys {
+        if let Some(mut record) = ledger.take(key) {
+            // Keep the consumed offset: an unchanged retained sidecar must
+            // not replay its retired claims from offset zero on every sweep.
+            record.retire();
+            let _ = ledger.insert(key.clone(), record);
+        }
+    }
+    keys.len() as u64
+}
+
 /// Telemetry retirement under budget pressure only: at 90% of the ledger's
 /// hash or serialized budget, retire the telemetry records with the oldest
 /// last append until both are under 80%. A retired telemetry record keeps
@@ -976,10 +1070,21 @@ pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger) -> u64 
         if !pressure(ledger, PRESSURE_TARGET_PERCENT) {
             break;
         }
+        let before = (
+            ledger.census().hash_total(),
+            ledger.census().serialized_total(),
+        );
         if let Some(mut record) = ledger.take(&key) {
             record.retire();
             let _ = ledger.insert(key, record);
             retired += 1;
+        }
+        let after = (
+            ledger.census().hash_total(),
+            ledger.census().serialized_total(),
+        );
+        if after.0 >= before.0 && after.1 >= before.1 {
+            break;
         }
     }
     retired

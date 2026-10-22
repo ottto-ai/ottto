@@ -104,6 +104,9 @@ struct RejectedUsageEvidence {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RejectedUsageReason {
     UsageAccountingAuthorityDowngrade,
+    ClaudeRequestOwnedUsageContractMismatch,
+    UsageDecreaseHeldForReview,
+    UsageDecreaseRefusedAfterReview,
     ReservedSessionIdentitySeparator,
     OccurredAtBeyondFutureHorizon,
     HourBucketCountAboveCap,
@@ -135,6 +138,11 @@ impl RejectedUsageReason {
             "usage_accounting_authority_downgrade" => {
                 RejectedUsageReason::UsageAccountingAuthorityDowngrade
             }
+            "claude_request_owned_usage_contract_mismatch" => {
+                Self::ClaudeRequestOwnedUsageContractMismatch
+            }
+            "usage_decrease_held_for_review" => Self::UsageDecreaseHeldForReview,
+            "usage_decrease_refused_after_review" => Self::UsageDecreaseRefusedAfterReview,
             "reserved_session_identity_separator" => {
                 RejectedUsageReason::ReservedSessionIdentitySeparator
             }
@@ -1800,6 +1808,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for RejectedUsageReason {
     fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::UsageAccountingAuthorityDowngrade
+            | Self::ClaudeRequestOwnedUsageContractMismatch
+            | Self::UsageDecreaseHeldForReview
+            | Self::UsageDecreaseRefusedAfterReview
             | Self::ReservedSessionIdentitySeparator
             | Self::OccurredAtBeyondFutureHorizon
             | Self::HourBucketCountAboveCap

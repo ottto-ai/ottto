@@ -20,9 +20,10 @@
 //! directory, from any batch, until one lands; a dropped one is retaken.
 //! A missing or corrupt shard at load is debt, never a silent loss.
 //!
-//! One writer thread does every file write of the shadow (diagnostics JSONL
-//! rows, serialized there, and ledger shards) and the ledger load, outside
-//! `SNAPSHOT_SYNC_LOCK`. Its outbox is bounded in batches and in admitted
+//! One writer thread serializes diagnostic rows, writes ledger shards and
+//! loads the ledger. A tiny durable intent precedes enqueue. Live offers and
+//! bound holds use a bounded writer barrier before the scan can commit; this
+//! may wait under `SNAPSHOT_SYNC_LOCK` and must be included in lock timing. Its outbox is bounded in batches and in admitted
 //! bytes; each batch carries the admission of its own buffers (released
 //! when it is written, dropped or refused), and the load admits each
 //! shard's bytes and a structural bound of its decoded records before
@@ -208,7 +209,7 @@ impl ClaudeLedger {
         &mut self,
         deadline: Instant,
     ) -> Option<(ClaudeLedgerSave, ShadowReservation)> {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || writer().is_none() {
             return None;
         }
         let mut selected = vec![false; DATA_SHARDS];
@@ -377,6 +378,7 @@ pub(crate) struct PendingMemo {
 /// One page's batch for the writer.
 pub(crate) struct WriteJob {
     pub(crate) support_dir: PathBuf,
+    pub(crate) pending_intent: Option<PathBuf>,
     pub(crate) jsonl: JsonlBatch,
     pub(crate) memos: Vec<PendingMemo>,
     pub(crate) save: Option<ClaudeLedgerSave>,
@@ -396,8 +398,18 @@ pub(crate) struct WriteResult {
 enum Job {
     Load(PathBuf),
     Write(Box<WriteJob>),
-    #[cfg(test)]
     Flush(SyncSender<()>),
+    #[cfg(test)]
+    Stall {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    },
+    Checkpoint(
+        PathBuf,
+        ClaudeLedgerSave,
+        ShadowReservation,
+        SyncSender<(Vec<usize>, Option<bool>)>,
+    ),
 }
 
 enum Slot {
@@ -408,7 +420,11 @@ enum Slot {
 
 static LEDGERS: Mutex<BTreeMap<PathBuf, Slot>> = Mutex::new(BTreeMap::new());
 static RESULTS: Mutex<BTreeMap<PathBuf, Vec<WriteResult>>> = Mutex::new(BTreeMap::new());
-static WRITER: OnceLock<Option<Mutex<SyncSender<Job>>>> = OnceLock::new();
+struct Writer {
+    sender: Mutex<SyncSender<Job>>,
+    thread: std::thread::JoinHandle<()>,
+}
+static WRITER: OnceLock<Option<Writer>> = OnceLock::new();
 
 fn writer() -> Option<&'static Mutex<SyncSender<Job>>> {
     WRITER
@@ -418,9 +434,14 @@ fn writer() -> Option<&'static Mutex<SyncSender<Job>>> {
                 .name("claude-money-shadow-writer".to_owned())
                 .spawn(move || run_writer(receiver))
                 .ok()
-                .map(|_| Mutex::new(sender))
+                .map(|thread| Writer {
+                    sender: Mutex::new(sender),
+                    thread,
+                })
         })
         .as_ref()
+        .filter(|writer| !writer.thread.is_finished())
+        .map(|writer| &writer.sender)
 }
 
 /// Admitted bytes of the batches handed to the writer and not yet written.
@@ -437,12 +458,17 @@ impl Job {
     fn queued_bytes(&self) -> usize {
         match self {
             Self::Write(job) => job.queued_bytes(),
+            Self::Checkpoint(_, _, reservation, _) => reservation.bytes(),
             _ => 0,
         }
     }
 }
 
 fn submit(job: Job) -> Result<(), Job> {
+    #[cfg(test)]
+    if REFUSE_WRITES_FOR_TEST.with(std::cell::Cell::get) && matches!(&job, Job::Write(_)) {
+        return Err(job);
+    }
     let Some(sender) = writer() else {
         return Err(job);
     };
@@ -505,6 +531,9 @@ pub(crate) enum ClaudeLedgerAcquire {
 /// empty (every shard dirty, so the first save writes them all); a saved one
 /// is loaded by the writer while pages skip.
 pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
+    if writer().is_none() {
+        return ClaudeLedgerAcquire::Unavailable;
+    }
     let Ok(mut ledgers) = LEDGERS.lock() else {
         return ClaudeLedgerAcquire::Unavailable;
     };
@@ -544,10 +573,19 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
 
 /// Hand a page's batch to the writer. On a full outbox the batch comes back
 /// and its shards are dirty again.
-pub(crate) fn submit_batch(ledger: &mut ClaudeLedger, job: WriteJob) -> Result<(), Box<WriteJob>> {
-    match submit(Job::Write(Box::new(job))) {
+pub(crate) fn submit_batch(
+    ledger: &mut ClaudeLedger,
+    mut job: WriteJob,
+) -> Result<(), Box<WriteJob>> {
+    job.pending_intent = write_intent(&job.support_dir, job.jsonl.now);
+    let submitted = if job.pending_intent.is_some() {
+        submit(Job::Write(Box::new(job)))
+    } else {
+        Err(Job::Write(Box::new(job)))
+    };
+    match submitted {
         Ok(()) => Ok(()),
-        Err(Job::Write(job)) => {
+        Err(Job::Write(mut job)) => {
             if let Some(save) = &job.save {
                 let failed = save
                     .shards
@@ -558,6 +596,7 @@ pub(crate) fn submit_batch(ledger: &mut ClaudeLedger, job: WriteJob) -> Result<(
                     .then_some(save.meta_debt);
                 ledger.restore(&failed, meta);
             }
+            coalesce_refused_intent(&mut job);
             Err(job)
         }
         Err(_) => unreachable!("a write job comes back as itself"),
@@ -565,10 +604,17 @@ pub(crate) fn submit_batch(ledger: &mut ClaudeLedger, job: WriteJob) -> Result<(
 }
 
 /// Hand a batch with no ledger (a page refused before it held one).
-pub(crate) fn submit_unledgered(job: WriteJob) -> Result<(), Box<WriteJob>> {
+pub(crate) fn submit_unledgered(mut job: WriteJob) -> Result<(), Box<WriteJob>> {
+    job.pending_intent = write_intent(&job.support_dir, job.jsonl.now);
+    if job.pending_intent.is_none() {
+        return Err(Box::new(job));
+    }
     match submit(Job::Write(Box::new(job))) {
         Ok(()) => Ok(()),
-        Err(Job::Write(job)) => Err(job),
+        Err(Job::Write(mut job)) => {
+            coalesce_refused_intent(&mut job);
+            Err(job)
+        }
         Err(_) => unreachable!("a write job comes back as itself"),
     }
 }
@@ -619,7 +665,18 @@ fn run_writer(receiver: Receiver<Job>) {
                     results.entry(support_dir).or_default().push(result);
                 }
             }
+            Job::Checkpoint(support_dir, save, reservation, done) => {
+                let state = failed.entry(support_dir.clone()).or_default();
+                let result = write_save(&support_dir.join(LEDGER_DIR), &save, state);
+                QUEUED_BYTES.fetch_sub(reservation.bytes(), Ordering::AcqRel);
+                drop(reservation);
+                let _ = done.send(result);
+            }
             #[cfg(test)]
+            Job::Stall { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
             Job::Flush(done) => {
                 let _ = done.send(());
             }
@@ -627,7 +684,7 @@ fn run_writer(receiver: Receiver<Job>) {
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     let staged = path.with_extension("json.tmp");
     let written = std::fs::File::create(&staged).and_then(|mut file| {
         file.write_all(bytes)?;
@@ -635,6 +692,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     });
     written
         .and_then(|()| std::fs::rename(&staged, path))
+        // Persist the name before any data shard can replace a zero meta.
+        .and_then(|()| {
+            std::fs::File::open(path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ledger file has no parent",
+                )
+            })?)?
+            .sync_all()
+        })
         .is_ok()
 }
 
@@ -650,6 +717,7 @@ pub(crate) struct WriterState {
 fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
     let WriteJob {
         support_dir,
+        pending_intent,
         jsonl,
         memos,
         save,
@@ -659,6 +727,20 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
     let (failed_shards, meta_unwritten) = save.map_or((Vec::new(), None), |save| {
         write_save(&support_dir.join(LEDGER_DIR), &save, failed)
     });
+    if jsonl.published && failed_shards.is_empty() && meta_unwritten.is_none() {
+        if let Some(intent) = pending_intent {
+            let _ = std::fs::remove_file(intent);
+        }
+    } else if let Some(now) = job_now(&pending_intent) {
+        super::owe_coverage(&support_dir, now, true);
+        if super::day_stamp(now)
+            .is_some_and(|day| super::owed_path(&support_dir.join("diagnostics"), &day).exists())
+        {
+            if let Some(intent) = pending_intent {
+                let _ = std::fs::remove_file(intent);
+            }
+        }
+    }
     let result = WriteResult {
         jsonl,
         memos,
@@ -806,19 +888,35 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
 }
 
 /// Wait until the writer has done everything handed to it so far.
-#[cfg(test)]
 pub(crate) fn flush() {
+    let _ = flush_acknowledged();
+}
+
+fn flush_acknowledged() -> bool {
     let (done, wait) = sync_channel(1);
-    let Some(sender) = writer() else {
-        return;
+    let Some(sender) = WRITER
+        .get()
+        .and_then(Option::as_ref)
+        .filter(|writer| !writer.thread.is_finished())
+        .map(|writer| &writer.sender)
+    else {
+        return false;
     };
-    let sent = sender
-        .lock()
-        .ok()
-        .is_some_and(|sender| sender.send(Job::Flush(done)).is_ok());
-    if sent {
-        let _ = wait.recv();
+    let deadline = Instant::now() + flush_timeout();
+    let mut job = Job::Flush(done);
+    loop {
+        let attempt = sender.lock().ok().map(|sender| sender.try_send(job));
+        match attempt {
+            Some(Ok(())) => break,
+            Some(Err(TrySendError::Full(returned))) if Instant::now() < deadline => {
+                job = returned;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => return false,
+        }
     }
+    wait.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .is_ok()
 }
 
 /// Forget the in-memory ledger of `support_dir` (a restart): the next page
@@ -939,5 +1037,353 @@ pub(crate) fn restore_for_test(ledger: &mut ClaudeLedger, saves: &[&ClaudeLedger
         let meta =
             (save.meta_first.is_some() || save.meta_last.is_some()).then_some(save.meta_debt);
         ledger.restore(&shards, meta);
+    }
+}
+
+/// Stable, content-free identity of a physical member's local scheduling debt.
+pub(super) fn money_key(prefix: &str, index_key: &str) -> String {
+    format!("{prefix}{:x}", Sha256::digest(index_key.as_bytes()))
+}
+
+impl ClaudeLedger {
+    pub(super) fn put_money(&mut self, key: String, record: ClaudeRequestCensusRecord) -> bool {
+        if self.get(&key) == Some(&record) {
+            return true;
+        }
+        self.insert(key, record) == ClaudeRequestCensusInsert::Stored
+    }
+}
+
+/// Complete one bounded save before any new live offer or bound local hold
+/// can advance the index. A busy/dead writer, admission failure or timeout is
+/// retry debt. The guard stays exclusive; a timed-out save is dirtied again.
+/// This barrier deliberately has no network or credential side effects.
+pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
+    super::apply_results(
+        support_dir,
+        ledger,
+        &mut super::ClaudeRequestMoneyShadowCounts::default(),
+    );
+    if ledger.dirty_shards() == 0 {
+        // No dirty buffers can also mean an earlier save is still in flight.
+        // A timeout is not proof that those shards reached disk.
+        if !flush_acknowledged() {
+            return false;
+        }
+        super::apply_results(
+            support_dir,
+            ledger,
+            &mut super::ClaudeRequestMoneyShadowCounts::default(),
+        );
+        return ledger.dirty_shards() == 0;
+    }
+    let Some((save, reservation)) = ledger.take_save(Instant::now() + Duration::from_millis(100))
+    else {
+        return false;
+    };
+    let shards = save
+        .shards
+        .iter()
+        .map(|(shard, _)| *shard)
+        .collect::<Vec<_>>();
+    let meta = (save.meta_first.is_some() || save.meta_last.is_some()).then_some(save.meta_debt);
+    let (done, wait) = sync_channel(1);
+    if submit(Job::Checkpoint(
+        support_dir.to_path_buf(),
+        save,
+        reservation,
+        done,
+    ))
+    .is_err()
+    {
+        ledger.restore(&shards, meta);
+        return false;
+    }
+    match wait.recv_timeout(Duration::from_secs(5)) {
+        Ok((failed, meta)) => ledger.restore(&failed, meta),
+        Err(_) => ledger.restore(&shards, meta),
+    }
+    super::apply_results(
+        support_dir,
+        ledger,
+        &mut super::ClaudeRequestMoneyShadowCounts::default(),
+    );
+    ledger.dirty_shards() == 0
+}
+
+/// Snapshot the ready ledger without taking custody from a running page.
+/// The scope is explicit; no account/destination can see another ledger.
+pub(super) fn scheduled(support_dir: &Path, index_key: &str, now: u64) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
+        return false;
+    };
+    let dirty = ledger.get(&money_key("dirty:", index_key));
+    if ledger
+        .get(&money_key("hold:", index_key))
+        .is_some_and(|hold| {
+            hold.window() > now
+                && dirty.map_or(true, |dirty| {
+                    dirty.window() <= hold.window().saturating_sub(1800)
+                })
+        })
+    {
+        return false;
+    }
+    ["due:", "dirty:", "hold:"].iter().any(|prefix| {
+        ledger
+            .get(&money_key(prefix, index_key))
+            .is_some_and(|record| record.window() <= now)
+    })
+}
+
+pub(super) fn hold_rereadable(support_dir: &Path, key: &str) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
+        return false;
+    };
+    ledger.get(&money_key("hold:", key)).is_some()
+        && ["due:", "dirty:"]
+            .iter()
+            .any(|prefix| ledger.get(&money_key(prefix, key)).is_some())
+}
+
+pub(super) fn hold_revision_bound(support_dir: &Path, revision: &str) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
+        return false;
+    };
+    ledger
+        .get(&format!("hold:body:{revision}"))
+        .is_some_and(|record| {
+            super::super::claude_request_census::fingerprint_matches(record, revision)
+        })
+}
+
+pub(super) fn blocking_file(support_dir: &Path, index_key: &str) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
+        return false;
+    };
+    ledger.get(&money_key("unbuilt:", index_key)).is_some()
+}
+
+pub(super) fn adoption_paused(support_dir: &Path, prefix: &str, now: u64) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return true;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
+        return false;
+    };
+    let mut total = 0_u64;
+    let mut local = 0_u64;
+    let mut holds = 0_u64;
+    let mut refused = 0_u64;
+    let deadline = Instant::now() + Duration::from_millis(100);
+    for (key, record) in ledger.census().records_with_prefix(prefix) {
+        if Instant::now() >= deadline {
+            return true;
+        }
+        if key.ends_with(":route") {
+            if record.window() > now {
+                return true;
+            }
+            continue;
+        }
+        match record.window() {
+            0..=4 | 6 => total += 1,
+            _ => continue,
+        }
+        local += u64::from(record.window() == 1);
+        holds += u64::from(record.window() == 2);
+        refused += u64::from(matches!(record.window(), 3 | 6));
+    }
+    total > 0
+        && (local.saturating_mul(100) > total
+            || refused.saturating_mul(100) >= total.saturating_mul(5)
+            || holds.saturating_mul(100) > total.saturating_sub(local))
+}
+
+pub(super) fn intent_run_id() -> &'static str {
+    static RUN: OnceLock<String> = OnceLock::new();
+    RUN.get_or_init(|| {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|time| time.as_nanos())
+                .unwrap_or(0)
+        )
+    })
+}
+
+// A refused job has no future writer completion to retire its unique intent.
+// Move that obligation to the existing coalesced day marker before deleting it.
+fn coalesce_refused_intent(job: &mut WriteJob) {
+    super::owe_coverage(&job.support_dir, job.jsonl.now, true);
+    let Some(day) = super::day_stamp(job.jsonl.now) else {
+        return;
+    };
+    let dir = job.support_dir.join("diagnostics");
+    if super::read_marker_time(&super::owed_path(&dir, &day)).is_some() {
+        if let Some(intent) = job.pending_intent.take() {
+            let _ = std::fs::remove_file(intent);
+            let _ = std::fs::File::open(&dir).and_then(|directory| directory.sync_all());
+        }
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static REFUSE_WRITES_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn write_intent(support_dir: &Path, now: u64) -> Option<PathBuf> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let day = super::day_stamp(now)?;
+    let dir = support_dir.join("diagnostics");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!(
+        ".{}{day}.{}.{}.pending",
+        super::JSONL_PREFIX,
+        intent_run_id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    write_atomic(&path, now.to_string().as_bytes()).then_some(path)
+}
+
+fn job_now(intent: &Option<PathBuf>) -> Option<u64> {
+    super::read_marker_time(intent.as_ref()?)
+}
+
+fn flush_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = TEST_FLUSH_TIMEOUT.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    Duration::from_secs(5)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FLUSH_TIMEOUT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct FlushTimeoutForTest(Option<Duration>);
+#[cfg(test)]
+impl Drop for FlushTimeoutForTest {
+    fn drop(&mut self) {
+        TEST_FLUSH_TIMEOUT.with(|timeout| timeout.set(self.0));
+    }
+}
+#[cfg(test)]
+pub(crate) fn flush_timeout_for_test(timeout: Duration) -> FlushTimeoutForTest {
+    FlushTimeoutForTest(TEST_FLUSH_TIMEOUT.with(|current| current.replace(Some(timeout))))
+}
+
+#[cfg(test)]
+pub(crate) struct WriterStallForTest(SyncSender<()>);
+#[cfg(test)]
+impl Drop for WriterStallForTest {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+#[cfg(test)]
+pub(crate) fn stall_writer_for_test() -> WriterStallForTest {
+    let (entered, wait) = sync_channel(1);
+    let (release, paused) = sync_channel(1);
+    let guard = WriterStallForTest(release);
+    assert!(submit(Job::Stall {
+        entered,
+        release: paused
+    })
+    .is_ok());
+    wait.recv_timeout(Duration::from_secs(5))
+        .expect("writer entered the injected stall");
+    guard
+}
+
+#[cfg(test)]
+mod refused_intent_tests {
+    use super::*;
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn refused_outbox_jobs_coalesce_their_durable_intents() {
+        let support = std::env::temp_dir().join(format!(
+            "ottto-money-intent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Reset(PathBuf);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REFUSE_WRITES_FOR_TEST.with(|flag| flag.set(false));
+                super::super::forget_owed_coverage_for_test(&self.0);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _reset = Reset(support.clone());
+        REFUSE_WRITES_FOR_TEST.with(|flag| flag.set(true));
+        let now = 1_790_000_000;
+        let day = super::super::day_stamp(now).unwrap();
+        let mut ledger = ClaudeLedger::new_for_test();
+        for with_ledger in [false, true] {
+            for _ in 0..24 {
+                let job = WriteJob {
+                    support_dir: support.clone(),
+                    pending_intent: None,
+                    jsonl: super::super::JsonlBatch {
+                        now,
+                        families: Vec::new(),
+                        coverage: super::super::CoverageRow::owed(now),
+                        buffer_bytes: 0,
+                    },
+                    memos: Vec::new(),
+                    save: None,
+                    reservations: Vec::new(),
+                };
+                let refused = if with_ledger {
+                    submit_batch(&mut ledger, job)
+                } else {
+                    submit_unledgered(job)
+                };
+                let Err(refused) = refused else {
+                    panic!("synthetic full outbox");
+                };
+                assert!(
+                    refused.pending_intent.is_none(),
+                    "coalesced debt owns this refusal"
+                );
+            }
+        }
+        assert!(super::super::read_marker_time(&super::super::owed_path(
+            &support.join("diagnostics"),
+            &day
+        ))
+        .is_some());
+        assert_eq!(
+            std::fs::read_dir(support.join("diagnostics"))
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "pending"))
+                .count(),
+            0
+        );
     }
 }

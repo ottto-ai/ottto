@@ -1977,6 +1977,123 @@ impl<'s, 'a> RequestSink<'s, 'a> {
     }
 }
 
+/// Counted units supplied by the money builder. Copies, immature and held
+/// units never reach the sink; ambiguous ownership remains explicitly untagged.
+pub(crate) fn request_owned_grouping(
+    item: &SnapshotItem,
+    evidence: &ScanEvidence<'_>,
+    entity: &super::claude_request_money::body::ClaudeEntityBody,
+) -> Option<Grouping> {
+    use super::claude_request_ledger::ClaudeCountedBy;
+    use super::claude_request_money::body::ClaudeRequestUsageOrigin;
+    let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?;
+    let own = item
+        .claude_usage_occurrences
+        .keys()
+        .map(|id| {
+            (
+                super::claude_request_census::claude_request_hash(id),
+                id.as_str(),
+            )
+        })
+        .chain(
+            evidence
+                .requests
+                .keys()
+                .filter(|(root, _)| *root == sink.root)
+                .map(|(_, id)| (super::claude_request_census::claude_request_hash(id), *id)),
+        )
+        .collect::<BTreeMap<_, _>>();
+    for contribution in &entity.counted {
+        let mut selector = SelectorCapture::default();
+        for (name, value) in &contribution.key.2 {
+            super::insert_selector_raw(
+                &mut selector,
+                name,
+                "claude_api_request",
+                &serde_json::Value::String(value.clone()),
+            );
+        }
+        if let Some(origin) = contribution.origin {
+            let name = match origin {
+                ClaudeRequestUsageOrigin::TelemetryMatched => "telemetry_matched",
+                ClaudeRequestUsageOrigin::TelemetryReported => "telemetry_reported",
+                ClaudeRequestUsageOrigin::TelemetryUnpriced => "telemetry_unpriced",
+            };
+            super::insert_selector_raw(
+                &mut selector,
+                "request_usage_origin",
+                "claude_api_request",
+                &serde_json::Value::String(name.into()),
+            );
+        }
+        let (mut row, mut context, _) = super::build_row_identity(
+            &contribution.key.1,
+            &selector,
+            contribution
+                .key
+                .2
+                .get("reasoning_effort")
+                .map(String::as_str),
+        );
+        // This literal-only selector is intentionally absent from the legacy
+        // allowlist. Hash the same reduced context the emitter actually sends.
+        if let Some(origin) = selector.context.get("request_usage_origin") {
+            context.insert("request_usage_origin".into(), origin.clone());
+            let payload = serde_json::to_string(&context).unwrap_or_else(|_| "{}".into());
+            row.selector_hash = super::sha256_hex(&[&payload])[..16].to_owned();
+        }
+        let tokens = contribution.tokens;
+        let usage = UsageTotals {
+            input_tokens: tokens.input,
+            output_tokens: tokens.output,
+            cache_read_tokens: tokens.cache_read,
+            cache_creation_5m_tokens: tokens.cache_5m,
+            cache_creation_1h_tokens: tokens.cache_1h,
+            unattributed_total_tokens: tokens.unattributed,
+            reasoning_output_tokens: tokens.reasoning,
+            request_count: contribution.requests,
+            costs: super::UsageCosts {
+                observed: true,
+                reported: contribution.cost.is_some(),
+                total: contribution.cost.map(|cost| u128::from(cost) * 1_000_000),
+                ..Default::default()
+            },
+        };
+        let id = contribution
+            .request
+            .and_then(|hash| own.get(&hash).copied());
+        let identity = if contribution.by == ClaudeCountedBy::TelemetryProven {
+            match id {
+                Some(id) => classify_ref(
+                    evidence,
+                    &RequestFacts {
+                        root: &sink.root,
+                        source_session_id: &item.source_session_id,
+                        request_id: id,
+                        terminal_unix_seconds: Some(contribution.clock),
+                        event_clock_complete: true,
+                        marker: MarkerVerdict::None,
+                        desktop: sink.desktop,
+                        scan_unix_seconds: sink.scan_unix_seconds,
+                        email_home: None,
+                        session_start_unix_seconds: sink.session_start_unix_seconds,
+                        duplicated_elsewhere: false,
+                    },
+                ),
+                None => IdentityRef::Missing,
+            }
+        } else {
+            IdentityRef::Missing
+        };
+        sink.grouping
+            .add(&contribution.key.0, &row, &usage, identity);
+    }
+    // Literal ownership is never an exclusive transcript-marker proof.
+    sink.grouping.withdraw_transcript_tags();
+    Some(sink.finish())
+}
+
 /// Per-pass counts; local only.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScanOutcome {
@@ -2156,12 +2273,14 @@ fn tag_item(
     ownership: &TranscriptOwnership<'_>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let root = owner_root(item)?;
+    let request_owned = item.usage_accounting_contract.as_deref()
+        == Some(super::claude_request_money::REQUEST_OWNED_CONTRACT);
     let reported_usage = item.usage_accounting_contract.as_deref() == Some(REPORTED);
     if !item.claude_context_curve_request_index_complete
         // A reported item also counts telemetry-only requests and excludes a
         // legacy fork's inherited prefix; its rebuild's admitted requests are
         // checked against its grouping below instead.
-        || (!reported_usage && !transcript_requests_counted(item))
+        || (!reported_usage && !request_owned && !transcript_requests_counted(item))
         || item
             .attribution_facts
             .iter()
@@ -2178,7 +2297,9 @@ fn tag_item(
     {
         return None;
     }
-    let mut grouping = if reported_usage {
+    let mut grouping = if request_owned {
+        reported.remove(&item.source_session_id)?
+    } else if reported_usage {
         let grouping = reported.remove(&item.source_session_id)?;
         if !grouping.reported_requests_admissible(item) {
             return None;
@@ -2190,7 +2311,7 @@ fn tag_item(
         transcript_requests(item, |request| sink.add(item, request))?;
         sink.finish()
     };
-    if !ownership.settled {
+    if request_owned || !ownership.settled {
         // An unmarked fork or resume copies its predecessor's lines, markers
         // included, and nothing short of a fully compared pass shows which
         // lines are copies: markers tag nothing this pass.
@@ -2219,3 +2340,66 @@ fn tag_item(
 crate::heap_layout_bound::fields!(OrgMarkers; entries, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
 crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
+
+#[cfg(test)]
+mod request_money_row_regressions {
+    use super::*;
+    use crate::snapshots::claude_request_money::{self as money, body};
+    #[test]
+    fn emitted_telemetry_origins_and_effort_reproduce_identity_rows() {
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        item.source_session_id = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000".into();
+        let mut entity = body::ClaudeEntityBody::default();
+        for origin in [
+            body::ClaudeRequestUsageOrigin::TelemetryMatched,
+            body::ClaudeRequestUsageOrigin::TelemetryReported,
+            body::ClaudeRequestUsageOrigin::TelemetryUnpriced,
+        ] {
+            for effort in ["low", "high"] {
+                let key = (
+                    "2026-08-02T09:00:00Z".into(),
+                    "claude-haiku-4-5".into(),
+                    BTreeMap::from([("reasoning_effort".into(), effort.into())]),
+                );
+                let tokens = money::ClaudeMoneyTokens {
+                    input: 10,
+                    ..Default::default()
+                };
+                entity.grains.insert(
+                    (key.clone(), Some(origin)),
+                    body::ClaudeGrainSide {
+                        tokens,
+                        requests: 1,
+                        cost_micros: 100,
+                        unpriced: 0,
+                        contributions: 1,
+                    },
+                );
+                entity.counted.push(body::ClaudeCountedContribution {
+                    key,
+                    origin: Some(origin),
+                    tokens,
+                    requests: 1,
+                    cost: Some(100),
+                    request: None,
+                    clock: 1_785_660_000,
+                    by: super::super::claude_request_ledger::ClaudeCountedBy::PolicyOwned,
+                });
+            }
+        }
+        assert!(money::emit_for_test(&mut item, &entity));
+        assert_eq!(item.usage_buckets[0].model_usage.len(), 6);
+        assert!(item
+            .model_usage
+            .iter()
+            .all(|row| matches!(row.reasoning_effort.as_deref(), Some("low" | "high"))));
+        let api = Default::default();
+        let trace = Default::default();
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let grouping = request_owned_grouping(&item, &evidence, &entity).unwrap();
+        assert!(
+            apply_grouped(&mut item, grouping).is_ok(),
+            "actual emitter rows must reproduce, including origin and effort"
+        );
+    }
+}

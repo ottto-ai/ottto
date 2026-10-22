@@ -424,6 +424,30 @@ impl ClaudeRequestCensusRecord {
         }
     }
 
+    /// Scheduling uses the existing bounded scalar codec, in the ledger only.
+    /// The fingerprint is the evidence revision; the window is its deadline.
+    /// Watch records share the observed hash buffer so removals can find former
+    /// dependents without copying telemetry facts or raw provider identifiers.
+    pub(crate) fn money_debt(revision: [u8; 32], deadline: u64) -> Self {
+        Self::bookkeeping(revision, deadline)
+    }
+
+    pub(crate) fn money_revision(&self) -> [u8; 32] {
+        self.source_file_fingerprint
+    }
+
+    pub(crate) fn money_watch(&self, revision: [u8; 32]) -> Self {
+        Self {
+            request_hashes: self.shared_request_hashes(),
+            shape: if self.request_hashes().is_empty() {
+                ClaudeRequestCensusShape::Empty
+            } else {
+                ClaudeRequestCensusShape::Exact
+            },
+            ..Self::bookkeeping(revision, 0)
+        }
+    }
+
     /// A `sweep:` record: cursor bytes, the sweep's start and its state.
     pub(crate) fn sweep_record(
         cursor: [u8; 32],
@@ -578,6 +602,11 @@ pub(crate) fn is_ledger_key(key: &str) -> bool {
         || key.starts_with(SWEEP_KEY_PREFIX)
         || key.starts_with(FAMILY_KEY_PREFIX)
         || key.starts_with(MESSAGE_KEY_PREFIX)
+        || [
+            "due:", "dirty:", "offer:", "hold:", "watch:", "unbuilt:", "adopt:", "union:",
+        ]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
 }
 
 /// The `mh:` key of a transcript's index key.
@@ -2063,7 +2092,7 @@ fn lower_hex(bytes: &[u8]) -> bool {
         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
-fn decode_fingerprint(value: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_fingerprint(value: &str) -> Option<[u8; 32]> {
     let bytes = value.as_bytes();
     if bytes.len() != 64 || !lower_hex(bytes) {
         return None;
@@ -2255,8 +2284,18 @@ pub(crate) fn record_claude_request_census(
         return;
     }
     let window = rfc3339_unix_seconds(parse.census_window_end).unwrap_or_default();
+    // A complete, verified physical file can name its logical entity from
+    // content. Path aliases remain distinct census/evidence records; E's
+    // per-file posture and account/project refusal are unchanged.
+    let logical_owner = match items {
+        [item] if parse.complete && parse.source_verified => (
+            claude_snapshot_family_root_ref(item).to_owned(),
+            item.source_session_id.clone(),
+        ),
+        _ => path_owner,
+    };
     let Some(record) = claude_request_census_record(
-        &path_owner,
+        &logical_owner,
         items,
         parse.itemless_request_hashes,
         parse.source_file_fingerprint,

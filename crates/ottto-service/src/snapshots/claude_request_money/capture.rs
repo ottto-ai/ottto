@@ -365,6 +365,31 @@ impl ClaudeResponseCapture {
         });
     }
 
+    /// Full-body copies of placement keys and counted contributions, admitted
+    /// before building. A single long selector can be copied by every unit.
+    pub(super) fn body_allocation_bound(&self) -> usize {
+        let largest = self
+            .rows
+            .iter()
+            .map(|row| {
+                row.selector.iter().fold(
+                    row.model.len().saturating_add(row.bucket_start.len()),
+                    |bytes, (key, value)| {
+                        bytes
+                            .saturating_add(key.len())
+                            .saturating_add(value.len())
+                            .saturating_add(128)
+                    },
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        self.placements
+            .len()
+            .saturating_add(self.units.len())
+            .saturating_mul(largest.saturating_add(1024).saturating_mul(8))
+    }
+
     pub(crate) fn units(&self) -> &[CapturedUnit] {
         &self.units
     }
