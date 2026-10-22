@@ -10,6 +10,7 @@ use super::aggregate::{stable_hash, Day};
 use super::aggregate::{Aggregate, AggregateRef, StoredAggregate};
 use super::checkpoint::{
     create_dir_durable, read_json, sync_dir, write_atomic, write_json, write_packed, Checkpoint,
+    Pin,
 };
 use super::file::Source;
 use super::STATE_SCHEMA;
@@ -160,6 +161,8 @@ pub(super) struct StoredScope {
     file_sessions: Vec<FileSession>,
     #[serde(default)]
     totals: Option<ShardRef>,
+    #[serde(default)]
+    recovery_pins: BTreeMap<String, Pin>,
 }
 
 /// The same layout, borrowed for writing.
@@ -172,6 +175,7 @@ struct StoredScopeRef<'a> {
     generation: u64,
     shards: &'a BTreeMap<u16, ShardRef>,
     totals: ShardRef,
+    recovery_pins: &'a BTreeMap<String, Pin>,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +197,10 @@ pub(super) struct Scope {
     pub(super) file_sessions: Vec<FileSession>,
     /// Shards whose file was checked against its reference in this run.
     verified: BTreeSet<u16>,
+    /// Exceptional pins commit with the totals: unfinished fallback reads
+    /// and quarantine decisions must survive a lost index write. Healthy
+    /// checkpoints need no duplicate pin.
+    pub(super) recovery_pins: BTreeMap<String, Pin>,
 }
 
 /// The files one committed generation references: its totals and shards.
@@ -207,6 +215,16 @@ impl Scope {
     pub(super) fn accounted_bytes(&self) -> usize {
         self.agg.accounted_bytes()
             + self.file_sessions.capacity() * std::mem::size_of::<FileSession>()
+            + self
+                .recovery_pins
+                .iter()
+                .map(|(key, pin)| {
+                    std::mem::size_of::<Pin>()
+                        + key.len()
+                        + pin.path.len()
+                        + pin.scope.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>()
             + self.shards.len() * 128
             + self
                 .files
@@ -225,6 +243,7 @@ impl Scope {
             shards: BTreeMap::new(),
             file_sessions: Vec::new(),
             verified: BTreeSet::new(),
+            recovery_pins: BTreeMap::new(),
         }
     }
 
@@ -384,6 +403,7 @@ fn load_manifest(
         shards: stored.shards,
         file_sessions,
         verified: BTreeSet::new(),
+        recovery_pins: stored.recovery_pins,
     }))
 }
 
@@ -441,6 +461,7 @@ pub(super) fn save_scope(path: &Path, source: Source, scope: &Scope) -> std::io:
         info: &scope.info,
         generation: scope.generation,
         shards: &scope.shards,
+        recovery_pins: &scope.recovery_pins,
         totals: ShardRef {
             generation: scope.generation,
             sha,

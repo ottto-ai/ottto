@@ -1417,6 +1417,12 @@ fn damage_scope_state(manifest: &Path, damage: &str) {
         "bad_manifest" => fs::write(manifest, b"{not json").unwrap(),
         "missing_manifest" => fs::remove_file(manifest).unwrap(),
         "totals_sha" => fs::write(&totals, b"not the committed totals").unwrap(),
+        "missing_totals" => fs::remove_file(&totals).unwrap(),
+        "malformed_totals" => {
+            fs::write(&totals, b"{not json").unwrap();
+            stored["totals"]["sha"] = json!(sha_of(&totals));
+            fs::write(manifest, serde_json::to_vec(&stored).unwrap()).unwrap();
+        }
         "unknown_totals_id" => {
             // A kind id this build does not know, with a matching hash.
             fn rename_one_kind(value: &mut Value) -> bool {
@@ -1446,6 +1452,8 @@ fn bad_scope_state_falls_back_to_the_last_good_generation() {
         "bad_manifest",
         "missing_manifest",
         "totals_sha",
+        "missing_totals",
+        "malformed_totals",
         "unknown_totals_id",
     ] {
         let env = Env::new(&format!("composition-v2-fallback-{damage}"));
@@ -4310,6 +4318,157 @@ fn fallback_catch_up_survives_a_crash_before_the_pins_write() {
 
     let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
     assert_eq!(stats.bytes_repair, fs::metadata(&b).unwrap().len());
+    assert_eq!(
+        v2_rows(&env.scope(Source::Claude).agg),
+        whole_rows_of(&[&a, &b])
+    );
+    env.cleanup();
+}
+
+#[test]
+fn shard_quarantine_survives_a_crash_before_the_pins_write() {
+    for lost_index in [false, true] {
+        for damage in ["missing", "truncated"] {
+            let env = Env::new("composition-v2-shard-quarantine-crash");
+            let now = base_now();
+            let cwd = env.cwd();
+            let sibling = same_shard_names(1).remove(0);
+            let a = env.root.join("p/a.jsonl");
+            let b = env.root.join("p").join(&sibling);
+            for (path, session) in [(&a, "sa"), (&b, "sb")] {
+                write_records(path, &as_session(claude_turn(&cwd, now.date(), 1), session));
+            }
+            env.run(Source::Claude, now, None);
+            let before = v2_rows(&env.scope(Source::Claude).agg);
+            let old_pins = read_index(&env.state, Source::Claude);
+            damage_shard(&manifest_of(&env, &cwd), "a.jsonl", damage);
+            append_records(&a, &as_session(claude_turn(&cwd, now.date(), 2), "sa"));
+            harvest::tests::set_crash_after(Some(1));
+            let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+            harvest::tests::set_crash_after(None);
+            assert_eq!((stats.files_quarantined, stats.scopes_committed), (2, 1));
+            if lost_index {
+                fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+            }
+            append_records(&b, &as_session(claude_turn(&cwd, now.date(), 3), "sb"));
+            let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+            assert_eq!((stats.bytes_new, stats.bytes_repair), (0, 0));
+            assert_eq!(v2_rows(&env.scope(Source::Claude).agg), before);
+            let recovered = read_index(&env.state, Source::Claude);
+            for key in ["a.jsonl", sibling.as_str()] {
+                assert!(recovered.files[key].quarantined);
+                assert_eq!(recovered.files[key].start, old_pins.files[key].start);
+                assert_eq!(recovered.files[key].ino, old_pins.files[key].ino);
+            }
+            env.cleanup();
+        }
+    }
+}
+
+#[test]
+fn shorter_rewrite_with_lost_pins_keeps_later_appends_uncapped() {
+    let env = Env::new("composition-v2-short-rewrite-crash");
+    let now = base_now();
+    let cwd = env.cwd();
+    let path = env.root.join("p/a.jsonl");
+    let mut original = claude_turn(&cwd, now.date(), 1);
+    for n in 2..8 {
+        original.extend(claude_turn(&cwd, now.date(), n));
+    }
+    write_records(&path, &original);
+    env.run(Source::Claude, now, None);
+    let shorter = claude_turn(&cwd, now.date(), 1);
+    write_records(&path, &shorter);
+    harvest::tests::set_crash_after(Some(1));
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    harvest::tests::set_crash_after(None);
+    assert_eq!(stats.bytes_repair, body(&shorter).len() as u64);
+    let more = claude_turn(&cwd, now.date(), 2);
+    append_records(&path, &more);
+    // No repair allowance: newly appended bytes must still be measured.
+    let stats = env.run_with(
+        Source::Claude,
+        now + time::Duration::days(2),
+        None,
+        0,
+        &mut FolderResolver::default(),
+    );
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair, stats.repair_waiting),
+        (body(&more).len() as u64, 0, 0)
+    );
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
+    assert!(read_index(&env.state, Source::Claude).files["a.jsonl"]
+        .repair_to
+        .is_none());
+    env.cleanup();
+}
+
+#[test]
+fn committed_fallback_debt_survives_complete_index_loss() {
+    let env = Env::new("composition-v2-fallback-debt-index-loss");
+    let now = base_now();
+    let cwd = env.cwd();
+    let a = env.root.join("p/a.jsonl");
+    let b = env.root.join("p/b.jsonl");
+    for (path, session) in [(&a, "sa"), (&b, "sb")] {
+        write_records(path, &as_session(claude_turn(&cwd, now.date(), 1), session));
+    }
+    env.run(Source::Claude, now, None);
+    let debt = as_session(claude_turn(&cwd, now.date(), 2), "sb");
+    append_records(&b, &debt);
+    env.run(Source::Claude, now + time::Duration::days(1), None);
+    fs::write(manifest_of(&env, &cwd), b"{not json").unwrap();
+    append_records(&a, &as_session(claude_turn(&cwd, now.date(), 3), "sa"));
+    harvest::tests::set_crash_after(Some(1));
+    let stats = env.run_with(
+        Source::Claude,
+        now + time::Duration::days(2),
+        None,
+        0,
+        &mut FolderResolver::default(),
+    );
+    harvest::tests::set_crash_after(None);
+    assert_eq!((stats.state_fallbacks, stats.repair_waiting), (1, 1));
+    fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!(
+        (stats.bytes_repair, stats.bytes_new),
+        (body(&debt).len() as u64, 0)
+    );
+    assert_eq!(
+        v2_rows(&env.scope(Source::Claude).agg),
+        whole_rows_of(&[&a, &b])
+    );
+    env.cleanup();
+}
+
+#[test]
+fn temporarily_missing_file_keeps_its_fallback_debt() {
+    let env = Env::new("composition-v2-missing-fallback-file");
+    let now = base_now();
+    let cwd = env.cwd();
+    let a = env.root.join("p/a.jsonl");
+    let b = env.root.join("p/b.jsonl");
+    for (path, session) in [(&a, "sa"), (&b, "sb")] {
+        write_records(path, &as_session(claude_turn(&cwd, now.date(), 1), session));
+    }
+    env.run(Source::Claude, now, None);
+    let debt = as_session(claude_turn(&cwd, now.date(), 2), "sb");
+    append_records(&b, &debt);
+    env.run(Source::Claude, now + time::Duration::days(1), None);
+    let hidden = env.root.parent().unwrap().join("saved-transcript");
+    fs::rename(&b, &hidden).unwrap();
+    fs::write(manifest_of(&env, &cwd), b"{not json").unwrap();
+    append_records(&a, &as_session(claude_turn(&cwd, now.date(), 3), "sa"));
+    let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(stats.state_fallbacks, 1);
+    fs::rename(&hidden, &b).unwrap();
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!(
+        (stats.bytes_repair, stats.bytes_new),
+        (body(&debt).len() as u64, 0)
+    );
     assert_eq!(
         v2_rows(&env.scope(Source::Claude).agg),
         whole_rows_of(&[&a, &b])

@@ -819,12 +819,6 @@ fn rebuild_pins(
             continue;
         };
         for (key, checkpoint) in &scope.files {
-            // Stale pins ahead of a committed checkpoint: a fallback commit
-            // whose pins write was lost. What they had counted is repair.
-            let repair_to = index.files.get(key).and_then(|old| {
-                old.repair_to
-                    .max((old.start > checkpoint.offset).then_some(old.start))
-            });
             index.files.insert(
                 key.clone(),
                 Pin {
@@ -845,22 +839,15 @@ fn rebuild_pins(
                     head: checkpoint.head,
                     tail: checkpoint.tail,
                     origin: checkpoint.origin,
-                    repair_to,
+                    repair_to: None,
                 },
             );
             rebuilt += 1;
         }
-        // A pinned file the committed generation does not hold was not
-        // caught up by that fallback: it reads from where it started.
-        for (key, pin) in index.files.iter_mut() {
-            if pin.scope.as_deref() == Some(scope_id.as_str())
-                && !pin.done
-                && !pin.quarantined
-                && !scope.files.contains_key(key)
-            {
-                follow_kept(pin, None);
-            }
-        }
+        // Only explicit committed recovery metadata identifies rollback
+        // debt. A shorter checkpoint can also be a successful rewrite.
+        // Quarantined files may deliberately have no checkpoint at all.
+        index.files.extend(scope.recovery_pins);
         if !scope.info.workspace_path.is_empty() {
             index
                 .cwd_scopes
@@ -1513,6 +1500,15 @@ fn process_scope(
     for item in items.drain(..) {
         groups.entry(shard_id(&item.key)).or_default().push(item);
     }
+    if base == Base::Fallback {
+        // A temporarily absent file still needs a durable rollback pin.
+        // Its shard may have no discovery work items this run.
+        for (key, pin) in &index.files {
+            if pin.scope.as_deref() == Some(scope_id) && !pin.done && !pin.quarantined {
+                groups.entry(shard_id(key)).or_default();
+            }
+        }
+    }
     // Migration reads state only, never transcript history. The switch has
     // not shipped, but preserve existing local checkpoints when upgrading.
     let mut legacy_groups: BTreeMap<u16, BTreeMap<String, Checkpoint>> = BTreeMap::new();
@@ -1531,7 +1527,7 @@ fn process_scope(
             stats.cut = true;
             if base == Base::Fallback {
                 follow_kept_shard(
-                    run, source, scope_id, &mut scope, &path, id, &items, &damaged, index, stats,
+                    run, source, scope_id, &mut scope, &path, id, &damaged, index, stats,
                 );
             }
             break;
@@ -1547,11 +1543,7 @@ fn process_scope(
         if base == Base::Fallback {
             // Whatever happens to the reads, the pins now follow the kept
             // generation, so nothing it is behind on is ever skipped.
-            for item in &items {
-                if let Some(pin) = index.files.get_mut(&item.key) {
-                    follow_kept(pin, scope.files.get(&item.key));
-                }
-            }
+            follow_kept_pins(index, scope_id, id, &scope);
         }
         // Bytes a failed generation had counted are read again within the
         // repair budget, or wait for a later day's.
@@ -1722,9 +1714,9 @@ fn process_scope(
     // reach: their pins follow it too, so the next run reads what it is
     // behind on.
     if base == Base::Fallback {
-        for (id, items) in groups {
+        for (id, _) in groups {
             follow_kept_shard(
-                run, source, scope_id, &mut scope, &path, id, &items, &damaged, index, stats,
+                run, source, scope_id, &mut scope, &path, id, &damaged, index, stats,
             );
         }
     }
@@ -1744,6 +1736,22 @@ fn process_scope(
     if base == Base::Current && keep_previous(&path).is_err() {
         stats.scopes_failed += 1;
         return None;
+    }
+    // Save exceptional pin decisions in the same transaction as totals.
+    // Apply successful read updates first, so discharged debt is removed.
+    scope.recovery_pins = index
+        .files
+        .iter()
+        .filter(|(_, pin)| pin.scope.as_deref() == Some(scope_id))
+        .filter(|(_, pin)| pin.quarantined || pin.repair_to.is_some())
+        .map(|(key, pin)| (key.clone(), pin.clone()))
+        .collect();
+    for (key, pin) in &updates {
+        if pin.quarantined || pin.repair_to.is_some() {
+            scope.recovery_pins.insert(key.clone(), pin.clone());
+        } else {
+            scope.recovery_pins.remove(key);
+        }
     }
     match save_scope(&path, source, &scope) {
         Ok(bytes) => {
@@ -1786,6 +1794,19 @@ fn follow_kept(pin: &mut Pin, kept: Option<&Checkpoint>) {
     (pin.head, pin.tail) = kept.map_or_else(Default::default, |kept| (kept.head, kept.tail));
 }
 
+/// Roll back every active pin of a shard, including temporarily absent files.
+fn follow_kept_pins(index: &mut Index, scope_id: &str, id: u16, scope: &Scope) {
+    for (key, pin) in &mut index.files {
+        if pin.scope.as_deref() == Some(scope_id)
+            && shard_id(key) == id
+            && !pin.done
+            && !pin.quarantined
+        {
+            follow_kept(pin, scope.files.get(key));
+        }
+    }
+}
+
 /// `follow_kept` for the files of a shard a cut fallback did not process.
 #[allow(clippy::too_many_arguments)]
 fn follow_kept_shard(
@@ -1795,7 +1816,6 @@ fn follow_kept_shard(
     scope: &mut Scope,
     path: &Path,
     id: u16,
-    items: &[Work],
     damaged: &BTreeSet<u16>,
     index: &mut Index,
     stats: &mut SourceStats,
@@ -1815,11 +1835,7 @@ fn follow_kept_shard(
         );
         return;
     }
-    for item in items {
-        if let Some(pin) = index.files.get_mut(&item.key) {
-            follow_kept(pin, scope.files.get(&item.key));
-        }
-    }
+    follow_kept_pins(index, scope_id, id, scope);
     scope.files.clear();
 }
 
