@@ -1973,3 +1973,71 @@ fn a_pending_newer_body_unbinds_its_dominated_refusal() {
         }
     );
 }
+
+// --- In-place resend budget across the cache-head bootstrap stages ---
+
+fn short_shed() -> anyhow::Error {
+    anyhow::Error::new(UploadShed {
+        status: 503,
+        retry_after: Some(Duration::from_secs(1)),
+    })
+}
+
+/// An exact ACK for one bootstrap or delivery batch; under head CAS every
+/// settled entity carries its held-head etag.
+fn stage_ack(batch: Vec<SnapshotItem>, enforce_head_cas: bool) -> Result<SnapshotBatchResponse> {
+    let mut ack = response(&batch, 0);
+    if enforce_head_cas {
+        for reference in ack
+            .accepted_entities
+            .iter_mut()
+            .chain(&mut ack.unchanged_entities)
+        {
+            reference.head_etag = Some("e".repeat(64));
+        }
+    }
+    ack.validate_entity_ack_with_head_cas(&request(batch), enforce_head_cas)?;
+    Ok(ack)
+}
+
+/// One source page gets two in-place resends and 10 s of waiting in total,
+/// not per bootstrap stage: two short sheds on the ordinary probe spend the
+/// budget, so a shed on the CAS repeat stands and the bootstrap keeps its
+/// existing unsettled-probe error.
+#[test]
+#[serial_test::serial(client_report)]
+fn inplace_retry_budget_spans_both_bootstrap_stages() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let probes = items(2);
+    let mut ledger = progress();
+    let mut calls = Vec::new();
+    let (result, waits) = with_inplace_retry_test_clock(None, || {
+        bootstrap_cache_heads(
+            &probes,
+            "inplace-bootstrap-budget",
+            &mut ledger,
+            true,
+            |batch, enforce_head_cas| {
+                calls.push(enforce_head_cas);
+                let stage_attempt = calls.iter().filter(|cas| **cas == enforce_head_cas).count();
+                let shed_attempts = if enforce_head_cas { 1 } else { 2 };
+                if stage_attempt <= shed_attempts {
+                    return Err(short_shed());
+                }
+                stage_ack(batch, enforce_head_cas)
+            },
+            |_| Ok(()),
+        )
+    });
+    assert!(
+        result.is_err(),
+        "the CAS shed stands once the page budget is spent"
+    );
+    assert_eq!(calls, [false, false, false, true]);
+    assert_eq!(waits.len(), 2);
+    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
+    assert!(ledger.accepted_cache_heads.is_empty(), "no head is minted");
+}

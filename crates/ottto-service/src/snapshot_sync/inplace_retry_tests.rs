@@ -149,20 +149,54 @@ fn inplace_retry_resends_only_unsettled_bodies() {
     assert_eq!(driven.progress.accepted_fingerprints.len(), 75);
 }
 
-/// The 15 s fast-failure bound is inclusive.
+/// The 15 s fast-failure bound is strict, for a fast 500/502 and a short shed
+/// alike: one tick under it is resent, exactly 15 s or more is not.
 #[test]
 #[serial(client_report)]
-fn a_failure_at_the_fast_bound_is_still_retried_in_place() {
-    let driven = drive(
-        2,
-        Some(Duration::from_secs(15)),
-        |attempt, batch| match attempt {
-            0 => Err(shed(Some(1))),
-            _ => Ok(accepted_batch(batch.len())),
-        },
-    );
-    assert_eq!(driven.result.unwrap(), ResumableUploadResult::Completed);
-    assert_eq!(driven.posts.len(), 2);
+fn the_fast_failure_bound_is_strict() {
+    let bound = Duration::from_secs(15);
+    let tick = Duration::from_nanos(1);
+    for failure in ["500", "502", "shed"] {
+        for (failed_after, resent) in [
+            (bound - tick, true),
+            (bound, false),
+            (bound + tick, false),
+            (Duration::from_secs(16), false),
+        ] {
+            let driven = drive(2, Some(failed_after), |attempt, batch| match attempt {
+                0 => Err(match failure {
+                    "500" => batch_server_error(500),
+                    "502" => batch_server_error(502),
+                    _ => shed(Some(1)),
+                }),
+                _ => Ok(accepted_batch(batch.len())),
+            });
+            let case = format!("{failure} after {failed_after:?}");
+            if resent {
+                assert_eq!(
+                    driven.result.unwrap(),
+                    ResumableUploadResult::Completed,
+                    "{case}"
+                );
+                assert_eq!(driven.posts.len(), 2, "{case}");
+                assert_eq!(driven.waits.len(), 1, "{case}");
+            } else {
+                match failure {
+                    "shed" => assert_eq!(
+                        driven.result.unwrap(),
+                        ResumableUploadResult::Shed {
+                            retry_after: Some(Duration::from_secs(1))
+                        },
+                        "{case}"
+                    ),
+                    _ => assert!(driven.result.is_err(), "{case}"),
+                }
+                assert_eq!(driven.posts.len(), 1, "{case}");
+                assert!(driven.waits.is_empty(), "{case}");
+                assert!(driven.progress.accepted_fingerprints.is_empty(), "{case}");
+            }
+        }
+    }
 }
 
 /// T5: at most two resends and 10 s of waiting per upload call, across all of
@@ -440,6 +474,162 @@ fn account_switch_during_inplace_wait_aborts() {
     assert_eq!(driven.posts.len(), 2);
     assert_eq!(driven.waits.len(), 1);
     assert!(driven.progress.accepted_fingerprints.is_empty());
+}
+
+// --- Client to driver: a shed's backend code reaches the admission ---
+
+/// A loopback batch endpoint that answers every POST with the backend's
+/// error envelope: `status`, `Retry-After` and one fixed `code`.
+struct EnvelopeShedServer {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    posts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl EnvelopeShedServer {
+    fn new(status: u16, retry_after_seconds: u64, code: &'static str) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counted = posts.clone();
+        let reason = if status == 429 {
+            "Too Many Requests"
+        } else {
+            "Service Unavailable"
+        };
+        let body = serde_json::json!({
+            "error": "ServiceOverloadedError",
+            "detail": "Synthetic temporary deferral",
+            "request_id": "synthetic-envelope-request",
+            "code": code,
+        })
+        .to_string();
+        let worker = std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("synthetic envelope shed accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_complete_http_request(&mut stream);
+                assert!(http_request_complete(request.as_bytes()));
+                counted.fetch_add(1, Ordering::SeqCst);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nRetry-After: {retry_after_seconds}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        Self {
+            url,
+            stop,
+            worker: Some(worker),
+            posts,
+        }
+    }
+}
+
+impl Drop for EnvelopeShedServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = self.worker.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
+
+/// Drive the real batch loop whose every POST goes through the real
+/// `SnapshotApiClient` to a loopback endpoint that always sheds with `code`.
+/// Returns the driver's view and the POSTs the endpoint received.
+fn drive_through_client(
+    status: u16,
+    retry_after_seconds: u64,
+    code: &'static str,
+) -> (Driven, usize) {
+    let server = EnvelopeShedServer::new(status, retry_after_seconds, code);
+    let client = SnapshotApiClient::new(server.url.clone());
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "claude_code".into(),
+        machine_id: "otm_test".into(),
+        collector_version: None,
+        snapshots: Vec::new(),
+        upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let driven = drive(3, None, |_, _| {
+        client.upload_batch("synthetic-inplace-token", &request, false)
+    });
+    let received = server.posts.load(std::sync::atomic::Ordering::SeqCst);
+    (driven, received)
+}
+
+/// The identity deferral is recognized by its fixed body code and never
+/// resent in place, whatever Retry-After accompanies it: it keeps today's
+/// single-POST shed and its backoff.
+#[test]
+#[serial(client_report)]
+fn identity_shed_code_is_never_retried_in_place_through_the_client() {
+    for retry_after in [1, 5, 60] {
+        let (driven, received) =
+            drive_through_client(503, retry_after, "snapshot_original_identity_unavailable");
+        assert_eq!(
+            driven.result.unwrap(),
+            ResumableUploadResult::Shed {
+                retry_after: Some(Duration::from_secs(retry_after))
+            },
+            "identity Retry-After {retry_after}"
+        );
+        assert_eq!(received, 1, "identity Retry-After {retry_after}");
+        assert_eq!(driven.posts.len(), 1, "identity Retry-After {retry_after}");
+        assert!(
+            driven.waits.is_empty(),
+            "identity Retry-After {retry_after}"
+        );
+        assert!(driven.progress.accepted_fingerprints.is_empty());
+    }
+}
+
+/// Ordinary cursor and lock contention sheds carry their own codes with
+/// `Retry-After: 1`; they are still resent in place, up to the budget.
+#[test]
+#[serial(client_report)]
+fn cursor_and_lock_shed_codes_are_retried_in_place_through_the_client() {
+    for code in [
+        "cursor_allocation_timeout",
+        "accept_discovery_shared_lock_timeout",
+        "accepted_log_head_conflict",
+    ] {
+        let (driven, received) = drive_through_client(503, 1, code);
+        assert_eq!(
+            driven.result.unwrap(),
+            ResumableUploadResult::Shed {
+                retry_after: Some(Duration::from_secs(1))
+            },
+            "{code}: the shed stands once the budget is spent"
+        );
+        assert_eq!(received, 3, "{code}: one POST and two resends");
+        assert_eq!(driven.posts.len(), 3, "{code}");
+        assert_eq!(driven.waits.len(), 2, "{code}");
+        for wait in &driven.waits {
+            assert!(
+                (Duration::from_secs(1)..=Duration::from_millis(1_200)).contains(wait),
+                "{code}: waited {wait:?}"
+            );
+        }
+    }
 }
 
 // --- T4: one real Claude prepare/finish cycle against a loopback backend ---
