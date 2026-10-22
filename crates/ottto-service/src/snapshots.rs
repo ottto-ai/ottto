@@ -5675,6 +5675,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             index
                 .claude_usage_family_witnesses
                 .insert(root_session_id.clone(), family.witness.clone());
+            index.rebind_retry_pending_claude_authority(root_session_id);
         }
     } else if census_complete {
         // Report availability is not evidence that a previously proven
@@ -6206,20 +6207,20 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .claude_usage_authority_quarantine
             .get(root_session_id)
             .is_some_and(|record| record.proof_correction.is_some());
-        let corrected_witness = correction_failed
-            .then(|| {
-                index
-                    .claude_usage_family_witnesses
-                    .get(root_session_id)
-                    .map(claude_usage_family_witness_fingerprint)
-            })
-            .flatten();
-        let Some(proven_witness_fingerprint) = corrected_witness
-            .as_ref()
-            .or_else(|| witness_fingerprints_before.get(root_session_id))
-        else {
+        let current_witness = index.claude_usage_family_witnesses.get(root_session_id);
+        let proven_witness_fingerprint = current_witness
+            .map(claude_usage_family_witness_fingerprint)
+            .or_else(|| witness_fingerprints_before.get(root_session_id).cloned());
+        let Some(proven_witness_fingerprint) = proven_witness_fingerprint.as_ref() else {
             continue;
         };
+        // SOURCE U3: a prior digest cannot bind a new record after census
+        // pruning. Count it and keep the page's demotion hold; the family
+        // stays unproven residue. Save and load drop any existing orphan.
+        if current_witness.is_none() {
+            count_claude_authority_unwitnessed_demotion();
+            continue;
+        }
         let mut member_source_file_fingerprints = index
             .files
             .iter()
@@ -30876,24 +30877,10 @@ impl ScanIndex {
                     && index
                         .quarantined_snapshot_fingerprints
                         .values()
-                        .all(snapshot_quarantine_deadline_is_bounded)
-                    && index
-                        .claude_usage_authority_quarantine
-                        .values()
-                        .all(claude_usage_authority_deadline_is_bounded)
-                    && index.claude_usage_authority_quarantine.iter().all(
-                        |(root_session_id, quarantine)| {
-                            index
-                                .claude_usage_family_witnesses
-                                .get(root_session_id)
-                                .is_some_and(|witness| {
-                                    claude_usage_family_witness_fingerprint(witness)
-                                        == quarantine.proven_witness_fingerprint
-                                })
-                        },
-                    ) =>
+                        .all(snapshot_quarantine_deadline_is_bounded) =>
             {
                 if index.canonicalize_codex_identity_keys() {
+                    index.drop_unbound_claude_authority_records("load");
                     Ok(index)
                 } else {
                     quarantine_invalid_scan_index(path)
@@ -30919,6 +30906,8 @@ impl ScanIndex {
         self.save_internal(path, Some(cap))
     }
     fn save_internal(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
+        // Fails closed for the one record, in debug and release; never the save.
+        self.drop_unbound_claude_authority_records("save");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
