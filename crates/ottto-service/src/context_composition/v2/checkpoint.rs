@@ -4,13 +4,13 @@
 //! A checkpoint is keyed by the transcript copy key (the session-named file
 //! name) and remembers the file's identity (device, inode), the offset of the
 //! first unread byte, fingerprints of the bytes before it, and the parse
-//! state at that offset. Checkpoints live in their scope's state file, so a
-//! scope's totals and its files' offsets always commit together.
+//! state at that offset. Immutable checkpoint shards and totals commit
+//! together through the scope manifest written last.
 //!
-//! Pins (`index-<agent>.json`) map every transcript seen to its scope and
-//! where reading starts. They are written before a scope commits, so a crash
-//! never lets one file count in two scopes; the scope state stays the truth
-//! for offsets.
+//! Pins (`index-<agent>.json`, compressed) map transcripts to their scope and
+//! starting offset. They are written once at the end of a run. Committed
+//! manifests recover missing or stale pins after a crash; checkpoint shards
+//! remain the authority for offsets.
 
 use super::aggregate::{stable_hash, Day, Slot, StoredContribution};
 use super::scope::ScopeInfo;

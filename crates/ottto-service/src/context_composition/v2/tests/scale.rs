@@ -21,7 +21,7 @@
 //!   appended to sessions still going, and one Codex rollout of about
 //!   700 MiB.
 //! - `daily`: the daily run over that day, with uploads. The first daily
-//!   run makes the build's idle files cold; the second shows a steady day.
+//!   run compacts idle files in changed shards; the second shows a steady day.
 //! - `load`: the memory each scope's state takes once loaded.
 
 use super::super::harvest::thread_cpu_micros;
