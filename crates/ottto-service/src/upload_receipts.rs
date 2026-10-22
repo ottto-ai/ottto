@@ -1130,6 +1130,7 @@ mod tests {
                 body_witness_digest: None,
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),
