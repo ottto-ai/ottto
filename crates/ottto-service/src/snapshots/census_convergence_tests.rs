@@ -578,6 +578,77 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
     let _ = fs::remove_dir_all(root);
 }
 
+// SI P3 (path-(a) bridge): authority debt no longer marks the sweep, so the
+// unchanged-proof skip may run while a family is held. A root that still
+// carries a RetryPending record bound to its witness is never an
+// unchanged-proof root; the same family without the record is one.
+#[test]
+fn retry_pending_root_is_never_an_unchanged_proof_root() {
+    let root = "root-session".to_string();
+    let mut held = ScanIndex::default();
+    bind_authority_quarantine(
+        &mut held,
+        &root,
+        &root,
+        &hex64('a'),
+        ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+    );
+    held.claude_usage_family_pending.insert(
+        root.clone(),
+        ClaudeUsageFamilyPending {
+            census_window_end: WINDOW.to_string(),
+            member_request_id_hashes: BTreeMap::from([(
+                root.clone(),
+                BTreeSet::from([hex64('c')]),
+            )]),
+            member_occurrences: BTreeMap::new(),
+            invalid: false,
+        },
+    );
+    let witness = held.claude_usage_family_witnesses[&root].clone();
+    let before = BTreeMap::from([(
+        root.clone(),
+        claude_usage_family_witness_fingerprint(&witness),
+    )]);
+    let proven = BTreeMap::from([(
+        root.clone(),
+        ProvenClaudeUsageFamily {
+            witness,
+            rows_by_member: BTreeMap::new(),
+        },
+    )]);
+    let complete = BTreeMap::from([(root.clone(), BTreeSet::from([root.clone()]))]);
+    let no_owners = BTreeSet::new();
+    let no_hashes = BTreeSet::new();
+    let unchanged = |index: &ScanIndex| {
+        claude_unchanged_proof_roots(
+            index,
+            &proven,
+            &complete,
+            &before,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            WINDOW,
+            &BTreeSet::new(),
+            (&no_owners, &no_hashes, &no_hashes),
+            None,
+        )
+        .map(|roots| roots.get(root.as_str()).copied())
+    };
+    let mut control = held.clone();
+    control.claude_usage_authority_quarantine.remove(&root);
+    let Some(control_root) = unchanged(&control) else {
+        // The scratch budget is not admitted on this layout.
+        return;
+    };
+    assert_eq!(control_root, Some(true), "control: an unchanged proof root");
+    assert_eq!(
+        unchanged(&held),
+        Some(Some(false)),
+        "the held root is excluded"
+    );
+}
+
 // A held key keeps its committed revision, its activity and accepted
 // ledger, and reparse debt; every other key commits as scanned. A held key
 // with no committed revision in a family with retained authority evidence is
