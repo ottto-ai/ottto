@@ -567,29 +567,7 @@ impl LocalDaemon {
 
     /// Allocation-free account identity fence for suspended snapshot scans.
     pub(crate) fn snapshot_scan_account_witness(&self) -> Result<[u8; 32], LocalApiError> {
-        use sha2::{Digest, Sha256};
-        let state = self.state()?;
-        let mut digest = Sha256::new();
-        digest.update(b"ottto:snapshot-scan-account:v1\0");
-        digest.update(match state.account.state {
-            ottto_protocol::LocalAccountState::NotConnected => b"not_connected".as_slice(),
-            ottto_protocol::LocalAccountState::ClaimPending => b"claim_pending".as_slice(),
-            ottto_protocol::LocalAccountState::ReattachRequired => b"reattach_required".as_slice(),
-            ottto_protocol::LocalAccountState::Connected => b"connected".as_slice(),
-            ottto_protocol::LocalAccountState::ResetRequired => b"reset_required".as_slice(),
-            ottto_protocol::LocalAccountState::Error => b"error".as_slice(),
-        });
-        for value in [
-            state.account.user.as_ref().map(|u| u.id.as_str()),
-            state.account.organization.as_ref().map(|o| o.id.as_str()),
-            state.account.connected_at.as_deref(),
-        ] {
-            digest.update([0]);
-            if let Some(value) = value {
-                digest.update(value.as_bytes());
-            }
-        }
-        Ok(digest.finalize().into())
+        Ok(snapshot_account_witness(&self.state()?.account))
     }
 
     pub fn account_for_trusted_client(&self) -> Result<LocalAccountBinding, LocalApiError> {
@@ -2192,6 +2170,19 @@ pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
 /// Project canonical health from daemon state, where `started_at` is the
 /// process start instant recorded once at construction.
 pub fn refresh_canonical_local_health_with_started_at(status: &mut DaemonStatus, started_at: &str) {
+    let money = snapshot_sync::request_money_menu_status(snapshot_account_witness(&status.account));
+    for source in &mut status.sources {
+        if source.source == SourceKind::ClaudeCode {
+            if let Some(collector) = &mut source.collector {
+                collector.held_for_review_count = money.as_ref().map(|money| money.held);
+                collector.not_applied_after_review_count =
+                    money.as_ref().map(|money| money.refused);
+                collector.adoption_state = money.as_ref().map(|money| money.adoption.clone());
+                collector.protected_list_state =
+                    money.as_ref().map(|money| money.protected.clone());
+            }
+        }
+    }
     let observed_at = status.generated_at.clone();
     let projection_revision = next_status_projection_revision(status);
     let runtime_event = LocalHealthEventV1 {
@@ -9129,6 +9120,10 @@ mod tests {
             upsert_agent_status_snapshot(&mut state, snapshot);
             let health = state.sources.first_mut().expect("source health");
             health.collector = Some(ottto_protocol::LocalCollectorHealth {
+                held_for_review_count: None,
+                not_applied_after_review_count: None,
+                adoption_state: None,
+                protected_list_state: None,
                 state: ottto_protocol::LocalCollectorState::Warm,
                 last_scan_started_at: Some("2026-05-05T10:19:00Z".to_string()),
                 last_scan_finished_at: Some("2026-05-05T10:19:30Z".to_string()),
@@ -9427,3 +9422,34 @@ mod owned_heap;
 #[cfg(test)]
 mod retry_allocation_probe;
 mod retry_retention_bound;
+
+/// Finish queued request-money writes before an orderly service exit.
+pub fn flush_request_money_on_shutdown() {
+    snapshots::claude_request_money::flush_on_shutdown();
+}
+
+/// Shared pure account fence for scan custody and status projection.
+pub(crate) fn snapshot_account_witness(account: &LocalAccountBinding) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:snapshot-scan-account:v1\0");
+    digest.update(match account.state {
+        ottto_protocol::LocalAccountState::NotConnected => b"not_connected".as_slice(),
+        ottto_protocol::LocalAccountState::ClaimPending => b"claim_pending".as_slice(),
+        ottto_protocol::LocalAccountState::ReattachRequired => b"reattach_required".as_slice(),
+        ottto_protocol::LocalAccountState::Connected => b"connected".as_slice(),
+        ottto_protocol::LocalAccountState::ResetRequired => b"reset_required".as_slice(),
+        ottto_protocol::LocalAccountState::Error => b"error".as_slice(),
+    });
+    for value in [
+        account.user.as_ref().map(|u| u.id.as_str()),
+        account.organization.as_ref().map(|o| o.id.as_str()),
+        account.connected_at.as_deref(),
+    ] {
+        digest.update([0]);
+        if let Some(value) = value {
+            digest.update(value.as_bytes());
+        }
+    }
+    digest.finalize().into()
+}

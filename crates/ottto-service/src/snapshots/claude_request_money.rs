@@ -1,13 +1,14 @@
 //! P1 per-request Claude Code money, shadow only (`claude_request_counting:v1`).
 //!
-//! The live path is unchanged: nothing here changes an upload byte, a hold,
+//! With the live revision disabled, nothing here changes an upload byte, a hold,
 //! an account decision, a live allowance or a return value. The live
 //! finalizer runs exactly as before unless the shadow is armed; then a side
 //! capture (its own funded budget, never on `SnapshotItem` or any live
 //! reservation) records which live bucket row each response went to, its
 //! message identity and the responses the occurrence map does not keep.
 //!
-//! The shadow reads the scan index and never writes it. Its ledger (the
+//! The shadow reads the scan index. Live revision 3 alone records optional
+//! bounded local selection custody; malformed records cannot erase the index. Its ledger (the
 //! telemetry facts, message-only ids, sweeps and family memos) is its own
 //! store (`store`), one in-memory copy per support directory: the index's
 //! bytes, live allowances, save and validation are the same armed or not.
@@ -26,8 +27,8 @@
 //! the exit criterion. The reader keeps each family's latest rows by
 //! `snapshot` (page sequence); nothing is deduplicated on the writer side. A
 //! page whose batch is dropped or not written owes a false coverage row to
-//! its day (a marker file keeps the debt across a restart), written with the
-//! next batch. All of its memory is admitted before allocation against the
+//! its day. Writer intents persist publication debt; after restart, retained
+//! days with existing rows are conservatively re-sealed before new publication. All of its memory is admitted before allocation against the
 //! shadow's own ceiling and its work runs under a deadline; a refusal skips
 //! the page's shadow, writes a false coverage row and is counted.
 //!
@@ -40,6 +41,14 @@
 
 pub(crate) mod body;
 pub(crate) mod capture;
+mod emit;
+mod selection;
+pub(in crate::snapshots) use selection::select_union_candidates;
+pub(crate) use selection::{
+    bind_union_checkpoints, decode_selections, finalize_synthetic, logical_family_member,
+    record_logical_member, selected_money_files, stage_selection_fingerprints,
+    synthetic_fingerprints, union_items_by_source, union_reparse, MoneyFileSelection,
+};
 pub(crate) mod facts;
 pub(crate) mod rows;
 pub(crate) mod store;
@@ -47,14 +56,14 @@ pub(crate) mod store;
 use super::claude_request_census::{
     claude_request_hash, family_key, fingerprint_matches, message_key, telemetry_key,
     ClaudeFamilyMemo, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord, FAMILY_KEY_PREFIX,
-    MESSAGE_KEY_PREFIX,
+    MESSAGE_KEY_PREFIX, TELEMETRY_KEY_PREFIX,
 };
 use super::claude_request_ledger::{
     self, ClaudeClassifyContext, ClaudeCountedBy, ClaudeLedgerScope, ClaudeUndecidedBy,
 };
 use super::{
     claude_index_path_family_member, claude_snapshot_family_root_ref,
-    claude_trace_owner_session_id, ScanIndex, SnapshotItem, UsageTotals,
+    claude_trace_owner_session_id, ScanIndex, SnapshotItem, SnapshotProvenance, UsageTotals,
 };
 use crate::claude_local_otel::telemetry_tail::{
     drop_certificate, tail_fixed_memory, telemetry_certified, telemetry_complete_through,
@@ -77,6 +86,44 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use store::{ClaudeLedger, ClaudeLedgerAcquire, PendingMemo, WriteJob};
+
+/// Activation is a separate reviewed change after backend enforcement and parity.
+pub(crate) const REQUEST_OWNED_LIVE_ENABLED: bool = false;
+pub(crate) const UNPRICED_UNATTRIBUTED_ALLOWED: bool = false;
+pub(crate) const REQUEST_OWNED_CONTRACT: &str = "claude_request_owned_usage:v1";
+const LIVE_OFF_FILE: &str = "claude-request-owned-live.off";
+/// The existing bounded debt codec keeps first-held time and a durable release
+/// bit. A release remains until a current rebuild; a new cycle cannot re-hold it.
+pub(crate) const UNBUILT_RELEASED: u64 = 1_u64 << 63;
+/// Keep at most the saved predecessor and current proposal per physical file.
+/// Outstanding contexts share one support ledger; this aggregate ceiling leaves
+/// most slots for evidence, watches and debt rather than historical offers.
+pub(crate) const MAX_MONEY_OFFERS_PER_FILE: usize = 2;
+pub(crate) const MAX_MONEY_OFFERS_PER_CONTEXT: usize = 16_384;
+
+pub(crate) fn request_owned_live(support_dir: &Path) -> bool {
+    #[cfg(test)]
+    let enabled = REQUEST_OWNED_LIVE_ENABLED
+        || LIVE_TEST_DIRS
+            .lock()
+            .expect("live test control")
+            .iter()
+            .any(|path| path == support_dir);
+    #[cfg(not(test))]
+    let enabled = REQUEST_OWNED_LIVE_ENABLED;
+    enabled
+        && !SHADOW_PANICKED.load(Ordering::Acquire)
+        && !support_dir.join(LIVE_OFF_FILE).exists()
+        && !support_dir.join(SHADOW_OFF_FILE).exists()
+}
+#[cfg(test)]
+static LIVE_TEST_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Flush already queued ledger/output work on an orderly service exit.
+/// Abrupt exits still rely on the persisted checkpoints; no signal handler does I/O.
+pub fn flush_on_shutdown() {
+    store::flush();
+}
 
 pub(crate) const CLAUDE_REQUEST_COUNTING: &str = "claude_request_counting:v1";
 /// Row format of the JSONL (B1 reader `claude_money_shadow_report.py`).
@@ -491,10 +538,14 @@ fn shadow_off(support_dir: &Path, now: u64) -> bool {
 fn publish_off(support_dir: &Path, now: u64) {
     let Some(reservation) = ShadowReservation::admit(1024) else {
         owe_coverage(support_dir, now, false);
+        if let Ok(mut off) = SHADOW_OFF.lock() {
+            off.remove(&shadow_scope(support_dir));
+        }
         return;
     };
     let job = WriteJob {
         support_dir: support_dir.to_path_buf(),
+        pending_intent: None,
         jsonl: JsonlBatch {
             now,
             families: Vec::new(),
@@ -519,6 +570,9 @@ fn publish_off(support_dir: &Path, now: u64) {
     };
     if store::submit_unledgered(job).is_err() {
         owe_coverage(support_dir, now, false);
+        if let Ok(mut off) = SHADOW_OFF.lock() {
+            off.remove(&shadow_scope(support_dir));
+        }
     }
 }
 
@@ -758,6 +812,8 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     /// only): an unbuilt file of the unit's group born before its holder,
     /// or of unknown birth.
     pub(crate) undecided_unbuilt_older: u64,
+    /// Blocking files released at the 24h / completed-census-cycle bound.
+    pub(crate) unbuilt_older_released: u64,
     /// Time under the sync lock, every phase included but this line's write.
     pub(crate) elapsed_us: u64,
 }
@@ -775,6 +831,7 @@ impl ClaudeRequestMoneyShadowCounts {
             ClaudeUndecidedBy::TraceUnavailable => &mut self.undecided_trace_unavailable,
             ClaudeUndecidedBy::StaleHolder => &mut self.undecided_stale_holder,
             ClaudeUndecidedBy::Births => &mut self.undecided_births,
+            ClaudeUndecidedBy::UnbuiltOlder => return,
         };
         *slot += 1;
     }
@@ -1006,6 +1063,7 @@ fn undecided_wire(reason: ClaudeUndecidedBy) -> &'static str {
         ClaudeUndecidedBy::TraceUnavailable => "trace_unavailable",
         ClaudeUndecidedBy::StaleHolder => "stale_holder",
         ClaudeUndecidedBy::Births => "births",
+        ClaudeUndecidedBy::UnbuiltOlder => "unbuilt_older",
     }
 }
 
@@ -1132,7 +1190,7 @@ fn family_members(
         if Instant::now() >= deadline {
             return None;
         }
-        let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
+        let Some((root, member)) = logical_family_member(index, key) else {
             continue;
         };
         if !roots.contains(root.as_str()) || index.confirmed_empty_files.contains(key) {
@@ -1171,6 +1229,36 @@ pub(crate) fn shadow_page_at(
     trace_report: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
     now: u64,
+) -> ClaudeRequestMoneyShadowCounts {
+    build_page_at(
+        support_dir,
+        snapshots,
+        index,
+        api_report,
+        trace_report,
+        census_complete,
+        now,
+        &mut PageBodies::default(),
+    )
+}
+
+#[derive(Default)]
+struct PageBodies {
+    entities: BTreeMap<String, body::ClaudeEntityBody>,
+    births: BTreeMap<String, Option<u64>>,
+    _reservation: Option<ShadowBudget>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_page_at(
+    support_dir: &Path,
+    snapshots: &[SnapshotItem],
+    index: &ScanIndex,
+    api_report: &ClaudeLocalOtelLoadReport,
+    trace_report: &ClaudeTraceOwnershipLoadReport,
+    census_complete: bool,
+    now: u64,
+    output: &mut PageBodies,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
     let deadline = started + PAGE_MAX_ELAPSED;
@@ -1217,7 +1305,7 @@ pub(crate) fn shadow_page_at(
     // Census records of members the index no longer lists: the scope walks
     // them too.
     let (mut residue_records, mut residue_key_bytes) = (0_usize, 0_usize);
-    for (key, _) in index.claude_request_census.records() {
+    for key in index.claude_request_census.retained_file_keys() {
         if Instant::now() >= deadline {
             counts.refused_deadline = 1;
             purge_captures(&scope_key, &mut counts);
@@ -1228,8 +1316,58 @@ pub(crate) fn shadow_page_at(
             residue_key_bytes = residue_key_bytes.saturating_add(key.len());
         }
     }
+    let mut full_body_bytes = 0_usize;
+    for item in snapshots {
+        if Instant::now() >= deadline {
+            counts.refused_deadline = 1;
+            return refuse(&end, None, index, roots.len(), counts);
+        }
+        let key_bytes = item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| {
+                bucket.model_usage.iter().map(move |row| {
+                    serialized_len(row).saturating_add(bucket.bucket_start.len() as u64)
+                })
+            })
+            .max()
+            .unwrap_or(0) as usize;
+        full_body_bytes = full_body_bytes.saturating_add(
+            item.claude_usage_occurrences
+                .len()
+                .saturating_mul(key_bytes.saturating_add(1024).saturating_mul(8)),
+        );
+    }
+    let variable_evidence_bytes = roots.iter().fold(0_usize, |bytes, root| {
+        let api = api_report
+            .evidence
+            .get(*root)
+            .into_iter()
+            .flatten()
+            .fold(0_usize, |bytes, row| {
+                bytes.saturating_add(serialized_len(row) as usize)
+            });
+        let trace = trace_report
+            .evidence
+            .get(*root)
+            .into_iter()
+            .flatten()
+            .fold(0_usize, |bytes, row| {
+                bytes.saturating_add(serialized_len(row) as usize)
+            });
+        bytes.saturating_add(api.saturating_add(trace).saturating_mul(4))
+    });
     let admission = occurrences
         .saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES)
+        .saturating_add(full_body_bytes)
+        .saturating_add(
+            snapshots
+                .iter()
+                .flat_map(|item| &item.claude_usage_request_ids)
+                .map(|id| id.len().saturating_add(128).saturating_mul(4))
+                .sum::<usize>(),
+        )
+        .saturating_add(variable_evidence_bytes)
         .saturating_add(row_charge(live_rows))
         .saturating_add(trace_rows.saturating_mul(TRACE_ROW_BYTES))
         .saturating_add(bucket_rows.saturating_mul(LIVE_ROW_BYTES))
@@ -1238,8 +1376,8 @@ pub(crate) fn shadow_page_at(
             key_bytes.saturating_add(residue_key_bytes),
         ))
         .saturating_add(roots.len().saturating_mul(FAMILY_BYTES))
-        .saturating_add(index.files.len().saturating_mul(64))
-        .saturating_add(key_bytes)
+        .saturating_add(index.files.len().saturating_mul(1536))
+        .saturating_add(key_bytes.saturating_mul(4))
         .saturating_add(snapshots.len().saturating_mul(64))
         .saturating_add(tail_fixed_memory(&tail_budget));
     counts.admission_bytes = admission as u64;
@@ -1277,9 +1415,24 @@ pub(crate) fn shadow_page_at(
     let key_of = |root: &str, member: &str| {
         member_keys
             .get(&(root.to_owned(), member.to_owned()))
-            .filter(|keys| keys.len() == 1)
-            .map(|keys| keys[0].clone())
+            .and_then(|keys| {
+                keys.iter()
+                    .min_by_key(|key| selection::primary_order(index, key))
+                    .cloned()
+            })
     };
+    // Reuse the already bounded family lookup. Emission never scans the
+    // complete index once per item, and a multi-file member has unknown birth.
+    for item in snapshots {
+        let birth = key_of(
+            claude_snapshot_family_root_ref(item),
+            &item.source_session_id,
+        )
+        .and_then(|key| index.claude_request_census.get(&key))
+        .and_then(ClaudeRequestCensusRecord::birth)
+        .map(|birth| birth.unix_seconds);
+        output.births.insert(item.source_session_id.clone(), birth);
+    }
     // The items of each root, grouped once.
     let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
     for item in snapshots {
@@ -1292,26 +1445,23 @@ pub(crate) fn shadow_page_at(
     // Take this page's captures (funded by the capture budget, freed
     // whatever the page decides) and record each parse's message-only ids.
     let mut captures = BTreeMap::<(String, String), ClaudeResponseCapture>::new();
+    let by_fingerprint = index
+        .files
+        .iter()
+        .map(|(key, entry)| (entry.source_file_fingerprint.as_str(), key.as_str()))
+        .collect::<BTreeMap<_, _>>();
     for item in snapshots {
         let root = claude_snapshot_family_root_ref(item);
-        let Some(key) = key_of(root, &item.source_session_id) else {
+        let Some(fingerprint) = item.source_file_fingerprint.as_deref() else {
             continue;
         };
-        let fingerprints = [
-            item.source_file_fingerprint.as_deref(),
-            index
-                .files
-                .get(&key)
-                .map(|entry| entry.source_file_fingerprint.as_str()),
-        ];
-        let taken = fingerprints.iter().flatten().find_map(|fingerprint| {
-            capture::take_capture(&scope_key, &key, fingerprint)
-                .map(|capture| (*fingerprint, capture))
-        });
-        if let Some((fingerprint, capture)) = taken {
+        let Some(key) = by_fingerprint.get(fingerprint).copied() else {
+            continue;
+        };
+        if let Some(capture) = capture::take_capture(&scope_key, key, fingerprint) {
             counts.captures_taken += 1;
-            note_message_record(ledger, index, &key, fingerprint, &capture, &mut counts);
-            captures.insert((root.to_owned(), item.source_session_id.clone()), capture);
+            note_message_record(ledger, index, key, fingerprint, &capture, &mut counts);
+            captures.insert((root.to_owned(), fingerprint.to_owned()), capture);
         }
     }
     if let Ok(mut last) = LAST_SHADOW.lock() {
@@ -1324,7 +1474,14 @@ pub(crate) fn shadow_page_at(
         .values()
         .map(|capture| capture.units().len())
         .sum::<usize>();
-    if !budget.charge(captured_units.saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES)) {
+    let captured_bytes = captures.values().fold(0_usize, |bytes, capture| {
+        bytes.saturating_add(capture.body_allocation_bound())
+    });
+    if !budget.charge(
+        captured_bytes.saturating_add(
+            captured_units.saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES),
+        ),
+    ) {
         counts.refused_budget = 1;
         return refuse(&end, Some(ledger), index, roots.len(), counts);
     }
@@ -1342,6 +1499,18 @@ pub(crate) fn shadow_page_at(
     let dropped = end.tail.certificate_dropped;
     end.tail = tail;
     end.tail.certificate_dropped += dropped;
+    if request_owned_live(support_dir) {
+        let mut updates = MoneyWatchUpdates::new();
+        let complete = schedule_evidence(ledger, index, now, deadline, &mut budget, &mut updates);
+        // Even a partial bootstrap may publish completed invalidations, but
+        // its watches cannot advance until that debt is durably on disk.
+        let durable = checkpoint_money_watches_at(support_dir, ledger, updates, deadline);
+        if !complete || !durable {
+            counts.refused_deadline = u64::from(Instant::now() >= deadline);
+            counts.refused_budget = u64::from(counts.refused_deadline == 0);
+            return refuse(&end, Some(ledger), index, roots.len(), counts);
+        }
+    }
     counts.telemetry_retired_pressure =
         claude_request_ledger::retire_telemetry_under_pressure(ledger);
     if counts.telemetry_retired_pressure > 0 {
@@ -1396,6 +1565,24 @@ pub(crate) fn shadow_page_at(
             },
         };
         root_rows.insert(root, rows);
+    }
+    let telemetry_body_bytes = root_rows
+        .values()
+        .flatten()
+        .flat_map(ClaudeRootRows::iter)
+        .fold(0_usize, |bytes, row| {
+            bytes.saturating_add(
+                row.model
+                    .len()
+                    .saturating_add(row.speed.len())
+                    .saturating_add(row.effort.len())
+                    .saturating_add(1024)
+                    .saturating_mul(8),
+            )
+        });
+    if !budget.charge(telemetry_body_bytes) {
+        counts.refused_budget = 1;
+        return refuse(&end, Some(ledger), index, roots.len(), counts);
     }
     for rows in root_rows.values().flatten() {
         end.rows.rows_conflicting += rows.conflicts;
@@ -1468,6 +1655,24 @@ pub(crate) fn shadow_page_at(
             }
         }
     }
+    if request_owned_live(support_dir) {
+        let mut updates = MoneyWatchUpdates::new();
+        let complete = schedule_trace(
+            ledger,
+            index,
+            &traces,
+            now,
+            deadline,
+            &mut budget,
+            &mut updates,
+        );
+        let durable = checkpoint_money_watches_at(support_dir, ledger, updates, deadline);
+        if !complete || !durable {
+            counts.refused_deadline = u64::from(Instant::now() >= deadline);
+            counts.refused_budget = u64::from(counts.refused_deadline == 0);
+            return refuse(&end, Some(ledger), index, roots.len(), counts);
+        }
+    }
     let mut page_hashes = first_id.keys().copied().collect::<Vec<_>>();
     page_hashes.extend(page_claims.keys().copied());
     for capture in captures.values() {
@@ -1486,6 +1691,15 @@ pub(crate) fn shadow_page_at(
     page_message_hashes.sort_unstable();
     page_message_hashes.dedup();
 
+    if request_owned_live(support_dir) {
+        let Some(released) =
+            update_unbuilt_lifecycle(index, ledger, &BTreeSet::new(), now, deadline)
+        else {
+            counts.refused_budget = 1;
+            return refuse(&end, Some(ledger), index, roots.len(), counts);
+        };
+        counts.unbuilt_older_released += released;
+    }
     let ledger_view: &ClaudeLedger = ledger;
     let holders = claude_request_ledger::scan_holders(
         &index.claude_request_census,
@@ -1525,6 +1739,44 @@ pub(crate) fn shadow_page_at(
         return refuse(&end, Some(ledger), index, roots.len(), counts);
     };
     let complete_through = telemetry_complete_through(ledger_view);
+    // One global representative map per page, not a full-index scan for each
+    // item/request. Ranks include aliases outside this page and aliases that
+    // do not themselves carry a particular request.
+    let mut primary_holders = BTreeMap::<(Option<&str>, String, String), &str>::new();
+    for key in index.files.keys() {
+        if Instant::now() >= deadline {
+            counts.refused_deadline = 1;
+            return refuse(&end, None, index, roots.len(), counts);
+        }
+        if let Some((root, member)) = logical_family_member(index, key) {
+            let primary = primary_holders
+                .entry((
+                    claude_request_ledger::claude_project_group(key),
+                    root,
+                    member,
+                ))
+                .or_insert(key);
+            if selection::primary_order(index, key) < selection::primary_order(index, primary) {
+                *primary = key;
+            }
+        }
+    }
+    for key in index.files.keys() {
+        if Instant::now() >= deadline {
+            counts.refused_deadline = 1;
+            return refuse(&end, None, index, roots.len(), counts);
+        }
+        if let Some((root, member)) = logical_family_member(index, key) {
+            if let Some(primary) = primary_holders.get(&(
+                claude_request_ledger::claude_project_group(key),
+                root,
+                member,
+            )) {
+                sessions.insert(key.clone(), (*primary).to_owned());
+            }
+        }
+    }
+    drop(primary_holders);
     let ctx = ClaudeClassifyContext {
         index,
         ledger: ledger_view.census(),
@@ -1559,13 +1811,18 @@ pub(crate) fn shadow_page_at(
             .collect();
         let empty = BTreeSet::new();
         let members = indexed_members.get(root).unwrap_or(&empty);
-        let total = members.len().max(items.len());
         let mut family_captures = BTreeMap::new();
         for item in items {
-            if let Some(capture) =
-                captures.remove(&(root.to_owned(), item.source_session_id.clone()))
-            {
-                family_captures.insert(item.source_session_id.as_str(), capture);
+            if let Some(capture) = captures.remove(&(
+                root.to_owned(),
+                item.source_file_fingerprint.clone().unwrap_or_default(),
+            )) {
+                family_captures.insert(
+                    item.source_file_fingerprint
+                        .as_deref()
+                        .unwrap_or(&item.source_session_id),
+                    capture,
+                );
             }
         }
         // Members not in this page: their census `u` (what the old path last
@@ -1575,6 +1832,13 @@ pub(crate) fn shadow_page_at(
             .iter()
             .map(|item| item.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
+        // Coverage counts logical members, while every physical capture is
+        // still required and certified by the union builder.
+        let total = members.len()
+            + present
+                .iter()
+                .filter(|member| !members.contains(**member))
+                .count();
         let mut absent_old = ClaudeMoneyTotals::default();
         let mut absent_old_unknown = 0_u64;
         for member in members {
@@ -1623,9 +1887,19 @@ pub(crate) fn shadow_page_at(
     }
     // The page's borrowed evidence ends here: the ledger changes below.
     counts.undecided_unbuilt_older = ctx.unbuilt_older.get();
+    let blocking_files = scope.blocking_files();
     end.scope = scope.debt;
     drop(holders);
     drop(scope);
+    if request_owned_live(support_dir) {
+        let Some(released) =
+            update_unbuilt_lifecycle(index, ledger, &blocking_files, now, deadline)
+        else {
+            counts.refused_budget = 1;
+            return refuse(&end, Some(ledger), index, roots.len(), counts);
+        };
+        counts.unbuilt_older_released += released;
+    }
     if late {
         counts.refused_deadline = 1;
         return refuse(&end, Some(ledger), index, roots.len(), counts);
@@ -1635,11 +1909,12 @@ pub(crate) fn shadow_page_at(
     // rows (the day's cap bounds them); the reader keeps each family's latest
     // by `snapshot`. The rows are serialized by the writer, outside the lock.
     let sweep_complete = telemetry_certified(ledger);
+    let mut built = BTreeMap::new();
     let mut families = Vec::with_capacity(bodies.len());
     let mut memos = Vec::with_capacity(bodies.len());
     let mut families_incomplete = 0_u64;
     let mut owned_bytes = 0_usize;
-    for (root, body, union, absent_old, absent_old_unknown) in bodies {
+    for (root, mut body, union, absent_old, absent_old_unknown) in bodies {
         let complete = body.coverage_complete(census_complete);
         tally(&mut counts, &body, complete);
         families_incomplete += u64::from(!complete);
@@ -1709,6 +1984,7 @@ pub(crate) fn shadow_page_at(
             absent_old: (&absent_old).into(),
             absent_old_unknown,
         };
+        built.append(&mut body.entities);
         let rows = FamilyRows {
             row,
             grains: body.grains,
@@ -1727,6 +2003,31 @@ pub(crate) fn shadow_page_at(
                     snapshot,
                 },
             });
+        }
+    }
+    if request_owned_live(support_dir) {
+        for (member, entity) in &built {
+            let key = member_keys.iter().find_map(|((_, id), keys)| {
+                (id == member)
+                    .then(|| {
+                        keys.iter()
+                            .min_by_key(|key| selection::primary_order(index, key))
+                    })
+                    .flatten()
+            });
+            if let (Some(key), Some(due)) = (key, entity.due_unix) {
+                let revision = ledger
+                    .get(&store::money_key("dirty:", key))
+                    .map(ClaudeRequestCensusRecord::money_revision)
+                    .unwrap_or_else(|| Sha256::digest(key.as_bytes()).into());
+                if !ledger.put_money(
+                    store::money_key("due:", key),
+                    ClaudeRequestCensusRecord::money_debt(revision, due),
+                ) {
+                    counts.refused_budget = 1;
+                    return refuse(&end, Some(ledger), index, roots.len(), counts);
+                }
+            }
         }
     }
     counts.family_memos_dropped = drop_old_family_memos(ledger, now);
@@ -1756,7 +2057,6 @@ pub(crate) fn shadow_page_at(
     let batch_bytes = owned_bytes.saturating_add(1024 + JSONL_WRITE_BUFFER_BYTES);
     let batch = ShadowReservation::admit(batch_bytes).filter(|_| !faulted(PageFault::BatchRefused));
     counts.admitted_peak_bytes = budget.granted().saturating_add(batch_bytes) as u64;
-    drop(budget);
     let Some(reservation) = batch else {
         // The rows cannot be handed over: a refused page (a false coverage
         // row, no memo moves), never a complete one without its rows.
@@ -1774,7 +2074,237 @@ pub(crate) fn shadow_page_at(
         &mut counts,
     );
     emit(&end, Some(&*ledger), index, &mut counts);
+    output.entities = built;
+    output._reservation = Some(budget);
     counts
+}
+
+/// Build once, publish the P1 comparison, then apply only certified members.
+/// Protected entities keep the existing body; failed builds become local holds.
+#[allow(clippy::too_many_arguments)] // Shared evidence and identity remain separately owned.
+pub(crate) fn live_page(
+    support_dir: &Path,
+    snapshots: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    census_complete: bool,
+    identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
+    groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
+) -> BTreeSet<String> {
+    let mut output = PageBodies::default();
+    guarded(|| {
+        build_page_at(
+            support_dir,
+            snapshots,
+            index,
+            api,
+            trace,
+            census_complete,
+            page_now(support_dir),
+            &mut output,
+        );
+    });
+    let mut held = BTreeSet::new();
+    let present = snapshots
+        .iter()
+        .filter_map(|item| item.source_file_fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    let page_members = snapshots
+        .iter()
+        .map(|item| item.source_session_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut custody = BTreeMap::<String, (BTreeSet<&str>, Option<String>)>::new();
+    for (key, entry) in &index.files {
+        let Some((root, member)) = logical_family_member(index, key) else {
+            continue;
+        };
+        if index.claude_reemission_exclusions.protected_root(&root) {
+            continue;
+        }
+        if !page_members.contains(member.as_str()) {
+            continue;
+        }
+        let (projects, _) = custody.entry(member.clone()).or_default();
+        if let Some(project) = claude_request_ledger::claude_project_group(key) {
+            projects.insert(project);
+        }
+        if !present.contains(entry.source_file_fingerprint.as_str()) {
+            held.insert(member);
+        }
+    }
+    for item in snapshots.iter() {
+        if index
+            .claude_reemission_exclusions
+            .protected_root(claude_snapshot_family_root_ref(item))
+        {
+            continue;
+        }
+        let account = serde_json::to_string(&(
+            item.session_account_evidence.as_ref().map(|evidence| {
+                (
+                    evidence.provider,
+                    evidence.account_identifier_hash.as_deref(),
+                    evidence.provider_workspace_hash.as_deref(),
+                    evidence.identity_hash_scheme,
+                )
+            }),
+            &item.workspace_hash,
+            &item.repository_hash,
+        ))
+        .unwrap_or_default();
+        let (projects, first) = custody.entry(item.source_session_id.clone()).or_default();
+        if projects.len() > 1 || first.as_ref().is_some_and(|prior| prior != &account) {
+            held.insert(item.source_session_id.clone());
+        }
+        first.get_or_insert(account);
+    }
+    let mut union_ids = BTreeMap::<String, BTreeSet<String>>::new();
+    for item in snapshots.iter() {
+        union_ids
+            .entry(item.source_session_id.clone())
+            .or_default()
+            .extend(item.claude_usage_request_ids.iter().cloned());
+    }
+    let mut activity = BTreeMap::<&str, Option<String>>::new();
+    for item in snapshots.iter() {
+        let last = activity.entry(&item.source_session_id).or_default();
+        for value in [&item.source_last_activity_at, &item.source_ended_at]
+            .into_iter()
+            .flatten()
+        {
+            if last
+                .as_ref()
+                .map_or(true, |prior| super::timestamp_is_after(value, prior))
+            {
+                *last = Some(value.clone());
+            }
+        }
+    }
+    let activity = activity
+        .into_iter()
+        .map(|(member, clock)| (member.to_owned(), clock))
+        .collect::<BTreeMap<_, _>>();
+    // Retain one carrier before emission/identity allocation: applying a full
+    // union once per physical copy would create quadratic transient memory.
+    let mut primaries = BTreeMap::<String, String>::new();
+    for key in index.files.keys() {
+        if let Some((_, member)) = logical_family_member(index, key) {
+            let replace = primaries.get(&member).map_or(true, |prior| {
+                selection::primary_order(index, key) < selection::primary_order(index, prior)
+            });
+            if replace {
+                primaries.insert(member, key.clone());
+            }
+        }
+    }
+    let mut retained = BTreeSet::new();
+    snapshots.retain(|item| {
+        if index
+            .claude_reemission_exclusions
+            .protected_root(claude_snapshot_family_root_ref(item))
+        {
+            return true;
+        }
+        let primary = primaries
+            .get(&item.source_session_id)
+            .and_then(|key| index.files.get(key));
+        let primary_present =
+            primary.is_some_and(|entry| present.contains(entry.source_file_fingerprint.as_str()));
+        let keep = !primary_present
+            || primary.is_some_and(|entry| {
+                item.source_file_fingerprint.as_deref() == Some(&entry.source_file_fingerprint)
+            });
+        keep && retained.insert(item.source_session_id.clone())
+    });
+    for item in snapshots.iter_mut() {
+        let member_id = item.source_session_id.clone();
+        let root = claude_snapshot_family_root_ref(item);
+        if index.claude_reemission_exclusions.protected_root(root) {
+            continue;
+        }
+        let birth = output.births.get(&member_id).copied().flatten();
+        if held.contains(&member_id)
+            || index.claude_reemission_exclusions.pauses_emission()
+            || index.claude_reemission_exclusions.holds_without_list(birth)
+            || !output
+                .entities
+                .get(&member_id)
+                .is_some_and(|entity| emit::apply(item, entity))
+        {
+            held.insert(item.source_session_id.clone());
+        } else if let Some(clock) = activity.get(&member_id).and_then(Option::as_ref) {
+            if item
+                .source_last_activity_at
+                .as_ref()
+                .map_or(true, |prior| super::timestamp_is_after(clock, prior))
+            {
+                item.source_last_activity_at = Some(clock.clone());
+            }
+            if item
+                .source_ended_at
+                .as_ref()
+                .map_or(true, |prior| super::timestamp_is_after(clock, prior))
+            {
+                item.source_ended_at = Some(clock.clone());
+            }
+        }
+        if !held.contains(&member_id) {
+            if let Some(ids) = union_ids.get(&member_id) {
+                item.claude_usage_request_ids = ids.clone();
+            }
+            if let (Some(evidence), Some(entity)) =
+                (identity, output.entities.get(&item.source_session_id))
+            {
+                if let Some(grouping) =
+                    super::claude_request_identity::request_owned_grouping(item, evidence, entity)
+                {
+                    groupings.insert(item.source_session_id.clone(), grouping);
+                }
+            }
+        }
+    }
+    held
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn live_page_for_test(
+    support: &Path,
+    snapshots: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    complete: bool,
+    identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
+    groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
+) -> BTreeSet<String> {
+    let original = snapshots.clone();
+    for _ in 0..24 {
+        let held = live_page(
+            support, snapshots, index, api, trace, complete, identity, groupings,
+        );
+        if !checkpoint_pending(support) {
+            return held;
+        }
+        store::flush();
+        *snapshots = original.clone();
+        for item in &original {
+            if let Some(fp) = item.source_file_fingerprint.as_deref() {
+                for (key, entry) in &index.files {
+                    if entry.source_file_fingerprint == fp {
+                        let _ = super::parse_claude_code_jsonl_file(
+                            Path::new(key),
+                            &item.collected_at,
+                            fp.to_owned(),
+                        )
+                        .expect("retry parses fresh evidence/capture");
+                    }
+                }
+            }
+        }
+    }
+    panic!("writer receipt did not converge")
 }
 
 /// A page whose shadow does not take its captures: they are dropped by the
@@ -1827,7 +2357,7 @@ fn refuse(
 }
 
 /// Hand the page's rows, its coverage row, its memos and the ledger's
-/// bounded save to the writer (after the page, outside the sync lock). A
+/// bounded save to the writer. All durable I/O runs on the writer. A
 /// dropped batch owes its day a false coverage row (Sol R3-6).
 fn hand_off(
     end: &PageEnd<'_>,
@@ -1862,6 +2392,7 @@ fn hand_off(
     counts.jsonl_queued = families.iter().map(FamilyRows::rows).sum::<u64>() + 1;
     let job = WriteJob {
         support_dir: end.support_dir.to_path_buf(),
+        pending_intent: None,
         jsonl: JsonlBatch {
             now: end.now,
             families,
@@ -2123,12 +2654,9 @@ fn day_stamp(unix: u64) -> Option<String> {
     ))
 }
 
-/// False coverage rows owed per support directory: day -> the earliest
-/// page that owes it (a dropped batch, or one whose rows were not written).
-/// A debt of a write that failed is also a marker file in the day's
-/// directory (Sol R3-6), so a restart keeps it: the writer reads the markers
-/// back with every batch. A dropped batch's debt is latched in memory only
-/// (no file I/O under the sync lock); the writer's next batch writes it.
+/// False coverage rows owed per support directory. The writer persists its
+/// intent before publication. On its first batch after restart it re-seals
+/// every retained day with existing rows, covering work lost before dequeue.
 static COVERAGE_OWED: Mutex<BTreeMap<PathBuf, BTreeMap<String, u64>>> = Mutex::new(BTreeMap::new());
 
 fn day_path(dir: &Path, day: &str) -> PathBuf {
@@ -2142,8 +2670,7 @@ fn owed_path(dir: &Path, day: &str) -> PathBuf {
 }
 
 /// The page at `observed_unix` did not reach its day's file: the next batch
-/// writes a false coverage row there. `durable` (the writer thread only)
-/// also writes the day's marker, a few bytes, once per owing day (a later
+/// writes a false coverage row there. `durable` also writes the day's marker, a few bytes, once per owing day (a later
 /// debt of the same day keeps it).
 fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
     let Some(day) = day_stamp(observed_unix) else {
@@ -2152,7 +2679,7 @@ fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
     let dir = support_dir.join("diagnostics");
     let marker = owed_path(&dir, &day);
     if durable && !marker.exists() && std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(&marker, observed_unix.to_string());
+        let _ = store::write_atomic(&marker, observed_unix.to_string().as_bytes());
     }
     if let Ok(mut owed) = COVERAGE_OWED.lock() {
         let slot = owed
@@ -2165,8 +2692,30 @@ fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
 }
 
 /// A false row of `day` is on disk: its debt is settled.
+fn read_marker_time(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(64)
+        .read_to_string(&mut text)
+        .ok()?;
+    text.parse().ok()
+}
+
 fn settle_owed(dir: &Path, day: &str) {
     let _ = std::fs::remove_file(owed_path(dir, day));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let prefix = format!(".{JSONL_PREFIX}{day}.");
+        let own = format!(".{}.", store::intent_run_id());
+        for entry in entries.take(JSONL_MAX_DIR_ENTRIES).flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".pending") && !name.contains(&own) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// The debts owed in `dir` (the process's and the markers on disk), taken.
@@ -2189,6 +2738,26 @@ fn take_owed_coverage(
         let Some(name) = name.to_str() else {
             continue;
         };
+        if let Some(day) = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_prefix(JSONL_PREFIX))
+            .and_then(|name| name.strip_suffix(".pending"))
+            .and_then(|name| name.split('.').next())
+            .filter(|day| day.len() == 8 && day.bytes().all(|b| b.is_ascii_digit()))
+        {
+            if oldest.is_some_and(|oldest| day < oldest) {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+            if !name.contains(&format!(".{}.", store::intent_run_id())) {
+                if let Some(observed) = read_marker_time(&entry.path()) {
+                    owed.entry(day.to_owned())
+                        .and_modify(|first| *first = (*first).min(observed))
+                        .or_insert(observed);
+                }
+            }
+            continue;
+        }
         let marker = name
             .strip_prefix('.')
             .and_then(|name| name.strip_prefix(JSONL_PREFIX))
@@ -2325,7 +2894,13 @@ impl DayFile {
 
     /// True when every row reached the file.
     fn finish(self) -> bool {
-        self.written && self.writer.is_some_and(|mut writer| writer.flush().is_ok())
+        self.written
+            && self.writer.is_some_and(|mut writer| {
+                writer
+                    .flush()
+                    .and_then(|()| writer.get_ref().sync_all())
+                    .is_ok()
+            })
     }
 }
 
@@ -2344,6 +2919,20 @@ fn serialized_len<T: Serialize>(value: &T) -> u64 {
     let mut count = Count(0);
     let _ = serde_json::to_writer(&mut count, value);
     count.0
+}
+
+/// Conservative crash recovery for queued/refused work that never reached
+/// the writer: every retained day containing earlier rows owes false coverage.
+/// Fixed day probes avoid an unbounded diagnostics-directory traversal.
+fn recover_queued_coverage(support: &Path, now: u64) {
+    for days in 0..JSONL_RETENTION_DAYS {
+        let observed = now.saturating_sub(days as u64 * 86400);
+        if let Some(day) = day_stamp(observed) {
+            if day_path(&support.join("diagnostics"), &day).exists() {
+                owe_coverage(support, observed, true);
+            }
+        }
+    }
 }
 
 /// Append a batch's rows and its coverage row to the day's capped file
@@ -2467,4 +3056,1759 @@ pub(crate) fn parse_usd_micros_for_test(value: &str) -> Option<u64> {
 #[cfg(test)]
 pub(crate) fn reserved_for_test() -> usize {
     SHADOW_RESERVED.load(Ordering::Acquire)
+}
+
+/// The selector reads only this support directory's ledger, before taking
+/// page custody. Missing/loading state is never interpreted as acceptance.
+pub(crate) fn family_root(item: &SnapshotItem) -> &str {
+    claude_snapshot_family_root_ref(item)
+}
+
+pub(crate) fn checkpoint_pending(support: &Path) -> bool {
+    store::checkpoint_pending(support)
+}
+
+pub(crate) fn has_offer(support: &Path, key: &str) -> bool {
+    store::has_offer(support, key)
+}
+
+pub(crate) fn money_due(support_dir: &Path, index_key: &str, now: u64) -> bool {
+    request_owned_live(support_dir) && store::scheduled(support_dir, index_key, now)
+}
+
+fn revision_of(record: &ClaudeRequestCensusRecord, deadline: Instant) -> Option<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(record.money_revision());
+    for hashes in record.request_hashes().chunks(1024) {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        for request in hashes {
+            hash.update(request.to_be_bytes());
+        }
+    }
+    if let Some(facts) = record.facts() {
+        for bytes in facts.chunks(8192) {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            hash.update(bytes);
+        }
+    }
+    Some(hash.finalize().into())
+}
+
+/// Reverse dependencies include former holders as well as current holders.
+/// Watches share only hashes; telemetry facts retain their existing custody.
+/// Sixteen direct holders are retained per changed key, with family-root
+/// fallback for overflow. Every loop is covered by the page deadline.
+fn evidence_watch_key(key: &str) -> String {
+    store::money_key(
+        if key.starts_with(MESSAGE_KEY_PREFIX) {
+            "watch:m:"
+        } else {
+            "watch:r:"
+        },
+        key,
+    )
+}
+
+fn schedule_evidence(
+    ledger: &mut ClaudeLedger,
+    index: &ScanIndex,
+    now: u64,
+    deadline: Instant,
+    budget: &mut ShadowBudget,
+    updates: &mut MoneyWatchUpdates,
+) -> bool {
+    let key_charge = index
+        .claude_request_census
+        .records()
+        .chain(ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX))
+        .chain(ledger.census().records_with_prefix(MESSAGE_KEY_PREFIX))
+        .fold(0_usize, |bytes, (key, _)| {
+            bytes.saturating_add(key.len()).saturating_add(128)
+        });
+    if !budget.charge(key_charge) {
+        return false;
+    }
+    let keys = index
+        .claude_request_census
+        .records()
+        .map(|(key, _)| key.clone())
+        .chain(
+            ledger
+                .census()
+                .records_with_prefix(TELEMETRY_KEY_PREFIX)
+                .map(|(key, _)| key.clone()),
+        )
+        .chain(
+            ledger
+                .census()
+                .records_with_prefix(MESSAGE_KEY_PREFIX)
+                .map(|(key, _)| key.clone()),
+        )
+        .collect::<Vec<_>>();
+    // Resolve family roots once; never walk the index once per dependent.
+    let mut roots = BTreeMap::<String, &str>::new();
+    for key in index.files.keys() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if let Some((root, member)) = logical_family_member(index, key) {
+            if root == member {
+                roots.insert(root, key);
+            }
+        }
+    }
+    if !budget.charge(keys.len().saturating_mul(256)) {
+        return false;
+    }
+    let present = keys
+        .iter()
+        .map(|key| evidence_watch_key(key))
+        .collect::<BTreeSet<_>>();
+    let missing_charge = ledger
+        .census()
+        .records_with_prefix("watch:")
+        .filter(|(key, _)| !key.starts_with("watch:trace:") && !present.contains(*key))
+        .fold(0_usize, |bytes, (key, _)| {
+            bytes.saturating_add(key.len()).saturating_add(128)
+        });
+    if !budget.charge(missing_charge) {
+        return false;
+    }
+    let missing = ledger
+        .census()
+        .records_with_prefix("watch:")
+        .filter(|(key, _)| !key.starts_with("watch:trace:") && !present.contains(*key))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for watch in missing {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let Some(old) = ledger.get(&watch) else {
+            continue;
+        };
+        let mut revision = Sha256::new();
+        revision.update(old.money_revision());
+        revision.update(b"evidence_removed");
+        let revision: [u8; 32] = revision.finalize().into();
+        let mut affected = BTreeSet::new();
+        let mut direct_holders = 0_usize;
+        for candidate in index.files.keys() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let Some((root, _)) = logical_family_member(index, candidate) else {
+                continue;
+            };
+            let mut affected_holder = evidence_watch_key(&telemetry_key(&root)) == watch;
+            let holder = if watch.starts_with("watch:m:") {
+                ledger.get(&message_key(candidate))
+            } else {
+                index.claude_request_census.get(candidate)
+            };
+            if let Some(holder) = holder {
+                for requests in holder.request_hashes().chunks(1024) {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    if requests
+                        .iter()
+                        .any(|request| old.request_hashes().binary_search(request).is_ok())
+                    {
+                        affected_holder = true;
+                        break;
+                    }
+                }
+            }
+            if affected_holder {
+                if direct_holders < 16 {
+                    affected.insert(candidate.as_str());
+                    direct_holders += 1;
+                }
+                if let Some(root_key) = roots.get(&root) {
+                    affected.insert(*root_key);
+                }
+            }
+        }
+        for key in affected {
+            if !stage_money_dirty(ledger, key, revision, now) {
+                return false;
+            }
+        }
+        // Phase two runs only after dependent debt has crossed a barrier.
+        if !stage_money_watch(updates, watch, None, budget) {
+            return false;
+        }
+    }
+    for key in keys {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let record = if key.starts_with(TELEMETRY_KEY_PREFIX) || key.starts_with(MESSAGE_KEY_PREFIX)
+        {
+            ledger.get(&key)
+        } else {
+            index.claude_request_census.get(&key)
+        };
+        let Some(record) = record.filter(|record| !record.is_birth_stub()) else {
+            continue;
+        };
+        let Some(revision) = revision_of(record, deadline) else {
+            return false;
+        };
+        let watch_key = evidence_watch_key(&key);
+        let previous = ledger.get(&watch_key);
+        if previous.is_some_and(|previous| previous.money_revision() == revision) {
+            continue;
+        }
+        let watch = record.money_watch(revision);
+        let mut affected = BTreeSet::new();
+        let mut holders = 0_usize;
+        for candidate in index.files.keys() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let Some((root, _)) = logical_family_member(index, candidate) else {
+                continue;
+            };
+            let direct = *candidate == key
+                || message_key(candidate) == key
+                || telemetry_key(&root) == key
+                || logical_family_member(index, candidate) == logical_family_member(index, &key);
+            let mut intersects = false;
+            let holder = if key.starts_with(MESSAGE_KEY_PREFIX) {
+                ledger.get(&message_key(candidate))
+            } else {
+                index.claude_request_census.get(candidate)
+            };
+            if let Some(holder) = holder {
+                for requests in holder.request_hashes().chunks(1024) {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    if requests.iter().any(|request| {
+                        record.request_hashes().binary_search(request).is_ok()
+                            || previous.is_some_and(|old| {
+                                old.request_hashes().binary_search(request).is_ok()
+                            })
+                    }) {
+                        intersects = true;
+                        break;
+                    }
+                }
+            }
+            if direct || intersects {
+                if holders < 16 {
+                    affected.insert(candidate.as_str());
+                    holders += 1;
+                }
+                if let Some(root_key) = roots.get(&root) {
+                    affected.insert(*root_key);
+                }
+            }
+        }
+        // A per-record commit means a large bootstrap makes progress over
+        // bounded pages. The watch moves only after every dirty mark fits.
+        for key in affected {
+            if !stage_money_dirty(ledger, key, revision, now) {
+                return false;
+            }
+        }
+        if !stage_money_watch(updates, watch_key, Some(watch), budget) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Persist exact offered-body -> current debt bindings before the network
+/// boundary. Local holds are bound to the parsed file revision and paced;
+/// they never erase v1 authority or account-hold records.
+fn retire_money_hold(ledger: &mut ClaudeLedger, key: &str) {
+    let hold_key = store::money_key("hold:", key);
+    if let Some(hold) = ledger.get(&hold_key) {
+        use std::fmt::Write as _;
+        let mut fingerprint = String::with_capacity(64);
+        for byte in hold.money_revision() {
+            let _ = write!(fingerprint, "{byte:02x}");
+        }
+        ledger.remove(&format!("hold:body:{fingerprint}"));
+    }
+    ledger.remove(&hold_key);
+}
+
+pub(crate) fn prepare_money_offers(
+    support_dir: &Path,
+    index: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    held: &BTreeSet<String>,
+) -> bool {
+    if !request_owned_live(support_dir) {
+        return true;
+    }
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support_dir) else {
+        return false;
+    };
+    apply_results(
+        support_dir,
+        &mut ledger,
+        &mut ClaudeRequestMoneyShadowCounts::default(),
+    );
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let cutoff = page_now(support_dir).saturating_sub(35 * 86400);
+    let stale_count = ledger
+        .census()
+        .records_with_prefix("union:")
+        .filter(|(_, record)| record.window() < cutoff)
+        .count();
+    let Some(_discovery_funds) = ShadowReservation::admit(stale_count.saturating_mul(256)) else {
+        return false;
+    };
+    let stale = ledger
+        .census()
+        .records_with_prefix("union:")
+        .filter(|(_, record)| record.window() < cutoff)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in stale {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        ledger.remove(&key);
+    }
+    let mut offer_count = ledger
+        .census()
+        .records_with_prefix("offer:")
+        .take(MAX_MONEY_OFFERS_PER_CONTEXT + 1)
+        .count();
+    let by_source = union_items_by_source(index, snapshots);
+    for (key, entry) in &index.files {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let Some(item) = by_source.get(entry.source_file_fingerprint.as_str()) else {
+            continue;
+        };
+        if index
+            .claude_reemission_exclusions
+            .protected_root(claude_snapshot_family_root_ref(item))
+        {
+            continue;
+        }
+        if let Some(discovery) = selection::discovery_revision(index, key) {
+            let discovery_key = store::money_key("union:", key);
+            let observed = ledger
+                .get(&discovery_key)
+                .filter(|record| record.money_revision() == discovery)
+                .map_or_else(|| page_now(support_dir), ClaudeRequestCensusRecord::window);
+            if !ledger.put_money(
+                discovery_key,
+                ClaudeRequestCensusRecord::money_debt(discovery, observed),
+            ) {
+                return false;
+            }
+        }
+        if held.contains(&item.source_session_id) {
+            let Some(revision) =
+                super::claude_request_census::decode_fingerprint(&entry.source_file_fingerprint)
+            else {
+                return false;
+            };
+            if ledger
+                .get(&store::money_key("hold:", key))
+                .is_some_and(|hold| {
+                    hold.money_revision() == revision && hold.window() > page_now(support_dir)
+                })
+            {
+                continue;
+            }
+            retire_money_hold(&mut ledger, key);
+            if !ledger.put_money(
+                store::money_key("hold:", key),
+                ClaudeRequestCensusRecord::money_debt(
+                    revision,
+                    page_now(support_dir).saturating_add(1800),
+                ),
+            ) {
+                return false;
+            }
+            // The restored predecessor keeps its old source revision, so the
+            // retry must be readable without a physical file change.
+            if !ledger.put_money(
+                store::money_key("due:", key),
+                ClaudeRequestCensusRecord::money_debt(
+                    revision,
+                    page_now(support_dir).saturating_add(1800),
+                ),
+            ) {
+                return false;
+            }
+            if !ledger.put_money(
+                format!("hold:body:{}", entry.source_file_fingerprint),
+                ClaudeRequestCensusRecord::money_debt(
+                    revision,
+                    page_now(support_dir).saturating_add(1800),
+                ),
+            ) {
+                return false;
+            }
+        } else if item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT) {
+            let dirty = store::money_key("dirty:", key);
+            let revision = ledger
+                .get(&dirty)
+                .or_else(|| ledger.get(&store::money_key("due:", key)))
+                .map(ClaudeRequestCensusRecord::money_revision)
+                .unwrap_or_else(|| Sha256::digest(entry.source_file_fingerprint.as_bytes()).into());
+            let due_key = store::money_key("due:", key);
+            if ledger.get(&due_key).is_none()
+                && !ledger.put_money(
+                    due_key,
+                    ClaudeRequestCensusRecord::money_debt(revision, page_now(support_dir)),
+                )
+            {
+                return false;
+            }
+            let offer = format!(
+                "{}:{}",
+                store::money_key("offer:", key),
+                item.snapshot_fingerprint
+            );
+            if ledger
+                .get(&offer)
+                .is_some_and(|old| old.money_revision() == revision)
+            {
+                continue;
+            }
+            let new_offer = ledger.get(&offer).is_none();
+            if new_offer
+                && (offer_count >= MAX_MONEY_OFFERS_PER_CONTEXT
+                    || ledger
+                        .census()
+                        .records_with_prefix(&format!("{}:", store::money_key("offer:", key)))
+                        .take(MAX_MONEY_OFFERS_PER_FILE)
+                        .count()
+                        >= MAX_MONEY_OFFERS_PER_FILE)
+            {
+                // The due/dirty obligation is independent and remains owed.
+                // Reconciliation must reclaim superseded offers before a new
+                // exact body can consume another slot; no POST occurs here.
+                return false;
+            }
+            if !ledger.put_money(
+                offer,
+                ClaudeRequestCensusRecord::money_debt(revision, page_now(support_dir)),
+            ) {
+                return false;
+            }
+            offer_count += usize::from(new_offer);
+        }
+    }
+    store::checkpoint(support_dir, &mut ledger)
+}
+
+pub(crate) fn money_hold_rereadable(support_dir: &Path, key: &str) -> bool {
+    store::hold_rereadable(support_dir, key)
+}
+
+pub(crate) fn money_hold_bound(index: &ScanIndex, item: &SnapshotItem) -> bool {
+    let Some(support_dir) = index.active_request_money_support_dir.as_deref() else {
+        return false;
+    };
+    let Some(revision) = item.source_file_fingerprint.as_deref() else {
+        return false;
+    };
+    store::hold_revision_bound(support_dir, revision)
+}
+
+/// After the selected index is durable, a covering literal ACK clears its
+/// dirty/due record. Callers must save the selected index first. An older
+/// ACK cannot clear a transfer discovered after its offer; a partial body's
+/// ACK leaves a future maturity deadline in place.
+pub(crate) fn settle_money_acks(
+    support_dir: &Path,
+    index: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    accepted: &BTreeSet<String>,
+    bodies: &BTreeMap<String, String>,
+) {
+    if !request_owned_live(support_dir) {
+        return;
+    }
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support_dir) else {
+        return;
+    };
+    apply_results(
+        support_dir,
+        &mut ledger,
+        &mut ClaudeRequestMoneyShadowCounts::default(),
+    );
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let by_source = union_items_by_source(index, snapshots)
+        .into_iter()
+        .filter(|(_, item)| {
+            item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT)
+                && accepted.contains(&item.snapshot_fingerprint)
+                && bodies
+                    .get(&item.snapshot_fingerprint)
+                    .is_some_and(|body| body == &super::snapshot_upload_body_witness(item))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (key, entry) in &index.files {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Some(item) = by_source.get(entry.source_file_fingerprint.as_str()) else {
+            continue;
+        };
+        // A selected-state rollback may retain the old body of this same
+        // physical file. Its ACK does not settle the newly offered body.
+        let Some(body) = bodies.get(&item.snapshot_fingerprint) else {
+            continue;
+        };
+        // The finalizer stores domain-separated SET digests, including for
+        // one logical entity. Compare that same representation for each
+        // primary/secondary checkpoint, never a raw entity/body fingerprint.
+        let singleton_set = |domain: &[u8], value: &str| {
+            let mut digest = Sha256::new();
+            super::update_length_prefixed(&mut digest, domain);
+            super::update_length_prefixed(&mut digest, value.as_bytes());
+            format!("{:x}", digest.finalize())
+        };
+        if entry.last_snapshot_fingerprint.as_ref()
+            != Some(&singleton_set(
+                b"snapshot_file_entity_set:v1",
+                &item.snapshot_fingerprint,
+            ))
+            || entry.last_upload_body_witness.as_ref()
+                != Some(&singleton_set(b"snapshot_file_upload_body_set:v1", body))
+        {
+            continue;
+        }
+        let offer_key = format!(
+            "{}:{}",
+            store::money_key("offer:", key),
+            item.snapshot_fingerprint
+        );
+        let Some(offer) = ledger.get(&offer_key) else {
+            continue;
+        };
+        let (revision, offered_at) = (offer.money_revision(), offer.window());
+        for prefix in ["dirty:", "due:"] {
+            let debt_key = store::money_key(prefix, key);
+            if ledger.get(&debt_key).is_some_and(|debt| {
+                debt.money_revision() == revision && debt.window() <= offered_at
+            }) {
+                ledger.remove(&debt_key);
+            }
+        }
+        retire_money_hold(&mut ledger, key);
+        ledger.remove(&format!("hold:body:{}", entry.source_file_fingerprint));
+        ledger.remove(&offer_key);
+    }
+    reconcile_money_offers(&mut ledger, index, index, snapshots, deadline);
+    // Failure preserves/replays debt; it never manufactures acceptance.
+    let _ = store::checkpoint(support_dir, &mut ledger);
+}
+
+/// Only called behind a successful selected-index save, with no earlier
+/// network operation in flight. Offer bindings are evidence, never debt:
+/// removing an obsolete binding cannot remove due/dirty scheduling records.
+fn reconcile_money_offers(
+    ledger: &mut ClaudeLedger,
+    index: &ScanIndex,
+    proposed_index: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    deadline: Instant,
+) {
+    let Some(_funds) = ShadowReservation::admit(
+        index
+            .files
+            .len()
+            .saturating_mul(256)
+            .saturating_add(proposed_index.files.len().saturating_mul(512))
+            .saturating_add(ledger.census().record_count().saturating_mul(256)),
+    ) else {
+        return;
+    };
+    let proposed_sources = union_items_by_source(proposed_index, snapshots);
+    let current_offers = proposed_index
+        .files
+        .iter()
+        .filter_map(|(key, entry)| {
+            let item = proposed_sources.get(entry.source_file_fingerprint.as_str())?;
+            Some(format!(
+                "{}:{}",
+                store::money_key("offer:", key),
+                item.snapshot_fingerprint
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    let by_source = union_items_by_source(index, snapshots);
+    let by_member = snapshots
+        .iter()
+        .map(|item| {
+            (
+                (
+                    claude_snapshot_family_root_ref(item),
+                    item.source_session_id.as_str(),
+                ),
+                item.snapshot_fingerprint.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let current = index
+        .files
+        .iter()
+        .map(|(key, entry)| {
+            (
+                store::money_key("offer:", key),
+                (
+                    entry,
+                    by_source
+                        .get(entry.source_file_fingerprint.as_str())
+                        .map(|item| item.snapshot_fingerprint.as_str())
+                        .or_else(|| {
+                            logical_family_member(index, key).and_then(|(root, member)| {
+                                by_member.get(&(root.as_str(), member.as_str())).copied()
+                            })
+                        }),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut obsolete = Vec::new();
+    for (key, _) in ledger.census().records_with_prefix("offer:") {
+        if Instant::now() >= deadline {
+            return;
+        }
+        if current_offers.contains(key) {
+            continue;
+        }
+        let Some((prefix, fingerprint)) = key.rsplit_once(':') else {
+            continue;
+        };
+        let keep = current.get(prefix).is_some_and(|(entry, proposed)| {
+            if *proposed == Some(fingerprint) {
+                return true;
+            }
+            let mut digest = Sha256::new();
+            super::update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
+            super::update_length_prefixed(&mut digest, fingerprint.as_bytes());
+            entry.last_snapshot_fingerprint.as_deref()
+                == Some(format!("{:x}", digest.finalize()).as_str())
+        });
+        if !keep {
+            obsolete.push(key.clone());
+        }
+    }
+    for key in obsolete {
+        ledger.remove(&key);
+    }
+}
+
+pub(crate) fn reconcile_saved_money_offers(
+    support: &Path,
+    saved: &ScanIndex,
+    proposed_index: &ScanIndex,
+    snapshots: &[SnapshotItem],
+) {
+    if !request_owned_live(support) {
+        return;
+    }
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support) else {
+        return;
+    };
+    apply_results(
+        support,
+        &mut ledger,
+        &mut ClaudeRequestMoneyShadowCounts::default(),
+    );
+    let before = ledger.census().record_count();
+    reconcile_money_offers(
+        &mut ledger,
+        saved,
+        proposed_index,
+        snapshots,
+        Instant::now() + Duration::from_millis(100),
+    );
+    if ledger.census().record_count() != before {
+        let _ = store::checkpoint(support, &mut ledger);
+    }
+}
+
+/// Reconcile bounded unbuilt debt before classification, then enroll the
+/// blockers actually encountered by T-empty decisions. The first-held clock
+/// and cycle survive lost/stale/over-budget replacements and process restart.
+/// A current verified rebuild clears the marker; passage of time or a completed
+/// census cycle releases it without fabricating request evidence.
+pub(crate) fn update_unbuilt_lifecycle(
+    index: &ScanIndex,
+    ledger: &mut ClaudeLedger,
+    blocking_files: &BTreeSet<String>,
+    now: u64,
+    deadline: Instant,
+) -> Option<u64> {
+    // Do not clear on derivation alone: stale fingerprints, lossy records and
+    // birth-only tombstones are still unbuilt. Empty verified files do settle.
+    for (key, entry) in &index.files {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if index.confirmed_empty_files.contains(key)
+            || index.claude_request_census.get(key).is_some_and(|record| {
+                record.retired().is_some()
+                    || record.current_holder_for(
+                        &entry.source_file_fingerprint,
+                        claude_request_ledger::message_known(
+                            &index.claude_request_census,
+                            ledger.census(),
+                            key,
+                        ),
+                    )
+            })
+        {
+            ledger.remove(&store::money_key("unbuilt:", key));
+        }
+    }
+    let cycle: [u8; 32] = Sha256::digest(
+        index
+            .resume_census_window_end
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    )
+    .into();
+    let expired = |record: &ClaudeRequestCensusRecord| {
+        record.window() & UNBUILT_RELEASED == 0
+            && (now.saturating_sub(record.window()) >= 86400 || record.money_revision() != cycle)
+    };
+    let mut charge = 0_usize;
+    for (key, record) in ledger.census().records_with_prefix("unbuilt:") {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if expired(record) {
+            charge = charge.saturating_add(
+                2 * (std::mem::size_of::<(String, ClaudeRequestCensusRecord)>() + key.len()),
+            );
+        }
+    }
+    let _funds = ShadowReservation::admit(charge)?;
+    let mut updates = Vec::new();
+    for (key, record) in ledger.census().records_with_prefix("unbuilt:") {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if expired(record) {
+            updates.push((
+                key.clone(),
+                ClaudeRequestCensusRecord::money_debt(
+                    record.money_revision(),
+                    record.window() | UNBUILT_RELEASED,
+                ),
+            ));
+        }
+    }
+    let released = updates.len() as u64;
+    for (key, record) in updates {
+        if !ledger.put_money(key, record) {
+            return None;
+        }
+    }
+    for key in blocking_files {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let record_key = store::money_key("unbuilt:", key);
+        if ledger.get(&record_key).is_none()
+            && !ledger.put_money(
+                record_key,
+                ClaudeRequestCensusRecord::money_debt(cycle, now),
+            )
+        {
+            return None;
+        }
+    }
+    if released > 0 {
+        eprintln!(
+            "claude_request_money unbuilt_older_alarm={released} unbuilt_older_released={released}"
+        );
+    }
+    Some(released)
+}
+
+/// Page-bounded local cause lookup. Build only in live money mode; the saved
+/// index determines whether the physical file changed, appeared as an alias,
+/// or belongs to a wholly rebuilt index. It never changes upload eligibility.
+pub(crate) fn protected_offer_causes(
+    saved: &ScanIndex,
+    scan: &super::SourceScanResult,
+) -> Option<(BTreeMap<String, u8>, ShadowReservation)> {
+    let charge = scan
+        .completed_parses()
+        .fold(0_usize, |bytes, (_, revision)| {
+            bytes.saturating_add(revision.len().saturating_add(128))
+        });
+    let funds = ShadowReservation::admit(charge)?;
+    let mut causes = BTreeMap::new();
+    for (key, revision) in scan.completed_parses() {
+        let cause = if saved.files.contains_key(key) {
+            0
+        } else if saved.files.is_empty() {
+            2
+        } else {
+            1
+        };
+        causes.insert(revision.to_owned(), cause);
+    }
+    Some((causes, funds))
+}
+
+pub(crate) fn note_protected_offers(
+    index: &ScanIndex,
+    causes: Option<&BTreeMap<String, u8>>,
+    items: &[SnapshotItem],
+) {
+    #[derive(Default, Serialize)]
+    struct Counts {
+        real_change: u64,
+        alias: u64,
+        rebuild: u64,
+        cause_unavailable: u64,
+    }
+    let mut counts = Counts::default();
+    for item in items {
+        if !index
+            .claude_reemission_exclusions
+            .protected_root(claude_snapshot_family_root_ref(item))
+        {
+            continue;
+        }
+        match item
+            .source_file_fingerprint
+            .as_ref()
+            .and_then(|revision| causes?.get(revision))
+        {
+            Some(0) => counts.real_change += 1,
+            Some(1) => counts.alias += 1,
+            Some(2) => counts.rebuild += 1,
+            _ => counts.cause_unavailable += 1,
+        }
+    }
+    if counts.real_change + counts.alias + counts.rebuild + counts.cause_unavailable > 0 {
+        crate::local_resource_diagnostics::claude_money_protected_offers(&counts);
+    }
+}
+
+pub(crate) fn money_blocking_file(support_dir: &Path, index_key: &str) -> bool {
+    request_owned_live(support_dir) && store::blocking_file(support_dir, index_key)
+}
+
+pub(crate) fn adoption_prefix(index: &ScanIndex) -> String {
+    format!(
+        "adopt:entity:v2:{:x}:",
+        Sha256::digest(
+            index
+                .active_upload_context_fingerprint
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes()
+        )
+    )
+}
+
+/// State per indexed entity, not per POST. Repeated server holds never
+/// inflate the denominator or erase a refusal from conservation accounting.
+/// 0 offered, 1 local held, 2 server held, 3 refused, 4 accepted,
+/// 5 below retention floor, 6 dominated/stale refusal (settled).
+pub(crate) fn note_adoption_outcomes(
+    support_dir: &Path,
+    index: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    outcome: impl Fn(&SnapshotItem) -> u64,
+) -> bool {
+    if !request_owned_live(support_dir) {
+        return true;
+    }
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support_dir) else {
+        return false;
+    };
+    apply_results(
+        support_dir,
+        &mut ledger,
+        &mut ClaudeRequestMoneyShadowCounts::default(),
+    );
+    let prefix = adoption_prefix(index);
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut seen = BTreeSet::new();
+    let mut rates = [0_u64; 4];
+    for item in snapshots {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let root = claude_snapshot_family_root_ref(item);
+        if index.claude_reemission_exclusions.protected_root(root)
+            || !seen.insert((root, item.source_session_id.as_str()))
+        {
+            continue;
+        }
+        let entity = format!("{root}/{}", item.source_session_id);
+        let record_key = store::money_key(&prefix, &entity);
+        let revision = Sha256::digest(item.snapshot_fingerprint.as_bytes()).into();
+        let proposed = outcome(item);
+        let state = if proposed == 0 {
+            ledger
+                .get(&record_key)
+                .filter(|old| old.money_revision() == revision && matches!(old.window(), 3 | 4 | 6))
+                .map_or(proposed, ClaudeRequestCensusRecord::window)
+        } else {
+            proposed
+        };
+        rates[0] += 1;
+        if state == 0 {
+            rates[0] |= 1_u64 << 63;
+        }
+        rates[1] += u64::from(state == 1);
+        rates[2] += u64::from(state == 2);
+        rates[3] += u64::from(matches!(state, 3 | 6));
+        if !ledger.put_money(
+            record_key,
+            ClaudeRequestCensusRecord::money_debt(revision, state),
+        ) {
+            return false;
+        }
+    }
+    let mut revision = [0; 32];
+    for (slot, value) in revision.chunks_exact_mut(8).zip(rates) {
+        slot.copy_from_slice(&value.to_be_bytes());
+    }
+    let rates_key = format!("{prefix}rates");
+    let observed = ledger
+        .get(&rates_key)
+        .filter(|old| old.money_revision() == revision)
+        .map_or_else(|| page_now(support_dir), ClaudeRequestCensusRecord::window);
+    if rates[0] > 0
+        && !ledger.put_money(
+            rates_key,
+            ClaudeRequestCensusRecord::money_debt(revision, observed),
+        )
+    {
+        return false;
+    }
+    let durable = store::checkpoint(support_dir, &mut ledger);
+    let mut counts = [0_u64; 7];
+    for (_, record) in ledger.census().records_with_prefix(&prefix) {
+        if let Some(count) = counts.get_mut(record.window() as usize) {
+            *count += 1;
+        }
+    }
+    eprintln!("claude_request_money adoption_offered={} adoption_local_held={} adoption_server_held={} adoption_refused={} adoption_accepted={} adoption_below_retention_floor={} adoption_refused_stale_again={}",
+        counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
+    durable
+}
+
+pub(crate) fn adoption_paused(support_dir: &Path, index: &ScanIndex) -> bool {
+    store::adoption_paused(support_dir, &adoption_prefix(index), page_now(support_dir))
+}
+
+pub(crate) fn adoption_probe_due(support_dir: &Path, index: &ScanIndex) -> bool {
+    store::adoption_probe_due(support_dir, &adoption_prefix(index), page_now(support_dir))
+}
+
+pub(crate) fn note_route_pause(support_dir: &Path, index: &ScanIndex, paused: bool) {
+    if !request_owned_live(support_dir) {
+        return;
+    }
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support_dir) else {
+        return;
+    };
+    let key = format!("{}route", adoption_prefix(index));
+    if paused {
+        let _ = ledger.put_money(
+            key,
+            ClaudeRequestCensusRecord::money_debt(
+                [0; 32],
+                page_now(support_dir).saturating_add(1800),
+            ),
+        );
+        eprintln!("claude_request_money adoption_paused=request_owned_usage_route_unavailable");
+    } else {
+        ledger.remove(&key);
+    }
+    let _ = store::checkpoint(support_dir, &mut ledger);
+}
+
+pub(crate) fn settle_below_retention_floor(
+    support_dir: &Path,
+    index: &ScanIndex,
+    key: &str,
+) -> bool {
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support_dir) else {
+        return false;
+    };
+    let Some(entry) = index.files.get(key) else {
+        return false;
+    };
+    let revision = Sha256::digest(entry.source_file_fingerprint.as_bytes()).into();
+    ledger.put_money(
+        store::money_key(
+            &adoption_prefix(index),
+            &logical_family_member(index, key)
+                .map(|(root, member)| format!("{root}/{member}"))
+                .unwrap_or_else(|| key.to_owned()),
+        ),
+        ClaudeRequestCensusRecord::money_debt(revision, 5),
+    ) && store::checkpoint(support_dir, &mut ledger)
+}
+
+pub(crate) fn scheduled_reoffers(index: &ScanIndex, items: &[SnapshotItem]) -> BTreeSet<String> {
+    let Some(support) = index.active_request_money_support_dir.as_deref() else {
+        return BTreeSet::new();
+    };
+    let sources = index
+        .files
+        .iter()
+        .filter(|(key, _)| {
+            index.claude_money_selection_changed.contains(*key)
+                || money_due(support, key, page_now(support))
+        })
+        .map(|(_, entry)| entry.source_file_fingerprint.as_str())
+        .collect::<BTreeSet<_>>();
+    items
+        .iter()
+        .filter(|item| {
+            item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT)
+                && item
+                    .source_file_fingerprint
+                    .as_deref()
+                    .is_some_and(|source| sources.contains(source))
+        })
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect()
+}
+
+/// Scoped live activation for synthetic callers only. Production still needs
+/// the compiled gate; kill files retain their precedence in tests too.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct LiveForTest {
+    support: PathBuf,
+    inserted: bool,
+    shadow_was_enabled: bool,
+}
+#[cfg(test)]
+#[allow(dead_code)]
+impl LiveForTest {
+    pub(crate) fn new(support: &Path) -> Self {
+        let shadow_was_enabled = shadow_enabled(support);
+        enable_shadow_for_test(support);
+        let mut dirs = LIVE_TEST_DIRS.lock().expect("live test scopes");
+        let inserted = !dirs.iter().any(|dir| dir == support);
+        if inserted {
+            dirs.push(support.to_path_buf());
+        }
+        Self {
+            support: support.to_path_buf(),
+            inserted,
+            shadow_was_enabled,
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for LiveForTest {
+    fn drop(&mut self) {
+        if self.inserted {
+            if let Ok(mut dirs) = LIVE_TEST_DIRS.lock() {
+                dirs.retain(|dir| dir != &self.support);
+            }
+        }
+        if !self.shadow_was_enabled {
+            disable_shadow_for_test(&self.support);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAGE_CLOCK: std::cell::RefCell<BTreeMap<PathBuf, u64>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct PageClockForTest(PathBuf, Option<u64>);
+#[cfg(test)]
+#[allow(dead_code)]
+impl PageClockForTest {
+    pub(crate) fn new(support: &Path, now: u64) -> Self {
+        Self(
+            support.to_path_buf(),
+            PAGE_CLOCK.with(|clock| clock.borrow_mut().insert(support.to_path_buf(), now)),
+        )
+    }
+}
+#[cfg(test)]
+impl Drop for PageClockForTest {
+    fn drop(&mut self) {
+        PAGE_CLOCK.with(|clock| {
+            let mut clock = clock.borrow_mut();
+            if let Some(previous) = self.1 {
+                clock.insert(self.0.clone(), previous);
+            } else {
+                clock.remove(&self.0);
+            }
+        });
+    }
+}
+fn page_now(support: &Path) -> u64 {
+    #[cfg(test)]
+    if let Some(now) = PAGE_CLOCK.with(|clock| clock.borrow().get(support).copied()) {
+        return now;
+    }
+    let _ = support;
+    now_unix()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn emit_for_test(item: &mut SnapshotItem, entity: &body::ClaudeEntityBody) -> bool {
+    emit::apply(item, entity)
+}
+
+fn schedule_trace(
+    ledger: &mut ClaudeLedger,
+    index: &ScanIndex,
+    traces: &BTreeMap<String, BTreeMap<u64, String>>,
+    now: u64,
+    deadline: Instant,
+    budget: &mut ShadowBudget,
+    updates: &mut MoneyWatchUpdates,
+) -> bool {
+    for (root, trace) in traces {
+        let prefix = format!("watch:trace:{:x}:", Sha256::digest(root.as_bytes()));
+        let old_charge =
+            ledger
+                .census()
+                .records_with_prefix(&prefix)
+                .fold(0_usize, |bytes, (key, _)| {
+                    bytes
+                        .saturating_add(key.len().saturating_mul(3))
+                        .saturating_add(512)
+                });
+        if !budget.charge(old_charge.saturating_add(trace.len().saturating_mul(512))) {
+            return false;
+        }
+        // Each old trace assignment keeps only the member's digest. Both the
+        // former and new named member are dirtied on a move or deletion.
+        let old = ledger
+            .census()
+            .records_with_prefix(&prefix)
+            .map(|(key, record)| (key.clone(), record.money_revision()))
+            .collect::<BTreeMap<_, _>>();
+        let mut changes = BTreeMap::new();
+        for (request, owner) in trace {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let key = format!("{prefix}{request:016x}");
+            let owner: [u8; 32] = Sha256::digest(owner.as_bytes()).into();
+            if old.get(&key) != Some(&owner) {
+                changes.insert(key, Some(owner));
+            }
+        }
+        for key in old.keys() {
+            let present = key
+                .strip_prefix(&prefix)
+                .and_then(|hash| u64::from_str_radix(hash, 16).ok())
+                .is_some_and(|hash| trace.contains_key(&hash));
+            if !present {
+                changes.insert(key.clone(), None);
+            }
+        }
+        for (watch, next_owner) in changes {
+            let old_owner = old.get(&watch);
+            let revision: [u8; 32] =
+                Sha256::digest(format!("{watch}:{next_owner:?}").as_bytes()).into();
+            for key in index.files.keys() {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                let Some((family, member)) = logical_family_member(index, key) else {
+                    continue;
+                };
+                if &family != root {
+                    continue;
+                }
+                let owner: [u8; 32] = Sha256::digest(member.as_bytes()).into();
+                if (member == family || old_owner == Some(&owner) || next_owner == Some(owner))
+                    && !stage_money_dirty(ledger, key, revision, now)
+                {
+                    return false;
+                }
+            }
+            if !stage_money_watch(
+                updates,
+                watch,
+                next_owner.map(|owner| ClaudeRequestCensusRecord::money_debt(owner, 0)),
+                budget,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A server hold/skew paces the same exact debt. A new evidence revision
+/// replaces its timer, so a real correction can still be offered promptly.
+pub(crate) fn pace_money_debt(
+    support_dir: &Path,
+    index: &ScanIndex,
+    items: &[SnapshotItem],
+    retry_after: impl Fn(&SnapshotItem) -> Option<u64>,
+) {
+    if !request_owned_live(support_dir) {
+        return;
+    }
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support_dir) else {
+        return;
+    };
+    let sources = union_items_by_source(index, items)
+        .into_iter()
+        .filter_map(|(source, item)| Some((source, retry_after(item)?)))
+        .collect::<BTreeMap<_, _>>();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    for (key, entry) in &index.files {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Some(retry_after) = sources.get(entry.source_file_fingerprint.as_str()) else {
+            continue;
+        };
+        for prefix in ["dirty:", "due:"] {
+            let key = store::money_key(prefix, key);
+            if let Some(record) = ledger.get(&key) {
+                let record = ClaudeRequestCensusRecord::money_debt(
+                    record.money_revision(),
+                    record.window().max(*retry_after),
+                );
+                let _ = ledger.put_money(key, record);
+            }
+        }
+    }
+    let _ = store::checkpoint(support_dir, &mut ledger);
+}
+
+// Watch publication is phase two. A crash at any earlier data-shard boundary
+// leaves the old watch replayable. A later watch write can only follow durable
+// dependent invalidation; no cross-shard atomic rename is assumed.
+type MoneyWatchUpdates = Vec<(String, Option<ClaudeRequestCensusRecord>)>;
+
+fn stage_money_dirty(
+    ledger: &mut ClaudeLedger,
+    index_key: &str,
+    revision: [u8; 32],
+    now: u64,
+) -> bool {
+    let key = store::money_key("dirty:", index_key);
+    if ledger
+        .get(&key)
+        .is_some_and(|record| record.money_revision() == revision)
+    {
+        return true;
+    }
+    ledger.put_money(key, ClaudeRequestCensusRecord::money_debt(revision, now))
+}
+
+#[cfg(test)]
+fn checkpoint_money_watches(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    updates: MoneyWatchUpdates,
+) -> bool {
+    checkpoint_money_watches_at(
+        support_dir,
+        ledger,
+        updates,
+        Instant::now() + PAGE_MAX_ELAPSED,
+    )
+}
+
+fn checkpoint_money_watches_at(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    updates: MoneyWatchUpdates,
+    deadline: Instant,
+) -> bool {
+    if updates.is_empty() {
+        return true;
+    }
+    if !store::checkpoint_until(support_dir, ledger, deadline) {
+        return false;
+    }
+    for (key, record) in updates {
+        match record {
+            Some(record) => {
+                if !ledger.put_money(key, record) {
+                    return false;
+                }
+            }
+            None => ledger.remove(&key),
+        }
+    }
+    true
+}
+
+fn stage_money_watch(
+    updates: &mut MoneyWatchUpdates,
+    key: String,
+    record: Option<ClaudeRequestCensusRecord>,
+    budget: &mut ShadowBudget,
+) -> bool {
+    if !budget.charge(key.capacity()) {
+        return false;
+    }
+    if updates.len() == updates.capacity() {
+        let capacity = updates.capacity().max(4).saturating_mul(2);
+        if !budget.charge(capacity.saturating_mul(std::mem::size_of::<(
+            String,
+            Option<ClaudeRequestCensusRecord>,
+        )>())) {
+            return false;
+        }
+        updates.reserve_exact(capacity - updates.len());
+    }
+    updates.push((key, record));
+    true
+}
+
+#[cfg(test)]
+mod scheduling_reconciliation_tests {
+    use super::super::claude_request_census::ClaudeTelemetryTailState;
+    use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn saved_offer_reconciliation_bounds_changed_and_deleted_bodies() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-offer-churn");
+        let mut index = ScanIndex::default();
+        let key = "/fixture/.claude/projects/group/a.jsonl".to_owned();
+        let fp = "01".repeat(32);
+        index.files.insert(key.clone(), serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":fp,"last_snapshot_fingerprint":null})).unwrap());
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        item.source_file_fingerprint = Some(fp);
+        item.snapshot_fingerprint = format!("{:064x}", 63);
+        let mut ledger = ClaudeLedger::new_for_test();
+        for n in 0..64 {
+            ledger.put_money(
+                format!("{}:{n:064x}", store::money_key("offer:", &key)),
+                ClaudeRequestCensusRecord::money_debt([1; 32], n),
+            );
+        }
+        let dirty = store::money_key("dirty:", &key);
+        ledger.put_money(
+            dirty.clone(),
+            ClaudeRequestCensusRecord::money_debt([1; 32], 0),
+        );
+        reconcile_money_offers(
+            &mut ledger,
+            &ScanIndex::default(),
+            &index,
+            &[item],
+            Instant::now() + PAGE_MAX_ELAPSED,
+        );
+        assert_eq!(ledger.census().records_with_prefix("offer:").count(), 1);
+        assert!(ledger.get(&dirty).is_some());
+        index.files.clear();
+        reconcile_money_offers(
+            &mut ledger,
+            &index,
+            &index,
+            &[],
+            Instant::now() + PAGE_MAX_ELAPSED,
+        );
+        assert!(store::checkpoint_for_test(&scratch, &mut ledger));
+        let restored = store::load_for_test(&scratch);
+        assert_eq!(restored.census().records_with_prefix("offer:").count(), 0);
+        assert!(
+            restored.get(&dirty).is_some(),
+            "offer cleanup cannot settle current debt"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn message_transfer_dirties_unchanged_former_holder_in_its_own_namespace() {
+        let mut index = ScanIndex::default();
+        let a = "/fixture/.claude/projects/group/a.jsonl".to_owned();
+        let b = "/fixture/.claude/projects/group/b.jsonl".to_owned();
+        for key in [&a, &b] {
+            index.files.insert(key.clone(), serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"01".repeat(32),"last_snapshot_fingerprint":null})).unwrap());
+        }
+        let mut ledger = ClaudeLedger::new_for_test();
+        let record = ClaudeRequestCensusRecord::money_debt([1; 32], 0);
+        let message = ClaudeRequestCensusRecord::message_record(&record, vec![7]);
+        ledger.insert(message_key(&a), message.clone());
+        ledger.insert(
+            evidence_watch_key(&message_key(&a)),
+            message.money_watch(revision_of(&message, Instant::now() + PAGE_MAX_ELAPSED).unwrap()),
+        );
+        // B has just been restored. A's physical revision is unchanged.
+        ledger.insert(message_key(&b), message);
+        let mut budget = ShadowBudget::new(ShadowReservation::admit(16384).unwrap());
+        let mut updates = Vec::new();
+        assert!(schedule_evidence(
+            &mut ledger,
+            &index,
+            100,
+            Instant::now() + PAGE_MAX_ELAPSED,
+            &mut budget,
+            &mut updates
+        ));
+        assert!(ledger.get(&store::money_key("dirty:", &a)).is_some());
+        assert!(ledger.get(&store::money_key("dirty:", &b)).is_some());
+        assert_ne!(evidence_watch_key(&message_key(&a)), evidence_watch_key(&a));
+        let scratch = crate::test_scratch::ScratchDir::new("money-message-transfer");
+        assert!(store::checkpoint_for_test(&scratch, &mut ledger));
+        assert!(checkpoint_money_watches(&scratch, &mut ledger, updates));
+        assert!(store::checkpoint_for_test(&scratch, &mut ledger));
+        let restarted = store::load_for_test(&scratch);
+        assert!(restarted.get(&store::money_key("dirty:", &a)).is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn vanished_evidence_dirties_former_holder_and_retires_watch_once() {
+        let mut index = ScanIndex::default();
+        let key = "/fixture/.claude/projects/group/holder.jsonl".to_owned();
+        let record = ClaudeRequestCensusRecord::telemetry(
+            vec![7],
+            Box::new([]),
+            ClaudeTelemetryTailState::default(),
+            1,
+        )
+        .money_watch([1; 32]);
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes": 1, "modified_unix_seconds": 1,
+                "source_file_fingerprint": "01".repeat(32), "last_snapshot_fingerprint": null
+            }))
+            .unwrap(),
+        );
+        index
+            .claude_request_census
+            .insert(key.clone(), record.clone());
+        let mut ledger = ClaudeLedger::new_for_test();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let current_watch = evidence_watch_key(&key);
+        ledger.insert(
+            current_watch,
+            record.money_watch(revision_of(&record, deadline).unwrap()),
+        );
+        let missing_watch = evidence_watch_key(&telemetry_key("vanished-owner"));
+        ledger.insert(missing_watch.clone(), record.money_watch([2; 32]));
+        let scratch = crate::test_scratch::ScratchDir::new("money-watch-order");
+        let support = scratch.join("support");
+        assert!(store::checkpoint_for_test(&support, &mut ledger));
+        let mut budget = ShadowBudget::new(ShadowReservation::admit(4096).unwrap());
+        let mut updates = MoneyWatchUpdates::new();
+        assert!(schedule_evidence(
+            &mut ledger,
+            &index,
+            50,
+            Instant::now() + Duration::from_secs(2),
+            &mut budget,
+            &mut updates
+        ));
+        let dirty = store::money_key("dirty:", &key);
+        assert!(
+            ledger.get(&missing_watch).is_some(),
+            "phase one retains replay evidence"
+        );
+        let blocked = store::shard_path_for_test(&support, &dirty).with_extension("json.tmp");
+        std::fs::create_dir_all(&blocked).unwrap();
+        assert!(!checkpoint_money_watches(&support, &mut ledger, updates));
+        store::flush();
+        let mut reloaded = store::load_for_test(&support);
+        assert!(
+            reloaded.get(&missing_watch).is_some(),
+            "failed dependent write cannot retire the watch"
+        );
+        assert!(reloaded.get(&dirty).is_none());
+        std::fs::remove_dir_all(&blocked).unwrap();
+        let mut updates = MoneyWatchUpdates::new();
+        assert!(schedule_evidence(
+            &mut reloaded,
+            &index,
+            50,
+            Instant::now() + Duration::from_secs(2),
+            &mut budget,
+            &mut updates
+        ));
+        assert!(store::checkpoint_for_test(&support, &mut reloaded));
+        assert!(checkpoint_money_watches(&support, &mut reloaded, updates));
+        assert!(reloaded.get(&missing_watch).is_none());
+        assert_eq!(reloaded.get(&dirty).unwrap().window(), 50);
+        assert!(store::checkpoint_for_test(&support, &mut reloaded));
+        let saved = store::load_for_test(&support);
+        assert!(saved.get(&missing_watch).is_none());
+        assert_eq!(saved.get(&dirty).unwrap().window(), 50);
+        reloaded.remove(&dirty);
+        let mut updates = MoneyWatchUpdates::new();
+        assert!(schedule_evidence(
+            &mut reloaded,
+            &index,
+            51,
+            Instant::now() + Duration::from_secs(2),
+            &mut budget,
+            &mut updates
+        ));
+        assert!(updates.is_empty());
+        ledger = reloaded;
+        assert!(
+            ledger.get(&dirty).is_none(),
+            "a settled watch deletion is not repeated"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn no_dirty_buffers_do_not_publish_watches_without_a_flush_ack() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-watch-flush-ack");
+        let support = scratch.join("support");
+        let mut ledger = ClaudeLedger::new_for_test();
+        let watch = store::money_key("watch:", "/fixture/holder.jsonl");
+        ledger.insert(
+            watch.clone(),
+            ClaudeRequestCensusRecord::money_debt([1; 32], 0),
+        );
+        let _inflight_buffers = store::take_save_for_test(&mut ledger).unwrap();
+        assert_eq!(ledger.dirty_shards(), 0);
+        let stalled = store::stall_writer_for_test();
+        let timeout = store::flush_timeout_for_test(Duration::from_millis(20));
+        assert!(!checkpoint_money_watches(
+            &support,
+            &mut ledger,
+            vec![(watch.clone(), None)]
+        ));
+        assert!(
+            ledger.get(&watch).is_some(),
+            "unacknowledged durability keeps replay evidence"
+        );
+        drop(timeout);
+        drop(stalled);
+        store::flush();
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn idle_retirement_keeps_consumed_tail_and_does_not_retire_it_again() {
+        let mut ledger = ClaudeLedger::new_for_test();
+        let header = facts::ClaudeFactsHeader {
+            session: "idle-owner".into(),
+            ..Default::default()
+        };
+        let encoded =
+            facts::encode(&header, std::iter::empty::<&facts::ClaudeFact>(), 0).into_boxed_slice();
+        let key = telemetry_key("idle-owner");
+        ledger.insert(
+            key.clone(),
+            ClaudeRequestCensusRecord::telemetry(
+                Vec::new(),
+                encoded,
+                ClaudeTelemetryTailState {
+                    offset: 80,
+                    last_append_unix: 1,
+                    ..Default::default()
+                },
+                1,
+            ),
+        );
+        let index = ScanIndex::default();
+        let now = 35 * 86400 + 2;
+        assert_eq!(
+            claude_request_ledger::retire_idle_telemetry(&mut ledger, &index, now),
+            0
+        );
+        let retired = ledger.get(&key).unwrap();
+        assert_eq!(retired.tail().unwrap().offset, 80);
+        assert_eq!(retired.retired(), None);
+        assert_eq!(
+            claude_request_ledger::retire_idle_telemetry(&mut ledger, &index, now + 1),
+            0
+        );
+    }
+}
+
+const SYNTHETIC_COLLECTOR: &str = "claude_api_synthetic";
+fn synthetic(item: &SnapshotItem) -> bool {
+    item.provenance.collector == SYNTHETIC_COLLECTOR
+}
+
+/// Bounded telemetry-only carriers share the literal builder and normal ACK
+/// ledger. Ever-indexed roots live in the separately admitted tolerant ledger;
+/// deleted transcripts must never turn into telemetry-only replacements.
+pub(crate) fn append_synthetic_sessions(
+    support: &Path,
+    scan: &mut super::SourceScanResult,
+    index: &ScanIndex,
+) -> Option<ShadowReservation> {
+    if !request_owned_live(support) || !scan.census_complete {
+        return None;
+    }
+    let funds = ShadowReservation::admit(64 * 8192 + index.files.len().saturating_mul(256))?;
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support) else {
+        return None;
+    };
+    apply_results(
+        support,
+        &mut ledger,
+        &mut ClaudeRequestMoneyShadowCounts::default(),
+    );
+    let deadline = Instant::now() + PAGE_MAX_ELAPSED;
+    for key in index.files.keys() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if let Some((root, _)) = logical_family_member(index, key) {
+            let key = store::money_key("ever:", &root);
+            if ledger.get(&key).is_none()
+                && !ledger.put_money(key, ClaudeRequestCensusRecord::money_debt([0; 32], 0))
+            {
+                return None;
+            }
+        }
+    }
+    if !store::checkpoint(support, &mut ledger) || ledger.load_damaged {
+        return None;
+    }
+    let mut roots = Vec::new();
+    for (key, record) in ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX) {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let Some(header) = record
+            .facts()
+            .and_then(facts::ClaudeFacts::open)
+            .map(|facts| facts.header)
+        else {
+            continue;
+        };
+        let root = header.session;
+        if root.is_empty()
+            || root.len() > 128
+            || ledger.get(&store::money_key("ever:", &root)).is_some()
+            || index.claude_reemission_exclusions.protected_root(&root)
+            || scan
+                .snapshots
+                .iter()
+                .any(|item| claude_snapshot_family_root_ref(item) == root)
+        {
+            continue;
+        }
+        if key.as_str() > ledger.synthetic_cursor.as_str() {
+            roots.push((key.clone(), root));
+        }
+        if roots.len() == 64 {
+            break;
+        }
+    }
+    if let Some((key, _)) = roots.last() {
+        ledger.synthetic_cursor = key.clone();
+    } else {
+        ledger.synthetic_cursor.clear();
+    }
+    for (_, root) in roots {
+        scan.snapshots
+            .push(synthetic_carrier(&root, &scan.census_window_end));
+    }
+    Some(funds)
+}
+
+fn synthetic_carrier(root: &str, collected_at: &str) -> SnapshotItem {
+    SnapshotItem {
+        request_evidence: Vec::new(),
+        request_identity_refusals: 0,
+        claude_org_markers: None,
+        claude_account_withheld_reason: None,
+        source_session_id: root.to_owned(),
+        snapshot_fingerprint: String::new(),
+        status: "final".to_string(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_5m_tokens: 0,
+        cache_creation_1h_tokens: 0,
+        reasoning_output_tokens: 0,
+        unattributed_total_tokens: 0,
+        request_count: 0,
+        removed_request_count: None,
+        removed_usage: None,
+        telemetry_owned_complete: None,
+        usage_accounting_contract: None,
+        session_account_evidence: None,
+        claude_usage_request_ids: BTreeSet::new(),
+        claude_usage_occurrences: BTreeMap::new(),
+        cache_observations: None,
+        cache_observations_state: None,
+        cache_base_head_etag: None,
+        cache_requests: Vec::new(),
+        cache_requests_complete: true,
+        avg_duration_ms: None,
+        avg_time_to_first_token_ms: None,
+        max_duration_ms: None,
+        max_time_to_first_token_ms: None,
+        peak_context_fill_tokens: None,
+        first_turn_context_tokens: None,
+        last_turn_context_tokens: None,
+        compaction_count: None,
+        compaction_timestamps: Vec::new(),
+        compaction_total_pre_tokens: None,
+        compaction_total_post_tokens: None,
+        compaction_total_cumulative_dropped_tokens: None,
+        compaction_total_duration_ms: None,
+        context_curve: None,
+        claude_context_curve_boundaries: Vec::new(),
+        claude_context_curve_identity_complete: false,
+        claude_context_curve_request_index_complete: false,
+        claude_context_curve_owned_start_proven: false,
+        claude_file_birth: Default::default(),
+        activity_summary: None,
+        tool_usage: None,
+        tool_usage_truncated: false,
+        session_start: None,
+        model_usage: Vec::new(),
+        usage_buckets: Vec::new(),
+        cost: None,
+        session_display_name: None,
+        session_display_name_source: None,
+        source_started_at: None,
+        source_ended_at: None,
+        source_last_activity_at: None,
+        collected_at: collected_at.to_owned(),
+        workspace_hash: None,
+        workspace_display_label: None,
+        workspace_label_source: None,
+        repository_hash: None,
+        repository_label: None,
+        repository_label_source: None,
+        repository_identity_source: None,
+        workspace_kind: None,
+        source_file_fingerprint: None,
+        session_artifacts: Vec::new(),
+        provenance: SnapshotProvenance {
+            collector: "claude_api_synthetic".to_string(),
+            source_file_count: 0,
+            input_token_scope: None,
+            state_total_tokens: None,
+            state_archived: None,
+        },
+        // Telemetry carries no transcript launcher provenance.
+        origin: None,
+        originator: None,
+        attribution_facts: Vec::new(),
+    }
 }

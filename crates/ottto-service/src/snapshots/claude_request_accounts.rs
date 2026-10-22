@@ -340,7 +340,11 @@ fn qualify_mixed(
     };
     if !super::codex_identity_is_uuid_shaped(root)
         || root != root.to_ascii_lowercase()
-        || item.usage_accounting_contract.as_deref() != Some("session_exclusive_reported_usage:v1")
+        || !(item.usage_accounting_contract.as_deref()
+            == Some("session_exclusive_reported_usage:v1")
+            || (item.usage_accounting_contract.as_deref()
+                == Some(super::claude_request_money::REQUEST_OWNED_CONTRACT)
+                && item.telemetry_owned_complete == Some(true)))
         || super::validate_snapshot_item(0, item).is_err()
         || original.provider != "anthropic"
         || original.identity_hash_scheme != "provider-sha256:v1"

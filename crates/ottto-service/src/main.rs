@@ -160,6 +160,13 @@ enum ServiceCommand {
 }
 
 fn main() -> Result<()> {
+    struct FlushMoneyOnExit;
+    impl Drop for FlushMoneyOnExit {
+        fn drop(&mut self) {
+            ottto_service::flush_request_money_on_shutdown();
+        }
+    }
+    let _flush_money = FlushMoneyOnExit;
     // This is a background service: it must never block on an interactive
     // keychain modal (e.g. "Keychain Not Found"). Disable Security UI for the
     // whole process up front so a transient keychain failure logs and retries

@@ -38,6 +38,11 @@ pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
     traversal_point("claude_context_resource_withhold", "claude_code", counts);
 }
 
+/// Actual protected-root upload offers, by local selection cause; no entity ids.
+pub(crate) fn claude_money_protected_offers(counts: &impl Serialize) {
+    traversal_point("claude_money_protected_offers", "claude_code", counts);
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Source {

@@ -353,17 +353,23 @@ impl NativeBodyBudget<'_> {
 }
 
 impl Completion {
+    /// Ordinary terminal census receipts do not filter emission. Only an
+    /// actual optimization/fallback must keep its native comparison body.
+    pub(crate) fn filters_emission(&self) -> bool {
+        self.fallback.is_some()
+            || !self.target_charges.revisions.is_empty()
+            || self
+                .window
+                .as_ref()
+                .is_some_and(|window| !window.roots.is_empty())
+    }
+
     pub(crate) fn record_native_observations_paid(
         &mut self,
         scan: &SourceScanResult,
         index: &mut ScanIndex,
     ) -> Result<Option<ClaudeNativeObservations>, crate::source_rotation::LocalRefusal> {
-        let active = self.fallback.is_some()
-            || !self.target_charges.revisions.is_empty()
-            || self
-                .window
-                .as_ref()
-                .is_some_and(|window| !window.roots.is_empty());
+        let active = self.filters_emission();
         if !active {
             // No emission filtering requires an early observation receipt.
             // The unchanged final canonical fold performs this work once.
