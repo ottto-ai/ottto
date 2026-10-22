@@ -1284,6 +1284,7 @@ pub(super) mod test_hooks {
         static BUCKETS: RefCell<Vec<super::sampled_jsonl::Bucket>> = const { RefCell::new(Vec::new()) };
         static UNREADABLE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
         static FINISH_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        static FINALIZATIONS: RefCell<Vec<Finalization>> = const { RefCell::new(Vec::new()) };
         static INS_EXTRA: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
 
@@ -1300,7 +1301,30 @@ pub(super) mod test_hooks {
         BUCKETS.with(|buckets| buckets.borrow_mut().clear());
         UNREADABLE.with(|causes| causes.borrow_mut().clear());
         FINISH_ERRORS.with(|errors| errors.borrow_mut().clear());
+        FINALIZATIONS.with(|records| records.borrow_mut().clear());
         INS_EXTRA.with(|term| term.set(None));
+    }
+
+    /// One completion's finalization check (diagnostic receipts): the budget
+    /// it was checked against, the finished bound (at that budget when it
+    /// fit; otherwise re-walked at `usize::MAX`, `None` when even that walk
+    /// fails: a failed measurement, not a bound above budget), whether it
+    /// fit, whether a retained copy was pending, and the release rank.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::snapshots) struct Finalization {
+        pub(in crate::snapshots) budget: usize,
+        pub(in crate::snapshots) charge: Option<usize>,
+        pub(in crate::snapshots) within_budget: bool,
+        pub(in crate::snapshots) copy_pending: Option<bool>,
+        pub(in crate::snapshots) released: Option<(i64, i64)>,
+    }
+
+    pub(in crate::snapshots) fn record_finalization(record: Finalization) {
+        FINALIZATIONS.with(|records| records.borrow_mut().push(record));
+    }
+
+    pub(in crate::snapshots) fn finalizations() -> Vec<Finalization> {
+        FINALIZATIONS.with(|records| records.borrow().clone())
     }
 
     pub(in crate::snapshots) fn fire(point: Point) {

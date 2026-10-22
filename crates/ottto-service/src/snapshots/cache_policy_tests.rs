@@ -492,6 +492,156 @@ fn append_padded_usage_at(tailed: &ScanFixture, id: usize) {
     ));
 }
 
+/// M1 (ii) diagnostic round (parent grant, 2026-10-22): one completion
+/// phase as the existing test hooks see it. Test-only, content-free: sizes,
+/// ranks and synthetic labels.
+struct DiagnosticPhase {
+    point: &'static str,
+    /// Nonzero lifecycle counters at this point (`observed`).
+    counts: Option<Counts>,
+    /// The retained cache's bound (R) and the whole shared cache's (R + P).
+    retained: Option<usize>,
+    whole: Option<usize>,
+    /// Residents in victim order: (key, admitted hint, exact bytes freed).
+    victims: Vec<(String, (i64, i64), usize)>,
+}
+
+fn diagnostic_phase(point: &'static str, cache: &sampled_scan::SharedCache) -> DiagnosticPhase {
+    let (retained, victims) = match cache.retained() {
+        Ok(retained) => (
+            crate::heap_layout_bound::bound(&*retained, usize::MAX),
+            retained.victims(),
+        ),
+        Err(_) => (None, Vec::new()),
+    };
+    DiagnosticPhase {
+        point,
+        counts: crate::local_resource_diagnostics::cache_lifecycle::observed(),
+        retained,
+        whole: crate::heap_layout_bound::bound(cache, usize::MAX),
+        victims,
+    }
+}
+
+/// Records a `DiagnosticPhase` at each completion test point, through the
+/// existing `test_hooks` points.
+fn diagnostic_phase_hooks(
+    cache: &Arc<sampled_scan::SharedCache>,
+) -> std::rc::Rc<std::cell::RefCell<Vec<DiagnosticPhase>>> {
+    use sampled_scan::test_hooks::Point;
+    let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    for (point, label) in [
+        (Point::BeforeRetain, "before_retain"),
+        (Point::BeforeStampGate, "before_stamp_gate"),
+        (Point::AfterRetain, "after_retain"),
+    ] {
+        let cache = Arc::clone(cache);
+        let phases = std::rc::Rc::clone(&phases);
+        sampled_scan::test_hooks::set(point, move || {
+            phases.borrow_mut().push(diagnostic_phase(label, &cache));
+        });
+    }
+    phases
+}
+
+/// `name=value` for every nonzero counter (from `Counts`' `Debug`).
+fn nonzero_counts(counts: &Counts) -> String {
+    let text = format!("{counts:?}");
+    let body = text
+        .trim_start_matches("Counts {")
+        .trim_end_matches('}')
+        .trim();
+    body.split(", ")
+        .filter(|field| !field.ends_with(": 0"))
+        .map(|field| field.replace(": ", "="))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The diagnostic receipt (`CACHE_POLICY_DIAG`), printed before the calling
+/// row's assertions. Keys are labelled (`tailed`, `filler-N`, `other`).
+fn print_diagnostic_receipt(
+    cache: &Arc<sampled_scan::SharedCache>,
+    tailed: &ScanFixture,
+    start: DiagnosticPhase,
+    phases: &std::rc::Rc<std::cell::RefCell<Vec<DiagnosticPhase>>>,
+    end_counts: &Counts,
+    resident_before: usize,
+) {
+    let tailed_key = tailed.key();
+    let label = |key: &str| {
+        if key == tailed_key {
+            "tailed".to_string()
+        } else if let Some(number) = key.strip_prefix("cache-policy-filler-") {
+            format!("filler-{number}")
+        } else {
+            "other".to_string()
+        }
+    };
+    let render = |phase: &DiagnosticPhase| {
+        let victims = phase
+            .victims
+            .iter()
+            .map(|(key, hint, freed)| format!("{}@{}.{:09}:{freed}", label(key), hint.0, hint.1))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "[{} retained={:?} whole={:?} victims=[{victims}] counts=[{}]]",
+            phase.point,
+            phase.retained,
+            phase.whole,
+            phase
+                .counts
+                .as_ref()
+                .map(nonzero_counts)
+                .unwrap_or_default()
+        )
+    };
+    let end = diagnostic_phase("end", cache);
+    let mut rendered = vec![render(&start)];
+    rendered.extend(phases.borrow().iter().map(render));
+    rendered.push(render(&end));
+    // Released residents: present at the stamp gate (or before retention),
+    // gone after retention.
+    let released = {
+        let phases = phases.borrow();
+        let before = phases
+            .iter()
+            .rev()
+            .find(|phase| phase.point != "after_retain")
+            .map_or(&start.victims, |phase| &phase.victims);
+        let after = phases
+            .iter()
+            .find(|phase| phase.point == "after_retain")
+            .map(|phase| &phase.victims);
+        after.map(|after| {
+            before
+                .iter()
+                .filter(|(key, _, _)| !after.iter().any(|(kept, _, _)| kept == key))
+                .map(|(key, hint, freed)| (label(key), *hint, *freed))
+                .collect::<Vec<_>>()
+        })
+    };
+    let released_bytes = released
+        .as_ref()
+        .map(|released| released.iter().map(|(_, _, freed)| freed).sum::<usize>());
+    eprintln!(
+        "CACHE_POLICY_DIAG test={} resident_before={resident_before} entry_bytes={} entry_overhead={} entry_slot_bytes={:?} decode_peak=n/a(#667_not_on_base) probe={:?} decisions={:?} buckets={:?} finalizations={:?} released={released:?} released_bytes={released_bytes:?} end_counts=[{}] phases={}",
+        std::thread::current().name().unwrap_or("unnamed"),
+        crate::transcript_cache::entry_bytes(),
+        crate::transcript_cache::entry_overhead::<sampled_jsonl::CachedJsonlReduction>(),
+        crate::transcript_cache::entry_slot_bytes::<sampled_jsonl::CachedJsonlReduction>(
+            tailed_key.len()
+        ),
+        sampled_scan::test_hooks::last_probe(),
+        sampled_scan::test_hooks::decisions(),
+        sampled_scan::test_hooks::buckets(),
+        sampled_scan::test_hooks::finalizations(),
+        nonzero_counts(end_counts),
+        rendered.join(" "),
+    );
+}
+
 /// `full_cache_with_retained_file`, then `append` to the file and read the
 /// append as a tail that meets a zero copy budget at a step start.
 fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBesideFullCache {
@@ -508,12 +658,15 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
         tailed.set_modified(unix_now() - OLD_SECONDS + 1);
     }
     sampled_scan::test_hooks::clear();
+    let phases = diagnostic_phase_hooks(&cache);
+    let start = diagnostic_phase("start", &cache);
     let (tail, counts) = observe(|| observed_scan(&tailed, source, index, &cache));
     let r0 = format!(
         "probe={:?} decisions={:?}",
         sampled_scan::test_hooks::last_probe(),
         sampled_scan::test_hooks::decisions()
     );
+    print_diagnostic_receipt(&cache, &tailed, start, &phases, &counts, resident_before);
     sampled_scan::test_hooks::clear();
     assert_eq!(
         tail.modes,
