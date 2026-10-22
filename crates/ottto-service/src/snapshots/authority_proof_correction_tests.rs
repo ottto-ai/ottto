@@ -2411,7 +2411,13 @@ fn binding_family() -> (
 fn demotion_after_same_call_reproof_binds_current_witness() {
     let (scratch, root, mut index, items, mut api, trace) = binding_family();
     let old = claude_usage_family_witness_fingerprint(&index.claude_usage_family_witnesses[&root]);
-    api.evidence.get_mut(&root).unwrap()[0].fingerprint = format!("sha256:{}", apc_hex('9'));
+    let row = &mut api.evidence.get_mut(&root).unwrap()[0];
+    row.cost_usd_micros = Some(200);
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(row).unwrap())
+    );
     // Controlled seam: native observations retain the complete real family;
     // the page item has no matching rows, so its rebuild cannot become v1.
     let counts = accumulate_claude_usage_family_pending_with_limit(
