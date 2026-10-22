@@ -13938,6 +13938,13 @@ impl SnapshotAccumulator {
             self.codex_legacy_bootstrap_valid = true;
         }
         if task_started || !self.codex_legacy_bootstrap_buffer.is_empty() {
+            if self.codex_proof_decision_only {
+                // U1a-2a (fix round 2b, DM1): a job child keeps no record. This
+                // arm settles `NotAFork` before the child's next step, so its
+                // buffer is never applied; a clone here would retain a whole
+                // decoded line (count-only children, R2).
+                return;
+            }
             if self.codex_legacy_bootstrap_buffer.len() == MAX_BOOTSTRAP_RECORDS {
                 self.codex_legacy_bootstrap_buffer.clear();
                 self.codex_legacy_bootstrap_valid = false;
@@ -16873,23 +16880,36 @@ impl CodexProofReaders {
         })
     }
 
-    /// R2-B1, owner note 4 (r79), fix round 2 (DM1): whether the readers'
-    /// charge before one more line fits `room` (`run`). From a walk `W`
-    /// (with buffer capacity `B`) and `s` bytes consumed since (`s <
+    /// R2-B1, owner note 4 (r79), fix rounds 2/2b (DM1): whether the
+    /// readers' charge before one more line fits `room` (`run`). From a walk
+    /// `W` (with buffer capacity `B`) and `s` bytes consumed since (`s <
     /// CHARGE_REFRESH_BYTES`), the readers hold at most
     /// `W + (W - B) + 2s + ΔB` before the next line, on E3's premise
     /// (retained growth at most twice the bytes consumed) plus one doubling
     /// of every walked non-buffer container and the measured buffer growth;
-    /// one `MAX_JSONL_LINE_BYTES` is charged for the next line. On that
-    /// generic premise the next line (L ≤ `MAX_JSONL_LINE_BYTES`) can add
-    /// `2L` retained plus up to `MAX_JSONL_LINE_BYTES` of buffer, so the
-    /// step stays within `room + 2 × MAX_JSONL_LINE_BYTES`, not `room` plus
-    /// one line. Charging `2 × MAX_JSONL_LINE_BYTES` here would exceed the
-    /// whole proof room (`STATE_BYTES` = 31 MiB) and refuse every step; the
-    /// fix is an owner ruling (a pinned proof-reader premise, or the
-    /// stated bound). Like main's E3, the transient `serde_json::Value` of
-    /// a line being decoded is not charged. Fresh walks use `s = 0`; a miss
-    /// re-walks, then shrinks the buffers and re-walks.
+    /// one `MAX_JSONL_LINE_BYTES` is charged for the next line's buffer.
+    ///
+    /// Fix round 2b (DM1 ruling (a), derivation in the U1a-2a deltas):
+    /// the readers' retained growth for one line `L` is NOT a fixed `k`.
+    /// An ordinary line adds at most a fixed amount (P: its ledger row and
+    /// one ring slot, 64-byte signatures; the acquisition's head/boundary
+    /// samples, `SAMPLE_BYTES` each, and their staged copy; a child: its
+    /// paged signature and fixed-size digest/counters). Line-proportional
+    /// retention remains in two places: each reader's first `session_meta`
+    /// line keeps its header strings (`codex_creator_header_id` and
+    /// `source_session_id` both copy the id, `started_at` and
+    /// `last_activity_at` both copy the timestamp, `origin.*`,
+    /// `workspace_path`, `codex_parent_session_ref`: at most `2L`, once per
+    /// reader), and an overlong line's paused skip keeps its salvaged
+    /// timestamp (`skipping`, at most `L`, one per reader). So a step stays
+    /// within `room + k` for an ordinary line and within
+    /// `room + 2 × MAX_JSONL_LINE_BYTES` at those lines, not `room`.
+    /// Charging `2 × MAX_JSONL_LINE_BYTES` would exceed the whole proof room
+    /// (`STATE_BYTES` = 31 MiB) and refuse every step; the bound is a
+    /// disclosure for the parent's ruling. Like main's E3, the transient
+    /// `serde_json::Value` of a line being decoded is not charged. Fresh
+    /// walks use `s = 0`; a miss re-walks, then shrinks the buffers and
+    /// re-walks.
     fn step_fits(&mut self, walk: &mut Option<ProofWalk>, room: usize) -> bool {
         let buffers = self.buffers();
         let worst = |walk: ProofWalk, since: usize, buffers: usize| {

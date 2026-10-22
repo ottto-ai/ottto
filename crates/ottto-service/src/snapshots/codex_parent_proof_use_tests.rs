@@ -1246,6 +1246,214 @@ fn a_suspended_job_does_not_keep_a_long_lines_buffer() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Fix round 2b (DM1 ruling (a)): the derived fixed amount an ordinary
+/// line adds to the readers' retained state, whatever its length or shape:
+/// P's ledger row and one ring slot and a child's paged signature (64-byte
+/// signatures), plus the acquisition's head and boundary samples
+/// (`SAMPLE_BYTES` each, at most doubled capacity).
+const ORDINARY_LINE_RETAINED: usize = 4 * SAMPLE_BYTES + 1024;
+
+/// The job's walked bound less its reader buffers' capacity (the buffer is
+/// the charged `MAX_JSONL_LINE_BYTES` term).
+fn retained(job: &CodexProofReaders) -> usize {
+    crate::heap_layout_bound::bound(job, usize::MAX).unwrap() - job.buffers()
+}
+
+/// Readers that have taken their first `session_meta` line.
+fn headers_seen(job: &CodexProofReaders) -> usize {
+    job.children
+        .iter()
+        .map(|child| &child.reader)
+        .chain(std::iter::once(&job.parent))
+        .filter(|reader| reader.parser.accumulator.codex_session_meta_seen)
+        .count()
+}
+
+/// One reader step (`run` with exactly one step's reserve); the retained
+/// growth it caused and whether it took a reader's first header.
+fn one_step(job: &mut CodexProofReaders) -> (CodexProofRun, isize, bool) {
+    let (before, seen) = (retained(job), headers_seen(job));
+    let mut budget = codex_proof_step_reserve();
+    let run = job.run(&mut budget, usize::MAX);
+    let grew = retained(job) as isize - before as isize;
+    (run, grew, headers_seen(job) != seen)
+}
+
+/// Fix round 2b (DM1 ruling (a), adversarial control): max-length,
+/// container-heavy and field-heavy lines, signed and unsigned, through P's
+/// ledger reader and a deciding child: every ordinary step's retained
+/// growth is at most `ORDINARY_LINE_RETAINED`, independent of the line.
+#[test]
+fn an_ordinary_proof_line_retains_a_fixed_amount_whatever_its_length_or_shape() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("job-line-k");
+    let long = MAX_JSONL_LINE_BYTES - 4096;
+    // Container-heavy (~2 MiB of empty arrays) and field-heavy (100k keys).
+    let items = vec![json!([]); 700_000];
+    let fields: serde_json::Map<String, Value> = (0..100_000)
+        .map(|at| (format!("k{at:06}"), json!(at)))
+        .collect();
+    let shared = vec![
+        turn("2026-08-02T08:00:01Z", &"t".repeat(long)),
+        json!({"timestamp": "2026-08-02T08:00:02Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": "x".repeat(long)}}),
+        json!({"timestamp": "2026-08-02T08:00:03Z", "type": "response_item", "payload": {"items": items}}),
+        json!({"timestamp": "2026-08-02T08:00:04Z", "type": "response_item", "payload": {"fields": fields}}),
+        json!({"timestamp": "2026-08-02T08:00:05Z", "type": "token_usage_record", "payload": {"response_id": "r".repeat(1 << 20)}}),
+        tokens("2026-08-02T08:00:06Z", (100, 80, 10, 2), (100, 80, 10, 2)),
+    ];
+    let mut parent_rows = vec![parent_values()[0].clone()];
+    parent_rows.extend(shared.iter().cloned());
+    parent_rows.push(turn("2026-08-02T08:30:01Z", "parent-later"));
+    parent_rows.push(tokens(
+        "2026-08-02T08:30:02Z",
+        (150, 115, 18, 3),
+        (50, 35, 8, 1),
+    ));
+    let mut child_rows = vec![child_values()[0].clone()];
+    child_rows.extend(shared.iter().cloned());
+    child_rows.push(turn("2026-08-02T08:20:01Z", "child-local"));
+    child_rows.push(tokens(
+        "2026-08-02T08:20:02Z",
+        (115, 92, 13, 3),
+        (15, 12, 3, 1),
+    ));
+    let parent = rollout(&root, PARENT);
+    write_values(&parent, &parent_rows);
+    let child = rollout(&root, CHILD);
+    write_values(&child, &child_rows);
+
+    let mut job = job_of(&parent, &[&child]);
+    let (mut ordinary, mut headers, mut max) = (0, 0, 0);
+    loop {
+        let (run, grew, header) = one_step(&mut job);
+        if header {
+            headers += 1;
+        } else {
+            assert!(
+                grew <= ORDINARY_LINE_RETAINED as isize,
+                "an ordinary step grew {grew}"
+            );
+            max = max.max(grew);
+            ordinary += 1;
+        }
+        if run == CodexProofRun::Done {
+            break;
+        }
+        assert_eq!(run, CodexProofRun::Budget);
+    }
+    assert_eq!(headers, 2, "P's and the child's first header");
+    assert!(ordinary >= shared.len() * 2, "{ordinary} ordinary steps");
+    assert!(
+        matches!(
+            job.children[0].result,
+            Some(ChildResult::Decided { owned: true, .. })
+        ),
+        "{:?} (max ordinary growth {max})",
+        job.children[0].result
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Fix round 2b (DM1, the fallback's reader evidence): what (a) cannot
+/// cover. A reader's first header keeps its strings (the id twice: at
+/// least `2 × id`), and an overlong line's paused skip keeps its salvaged
+/// timestamp: both line-proportional. A decision-only child whose header
+/// takes the legacy arm keeps no decoded record (count-only), however
+/// container-heavy the header.
+#[test]
+fn a_proof_readers_header_and_overlong_salvage_retain_line_proportional_bytes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("job-line-proportional");
+    let big = 1 << 20;
+
+    // A header with a long id: P's first step keeps it twice.
+    let parent = rollout(&root, PARENT);
+    let mut values = parent_values();
+    values[0] = json!({"timestamp": "2026-08-02T08:00:00Z", "type": "session_meta", "payload": {"id": "p".repeat(big), "thread_source": "user"}});
+    write_values(&parent, &values);
+    let mut job = job_of(&parent, &[]);
+    let (run, grew, header) = one_step(&mut job);
+    assert_eq!(run, CodexProofRun::Budget);
+    assert!(header && grew >= 2 * big as isize, "header grew {grew}");
+
+    // An overlong line whose capped prefix carries a long timestamp: the
+    // paused skip keeps it (the buffer is cleared, E4).
+    let timestamp = "2".repeat(4 * big);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        serde_json::to_string(&parent_values()[0])
+            .unwrap()
+            .as_bytes(),
+    );
+    bytes.push(b'\n');
+    bytes.extend_from_slice(format!("{{\"timestamp\":\"{timestamp}\",\"ordinal\":7,\"type\":\"response_item\",\"payload\":{{\"content\":\"").as_bytes());
+    bytes.resize(bytes.len() + MAX_JSONL_LINE_BYTES, b'y');
+    bytes.extend_from_slice(b"\"}}\n");
+    fs::write(&parent, bytes).unwrap();
+    sampled_scan::codex_cursor::with_test_limits(2048, 8192, 64 * 1024, || {
+        let mut job = job_of(&parent, &[]);
+        let (_, _, header) = one_step(&mut job);
+        assert!(header);
+        let (run, grew, header) = one_step(&mut job);
+        assert_eq!(run, CodexProofRun::Budget);
+        assert!(
+            job.parent.parser.reader.skipping.is_some(),
+            "the skip paused"
+        );
+        assert!(job.parent.parser.reader.buf.is_empty());
+        assert!(
+            !header && grew >= timestamp.len() as isize,
+            "salvage grew {grew}"
+        );
+    });
+
+    // A legacy-arm job child: count-only, then `NotAFork`.
+    write_values(&parent, &parent_values());
+    let child = rollout(&root, CHILD);
+    let mut rows = child_values();
+    let items = vec![json!([]); 350_000];
+    rows[0] = json!({"timestamp": "2026-08-02T08:20:00Z", "type": "session_meta", "payload": {
+        "id": CHILD, "forked_from_id": PARENT, "source": {"subagent": {"thread_spawn": {}}},
+        "type": "task_started", "items": items,
+    }});
+    write_values(&child, &rows);
+    let mut job = job_of(&parent, &[&child]);
+    let child_header = loop {
+        let seen = job.children[0]
+            .reader
+            .parser
+            .accumulator
+            .codex_session_meta_seen;
+        let (run, grew, _) = one_step(&mut job);
+        if !seen
+            && job.children[0]
+                .reader
+                .parser
+                .accumulator
+                .codex_session_meta_seen
+        {
+            break grew;
+        }
+        assert_eq!(run, CodexProofRun::Budget);
+    };
+    let accumulator = &job.children[0].reader.parser.accumulator;
+    assert_eq!(
+        accumulator.codex_ownership_boundary,
+        CodexOwnershipBoundary::AwaitingLegacyTrigger
+    );
+    assert!(accumulator.codex_legacy_bootstrap_buffer.is_empty());
+    assert!(
+        child_header < 64 * 1024,
+        "the child header grew {child_header}"
+    );
+    assert_eq!(run_to_end(&mut job), vec![ChildResult::NotAFork]);
+    let _ = fs::remove_dir_all(root);
+}
+
 /// D6(c): the window is allocated once; a push past it, or of an odd shape,
 /// is refused (never a silent drop), and indices stay absolute.
 #[test]
