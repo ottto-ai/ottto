@@ -5554,6 +5554,7 @@ fn finish_sync_source(
         crate::snapshots::claude_request_money::reconcile_saved_money_offers(
             support_dir,
             &committed_index,
+            &index,
             &scan_result.snapshots,
         );
     }
@@ -5962,6 +5963,7 @@ fn finish_sync_source(
         } else if source == SnapshotSource::ClaudeCode {
             crate::snapshots::claude_request_money::reconcile_saved_money_offers(
                 support_dir,
+                saved,
                 saved,
                 &scan_result.snapshots,
             );
@@ -7198,7 +7200,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
 > {
     let request_owned_live = comparison
         .as_ref()
-        .is_none_or(|completion| !completion.filters_emission())
+        .map_or(true, |completion| !completion.filters_emission())
         && crate::snapshots::claude_request_money::request_owned_live(support_dir);
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.

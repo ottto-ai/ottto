@@ -336,6 +336,13 @@ impl ClaudeLedger {
     /// A batch that did not reach the disk: its shards are dirty again (a
     /// zero meta among them is owed again).
     fn restore(&mut self, failed_shards: &[usize], meta: Option<bool>) {
+        // A preceding queued batch may fail after this checkpoint was taken.
+        // Restoring that debt changes the epoch even if its dirty bits were
+        // already cleared into a later queued command.
+        if !failed_shards.is_empty() || meta.is_some() {
+            self.custody_epoch = self.custody_epoch.wrapping_add(1);
+            self.barrier_needed = true;
+        }
         for shard in failed_shards {
             self.dirty[*shard] = true;
         }
@@ -1116,9 +1123,20 @@ impl ClaudeLedger {
 /// not invalidate durable due/dirty/offer/watch authority. A partial save or
 /// failed shard never acknowledges the epoch. No caller-side disk wait.
 pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
+    checkpoint_until(
+        support_dir,
+        ledger,
+        Instant::now() + Duration::from_millis(100),
+    )
+}
+
+pub(super) fn checkpoint_until(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    deadline: Instant,
+) -> bool {
     // No wait and no durable I/O on the caller. A later page reacquires the
     // ledger and checks the completed writer receipt before POST or commit.
-    let deadline = Instant::now() + Duration::from_millis(100);
     if let Some((wait, shards, meta, epoch, complete)) = ledger.pending_checkpoint.take() {
         match wait.try_recv() {
             Ok((failed, meta)) => {
@@ -1504,6 +1522,48 @@ mod refused_intent_tests {
             .get(&support)
             .unwrap()
             .contains_key(&day));
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn checkpoint_retries_a_preceding_queued_custody_write_failure() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-prior-write-receipt");
+        let support = scratch.join("support");
+        let key = "dirty:prior-write";
+        let mut ledger = ClaudeLedger::new_for_test();
+        ledger.put_money(
+            key.into(),
+            ClaudeRequestCensusRecord::money_debt([1; 32], 0),
+        );
+        let blocked = shard_path_for_test(&support, key).with_extension("json.tmp");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let (save, funds) = ledger
+            .take_save(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        let job = WriteJob {
+            support_dir: support.clone(),
+            pending_intent: None,
+            jsonl: super::super::JsonlBatch {
+                now: 1_790_000_000,
+                families: Vec::new(),
+                coverage: super::super::CoverageRow::owed(1_790_000_000),
+                buffer_bytes: 0,
+            },
+            memos: Vec::new(),
+            save: Some(save),
+            reservations: vec![funds],
+        };
+        assert!(submit_batch(&mut ledger, job).is_ok());
+        assert!(!checkpoint(&support, &mut ledger));
+        flush();
+        assert!(
+            !checkpoint(&support, &mut ledger),
+            "an empty successful fence cannot hide the preceding failed custody save"
+        );
+        flush();
+        std::fs::remove_dir_all(blocked).unwrap();
+        assert!(checkpoint_for_test(&support, &mut ledger));
+        assert!(load_for_test(&support).get(key).is_some());
     }
 
     #[test]

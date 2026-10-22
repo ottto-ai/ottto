@@ -1494,7 +1494,7 @@ fn build_page_at(
         let complete = schedule_evidence(ledger, index, now, deadline, &mut budget, &mut updates);
         // Even a partial bootstrap may publish completed invalidations, but
         // its watches cannot advance until that debt is durably on disk.
-        let durable = checkpoint_money_watches(support_dir, ledger, updates);
+        let durable = checkpoint_money_watches_at(support_dir, ledger, updates, deadline);
         if !complete || !durable {
             counts.refused_deadline = u64::from(Instant::now() >= deadline);
             counts.refused_budget = u64::from(counts.refused_deadline == 0);
@@ -1656,7 +1656,7 @@ fn build_page_at(
             &mut budget,
             &mut updates,
         );
-        let durable = checkpoint_money_watches(support_dir, ledger, updates);
+        let durable = checkpoint_money_watches_at(support_dir, ledger, updates, deadline);
         if !complete || !durable {
             counts.refused_deadline = u64::from(Instant::now() >= deadline);
             counts.refused_budget = u64::from(counts.refused_deadline == 0);
@@ -2189,7 +2189,7 @@ pub(crate) fn live_page(
         {
             if last
                 .as_ref()
-                .is_none_or(|prior| super::timestamp_is_after(value, prior))
+                .map_or(true, |prior| super::timestamp_is_after(value, prior))
             {
                 *last = Some(value.clone());
             }
@@ -2204,7 +2204,7 @@ pub(crate) fn live_page(
     let mut primaries = BTreeMap::<String, String>::new();
     for key in index.files.keys() {
         if let Some((_, member)) = logical_family_member(index, key) {
-            let replace = primaries.get(&member).is_none_or(|prior| {
+            let replace = primaries.get(&member).map_or(true, |prior| {
                 selection::primary_order(index, key) < selection::primary_order(index, prior)
             });
             if replace {
@@ -2251,14 +2251,14 @@ pub(crate) fn live_page(
             if item
                 .source_last_activity_at
                 .as_ref()
-                .is_none_or(|prior| super::timestamp_is_after(clock, prior))
+                .map_or(true, |prior| super::timestamp_is_after(clock, prior))
             {
                 item.source_last_activity_at = Some(clock.clone());
             }
             if item
                 .source_ended_at
                 .as_ref()
-                .is_none_or(|prior| super::timestamp_is_after(clock, prior))
+                .map_or(true, |prior| super::timestamp_is_after(clock, prior))
             {
                 item.source_ended_at = Some(clock.clone());
             }
@@ -3602,7 +3602,7 @@ pub(crate) fn settle_money_acks(
         ledger.remove(&format!("hold:body:{}", entry.source_file_fingerprint));
         ledger.remove(&offer_key);
     }
-    reconcile_money_offers(&mut ledger, index, snapshots, deadline);
+    reconcile_money_offers(&mut ledger, index, index, snapshots, deadline);
     // Failure preserves/replays debt; it never manufactures acceptance.
     let _ = store::checkpoint(support_dir, &mut ledger);
 }
@@ -3613,6 +3613,7 @@ pub(crate) fn settle_money_acks(
 fn reconcile_money_offers(
     ledger: &mut ClaudeLedger,
     index: &ScanIndex,
+    proposed_index: &ScanIndex,
     snapshots: &[SnapshotItem],
     deadline: Instant,
 ) {
@@ -3621,10 +3622,24 @@ fn reconcile_money_offers(
             .files
             .len()
             .saturating_mul(256)
+            .saturating_add(proposed_index.files.len().saturating_mul(512))
             .saturating_add(ledger.census().record_count().saturating_mul(256)),
     ) else {
         return;
     };
+    let proposed_sources = union_items_by_source(proposed_index, snapshots);
+    let current_offers = proposed_index
+        .files
+        .iter()
+        .filter_map(|(key, entry)| {
+            let item = proposed_sources.get(entry.source_file_fingerprint.as_str())?;
+            Some(format!(
+                "{}:{}",
+                store::money_key("offer:", key),
+                item.snapshot_fingerprint
+            ))
+        })
+        .collect::<BTreeSet<_>>();
     let by_source = union_items_by_source(index, snapshots);
     let by_member = snapshots
         .iter()
@@ -3663,6 +3678,9 @@ fn reconcile_money_offers(
         if Instant::now() >= deadline {
             return;
         }
+        if current_offers.contains(key) {
+            continue;
+        }
         let Some((prefix, fingerprint)) = key.rsplit_once(':') else {
             continue;
         };
@@ -3688,6 +3706,7 @@ fn reconcile_money_offers(
 pub(crate) fn reconcile_saved_money_offers(
     support: &Path,
     saved: &ScanIndex,
+    proposed_index: &ScanIndex,
     snapshots: &[SnapshotItem],
 ) {
     if !request_owned_live(support) {
@@ -3705,6 +3724,7 @@ pub(crate) fn reconcile_saved_money_offers(
     reconcile_money_offers(
         &mut ledger,
         saved,
+        proposed_index,
         snapshots,
         Instant::now() + Duration::from_millis(100),
     );
@@ -4131,15 +4151,30 @@ fn stage_money_dirty(
     ledger.put_money(key, ClaudeRequestCensusRecord::money_debt(revision, now))
 }
 
+#[cfg(test)]
 fn checkpoint_money_watches(
     support_dir: &Path,
     ledger: &mut ClaudeLedger,
     updates: MoneyWatchUpdates,
 ) -> bool {
+    checkpoint_money_watches_at(
+        support_dir,
+        ledger,
+        updates,
+        Instant::now() + PAGE_MAX_ELAPSED,
+    )
+}
+
+fn checkpoint_money_watches_at(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    updates: MoneyWatchUpdates,
+    deadline: Instant,
+) -> bool {
     if updates.is_empty() {
         return true;
     }
-    if !store::checkpoint(support_dir, ledger) {
+    if !store::checkpoint_until(support_dir, ledger, deadline) {
         return false;
     }
     for (key, record) in updates {
@@ -4208,6 +4243,7 @@ mod scheduling_reconciliation_tests {
         );
         reconcile_money_offers(
             &mut ledger,
+            &ScanIndex::default(),
             &index,
             &[item],
             Instant::now() + PAGE_MAX_ELAPSED,
@@ -4215,7 +4251,13 @@ mod scheduling_reconciliation_tests {
         assert_eq!(ledger.census().records_with_prefix("offer:").count(), 1);
         assert!(ledger.get(&dirty).is_some());
         index.files.clear();
-        reconcile_money_offers(&mut ledger, &index, &[], Instant::now() + PAGE_MAX_ELAPSED);
+        reconcile_money_offers(
+            &mut ledger,
+            &index,
+            &index,
+            &[],
+            Instant::now() + PAGE_MAX_ELAPSED,
+        );
         assert!(store::checkpoint_for_test(&scratch, &mut ledger));
         let restored = store::load_for_test(&scratch);
         assert_eq!(restored.census().records_with_prefix("offer:").count(), 0);

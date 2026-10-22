@@ -429,8 +429,8 @@ pub(crate) fn decode_selections<'de, D: serde::Deserializer<'de>>(
                     if digest(&state.revision)
                         && state.root.len() <= 128
                         && state.member.len() <= 128
-                        && state.consumed.as_deref().is_none_or(digest)
-                        && state.synthetic_body.as_deref().is_none_or(digest)
+                        && state.consumed.as_deref().map_or(true, digest)
+                        && state.synthetic_body.as_deref().map_or(true, digest)
                     {
                         result.insert(key, state);
                     }
