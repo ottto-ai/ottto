@@ -143,6 +143,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 }).unwrap();
             }
             let mut attempts = 0;
+            let mut retained_progress = None;
             let (result, progress_path) = loop {
                 attempts += 1;
                 assert!(attempts <= 24, "resumable writer must converge");
@@ -163,9 +164,25 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                         daemon.snapshot_scan_account_witness().unwrap(),
                         false,
                     )
-                })
-                .unwrap()
-                .expect("real due preparation");
+                });
+                let frame = match frame {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break (Ok(()), retained_progress.expect("resumed progress path")),
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains("request money scheduling checkpoint pending") =>
+                    {
+                        money::store::flush();
+                        continue;
+                    }
+                    Err(error) => {
+                        break (
+                            Err(error),
+                            retained_progress.expect("resumed progress path"),
+                        )
+                    }
+                };
                 let (preparation, index, scan) =
                     collect_native_preparation_with_rotation(frame, false);
                 assert!(index.request_money_live_revision());
@@ -174,6 +191,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     "actual selector must re-read the owed revision"
                 );
                 let progress_path = preparation.upload_progress_path.clone();
+                retained_progress = Some(progress_path.clone());
                 if ack_save_fault && cycle == 0 {
                     P2A_ACK_SAVE_FAILURE
                         .with(|state| *state.borrow_mut() = Some(progress_path.clone()));
@@ -206,6 +224,9 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                         .to_string()
                         .contains("request money scheduling checkpoint pending")
                 }) {
+                    if ledger_fault && cycle == 0 {
+                        break (result, progress_path);
+                    }
                     continue;
                 }
                 break (result, progress_path);
@@ -461,6 +482,7 @@ impl P2aControl {
             .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"))
     }
     fn restart(&mut self) {
+        money_resume::forget_for_test(&self.support);
         crate::snapshots::claude_request_money::store::reload_for_test(&self.support).unwrap();
         self.daemon = test_daemon("otm_test");
     }
@@ -468,8 +490,13 @@ impl P2aControl {
         self.cycle_result().unwrap()
     }
     fn cycle_result(&self) -> Result<(usize, Vec<SnapshotItem>)> {
+        self.cycle_changing(|_| {})
+    }
+    fn cycle_changing(&self, mut change: impl FnMut(usize)) -> Result<(usize, Vec<SnapshotItem>)> {
         use crate::snapshots::claude_request_money as money;
-        for _ in 0..32 {
+        let mut retained = None;
+        for attempt in 0..32 {
+            change(attempt);
             self.cadence.next_due_cycle();
             // Isolate the durable money pause from HTTP backoff, whose own
             // behavior is covered elsewhere. This represents a due retry.
@@ -499,12 +526,24 @@ impl P2aControl {
                     self.daemon.snapshot_scan_account_witness().unwrap(),
                     false,
                 )
-            })
-            .unwrap()
-            .expect("real due preparation");
+            });
+            let frame = match frame {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(retained.expect("resumed exact scan completed")),
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("request money scheduling checkpoint pending") =>
+                {
+                    money::store::flush();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
             let parsed = scan.scanned_file_count;
             let items = scan.snapshots.clone();
+            retained = Some((parsed, items.clone()));
             let result = crate::agent_status_refresh::with_test_collection(collection(), || {
                 finish_sync_source(
                     preparation,
@@ -533,7 +572,10 @@ impl P2aControl {
             result?;
             return Ok((parsed, items));
         }
-        panic!("real prepare/finish writer receipts did not converge")
+        Err(
+            crate::source_rotation::LocalRefusal("request money scheduling checkpoint pending")
+                .into(),
+        )
     }
     fn saved(&self) -> ScanIndex {
         ScanIndex::load(&self.index_path).unwrap()
@@ -545,6 +587,7 @@ impl P2aControl {
 
 impl Drop for P2aControl {
     fn drop(&mut self) {
+        money_resume::forget_for_test(&self.support);
         crate::snapshots::claude_request_money::store::forget_for_test(&self.support);
         let mut deadlines = source_upload_deadlines().lock().unwrap();
         deadlines.remove("claude_code");
@@ -1556,5 +1599,136 @@ fn p2a_accepted_a_restored_older_b_message_only_real_reoffers_settle_loser() {
             before,
             "covering saved ACKs settle both winner and loser after restart"
         );
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_continuously_changing_evidence_finishes_frozen_epoch_then_next_epoch() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("continuous custody: UNEXECUTED unsupported layout");
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::new(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let mut sequence = 0;
+    let mut counts = Vec::new();
+    for epoch in 0..2 {
+        let before = control.offers().len();
+        let mut attempts = 0;
+        control
+            .cycle_changing(|attempt| {
+                attempts += 1;
+                assert!(
+                    attempt < 12,
+                    "writer ACKs must bound progress despite ongoing input"
+                );
+                sequence += 1;
+                let clock = (OffsetDateTime::now_utc() - TimeDuration::hours(2))
+                    .format(&Rfc3339)
+                    .unwrap();
+                let row = serde_json::json!({"timestamp":clock, "type":"assistant",
+                "sessionId":IDENTITY_PIPELINE_ROOT, "requestId":format!("active-{sequence}"),
+                "message":{"id":format!("active-message-{sequence}"), "model":"claude-haiku-4-5",
+                    "usage":{"input_tokens":sequence + 30,"output_tokens":1}}});
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(control.transcript())
+                    .unwrap()
+                    .write_all(format!("{row}\n").as_bytes())
+                    .unwrap();
+                // All three actual evidence sources change on EVERY turn, including
+                // the turn that consumes each writer receipt. No quiet retry exists.
+                write_native_bootstrap_sidecars(&control.fixture, &control.support);
+            })
+            .unwrap();
+        assert!(attempts > 1, "exercise actual asynchronous custody yields");
+        let offers = control.offers();
+        assert!(offers.len() > before, "epoch {epoch} must actually POST");
+        let offered = &offers[before];
+        assert_eq!(
+            offered["usage_accounting_contract"],
+            money::REQUEST_OWNED_CONTRACT
+        );
+        counts.push(offered["request_count"].as_u64().unwrap());
+        let saved = control.saved();
+        assert!(saved
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
+        let fp = offered["snapshot_fingerprint"].as_str().unwrap();
+        assert!(
+            saved.accepted_snapshot_fingerprint_recorded(fp),
+            "exact body's durable ACK and selected save complete under activity"
+        );
+    }
+    assert_eq!(
+        counts[0], 3,
+        "first checkpoint owns its frozen two original requests plus first append"
+    );
+    assert!(
+        counts[1] > counts[0],
+        "later evidence belongs to the next checkpoint epoch"
+    );
+    assert!(
+        sequence + 2 > counts[1],
+        "input continues changing even on the last resumed turn"
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_checkpoint_resume_revalidates_selected_state_protection_and_live_gate() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("resume revalidation: UNEXECUTED unsupported layout");
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for reason in ["selected index", "protection list", "live custody"] {
+        let control = P2aControl::new(FinishOutcome::Accept);
+        let _live = money::LiveForTest::new(&control.support);
+        let result = control.cycle_changing(|attempt| {
+            if attempt == 1 {
+                match reason {
+                    "selected index" => {
+                        control.saved().save(&control.index_path).unwrap();
+                    }
+                    "protection list" => std::fs::write(
+                        control
+                            .support
+                            .join("snapshots/claude_code-reemission-exclusions.txt"),
+                        format!("{IDENTITY_PIPELINE_ROOT}\n"),
+                    )
+                    .unwrap(),
+                    "live custody" => {
+                        std::fs::write(control.support.join("claude-request-owned-live.off"), b"")
+                            .unwrap()
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+        assert!(
+            result.unwrap_err().to_string().contains(reason),
+            "must revalidate {reason}"
+        );
+        assert!(
+            control.offers().is_empty(),
+            "stale continuation must never POST"
+        );
+        assert!(control
+            .saved()
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision != 3));
     }
 }

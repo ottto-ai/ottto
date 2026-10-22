@@ -522,7 +522,7 @@ impl RearmFixture {
                 cycle_request_identity_permit(SnapshotSource::ClaudeCode, &frame.activity_hint),
                 frame.prepared_claude_evidence.take(),
                 comparison_completion.as_mut(),
-                frame.native_comparison_lease.as_ref(),
+                frame.native_comparison_lease.as_mut(),
             )
         } else {
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
