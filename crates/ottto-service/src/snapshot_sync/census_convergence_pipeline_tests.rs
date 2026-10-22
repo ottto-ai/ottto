@@ -24,6 +24,8 @@ fn pipeline_transcript_line(session: &str, request: &str, second: u32) -> String
 enum PipelineUpload {
     Accept,
     ServerDeferred,
+    /// The page settles as a validated permanent refusal (`Rejected`).
+    ServerRejected,
 }
 
 struct PipelineCycle<'a> {
@@ -196,8 +198,10 @@ impl PipelineFixture {
         // Completed/restorable holds are the sole changed production route.
         // Keep all existing field/ACK/debt/restart assertions below, and compare
         // the full state at that boundary with the borrowed reference surface.
-        let borrowed_reference = (matches!(&upload, PipelineUpload::Accept)
-            && holds.any()
+        let borrowed_reference = (matches!(
+            &upload,
+            PipelineUpload::Accept | PipelineUpload::ServerRejected
+        ) && holds.any()
             && !holds.progress_blocking
             && index.locally_held_keys_restorable(
                 &committed_index,
@@ -219,12 +223,15 @@ impl PipelineFixture {
             PipelineUpload::ServerDeferred => {
                 settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
             }
+            PipelineUpload::ServerRejected => {
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+            }
         };
         if let Some(reference) = borrowed_reference {
             assert_eq!(
                 serde_json::to_vec(&settlement.index).unwrap(),
                 reference,
-                "owned Completed settlement preserves the entire borrowed state"
+                "{upload:?}: restorable holds settle through the owned Completed restore path"
             );
         }
         let mut index = settlement.index;
@@ -1112,4 +1119,187 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             0
         );
     }
+}
+
+/// The restorable terminal authority shape above: a committed family whose
+/// changed revision a terminal authority quarantine binds. The first bounded
+/// page settles through `first_upload`, the terminal page is accepted.
+fn terminal_bound_hold_traversal(
+    name: &str,
+    first_upload: PipelineUpload,
+    retry_pending: bool,
+) -> (PipelineFixture, ScanIndex, PipelinePage, PipelinePage) {
+    let fixture = PipelineFixture::new(name);
+    let baseline = fixture.baseline();
+    fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+    if retry_pending {
+        fixture.inject_retry_pending_family();
+    }
+    let cycle = PipelineCycle {
+        proven_owner_session: Some(PIPELINE_HELD_SESSION),
+        first_page_upload: first_upload,
+        ..PIPELINE_HOLD_CYCLE
+    };
+    let first = fixture.page("2026-08-02T09:00:00Z", &cycle, first_upload);
+    assert!(!first.scan.census_complete);
+    assert_eq!(first.held.len(), 1, "the changed demoted revision is held");
+    assert_eq!(first.progress_blocking, retry_pending);
+    assert_eq!(first.index.claude_account_deferred_hold_count(), 0);
+    assert!(!first.fully_settled, "a held page keeps backfill pending");
+    let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+    assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
+    (fixture, baseline, first, last)
+}
+
+/// H1: a `Rejected` page (a validated permanent refusal) whose only local
+/// hold is bound to a terminal authority record settles the hold through the
+/// same restore path a `Completed` page uses, so the traversal completes its
+/// census in the same window. The family stays named, terminal residue: its
+/// quarantine is rebound to the held revision and counted as terminal
+/// ownership-incomplete, the held body is never uploaded or accepted, and
+/// backfill stays pending on the held page.
+#[test]
+#[serial(source_manifests)]
+fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let (_fixture, baseline, first, last) = terminal_bound_hold_traversal(
+        "claude-census-rejected-terminal-bound-hold",
+        PipelineUpload::ServerRejected,
+        false,
+    );
+    let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+    assert!(
+        !first.index.bounded_sweep_had_unsettled_upload(),
+        "terminal-bound holds no longer leave a Rejected page unsettled"
+    );
+    assert_eq!(
+        first.index.files[&held_key].last_snapshot_fingerprint,
+        baseline.files[&held_key].last_snapshot_fingerprint
+    );
+    let held_revision = first
+        .index
+        .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION)
+        .expect("terminal quarantine bound to the held revision");
+
+    assert!(last.scan.census_complete, "the census completes in window");
+    let held_body = first.held.iter().next().expect("held body");
+    for page in [&first, &last] {
+        assert!(!page.uploaded.contains(held_body));
+    }
+    let settled = &last.index;
+    assert!(!settled.accepted_snapshot_fingerprint_recorded(held_body));
+    assert!(!settled.current_snapshot_fingerprints().contains(held_body));
+    assert_eq!(
+        settled.file_snapshot_fingerprints[&held_key],
+        baseline.file_snapshot_fingerprints[&held_key]
+    );
+    // Named residue: the terminal record still binds the held revision.
+    assert_eq!(
+        settled.bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
+        Some(held_revision)
+    );
+    assert_eq!(settled.claude_usage_authority_pending_count(), 0);
+    // Counted residue: terminal ownership-incomplete, disclosed on the receipt.
+    let counts =
+        SyncCounts::from_scan_result(&last.scan, 0, 183).with_snapshot_terminal_counts(settled);
+    assert!(counts.census_complete);
+    assert!(counts.terminal_ownership_incomplete_file_count >= 1);
+    assert_ne!(counts.disclosed_loss(), DisclosedLoss::None);
+    let (window_start, window_end) =
+        snapshot_manifest_window(&last.scan.census_window_end, 183).expect("manifest window");
+    let manifest = settled
+        .manifest_for_window(SnapshotSource::ClaudeCode, &window_start, &window_end)
+        .expect("complete activity witness");
+    assert_eq!(
+        manifest,
+        baseline
+            .manifest_for_window(SnapshotSource::ClaudeCode, &window_start, &window_end)
+            .expect("baseline manifest")
+    );
+    assert_eq!(
+        cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode),
+        Some(manifest)
+    );
+
+    // Control: the refusal still reports as today. The held page is not
+    // fully settled, so neither a non-dominated nor a dominated-only refusal
+    // becomes Success.
+    for refusals in [
+        PermanentRefusalCounts {
+            total: 1,
+            dominated: 0,
+        },
+        PermanentRefusalCounts {
+            total: 1,
+            dominated: 1,
+        },
+    ] {
+        assert!(matches!(
+            refused_entity_state(true, refusals, first.fully_settled),
+            CollectorState::Error {
+                code: "backend_validation_error",
+                ..
+            }
+        ));
+    }
+}
+
+/// Controls for H1. A `Deferred` page keeps its own retryable conflict, a
+/// RetryPending authority family anywhere keeps path (a), and a terminal hold
+/// with no committed entry to restore (path (b), after a historical replay
+/// reset) stays progress-blocking. Each still leaves the page unsettled and
+/// withholds the census, with no manifest.
+#[test]
+#[serial(source_manifests)]
+fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_census() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    for (name, upload, retry_pending) in [
+        (
+            "claude-census-deferred-terminal-bound-hold",
+            PipelineUpload::ServerDeferred,
+            false,
+        ),
+        (
+            "claude-census-rejected-retry-pending-hold",
+            PipelineUpload::ServerRejected,
+            true,
+        ),
+    ] {
+        let (_fixture, _baseline, first, last) =
+            terminal_bound_hold_traversal(name, upload, retry_pending);
+        assert!(first.index.bounded_sweep_had_unsettled_upload(), "{name}");
+        assert!(!last.scan.census_complete, "{name}: owes a clean follow-up");
+        assert!(!last.backfill_succeeded, "{name}");
+        assert!(
+            cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none(),
+            "{name}"
+        );
+    }
+
+    // Path (b): a replay reset leaves the bound terminal hold nothing to
+    // restore, so a Rejected page still blocks.
+    let fixture = PipelineFixture::new("claude-census-rejected-unrestorable-hold");
+    fixture.baseline();
+    fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+    let cycle = PipelineCycle {
+        replay_generation: "replay-generation-reset",
+        proven_owner_session: Some(PIPELINE_HELD_SESSION),
+        historical_replay: true,
+        first_page_upload: PipelineUpload::ServerRejected,
+        ..PIPELINE_HOLD_CYCLE
+    };
+    let first = fixture.page(
+        "2026-08-02T09:00:00Z",
+        &cycle,
+        PipelineUpload::ServerRejected,
+    );
+    assert_eq!(first.held.len(), 1);
+    assert!(!first.progress_blocking);
+    assert!(first.index.bounded_sweep_had_unsettled_upload());
+    let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+    assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
+    assert!(!last.scan.census_complete);
+    assert!(!last.backfill_succeeded);
+    assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
 }
