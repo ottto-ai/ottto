@@ -8272,9 +8272,12 @@ fn deferred_intermediate_parent_is_not_reread_every_generation() {
 }
 
 /// Fix round 6 (control B): C -> P -> X with X's ref never fitting, so C is
-/// held `DeferredRef` under P's step-map witness. C's proof turns `Proven`
-/// (its hold memo ends), C's next parse installs it, the witness arm holds C
-/// anyway, and that hold is memoized: from the page after, C is not parsed.
+/// held `DeferredRef` under P's step-map witness. C's hold memo ends and its
+/// proof turns `Proven` once C's parser is built (as in control A: no install,
+/// no refusal, the record site sees `Proven`). The witness arm holds C, and
+/// that hold is memoized: from the page after, C is not parsed. (An install
+/// would change nothing here: the witness arm drops a proof unused, so the
+/// record site reads the same no-proof, no-refusal parse.)
 #[test]
 fn a_witnessed_deferred_ref_hold_stays_memoized_beside_its_proven_entry() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -8299,11 +8302,12 @@ fn a_witnessed_deferred_ref_hold_stays_memoized_beside_its_proven_entry() {
         index = fixture_generation(&fixture, &cache, index, n).0;
     }
     let (parent, child) = (fixture.file(PARENT), fixture.file(CHILD));
+    cache.memo_forget(&stored_key(&cache, &child).expect("C's hold memo"));
     let mut key = None;
     index.traversal = None;
     let ((index, held), parsed) = parses(|| {
         page_between(&fixture, index, &cache, &collected_at(3), |scan| {
-            if key.is_none() {
+            if key.is_none() && active_is(scan, &child) {
                 key = Some(prove_child(
                     scan,
                     &cache,
@@ -8315,16 +8319,13 @@ fn a_witnessed_deferred_ref_hold_stays_memoized_beside_its_proven_entry() {
             }
         })
     });
-    let key = key.unwrap();
+    let key = key.expect("C's parse spans step calls");
     assert_eq!(parsed, vec![file_name(&child)], "{}", counters(&cache));
     assert_eq!(parent_causes(&held), only(DeferredRef, 2));
-    assert!(
-        matches!(
-            index.codex_parent_prefix_proofs.get(&key),
-            Some(CodexParentProofState::Proven(_))
-        ),
-        "installed, not refused"
-    );
+    assert!(matches!(
+        index.codex_parent_prefix_proofs.get(&key),
+        Some(CodexParentProofState::Proven(_))
+    ));
     assert!(stored_key(&cache, &child).is_some(), "{}", counters(&cache));
     let hits = counter(&cache, |c| c.memo_hits);
     let ((_, again), parsed) = parses(|| fixture_generation(&fixture, &cache, index, 4));
