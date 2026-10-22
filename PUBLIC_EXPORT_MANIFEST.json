@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 800,
-  "content_sha256": "67857d33e23c5c4da03227d0d0a70185276daf12482888b14b2643bcedeacca2",
+  "content_sha256": "0e50b085baa91c9a23f11f91e071271b305eba2f236f7d7ffe3aaf3fa8e2ddd2",
   "files": [
     {
       "executable": false,
@@ -1413,8 +1413,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "cdd985c7afa303a6329d1acc47280ba9019a6d263b36aabd34208850af5d840b",
-      "size_bytes": 875632
+      "sha256": "d0234e5f23c768e63393496a6cf77941b64fbf233120061cd75d20b9f4718516",
+      "size_bytes": 875943
     },
     {
       "executable": false,
@@ -1427,8 +1427,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/census_convergence_pipeline_tests.rs",
-      "sha256": "cb99df35dacb712da5024481d9af0dd020f282f18112e843acdb687ae2590e6c",
-      "size_bytes": 78142
+      "sha256": "d10e6493f20832b11968d234c5dc29005cd1707dfae4c242cc64ebdf07c7f0ff",
+      "size_bytes": 87644
     },
     {
       "executable": false,
@@ -3828,8 +3828,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-terminal-bound-hold-settlement.md",
-      "sha256": "91910b543ceb6bdbc26bbd68ea651fb91c7cb71a17aaa6b3bd4366440c224340",
-      "size_bytes": 3304
+      "sha256": "55d2e7bc8609695e43df1bef19ac04bf66697a42d8ca54a00ab0cc7c65c1959c",
+      "size_bytes": 3865
     },
     {
       "executable": false,
@@ -5603,7 +5603,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T22:26:20+00:00",
+  "generated_at": "2026-10-22T22:28:27+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 801,
   "public_roots": [
@@ -5642,5 +5642,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "1951b495711cdcb1d593e9c2e89c0d1f9f24a16e"
+  "source_commit": "edcc0f021d8e023c433cec7426547bb12555f5fd"
 }

@@ -51,9 +51,13 @@ struct PipelinePage {
     fully_settled: bool,
     backfill_succeeded: bool,
     held: BTreeSet<String>,
+    /// Exact held bodies observed before production classification removes them.
+    held_bodies: Vec<SnapshotItem>,
     /// The page's hold classification, before settlement.
     progress_blocking: bool,
     uploaded: BTreeSet<String>,
+    /// Exact bodies passed to the synthetic transport, after policy/finalization.
+    uploaded_bodies: Vec<SnapshotItem>,
     result: ResumableUploadResult,
     progress: SnapshotUploadProgress,
 }
@@ -65,6 +69,8 @@ struct PipelineFixture {
     index_path: PathBuf,
     page_files: usize,
     durable_progress: bool,
+    request_identity: bool,
+    conflicting_creator: bool,
 }
 
 impl PipelineFixture {
@@ -85,6 +91,8 @@ impl PipelineFixture {
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
+            request_identity: false,
+            conflicting_creator: false,
             base,
             root,
             support,
@@ -137,18 +145,78 @@ impl PipelineFixture {
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&self.root),
+        let mut scan = if self.request_identity {
+            let mut state = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&self.root),
+                index,
+                collected_at,
+                183,
+                self.page_files,
+                true,
+                Some(&self.support),
+                &[],
+                false,
+                true,
+                true,
+            );
+            loop {
+                match state.step(None) {
+                    crate::snapshots::OwnedSourceScanStep::Pending(next) => state = next,
+                    crate::snapshots::OwnedSourceScanStep::Complete {
+                        index: complete_index,
+                        scan,
+                        ..
+                    } => {
+                        index = complete_index;
+                        break scan;
+                    }
+                }
+            }
+        } else {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&self.root),
+                &mut index,
+                collected_at,
+                183,
+                self.page_files,
+                true,
+            )
+            .expect("scan bounded Claude page")
+        };
+        let permit = self.request_identity.then(|| {
+            crate::snapshots::claude_request_identity::emission_permit(
+                SnapshotSource::ClaudeCode,
+                Some(crate::snapshots::claude_request_identity::COHORT_HINT_TOKEN),
+            )
+            .expect("synthetic capture-ON permit")
+        });
+        let (mut disposition, census_withheld, _) = apply_claude_local_evidence_to_scan_with_permit(
+            &self.support,
+            &mut scan,
             &mut index,
-            collected_at,
-            183,
-            self.page_files,
-            true,
-        )
-        .expect("scan bounded Claude page");
-        let (mut disposition, census_withheld, _) =
-            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+            permit,
+        );
+        if self.conflicting_creator {
+            for item in scan
+                .snapshots
+                .iter_mut()
+                .filter(|item| item.source_session_id == PIPELINE_HELD_SESSION)
+            {
+                // Synthetic creator proof contradicts the retained owner A.
+                // Real binding/classification must defer this contract-5 body.
+                item.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                    provider: "anthropic",
+                    account_identifier_hash: Some("b".repeat(64)),
+                    provider_workspace_hash: Some("d".repeat(64)),
+                    identity_hash_scheme: "provider-sha256:v1",
+                    evidence_source: "claude_desktop_original:v1",
+                    identity_disposition: Some("complete"),
+                    source_created_at: None,
+                });
+            }
+        }
         if let Some(owner_session) = cycle.proven_owner_session {
             for item in scan
                 .snapshots
@@ -205,6 +273,13 @@ impl PipelineFixture {
             },
         );
         before_classify(&mut index);
+        let held_fingerprints = disposition.quarantined_fingerprints(&scan.snapshots);
+        let held_bodies = scan
+            .snapshots
+            .iter()
+            .filter(|item| held_fingerprints.contains(&item.snapshot_fingerprint))
+            .cloned()
+            .collect();
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
             &mut index,
@@ -212,6 +287,7 @@ impl PipelineFixture {
             &disposition,
         );
         let mut uploaded = BTreeSet::new();
+        let mut uploaded_bodies = Vec::new();
         let mut accepted = 0;
         let result = upload_resumable_batches_with_body_witness(
             &scan.snapshots,
@@ -222,6 +298,7 @@ impl PipelineFixture {
             snapshot_upload_body_witness,
             |items| {
                 uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
+                uploaded_bodies.extend(items.iter().cloned());
                 if let PipelineUpload::EntityAckRejected { session, reason } = upload {
                     let mut response = accepted_batch(0);
                     response.entity_ack_contract =
@@ -347,8 +424,10 @@ impl PipelineFixture {
             fully_settled,
             backfill_succeeded: census_complete && !census_withheld && fully_settled,
             held: holds.held_fingerprints,
+            held_bodies,
             progress_blocking: holds.progress_blocking,
             uploaded,
+            uploaded_bodies,
             result,
             progress,
         }
@@ -466,10 +545,10 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
         .all(|fingerprint| baseline.accepted_snapshot_fingerprint_recorded(fingerprint)));
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
 
-    let counter_before = terminal_hold_settlement_count();
+    let counter_before = restorable_hold_settlement_count();
     let pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         counter_before,
         "Completed account hold adds zero"
     );
@@ -1248,14 +1327,14 @@ fn terminal_bound_hold_traversal(
 #[serial(source_manifests)]
 fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
     let _source_manifests = SourceManifestTestGuard::new();
-    let settled_before = terminal_hold_settlement_count();
+    let settled_before = restorable_hold_settlement_count();
     let (_fixture, baseline, first, last) = terminal_bound_hold_traversal(
         "claude-census-rejected-terminal-bound-hold",
         PipelineUpload::ServerRejected,
         false,
     );
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         settled_before + 1,
         "exactly one eligible Rejected settlement decision"
     );
@@ -1357,10 +1436,10 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
             true,
         ),
     ] {
-        let before = terminal_hold_settlement_count();
+        let before = restorable_hold_settlement_count();
         let (_fixture, _baseline, first, last) =
             terminal_bound_hold_traversal(name, upload, retry_pending);
-        assert_eq!(terminal_hold_settlement_count(), before, "{name}");
+        assert_eq!(restorable_hold_settlement_count(), before, "{name}");
         assert!(first.index.bounded_sweep_had_unsettled_upload(), "{name}");
         assert!(!last.scan.census_complete, "{name}: owes a clean follow-up");
         assert!(!last.backfill_succeeded, "{name}");
@@ -1372,7 +1451,7 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
 
     // Path (b): a replay reset leaves the bound terminal hold nothing to
     // restore, so a Rejected page still blocks.
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let fixture = PipelineFixture::new("claude-census-rejected-unrestorable-hold");
     fixture.baseline();
     fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
@@ -1396,14 +1475,15 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
     assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
 }
 
 // Every test that can increment this process-wide counter uses
 // serial(source_manifests), including APC pipeline and h357 hold tests.
 // Controls retain that lock across both readings; never reset the counter.
-fn terminal_hold_settlement_count() -> u64 {
-    CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS.load(std::sync::atomic::Ordering::Relaxed)
+fn restorable_hold_settlement_count() -> u64 {
+    CHECKPOINTED_PAGES_SETTLED_WITH_NON_PROGRESSING_RESTORABLE_HOLDS
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 const PIPELINE_REFUSED_SESSION: &str = PIPELINE_SESSIONS[1];
@@ -1463,7 +1543,7 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
         true,
     );
 
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let next = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
     let last = next.last().unwrap();
     assert!(last.scan.census_complete);
@@ -1494,10 +1574,153 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
         .index
         .context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         before,
         "Completed account-hold settlement does not increment the Rejected counter"
     );
+}
+
+/// Diagnostic text must cover account/literal holds as well as terminal authority.
+#[test]
+#[serial(source_manifests)]
+fn checkpointed_hold_diagnostic_names_non_progressing_restorable_holds() {
+    assert_eq!(
+        checkpointed_hold_settlement_diagnostic(),
+        format!(
+            "{} page(s) settled with non-progressing restorable holds",
+            restorable_hold_settlement_count()
+        )
+    );
+}
+
+/// Capture stays ON across v1 -> v2. A real Rejected page holds the v2
+/// account-conflicting body; after release the transport must receive v2 tags,
+/// rather than the accepted v1 predecessor restored by settlement.
+#[test]
+#[serial(source_manifests)]
+#[serial(client_report)]
+fn capture_on_rejected_account_hold_release_uploads_new_contract_tags() {
+    use crate::snapshots::claude_request_identity::{
+        self as identity, with_cycle_contract_for_test,
+    };
+    const V1: &str = "claude_code_jsonl:own_request_identity_rows:v1";
+    const V2: &str = "claude_code_jsonl:own_request_identity_rows:v2";
+    const ORG: &str = "11111111-1111-4111-8111-111111111111";
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut fixture = PipelineFixture::new("h1-capture-on-account-release");
+    fixture.baseline(); // Retain creator A before contract-5 admission takes over.
+    fixture.page_files = PIPELINE_SESSIONS.len();
+    fixture.durable_progress = true;
+    let path = fixture.root.join(format!("{PIPELINE_HELD_SESSION}.jsonl"));
+    let transcript = std::fs::read_to_string(&path).unwrap();
+    let marker = serde_json::json!({
+        "type": "attachment", "sessionId": PIPELINE_HELD_SESSION,
+        "attachment": {"type": "credential_org", "organizationUuid": ORG}
+    });
+    std::fs::write(&path, format!("{marker}\n{transcript}")).unwrap();
+    fixture.request_identity = true;
+    let old = with_cycle_contract_for_test(V1, || {
+        fixture.page(
+            "2026-08-02T09:00:00Z",
+            &PIPELINE_HOLD_CYCLE,
+            PipelineUpload::Accept,
+        )
+    });
+    assert!(old.scan.census_complete);
+    let old_body = old
+        .uploaded_bodies
+        .iter()
+        .find(|item| item.source_session_id == PIPELINE_HELD_SESSION)
+        .expect("v1 body reached transport");
+    assert_eq!(old_body.provenance.collector, V1);
+    assert!(!old_body.request_evidence.is_empty());
+    assert!(old
+        .index
+        .accepted_snapshot_fingerprint_recorded(&old_body.snapshot_fingerprint));
+
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+    fixture.append(PIPELINE_REFUSED_SESSION, "req_1_2");
+    fixture.conflicting_creator = true;
+    let before = restorable_hold_settlement_count();
+    let held = with_cycle_contract_for_test(V2, || {
+        fixture.page(
+            "2026-08-02T10:00:00Z",
+            &PIPELINE_HOLD_CYCLE,
+            PipelineUpload::EntityAckRejected {
+                session: PIPELINE_REFUSED_SESSION,
+                reason: "invalid",
+            },
+        )
+    });
+    assert_eq!(held.result, ResumableUploadResult::Rejected { count: 1 });
+    assert_eq!(restorable_hold_settlement_count(), before + 1);
+    assert_eq!(held.held.len(), 1);
+    assert!(!held.progress_blocking);
+    assert_eq!(held.index.claude_account_deferred_hold_count(), 1);
+    assert!(!held.index.bounded_sweep_had_unsettled_upload());
+    assert!(!held.fully_settled);
+    let held_body = held
+        .held_bodies
+        .iter()
+        .find(|item| item.source_session_id == PIPELINE_HELD_SESSION)
+        .expect("v2 account-held body parsed");
+    assert_eq!(held_body.provenance.collector, V2);
+    assert!(held.held.contains(&held_body.snapshot_fingerprint));
+    assert!(!held.uploaded.contains(&held_body.snapshot_fingerprint));
+    assert!(!held
+        .index
+        .accepted_snapshot_fingerprint_recorded(&held_body.snapshot_fingerprint));
+    let key = PipelineFixture::key(&held.index, PIPELINE_HELD_SESSION);
+    let old_key = PipelineFixture::key(&old.index, PIPELINE_HELD_SESSION);
+    // The file head is a digest of its entity set, not an entity fingerprint.
+    assert_eq!(
+        held.index.files[&key].last_snapshot_fingerprint,
+        old.index.files[&old_key].last_snapshot_fingerprint
+    );
+    assert_eq!(
+        held.index.file_snapshot_fingerprints[&key],
+        old.index.file_snapshot_fingerprints[&old_key]
+    );
+    assert!(held.index.file_snapshot_fingerprints[&key].contains(&old_body.snapshot_fingerprint));
+    assert!(held.index.files[&key].source_file_fingerprint.is_empty());
+
+    fixture.conflicting_creator = false; // Remove contradicting creator evidence.
+    let released = with_cycle_contract_for_test(V2, || fixture.traversal(11, &PIPELINE_HOLD_CYCLE));
+    let (page, body) = released
+        .iter()
+        .find_map(|page| {
+            page.uploaded_bodies
+                .iter()
+                .find(|item| item.source_session_id == PIPELINE_HELD_SESSION)
+                .map(|body| (page, body))
+        })
+        .expect("released body actually reached transport");
+    assert!(page.held.is_empty());
+    assert_eq!(page.result, ResumableUploadResult::Completed);
+    assert_eq!(page.index.claude_account_deferred_hold_count(), 0);
+    assert!(page
+        .index
+        .accepted_snapshot_fingerprint_recorded(&body.snapshot_fingerprint));
+    assert_eq!(body.provenance.collector, V2);
+    assert_ne!(body.snapshot_fingerprint, old_body.snapshot_fingerprint);
+    assert_eq!(body.request_identity_refusals, 0);
+    assert!(!body.request_evidence.is_empty());
+    assert!(!body.model_usage.is_empty() && !body.usage_buckets.is_empty());
+    let expected_org = ottto_core::billing_identity_hash("anthropic", "organization", ORG).unwrap();
+    for row in body
+        .model_usage
+        .iter()
+        .chain(body.usage_buckets.iter().flat_map(|b| &b.model_usage))
+    {
+        let evidence = &body.request_evidence
+            [usize::from(row.evidence_ref.expect("released row identity tag"))];
+        assert_eq!(evidence.identity_basis, identity::TRANSCRIPT_ORG);
+        assert_eq!(
+            evidence.provider_workspace_hash.as_deref(),
+            Some(expected_org.as_str())
+        );
+    }
+    assert_eq!(restorable_hold_settlement_count(), before + 1);
 }
 
 fn assert_real_rejected_hold(
@@ -1507,7 +1730,7 @@ fn assert_real_rejected_hold(
     reason: &'static str,
     account_hold: bool,
 ) {
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let first = fixture.page(
         "2026-08-02T09:00:00Z",
         cycle,
@@ -1517,7 +1740,7 @@ fn assert_real_rejected_hold(
         },
     );
     assert_eq!(first.result, ResumableUploadResult::Rejected { count: 1 });
-    assert_eq!(terminal_hold_settlement_count(), before + 1);
+    assert_eq!(restorable_hold_settlement_count(), before + 1);
     assert_eq!(first.held.len(), 1);
     assert_eq!(
         first.uploaded.len(),
@@ -1560,7 +1783,7 @@ fn assert_real_rejected_hold(
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     assert!(last.held.is_empty());
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         before + 1,
         "no-hold page adds zero"
     );
@@ -1695,7 +1918,7 @@ fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_co
         proven_owner_session: Some(PIPELINE_HELD_SESSION),
         ..PIPELINE_HOLD_CYCLE
     };
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let first = fixture.page_before_classify(
         "2026-08-02T09:00:00Z",
         &cycle,
@@ -1715,7 +1938,7 @@ fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_co
     let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
 }
 
 #[test]
@@ -1730,7 +1953,7 @@ fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
         proven_owner_session: Some(PIPELINE_HELD_SESSION),
         ..PIPELINE_HOLD_CYCLE
     };
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let first = fixture.page_before_classify(
         "2026-08-02T09:00:00Z",
         &cycle,
@@ -1758,7 +1981,7 @@ fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
     let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
 }
 
 #[test]
@@ -1769,7 +1992,7 @@ fn rejected_page_with_cap_refused_account_hold_blocks_without_counting() {
     let baseline = fixture.baseline();
     let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let first = fixture.page_before_classify(
         "2026-08-02T09:00:00Z",
         &PIPELINE_HOLD_CYCLE,
@@ -1803,7 +2026,7 @@ fn rejected_page_with_cap_refused_account_hold_blocks_without_counting() {
     );
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
 }
 
 #[test]
@@ -1819,7 +2042,7 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
         proven_owner_session: Some(PIPELINE_HELD_SESSION),
         ..PIPELINE_HOLD_CYCLE
     };
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let earlier = fixture.page(
         "2026-08-02T09:00:00Z",
         &cycle,
@@ -1830,7 +2053,7 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
         "earlier debt is unrelated to the later local hold"
     );
     assert!(earlier.index.bounded_sweep_had_unsettled_upload());
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
     let held_page = fixture.page(
         "2026-08-02T09:01:00Z",
         &cycle,
@@ -1839,7 +2062,7 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
     assert_eq!(held_page.held.len(), 1);
     assert!(!held_page.progress_blocking);
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         before + 1,
         "eligible decision still counted once"
     );
@@ -1851,13 +2074,13 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
     assert_eq!(last.scan.census_window_end, earlier.scan.census_window_end);
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
-    assert_eq!(terminal_hold_settlement_count(), before + 1);
+    assert_eq!(restorable_hold_settlement_count(), before + 1);
     assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
 }
 
 #[test]
 #[serial(source_manifests)]
-fn no_hold_rejected_and_deferred_pages_never_increment_the_terminal_hold_counter() {
+fn no_hold_rejected_and_deferred_pages_never_increment_the_restorable_hold_counter() {
     let _source_manifests = SourceManifestTestGuard::new();
     for upload in [
         PipelineUpload::ServerRejected,
@@ -1869,13 +2092,13 @@ fn no_hold_rejected_and_deferred_pages_never_increment_the_terminal_hold_counter
             proven_owner_session: Some(PIPELINE_HELD_SESSION),
             ..PIPELINE_HOLD_CYCLE
         };
-        let before = terminal_hold_settlement_count();
+        let before = restorable_hold_settlement_count();
         let first = fixture.page("2026-08-02T09:00:00Z", &cycle, upload);
         assert!(first.held.is_empty());
         assert_eq!(
             first.index.bounded_sweep_had_unsettled_upload(),
             upload == PipelineUpload::ServerDeferred
         );
-        assert_eq!(terminal_hold_settlement_count(), before, "{upload:?}");
+        assert_eq!(restorable_hold_settlement_count(), before, "{upload:?}");
     }
 }
