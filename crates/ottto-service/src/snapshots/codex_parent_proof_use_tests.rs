@@ -1295,7 +1295,7 @@ fn an_ordinary_proof_line_retains_a_fixed_amount_whatever_its_length_or_shape() 
     let fields: serde_json::Map<String, Value> = (0..100_000)
         .map(|at| (format!("k{at:06}"), json!(at)))
         .collect();
-    let shared = vec![
+    let shared = [
         turn("2026-08-02T08:00:01Z", &"t".repeat(long)),
         json!({"timestamp": "2026-08-02T08:00:02Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": "x".repeat(long)}}),
         json!({"timestamp": "2026-08-02T08:00:03Z", "type": "response_item", "payload": {"items": items}}),
