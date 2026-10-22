@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 767,
-  "content_sha256": "ad96e5a189e0815ce0a09f739dbc892b3af481408b428dc253f88717bea8b23d",
+  "content_sha256": "ed3d1969a3f0700cfdaf9eab1bd17f7264f4df95166feb0f9c6899224b0d6bf7",
   "files": [
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "e37e3184579a1dbb688da2921a9b09a6d3c5351de7900b140da13e321eff3a30",
-      "size_bytes": 3068631
+      "sha256": "e9de9c342def9aa12a3d0f8ed4597019d79ab06c1d9bb4856ef915ef66c6bda5",
+      "size_bytes": 3068783
     },
     {
       "executable": false,
@@ -1497,8 +1497,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_context_file_birth_tests.rs",
-      "sha256": "339cbdfec5f88be99025826de3bdb5ece947c635373f955cd89b246349703a2b",
-      "size_bytes": 79130
+      "sha256": "5550e006cc626e8b81526c5ed76c4cf897bb3c9a2419fad410e6084624b99125",
+      "size_bytes": 81576
     },
     {
       "executable": false,
@@ -1763,8 +1763,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/session_start.rs",
-      "sha256": "8ddfad81c4b4be112d9fbcbf3a13e016e0a44ced2b3ec4a303587ed665ec2ccd",
-      "size_bytes": 123497
+      "sha256": "f8b357a75e72e73d5598d233a019587b4920e3d2c91895b1d51aa23844802e70",
+      "size_bytes": 129921
     },
     {
       "executable": false,
@@ -5372,7 +5372,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T11:58:32+00:00",
+  "generated_at": "2026-10-22T11:59:34+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 768,
   "public_roots": [
@@ -5411,5 +5411,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b7e49b05d3cccd2593a9cae5d5707b4707cc5f9d"
+  "source_commit": "ddb57bc93d13c0227347377f5691428d312100cd"
 }
