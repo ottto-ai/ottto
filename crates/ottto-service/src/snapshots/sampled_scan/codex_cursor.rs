@@ -2969,12 +2969,13 @@ impl SharedCache {
         self.with_cursor(|cursor| drop_suspended_proof_over(retained, cursor, 0, budget));
     }
 
-    /// U1a-2a (R2-B3, r79): main's copy-budget step, before it allocates its
-    /// copy, leaves `room` bytes beside that copy in main's view
-    /// (`bound_for_main`). A suspended proof larger than that would spend
-    /// bytes main is about to use, so it is retired here (retained, then
-    /// cursor; the readers are freed under them, the entries kept for the
-    /// index's next hook), counted `side_proof_drops`. Otherwise nothing is
+    /// U1a-2a (R2-B3, r79, fix round 2 DB1): where main allocates against
+    /// its copy budget (`retire_proof_beside_copy`), both shares leave
+    /// `room` bytes in main's view (`bound_for_main`). A suspended proof
+    /// larger than that would spend bytes main is about to use, so it is
+    /// retired here (retained, then cursor; the job is freed under them,
+    /// its entry `seq`s kept for the index's next hook), counted
+    /// `side_proof_drops`. Otherwise nothing is
     /// locked beyond one `try_lock` read; a cursor busy elsewhere is decided
     /// under the locks, never skipped.
     pub(in crate::snapshots) fn retire_proof_over_room(&self, room: usize) {

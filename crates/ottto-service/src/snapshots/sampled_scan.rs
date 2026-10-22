@@ -393,6 +393,24 @@ impl StepMeasure {
     fn visit_limited(&self) -> bool {
         self.active.is_some() && self.used.is_none()
     }
+
+    /// U1a-2a (fix round 2, DB1): the room this walk left in main's view
+    /// (`bound_for_main`) for the copy budget's two equal shares, a retained
+    /// copy and finish/output: `STATE_BYTES - resident - used`, or
+    /// `STATE_BYTES - resident` with no active. The same arithmetic
+    /// `copy_budget_step` halves, on this walk's own fields (no second
+    /// walk; a field would edit M1's unedited test literals). `None`:
+    /// unknown. Read only beside this walk's own non-zero budget, which
+    /// implies a known room, where that budget is allocated against
+    /// (`retire_proof_beside_copy`).
+    pub(super) fn room(&self) -> Option<usize> {
+        let remaining = STATE_BYTES.checked_sub(self.resident?)?;
+        match (self.active, self.used) {
+            (_, Some(used)) => remaining.checked_sub(used),
+            (None, None) => Some(remaining),
+            (Some(_), None) => None,
+        }
+    }
 }
 
 /// The conservative copy-refusal release, given at most a resident bound and
@@ -630,16 +648,66 @@ pub(super) fn context_overhead_covers(context: &Context) -> bool {
 }
 
 /// A completing cursor job's exact copy budget (E3), with the same
-/// refusal release the step start applies to an ordinary file.
+/// refusal release the step start applies to an ordinary file, and the
+/// walk it came from (for `retire_proof_beside_copy`).
 pub(super) fn completion_copy_budget(
     sampling: Option<&Context>,
     active: &mut OwnedActiveFile,
-) -> usize {
+) -> (usize, StepMeasure) {
     let (budget, step) = copy_budget_step(sampling, Some(&mut *active), true);
     if budget == 0 {
         release_cache_to_fit(sampling, Some(&*active), step);
     }
-    budget
+    (budget, step)
+}
+
+/// U1a-2a (R2-B3, fix round 2 DB1, c22 ruling (b)): main's copy budget
+/// funds two equal shares at once, a retained copy and finish/output
+/// (`ClaudeResponses::finish_copy_budget`), so before main allocates
+/// against `budget` (its completion's clone and finish), a suspended proof
+/// larger than what both shares leave of `step`'s room is retired:
+/// `proof + copy + finish/output <= room`, the room main's view
+/// (`bound_for_main`) measured without the proof. Where no copy can be
+/// allocated (`budget == 0`, which an unknown room always gives) nothing is
+/// retired: no proof drops on unavailable inputs. Non-allocating steps never
+/// call this, and M1 Path A (`admit_tail_copy`) clones nothing at its
+/// zero-budget step.
+pub(super) fn retire_proof_beside_copy(
+    sampling: Option<&Context>,
+    budget: usize,
+    step: StepMeasure,
+) {
+    if budget == 0 {
+        return;
+    }
+    let Some((context, room)) = sampling.zip(step.room()) else {
+        return;
+    };
+    context
+        .cache
+        .retire_proof_over_room(room.saturating_sub(budget.saturating_mul(2)));
+    #[cfg(test)]
+    COPY_RETIRE_PROBE.with(|probe| {
+        probe.set(Some((
+            crate::heap_layout_bound::bound(context, STATE_BYTES),
+            step.used.unwrap_or(0),
+            budget,
+        )))
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: after `retire_proof_beside_copy`'s retire, the whole
+    /// `bound(context)` (proof included), the active's charge and the budget.
+    static COPY_RETIRE_PROBE: std::cell::Cell<Option<(Option<usize>, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: the last `COPY_RETIRE_PROBE` on this thread, taken.
+#[cfg(test)]
+pub(super) fn copy_retire_probe() -> Option<(Option<usize>, usize, usize)> {
+    COPY_RETIRE_PROBE.with(std::cell::Cell::take)
 }
 
 /// The copy budget left beside the active file. A cursor job's state grows
@@ -660,18 +728,15 @@ pub(super) fn copy_budget_step(
     let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
         return (0, StepMeasure::default());
     };
-    // U1a-2a (R2-B3, r79): main's view, any suspended proof charged as
-    // none, so optional proof work never shrinks a copy budget; it is no
-    // allocation authority either: before main's copy is allocated, a
-    // proof larger than the room the copy leaves is retired (`proof +
-    // copy <= room`), as the admission and the insert retire it.
+    // U1a-2a (R2-B3): main's view, any suspended proof charged as none, so
+    // optional proof work never shrinks a copy budget. It is no allocation
+    // authority either: the walk's `room` goes with the budget, and where
+    // main allocates against it the proof is retired first
+    // (`retire_proof_beside_copy`, fix round 2 DB1).
     let resident = codex_cursor::bound_for_main(context, STATE_BYTES);
     let remaining = resident.and_then(|resident| STATE_BYTES.checked_sub(resident));
     let Some(active) = active else {
         let budget = remaining.map_or(0, |remaining| remaining / 2);
-        context
-            .cache
-            .retire_proof_over_room(remaining.map_or(0, |remaining| remaining - budget));
         return (
             budget,
             StepMeasure {
@@ -746,15 +811,10 @@ pub(super) fn copy_budget_step(
             )
         }
     };
-    // R2-B3 (r79): a suspended proof never holds bytes this step spends;
-    // it is retired before the copy is allocated.
     let room = remaining
         .zip(used)
         .and_then(|(remaining, used)| remaining.checked_sub(used));
     let budget = room.map_or(0, |room| room / 2);
-    context
-        .cache
-        .retire_proof_over_room(room.map_or(0, |room| room - budget));
     (
         budget,
         StepMeasure {

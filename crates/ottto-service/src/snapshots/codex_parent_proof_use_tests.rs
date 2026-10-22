@@ -1157,12 +1157,12 @@ fn a_run_steps_only_while_one_more_line_fits_its_room() {
     write_values(&parent, &parent_values());
     let child = rollout(&root, CHILD);
     write_values(&child, &child_values());
-    // Owner note 4 (r79): the strict worst case of a fresh walk `W` with
-    // buffers `B`, through one more line: `W + (W - B) + MAX_JSONL_LINE_BYTES`.
+    // Owner note 4 (r79), fix round 2 DM1: the charge of a fresh walk `W`
+    // with buffers `B` before one more line: `W + (W - B) + 2 * MAX`.
     let walk = |job: &mut CodexProofReaders| {
         job.shrink_buffers();
         let walked = crate::heap_layout_bound::bound(&*job, usize::MAX).unwrap();
-        walked + (walked - job.buffers()) + MAX_JSONL_LINE_BYTES
+        walked + (walked - job.buffers()) + 2 * MAX_JSONL_LINE_BYTES
     };
 
     let mut job = job_of(&parent, &[&child]);
@@ -1816,4 +1816,41 @@ fn an_invalid_page_whose_suspend_fails_backs_off_and_publishes_nothing() {
         assert_eq!(spent(&page), 0, "valid {valid}");
         assert_eq!(scene.owed_entry(), owed);
     }
+}
+
+/// Fix round 2 (R2-L3): a retired job's backoff is drained only on a
+/// side-allowed page. On a save-outage page its ring entry waits (no
+/// backoff write, nothing read); the next open page drains it.
+#[test]
+fn a_save_outage_page_leaves_the_retired_record_for_an_open_gate() {
+    let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
+    let mut scene = Scene::owed("hook-retired-outage");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let now = sampled_scan::now_seconds();
+    let mut page = page_with(leftover);
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    assert!(cache.proof_suspended_for_test().is_some());
+    cache.retire_proof_over_room(0);
+    let owed = scene.owed_entry();
+    let closed = CodexSidePass {
+        gate: sampled_scan::side_ledger::GateOpen {
+            side_allowed: false,
+            first_in_process: false,
+        },
+        ..hook_pass()
+    };
+    for _ in 0..3 {
+        let mut page = PageBudget::default();
+        scene.hook_in(&cache, &closed, &mut page, now);
+        assert_eq!(spent(&page), 0);
+        assert_eq!(scene.owed_entry(), owed, "no backoff write");
+    }
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    assert_eq!(spent(&page), 0);
+    let drained = scene.owed_entry();
+    assert_eq!(
+        (drained.attempts, drained.outcome, &drained.wake),
+        (1, ProofOutcome::MemoryRefused as u8, &ProofWake::Backoff)
+    );
 }

@@ -117,7 +117,7 @@ pub(super) fn codex_parent_proof_step(
     let side_allowed = pass.gate.side_allowed;
     // Step 1: prune first, metadata only, whatever the holder or budget.
     if pass.sweep_allowed() {
-        index.sweep_codex_parent_side(census_valid, side);
+        index.sweep_codex_parent_side(census_valid, side, now);
     }
     // A job never binds to an unminted index (row 35). Only proof work
     // adopts the incarnation (its first binding use).
@@ -131,11 +131,17 @@ pub(super) fn codex_parent_proof_step(
     }
     // Owner note 3 (r79): a job of this index that main retired (or another
     // index dropped) while suspended backs every entry off before the visit,
-    // so main's retirements pace restarts instead of repeating them.
-    let retired =
+    // so main's retirements pace restarts instead of repeating them. Only on
+    // a side-allowed page (fix round 2, R2-L3): on a save outage the ring
+    // entry waits, so a failed save cannot lose the backoff (no Free start
+    // happens before the gate opens).
+    let retired = if side_allowed {
         context
             .cache
-            .take_retired_proof_seqs(&context.namespace, &pass.index_path, &incarnation);
+            .take_retired_proof_seqs(&context.namespace, &pass.index_path, &incarnation)
+    } else {
+        Vec::new()
+    };
     if !retired.is_empty() {
         let entries = index
             .codex_parent_prefix_proofs

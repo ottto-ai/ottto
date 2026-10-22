@@ -3,6 +3,9 @@
 //! provider account.
 use super::*;
 
+/// The sweep's clock in these tests: past every fixture pace's `not_before`.
+const SWEEP_NOW: u64 = 1_800_000_000;
+
 fn parsed() -> ParsedJsonlFile {
     ParsedJsonlFile {
         snapshots: Vec::new(),
@@ -934,7 +937,7 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
             },
         );
         assert_eq!(
-            index.sweep_codex_parent_side(true, None),
+            index.sweep_codex_parent_side(true, None, SWEEP_NOW),
             SideSweep::default()
         );
         assert_eq!(index.codex_parent_side_requests[SWEPT].referenced_epoch, 10);
@@ -954,7 +957,7 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
             .codex_parent_side_requests
             .insert(SWEPT.into(), uncharged_request(epoch));
         let before = serde_json::to_vec(&index).unwrap().len();
-        let sweep = index.sweep_codex_parent_side(true, None);
+        let sweep = index.sweep_codex_parent_side(true, None, SWEEP_NOW);
         assert_eq!(sweep.requests_pruned, usize::from(pruned), "{epoch} {wrap}");
         assert_eq!(
             index.codex_parent_side_requests.contains_key(SWEPT),
@@ -972,12 +975,27 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
     index
         .codex_parent_side_requests
         .insert(SWEPT.into(), uncharged_request(0));
-    assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 0);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(true, None, SWEEP_NOW)
+            .requests_pruned,
+        0
+    );
     assert_eq!(index.codex_parent_side_requests[SWEPT].referenced_epoch, 10);
     index.codex_parent_proof_wrap_epoch = 12;
-    assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 0);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(true, None, SWEEP_NOW)
+            .requests_pruned,
+        0
+    );
     index.codex_parent_proof_wrap_epoch = 13;
-    assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 1);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(true, None, SWEEP_NOW)
+            .requests_pruned,
+        1
+    );
     // R2-M3: a charged stale request with no record to carry its pacing is
     // kept, as is a worn one or one whose need the record does not cover
     // (r79); with P's same-object record covering it, it is pruned and the
@@ -1009,7 +1027,7 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
                 .codex_parent_side
                 .insert(SWEPT.into(), same_object_record(10));
         }
-        let sweep = index.sweep_codex_parent_side(true, None);
+        let sweep = index.sweep_codex_parent_side(true, None, SWEEP_NOW);
         assert_eq!(sweep.requests_pruned, usize::from(pruned), "{attempts}");
         assert_eq!(
             index.codex_parent_side_requests.get(SWEPT).copied(),
@@ -1037,7 +1055,7 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
             .codex_parent_side_requests
             .insert(SWEPT.into(), epoch_request(state, 1));
         assert_eq!(
-            index.sweep_codex_parent_side(true, None),
+            index.sweep_codex_parent_side(true, None, SWEEP_NOW),
             SideSweep::default()
         );
         assert_eq!(
@@ -1054,18 +1072,63 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
         SWEPT.into(),
         CodexParentSide {
             referenced_epoch: 7,
+            pace: None,
             ..extreme_record()
         },
     );
     assert_eq!(
-        index.sweep_codex_parent_side(true, None),
+        index.sweep_codex_parent_side(true, None, SWEEP_NOW),
         SideSweep::default()
     );
     assert_eq!(index.codex_parent_side[SWEPT].referenced_epoch, 10);
     index.codex_parent_side_requests.clear();
     index.codex_parent_proof_wrap_epoch = 13;
-    assert_eq!(index.sweep_codex_parent_side(true, None).records_pruned, 1);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(true, None, SWEEP_NOW)
+            .records_pruned,
+        1
+    );
     assert!(index.codex_parent_side.is_empty());
+    // Fix round 2 (DM2): a stale record whose pace is active (a floor, or
+    // a `not_before` ahead of the sweep's clock) is kept; an expired pace
+    // (no floor, `not_before` passed) prunes as before.
+    for (pace, pruned) in [
+        (
+            SidePace {
+                not_before_unix_seconds: 0,
+                attempts_floor: SIDE_REQUEST_EVICT_ATTEMPTS - 1,
+            },
+            false,
+        ),
+        (
+            SidePace {
+                not_before_unix_seconds: SWEEP_NOW + 1,
+                attempts_floor: 0,
+            },
+            false,
+        ),
+        (
+            SidePace {
+                not_before_unix_seconds: SWEEP_NOW,
+                attempts_floor: 0,
+            },
+            true,
+        ),
+    ] {
+        let mut index = swept_index(13);
+        index.codex_parent_side.insert(
+            SWEPT.into(),
+            CodexParentSide {
+                referenced_epoch: 7,
+                pace: Some(pace),
+                ..extreme_record()
+            },
+        );
+        let sweep = index.sweep_codex_parent_side(true, None, SWEEP_NOW);
+        assert_eq!(sweep.records_pruned, usize::from(pruned), "{pace:?}");
+        assert_eq!(index.codex_parent_side.contains_key(SWEPT), !pruned);
+    }
 }
 
 /// A census holding `key` only.
@@ -1104,14 +1167,25 @@ fn the_side_sweep_drops_orphans_under_a_valid_census_and_wraps_its_cursor() {
     index
         .codex_parent_side
         .insert(orphan.into(), extreme_record());
-    assert_eq!(index.sweep_codex_parent_side(false, None).orphans, 0);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(false, None, SWEEP_NOW)
+            .orphans,
+        0
+    );
     assert!(index.codex_parent_side_requests.contains_key(orphan));
     // R2-L1: a key the valid census holds is not an orphan (as the visit).
     index.traversal = Some(census_of(orphan));
-    assert_eq!(index.sweep_codex_parent_side(true, None).orphans, 0);
+    assert_eq!(
+        index.sweep_codex_parent_side(true, None, SWEEP_NOW).orphans,
+        0
+    );
     assert!(index.codex_parent_side_requests.contains_key(orphan));
     index.traversal = None;
-    assert_eq!(index.sweep_codex_parent_side(true, None).orphans, 1);
+    assert_eq!(
+        index.sweep_codex_parent_side(true, None, SWEEP_NOW).orphans,
+        1
+    );
     assert!(index.codex_parent_side_requests.is_empty());
     assert!(index.codex_parent_side.is_empty());
 
@@ -1127,12 +1201,12 @@ fn the_side_sweep_drops_orphans_under_a_valid_census_and_wraps_its_cursor() {
             index.codex_parent_side.insert(key, extreme_record());
         }
     }
-    index.sweep_codex_parent_side(true, None);
+    index.sweep_codex_parent_side(true, None, SWEEP_NOW);
     assert_eq!(
         index.codex_parent_side_cursor.as_deref(),
         Some(format!("/s/k{:03}.jsonl", CODEX_SIDE_SWEEP_KEYS - 1).as_str())
     );
-    index.sweep_codex_parent_side(true, None);
+    index.sweep_codex_parent_side(true, None, SWEEP_NOW);
     assert_eq!(index.codex_parent_side_cursor, None, "a short visit wraps");
 }
 
@@ -1180,12 +1254,22 @@ fn the_request_epoch_prune_keeps_unsaved_charges_and_never_resurrects_budget() {
     index
         .codex_parent_side_requests
         .insert(SWEPT.into(), charged);
-    assert_eq!(index.sweep_codex_parent_side(true, side).requests_pruned, 0);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(true, side, SWEEP_NOW)
+            .requests_pruned,
+        0
+    );
     assert_eq!(index.codex_parent_side_requests[SWEPT], charged);
     // The pass's selected save succeeds (the mark covers the charge).
     let mark = codex_side_save_mark(&cache, &path);
     note_codex_side_pass_saved(&cache, &path, true, mark);
-    assert_eq!(index.sweep_codex_parent_side(true, side).requests_pruned, 1);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(true, side, SWEEP_NOW)
+            .requests_pruned,
+        1
+    );
     assert!(index.codex_parent_side_requests.is_empty());
     let pace = Some(SidePace {
         not_before_unix_seconds: charged.not_before_unix_seconds,
@@ -1213,7 +1297,7 @@ fn the_request_epoch_prune_keeps_unsaved_charges_and_never_resurrects_budget() {
     assert!(saved.attempts > 0);
     assert_eq!(
         restarted
-            .sweep_codex_parent_side(true, Some((&restarted_cache, pass.ns)))
+            .sweep_codex_parent_side(true, Some((&restarted_cache, pass.ns)), SWEEP_NOW)
             .requests_pruned,
         1
     );
@@ -1253,7 +1337,7 @@ fn the_epoch_prune_ends_an_uncharged_key() {
         .is_ok());
     let mark = codex_side_save_mark(&cache, &path);
     note_codex_side_pass_saved(&cache, &path, true, mark);
-    let sweep = index.sweep_codex_parent_side(true, Some((&cache, pass.ns)));
+    let sweep = index.sweep_codex_parent_side(true, Some((&cache, pass.ns)), SWEEP_NOW);
     assert_eq!(sweep.requests_pruned, 1);
     assert!(index.codex_parent_side_requests.is_empty());
     assert_eq!(index.codex_parent_side[SWEPT].pace, None);

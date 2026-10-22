@@ -8888,14 +8888,16 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
     });
 }
 
-/// R2-B3 (r79): main's view is no allocation authority. A suspended proof
-/// larger than the room main's copy leaves (`remaining - budget`) is
-/// retired at the copy-budget step, before the copy is allocated (counted;
-/// its entry `seq`s wait for its index's hook, taken once, no heap kept);
-/// the budget is unchanged. A proof that fits beside the copy keeps its
-/// slot.
+/// R2-B3, fix round 2 DB1 (c22 ruling (b)): main's copy budget funds two
+/// equal shares, so where it is allocated against
+/// (`retire_proof_beside_copy`) a suspended proof over `room - 2 * budget`
+/// is retired, even one the copy's share alone leaves room for
+/// (`room - budget - 1`); then `bound(context)` + copy + finish/output fit
+/// `STATE_BYTES`. `copy_budget_step` itself retires nothing, and nothing is
+/// retired where no copy is allocated (budget 0, as an unknown room gives):
+/// no drop on unavailable inputs. The retired job keeps only its `seq`s.
 #[test]
-fn a_proof_over_the_copys_room_is_retired_before_the_copy() {
+fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -8903,39 +8905,103 @@ fn a_proof_over_the_copys_room_is_retired_before_the_copy() {
     let cache = Arc::new(SharedCache::default());
     let context = main_context(&cache);
     let budget = || super::super::copy_budget_step(Some(&context), None, false);
-    // Beside the copy: kept (the baseline is main's view with it).
-    assert!(suspend(
-        &cache,
-        proof_job("ns-a", "/idx/a.json", "inc-1", 4096)
-    ));
-    let ((without, measured), counts) = observe(budget);
+    let (without, measured) = budget();
+    let room = measured.room().expect("a measured room");
+    assert_eq!(without, room / 2);
+    // Kept by the copy's share alone, over both shares.
+    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", room - without - 1 - fixed);
+    let charge = proof_charge(&job);
+    assert!(
+        charge > room - 2 * without && charge < room - without,
+        "{charge}"
+    );
+    assert!(suspend(&cache, job), "fits the free room alone");
+    let ((with, step), counts) = observe(budget);
+    assert_eq!(with, without, "the budget is unchanged");
+    assert_eq!(step.room(), Some(room));
+    assert!(
+        cache.proof_suspended_for_test().is_some(),
+        "no retire at the step"
+    );
+    assert_eq!(proof_drops(counts), 0);
+    // No copy allocated: nothing retired.
+    let ((), counts) = observe(|| super::super::retire_proof_beside_copy(Some(&context), 0, step));
     assert!(cache.proof_suspended_for_test().is_some());
     assert_eq!(proof_drops(counts), 0);
-    let remaining = STATE_BYTES - measured.resident.unwrap();
-    assert_eq!(without, remaining / 2);
-    cache.retire_proof_over_room(0);
-    let scope = Scope("ns-a".to_owned());
-    let index = std::path::Path::new("/idx/a.json");
-    assert_eq!(cache.take_retired_proof_seqs(&scope, index, "inc-1"), [1]);
-    // Over the copy's room: retired first, the budget unchanged.
-    let job = proof_job("ns-a", "/idx/a.json", "inc-1", remaining - without + 4096);
-    assert!(proof_charge(&job) > remaining - without);
-    assert!(suspend(&cache, job), "fits the free room alone");
-    let ((with, _), counts) = observe(budget);
-    assert_eq!(with, without, "the budget is unchanged");
+    // A busy cache: an unknown room and budget 0; the proof is kept.
+    let busy = {
+        let _held = cache.retained().unwrap();
+        budget()
+    };
+    assert_eq!((busy.0, busy.1.room()), (0, None));
+    let ((), counts) =
+        observe(|| super::super::retire_proof_beside_copy(Some(&context), busy.0, busy.1));
+    assert!(cache.proof_suspended_for_test().is_some());
+    assert_eq!(proof_drops(counts), 0);
+    // The allocation: retired first, and both shares fit beside the rest.
+    super::super::copy_retire_probe();
+    let ((), counts) =
+        observe(|| super::super::retire_proof_beside_copy(Some(&context), with, step));
     assert_eq!(cache.proof_suspended_for_test(), None, "retired first");
     assert_eq!(proof_drops(counts), 1);
-    // Its binding's `seq`s, once; another binding's, none.
-    assert!(cache
-        .take_retired_proof_seqs(&scope, index, "inc-2")
-        .is_empty());
+    let (whole, used, funded) = super::super::copy_retire_probe().expect("probed");
+    assert_eq!((used, funded), (0, with));
+    assert!(whole.expect("measured") + used + 2 * funded <= STATE_BYTES);
+    let scope = Scope("ns-a".to_owned());
+    let index = std::path::Path::new("/idx/a.json");
     assert_eq!(cache.take_retired_proof_seqs(&scope, index, "inc-1"), [1]);
     assert!(cache
         .take_retired_proof_seqs(&scope, index, "inc-1")
         .is_empty());
     // Nothing of the retired job stays charged.
-    let (_, after) = budget();
-    assert_eq!(after.resident, measured.resident);
+    assert_eq!(budget().1.resident, measured.resident);
+}
+
+/// Fix round 2 DB1, the completion site: a cursor job's pages that allocate
+/// nothing keep a suspended proof of a third of the state budget; the page
+/// whose completion retains the certified copy retires it before the clone,
+/// and `bound(context)` + the active + both shares fit `STATE_BYTES` there.
+#[test]
+fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        assert!(suspend(
+            &cache,
+            proof_job("ns-a", "/idx/a.json", "inc-1", STATE_BYTES / 3)
+        ));
+        super::super::copy_retire_probe();
+        let mut index = ScanIndex::default();
+        let mut certified = false;
+        for _ in 0..64 {
+            let ((next, _, _), counts) =
+                observe(|| page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture"));
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                assert_eq!(cache.proof_suspended_for_test(), None);
+                assert_eq!(proof_drops(counts), 1);
+                certified = true;
+                break;
+            }
+            assert!(
+                cache.proof_suspended_for_test().is_some(),
+                "a page with no clone keeps the proof"
+            );
+        }
+        assert!(certified, "precondition: the job certified");
+        assert!(cache.take(&key).is_some(), "the certified copy is retained");
+        let (whole, used, funded) = super::super::copy_retire_probe().expect("probed");
+        assert!(funded > 0);
+        assert!(whole.expect("measured") + used + 2 * funded <= STATE_BYTES);
+    });
 }
 
 // ---------------------------------------------------------------------------

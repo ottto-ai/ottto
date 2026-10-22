@@ -2282,6 +2282,12 @@ impl SidePace {
             attempts_floor: old.attempts_floor.max(new.attempts_floor),
         })
     }
+
+    /// Fix round 2 (DM2): the pace still binds at `now`: a floor, or a
+    /// `not_before` still ahead. Its record is not epoch-pruned meanwhile.
+    pub(in crate::snapshots) fn active(&self, now: u64) -> bool {
+        self.attempts_floor > 0 || self.not_before_unix_seconds > now
+    }
 }
 
 /// U1a-2a: a side request's state. `Live` is pending; the others are
@@ -16867,17 +16873,19 @@ impl CodexProofReaders {
         })
     }
 
-    /// R2-B1, owner note 4 (r79): whether the readers' worst case through
-    /// one more line fits `room` (`run`), strictly. From a walk `W` (with
-    /// buffer capacity `B`) and `s` bytes consumed since (`s <
+    /// R2-B1, owner note 4 (r79), fix round 2 (DM1): whether the readers'
+    /// charge before one more line fits `room` (`run`). From a walk `W`
+    /// (with buffer capacity `B`) and `s` bytes consumed since (`s <
     /// CHARGE_REFRESH_BYTES`), the readers hold at most
-    /// `W + (W - B) + 2s + ΔB` before the next line, and that line adds at
-    /// most `MAX_JSONL_LINE_BYTES`: E3's premise (retained growth is at
-    /// most the bytes consumed, at most doubled by a container's
-    /// doubling), plus one doubling of every walked non-buffer container,
-    /// plus the buffers' measured growth. The bound is charged whole here,
-    /// fresh walks included (`s = 0`), so a step never runs past
-    /// `room + MAX_JSONL_LINE_BYTES`; a miss re-walks, then shrinks the
+    /// `W + (W - B) + 2s + ΔB` before the next line, on E3's premise
+    /// (retained growth at most twice the bytes consumed) plus one doubling
+    /// of every walked non-buffer container and the measured buffer growth.
+    /// The next line (L ≤ `MAX_JSONL_LINE_BYTES`) adds at most `2L` retained
+    /// and `g ≤ MAX_JSONL_LINE_BYTES` of buffer, so charging
+    /// `2 × MAX_JSONL_LINE_BYTES` here keeps the step within
+    /// `room + MAX_JSONL_LINE_BYTES` on that premise. Like main's E3, the
+    /// transient `serde_json::Value` of a line being decoded is not
+    /// charged. Fresh walks use `s = 0`; a miss re-walks, then shrinks the
     /// buffers and re-walks.
     fn step_fits(&mut self, walk: &mut Option<ProofWalk>, room: usize) -> bool {
         let buffers = self.buffers();
@@ -16886,7 +16894,7 @@ impl CodexProofReaders {
                 .checked_add(walk.charge.saturating_sub(walk.buffers))?
                 .checked_add(since.checked_mul(2)?)?
                 .checked_add(buffers.saturating_sub(walk.buffers))?
-                .checked_add(MAX_JSONL_LINE_BYTES)
+                .checked_add(MAX_JSONL_LINE_BYTES.checked_mul(2)?)
         };
         let fits = |need: Option<usize>| need.is_some_and(|need| need <= room);
         let estimate = walk.and_then(|walk| {
@@ -17708,7 +17716,11 @@ impl ScanIndex {
     ///   object is reset.
     /// - **Record:** live (`codex_parent_side_live`) → takes the wrap epoch;
     ///   else removed when more than 2 wraps stale, P's ledger generation
-    ///   ended.
+    ///   ended, unless its pace is active at `now` (`SidePace::active`,
+    ///   fix round 2 DM2): a pruned request's pacing then outlives every
+    ///   wrap, so a re-reference re-arms at the floor, never `Live{0}`. A
+    ///   pace record leaves with P (orphan sweep, replay) or by its cure;
+    ///   it is bounded by the index's parents, one record each.
     ///
     /// No byte of any transcript is read; the transient is ≤ 2 ×
     /// `CODEX_SIDE_SWEEP_KEYS` key clones.
@@ -17717,6 +17729,7 @@ impl ScanIndex {
         &mut self,
         census_valid: bool,
         side: Option<(&sampled_scan::SharedCache, u128)>,
+        now: u64,
     ) -> SideSweep {
         use sampled_scan::side_ledger::{LedgerEntry, LedgerTag};
         use std::ops::Bound::{Excluded, Unbounded};
@@ -17850,7 +17863,10 @@ impl ScanIndex {
                     record.referenced_epoch = wrap;
                     false
                 }
-                Some(record) => codex_side_epoch_stale(record.referenced_epoch, wrap),
+                Some(record) => {
+                    codex_side_epoch_stale(record.referenced_epoch, wrap)
+                        && !record.pace.is_some_and(|pace| pace.active(now))
+                }
                 None => false,
             };
             if prune_record {
@@ -21749,10 +21765,10 @@ impl OwnedSourceScan {
                 }
                 // E3: the completion step walks the finished job exactly,
                 // once, for the budget its retention consumes below.
-                let copy_budget = if active.cursor.is_some() {
+                let (copy_budget, copy_measure) = if active.cursor.is_some() {
                     sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active)
                 } else {
-                    copy_budget
+                    (copy_budget, step_measure)
                 };
                 // #631 review M1: the bytes this attempt read, taken before
                 // `finish_job` consumes the acquisition's start offset. An
@@ -22065,6 +22081,13 @@ impl OwnedSourceScan {
                 // compact records and their selector table were already charged
                 // by copy_budget_step. A refusal disables retention, preserving
                 // the ordinary native finish and its loss/output semantics.
+                // U1a-2a (R2-B3, fix round 2 DB1): a suspended proof that both
+                // shares would overrun is retired first, before either clone.
+                sampled_scan::retire_proof_beside_copy(
+                    sampling.as_ref(),
+                    copy_budget,
+                    copy_measure,
+                );
                 let finish_copy_budget = parser
                     .accumulator
                     .claude_responses

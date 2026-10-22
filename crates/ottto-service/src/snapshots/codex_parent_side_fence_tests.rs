@@ -9,6 +9,9 @@ use sampled_scan::codex_cursor::OpenStamp;
 use sampled_scan::side_ledger::{namespace_of, parent_of, LedgerEntry, LedgerKey, LedgerTag};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 
+/// The sweep's clock in these tests: past every fixture pace's `not_before`.
+const SWEEP_NOW: u64 = 1_800_000_000;
+
 const KEY: &str = "/s/rollout-parent.jsonl";
 
 struct Parent {
@@ -435,7 +438,9 @@ fn an_epoch_pruned_request_rearms_with_at_least_its_attempts() {
     index.codex_parent_proof_wrap_epoch = 10;
     index.codex_parent_side_requests.insert(KEY.into(), charged);
     assert_eq!(
-        index.sweep_codex_parent_side(false, None).requests_pruned,
+        index
+            .sweep_codex_parent_side(false, None, SWEEP_NOW)
+            .requests_pruned,
         1
     );
     assert!(index.codex_parent_side_requests.is_empty());
@@ -448,13 +453,52 @@ fn an_epoch_pruned_request_rearms_with_at_least_its_attempts() {
         charged.not_before_unix_seconds
     );
 
+    // Fix round 2 (DM2): unreferenced for 3+ wraps, the record keeps the
+    // pruned pacing (its pace is active), so the re-reference re-arms at
+    // the floor with the same `not_before`, never `Live{0}`.
+    let mut record = parent.record(SideVerdict::Settled, now + 600);
+    record.referenced_epoch = 10;
+    let mut index = with_record(record);
+    index.codex_parent_proof_wrap_epoch = 10;
+    index.codex_parent_side_requests.insert(KEY.into(), charged);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(false, None, now)
+            .requests_pruned,
+        1
+    );
+    for wrap in 11..=14 {
+        index.codex_parent_proof_wrap_epoch = wrap;
+        assert_eq!(
+            index
+                .sweep_codex_parent_side(false, None, now)
+                .records_pruned,
+            0,
+            "wrap {wrap}"
+        );
+    }
+    assert!(index.codex_parent_side.contains_key(KEY));
+    let (fenced, _) = parent.fence(&mut index, 1, now);
+    assert_eq!(fenced, SideFence::Refused(FullReason::ClockChanged));
+    let rearmed = index.codex_parent_side_requests[KEY];
+    assert!(
+        rearmed.attempts >= SIDE_REQUEST_EVICT_ATTEMPTS - 1,
+        "{rearmed:?}"
+    );
+    assert_eq!(
+        rearmed.not_before_unix_seconds,
+        charged.not_before_unix_seconds
+    );
+
     let mut index = ScanIndex {
         codex_parent_proof_wrap_epoch: 10,
         ..ScanIndex::default()
     };
     index.codex_parent_side_requests.insert(KEY.into(), charged);
     assert_eq!(
-        index.sweep_codex_parent_side(false, None).requests_pruned,
+        index
+            .sweep_codex_parent_side(false, None, SWEEP_NOW)
+            .requests_pruned,
         0
     );
     assert_eq!(index.codex_parent_side_requests[KEY], charged);
