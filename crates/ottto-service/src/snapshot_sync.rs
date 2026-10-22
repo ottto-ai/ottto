@@ -22683,6 +22683,48 @@ mod request_owned_retry_tests {
     }
 
     #[test]
+    fn held_clock_rollback_load_preserves_destination_ack_and_permanent_custody() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-hold-clock-rollback");
+        let path = scratch.join("upload-progress.json");
+        let namespace = "a".repeat(64);
+        let accepted = "b".repeat(64);
+        let refused = "c".repeat(64);
+        let held = "d".repeat(64);
+        let body = "e".repeat(64);
+        let witness = snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+        let mut p = SnapshotUploadProgress::new(namespace.clone(), witness.clone());
+        p.record_body(&accepted, &body);
+        p.quarantine_permanent_body(
+            &refused,
+            &body,
+            "claude_request_owned_usage_contract_mismatch",
+        );
+        p.quarantine_held_body(&held, &body, SnapshotHoldKind::Held);
+        // Simulate an hour of rollback by persisting the clock seen before it.
+        let future = current_unix_seconds() + 3600;
+        let record = p.quarantined_fingerprints.get_mut(&held).unwrap();
+        let hold = record.hold.as_mut().unwrap();
+        hold.first_held_unix = future;
+        hold.day_start_unix = future;
+        hold.retries_in_day = 6;
+        record.retry_after_unix_seconds = hold.retry_after(&held, future);
+        p.save(&path).unwrap();
+        let restored = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();
+        assert_eq!(restored.accepted_fingerprints, p.accepted_fingerprints);
+        assert_eq!(restored.accepted_body_witnesses, p.accepted_body_witnesses);
+        assert_eq!(restored.permanent_rejections, p.permanent_rejections);
+        assert_eq!(
+            restored.quarantined_fingerprints,
+            p.quarantined_fingerprints
+        );
+        assert!(!restored.quarantined_fingerprints[&held]
+            .hold
+            .as_ref()
+            .unwrap()
+            .allowance(current_unix_seconds()));
+    }
+
+    #[test]
     fn request_owned_hold_slots_preserve_ordinary_retries_and_return_unused_capacity() {
         let mut p = progress();
         for n in 0..60 {

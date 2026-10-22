@@ -753,6 +753,7 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
                 record.hold.is_none(),
                 "this is v1 custody, not a money server hold"
             );
+            let protected_quarantine = serde_json::to_value(&*record).unwrap();
             progress.save(&progress_path).unwrap();
             saved.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
             saved.save(&control.index_path).unwrap();
@@ -772,15 +773,18 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
                     .is_some(),
                 "v1 quarantine stays retained"
             );
-            let retained = SnapshotUploadProgress::load(
-                &progress_path,
-                &namespace,
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .unwrap();
-            assert!(retained
-                .quarantined_fingerprints
-                .contains_key(&protected_fp));
+            // Finish transfers cycle custody into the durable index before
+            // retiring transient progress. Compare the whole v1 record.
+            assert_eq!(
+                serde_json::to_value(
+                    saved
+                        .quarantined_snapshot_fingerprints
+                        .get(&protected_fp)
+                        .expect("protected upload-v1 custody")
+                )
+                .unwrap(),
+                protected_quarantine
+            );
             assert!(saved
                 .quarantined_snapshot_fingerprints
                 .contains_key(&protected_fp));
@@ -840,15 +844,16 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
                 assert!(saved
                     .quarantined_snapshot_fingerprints
                     .contains_key(&protected_fp));
-                let retained = SnapshotUploadProgress::load(
-                    &progress_path,
-                    &namespace,
-                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-                )
-                .unwrap();
-                assert!(retained
-                    .quarantined_fingerprints
-                    .contains_key(&protected_fp));
+                assert_eq!(
+                    serde_json::to_value(
+                        saved
+                            .quarantined_snapshot_fingerprints
+                            .get(&protected_fp)
+                            .expect("sibling must preserve protected upload-v1 custody")
+                    )
+                    .unwrap(),
+                    protected_quarantine
+                );
                 let statuses = control.server.terminal.lock().unwrap();
                 let status = statuses.last().unwrap();
                 if terminal {
