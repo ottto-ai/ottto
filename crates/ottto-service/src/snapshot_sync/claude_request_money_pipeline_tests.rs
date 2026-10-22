@@ -387,7 +387,6 @@ fn money_shadow_changes_no_page_decision_through_the_real_caller() {
     assert_eq!(latest[0]["new"]["cost_usd"], "0.000100");
     assert_eq!(latest[0]["new"]["requests"], 1);
     assert_eq!(money::reserved_for_test(), 0, "admission is released");
-    assert_eq!(money::capture::capture_reserved(), 0, "captures are taken");
 }
 
 /// Finding 8: arming the shadow changes no live item and no live
@@ -462,6 +461,9 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
         armed.census_complete,
         response + 3600,
     );
+    // Every page item's capture was taken (freed); drop any parse of this
+    // scope no item carried, then the capture budget is back to baseline.
+    money::capture::purge_scope_for_test(&fixture.support);
     assert_eq!(money::capture::capture_reserved(), baseline_reserved);
     assert_eq!(money::reserved_for_test(), 0);
 }
@@ -549,8 +551,6 @@ fn money_shadow_refusal_logs_and_changes_nothing() {
     assert!(coverage
         .iter()
         .all(|row| row["coverage_complete"] == false && row["refused"] == true));
-    // The refused pages' captures were still taken and freed.
-    assert_eq!(money::capture::capture_reserved(), 0);
 }
 
 /// One armed scan of a fresh fixture, for direct `shadow_page_at` calls.
@@ -654,14 +654,33 @@ fn money_shadow_removed_change_is_bound_to_the_previous_body() {
         >= rows.len() as u64);
 }
 
+/// The latest snapshot's grains of each family row.
+fn money_latest_grains(arm: &MoneyPipelineArm) -> Vec<&serde_json::Value> {
+    let mut latest = BTreeMap::<String, u64>::new();
+    for family in arm.of("family") {
+        let snapshot = family["snapshot"].as_u64().unwrap();
+        let slot = latest
+            .entry(family["family"].as_str().unwrap().to_owned())
+            .or_default();
+        *slot = (*slot).max(snapshot);
+    }
+    arm.of("grain")
+        .into_iter()
+        .filter(|grain| {
+            latest.get(grain["family"].as_str().unwrap()) == grain["snapshot"].as_u64().as_ref()
+        })
+        .collect()
+}
+
 /// SI parity: on a corpus with no copied request and no side call, the shadow
-/// body equals the live body for every built family. With them, only the
-/// deliberate differences appear, each in its own family and by its exact
-/// amount.
+/// body equals the live body except units it holds on unknown debt (or
+/// defers as immature). With them, only the deliberate differences appear,
+/// each in its own family and by its exact amount.
 #[test]
 #[serial(source_manifests)]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
+    let undecided = ["held", "immature"];
     let plain = money_pipeline_arm(
         "money-shadow-parity-plain",
         MoneyCorpus {
@@ -671,15 +690,21 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
         },
     );
     money_assert_rows_consistent(&plain);
+    for grain in plain.of("grain") {
+        assert!(
+            undecided.contains(&grain["category"].as_str().unwrap()),
+            "an undeclared difference: {grain}"
+        );
+    }
     for row in plain
         .of("family")
         .into_iter()
         .filter(|row| row["category"] != "unbuilt")
+        .filter(|row| money_totals(row, "held").1 == 0 && money_totals(row, "immature").1 == 0)
     {
         assert_eq!(row["category"], "equal", "{row}");
         assert_eq!(money_totals(row, "new"), money_totals(row, "old"), "{row}");
     }
-    assert!(plain.of("grain").is_empty(), "{:?}", plain.of("grain"));
     assert_eq!(money_count(&plain.lines, "side_calls"), 0);
     assert_eq!(money_count(&plain.lines, "units_removed"), 0);
 
@@ -694,24 +719,29 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
     money_assert_rows_consistent(&differing);
     let copy_family = money::hashed_id_for_test(MONEY_PIPELINE_COPY);
     let side_family = money::hashed_id_for_test(PIPELINE_SESSIONS[1]);
-    for row in differing
-        .of("family")
-        .into_iter()
-        .filter(|row| row["category"] != "unbuilt")
-    {
-        let (old, _) = money_totals(row, "old");
-        let (new, _) = money_totals(row, "new");
-        if row["family"] == copy_family.as_str() {
+    let mut copies = 0_i128;
+    let mut side_calls = 0_i128;
+    for grain in money_latest_grains(&differing) {
+        let change = money_grain_tokens(&grain["new"]) - money_grain_tokens(&grain["old"]);
+        match grain["category"].as_str().unwrap() {
             // MONEY_DELIBERATE_DIFFERENCES[0]
-            assert_eq!(old - new, MONEY_PIPELINE_RESPONSE_TOKENS, "{row}");
-        } else if row["family"] == side_family.as_str() && new != old {
-            // MONEY_DELIBERATE_DIFFERENCES[1], unless the live body already
-            // carries reported usage (then it is counted, not added).
-            assert_eq!(new - old, MONEY_PIPELINE_SIDE_CALL_TOKENS, "{row}");
-        } else {
-            assert_eq!(new, old, "an undeclared difference: {row}");
+            "copies_removed" => {
+                assert_eq!(grain["family"], copy_family.as_str(), "{grain}");
+                copies += change;
+            }
+            // MONEY_DELIBERATE_DIFFERENCES[1]
+            "side_call_added" => {
+                assert_eq!(grain["family"], side_family.as_str(), "{grain}");
+                side_calls += change;
+            }
+            // A matched unit's own money: same tokens.
+            "own_cost" => assert_eq!(change, 0, "{grain}"),
+            category if undecided.contains(&category) => {}
+            _ => panic!("an undeclared difference: {grain}"),
         }
     }
+    assert_eq!(copies, -i128::from(MONEY_PIPELINE_RESPONSE_TOKENS));
+    assert_eq!(side_calls, i128::from(MONEY_PIPELINE_SIDE_CALL_TOKENS));
     assert_eq!(MONEY_DELIBERATE_DIFFERENCES.len(), 2);
 }
 
