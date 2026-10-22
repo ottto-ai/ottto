@@ -445,6 +445,8 @@ fn money_unclocked(mut value: serde_json::Value) -> serde_json::Value {
 enum MoneyArm {
     Unarmed,
     Armed,
+    /// P2 compiled in, explicitly disabled at the live caller boundary.
+    LiveGateOff,
     /// Armed, with the shadow's whole memory ceiling held: the page refuses.
     ShadowRefused,
     /// Armed, with the output batch's admission refused after the page.
@@ -651,6 +653,11 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
         }
+        if arm == MoneyArm::LiveGateOff {
+            assert!(!money::request_owned_live(&support));
+            std::fs::write(support.join("claude-request-owned-live.off"), b"").unwrap();
+            assert!(!money::request_owned_live(&support));
+        }
         if arm == MoneyArm::Unarmed {
             money::disable_shadow_for_test(&support);
             money::store::forget_for_test(&support);
@@ -671,7 +678,7 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
         };
         match arm {
             MoneyArm::Unarmed => assert!(lines.is_empty()),
-            MoneyArm::Armed => {
+            MoneyArm::Armed | MoneyArm::LiveGateOff => {
                 assert!(count("families") > 0, "{lines:?}");
                 assert_eq!(count("ledger_loading") + count("refused_budget"), 0, "{lines:?}");
                 assert!(lines
@@ -711,9 +718,9 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
             );
             assert_eq!(baseline.ok, !conflict, "{baseline:?}");
             let arms: &[MoneyArm] = if granted && !conflict {
-                &[MoneyArm::Armed, MoneyArm::ShadowRefused, MoneyArm::BatchRefused]
+                &[MoneyArm::Armed, MoneyArm::LiveGateOff, MoneyArm::ShadowRefused, MoneyArm::BatchRefused]
             } else {
-                &[MoneyArm::Armed]
+                &[MoneyArm::Armed, MoneyArm::LiveGateOff]
             };
             for arm in arms {
                 assert_eq!(
