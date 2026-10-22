@@ -36,8 +36,8 @@
 //! A read during which the file was written (its times moved) commits only
 //! when a second pass over the bytes it read finds them unchanged (R3-5).
 //! Audits are scheduled, not continuous (StateMissing M4): a record is
-//! audited a day after it grew, an idle one on a 30-day sample, a retired
-//! one never, and audits read at most 48 MiB per support directory a day.
+//! audited a day after it grew, an idle one on a 30-day sample, one without
+//! claims never, and audits read at most 48 MiB per support directory a day.
 
 use super::{ClaudeLocalOtelEvidence, STORE_DIR};
 use crate::snapshots::claude_request_census::{
@@ -1229,7 +1229,7 @@ fn note_audit_bytes(dir: &Path, now_unix: u64, bytes: u64) -> u64 {
 /// One bounded step of the audit: continue the audit in progress, else start
 /// one on the least recently audited due record. Due: a day after its last
 /// audit when bytes were appended since, else 30 days (an idle sidecar is
-/// sampled, not reread daily); a retired record (no claims) never. An audit
+/// sampled, not reread daily); a record without claims never. An audit
 /// rereads `[0, target)` across pages within today's audit bytes and
 /// compares the resumable checksum; a mismatch drops the record (rebuilt
 /// from 0 next sweep) and the certificate. A read the stamps show raced or
@@ -1252,7 +1252,9 @@ fn audit_step(
         .records_with_prefix(TELEMETRY_KEY_PREFIX)
         .filter_map(|(key, record)| {
             let state = record.tail()?;
-            if state.offset == 0 || record.retired().is_some() {
+            // No claims (a retired record before any later append): nothing
+            // an audit protects.
+            if state.offset == 0 || record.request_hashes().is_empty() {
                 return None;
             }
             let in_progress = state.audit.is_some();
