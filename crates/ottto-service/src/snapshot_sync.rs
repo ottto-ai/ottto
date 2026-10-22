@@ -4814,6 +4814,7 @@ fn prepare_sync_source(
         source,
     ));
     if source == SnapshotSource::ClaudeCode {
+        index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
     }
     let committed_index = index.clone();

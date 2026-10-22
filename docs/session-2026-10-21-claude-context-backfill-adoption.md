@@ -33,6 +33,21 @@ generation, so no body identity, progress generation or census state is reset.
 - The Claude parse-reason log line gains `body_witness_adoption_deferred=<n>`
   (count only). The `body_witness_adoption` count per page shows progress and
   falls to 0 when the re-read is done.
+- Claude compares revisions monotonically (MONEY P2): a file is re-read only
+  when its stored revision is below the active one (a missing stored value
+  counts as 0). A newer stored revision, as after a downgrade, is never
+  re-read. Codex and Pi keep the exact comparison. Runtime-only flag set by
+  `prepare_sync_source` for Claude; no index format change.
+- Stop rule (SOURCE Amendment 7, after #678): every Claude fold records
+  `ClaudeContextFileBirthCounts::resource_withheld()` (a family over its
+  evidence bound, or a full remembered-veto table). While the last fold's value
+  is true, Claude adoption takes no adoption-only file (budget 0, every such
+  file deferred) and the log line reports
+  `body_witness_adoption_stop=evidence_bound_withheld` (otherwise `none`). The
+  next clean fold resumes. The flag is process-local, like the fold's alarm
+  latch, and process-wide across Claude destinations: after a restart the first
+  page runs before its fold re-arms the stop, so at most one page (the file and
+  byte caps above) is read.
 
 Authority-quarantined Claude families are unaffected: the quarantine gate runs
 before the adoption gate, so a held family keeps its own bounded retry and is
@@ -54,7 +69,11 @@ against the index's path-derived ids (root = file stem, subagent =
 load the list is closed over the index's roots (a listed subagent adds its root
 digest), so no sibling's adoption can cancel a carry or re-arm the listed
 member (StateMissing N1). Listing roots stays the install rule, as defence in
-depth.
+depth. The closure is bounded: it walks the index keys borrowed, hashes ids on
+the stack, adds each root once, and keeps at most 2,048 digests (each listed
+line plus at most one root per line; each added root is one 64-byte string).
+Past that bound the list state becomes `closure_overflow` and adoption pauses
+rather than run with a partial closure.
 
 - Read once per Claude cycle, before the scan. Other sources never read it.
 - The list fails closed (SOURCE Amendment 3):
@@ -80,6 +99,7 @@ depth.
     service log (`local_resource_diagnostics`, local only, no wire field).
     Restoring the file (empty is fine) resumes.
   - Unreadable, oversized or malformed: adoption pauses that cycle, as before.
+  - Family closure past its bound (`closure_overflow`): adoption pauses.
   - Changed and new files are never held or paused by the list, and the hold
     applies to Claude Code only (Codex and Pi never load the list).
 - A listed file is one whose family root id or own member id digest is in the
@@ -90,7 +110,8 @@ depth.
 - The parse-reason log line adds `body_witness_adoption_excluded=<n>`,
   `body_witness_adoption_held_no_list=<n>`,
   `body_witness_adoption_exclusions_invalid=<0|1>` and
-  `body_witness_adoption_list=<not_installed|installed|missing_after_install|unreadable|marker_unwritable>`.
+  `body_witness_adoption_list=<not_installed|installed|missing_after_install|unreadable|marker_unwritable|closure_overflow>`,
+  and `body_witness_adoption_stop=<none|evidence_bound_withheld>`.
   No id, digest or path is logged.
 
 ## Release rule
@@ -158,4 +179,10 @@ the server are unchanged.
   and unknown only, empty list writes a 0600 marker and a later missing file
   pauses, an unwritable marker pauses until written, a listed member closes
   over its root, listed root or member, malformed and oversized lists never
-  write the marker)
+  write the marker, family closure deduplicates roots and fails closed past
+  its bound, stack digests match the full-id digest)
+- `claude_context_backfill_compares_revisions_monotonically` (stored 3 with
+  active 2 is not re-read; stored 1 with active 2 is re-read once)
+- `claude_context_file_birth_tests::claude_backfill_stops_while_the_last_fold_withheld_for_a_resource_limit`
+  (evidence bound through `with_claude_evidence_bound_for_test`, and a full
+  remembered-veto table, each stop adoption; a clean fold resumes it)

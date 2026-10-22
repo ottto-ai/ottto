@@ -23,6 +23,8 @@
 //! - Marker present and file missing: adoption pauses, the status reason says
 //!   so, and a local alarm is raised every cycle until the file is back.
 //! - Unreadable, oversized or malformed: adoption pauses.
+//! - Closing over families would pass `MAX_CLOSED_DIGESTS`: adoption pauses
+//!   rather than run with a partial closure.
 //!
 //! Only adoption is gated; changed and new files are never held here.
 
@@ -35,6 +37,10 @@ const FILE_NAME: &str = "claude_code-reemission-exclusions.txt";
 const SEEN_FILE_NAME: &str = "claude_code-reemission-exclusions.seen";
 const MAX_BYTES: u64 = 64 * 1024;
 const MAX_LINES: usize = 1_024;
+/// Digests kept after closing over families: each listed line plus at most
+/// one root per listed line (a member id names exactly one root). Each added
+/// root is one 64-byte string; the walk itself allocates nothing.
+const MAX_CLOSED_DIGESTS: usize = 2 * MAX_LINES;
 /// 2026-10-21T00:00:00Z. Before the list was ever installed, entities first
 /// indexed before this instant are not re-emitted by adoption.
 const NO_LIST_HOLD_BEFORE_UNIX_SECONDS: u64 = 1_792_540_800;
@@ -52,6 +58,9 @@ pub(crate) enum ListState {
     Unreadable,
     /// A well-formed list whose seen-marker could not be written: paused.
     MarkerUnwritable,
+    /// Closing the list over family roots would pass `MAX_CLOSED_DIGESTS`:
+    /// paused, never a partial closure.
+    ClosureOverflow,
 }
 
 impl ListState {
@@ -62,6 +71,7 @@ impl ListState {
             Self::MissingAfterInstall => "missing_after_install",
             Self::Unreadable => "unreadable",
             Self::MarkerUnwritable => "marker_unwritable",
+            Self::ClosureOverflow => "closure_overflow",
         }
     }
 }
@@ -165,11 +175,15 @@ impl ReemissionExclusions {
     }
 
     /// Adoption takes no file this cycle: the list is unreadable, it was
-    /// installed once and is now missing, or its install is not yet recorded.
+    /// installed once and is now missing, its install is not yet recorded, or
+    /// its family closure overflowed.
     pub(crate) fn pauses_adoption(&self) -> bool {
         matches!(
             self.state,
-            ListState::Unreadable | ListState::MissingAfterInstall | ListState::MarkerUnwritable
+            ListState::Unreadable
+                | ListState::MissingAfterInstall
+                | ListState::MarkerUnwritable
+                | ListState::ClosureOverflow
         )
     }
 
@@ -185,31 +199,81 @@ impl ReemissionExclusions {
     }
 
     /// Close the list over families: a listed member also lists its root.
-    /// `members` yields (root id, member id) for each indexed subagent file.
-    pub(crate) fn close_over_roots(&mut self, members: impl Iterator<Item = (String, String)>) {
+    /// `members` yields borrowed (root id, subagent stem) for each indexed
+    /// subagent file. Digests are hashed on the stack, a root already listed
+    /// is not added again, and the set never grows past `MAX_CLOSED_DIGESTS`:
+    /// at that bound the state becomes `ClosureOverflow` and adoption pauses.
+    pub(crate) fn close_over_roots<'a>(
+        &mut self,
+        members: impl Iterator<Item = (&'a str, &'a str)>,
+    ) {
+        self.close_over_roots_within(members, MAX_CLOSED_DIGESTS);
+    }
+
+    fn close_over_roots_within<'a>(
+        &mut self,
+        members: impl Iterator<Item = (&'a str, &'a str)>,
+        max_digests: usize,
+    ) {
         if self.is_empty() {
             return;
         }
-        let roots = members
-            .filter(|(_, member)| self.digests.contains(&digest(member)))
-            .map(|(root, _)| digest(&root))
-            .collect::<Vec<_>>();
-        self.digests.extend(roots);
+        for (root, stem) in members {
+            if !self.contains(&HexDigest::of(root, Some(stem))) {
+                continue;
+            }
+            let root_digest = HexDigest::of(root, None);
+            if self.contains(&root_digest) {
+                continue;
+            }
+            if self.digests.len() >= max_digests {
+                self.state = ListState::ClosureOverflow;
+                return;
+            }
+            self.digests.insert(root_digest.as_str().to_owned());
+        }
     }
 
-    /// True when the exact full id of the family root or of this member is
-    /// listed. After `close_over_roots`, every member of a family with any
-    /// listed member matches through its root.
-    pub(crate) fn excludes(&self, root_session_id: &str, member_session_id: &str) -> bool {
+    /// True when the exact full id of the family root or of this member
+    /// (`root` alone, or `root_stem`) is listed. After `close_over_roots`,
+    /// every member of a family with any listed member matches through its
+    /// root.
+    pub(crate) fn excludes(&self, root_session_id: &str, subagent_stem: Option<&str>) -> bool {
         !self.is_empty()
-            && [root_session_id, member_session_id]
-                .iter()
-                .any(|id| self.digests.contains(&digest(id)))
+            && (self.contains(&HexDigest::of(root_session_id, None))
+                || subagent_stem
+                    .is_some_and(|stem| self.contains(&HexDigest::of(root_session_id, Some(stem)))))
+    }
+
+    fn contains(&self, digest: &HexDigest) -> bool {
+        self.digests.contains(digest.as_str())
     }
 }
 
-fn digest(id: &str) -> String {
-    format!("{:x}", Sha256::digest(id.as_bytes()))
+/// Lowercase hex SHA-256 of a full session id, `root` or `root_stem`, built
+/// on the stack so a lookup allocates nothing.
+struct HexDigest([u8; 64]);
+
+impl HexDigest {
+    fn of(root: &str, subagent_stem: Option<&str>) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hasher = Sha256::new();
+        hasher.update(root.as_bytes());
+        if let Some(stem) = subagent_stem {
+            hasher.update(b"_");
+            hasher.update(stem.as_bytes());
+        }
+        let mut hex = [0_u8; 64];
+        for (at, byte) in hasher.finalize().iter().enumerate() {
+            hex[2 * at] = HEX[usize::from(byte >> 4)];
+            hex[2 * at + 1] = HEX[usize::from(byte & 0x0f)];
+        }
+        Self(hex)
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("hex digits are ASCII")
+    }
 }
 
 fn write_seen_marker(path: &Path) -> std::io::Result<()> {
@@ -272,7 +336,7 @@ mod tests {
         assert_eq!(loaded.state(), ListState::NotInstalled);
         assert_eq!(loaded.state().as_str(), "not_installed");
         assert!(!loaded.is_invalid() && !loaded.pauses_adoption());
-        assert!(!loaded.excludes("root", "root"));
+        assert!(!loaded.excludes("root", None));
         assert!(loaded.holds_without_list(Some(NO_LIST_HOLD_BEFORE_UNIX_SECONDS - 1)));
         assert!(loaded.holds_without_list(None), "unknown counts as old");
         assert!(!loaded.holds_without_list(Some(NO_LIST_HOLD_BEFORE_UNIX_SECONDS)));
@@ -347,19 +411,86 @@ mod tests {
     fn a_listed_member_closes_over_its_family_root() {
         let mut parsed =
             ReemissionExclusions::parse(format!("{}\n", digest("root-b_agent-1")).as_bytes());
-        assert!(!parsed.excludes("root-b", "root-b"));
+        assert!(!parsed.excludes("root-b", None));
         parsed.close_over_roots(
             [
-                ("root-b".to_string(), "root-b_agent-1".to_string()),
-                ("root-b".to_string(), "root-b_agent-2".to_string()),
-                ("root-c".to_string(), "root-c_agent-1".to_string()),
+                ("root-b", "agent-1"),
+                ("root-b", "agent-2"),
+                ("root-c", "agent-1"),
             ]
             .into_iter(),
         );
-        assert!(parsed.excludes("root-b", "root-b"));
-        assert!(parsed.excludes("root-b", "root-b_agent-2"));
-        assert!(!parsed.excludes("root-c", "root-c"));
-        assert!(!parsed.excludes("root-c", "root-c_agent-1"));
+        assert!(parsed.excludes("root-b", None));
+        assert!(parsed.excludes("root-b", Some("agent-2")));
+        assert!(!parsed.excludes("root-c", None));
+        assert!(!parsed.excludes("root-c", Some("agent-1")));
+        assert_eq!(parsed.state(), ListState::Installed);
+    }
+
+    /// Repeated members of one listed family add its root once; the closed
+    /// set stays within its bound, and a closure that would pass it pauses
+    /// adoption instead of running with a partial closure.
+    #[test]
+    fn family_closure_deduplicates_roots_and_fails_closed_past_its_bound() {
+        assert_eq!(MAX_CLOSED_DIGESTS, 2 * MAX_LINES);
+        let listed = format!(
+            "{}\n{}\n{}\n",
+            digest("root-a_agent-1"),
+            digest("root-a_agent-2"),
+            digest("root-b_agent-1")
+        );
+        let members = || {
+            [
+                ("root-a", "agent-1"),
+                ("root-a", "agent-2"),
+                ("root-a", "agent-1"),
+                ("root-a", "agent-3"),
+                ("root-b", "agent-1"),
+                ("root-b", "agent-1"),
+                ("root-c", "agent-1"),
+            ]
+            .into_iter()
+        };
+        // Three lines plus two distinct roots fill a bound of five exactly.
+        let mut exact = ReemissionExclusions::parse(listed.as_bytes());
+        exact.close_over_roots_within(members(), 5);
+        assert_eq!(exact.state(), ListState::Installed);
+        assert!(!exact.pauses_adoption());
+        assert_eq!(
+            exact.digests.len(),
+            5,
+            "each root once, whatever the repeats"
+        );
+        assert!(exact.excludes("root-a", Some("agent-3")));
+        assert!(exact.excludes("root-b", None));
+        assert!(!exact.excludes("root-c", Some("agent-1")));
+        // A bound one lower refuses the second root and pauses adoption.
+        let mut over = ReemissionExclusions::parse(listed.as_bytes());
+        over.close_over_roots_within(members(), 4);
+        assert_eq!(over.state(), ListState::ClosureOverflow);
+        assert_eq!(over.state().as_str(), "closure_overflow");
+        assert!(over.pauses_adoption() && !over.is_invalid());
+        assert_eq!(over.digests.len(), 4, "never past the bound");
+        // The production bound holds a full list closed over a root per line.
+        let full = (0..MAX_LINES)
+            .map(|slot| digest(&format!("root-{slot}_agent")) + "\n")
+            .collect::<String>();
+        let roots = (0..MAX_LINES)
+            .map(|slot| format!("root-{slot}"))
+            .collect::<Vec<_>>();
+        let mut closed = ReemissionExclusions::parse(full.as_bytes());
+        closed.close_over_roots(roots.iter().map(|root| (root.as_str(), "agent")));
+        assert_eq!(closed.state(), ListState::Installed);
+        assert_eq!(closed.digests.len(), MAX_CLOSED_DIGESTS);
+    }
+
+    #[test]
+    fn stack_digest_matches_the_full_id_digest() {
+        assert_eq!(HexDigest::of("root-a", None).as_str(), digest("root-a"));
+        assert_eq!(
+            HexDigest::of("root-a", Some("agent-1")).as_str(),
+            digest("root-a_agent-1")
+        );
     }
 
     #[test]
@@ -371,11 +502,11 @@ mod tests {
         );
         let parsed = ReemissionExclusions::parse(text.as_bytes());
         assert!(!parsed.is_invalid());
-        assert!(parsed.excludes("root-a", "root-a"));
-        assert!(parsed.excludes("root-a", "root-a_agent-9"));
-        assert!(parsed.excludes("root-b", "root-b_agent-1"));
-        assert!(!parsed.excludes("root-b", "root-b"));
-        assert!(!parsed.excludes("root-b", "root-b_agent-2"));
+        assert!(parsed.excludes("root-a", None));
+        assert!(parsed.excludes("root-a", Some("agent-9")));
+        assert!(parsed.excludes("root-b", Some("agent-1")));
+        assert!(!parsed.excludes("root-b", None));
+        assert!(!parsed.excludes("root-b", Some("agent-2")));
     }
 
     #[test]
@@ -410,6 +541,6 @@ mod tests {
         std::fs::write(&path, format!("{}\n", digest("root-a"))).unwrap();
         let loaded = ReemissionExclusions::load(&dir);
         assert!(!loaded.is_invalid());
-        assert!(loaded.excludes("root-a", "root-a"));
+        assert!(loaded.excludes("root-a", None));
     }
 }

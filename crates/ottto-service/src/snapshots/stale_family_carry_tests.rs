@@ -864,11 +864,11 @@ fn c1b_member_only_reemission_line_excludes_the_carried_family_root() {
     // The root is excluded although only the member is listed.
     assert!(index
         .claude_reemission_exclusions
-        .excludes(CARRY_ROOT, CARRY_ROOT));
+        .excludes(CARRY_ROOT, None));
     // Unrelated families stay unlisted.
     assert!(!index
         .claude_reemission_exclusions
-        .excludes(CARRY_OTHER, CARRY_OTHER));
+        .excludes(CARRY_OTHER, None));
     // The carry is intact and the member is not re-armed.
     assert!(index.claude_stale_family_carry.roots.contains(CARRY_ROOT));
     assert_eq!(index.files[&agent_key].source_file_fingerprint, before);

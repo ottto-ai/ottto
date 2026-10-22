@@ -2429,6 +2429,10 @@ pub struct ScanIndex {
     /// Adoption is recorded per complete, settled file rather than per census.
     #[serde(skip)]
     active_effective_upload_body_witness_revision: u64,
+    /// Runtime-only, Claude only: adopt a file only when its stored revision
+    /// is below the active one. Codex and Pi compare exactly.
+    #[serde(skip)]
+    active_effective_upload_body_witness_revision_monotone: bool,
     /// Local held/mixed groups must not adopt a projection they did not upload.
     #[serde(skip)]
     effective_upload_body_witness_revision_excluded_source_files: BTreeSet<String>,
@@ -2502,6 +2506,7 @@ impl Default for ScanIndex {
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
             active_effective_upload_body_witness_revision: 0,
+            active_effective_upload_body_witness_revision_monotone: false,
             effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
             claude_reemission_exclusions: ReemissionExclusions::default(),
         }
@@ -6140,6 +6145,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         }
     }
     claude_context_file_birth::alarm_first_resource_withhold(&context_file_birth);
+    record_claude_context_resource_withheld(&context_file_birth);
 
     let owned_start_reparse_ids = index
         .claude_owned_start_census
@@ -19553,12 +19559,13 @@ impl OwnedSourceScan {
                         || body_witness_adoption_deferred > 0
                         || body_witness_adoption_excluded > 0
                         || body_witness_adoption_held_no_list > 0
-                        || index.claude_reemission_exclusions.pauses_adoption())
+                        || index.claude_reemission_exclusions.pauses_adoption()
+                        || claude_context_resource_withheld())
                 {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         CANDIDATE_PARSE_REASON_NAMES
                             .iter()
@@ -19571,7 +19578,12 @@ impl OwnedSourceScan {
                         body_witness_adoption_excluded,
                         body_witness_adoption_held_no_list,
                         u8::from(index.claude_reemission_exclusions.is_invalid()),
-                        index.claude_reemission_exclusions.state().as_str()
+                        index.claude_reemission_exclusions.state().as_str(),
+                        if claude_context_resource_withheld() {
+                            "evidence_bound_withheld"
+                        } else {
+                            "none"
+                        }
                     );
                 }
                 // A remove/rename hint can arrive after bounded reconciliation has already
@@ -20161,7 +20173,9 @@ impl OwnedSourceScan {
             // re-emission list names is skipped the same way without using the
             // budget; an unreadable or vanished list defers every such file.
             // Before the list was ever installed, a file born before the
-            // cutoff (the index keeps no first-indexed time) is held.
+            // cutoff (the index keeps no first-indexed time) is held. While
+            // the last Claude fold withheld for a resource limit, the budget
+            // is 0 (the Amendment 7 stop rule).
             if decision == CandidateDecision::Parse
                 && !comparison_target
                 && parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
@@ -20182,6 +20196,7 @@ impl OwnedSourceScan {
                     body_witness_adoption_held_no_list += 1;
                     decision = CandidateDecision::Skip;
                 } else if !index.claude_reemission_exclusions.pauses_adoption()
+                    && !(source == SnapshotSource::ClaudeCode && claude_context_resource_withheld())
                     && body_witness_adoption_only_parses < body_witness_adoption_page_budget()
                     && (body_witness_adoption_only_parses == 0
                         || body_witness_adoption_only_bytes.saturating_add(candidate.size_bytes)
@@ -29687,6 +29702,47 @@ fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> 
     value
 }
 
+// SOURCE Amendment 7 stop rule. Every Claude fold records whether it withheld
+// context scalars for a resource limit (a family over its evidence bound, or a
+// full remembered-veto table). While the last fold did, Claude adoption takes
+// no adoption-only file (budget 0, reason `evidence_bound_withheld`); a clean
+// fold resumes it. Process-local, like the fold's alarm latch: after a restart
+// the first page runs before its fold re-arms the stop, so at most one page
+// (the file and byte caps above) is read.
+#[cfg(not(test))]
+static CLAUDE_CONTEXT_RESOURCE_WITHHELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Tests share one process, so each test thread keeps its own flag.
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_CONTEXT_RESOURCE_WITHHELD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(not(test))]
+fn record_claude_context_resource_withheld(counts: &ClaudeContextFileBirthCounts) {
+    CLAUDE_CONTEXT_RESOURCE_WITHHELD.store(
+        counts.resource_withheld(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+fn record_claude_context_resource_withheld(counts: &ClaudeContextFileBirthCounts) {
+    CLAUDE_CONTEXT_RESOURCE_WITHHELD.with(|flag| flag.set(counts.resource_withheld()));
+}
+
+#[cfg(not(test))]
+fn claude_context_resource_withheld() -> bool {
+    CLAUDE_CONTEXT_RESOURCE_WITHHELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn claude_context_resource_withheld() -> bool {
+    CLAUDE_CONTEXT_RESOURCE_WITHHELD.with(std::cell::Cell::get)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateDecision {
     Skip,
@@ -30081,8 +30137,16 @@ impl ScanIndex {
     /// revisions adopt each unchanged file once; zero opts out of adoption.
     pub fn activate_effective_upload_body_witness_revision(&mut self, revision: u64) {
         self.active_effective_upload_body_witness_revision = revision;
+        self.active_effective_upload_body_witness_revision_monotone = false;
         self.effective_upload_body_witness_revision_excluded_source_files
             .clear();
+    }
+
+    /// Claude only (MONEY P2), after activating: re-read a file only when its
+    /// stored revision is below the active one (a missing stored value is 0),
+    /// so a newer stored revision is never re-read by an older build.
+    pub fn adopt_effective_upload_body_witness_revision_monotonically(&mut self) {
+        self.active_effective_upload_body_witness_revision_monotone = true;
     }
 
     /// Exclude every source file containing a locally held item before finalizing.
@@ -30102,9 +30166,8 @@ impl ScanIndex {
     pub fn load_claude_reemission_exclusions(&mut self, support_dir: &Path) {
         let mut exclusions = ReemissionExclusions::load(support_dir);
         exclusions.close_over_roots(self.files.keys().filter_map(|key| {
-            claude_index_path_member_ref(Path::new(key))
-                .filter(|member| member.subagent_stem.is_some())
-                .map(ClaudeIndexPathMemberRef::into_owned)
+            let member = claude_index_path_member_ref(Path::new(key))?;
+            Some((member.root, member.subagent_stem?))
         }));
         self.claude_reemission_exclusions = exclusions;
         if self.claude_reemission_exclusions.state() == ListState::MissingAfterInstall {
@@ -32020,6 +32083,8 @@ impl ScanIndex {
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
             active_effective_upload_body_witness_revision: self
                 .active_effective_upload_body_witness_revision,
+            active_effective_upload_body_witness_revision_monotone: self
+                .active_effective_upload_body_witness_revision_monotone,
             effective_upload_body_witness_revision_excluded_source_files: self
                 .effective_upload_body_witness_revision_excluded_source_files
                 .clone(),
@@ -32301,10 +32366,15 @@ impl ScanIndex {
     }
 
     fn effective_upload_body_witness_revision_requires_adoption(&self, key: &str) -> bool {
-        self.active_effective_upload_body_witness_revision != 0
+        let active = self.active_effective_upload_body_witness_revision;
+        active != 0
             && self.files.get(key).map_or(true, |entry| {
-                entry.effective_upload_body_witness_revision
-                    != self.active_effective_upload_body_witness_revision
+                let stored = entry.effective_upload_body_witness_revision;
+                if self.active_effective_upload_body_witness_revision_monotone {
+                    stored < active
+                } else {
+                    stored != active
+                }
             })
     }
 
@@ -32341,9 +32411,8 @@ impl ScanIndex {
     fn claude_reemission_excluded(&self, candidate: &CandidateFile) -> bool {
         !self.claude_reemission_exclusions.is_empty()
             && claude_index_path_member_ref(&candidate.path).is_some_and(|member| {
-                let (root_session_id, member_session_id) = member.into_owned();
                 self.claude_reemission_exclusions
-                    .excludes(&root_session_id, &member_session_id)
+                    .excludes(member.root, member.subagent_stem)
             })
     }
 
@@ -55668,6 +55737,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
             ),
         );
+        index.adopt_effective_upload_body_witness_revision_monotonically();
         scan_source_roots_with_limit(
             SnapshotSource::ClaudeCode,
             &[root.to_path_buf()],
@@ -55781,6 +55851,55 @@ mod tests {
         let stable = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
         assert_eq!((stable.scanned_file_count, stable.snapshots.len()), (0, 0));
         assert!(stable.census_complete);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// MONEY P2: Claude re-reads a file only when its stored revision is
+    /// below the active one (a missing stored value is 0). A newer stored
+    /// revision, as after a downgrade, is not re-read; Codex and Pi keep the
+    /// exact comparison.
+    #[test]
+    fn claude_context_backfill_compares_revisions_monotonically() {
+        let (home, root, index) =
+            claude_context_backfill_fixture("claude-context-backfill-monotone", 1);
+        let mut newer = index.clone();
+        for entry in newer.files.values_mut() {
+            entry.effective_upload_body_witness_revision = 3;
+        }
+        let skipped =
+            claude_context_backfill_scan(&root, &mut newer, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(
+            skipped.scanned_file_count, 0,
+            "stored 3, active 2: no re-read"
+        );
+        // The exact comparison Codex and Pi keep would select the same files.
+        let mut exact = newer.clone();
+        exact.activate_effective_upload_body_witness_revision(2);
+        assert!(exact
+            .files
+            .keys()
+            .all(|key| exact.effective_upload_body_witness_revision_requires_adoption(key)));
+        let mut unstamped = newer.clone();
+        for entry in unstamped.files.values_mut() {
+            entry.effective_upload_body_witness_revision = 0;
+        }
+        assert!(unstamped
+            .files
+            .keys()
+            .all(|key| unstamped.effective_upload_body_witness_revision_requires_adoption(key)));
+
+        let mut index = index;
+        assert!(index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+        let previous = index.clone();
+        let mut scan =
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(scan.scanned_file_count, 2, "stored 1, active 2: re-read");
+        let mut loaded = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+        let again = claude_context_backfill_scan(&root, &mut loaded, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(again.scanned_file_count, 0, "once");
         let _ = fs::remove_dir_all(home);
     }
 
@@ -70114,7 +70233,7 @@ crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verifi
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

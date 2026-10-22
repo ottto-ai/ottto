@@ -2120,3 +2120,88 @@ fn tail_and_full_read_select_the_same_first_request() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+/// #677 stop rule (SOURCE Amendment 7): while the last Claude fold withheld
+/// scalars for a resource limit, the one-time re-read takes no adoption-only
+/// file; a clean fold resumes it. Both cases: a root over the evidence bound
+/// (the merged seam) and a full remembered-veto table.
+#[test]
+fn claude_backfill_stops_while_the_last_fold_withheld_for_a_resource_limit() {
+    let dir = temp_dir("claude-file-birth-backfill-stop");
+    let now = OffsetDateTime::now_utc();
+    let files = five_request_roots(&dir, now, &[ROOT, SECOND]);
+    let paths = [files[0].0.as_path()];
+    let rows = own_rows(&[ROOT], &[]);
+    let fold_pass = || {
+        let mut items = vec![files[0].1.clone()];
+        let mut index = indexed(&paths, true);
+        fold_with_bound(
+            &mut items,
+            &rows,
+            &mut index,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        )
+    };
+    let (home, transcripts, backfill) =
+        claude_context_backfill_fixture("claude-file-birth-backfill-stop-history", 1);
+    let adoption_page = || {
+        let mut index = backfill.clone();
+        let scan =
+            claude_context_backfill_scan(&transcripts, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert!(scan.census_complete, "a stop never holds the census");
+        scan.scanned_file_count
+    };
+
+    assert!(!fold_pass().context_file_birth.resource_withheld());
+    assert!(!claude_context_resource_withheld());
+    assert_eq!(adoption_page(), 2, "the root and its subagent adopt");
+
+    // Evidence bound: the seam puts ROOT's five requests over a bound of 4.
+    let withheld = claude_context_file_birth::with_claude_evidence_bound_for_test(4, fold_pass);
+    assert_eq!(
+        withheld.posture_admission(ROOT),
+        Some("withheld_evidence_bound")
+    );
+    assert!(withheld.context_file_birth.resource_withheld());
+    assert!(claude_context_resource_withheld());
+    assert_eq!(adoption_page(), 0, "budget 0 while the last fold withheld");
+
+    // The next clean fold resumes adoption.
+    assert!(!fold_pass().context_file_birth.resource_withheld());
+    assert!(!claude_context_resource_withheld());
+    assert_eq!(adoption_page(), 2);
+
+    // A full remembered-veto table is a resource withhold too: a capacity-1
+    // table that already holds another file overflows on the next veto.
+    let item = files[0].1.clone();
+    let mut memory = claude_context_file_birth::ClaudeRememberedTripwire::new(1);
+    memory.remember(&files[1].1);
+    memory.remember(&item);
+    let reports = no_reports();
+    let veto_rows = ClaudeVetoApiRows::new();
+    let tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
+        std::slice::from_ref(&item),
+        1_000,
+        &reports.0,
+        &reports.1,
+        &veto_rows,
+    );
+    let mut counts = ClaudeContextFileBirthCounts::default();
+    let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
+        &mut item.clone(),
+        ROOT,
+        &tripwire,
+        &mut memory,
+        false,
+        &mut counts,
+    );
+    assert_eq!(verdict, ClaudeFileBirthVerdict::Tripwire);
+    assert!(counts.remembered_veto_overflowed);
+    assert_eq!(counts.total.withheld_evidence_bound_session_count, 0);
+    record_claude_context_resource_withheld(&counts);
+    assert!(claude_context_resource_withheld());
+    assert_eq!(adoption_page(), 0, "veto overflow stops adoption");
+    record_claude_context_resource_withheld(&ClaudeContextFileBirthCounts::default());
+    assert_eq!(adoption_page(), 2);
+    let _ = (fs::remove_dir_all(dir), fs::remove_dir_all(home));
+}
