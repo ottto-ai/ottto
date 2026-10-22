@@ -2491,7 +2491,7 @@ fn read_file(
         if undated
             && OffsetDateTime::from_unix_timestamp(checkpoint.created)
                 .ok()
-                .is_none_or(|created| day_of(created.date()) < window.floor)
+                .map_or(true, |created| day_of(created.date()) < window.floor)
         {
             // Undated records were attributed when first read. Once that
             // day may have expired, a reread cannot safely restore them on

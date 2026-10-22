@@ -31,8 +31,8 @@ changed before the post, the record is dropped unsent. The record is marked
 sent before the first request, then the state lease is released before credential
 or network work. Relay-token and health requests each use a bounded DNS/request
 budget of ten seconds; successful health responses have a 64 KiB byte cap.
-A refused or failed post is logged once and counted in the daemon's metrics line, and is never retried within the day; the
-next daily run reports again. A record older than yesterday is dropped rather
+A refused or failed post is logged once and counted in the daemon's metrics
+line, and is never retried within the day; the next daily run reports again. A record older than yesterday is dropped rather
 than sent late.
 
 ## Audit sample

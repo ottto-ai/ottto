@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 802,
-  "content_sha256": "f6700b6d8460b88de57eb4260e4e9407d8682317b21a369a654438bce94e530d",
+  "content_sha256": "1d589874c9d747a8e2dcc82310917b3e6028f49ed591faf5fef9941ff55c336f",
   "files": [
     {
       "executable": false,
@@ -1063,8 +1063,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/harvest.rs",
-      "sha256": "f6947ec9ff27179e12b430c5e13c117e2e170d186cba34a56a220af744c3b567",
-      "size_bytes": 103631
+      "sha256": "173f04935b5c7705b246a7e709c2058f099a3d2293b655aeb70d0ab7a7b38d10",
+      "size_bytes": 103633
     },
     {
       "executable": false,
@@ -1105,8 +1105,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/tests/a2.rs",
-      "sha256": "71eb42571d32928c1655af2e7e38284a25bd26a9c451afda5fba35d2cb11e72a",
-      "size_bytes": 37406
+      "sha256": "7430ec6d6588854f9048ad63edc797be2438d136e553d5226768d0f61bf05676",
+      "size_bytes": 37721
     },
     {
       "executable": false,
@@ -3828,7 +3828,7 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-composition-run-health-audit.md",
-      "sha256": "8f68b334abcaec7562c00b50cd3f1067eb7f5f6e346352fdd0717e594d4c67ca",
+      "sha256": "99cf2eb34a9b2347559cfa9ee819d39b93501619059b868c4751a04523195c88",
       "size_bytes": 4838
     },
     {
@@ -5617,7 +5617,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T17:04:28+00:00",
+  "generated_at": "2026-10-22T17:09:41+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 803,
   "public_roots": [
@@ -5656,5 +5656,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e8214e11fb1382faedd3f9a67f1023b4adf0f24e"
+  "source_commit": "7918a98b4952fc9acac75327c272b95c0902ea30"
 }

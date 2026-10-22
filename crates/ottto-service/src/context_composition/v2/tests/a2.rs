@@ -900,11 +900,14 @@ fn run_health_client_bounds_a_stalled_response() {
         "http://{}",
         listener.local_addr().unwrap()
     ));
+    let (done, stop) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let until = Instant::now() + Duration::from_secs(2);
         loop {
             if let Ok((_stream, _)) = listener.accept() {
-                std::thread::sleep(Duration::from_millis(400));
+                // Stay open past the asserted client deadline. The caller
+                // releases us after it returns, including on a failed assertion.
+                let _ = stop.recv_timeout(Duration::from_secs(3));
                 return;
             }
             assert!(Instant::now() < until, "health client never connected");
@@ -912,15 +915,19 @@ fn run_health_client_bounds_a_stalled_response() {
         }
     });
     let start = Instant::now();
-    assert!(client
-        .post_context_composition_run_health_with_timeout(
-            "synthetic-relay",
-            &json!({}),
-            Duration::from_millis(150)
-        )
-        .is_err());
-    assert!(start.elapsed() < Duration::from_secs(2));
+    let result = client.post_context_composition_run_health_with_timeout(
+        "synthetic-relay",
+        &json!({}),
+        Duration::from_millis(150),
+    );
+    let elapsed = start.elapsed();
+    let _ = done.send(());
     server.join().unwrap();
+    assert!(result.is_err());
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "health deadline took {elapsed:?}"
+    );
 }
 
 #[test]
