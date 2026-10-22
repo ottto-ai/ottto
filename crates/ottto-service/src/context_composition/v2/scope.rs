@@ -8,14 +8,16 @@
 
 use super::aggregate::{stable_hash, Day};
 use super::aggregate::{Aggregate, AggregateRef, StoredAggregate};
-use super::checkpoint::{read_json, write_json, write_packed, Checkpoint};
+use super::checkpoint::{
+    create_dir_durable, read_json, sync_dir, write_atomic, write_json, write_packed, Checkpoint,
+};
 use super::file::Source;
 use super::STATE_SCHEMA;
 use crate::context_footprint::{
     repository_main_checkout, resolve_repository_identity, sha256_hex, workspace_label,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Identity fields uploaded with the scope (labels resolved with consent
@@ -189,6 +191,15 @@ pub(super) struct Scope {
     pub(super) agg: Aggregate,
     pub(super) shards: BTreeMap<u16, ShardRef>,
     pub(super) file_sessions: Vec<FileSession>,
+    /// Shards whose file was checked against its reference in this run.
+    verified: BTreeSet<u16>,
+}
+
+/// The files one committed generation references: its totals and shards.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Refs {
+    totals: Option<u64>,
+    shards: BTreeMap<u16, u64>,
 }
 
 impl Scope {
@@ -213,6 +224,19 @@ impl Scope {
             agg: Aggregate::default(),
             shards: BTreeMap::new(),
             file_sessions: Vec::new(),
+            verified: BTreeSet::new(),
+        }
+    }
+
+    /// The files this state references (kept by the next commit's cleanup).
+    pub(super) fn refs(&self) -> Refs {
+        Refs {
+            totals: Some(self.generation),
+            shards: self
+                .shards
+                .iter()
+                .map(|(id, reference)| (*id, reference.generation))
+                .collect(),
         }
     }
 }
@@ -297,9 +321,42 @@ pub(super) fn scope_path(state_dir: &Path, source: Source, scope_id: &str) -> Pa
         .join(format!("{}.json", scope_file_stem(source, scope_id)))
 }
 
+/// The previous committed manifest, kept until a newer commit is verified.
+/// A commit keeps it as the fallback; its files stay until the next
+/// verified commit replaces it.
+pub(super) fn prev_path(path: &Path) -> PathBuf {
+    path.with_extension("prev.json")
+}
+
+/// Keep the manifest now committed as the previous generation, before a new
+/// one replaces it.
+pub(super) fn keep_previous(path: &Path) -> std::io::Result<()> {
+    let mut current = std::fs::File::open(path)?;
+    write_atomic(&prev_path(path), |file| {
+        std::io::copy(&mut current, file).map(|_| ())
+    })
+}
+
 /// Load a scope. `Err` = the file exists but cannot be used (bad state).
 pub(super) fn load_scope(path: &Path, source: Source, scope_id: &str) -> Result<Option<Scope>, ()> {
-    let Some(stored) = read_json::<StoredScope>(path)? else {
+    load_manifest(path, path, source, scope_id)
+}
+
+/// Load the previous generation (`None` when there is none or it cannot
+/// be used either). Its files are named after the scope's manifest.
+pub(super) fn load_previous(path: &Path, source: Source, scope_id: &str) -> Option<Scope> {
+    load_manifest(&prev_path(path), path, source, scope_id)
+        .ok()
+        .flatten()
+}
+
+fn load_manifest(
+    manifest: &Path,
+    path: &Path,
+    source: Source,
+    scope_id: &str,
+) -> Result<Option<Scope>, ()> {
+    let Some(stored) = read_json::<StoredScope>(manifest)? else {
         return Ok(None);
     };
     if stored.schema != STATE_SCHEMA
@@ -326,7 +383,36 @@ pub(super) fn load_scope(path: &Path, source: Source, scope_id: &str) -> Result<
         agg,
         shards: stored.shards,
         file_sessions,
+        verified: BTreeSet::new(),
     }))
+}
+
+/// Read a just-written manifest back and check the totals and the shards it
+/// wrote against their hashes. Only a verified commit lets the cleanup drop
+/// the previous generation.
+pub(super) fn verify_commit(path: &Path, source: Source, scope: &Scope) -> bool {
+    let Ok(Some(stored)) = read_json::<StoredScope>(path) else {
+        return false;
+    };
+    if stored.schema != STATE_SCHEMA
+        || stored.agent != source.label()
+        || stored.scope_id != scope.scope_id
+        || stored.generation != scope.generation
+    {
+        return false;
+    }
+    let Some(totals) = stored.totals else {
+        return false;
+    };
+    let file = path.with_extension(format!("totals.{}.zst", totals.generation));
+    if totals.generation != scope.generation || file_sha(&file).ok() != Some(totals.sha) {
+        return false;
+    }
+    stored.shards.iter().all(|(id, reference)| {
+        reference.generation != scope.generation
+            || file_sha(&shard_path(path, *id, reference.generation)).ok()
+                == Some(reference.sha.clone())
+    })
 }
 
 /// Write a scope atomically; returns its size in bytes.
@@ -373,7 +459,7 @@ impl Scope {
     pub(super) fn load_shard(&mut self, path: &Path, id: u16) -> Result<(), ()> {
         if let Some(reference) = self.shards.get(&id) {
             let file = shard_path(path, id, reference.generation);
-            if file_sha(&file).map_err(|_| ())? != reference.sha {
+            if !self.verified.contains(&id) && file_sha(&file).map_err(|_| ())? != reference.sha {
                 return Err(());
             }
             let shard: Shard = read_json(&file)?.ok_or(())?;
@@ -414,6 +500,36 @@ impl Scope {
         Ok(bytes)
     }
 
+    /// Check the referenced files of these shards (missing, partial or a
+    /// different hash) before anything is read; returns the damaged ones.
+    pub(super) fn verify_shards(
+        &mut self,
+        path: &Path,
+        ids: impl IntoIterator<Item = u16>,
+    ) -> BTreeSet<u16> {
+        let mut damaged = BTreeSet::new();
+        for id in ids {
+            let Some(reference) = self.shards.get(&id) else {
+                continue;
+            };
+            if file_sha(&shard_path(path, id, reference.generation)).ok()
+                == Some(reference.sha.clone())
+            {
+                self.verified.insert(id);
+            } else {
+                damaged.insert(id);
+            }
+        }
+        damaged
+    }
+
+    /// Stop referencing a damaged shard; returns its file (to set aside).
+    pub(super) fn drop_shard(&mut self, path: &Path, id: u16) -> Option<PathBuf> {
+        self.verified.remove(&id);
+        let reference = self.shards.remove(&id)?;
+        Some(shard_path(path, id, reference.generation))
+    }
+
     /// Recovery and test inspection only. The daily path never hydrates all
     /// checkpoints; it holds one changed shard at a time.
     pub(super) fn load_all_shards(&mut self, path: &Path) -> Result<(), ()> {
@@ -426,49 +542,117 @@ impl Scope {
         Ok(())
     }
 
-    /// Remove obsolete generations only after the new manifest is durable.
-    pub(super) fn clean_shards(&self, path: &Path) {
+    /// Remove generations neither this state nor `previous` references, only
+    /// after the new manifest is verified.
+    pub(super) fn clean_shards(&self, path: &Path, previous: &Refs) {
         let Some(dir) = path.parent() else { return };
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             return;
         };
-        let prefix = format!("{stem}.s");
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let name = entry.file_name();
-            if let Some(rest) = name
-                .to_str()
-                .and_then(|n| n.strip_prefix(&format!("{stem}.totals.")))
-            {
-                if rest
-                    .strip_suffix(".zst")
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .is_some_and(|g| g != self.generation)
-                {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-                continue;
-            }
-            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
-                continue;
-            };
-            let mut parts = rest.split('.');
-            let (Some(id), Some(generation), Some("zst"), None) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let (Ok(id), Ok(generation)) = (id.parse::<u16>(), generation.parse::<u64>()) else {
-                continue;
-            };
-            if !self
-                .shards
-                .get(&id)
-                .is_some_and(|r| r.generation == generation)
-            {
-                let _ = std::fs::remove_file(entry.path());
+        let current = self.refs();
+        let kept = |refs: &Refs, id: Option<u16>, generation: u64| match id {
+            None => refs.totals == Some(generation),
+            Some(id) => refs.shards.get(&id) == Some(&generation),
+        };
+        for (file, id, generation) in generation_files(dir, stem) {
+            if !kept(&current, id, generation) && !kept(previous, id, generation) {
+                let _ = std::fs::remove_file(file);
             }
         }
     }
+}
+
+/// Totals (`None`) and shard files of a scope, with their generations.
+fn generation_files(dir: &Path, stem: &str) -> Vec<(PathBuf, Option<u16>, u64)> {
+    let prefix = format!("{stem}.s");
+    let totals = format!("{stem}.totals.");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(rest) = name.strip_prefix(&totals) {
+            if let Some(generation) = rest
+                .strip_suffix(".zst")
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                out.push((entry.path(), None, generation));
+            }
+            continue;
+        }
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let mut parts = rest.split('.');
+        let (Some(id), Some(generation), Some("zst"), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if let (Ok(id), Ok(generation)) = (id.parse::<u16>(), generation.parse::<u64>()) {
+            out.push((entry.path(), Some(id), generation));
+        }
+    }
+    out
+}
+
+/// The highest generation any file of the scope carries: a commit after a
+/// fallback must never reuse a name the failed generation wrote.
+pub(super) fn highest_generation(path: &Path) -> u64 {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
+        return 0;
+    };
+    generation_files(dir, stem)
+        .into_iter()
+        .map(|(_, _, generation)| generation)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Every state file of one scope (manifests, totals, shards, upload ack).
+pub(super) fn scope_files(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
+        return Vec::new();
+    };
+    let prefix = format!("{stem}.");
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Move state files that cannot be used out of the way, under
+/// `quarantine/<label>`, for inspection. Nothing reads them again.
+pub(super) fn set_aside(state_dir: &Path, label: &str, files: &[PathBuf]) -> std::io::Result<()> {
+    let target = state_dir.join("quarantine").join(label);
+    create_dir_durable(&target)?;
+    let mut sources = BTreeSet::new();
+    for file in files {
+        let Some(name) = file.file_name() else {
+            continue;
+        };
+        match std::fs::rename(file, target.join(name)) {
+            Ok(()) => {
+                if let Some(dir) = file.parent() {
+                    sources.insert(dir.to_path_buf());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    sync_dir(&target)?;
+    for dir in sources {
+        sync_dir(&dir)?;
+    }
+    Ok(())
 }
 
 fn file_sha(path: &Path) -> std::io::Result<String> {

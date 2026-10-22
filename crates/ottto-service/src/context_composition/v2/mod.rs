@@ -68,10 +68,9 @@ pub(super) fn changed_days_enabled() -> bool {
 /// Local state folder, under the composition state folder.
 const STATE_DIR: &str = "v2";
 /// Bumped when the local state layout changes incompatibly; a mismatch reads
-/// as bad state (a full read within budget, never a failure). Once released,
-/// a layout change must ship a migration of the old state instead of a bump:
-/// a bump re-reads every file within the repair budget, which the
-/// forward-only rule for methodology changes forbids.
+/// as bad state (the scope is set aside and counted, never a failure or a
+/// re-read). Once released, a layout change must ship a migration of the old
+/// state instead of a bump: a bump would set every scope aside.
 const STATE_SCHEMA: u32 = 1;
 /// Parser identity recorded on each checkpoint at its first read. Changing it
 /// never re-reads old bytes.
@@ -89,7 +88,8 @@ const MIN_UPTIME: Duration = Duration::from_secs(15 * 60);
 const RUN_WALL_CAP: Duration = Duration::from_secs(30 * 60);
 
 // Budgets.
-/// Full reads (rewritten files, bad state, files live at install) per day.
+/// Full reads (rewritten files, files live at install) and reads after a
+/// state fallback, per day.
 /// New bytes are not capped.
 const REPAIR_BYTES_PER_DAY: u64 = 1024 * 1024 * 1024;
 /// A file modified this recently at the first run is "live at install" and

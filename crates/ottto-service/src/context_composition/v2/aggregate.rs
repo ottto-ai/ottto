@@ -1305,6 +1305,18 @@ impl StoredContribution {
         Some(share)
     }
 
+    /// Every stored kind and part id is known (`into_share` would succeed).
+    pub(super) fn ids_known(&self) -> bool {
+        let known =
+            |kind: &str, part: &str| kind_from_str(kind).is_some() && part_from_str(part).is_some();
+        self.parts.iter().all(|row| known(&row.1, &row.2))
+            && self.files.iter().all(|row| known(&row.2, &row.3))
+            && self
+                .sessions
+                .iter()
+                .all(|row| kind_from_str(&row.1).is_some())
+    }
+
     /// The file's session, as first counted.
     pub(super) fn session(&self) -> Option<&str> {
         self.session.as_deref()

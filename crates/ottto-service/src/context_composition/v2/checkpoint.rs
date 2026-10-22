@@ -10,7 +10,8 @@
 //! Pins (`index-<agent>.json`, compressed) map transcripts to their scope and
 //! starting offset. They are written once at the end of a run. Committed
 //! manifests recover missing or stale pins after a crash; checkpoint shards
-//! remain the authority for offsets.
+//! remain the authority for offsets. The first run also saves its discovery
+//! (`install-<agent>.json`) before any scope commits, until its pins exist.
 
 use super::aggregate::{stable_hash, Day, Slot, StoredContribution};
 use super::scope::ScopeInfo;
@@ -45,7 +46,7 @@ pub(super) fn write_atomic<T>(
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("state path has no folder"))?;
-    fs::create_dir_all(dir)?;
+    create_dir_durable(dir)?;
     let mut temp_name = path
         .file_name()
         .ok_or_else(|| std::io::Error::other("state path has no name"))?
@@ -64,8 +65,41 @@ pub(super) fn write_atomic<T>(
         written
     };
     fs::rename(&temp, path)?;
-    File::open(dir)?.sync_all()?;
+    sync_dir(dir)?;
     Ok(written)
+}
+
+/// Flush a folder's entries to disk.
+pub(super) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    SYNCED_DIRS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+thread_local! { pub(super) static SYNCED_DIRS: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+/// Create a folder and any missing parents, each flushed into its parent
+/// before anything is committed inside it: a power loss can otherwise drop
+/// a new folder's entry even though the files in it were synced.
+pub(super) fn create_dir_durable(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let parent = dir.parent().filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        create_dir_durable(parent)?;
+    }
+    match fs::create_dir(dir) {
+        Ok(()) => {}
+        // Created meanwhile by someone else: still make its entry durable.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+        Err(error) => return Err(error),
+    }
+    match parent {
+        Some(parent) => sync_dir(parent),
+        None => Ok(()),
+    }
 }
 
 /// Write `value` as JSON, streamed to the file (never one buffer of the
@@ -211,6 +245,11 @@ pub(super) struct Pin {
     pub(super) head: Fingerprint,
     #[serde(default)]
     pub(super) tail: Fingerprint,
+    /// Where the file's first read started (`start` moves on with each
+    /// commit). A scope falling back to an older committed generation reads
+    /// a file that generation never held from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) origin: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -235,6 +274,30 @@ pub(super) struct Index {
     /// The last day a pin named each scope. A scope no pin named for
     /// `KEEP_DAYS` is no longer refreshed.
     pub(super) scope_last_pinned: BTreeMap<String, Day>,
+    /// Scopes whose state could not be used and had no good earlier
+    /// generation, with the day they were set aside: never read, rebuilt or
+    /// uploaded again.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) quarantined_scopes: BTreeMap<String, Day>,
+}
+
+/// The first run's discovery, saved before any scope commits, so a crash
+/// part way through the first run resumes with the same cutoff and starting
+/// offsets instead of treating uncommitted files as found later.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct InstallRecord {
+    pub(super) schema: u32,
+    /// The first run's start (unix seconds): files born later are new.
+    pub(super) cutoff: i64,
+    /// Starting offset of each file the first run found.
+    pub(super) starts: BTreeMap<String, u64>,
+    /// Files live at install, read from their start within the repair budget.
+    pub(super) live: std::collections::BTreeSet<String>,
+}
+
+pub(super) fn install_path(dir: &Path, source_label: &str) -> std::path::PathBuf {
+    dir.join(format!("install-{source_label}.json"))
 }
 
 impl Index {
@@ -363,6 +426,13 @@ impl Checkpoint {
         let dropped = self.contribution.keep_session_only();
         let folded = self.parse.fold_open_by_kind();
         !was_cold || dropped || folded
+    }
+
+    /// Every stored kind and part id is known to this build: the parse
+    /// state, its open calls and their shares, and the contribution's part,
+    /// file and session rows. A checkpoint failing this is never used.
+    pub(super) fn ids_known(&self) -> bool {
+        self.parse.ids_known() && self.contribution.ids_known()
     }
 
     /// Drop days before `floor`.
@@ -569,6 +639,19 @@ impl StoredParse {
             copied: self.copied,
             ..ParseState::default()
         }
+    }
+
+    fn ids_known(&self) -> bool {
+        use super::aggregate::{kind_from_str, part_from_str};
+        let known =
+            |kind: &str, part: &str| kind_from_str(kind).is_some() && part_from_str(part).is_some();
+        self.open_calls.iter().all(|call| {
+            known(&call.kind, &call.part)
+                && call.shares.iter().all(|(kind, part, ..)| known(kind, part))
+        }) && self
+            .open
+            .iter()
+            .all(|(_, kind, part, ..)| known(kind, part))
     }
 
     /// Bytes held in memory, approximately.
