@@ -1008,37 +1008,15 @@ fn pressure(ledger: &ClaudeLedger, percent: usize) -> bool {
             >= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES * percent
 }
 
-/// Remove idle telemetry with no indexed transcript. It cannot establish a
-/// permanent ownership claim after the transcript retention window has passed.
-pub(crate) fn retire_idle_telemetry(ledger: &mut ClaudeLedger, index: &ScanIndex, now: u64) -> u64 {
-    let roots = index
-        .files
-        .keys()
-        .filter_map(|key| {
-            super::claude_request_money::logical_family_member(index, key).map(|(root, _)| root)
-        })
-        .collect::<BTreeSet<_>>();
-    let keys = ledger
-        .census()
-        .records_with_prefix(TELEMETRY_KEY_PREFIX)
-        .filter_map(|(key, record)| {
-            let tail = record.tail()?;
-            if now.saturating_sub(tail.last_append_unix) <= 35 * 86_400 {
-                return None;
-            }
-            let facts = super::claude_request_money::facts::ClaudeFacts::open(record.facts()?)?;
-            (!roots.contains(&facts.header.session)).then(|| key.clone())
-        })
-        .collect::<Vec<_>>();
-    for key in &keys {
-        if let Some(mut record) = ledger.take(key) {
-            // Keep the consumed offset: an unchanged retained sidecar must
-            // not replay its retired claims from offset zero on every sweep.
-            record.retire();
-            let _ = ledger.insert(key.clone(), record);
-        }
-    }
-    keys.len() as u64
+/// Idle time never retires telemetry ownership claims. Only the pressure
+/// retirement path below may withdraw them.
+#[cfg(test)]
+pub(crate) fn retire_idle_telemetry(
+    _ledger: &mut ClaudeLedger,
+    _index: &ScanIndex,
+    _now: u64,
+) -> u64 {
+    0
 }
 
 /// Telemetry retirement under budget pressure only: at 90% of the ledger's

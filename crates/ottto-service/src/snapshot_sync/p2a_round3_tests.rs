@@ -142,59 +142,74 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     }
                 }).unwrap();
             }
-            cadence.next_due_cycle();
-            let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-            let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
-            let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
-                prepare_sync_source(
-                    &client,
-                    &device,
-                    "device-secret",
-                    SnapshotSource::ClaudeCode,
-                    "otm_test",
-                    &fixture.home,
-                    &support,
-                    &daemon,
-                    &mut transport,
-                    daemon.snapshot_scan_account_witness().unwrap(),
-                    false,
-                )
-            })
-            .unwrap()
-            .expect("real due preparation");
-            let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-            assert!(index.request_money_live_revision());
-            assert!(
-                !scan.snapshots.is_empty(),
-                "actual selector must re-read the owed revision"
-            );
-            let progress_path = preparation.upload_progress_path.clone();
-            if ack_save_fault && cycle == 0 {
-                P2A_ACK_SAVE_FAILURE
-                    .with(|state| *state.borrow_mut() = Some(progress_path.clone()));
-            }
-            if conflict && cycle == 1 {
-                P2A_INDEX_CONFLICT
-                    .with(|state| *state.borrow_mut() = Some(preparation.index_path.clone()));
-            }
-            let result = crate::agent_status_refresh::with_test_collection(collection(), || {
-                finish_sync_source(
-                    preparation,
-                    index,
-                    scan,
-                    &client,
-                    &device,
-                    "device-secret",
-                    SnapshotSource::ClaudeCode,
-                    "otm_test",
-                    &fixture.home,
-                    &support,
-                    &daemon,
-                    &mut transport,
-                    &mut retry,
-                )
-            });
-            money::store::flush();
+            let mut attempts = 0;
+            let (result, progress_path) = loop {
+                attempts += 1;
+                assert!(attempts <= 24, "resumable writer must converge");
+                cadence.next_due_cycle();
+                let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+                let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+                let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+                    prepare_sync_source(
+                        &client,
+                        &device,
+                        "device-secret",
+                        SnapshotSource::ClaudeCode,
+                        "otm_test",
+                        &fixture.home,
+                        &support,
+                        &daemon,
+                        &mut transport,
+                        daemon.snapshot_scan_account_witness().unwrap(),
+                        false,
+                    )
+                })
+                .unwrap()
+                .expect("real due preparation");
+                let (preparation, index, scan) =
+                    collect_native_preparation_with_rotation(frame, false);
+                assert!(index.request_money_live_revision());
+                assert!(
+                    !scan.snapshots.is_empty(),
+                    "actual selector must re-read the owed revision"
+                );
+                let progress_path = preparation.upload_progress_path.clone();
+                if ack_save_fault && cycle == 0 {
+                    P2A_ACK_SAVE_FAILURE
+                        .with(|state| *state.borrow_mut() = Some(progress_path.clone()));
+                }
+                if conflict && cycle == 1 {
+                    P2A_INDEX_CONFLICT
+                        .with(|state| *state.borrow_mut() = Some(preparation.index_path.clone()));
+                }
+                let result =
+                    crate::agent_status_refresh::with_test_collection(collection(), || {
+                        finish_sync_source(
+                            preparation,
+                            index,
+                            scan,
+                            &client,
+                            &device,
+                            "device-secret",
+                            SnapshotSource::ClaudeCode,
+                            "otm_test",
+                            &fixture.home,
+                            &support,
+                            &daemon,
+                            &mut transport,
+                            &mut retry,
+                        )
+                    });
+                money::store::flush();
+                if result.as_ref().err().is_some_and(|error| {
+                    error
+                        .to_string()
+                        .contains("request money scheduling checkpoint pending")
+                }) {
+                    continue;
+                }
+                break (result, progress_path);
+            };
             let saved = ScanIndex::load(&index_path).unwrap();
             if conflict && cycle == 1 {
                 assert!(result.is_err(), "competing selected save must reject CAS");

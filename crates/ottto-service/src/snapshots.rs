@@ -2273,7 +2273,11 @@ pub struct ScanIndex {
     #[serde(default, skip_serializing_if = "ClaudeRequestCensus::is_empty")]
     claude_request_census: ClaudeRequestCensus,
     /// Local selection/custody only; never part of an upload or semantic hash.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "claude_request_money::decode_selections"
+    )]
     claude_money_files: BTreeMap<String, claude_request_money::MoneyFileSelection>,
     #[serde(skip)]
     claude_money_selection_changed: BTreeSet<String>,
@@ -5188,6 +5192,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .unwrap_or(true)
     });
 
+    if source == SnapshotSource::ClaudeCode && index.request_money_live_revision() {
+        claude_request_money::finalize_synthetic(index, &result.snapshots);
+    }
     // State-only Codex entities do not have a source-file fingerprint, so they
     // cannot use the file finalization table above. Rebind their durable map to
     // the final post-enrichment/post-policy/post-cutoff fingerprint here. This
@@ -5230,6 +5237,13 @@ pub fn finalize_scan_after_policy_with_body_witness(
         .values()
         .flat_map(BTreeSet::iter)
         .chain(index.codex_state_only_snapshot_fingerprints.values())
+        .chain(
+            index
+                .claude_money_files
+                .values()
+                .filter(|state| state.synthetic_body.is_some())
+                .map(|state| &state.revision),
+        )
         .collect::<BTreeSet<_>>();
     index
         .snapshot_activity_at
@@ -19463,7 +19477,12 @@ impl OwnedSourceScan {
                     }
                 }
                 if source == SnapshotSource::ClaudeCode {
-                    if parse_complete && source_verified && parsed.len() == 1 {
+                    if !comparison_target
+                        && index.request_money_live_revision()
+                        && parse_complete
+                        && source_verified
+                        && parsed.len() == 1
+                    {
                         claude_request_money::record_logical_member(
                             index,
                             &index_key,
@@ -20525,7 +20544,17 @@ impl OwnedSourceScan {
                 {
                     body_witness_adoption_held_no_list += 1;
                     decision = CandidateDecision::Skip;
-                } else if !adoption_paused
+                } else if (!adoption_paused
+                    || (index.active_request_money_adoption_paused
+                        && !index.claude_reemission_exclusions.pauses_adoption()
+                        && !claude_reemission_stop_latched()
+                        && body_witness_adoption_only_parses == 0
+                        && index
+                            .active_request_money_support_dir
+                            .as_deref()
+                            .is_some_and(|support| {
+                                claude_request_money::adoption_probe_due(support, index)
+                            })))
                     && body_witness_adoption_only_parses < body_witness_adoption_page_budget()
                     && (if index.request_money_live_revision() {
                         body_witness_adoption_only_bytes.saturating_add(candidate.size_bytes)
@@ -30972,14 +31001,35 @@ impl ScanIndex {
         &self,
         scan_result: &mut SourceScanResult,
     ) -> bool {
-        let terminal_entity_count = self.claude_usage_authority_terminal_entity_count();
+        let applicable = |root: &&String| {
+            !self.request_money_live_revision()
+                || self.claude_reemission_exclusions.protected_root(root)
+        };
+        let terminal_entity_count = if !self.request_money_live_revision() {
+            self.claude_usage_authority_terminal_entity_count()
+        } else {
+            self.claude_usage_authority_quarantine
+                .iter()
+                .filter(|(root, record)| {
+                    applicable(root)
+                        && record.disposition
+                            == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+                })
+                .map(|(_, record)| record.member_source_file_fingerprints.len())
+                .sum::<usize>()
+        };
         scan_result.ownership_incomplete_file_count = scan_result
             .ownership_incomplete_file_count
             .saturating_add(terminal_entity_count);
         scan_result.terminal_ownership_incomplete_file_count = scan_result
             .terminal_ownership_incomplete_file_count
             .saturating_add(terminal_entity_count);
-        self.claude_usage_authority_pending_count() > 0
+        self.claude_usage_authority_quarantine
+            .iter()
+            .any(|(root, record)| {
+                applicable(&root)
+                    && record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            })
     }
 
     pub(crate) fn legacy_settlement_ledger_needs_migration(&self) -> bool {
@@ -31775,11 +31825,14 @@ impl ScanIndex {
             .iter()
             .filter(|(key, _)| !self.file_snapshot_fingerprints.contains_key(*key))
             .filter_map(|(_, entry)| entry.last_snapshot_fingerprint.as_deref());
-        exact.chain(legacy).chain(
-            self.codex_state_only_snapshot_fingerprints
-                .values()
-                .map(String::as_str),
-        )
+        exact
+            .chain(legacy)
+            .chain(
+                self.codex_state_only_snapshot_fingerprints
+                    .values()
+                    .map(String::as_str),
+            )
+            .chain(claude_request_money::synthetic_fingerprints(self).map(String::as_str))
     }
 
     /// The subset of this scan's index that is safe to commit when the upload
@@ -32638,20 +32691,9 @@ impl ScanIndex {
             claude_usage_family_witnesses: self.claude_usage_family_witnesses.clone(),
             claude_usage_family_pending: self.claude_usage_family_pending.clone(),
             claude_request_census: self.claude_request_census.clone(),
-            claude_money_files: previous
-                .claude_money_files
-                .iter()
-                .filter(|(key, _)| {
-                    self.files.contains_key(*key) || previous.files.contains_key(*key)
-                })
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .chain(
-                    self.claude_money_files
-                        .iter()
-                        .filter(|(key, _)| safe_keys.contains(*key))
-                        .map(|(key, value)| (key.clone(), value.clone())),
-                )
-                .collect(),
+            claude_money_files: claude_request_money::selected_money_files(
+                self, previous, &safe_keys, settled,
+            ),
             claude_money_selection_changed: BTreeSet::new(),
             claude_request_census_shadow: self.claude_request_census_shadow.clone(),
             claude_usage_authority_quarantine: self.claude_usage_authority_quarantine.clone(),
@@ -32854,7 +32896,7 @@ impl ScanIndex {
     fn prune_terminal_jsonl_dispositions(&mut self) {
         let files = &self.files;
         self.claude_money_files
-            .retain(|key, _| files.contains_key(key));
+            .retain(|key, state| state.synthetic_body.is_some() || files.contains_key(key));
         self.terminal_jsonl_dispositions
             .retain(|key, _| files.contains_key(key));
     }
@@ -33107,6 +33149,13 @@ impl ScanIndex {
             }
         }
         if !self.claude_reemission_excluded(candidate)
+            && self.files.get(&key).is_some_and(|entry| {
+                entry.effective_upload_body_witness_revision >= 3
+                    || self
+                        .active_request_money_support_dir
+                        .as_deref()
+                        .is_some_and(|support| claude_request_money::has_offer(support, &key))
+            })
             && self
                 .active_request_money_support_dir
                 .as_deref()

@@ -5,16 +5,26 @@ fn p2a_scan(root: &Path, support: &Path, index: &mut ScanIndex) -> SourceScanRes
     index.activate_effective_upload_body_witness_revision(3);
     index.adopt_effective_upload_body_witness_revision_monotonically();
     index.load_claude_reemission_exclusions(support);
-    scan_source_roots_with_limit(
-        SnapshotSource::ClaudeCode,
-        &[root.to_owned()],
-        index,
-        "2026-08-23T18:40:00Z",
-        BACKFILL_WINDOW_DAYS,
-        MAX_BACKFILL_FILES_PER_SOURCE,
-        true,
-    )
-    .unwrap()
+    // A selection may yield while its writer receipt is pending. Re-enter
+    // the real scan (fresh captures) once that receipt is available.
+    for _ in 0..24 {
+        let result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            &[root.to_owned()],
+            index,
+            "2026-08-23T18:40:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        if money::checkpoint_pending(support) {
+            money::store::flush();
+            continue;
+        }
+        return result;
+    }
+    panic!("adoption checkpoint did not converge")
 }
 fn p2a_support(home: &Path) -> PathBuf {
     let support = home.join("support");
@@ -349,7 +359,10 @@ fn p2a_real_scan_union_partial_files_primary_promotion_and_project_refusal() {
 #[serial_test::serial(claude_request_money_shadow)]
 fn p2a_gate_off_reconciliation_prunes_local_selection_metadata() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-metadata-prune", 1);
-    assert_eq!(index.claude_money_files.len(), 2);
+    assert!(
+        index.claude_money_files.is_empty(),
+        "gate-off scans allocate no selection custody"
+    );
     for key in index.files.keys() {
         fs::remove_file(key).unwrap();
     }
@@ -463,12 +476,11 @@ fn p2a_held_new_alias_discovery_survives_partial_index_rollback() {
         &mut BTreeMap::new(),
     );
     assert!(held.contains("aaaaaaaa-bbbb-4ccc-8ddd-000000000000"));
-    assert!(money::prepare_money_offers(
-        &support,
-        &index,
-        &page.snapshots,
-        &held
-    ));
+    assert!((0..8).any(|_| {
+        let ready = money::prepare_money_offers(&support, &index, &page.snapshots, &held);
+        money::store::flush();
+        ready
+    }));
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut page, &mut index);
     let mut partial = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     assert!(
@@ -526,7 +538,7 @@ fn p2a_union_resolves_pair_copies_before_request_conflicts_and_keeps_idless_line
     for (name, different_message, idless, expected_requests, expected_removed) in [
         ("progressive", false, false, 1, 0),
         ("conflicting", true, false, 1, 1),
-        ("idless", false, true, 4, 0),
+        ("idless", false, true, 2, 0),
     ] {
         let (home, root, mut index) =
             claude_context_backfill_fixture(&format!("p2a-pair-{name}"), 1);

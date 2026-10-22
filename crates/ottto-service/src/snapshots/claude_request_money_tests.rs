@@ -24,8 +24,7 @@ use crate::snapshots::claude_request_money::rows::ClaudeRootRows;
 use crate::snapshots::claude_request_money::store::{self, ClaudeLedger};
 use crate::snapshots::claude_request_money::{
     claude_cache_creation, claude_response_conflict_order, enable_shadow_for_test,
-    parse_usd_micros_for_test, reserved_for_test, shadow_page_at, CacheCreation,
-    ClaudeMoneyTokens,
+    parse_usd_micros_for_test, reserved_for_test, shadow_page_at, CacheCreation, ClaudeMoneyTokens,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -278,9 +277,15 @@ fn money_birth_is_carried_only_for_the_same_object() {
     let totals = census.totals_for_test();
     census.invalidate_keeping_birth_for_test(key);
     assert!(census.get(key).is_none());
-    assert!(census.record_for_test(key).unwrap().is_birth_stub_for_test());
+    assert!(census
+        .record_for_test(key)
+        .unwrap()
+        .is_birth_stub_for_test());
     assert_eq!(census.len_for_test(), 0);
-    assert!(census.totals_for_test().0 < totals.0, "the hashes are freed");
+    assert!(
+        census.totals_for_test().0 < totals.0,
+        "the hashes are freed"
+    );
     assert_eq!(census.totals_for_test(), census.recounted_for_test());
     assert_eq!(
         census.carried_birth_for_test(key, Some(reread)),
@@ -322,7 +327,10 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
     let birth = parser
         .claude_opened_birth
         .expect("the test file system must report file birth");
-    assert!(parser.accumulator.claude_file_birth.is_root_with_birth_for_test());
+    assert!(parser
+        .accumulator
+        .claude_file_birth
+        .is_root_with_birth_for_test());
     let created = expected
         .created()
         .expect("created")
@@ -330,7 +338,10 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
         .expect("after the epoch");
     assert_eq!(birth.unix_seconds, created.as_secs());
     #[cfg(unix)]
-    assert_eq!((birth.device, birth.inode), (expected.dev(), expected.ino()));
+    assert_eq!(
+        (birth.device, birth.inode),
+        (expected.dev(), expected.ino())
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -588,7 +599,12 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
     let otel = telemetry_key("root");
     ledger.insert_for_test(
         &otel,
-        ClaudeRequestCensusRecord::telemetry(vec![2, 3], money_facts("root", 2), tail, 1_700_000_000),
+        ClaudeRequestCensusRecord::telemetry(
+            vec![2, 3],
+            money_facts("root", 2),
+            tail,
+            1_700_000_000,
+        ),
     );
     ledger.insert_for_test(
         &message_key("/money/projects/c.jsonl"),
@@ -628,13 +644,21 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
     let telemetry = loaded.record_for_test(&otel).unwrap();
     assert_eq!(telemetry.tail().copied(), Some(tail));
     assert_eq!(telemetry.facts(), Some(&money_facts("root", 2)[..]));
-    let sweep = loaded.record_for_test("sweep:tail").unwrap().sweep().unwrap();
-    assert_eq!((*sweep.0, sweep.1, sweep.2.debt), ([9; 32], 1_700_000_300, 1));
-    let memo = loaded.record_for_test("fam:x").unwrap().family_memo().unwrap();
+    let sweep = loaded
+        .record_for_test("sweep:tail")
+        .unwrap()
+        .sweep()
+        .unwrap();
     assert_eq!(
-        (memo.1.removed_tokens, memo.1.snapshot),
-        (900, 5)
+        (*sweep.0, sweep.1, sweep.2.debt),
+        ([9; 32], 1_700_000_300, 1)
     );
+    let memo = loaded
+        .record_for_test("fam:x")
+        .unwrap()
+        .family_memo()
+        .unwrap();
+    assert_eq!((memo.1.removed_tokens, memo.1.snapshot), (900, 5));
     let messages = loaded
         .record_for_test(&message_key("/money/projects/c.jsonl"))
         .unwrap();
@@ -703,7 +727,11 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
     );
     with("b-wrong-type", "b", serde_json::json!([1, 2]));
     // Facts belong to a telemetry record (with a tail).
-    with("f-without-tail", "f", serde_json::json!(encode(&money_facts("r", 2)[..])));
+    with(
+        "f-without-tail",
+        "f",
+        serde_json::json!(encode(&money_facts("r", 2)[..])),
+    );
     with("f-not-base64", "f", serde_json::json!("!!!!"));
     with("bi-negative", "bi", serde_json::json!(-1));
     with("bi-string", "bi", serde_json::json!("1"));
@@ -766,7 +794,11 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
     for (field, value) in [("xa", 11), ("xs", 0), ("xp", 0), ("xq", 0), ("xk", 0)] {
         tail[field] = serde_json::json!(value);
     }
-    assert_eq!(money_decode_one(tail.clone()), None, "audit target past offset");
+    assert_eq!(
+        money_decode_one(tail.clone()),
+        None,
+        "audit target past offset"
+    );
     tail["xa"] = serde_json::json!(10);
     assert!(money_decode_one(tail.clone()).is_some());
     // Facts must hold exactly one fact per hash.
@@ -934,7 +966,10 @@ impl MoneyTail {
         now: u64,
         work: &mut ClaudeLedgerWork,
         roots: &[&str],
-    ) -> (ClaudeTelemetryTailCounts, BTreeMap<String, ClaudeRootTelemetry>) {
+    ) -> (
+        ClaudeTelemetryTailCounts,
+        BTreeMap<String, ClaudeRootTelemetry>,
+    ) {
         let out = ClaudeTelemetryTail::advance(&self.support, ledger, now, budget, roots, work);
         // Moving hashes in and out never leaves the budget totals behind.
         let census = ledger.census();
@@ -1291,7 +1326,11 @@ fn money_rows_converge_by_tailing_long_sidecars() {
     );
     assert_eq!(roots[session], ClaudeRootTelemetry::Current);
     assert_eq!(
-        (counts.files_appended, counts.files_rebuilt, counts.bytes_read),
+        (
+            counts.files_appended,
+            counts.files_rebuilt,
+            counts.bytes_read
+        ),
         (1, 0, line.len() as u64),
         "{counts:?}"
     );
@@ -1368,7 +1407,8 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     race_reads_for_test(Some(Box::new(|path: &Path| {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         let modified = file.metadata().unwrap().modified().unwrap();
-        file.set_modified(modified + Duration::from_secs(1)).unwrap();
+        file.set_modified(modified + Duration::from_secs(1))
+            .unwrap();
     })));
     let (counts, roots) = run(&mut ledger);
     assert!(counts.files_raced >= 1, "{counts:?}");
@@ -1521,8 +1561,15 @@ fn money_lost_claims_are_durable_debt() {
         "the debt first, then the data shard (which fails)"
     );
     let loaded = store::load_for_test(&support);
-    assert!(loaded.get(&otel).is_some(), "the disk still holds the claim");
-    assert_eq!(telemetry_complete_through(&loaded), 0, "no certificate covers it");
+    assert!(
+        loaded.get(&otel).is_some(),
+        "the disk still holds the claim"
+    );
+    assert_eq!(
+        telemetry_complete_through(&loaded),
+        0,
+        "no certificate covers it"
+    );
 
     // A sweep advance is not written while that shard's write has failed.
     save_sweep(
@@ -1539,7 +1586,10 @@ fn money_lost_claims_are_durable_debt() {
         store::save_page_for_test(&support, &mut ledger, &mut failed),
         Some((2, false, 1))
     );
-    assert_eq!(telemetry_complete_through(&store::load_for_test(&support)), 0);
+    assert_eq!(
+        telemetry_complete_through(&store::load_for_test(&support)),
+        0
+    );
 
     // Once the shard is written, the advance follows it.
     std::fs::remove_dir_all(&staged).unwrap();
@@ -1587,7 +1637,9 @@ fn money_failed_debt_meta_blocks_later_batches() {
     // A later change, queued before the first batch's result comes back.
     let other = (0..)
         .map(|number| telemetry_key(&format!("other-{number}")))
-        .find(|key| store::shard_path_for_test(&support, key) == store::shard_path_for_test(&support, &otel))
+        .find(|key| {
+            store::shard_path_for_test(&support, key) == store::shard_path_for_test(&support, &otel)
+        })
         .unwrap();
     let _ = ledger.insert(other.clone(), record(1));
     let second = store::take_save_for_test(&mut ledger).expect("the later batch");
@@ -1642,7 +1694,13 @@ fn money_zero_meta_is_retaken_after_an_advance() {
         complete_through,
         debt: 0,
     };
-    save_sweep(&mut ledger, "sweep:tail", "", 1_800_000_000, sweep(1_799_000_000));
+    save_sweep(
+        &mut ledger,
+        "sweep:tail",
+        "",
+        1_800_000_000,
+        sweep(1_799_000_000),
+    );
     money_save_all(&support, &mut ledger);
 
     ledger.remove(&otel);
@@ -1654,7 +1712,13 @@ fn money_zero_meta_is_retaken_after_an_advance() {
     let dropped = store::take_save_for_test(&mut ledger).expect("the zero batch");
     store::restore_for_test(&mut ledger, &[&dropped]);
     // A clean sweep advances the certificate before the retry.
-    save_sweep(&mut ledger, "sweep:tail", "", 1_800_000_600, sweep(1_800_000_500));
+    save_sweep(
+        &mut ledger,
+        "sweep:tail",
+        "",
+        1_800_000_600,
+        sweep(1_800_000_500),
+    );
     let staged = store::shard_path_for_test(&support, &otel).with_extension("json.tmp");
     std::fs::create_dir_all(staged.join("blocked")).unwrap();
     let mut failed = store::WriterState::default();
@@ -1664,7 +1728,10 @@ fn money_zero_meta_is_retaken_after_an_advance() {
         "the zero meta first, then the data shard (which fails)"
     );
     let loaded = store::load_for_test(&support);
-    assert!(loaded.get(&otel).is_some(), "the disk still holds the claim");
+    assert!(
+        loaded.get(&otel).is_some(),
+        "the disk still holds the claim"
+    );
     assert_eq!(
         telemetry_complete_through(&loaded),
         0,
@@ -1713,7 +1780,11 @@ fn money_dirty_sweep_wrap_keeps_the_certificate_zero() {
     }
     money_save_all(&tail.support, &mut ledger);
     let mut loaded = store::load_for_test(&tail.support);
-    assert_eq!(telemetry_complete_through(&loaded), 0, "a restart loads the zero");
+    assert_eq!(
+        telemetry_complete_through(&loaded),
+        0,
+        "a restart loads the zero"
+    );
 
     // The line completes: the next clean sweep certifies again.
     tail.append(partial, rest);
@@ -1948,7 +2019,10 @@ fn money_facts_round_trip_compactly() {
     assert!(!facts::valid(&blob, rows.len() - 1));
     assert_eq!(facts::header_of_for_test(&blob), Some(header.clone()));
     let per_row = facts::body_len(&blob) as f64 / rows.len() as f64;
-    eprintln!("MONEY_FACTS rows={} body_bytes_per_row={per_row:.1}", rows.len());
+    eprintln!(
+        "MONEY_FACTS rows={} body_bytes_per_row={per_row:.1}",
+        rows.len()
+    );
     assert!(per_row <= 24.0, "{per_row}");
     let hashes = (1..=rows.len() as u64).collect::<Vec<_>>();
     let record = ClaudeRequestCensusRecord::telemetry(
@@ -1988,7 +2062,10 @@ struct MoneyLedger {
 }
 
 fn money_hashes(ids: &[&str]) -> Vec<u64> {
-    let mut hashes = ids.iter().map(|id| claude_request_hash(id)).collect::<Vec<_>>();
+    let mut hashes = ids
+        .iter()
+        .map(|id| claude_request_hash(id))
+        .collect::<Vec<_>>();
     hashes.sort_unstable();
     hashes
 }
@@ -2224,15 +2301,18 @@ fn money_scope_debt_blocks_negative_membership_claims() {
     // A retained record of a member the index no longer lists (residue):
     // its ids are no holder, so it blocks too.
     let mut ledger = MoneyLedger::new(&[], &[], &["req_own"]);
-    ledger.index.claude_request_census_mut_for_test().insert_for_test(
-        "/m/projects/-repo/R.jsonl",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &money_fingerprint('d'),
-            7,
-            ClaudeRequestCensusShape::Lossy,
-            vec![1],
-        ),
-    );
+    ledger
+        .index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(
+            "/m/projects/-repo/R.jsonl",
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &money_fingerprint('d'),
+                7,
+                ClaudeRequestCensusShape::Lossy,
+                vec![1],
+            ),
+        );
     assert_eq!(
         ledger.classify("req_own", &ledger.b, "B", &none),
         ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Scope)
@@ -2500,7 +2580,8 @@ fn money_rows_follow_audited_rewrites() {
     (&file).write_all(rewritten.as_bytes()).unwrap();
     // A later rewrite: its mtime moves past the last read's second.
     let modified = file.metadata().unwrap().modified().unwrap();
-    file.set_modified(modified + Duration::from_secs(5)).unwrap();
+    file.set_modified(modified + Duration::from_secs(5))
+        .unwrap();
     drop(file);
     // The tail sees the touched file; the next day's audit catches it (an
     // idle untouched sidecar waits for the 30-day sample); the tail
@@ -2554,7 +2635,10 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         )
         .unwrap();
         std::fs::write(
-            store_dir.join(format!("{:x}.jsonl", sha2::Sha256::digest(session.as_bytes()))),
+            store_dir.join(format!(
+                "{:x}.jsonl",
+                sha2::Sha256::digest(session.as_bytes())
+            )),
             money_api_line(session, &request, "2026-08-02T07:00:00Z"),
         )
         .unwrap();
@@ -2729,8 +2813,16 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     store::flush();
     let counts = page(&index);
     store::flush();
-    assert_eq!(counts.ledger_loading + counts.ledger_unavailable, 0, "{counts:?}");
-    assert_eq!(counts.refused_budget + counts.refused_deadline, 0, "{counts:?}");
+    assert_eq!(
+        counts.ledger_loading + counts.ledger_unavailable,
+        0,
+        "{counts:?}"
+    );
+    assert_eq!(
+        counts.refused_budget + counts.refused_deadline,
+        0,
+        "{counts:?}"
+    );
     assert_eq!(counts.ledger_load_damaged, 0, "{counts:?}");
     assert_eq!(counts.families, sessions.len() as u64, "{counts:?}");
     eprintln!(
@@ -2753,7 +2845,10 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         counts.admission_bytes,
         counts.admitted_peak_bytes,
         counts.elapsed_us,
-        counts.units_counted + counts.units_removed + counts.units_undecided + counts.units_immature,
+        counts.units_counted
+            + counts.units_removed
+            + counts.units_undecided
+            + counts.units_immature,
         counts.families,
     );
     assert_eq!(reserved_for_test(), 0);
@@ -2834,9 +2929,7 @@ mod p2a_conservation {
         }
 
         fn transcript(&mut self, session: &str, text: &str, birth: u64) {
-            let path = self
-                .scratch
-                .join(format!("projects/-repo/{session}.jsonl"));
+            let path = self.scratch.join(format!("projects/-repo/{session}.jsonl"));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, text).unwrap();
             let fp = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
@@ -3450,6 +3543,47 @@ mod p2a_conservation {
         assert_eq!(sum_entity(entity), (unit(11), 1));
         assert_mac_distinct(&[&body], 1);
     }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_zero_token_transcript_holds_previously_priced_side_call() {
+        let mut c = Corpus::new("p2a-zero-token-own-cost");
+        let original = line(A, "r1", "m1", H7, 11);
+        c.transcript(A, &original, 1_700_000_000);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        c.telemetry(A, "r2", H8, 13, 'a', true);
+        let before = c.build(A, NOW);
+        assert_eq!(before.new.cost_micros, 200);
+        let zero = serde_json::json!({"timestamp":H8,"type":"assistant","sessionId":A,"requestId":"r2","message":{"id":"m2","model":"claude-haiku-4-5","usage":{"input_tokens":0,"output_tokens":0}}}).to_string()+"\n";
+        c.transcript(A, &(original + &zero), 1_700_000_000);
+        let after = c.build(A, NOW);
+        assert!(after.entities[A].held);
+        assert!(!after.coverage_complete(true));
+        let mut retained = c.items[A].clone();
+        assert!(!money::emit_for_test(&mut retained, &after.entities[A]));
+        assert_eq!(
+            after.entities[A].removed_requests, 0,
+            "hold does not manufacture removal"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_shadow_uses_actual_mismatched_cost_grains_and_final_cost_hold() {
+        let mut c = Corpus::new("p2a-final-shadow-grains");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.telemetry(A, "r1", H7, 99, 'a', true);
+        let body = c.build(A, NOW);
+        let mut item = c.items[A].clone();
+        assert!(money::emit_for_test(&mut item, &body.entities[A]));
+        assert_eq!(body.new.cost_micros, 100);
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.000100")
+        );
+        assert_eq!(body.new.requests, item.request_count);
+        assert!(body.grains.values().any(|(_, new)| new.cost_micros == 100));
+    }
+
     // A fixture projection of the already-built grains lets contract-5 verify
     // exact row reproduction without opening the private production emitter.
     // Emitter/wire behavior is covered separately by the live-page controls.
@@ -3739,7 +3873,7 @@ mod p2a_conservation {
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
-    fn p2a_retirement_boundary_keeps_deleted_owner_for_35_days_then_discloses_policy() {
+    fn p2a_idle_telemetry_keeps_deleted_owner_after_transcript_retention() {
         let mut c = Corpus::new("p2a-retirement-limit");
         c.transcript(B, &line(B, "r1", "m1", H7, 11), 1_700_000_100);
         c.telemetry(A, "r1", H7, 11, 'a', true);
@@ -3769,14 +3903,13 @@ mod p2a_conservation {
                 &c.index,
                 at_limit + 1
             ),
-            1
+            0
         );
         c.restart();
         let after = c.build(B, at_limit + 1);
-        assert_entity(&c, B, &after, &[(H7, 1, 28)], 0, Default::default(), false);
-        assert_mac_distinct(&[&after], 1);
-        // This is the explicitly accepted retirement limit: there is no claim
-        // of lifetime conservation against a server's deleted owner's old head.
+        assert_entity(&c, B, &after, &[], 1, unit(11), true);
+        assert_mac_distinct(&[&after], 0);
+        // Transcript retention cannot withdraw telemetry ownership claims.
         assert_eq!(after.entities[B].counted[0].by, ClaudeCountedBy::Owned);
     }
     #[test]

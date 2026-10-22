@@ -5261,6 +5261,13 @@ fn finish_sync_source(
     // This must precede upload-policy stripping: parent/root references are
     // identity evidence needed locally even when the org disables attribution
     // labels on the wire.
+    if source == SnapshotSource::ClaudeCode {
+        crate::snapshots::claude_request_money::reconcile_saved_money_offers(
+            support_dir,
+            &committed_index,
+            &[],
+        );
+    }
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     let mut actual_native_conjunction = false;
@@ -5561,12 +5568,14 @@ fn finish_sync_source(
         return Err(anyhow!("request money scheduling checkpoint pending"));
     }
     if source == SnapshotSource::ClaudeCode {
-        crate::snapshots::claude_request_money::note_adoption_outcomes(
+        if !crate::snapshots::claude_request_money::note_adoption_outcomes(
             support_dir,
             &index,
             &scan_result.snapshots,
             |item| u64::from(claude_authority_disposition.was_quarantined(&item.source_session_id)),
-        );
+        ) {
+            return Err(anyhow!("request money scheduling checkpoint pending"));
+        }
     }
     let local_holds = LocalHoldSettlement::classify(
         source,
@@ -5737,6 +5746,13 @@ fn finish_sync_source(
                 }));
             }
             ensure_authority()?;
+            if request.snapshots.iter().any(|item| {
+                item.usage_accounting_contract.as_deref()
+                    == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+            }) && !crate::snapshots::claude_request_money::request_owned_live(support_dir)
+            {
+                return Err(anyhow!("request money live custody withdrawn"));
+            }
             let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
             ensure_authority()?;
             validate_joined(&request.snapshots)?;
@@ -5820,6 +5836,11 @@ fn finish_sync_source(
     }
 
     let money_settlement = if source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_money::request_owned_live(support_dir)
+        && scan_result.snapshots.iter().any(|item| {
+            item.usage_accounting_contract.as_deref()
+                == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+        })
         && !upload_result.as_ref().err().is_some_and(|error| {
             snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
         }) {
@@ -5839,7 +5860,7 @@ fn finish_sync_source(
                     .map(|record| record.retry_after_unix_seconds)
             },
         );
-        crate::snapshots::claude_request_money::note_adoption_outcomes(
+        if !crate::snapshots::claude_request_money::note_adoption_outcomes(
             support_dir,
             &index,
             &scan_result.snapshots,
@@ -5863,15 +5884,48 @@ fn finish_sync_source(
                     0
                 }
             },
-        );
+        ) {
+            return Err(anyhow!("request money scheduling checkpoint pending"));
+        }
+
+        let Some(settlement_funds) =
+            crate::snapshots::claude_request_money::ShadowReservation::admit(
+                scan_result
+                    .snapshots
+                    .iter()
+                    .filter(|item| {
+                        item.usage_accounting_contract.as_deref()
+                            == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                    })
+                    .map(|item| {
+                        512_usize.saturating_add(item.snapshot_fingerprint.len().saturating_mul(2))
+                    })
+                    .sum(),
+            )
+        else {
+            return Err(anyhow!("request money settlement admission pending"));
+        };
         // A dominated/stale exact literal is settled-refused, never accepted.
         // Use the same covering body check for adoption and debt retirement.
-        let mut settled = upload_progress.accepted_fingerprints.clone();
-        let mut settled_bodies = upload_progress.accepted_body_witnesses.clone();
+        let mut settled = BTreeSet::new();
+        let mut settled_bodies = BTreeMap::new();
         for item in &scan_result.snapshots {
             if item.usage_accounting_contract.as_deref()
                 == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
             {
+                if upload_progress
+                    .accepted_fingerprints
+                    .contains(&item.snapshot_fingerprint)
+                {
+                    if let Some(body) = upload_progress
+                        .accepted_body_witnesses
+                        .get(&item.snapshot_fingerprint)
+                        .filter(|body| **body == snapshot_upload_body_witness(item))
+                    {
+                        settled.insert(item.snapshot_fingerprint.clone());
+                        settled_bodies.insert(item.snapshot_fingerprint.clone(), body.clone());
+                    }
+                }
                 if let Some(refusal) = upload_progress
                     .permanent_rejections
                     .get(&item.snapshot_fingerprint)
@@ -5889,7 +5943,7 @@ fn finish_sync_source(
             }
         }
         index.stamp_request_money_acks(&scan_result.snapshots, &settled, &settled_bodies);
-        Some((settled, settled_bodies))
+        Some((settled, settled_bodies, settlement_funds))
     } else {
         None
     };
@@ -5897,13 +5951,19 @@ fn finish_sync_source(
     // due/dirty selection obligation through every failed CAS or save, even
     // for unchanged, already-adopted files. Each caller below has saved first.
     let settle_saved_money = |saved: &ScanIndex| {
-        if let Some((settled, bodies)) = &money_settlement {
+        if let Some((settled, bodies, _funds)) = &money_settlement {
             crate::snapshots::claude_request_money::settle_money_acks(
                 support_dir,
                 saved,
                 &scan_result.snapshots,
                 settled,
                 bodies,
+            );
+        } else if source == SnapshotSource::ClaudeCode {
+            crate::snapshots::claude_request_money::reconcile_saved_money_offers(
+                support_dir,
+                saved,
+                &scan_result.snapshots,
             );
         }
     };
@@ -7152,6 +7212,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     {
         fallback.withhold(scan_result);
     }
+    let _synthetic_funds = if request_owned_live {
+        crate::snapshots::claude_request_money::append_synthetic_sessions(
+            support_dir,
+            scan_result,
+            index,
+        )
+    } else {
+        None
+    };
     let emission_permitted = permit.is_some();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
@@ -7357,6 +7426,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             identity_evidence.as_ref(),
             &mut groupings,
         );
+        if crate::snapshots::claude_request_money::checkpoint_pending(support_dir) {
+            return Err(crate::source_rotation::LocalRefusal(
+                "request money scheduling checkpoint pending",
+            ));
+        }
         let mut holds = holds;
         if !crate::snapshots::claude_request_money::stage_selection_fingerprints(
             support_dir,
@@ -7479,10 +7553,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .count();
     stats.duplicate_census = disposition.duplicate_census;
     stats.context_file_birth = disposition.context_file_birth.clone();
-    let census_withheld =
-        !request_owned_live && index.account_claude_usage_authority_census_health(scan_result);
+    let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
-        census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),
+        census_withheld_retry_pending_family_count: if request_owned_live {
+            index.request_money_v1_pending_count()
+        } else {
+            index.claude_usage_authority_pending_count()
+        },
         ..disposition.first_proof_hold
     };
     if census_withheld {

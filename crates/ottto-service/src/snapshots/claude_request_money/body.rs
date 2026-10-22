@@ -467,8 +467,8 @@ pub(crate) fn build_claude_request_body(
     let mut reported_side_calls = BTreeMap::<u64, (usize, ClaudeLiveKey)>::new();
     let mut family_hashes = BTreeSet::<u64>::new();
     let mut position = 0_usize;
-    let mut idless_identity = 0_u64;
-    let mut union_units = BTreeMap::<(String, UnitKind, u64), Unit>::new();
+
+    let mut union_units = BTreeMap::<(String, UnitKind, u64, u64), Unit>::new();
     let mut built_members = BTreeSet::new();
     for item in &family.items {
         for request_id in item.claude_usage_occurrences.keys() {
@@ -488,6 +488,11 @@ pub(crate) fn build_claude_request_body(
         }
         let member = item.source_session_id.as_str();
         body.entities.entry(member.to_owned()).or_default();
+        if super::synthetic(item) {
+            built_members.insert(member);
+            body.members_built = built_members.len();
+            continue;
+        }
         let mut old_rows = BTreeMap::<ClaudeLiveKey, (ClaudeMoneyTokens, u64, Option<u64>)>::new();
         for bucket in &item.usage_buckets {
             for row in &bucket.model_usage {
@@ -549,8 +554,15 @@ pub(crate) fn build_claude_request_body(
                 body.unbuilt = true;
                 return body;
             }
-            // Zero usage: the live path adds no row and there is no money.
+            // A zero-token transcript can supersede a priced side call. Its
+            // missing placement is a hold, never silent loss of the own cost.
             if occurrence.usage.is_zero() {
+                if rows
+                    .get(claude_request_hash(request_id))
+                    .is_some_and(|row| row.cost_micros.is_some())
+                {
+                    body.entities.get_mut(member).expect("member").held = true;
+                }
                 continue;
             }
             let hash = claude_request_hash(request_id);
@@ -804,18 +816,23 @@ pub(crate) fn build_claude_request_body(
         }
         // Resolve progressive copies by (request, message) first. R conflicts
         // across distinct message ids are partitioned only after this union.
+        let mut idless_ordinals = BTreeMap::<u64, u64>::new();
         for unit in units.into_iter().chain(losers) {
             let pair = match unit.kind {
                 UnitKind::Request(_) => unit.message,
                 UnitKind::Message(_) => 0,
-                // L has no deduplication key: the counting contract keeps
-                // every physical file/line, including identical unkeyed lines.
-                UnitKind::Idless => {
-                    idless_identity += 1;
-                    idless_identity
-                }
+                // Preserve repeated lines within one copy, taking the maximum
+                // multiset across physical copies of the same logical session.
+                UnitKind::Idless => unit.fingerprint,
             };
-            let slot = union_units.entry((member.to_owned(), unit.kind, pair));
+            let ordinal = if unit.kind == UnitKind::Idless {
+                let ordinal = idless_ordinals.entry(unit.fingerprint).or_default();
+                *ordinal += 1;
+                *ordinal
+            } else {
+                0
+            };
+            let slot = union_units.entry((member.to_owned(), unit.kind, pair, ordinal));
             match slot {
                 std::collections::btree_map::Entry::Vacant(slot) => {
                     slot.insert(unit);
@@ -849,7 +866,7 @@ pub(crate) fn build_claude_request_body(
         }
     }
     let mut request_winners = BTreeMap::<(&str, u64), &Unit>::new();
-    for ((member, kind, _), unit) in &union_units {
+    for ((member, kind, _, _), unit) in &union_units {
         if ctx.late() {
             body.unbuilt = true;
             return body;
@@ -867,7 +884,7 @@ pub(crate) fn build_claude_request_body(
             }
         }
     }
-    for (position, ((member, _, _), unit)) in union_units.iter().enumerate() {
+    for (position, ((member, _, _, _), unit)) in union_units.iter().enumerate() {
         let member = member.as_str();
         let Some(Some(own_key)) = family.member_keys.get(member) else {
             body.unbuilt = true;
@@ -1040,27 +1057,96 @@ pub(crate) fn build_claude_request_body(
     for entity in body.entities.values_mut() {
         entity.held |= body.unbuilt || !body.rows_complete || body.held.requests > 0;
         entity.certify();
+        body.certificate_ok &= entity.certificate_ok;
+        body.unbuilt |= entity.held;
     }
-    // The new totals: the old ones moved by every slice.
-    let mut new_tokens = i128::from(body.old.tokens);
-    let mut new_requests = i128::from(body.old.requests);
-    for (old, new) in body.grains.values() {
-        new_tokens += i128::from(new.tokens.conserved()) - i128::from(old.tokens.conserved());
-        new_requests += i128::from(new.requests) - i128::from(old.requests);
-    }
-    body.new = ClaudeMoneyTotals {
-        tokens: u64::try_from(new_tokens.max(0)).unwrap_or(u64::MAX),
-        requests: u64::try_from(new_requests.max(0)).unwrap_or(u64::MAX),
-        ..ClaudeMoneyTotals::default()
-    };
-    // Drop slices that changed nothing (an own-cost slice always changes
-    // the money; equal tokens with equal origin are no difference).
-    body.grains.retain(|key, (old, new)| {
-        key.category == ClaudeGrainCategory::OwnCost
-            || old.tokens != new.tokens
-            || old.requests != new.requests
-    });
+    // The emitter and shadow consume the same proposed grains. Old-side
+    // slices retain their explanations; new sides are rebuilt from entities.
+    finalize_shadow(&mut body, family);
     body
+}
+
+fn finalize_shadow(body: &mut ClaudeRequestBody, family: &ClaudeFamilyInput<'_>) {
+    let explanations = std::mem::take(&mut body.grains);
+    let mut rows = BTreeMap::<
+        (String, ClaudeLiveKey, Option<ClaudeRequestUsageOrigin>),
+        (ClaudeGrainSide, ClaudeGrainSide),
+    >::new();
+    for item in &family.items {
+        for bucket in &item.usage_buckets {
+            for row in &bucket.model_usage {
+                let origin = if item.usage_accounting_contract.as_deref() == Some(REPORTED_CONTRACT)
+                {
+                    Some(ClaudeRequestUsageOrigin::TelemetryMatched)
+                } else {
+                    None
+                };
+                rows.entry((
+                    item.source_session_id.clone(),
+                    live_key_of_row(&bucket.bucket_start, row),
+                    origin,
+                ))
+                .or_default()
+                .0
+                .add(
+                    &ClaudeMoneyTokens::from_model_usage(row),
+                    row.request_count,
+                    row.cost_usd.as_deref().and_then(parse_usd_micros),
+                );
+            }
+        }
+    }
+    body.new = ClaudeMoneyTotals::default();
+    body.held = ClaudeMoneyTotals::default();
+    body.removed = ClaudeMoneyTotals::default();
+    body.immature = ClaudeMoneyTotals::default();
+    for (member, entity) in &body.entities {
+        body.held
+            .add(entity.parts[2].0.conserved(), entity.parts[2].1, None);
+        body.removed
+            .add(entity.removed.conserved(), entity.removed_requests, None);
+        body.immature
+            .add(entity.parts[3].0.conserved(), entity.parts[3].1, None);
+        for ((live, origin), grain) in &entity.grains {
+            body.new.tokens = body.new.tokens.saturating_add(grain.tokens.conserved());
+            body.new.requests = body.new.requests.saturating_add(grain.requests);
+            body.new.cost_micros = body.new.cost_micros.saturating_add(grain.cost_micros);
+            body.new.unpriced = body.new.unpriced.saturating_add(grain.unpriced);
+            rows.entry((member.clone(), live.clone(), *origin))
+                .or_default()
+                .1 = *grain;
+        }
+    }
+    for ((member, live, origin), (old, new)) in rows {
+        if old.tokens == new.tokens && old.requests == new.requests && old.cost() == new.cost() {
+            continue;
+        }
+        let category = explanations
+            .keys()
+            .find(|key| key.member == member && key.live == live && key.origin == origin)
+            .map(|key| key.category)
+            .unwrap_or(
+                if origin == Some(ClaudeRequestUsageOrigin::TelemetryMatched) {
+                    ClaudeGrainCategory::OwnCost
+                } else {
+                    ClaudeGrainCategory::LegacyExclusion
+                },
+            );
+        body.grains.insert(
+            ClaudeGrainKey {
+                owner: if new.requests > 0 {
+                    member.clone()
+                } else {
+                    String::new()
+                },
+                member,
+                live,
+                origin,
+                category,
+            },
+            (old, new),
+        );
+    }
 }
 
 /// A counted transcript unit: unchanged where the live body carries it the

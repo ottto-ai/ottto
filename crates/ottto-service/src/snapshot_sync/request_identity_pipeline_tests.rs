@@ -372,7 +372,8 @@ impl NativeBootstrapServer {
                     serde_json::json!({"source":"claude_code", "server_time":current_rfc3339(),
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
-                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                        "recommended_scan_after":"2099-01-01T00:00:00Z",
+                        "session_request_identity_contract": if std::env::var_os("OTTTO_MONEY_PARITY_ROOT").is_some() { Some("own_request_identity_rows:v1") } else { None }})
                 } else if request.contains("/agent-status/snapshots") {
                     serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
                 } else if let Some(items) =
@@ -785,4 +786,199 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         eprintln!("native paid evidence subset: requested_roots=2 retained_healthy=1 pressure_root_base=true duplicate_root_loaded_once=true actual_requested_peak={} prepaid_peak={prepaid} ordinary_final_cohort_unchanged=true not_RSS=true", allocation.requested_peak_with_overlap);
     }
     writeln!(std::io::stderr().lock(), "native_comparison_source_bootstrap: actual_prepare_step_finish=true completed_saved_cycles={completed} actual_wire_ack=true next_real_preparation_allowed=true abandoned_preparation_revokes=true test_only_due_cadence_slot=true ordinary_post_finish_wait_verified=true backfill_to_normal_scope_revokes=true new_request_native_conjunction=true actual_positive_retained_layout_unproved=true").unwrap();
+}
+
+/// CI runs this exact test source at main and the candidate against the same
+/// saved input tree. No production endpoint or host account is involved.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn money_gate_off_saved_fixture_receipt() {
+    let (Ok(root), Ok(output)) = (
+        std::env::var("OTTTO_MONEY_PARITY_ROOT"),
+        std::env::var("OTTTO_MONEY_PARITY_OUTPUT"),
+    ) else {
+        return;
+    };
+    let base = PathBuf::from(root);
+    std::fs::create_dir_all(&base).unwrap();
+    let home = base.join("home");
+    if !home.exists() {
+        let seed = IdentityPipelineHome::new();
+        std::fs::rename(&seed.home, &home).unwrap();
+    }
+    let fixture = std::mem::ManuallyDrop::new(IdentityPipelineHome {
+        base: base.clone(),
+        home,
+    });
+    let support = base.join("support");
+    let secrets = base.join("secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    if !support.join("local-otel").exists() {
+        write_native_bootstrap_sidecars(&fixture, &support);
+        let path = support.join("local-otel/claude-code-effort").join(format!(
+            "{:x}.jsonl",
+            Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+        ));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut rows = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<crate::claude_local_otel::ClaudeLocalOtelEvidence>(line)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (n, row) in rows.iter_mut().enumerate() {
+            row.account_identifier_hash = Some(if n == 0 { "a" } else { "b" }.repeat(64));
+        }
+        // Both a missing-trace row and an auxiliary observer-clock row are
+        // present in the saved evidence, alongside the split logins/marker.
+        let mut missing = rows[0].clone();
+        missing.request_id = "req_missing_trace".into();
+        missing.client_request_id = "client-missing".into();
+        let mut side = rows[0].clone();
+        side.request_id = "req_side_call".into();
+        side.client_request_id = "client-side".into();
+        rows.extend([missing.clone(), side]);
+        let transcript = fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+        let extra = serde_json::json!({"timestamp":missing.observed_at,"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,"requestId":missing.request_id,"message":{"id":"missing-trace-message","model":missing.model,"usage":{"input_tokens":missing.input_tokens,"output_tokens":missing.output_tokens}}});
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(transcript)
+            .unwrap()
+            .write_all((extra.to_string() + "\n").as_bytes())
+            .unwrap();
+        for row in &mut rows {
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+        }
+        std::fs::write(
+            path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
+    let device = LocalDeviceBinding {
+        device_id: "money-baseline-device".into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    let mut receipts = Vec::new();
+    for history in [0, 20_000] {
+        let _cadence = IdentityPipelineCadence::new();
+        let _ = std::fs::remove_dir_all(support.join("snapshots"));
+        let server = NativeBootstrapServer::new();
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+        let client = SnapshotApiClient::new(server.url.clone());
+        let daemon = test_daemon("otm_test");
+        let namespace = snapshot_upload_destination_namespace(&device, "device-secret");
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
+            &namespace,
+        ));
+        let mut seed = serde_json::to_value(ScanIndex::default()).unwrap();
+        seed["accepted_snapshot_fingerprints"] = serde_json::json!((0..history)
+            .map(|n| format!("{n:064x}"))
+            .collect::<Vec<_>>());
+        std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        std::fs::write(&index_path, serde_json::to_vec(&seed).unwrap()).unwrap();
+        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        let collection = || AgentStatusCollection {
+            snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+            source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+        };
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        });
+        let mut decision = "refused";
+        let mut accepted = 0;
+        if let Ok(Some(mut frame)) = frame {
+            for n in 0..history {
+                frame
+                    .upload_progress
+                    .accepted_fingerprints
+                    .insert(format!("{n:064x}"));
+                frame
+                    .upload_progress
+                    .accepted_body_witnesses
+                    .insert(format!("{n:064x}"), "historical-body".into());
+            }
+            frame
+                .upload_progress
+                .save(&frame.upload_progress_path)
+                .unwrap();
+            let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+            let progress_path = preparation.upload_progress_path.clone();
+            let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+                finish_sync_source(
+                    preparation,
+                    index,
+                    scan,
+                    &client,
+                    &device,
+                    "device-secret",
+                    SnapshotSource::ClaudeCode,
+                    "otm_test",
+                    &fixture.home,
+                    &support,
+                    &daemon,
+                    &mut transport,
+                    &mut retry,
+                )
+            });
+            decision = if result.is_ok() { "accepted" } else { "failed" };
+            let progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &namespace,
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .unwrap();
+            accepted = progress.accepted_fingerprints.len();
+        }
+        let mut offers = server.bodies.lock().unwrap().clone();
+        for item in &mut offers {
+            item.as_object_mut().unwrap().remove("collected_at");
+        }
+        if history == 0 {
+            assert!(!offers.is_empty(), "baseline must exercise real upload");
+            assert!(accepted > 0);
+        }
+        receipts.push(serde_json::json!({"history":history,"decision":decision,"accepted":accepted,"offers":offers,"saved_fingerprints":ScanIndex::load(&index_path).unwrap().current_snapshot_fingerprints()}));
+    }
+    std::fs::write(output, serde_json::to_vec_pretty(&receipts).unwrap()).unwrap();
 }

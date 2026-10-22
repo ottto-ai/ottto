@@ -4,15 +4,17 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MoneyFileSelection {
-    revision: String,
-    root: String,
+    pub(crate) revision: String,
+    pub(crate) root: String,
     member: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consumed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) synthetic_body: Option<String>,
     #[serde(skip)]
     reparse_union: Option<bool>,
 }
-crate::heap_layout_bound::fields!(MoneyFileSelection; revision, root, member, consumed, reparse_union);
+crate::heap_layout_bound::fields!(MoneyFileSelection; revision, root, member, consumed, synthetic_body, reparse_union);
 
 pub(crate) fn record_logical_member(
     index: &mut ScanIndex,
@@ -35,6 +37,7 @@ pub(crate) fn record_logical_member(
             root: root.to_owned(),
             member: item.source_session_id.clone(),
             consumed,
+            synthetic_body: None,
             reparse_union: None,
         },
     );
@@ -174,7 +177,7 @@ pub(crate) fn stage_selection_fingerprints(
     }
     index
         .claude_money_files
-        .retain(|key, _| index.files.contains_key(key));
+        .retain(|key, state| state.synthetic_body.is_some() || index.files.contains_key(key));
     true
 }
 
@@ -390,4 +393,160 @@ pub(in crate::snapshots) fn select_union_candidates(
         }
     }
     selected
+}
+
+/// Optional local custody never makes unrelated committed state unreadable.
+/// Persisted callers cap the entire raw field before this per-record decoder.
+pub(crate) fn decode_selections<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, MoneyFileSelection>, D::Error> {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+    struct Selections;
+    impl<'de> Visitor<'de> for Selections {
+        type Value = BTreeMap<String, MoneyFileSelection>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("optional local selection map")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut result = BTreeMap::new();
+            let mut seen = BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if seen.len() >= 65_536 || key.len() > 4096 {
+                    map.next_value::<IgnoredAny>()?;
+                    continue;
+                }
+                let raw = map.next_value::<Box<serde_json::value::RawValue>>()?;
+                if !seen.insert(key.clone()) {
+                    result.remove(&key);
+                    continue;
+                }
+                if raw.get().len() > 8192 {
+                    continue;
+                }
+                if let Ok(state) = serde_json::from_str::<MoneyFileSelection>(raw.get()) {
+                    let digest =
+                        |v: &str| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit());
+                    if digest(&state.revision)
+                        && state.root.len() <= 128
+                        && state.member.len() <= 128
+                        && state.consumed.as_deref().is_none_or(digest)
+                        && state.synthetic_body.as_deref().is_none_or(digest)
+                    {
+                        result.insert(key, state);
+                    }
+                }
+            }
+            Ok(result)
+        }
+    }
+    let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    let mut isolated = serde_json::Deserializer::from_str(raw.get());
+    Ok(serde::de::Deserializer::deserialize_map(&mut isolated, Selections).unwrap_or_default())
+}
+
+pub(crate) fn synthetic_fingerprints(index: &ScanIndex) -> impl Iterator<Item = &String> {
+    index
+        .claude_money_files
+        .values()
+        .filter(|state| state.synthetic_body.is_some())
+        .map(|state| &state.revision)
+}
+
+pub(crate) fn finalize_synthetic(index: &mut ScanIndex, items: &[SnapshotItem]) {
+    for item in items {
+        let key = store::money_key("synthetic:", &item.source_session_id);
+        if synthetic(item)
+            && item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT)
+        {
+            index.claude_money_files.insert(
+                key,
+                MoneyFileSelection {
+                    revision: item.snapshot_fingerprint.clone(),
+                    root: item.source_session_id.clone(),
+                    member: item.source_session_id.clone(),
+                    consumed: None,
+                    synthetic_body: Some(super::super::snapshot_upload_body_witness(item)),
+                    reparse_union: None,
+                },
+            );
+        } else if item.source_file_fingerprint.is_some()
+            && item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT)
+        {
+            index.claude_money_files.remove(&key);
+        }
+    }
+}
+
+pub(crate) fn selected_money_files(
+    index: &ScanIndex,
+    previous: &ScanIndex,
+    safe: &BTreeSet<String>,
+    settled: impl Fn(&str) -> bool,
+) -> BTreeMap<String, MoneyFileSelection> {
+    let mut selected = previous
+        .claude_money_files
+        .iter()
+        .filter(|(key, state)| {
+            state.synthetic_body.is_some()
+                || index.files.contains_key(*key)
+                || previous.files.contains_key(*key)
+        })
+        .map(|(key, state)| (key.clone(), state.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (key, state) in &index.claude_money_files {
+        if safe.contains(key) || (state.synthetic_body.is_some() && settled(&state.revision)) {
+            selected.insert(key.clone(), state.clone());
+        }
+    }
+    for (key, state) in &previous.claude_money_files {
+        if state.synthetic_body.is_some() && !index.claude_money_files.contains_key(key) {
+            let replacement = safe.iter().any(|file| {
+                logical_family_member(index, file).is_some_and(|(_, member)| member == state.member)
+            });
+            if replacement {
+                selected.remove(key);
+            }
+        }
+    }
+    selected
+}
+
+#[cfg(test)]
+mod decoder_tests {
+    use super::*;
+    #[test]
+    fn damaged_selection_isolated_through_load_cas_and_selected_save() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-selection-isolation");
+        let path = scratch.join("index.json");
+        let ordinary = serde_json::to_string(&ScanIndex::default()).unwrap();
+        for malformed in [
+            r#"{"x":{"revision":1e400,"root":"r"}}"#.to_owned(),
+            r#"{"x":{"revision":null,"root":null,"member":false}}"#.to_owned(),
+            r#"[1e400,{"future":true}]"#.to_owned(),
+            format!(
+                r#"{{"{}":{{"root":"{}"}}}}"#,
+                "x".repeat(8192),
+                "y".repeat(8192)
+            ),
+        ] {
+            let bytes = format!(
+                "{},\"claude_money_files\":{malformed}}}",
+                &ordinary[..ordinary.len() - 1]
+            );
+            std::fs::write(&path, bytes).unwrap();
+            let mut loaded =
+                ScanIndex::load(&path).expect("optional damage cannot quarantine index");
+            assert!(loaded.claude_money_files.is_empty());
+            loaded
+                .save(&path)
+                .expect("CAS isolates the same optional damage");
+            let mut selected =
+                loaded.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
+            selected.save(&path).unwrap();
+            assert_eq!(
+                ScanIndex::load(&path).unwrap().generation,
+                loaded.generation + 1
+            );
+        }
+    }
 }

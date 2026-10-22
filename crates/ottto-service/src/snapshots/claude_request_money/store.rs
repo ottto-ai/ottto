@@ -21,9 +21,9 @@
 //! A missing or corrupt shard at load is debt, never a silent loss.
 //!
 //! One writer thread serializes diagnostic rows, writes ledger shards and
-//! loads the ledger. A tiny durable intent precedes enqueue. Live offers and
-//! bound holds use a bounded writer barrier before the scan can commit; this
-//! may wait under `SNAPSHOT_SYNC_LOCK` and must be included in lock timing. Its outbox is bounded in batches and in admitted
+//! loads the ledger. The writer persists an intent before publication. Live
+//! offers and bound holds poll a writer receipt on subsequent pages before
+//! POST or index commit; the sync lock never waits for disk. Its outbox is bounded in batches and in admitted
 //! bytes; each batch carries the admission of its own buffers (released
 //! when it is written, dropped or refused), and the load admits each
 //! shard's bytes and a structural bound of its decoded records before
@@ -121,6 +121,9 @@ pub(crate) struct ClaudeLedger {
     /// Where the `mh:` round-robin resumes (process memory only: pruning
     /// is housekeeping, a stale record is never a holder).
     pub(crate) message_cursor: String,
+    pub(crate) synthetic_cursor: String,
+    pending_checkpoint: Option<PendingCheckpoint>,
+    barrier_needed: bool,
 }
 
 impl ClaudeLedger {
@@ -134,6 +137,9 @@ impl ClaudeLedger {
             oversized_shards: 0,
             load_damaged: false,
             message_cursor: String::new(),
+            synthetic_cursor: String::new(),
+            pending_checkpoint: None,
+            barrier_needed: dirty,
         }
     }
 
@@ -395,6 +401,12 @@ pub(crate) struct WriteResult {
     meta_unwritten: Option<bool>,
 }
 
+type PendingCheckpoint = (
+    Receiver<(Vec<usize>, Option<bool>)>,
+    Vec<usize>,
+    Option<bool>,
+);
+
 type CheckpointPayload = (
     PathBuf,
     ClaudeLedgerSave,
@@ -575,19 +587,13 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
 
 /// Hand a page's batch to the writer. On a full outbox the batch comes back
 /// and its shards are dirty again.
-pub(crate) fn submit_batch(
-    ledger: &mut ClaudeLedger,
-    mut job: WriteJob,
-) -> Result<(), Box<WriteJob>> {
-    job.pending_intent = write_intent(&job.support_dir, job.jsonl.now);
-    let submitted = if job.pending_intent.is_some() {
-        submit(Job::Write(Box::new(job)))
-    } else {
-        Err(Job::Write(Box::new(job)))
-    };
+pub(crate) fn submit_batch(ledger: &mut ClaudeLedger, job: WriteJob) -> Result<(), Box<WriteJob>> {
+    ledger.barrier_needed = true;
+    let submitted = submit(Job::Write(Box::new(job)));
     match submitted {
         Ok(()) => Ok(()),
-        Err(Job::Write(mut job)) => {
+        Err(Job::Write(job)) => {
+            super::owe_coverage(&job.support_dir, job.jsonl.now, false);
             if let Some(save) = &job.save {
                 let failed = save
                     .shards
@@ -598,7 +604,6 @@ pub(crate) fn submit_batch(
                     .then_some(save.meta_debt);
                 ledger.restore(&failed, meta);
             }
-            coalesce_refused_intent(&mut job);
             Err(job)
         }
         Err(_) => unreachable!("a write job comes back as itself"),
@@ -606,15 +611,11 @@ pub(crate) fn submit_batch(
 }
 
 /// Hand a batch with no ledger (a page refused before it held one).
-pub(crate) fn submit_unledgered(mut job: WriteJob) -> Result<(), Box<WriteJob>> {
-    job.pending_intent = write_intent(&job.support_dir, job.jsonl.now);
-    if job.pending_intent.is_none() {
-        return Err(Box::new(job));
-    }
+pub(crate) fn submit_unledgered(job: WriteJob) -> Result<(), Box<WriteJob>> {
     match submit(Job::Write(Box::new(job))) {
         Ok(()) => Ok(()),
-        Err(Job::Write(mut job)) => {
-            coalesce_refused_intent(&mut job);
+        Err(Job::Write(job)) => {
+            super::owe_coverage(&job.support_dir, job.jsonl.now, false);
             Err(job)
         }
         Err(_) => unreachable!("a write job comes back as itself"),
@@ -641,6 +642,7 @@ fn run_writer(receiver: Receiver<Job>) {
     // advance is written over them), and whether a debt-carrying meta failed
     // (no data shard is written until one lands).
     let mut failed = BTreeMap::<PathBuf, WriterState>::new();
+    let mut recovered = BTreeSet::new();
     while let Ok(job) = receiver.recv() {
         match job {
             Job::Load(support_dir) => {
@@ -659,6 +661,12 @@ fn run_writer(receiver: Receiver<Job>) {
                 }
             }
             Job::Write(job) => {
+                // A process can die before a queued batch starts. Re-seal
+                // retained days with existing rows before publishing any new
+                // coverage in this process; no caller-side fsync is needed.
+                if recovered.insert(job.support_dir.clone()) {
+                    super::recover_queued_coverage(&job.support_dir, job.jsonl.now);
+                }
                 let bytes = job.queued_bytes();
                 let failed = failed.entry(job.support_dir.clone()).or_default();
                 let (support_dir, result) = write(*job, failed);
@@ -718,7 +726,30 @@ pub(crate) struct WriterState {
     debt_unwritten: bool,
 }
 
-fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
+fn write(mut job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
+    // Only the writer performs durable intent I/O. Before it publishes any
+    // shard or row the recoverable intent must be on disk.
+    job.pending_intent = write_intent(&job.support_dir, job.jsonl.now);
+    if job.pending_intent.is_none() {
+        super::owe_coverage(&job.support_dir, job.jsonl.now, true);
+        let failed_shards = job
+            .save
+            .as_ref()
+            .map(|save| save.shards.iter().map(|(s, _)| *s).collect())
+            .unwrap_or_default();
+        let meta_unwritten = job.save.as_ref().and_then(|save| {
+            (save.meta_first.is_some() || save.meta_last.is_some()).then_some(save.meta_debt)
+        });
+        return (
+            job.support_dir,
+            WriteResult {
+                jsonl: JsonlOutcome::default(),
+                memos: Vec::new(),
+                failed_shards,
+                meta_unwritten,
+            },
+        );
+    }
     let WriteJob {
         support_dir,
         pending_intent,
@@ -1066,16 +1097,31 @@ impl ClaudeLedger {
 /// retry debt. The guard stays exclusive; a timed-out save is dirtied again.
 /// This barrier deliberately has no network or credential side effects.
 pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
-    let deadline = Instant::now() + flush_timeout();
-    if writer().is_none() || !flush_acknowledged_by(deadline) {
-        return false;
+    // No wait and no durable I/O on the caller. A later page reacquires the
+    // ledger and checks the completed writer receipt before POST or commit.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    if let Some((wait, shards, meta)) = ledger.pending_checkpoint.take() {
+        match wait.try_recv() {
+            Ok((failed, meta)) => {
+                ledger.restore(&failed, meta);
+                ledger.barrier_needed = false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ledger.pending_checkpoint = Some((wait, shards, meta));
+                return false;
+            }
+            Err(_) => {
+                ledger.restore(&shards, meta);
+                return false;
+            }
+        }
     }
     super::apply_results(
         support_dir,
         ledger,
         &mut super::ClaudeRequestMoneyShadowCounts::default(),
     );
-    if ledger.dirty_shards() == 0 {
+    if ledger.dirty_shards() == 0 && !ledger.barrier_needed {
         return true;
     }
     // Admit the boxed command and its directory before allocating either.
@@ -1086,9 +1132,12 @@ pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool 
     ) else {
         return false;
     };
-    let Some((save, reservation)) =
-        ledger.take_save(deadline.min(Instant::now() + Duration::from_millis(100)))
-    else {
+    let saved = if ledger.dirty_shards() == 0 {
+        ShadowReservation::admit(0).map(|reservation| (ClaudeLedgerSave::default(), reservation))
+    } else {
+        ledger.take_save(deadline)
+    };
+    let Some((save, reservation)) = saved else {
         return false;
     };
     let shards = save
@@ -1107,16 +1156,19 @@ pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool 
         ledger.restore(&shards, meta);
         return false;
     }
-    match wait.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok((failed, meta)) => ledger.restore(&failed, meta),
-        Err(_) => ledger.restore(&shards, meta),
+    ledger.pending_checkpoint = Some((wait, shards, meta));
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_for_test(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
+    for _ in 0..8 {
+        if checkpoint(support_dir, ledger) {
+            return true;
+        }
+        flush();
     }
-    super::apply_results(
-        support_dir,
-        ledger,
-        &mut super::ClaudeRequestMoneyShadowCounts::default(),
-    );
-    ledger.dirty_shards() == 0
+    false
 }
 
 /// Snapshot the ready ledger without taking custody from a running page.
@@ -1184,40 +1236,91 @@ pub(super) fn blocking_file(support_dir: &Path, index_key: &str) -> bool {
     ledger.get(&money_key("unbuilt:", index_key)).is_some()
 }
 
-pub(super) fn adoption_paused(support_dir: &Path, prefix: &str, now: u64) -> bool {
+pub(super) fn has_offer(support: &Path, key: &str) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support) else {
+        return false;
+    };
+    let found = ledger
+        .census()
+        .records_with_prefix(&format!("{}:", money_key("offer:", key)))
+        .next()
+        .is_some();
+    found
+}
+
+pub(super) fn checkpoint_pending(support_dir: &Path) -> bool {
     let Ok(ledgers) = LEDGERS.lock() else {
         return true;
+    };
+    match ledgers.get(support_dir) {
+        Some(Slot::Ready(ledger)) => ledger.pending_checkpoint.is_some(),
+        _ => false,
+    }
+}
+
+pub(super) fn adoption_paused(support_dir: &Path, prefix: &str, now: u64) -> bool {
+    let pause = |state: u64| {
+        static ALARMED: AtomicU64 = AtomicU64::new(0);
+        if ALARMED.fetch_or(state, Ordering::Relaxed) & state == 0 {
+            eprintln!("claude_request_money adoption_paused_state={state}");
+        }
+        true
+    };
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return pause(1);
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
+        return pause(1);
+    };
+    if ledger.pending_checkpoint.is_some() || ledger.dirty_shards() > 0 || ledger.barrier_needed {
+        return pause(1);
+    }
+    if ledger
+        .get(&format!("{prefix}route"))
+        .is_some_and(|record| record.window() > now)
+    {
+        return pause(2);
+    }
+    let Some(record) = ledger.get(&format!("{prefix}rates")) else {
+        return false;
+    };
+    let revision = record.money_revision();
+    let values = revision
+        .chunks_exact(8)
+        .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("rate")))
+        .collect::<Vec<_>>();
+    let [total, local, holds, refused] = values[..] else {
+        return pause(1);
+    };
+    let paused = total & (1_u64 << 63) != 0
+        || total > 0
+            && (local.saturating_mul(100) > total
+                || refused.saturating_mul(100) >= total.saturating_mul(5)
+                || holds.saturating_mul(100) > total.saturating_sub(local));
+    paused && pause(4)
+}
+
+/// A paused slice gets one recovery candidate after thirty minutes. Route
+/// and unknown/pending accounting remain closed. The next outcome renews it.
+pub(super) fn adoption_probe_due(support_dir: &Path, prefix: &str, now: u64) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
     };
     let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
         return false;
     };
-    let mut total = 0_u64;
-    let mut local = 0_u64;
-    let mut holds = 0_u64;
-    let mut refused = 0_u64;
-    let deadline = Instant::now() + Duration::from_millis(100);
-    for (key, record) in ledger.census().records_with_prefix(prefix) {
-        if Instant::now() >= deadline {
-            return true;
-        }
-        if key.ends_with(":route") {
-            if record.window() > now {
-                return true;
-            }
-            continue;
-        }
-        match record.window() {
-            0..=4 | 6 => total += 1,
-            _ => continue,
-        }
-        local += u64::from(record.window() == 1);
-        holds += u64::from(record.window() == 2);
-        refused += u64::from(matches!(record.window(), 3 | 6));
-    }
-    total > 0
-        && (local.saturating_mul(100) > total
-            || refused.saturating_mul(100) >= total.saturating_mul(5)
-            || holds.saturating_mul(100) > total.saturating_sub(local))
+    ledger.pending_checkpoint.is_none()
+        && !ledger.barrier_needed
+        && ledger.dirty_shards() == 0
+        && !ledger
+            .get(&format!("{prefix}route"))
+            .is_some_and(|record| record.window() > now)
+        && ledger.get(&format!("{prefix}rates")).is_some_and(|record| {
+            record.money_revision()[0] & 0x80 == 0 && now >= record.window().saturating_add(1800)
+        })
 }
 
 pub(super) fn intent_run_id() -> &'static str {
@@ -1234,21 +1337,6 @@ pub(super) fn intent_run_id() -> &'static str {
     })
 }
 
-// A refused job has no future writer completion to retire its unique intent.
-// Move that obligation to the existing coalesced day marker before deleting it.
-fn coalesce_refused_intent(job: &mut WriteJob) {
-    super::owe_coverage(&job.support_dir, job.jsonl.now, true);
-    let Some(day) = super::day_stamp(job.jsonl.now) else {
-        return;
-    };
-    let dir = job.support_dir.join("diagnostics");
-    if super::read_marker_time(&super::owed_path(&dir, &day)).is_some() {
-        if let Some(intent) = job.pending_intent.take() {
-            let _ = std::fs::remove_file(intent);
-            let _ = std::fs::File::open(&dir).and_then(|directory| directory.sync_all());
-        }
-    }
-}
 #[cfg(test)]
 thread_local! {
     static REFUSE_WRITES_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1326,7 +1414,7 @@ mod refused_intent_tests {
     use super::*;
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
-    fn refused_outbox_jobs_coalesce_their_durable_intents() {
+    fn refused_outbox_jobs_leave_debt_without_caller_disk_io() {
         let support = std::env::temp_dir().join(format!(
             "ottto-money-intent-{}-{}",
             std::process::id(),
@@ -1377,22 +1465,40 @@ mod refused_intent_tests {
                 );
             }
         }
-        assert!(super::super::read_marker_time(&super::super::owed_path(
-            &support.join("diagnostics"),
-            &day
-        ))
-        .is_some());
-        assert_eq!(
-            std::fs::read_dir(support.join("diagnostics"))
-                .unwrap()
-                .flatten()
-                .filter(|entry| entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "pending"))
-                .count(),
-            0
+        assert!(
+            !support.join("diagnostics").exists(),
+            "full writer cannot cause synchronous durable work"
         );
+        assert!(super::super::COVERAGE_OWED
+            .lock()
+            .unwrap()
+            .get(&support)
+            .unwrap()
+            .contains_key(&day));
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn stalled_writer_never_blocks_checkpoint_or_shadow_handoff() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-resumable-writer");
+        let support = scratch.join("support");
+        let mut ledger = ClaudeLedger::new_for_test();
+        ledger.put_money(
+            "dirty:fixture".into(),
+            ClaudeRequestCensusRecord::money_debt([1; 32], 0),
+        );
+        let stalled = stall_writer_for_test();
+        let started = Instant::now();
+        assert!(!checkpoint(&support, &mut ledger));
+        assert!(!checkpoint(&support, &mut ledger));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(
+            !support.join(LEDGER_DIR).exists(),
+            "caller performs no durable write"
+        );
+        drop(stalled);
+        assert!(checkpoint_for_test(&support, &mut ledger));
+        assert!(load_for_test(&support).get("dirty:fixture").is_some());
     }
 
     #[test]
@@ -1431,7 +1537,7 @@ mod refused_intent_tests {
             std::thread::sleep(Duration::from_millis(20));
             drop(stalled);
         });
-        assert!(checkpoint(&support, &mut ledger));
+        assert!(checkpoint_for_test(&support, &mut ledger));
         release.join().unwrap();
         assert_eq!(ledger.dirty_shards(), 0);
         assert_eq!(
