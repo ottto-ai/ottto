@@ -34,26 +34,54 @@ Authority-quarantined Claude families are unaffected: the quarantine gate runs
 before the adoption gate, so a held family keeps its own bounded retry and is
 neither adopted nor deferred while held. It adopts on its next retry.
 
-## Local re-emission exclusions
+## Local re-emission exclusions (the one protected list)
 
 Some sessions must not be re-sent by this re-read until their own recovery
-settles them. The Mac's runtime owner can list them in a local file the daemon
-only reads: `<support dir>/snapshots/claude_code-reemission-exclusions.txt`
-(mode 0600, never in the repo, config or logs). Each line is the lowercase
-64-hex SHA-256 of one exact, full Claude `source_session_id`; blank and `#`
-lines are ignored; at most 1,024 lines and 64 KiB.
+settles them. This is the single protected-session list on the Mac:
+`<support dir>/snapshots/claude_code-reemission-exclusions.txt` (mode 0600,
+never in the repo, config or logs). SESSION (01a0f6e0) owns its content; the
+Mac's runtime owner installs it; the daemon only reads it. MONEY P2 reuses this
+reader (`snapshots/claude_reemission_exclusions.rs`) and this file; there is no
+`claude-protected-entities.json`. Each line is the lowercase 64-hex SHA-256 of
+one exact, full Claude `source_session_id`; blank and `#` lines are ignored; at
+most 1,024 lines and 64 KiB. Families are listed by their ROOT digest, verified
+against the index's path-derived ids (root = file stem, subagent =
+`<root>_<stem>`). A member digest also matches, but a sibling's carry-cancel or
+proof re-arm can re-read members of an unlisted root, so list roots.
 
 - Read once per Claude cycle, before the scan. Other sources never read it.
-- Missing file: empty list, so every other Mac is unaffected.
-- Unreadable, oversized or malformed: fail closed for the re-read only. Every
-  adoption-only file is deferred that cycle; changed and new files are not.
+- The list fails closed (SOURCE Amendment 3):
+  - Never installed (no file and no seen-marker): adoption-only files whose
+    entity was first indexed before 2026-10-21T00:00:00Z are held: Skip, old
+    stamp kept, no budget used, counted as `body_witness_adoption_held_no_list`.
+    Newer ones proceed. The index keeps no first-indexed time, so the file's
+    birth time from the opened descriptor stands in for it; a file born before
+    the cutoff cannot have been indexed later than it was born, and an unknown
+    birth time counts as old. On a Mac where no list is ever installed, history
+    older than the cutoff is therefore not re-read.
+  - Installed: the first well-formed read writes a 0600 seen-marker
+    `claude_code-reemission-exclusions.seen` beside the list. An empty but
+    well-formed file counts as installed. The marker is outside the rebuildable
+    scan index, so a restart or an index rebuild keeps it.
+  - Marker present and file missing: adoption pauses (budget 0, every
+    adoption-only file deferred), the log line reports
+    `body_witness_adoption_list=missing_after_install`, and each Claude cycle
+    raises the local alarm record `ottto-service: local_resources
+    {"stage":"claude_reemission_list_missing_after_install",...}` in the
+    service log (`local_resource_diagnostics`, local only, no wire field).
+    Restoring the file (empty is fine) resumes.
+  - Unreadable, oversized or malformed: adoption pauses that cycle, as before.
+  - Changed and new files are never held or paused by the list.
 - A listed file is one whose family root id or own member id digest is in the
   list. When only the re-read selects it, it takes the ordinary Skip: no read,
-  no upload, old stamp kept, no budget used. Removing its line later lets it
-  adopt with no new revision.
-- The parse-reason log line adds `body_witness_adoption_excluded=<n>` and
-  `body_witness_adoption_exclusions_invalid=<0|1>`. No id, digest or path is
-  logged.
+  no upload, old stamp kept, no budget used. When its recovery settles, its line
+  is removed (the file stays, possibly empty) and it adopts with no new
+  revision. Deleting the file instead pauses the re-read.
+- The parse-reason log line adds `body_witness_adoption_excluded=<n>`,
+  `body_witness_adoption_held_no_list=<n>`,
+  `body_witness_adoption_exclusions_invalid=<0|1>` and
+  `body_witness_adoption_list=<not_installed|installed|missing_after_install|unreadable>`.
+  No id, digest or path is logged.
 
 ## Release rule
 
@@ -106,5 +134,11 @@ the server are unchanged.
 - `claude_context_backfill_spreads_adoption_only_files_over_pages`
 - `claude_context_backfill_quarantined_family_keeps_its_own_retry_gate`
 - `claude_context_backfill_skips_sessions_on_the_local_reemission_list`
-- `snapshots::claude_reemission_exclusions::tests` (missing, listed root or
-  member, malformed and oversized lists)
+- `claude_context_backfill_holds_old_entities_until_the_list_is_installed`
+- `claude_context_backfill_empty_list_installs_the_marker_and_adopts_old_entities`
+- `claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing`
+  (also restart and index rebuild keep the marker)
+- `snapshots::claude_reemission_exclusions::tests` (never installed holds old
+  and unknown only, empty list writes a 0600 marker and a later missing file
+  pauses, listed root or member, malformed and oversized lists never write the
+  marker)
