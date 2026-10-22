@@ -15576,6 +15576,30 @@ pub(in crate::snapshots) fn with_codex_before_parse<T>(
     value
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Stage2-pre seam: runs once the active file's reader reports EOF and
+    /// before its completion (E1, tier gate, revalidation, commit), so a test
+    /// can change the file inside the window that `OwnedSourceScan::step`
+    /// boundaries do not expose.
+    static AFTER_READER_EOF: std::cell::RefCell<Option<AfterReaderEofHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+type AfterReaderEofHook = Box<dyn FnMut(&OwnedActiveFile)>;
+
+#[cfg(test)]
+pub(in crate::snapshots) fn with_after_reader_eof<T>(
+    hook: impl FnMut(&OwnedActiveFile) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    AFTER_READER_EOF.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let value = run();
+    AFTER_READER_EOF.with(|slot| *slot.borrow_mut() = None);
+    value
+}
+
 /// PR-P: this page's step map of validated parent ledgers and witnesses.
 type CodexStepMap = Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>;
 
@@ -18184,6 +18208,12 @@ impl OwnedSourceScan {
                     }
                     Ok(true) => {}
                 }
+                #[cfg(test)]
+                AFTER_READER_EOF.with(|slot| {
+                    if let Some(hook) = slot.borrow_mut().as_mut() {
+                        hook(&active);
+                    }
+                });
                 if active.cursor.is_some() && active.group.is_none() {
                     // E1 before the protected-tier gate below (R1-H1). A group
                     // job applies it to its live member in `member_eof`, before

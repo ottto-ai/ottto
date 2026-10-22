@@ -1,0 +1,1171 @@
+//! FE red-first fixtures: Claude appends while an in-page sampled `Full` or
+//! `Tail` reads. FE is the Claude twin of Stage2-pre: a reader-relative extent
+//! limit (H1c), an in-page E1 for a quiescent unterminated row (H2c), and a
+//! grown-read route (H3c) that publishes the sealed prefix `[0, s)` as a
+//! certificate only: no checkpoint, copy, cache insert or audit credit, the
+//! prepared debt re-staged, and the index left at the opened stamp.
+//!
+//! Tests marked RED assert FE's behavior and fail on main for the reason in
+//! their doc comment (the D1 "acquisition exceeds stable source" failure,
+//! recorded as `OpenRead`, or `ScopeObject` at revalidation). Tests marked
+//! GREEN assert main's behavior, which FE must keep, and pass on main.
+//! Production code is unchanged; the only seam is #670's `with_after_reader_eof`.
+//!
+//! SOURCE conditions pinned here (qualified YES, d680b524):
+//! - publish only when `s` is at least the last committed size;
+//! - a prefix never backs proof, v1, a family witness, or a verified D1
+//!   record;
+//! - FE2: the sample-preserving-rewrite residual is accepted (SP-5 residual).
+//!
+//! Not added: #660 side reads (SP-11; #660 is not on main). Stage2-pre's
+//! `sp11_claude_in_page_tail_with_append_keeps_main_failure` pins the Claude
+//! D1 failure that FE replaces; the FE production change updates it.
+use super::*;
+use crate::claude_local_otel::{ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport};
+use crate::snapshots::claude_request_census::claude_request_hash;
+
+const CLAUDE: SnapshotSource = SnapshotSource::ClaudeCode;
+/// The fixture's session id, its path stem, and so its family root.
+const SESSION: &str = "native-tail-fixture";
+const V1: &str = "session_exclusive_reported_usage:v1";
+
+/// A body without the revision fields a stat-bound fingerprint sets, so a
+/// prefix publication compares with the parse of a copy cut at `s`.
+fn content(mut body: Value) -> Value {
+    for item in body.as_array_mut().into_iter().flatten() {
+        if let Some(item) = item.as_object_mut() {
+            item.remove("source_file_fingerprint");
+            item.remove("snapshot_fingerprint");
+        }
+    }
+    body
+}
+
+/// The unsampled native body of the fixture's first `length` bytes: the file
+/// is cut to `length`, parsed, and restored.
+fn body_at(fixture: &ScanFixture, length: u64) -> Value {
+    let path = &fixture.file.0;
+    let bytes = bytes_of(path);
+    overwrite(path, &bytes[..length as usize]);
+    let body = full_body(fixture, CLAUDE);
+    overwrite(path, &bytes);
+    body
+}
+
+/// A later mtime at the same length, so the ordinary page re-selects the file.
+fn touch(path: &Path) {
+    let file = OpenOptions::new().write(true).open(path).unwrap();
+    let modified = file.metadata().unwrap().modified().unwrap();
+    file.set_modified(modified + std::time::Duration::from_secs(10))
+        .unwrap();
+}
+
+/// The same bytes with the header row's text changed: equal length,
+/// different head sample.
+fn claude_changed_head(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let changed = text.replacen("Synthetic test", "Synthetic best", 1);
+    assert_ne!(changed, text, "precondition: the header row names the text");
+    changed.into_bytes()
+}
+
+fn requests(ids: Range<usize>) -> impl Iterator<Item = String> {
+    ids.map(|id| format!("req-{id}"))
+}
+
+/// Pending keys request ids by their full SHA-256 hex.
+fn pending_hashes(ids: Range<usize>) -> BTreeSet<String> {
+    requests(ids)
+        .map(|request| format!("{:x}", Sha256::digest(request.as_bytes())))
+        .collect()
+}
+
+/// A D1 record holds sorted 8-byte prefixes.
+fn census_hashes(ids: Range<usize>) -> Vec<u64> {
+    let mut hashes = requests(ids)
+        .map(|request| claude_request_hash(&request))
+        .collect::<Vec<_>>();
+    hashes.sort_unstable();
+    hashes
+}
+
+/// Complete API and trace evidence for `ids`, matching `row(CLAUDE, id)`.
+fn reports(ids: Range<usize>) -> (ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport) {
+    let mut api = Vec::new();
+    let mut trace = Vec::new();
+    for id in ids {
+        let request = format!("req-{id}");
+        let n = 100 + 30 * id as u64;
+        let mut row = crate::snapshots::tests::complete_api_row(
+            SESSION,
+            &request,
+            id as u64 + 1,
+            n,
+            n / 10,
+            0,
+        );
+        row.cache_read_tokens = n / 2;
+        row.model = "fixture-model".into();
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        api.push(row);
+        trace.push(crate::snapshots::tests::complete_trace_row(
+            SESSION, &request, "",
+        ));
+    }
+    (
+        ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(SESSION.to_string(), api)]),
+            health: Default::default(),
+        },
+        ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(SESSION.to_string(), trace)]),
+            ..Default::default()
+        },
+    )
+}
+
+/// Runs the scan-level authority fold with complete evidence for `ids`.
+/// Returns whether any item was rebuilt under the v1 contract.
+fn mints_v1(index: &mut ScanIndex, result: &SourceScanResult, ids: Range<usize>) -> bool {
+    let mut scan = result.clone();
+    let (api, trace) = reports(ids);
+    let _ = apply_claude_reported_usage_to_scan_with_identity(&mut scan, &api, &trace, index, None);
+    scan.snapshots
+        .iter()
+        .any(|item| item.usage_accounting_contract.as_deref() == Some(V1))
+}
+
+/// FE's grown-route publication: nothing unreadable, no checkpoint or cache
+/// insert, the index entry keeps the opened stamp, and the body is the native
+/// parse of a copy cut at `s`.
+fn assert_prefix_published(
+    id: &str,
+    base: &Baseline,
+    index: &ScanIndex,
+    result: SourceScanResult,
+    seen: &Seen,
+    read: &InPage,
+    s: u64,
+) {
+    assert_eq!(
+        seen.unreadable, 0,
+        "{id}: no unreadable; causes={:?}",
+        seen.causes
+    );
+    assert!(
+        base.cache.retained_checkpoint(&base.key).is_none(),
+        "{id}: no checkpoint or cache insert"
+    );
+    assert!(len(&base.path) > read.frozen, "precondition: grown");
+    assert_eq!(
+        index.files[&base.key].size_bytes, read.frozen,
+        "{id}: the index keeps the opened stamp"
+    );
+    assert_eq!(
+        content(production_body(CLAUDE, result)),
+        content(body_at(&base.fixture, s)),
+        "{id}: body == Full parse of a copy cut at s"
+    );
+}
+
+/// The ordinary next page: the grown file re-selects (SourceChanged), reads
+/// `Full(reason)` without a copy, and matches the Full parse.
+fn next_full(
+    id: &str,
+    base: &Baseline,
+    index: ScanIndex,
+    reason: usize,
+) -> (ScanIndex, SourceScanResult) {
+    let (index, next, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+    assert_eq!(seen.modes, (1, 0, 0), "{id}: the next page reads Full");
+    assert_eq!(seen.full_reasons[reason], 1, "{id}: next Full reason");
+    assert_eq!(seen.unreadable, 0, "{id}: causes={:?}", seen.causes);
+    assert_eq!(
+        content(production_body(CLAUDE, next.clone())),
+        content(full_body(&base.fixture, CLAUDE)),
+        "{id}: next body == Full parse"
+    );
+    (index, next)
+}
+
+/// A Claude file with rows 0..6 and no copy, read `Full(StateMissing)` while
+/// rows 6..9 are appended after the open step.
+struct Grown {
+    base: Baseline,
+    index: ScanIndex,
+    result: SourceScanResult,
+    seen: Seen,
+}
+
+fn grown_full() -> Grown {
+    let mut base = baseline(CLAUDE, 4, 2);
+    base.cache.clear();
+    let path = base.path.clone();
+    let appended = row_bytes(CLAUDE, 6..9);
+    let index = std::mem::take(&mut base.index);
+    let (index, result, seen, read) =
+        page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
+            append_raw(&path, &appended)
+        });
+    assert_eq!(
+        read.mode,
+        ReadMode::Full(FullReason::StateMissing),
+        "precondition: an in-page Full"
+    );
+    Grown {
+        base,
+        index,
+        result,
+        seen,
+    }
+}
+
+/// A fresh Claude fixture with rows 0..6, read once (sampled, `Full`).
+fn quiescent() -> (ScanFixture, ScanIndex, SourceScanResult) {
+    let fixture = ScanFixture::new(CLAUDE);
+    append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (index, result, seen) = plain(&fixture, CLAUDE, ScanIndex::default(), &cache);
+    assert_eq!(seen.modes, (1, 0, 0), "precondition: one Full read");
+    assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
+    assert!(result.census_complete, "precondition: a healthy terminal");
+    (fixture, index, result)
+}
+
+/// SP-1c (RED): a Claude file with no copy and a prepared (not yet due)
+/// audit debt; complete rows are appended after the open step of its in-page
+/// `Full`. FE publishes `[0, s)` (here `s` = frozen) with no checkpoint or
+/// cache insert and no `complete_full_audit` (the debt stays staged at its
+/// deadline); the index keeps the opened stamp; the next page re-selects the
+/// grown file and reads `Full` with body parity.
+///
+/// Red on main: the reader passes the frozen length and fails D1
+/// ("acquisition exceeds stable source"), recorded as one `OpenRead`.
+#[test]
+fn fe_claude_sp1c_append_during_full_read_publishes_sealed_prefix() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut base = baseline(CLAUDE, 4, 2);
+    base.cache.clear();
+    let due = sampled_scan::now_seconds() + 1800;
+    base.index
+        .files
+        .get_mut(&base.key)
+        .unwrap()
+        .set_unverified_deadline(due);
+    let path = base.path.clone();
+    let appended = row_bytes(CLAUDE, 6..9);
+    let index = std::mem::take(&mut base.index);
+    let (index, full, seen, read) =
+        page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
+            append_raw(&path, &appended)
+        });
+    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
+    assert_eq!(seen.modes, (1, 0, 0));
+    assert_eq!(
+        read.debt.map(|debt| debt.due_unix_seconds),
+        Some(due),
+        "precondition: the Full owes the prepared audit"
+    );
+    assert_prefix_published("SP-1c", &base, &index, full, &seen, &read, read.frozen);
+    assert_eq!(
+        index.files[&base.key].unverified_deadline(),
+        Some(due),
+        "SP-1c: no complete_full_audit; the prepared debt stays staged"
+    );
+    next_full("SP-1c", &base, index, STATE_MISSING);
+}
+
+/// SP-1c' (RED): the same during a Claude in-page `Tail` from `s` of a
+/// retained copy. FE publishes `[0, frozen)`, discards the taken copy (no
+/// checkpoint or cache insert), and re-stages the Tail's prepared debt
+/// unchanged; the next page reads `Full(StateMissing)` with body parity.
+///
+/// Red on main: D1 (one `OpenRead`), and the taken copy is dropped.
+#[test]
+fn fe_claude_sp1c_prime_append_during_tail_read_publishes_prefix_and_restages_debt() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let path = base.path.clone();
+    let appended = row_bytes(CLAUDE, 6..9);
+    let (index, tail, seen, read) = page_injecting(
+        &base.fixture,
+        CLAUDE,
+        base.index.clone(),
+        &base.cache,
+        is_tail,
+        |_| append_raw(&path, &appended),
+    );
+    assert_eq!(read.start, base.sealed, "precondition: Tail from s");
+    assert_eq!(seen.modes, (0, 1, 0));
+    assert!(read.debt.is_some(), "precondition: a Tail owes its audit");
+    assert_prefix_published("SP-1c'", &base, &index, tail, &seen, &read, read.frozen);
+    assert_eq!(
+        index.files[&base.key].unverified_deadline(),
+        read.debt.map(|debt| debt.due_unix_seconds),
+        "SP-1c': the prepared debt is re-staged unchanged"
+    );
+    next_full("SP-1c'", &base, index, STATE_MISSING);
+}
+
+/// SP-2a-c (RED): half a row at open, completed (plus more rows) after the
+/// open step of a Claude `Tail`. FE seals at the row's start `s'` < frozen:
+/// the row is absent now and present on the next read.
+///
+/// Red on main: the row's newline lies past the frozen length, so the reader
+/// fails D1 (one `OpenRead`).
+#[test]
+fn fe_claude_sp2a_partial_row_at_frozen_grown_is_absent_now_present_next() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let row_start = len(&base.path);
+    let split = row_bytes(CLAUDE, 6..7);
+    let (head, rest) = split.split_at(split.len() / 2);
+    append_raw(&base.path, head);
+    let mut completion = rest.to_vec();
+    completion.extend(row_bytes(CLAUDE, 7..9));
+    let path = base.path.clone();
+    let (index, tail, seen, read) = page_injecting(
+        &base.fixture,
+        CLAUDE,
+        base.index.clone(),
+        &base.cache,
+        is_tail,
+        |_| append_raw(&path, &completion),
+    );
+    assert_eq!(read.frozen, row_start + head.len() as u64);
+    let prefix = content(production_body(CLAUDE, tail.clone()));
+    assert_prefix_published("SP-2a-c", &base, &index, tail, &seen, &read, row_start);
+    let (_, next) = next_full("SP-2a-c", &base, index, STATE_MISSING);
+    assert_ne!(
+        content(production_body(CLAUDE, next)),
+        prefix,
+        "SP-2a-c: the completed row is present on the next read"
+    );
+}
+
+/// SP-2b-c (GREEN): a quiescent unterminated last row in a Claude `Tail`,
+/// not grown. Main's trailing-line rule applies it; H2c must keep this
+/// byte-identical: body == Full parse, `RetentionUnsealedEof`, no copy,
+/// nothing unreadable.
+#[test]
+fn fe_claude_sp2b_quiescent_unterminated_tail_keeps_main_output() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let last = row_bytes(CLAUDE, 6..7);
+    append_raw(&base.path, &last[..last.len() - 1]);
+    let ((_, tail, seen), counts) =
+        observe(|| plain(&base.fixture, CLAUDE, base.index, &base.cache));
+    assert_eq!(seen.modes, (0, 1, 0));
+    assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
+    assert_eq!(counts.retention_unsealed_eof, 1);
+    assert!(
+        base.cache.retained_checkpoint(&base.key).is_none(),
+        "no copy"
+    );
+    assert_eq!(
+        production_body(CLAUDE, tail),
+        full_body(&base.fixture, CLAUDE)
+    );
+}
+
+/// SP-2b-c, Full (GREEN): the same unterminated last row read by a Claude
+/// in-page `Full` keeps main's output: nothing unreadable, body == Full parse.
+#[test]
+fn fe_claude_sp2b_quiescent_unterminated_full_keeps_main_output() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    base.cache.clear();
+    let last = row_bytes(CLAUDE, 6..7);
+    append_raw(&base.path, &last[..last.len() - 1]);
+    let (_, full, seen) = plain(&base.fixture, CLAUDE, base.index, &base.cache);
+    assert_eq!(seen.modes, (1, 0, 0));
+    assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
+    assert_eq!(
+        production_body(CLAUDE, full),
+        full_body(&base.fixture, CLAUDE)
+    );
+}
+
+/// SP-2c-c (RED): setter units with `s` >= 64 KiB. The Claude `Tail` reader
+/// stops at frozen with a reader-relative limit `frozen - start`.
+///
+/// Red on main: no in-page limit is set; the reader passes frozen and fails
+/// D1 (one `OpenRead`), so the EOF hook never sees this read.
+#[test]
+fn fe_claude_sp2c_large_prefix_tail_stops_at_frozen_with_relative_limit() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 320, 2);
+    assert!(base.sealed >= 64 * 1024, "precondition: s >= 64 KiB");
+    let path = base.path.clone();
+    let appended = row_bytes(CLAUDE, 322..325);
+    let ((_, _, seen, read), at_eof) = with_eof_hook(
+        &base.path,
+        |_| {},
+        || {
+            page_injecting(
+                &base.fixture,
+                CLAUDE,
+                base.index.clone(),
+                &base.cache,
+                is_tail,
+                |_| append_raw(&path, &appended),
+            )
+        },
+    );
+    assert_eq!(
+        seen.unreadable, 0,
+        "SP-2c-c: no D1 failure; causes={:?}",
+        seen.causes
+    );
+    let at_eof = at_eof.expect("SP-2c-c: the reader reached EOF");
+    assert_eq!(
+        at_eof.extent_limit,
+        Some(read.frozen - read.start),
+        "SP-2c-c: reader-relative limit"
+    );
+    assert_eq!(at_eof.start + at_eof.consumed, read.frozen);
+    assert!(
+        base.cache.retained_checkpoint(&base.key).is_none(),
+        "SP-2c-c: no copy"
+    );
+}
+
+/// SP-D2c (RED): a Claude `Full` reader reaches EOF exactly at frozen, then
+/// rows are appended before revalidation reopens the path. FE takes the grown
+/// route: nothing unreadable, `[0, frozen)` published as a certificate only.
+///
+/// Red on main: revalidation sees the grown identity (length, ctime, last
+/// 4 KiB) and refuses the page as one `ScopeObject`.
+#[test]
+fn fe_claude_spd2c_append_after_full_reader_eof_takes_grown_route() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    base.cache.clear();
+    let frozen = len(&base.path);
+    let path = base.path.clone();
+    let appended = row_bytes(CLAUDE, 6..9);
+    let ((index, full, seen), at_eof) = with_eof_hook(
+        &base.path,
+        move |_| append_raw(&path, &appended),
+        || plain(&base.fixture, CLAUDE, base.index.clone(), &base.cache),
+    );
+    let at_eof = at_eof.expect("precondition: the reader reached EOF");
+    assert_eq!(at_eof.mode, ReadMode::Full(FullReason::StateMissing));
+    assert_eq!(at_eof.start + at_eof.consumed, frozen);
+    assert_prefix_published("SP-D2c", &base, &index, full, &seen, &at_eof, frozen);
+    next_full("SP-D2c", &base, index, STATE_MISSING);
+}
+
+/// SP-D2c, Tail (RED): the same after a Claude `Tail` reader reaches EOF.
+///
+/// Red on main: one `ScopeObject` at revalidation.
+#[test]
+fn fe_claude_spd2c_append_after_tail_reader_eof_takes_grown_route() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let frozen = len(&base.path);
+    let path = base.path.clone();
+    let appended = row_bytes(CLAUDE, 6..9);
+    let ((index, tail, seen), at_eof) = with_eof_hook(
+        &base.path,
+        move |_| append_raw(&path, &appended),
+        || plain(&base.fixture, CLAUDE, base.index.clone(), &base.cache),
+    );
+    let at_eof = at_eof.expect("precondition: the reader reached EOF");
+    assert_eq!(at_eof.mode, ReadMode::Tail);
+    assert_eq!(at_eof.start + at_eof.consumed, frozen);
+    assert_prefix_published("SP-D2c Tail", &base, &index, tail, &seen, &at_eof, frozen);
+    next_full("SP-D2c Tail", &base, index, STATE_MISSING);
+}
+
+/// SP-3a-c (GREEN): a new object renamed over the path during a Claude
+/// `Tail`; the held FD is not grown. Main's revalidation refuses as
+/// `ScopeObject`: no checkpoint, copy or publication.
+#[test]
+fn fe_claude_sp3a_replace_during_tail_not_grown_is_scope_object() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let path = base.path.clone();
+    let bytes = bytes_of(&base.path);
+    let (_, tail, seen, _) = page_injecting(
+        &base.fixture,
+        CLAUDE,
+        base.index,
+        &base.cache,
+        is_tail,
+        |_| replace(&path, &bytes),
+    );
+    assert_refused(
+        &base.cache,
+        &base.key,
+        &tail,
+        &seen,
+        SCOPE_OBJECT,
+        "SP-3a-c",
+    );
+}
+
+/// SP-4-c (GREEN): truncated below frozen during a Claude `Tail`, no regrow.
+/// Not grown, so main's path: `ScopeObject`; nothing published.
+#[test]
+fn fe_claude_sp4_truncate_during_tail_keeps_main_failure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let (path, sealed) = (base.path.clone(), base.sealed);
+    let (_, tail, seen, _) = page_injecting(
+        &base.fixture,
+        CLAUDE,
+        base.index,
+        &base.cache,
+        is_tail,
+        |_| truncate(&path, sealed),
+    );
+    assert_refused(&base.cache, &base.key, &tail, &seen, SCOPE_OBJECT, "SP-4-c");
+}
+
+/// SP-5a-c (GREEN): truncated at the open step (a short EOF), then regrown
+/// past frozen before completion. H3c's traversal check fails, so main's
+/// path: `ScopeObject`.
+#[test]
+fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let (path, sealed) = (base.path.clone(), base.sealed);
+    let mut regrown = bytes_of(&base.path)[sealed as usize..].to_vec();
+    regrown.extend(row_bytes(CLAUDE, 6..8));
+    let regrow_path = base.path.clone();
+    let ((_, tail, seen, read), at_eof) = with_eof_hook(
+        &base.path,
+        move |_| append_raw(&regrow_path, &regrown),
+        || {
+            page_injecting(
+                &base.fixture,
+                CLAUDE,
+                base.index,
+                &base.cache,
+                is_tail,
+                |_| truncate(&path, sealed),
+            )
+        },
+    );
+    let at_eof = at_eof.expect("precondition: the reader reached EOF");
+    assert!(
+        at_eof.start + at_eof.consumed < read.frozen,
+        "precondition: a short EOF"
+    );
+    assert!(len(&base.path) > read.frozen, "precondition: regrown");
+    assert_refused(
+        &base.cache,
+        &base.key,
+        &tail,
+        &seen,
+        SCOPE_OBJECT,
+        "SP-5a-c",
+    );
+}
+
+/// SP-5b-c (GREEN): after the Claude reader passes frozen, the file is
+/// rewritten past frozen with a different head. Main's revalidation and H3c's
+/// head sample both refuse as `ScopeObject`; nothing published.
+#[test]
+fn fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let path = base.path.clone();
+    let mut regrown = claude_changed_head(&bytes_of(&base.path));
+    regrown.extend(row_bytes(CLAUDE, 6..8));
+    let ((_, tail, seen), at_eof) = with_eof_hook(
+        &base.path,
+        move |_| overwrite(&path, &regrown),
+        || plain(&base.fixture, CLAUDE, base.index, &base.cache),
+    );
+    let at_eof = at_eof.expect("precondition: the reader reached EOF");
+    assert_eq!(at_eof.start + at_eof.consumed, at_eof.frozen);
+    assert_refused(
+        &base.cache,
+        &base.key,
+        &tail,
+        &seen,
+        SCOPE_OBJECT,
+        "SP-5b-c",
+    );
+}
+
+/// SP-5c-c (GREEN): after the Claude reader passes frozen, the file is
+/// rewritten to exactly frozen with a different head. Not grown, so main's
+/// revalidation refuses as `ScopeObject`.
+#[test]
+fn fe_claude_sp5c_rewrite_to_exactly_frozen_keeps_main_failure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let path = base.path.clone();
+    let rewritten = claude_changed_head(&bytes_of(&base.path));
+    let ((_, tail, seen), at_eof) = with_eof_hook(
+        &base.path,
+        move |_| overwrite(&path, &rewritten),
+        || plain(&base.fixture, CLAUDE, base.index, &base.cache),
+    );
+    let at_eof = at_eof.expect("precondition: the reader reached EOF");
+    assert_eq!(len(&base.path), at_eof.frozen, "precondition: not grown");
+    assert_refused(
+        &base.cache,
+        &base.key,
+        &tail,
+        &seen,
+        SCOPE_OBJECT,
+        "SP-5c-c",
+    );
+}
+
+/// SP-5 residual, Claude (RED; EXPECTED RESIDUAL per SOURCE FE2, not mutation
+/// detection): after the reader passed them, already-read tail bytes outside
+/// both 4 KiB sample windows are truncated and regrown with a different row
+/// of the same length, plus growth. H3c accepts it as the cursor does: the
+/// page publishes the bytes it read; only a later Full (the quiet audit) sees
+/// the edit.
+///
+/// Red on main: revalidation sees the grown identity and refuses the page as
+/// one `ScopeObject`.
+#[test]
+fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 30, 30);
+    let frozen = len(&base.path);
+    assert!(
+        base.sealed > 4096,
+        "precondition: head window inside [0, s)"
+    );
+    let original = bytes_of(&base.path);
+    let edited_row = base.sealed as usize;
+    let row_len = row_bytes(CLAUDE, 30..31).len();
+    assert!(
+        edited_row + row_len < frozen as usize - 4096,
+        "precondition: the edit is outside the boundary window"
+    );
+    let text = String::from_utf8(original[edited_row..edited_row + row_len].to_vec()).unwrap();
+    let edited = text.replacen("fixture-model", "fixture-modem", 1);
+    assert_ne!(edited, text);
+    let mut regrown = original[edited_row..].to_vec();
+    regrown[..row_len].copy_from_slice(edited.as_bytes());
+    regrown.extend(row_bytes(CLAUDE, 60..62));
+    let frozen_body = full_body(&base.fixture, CLAUDE);
+    let path = base.path.clone();
+    let ((_, tail, seen), at_eof) = with_eof_hook(
+        &base.path,
+        move |_| {
+            truncate(&path, edited_row as u64);
+            append_raw(&path, &regrown);
+        },
+        || plain(&base.fixture, CLAUDE, base.index, &base.cache),
+    );
+    assert!(at_eof.is_some(), "precondition: the reader reached EOF");
+    assert_eq!(
+        seen.unreadable, 0,
+        "SP-5 residual (Claude): accepted; causes={:?}",
+        seen.causes
+    );
+    assert!(
+        base.cache.retained_checkpoint(&base.key).is_none(),
+        "no copy"
+    );
+    assert_eq!(
+        content(production_body(CLAUDE, tail)),
+        content(frozen_body),
+        "SP-5 residual (Claude): the bytes read before the edit are published"
+    );
+}
+
+/// The Claude baseline plus a malformed row inside `[s, frozen)`.
+fn claude_lossy_baseline() -> Baseline {
+    let base = baseline(CLAUDE, 4, 1);
+    append_raw(&base.path, b"{\"type\":\"assistant\",\"message\":\n");
+    append_raw(&base.path, &row_bytes(CLAUDE, 5..6));
+    base
+}
+
+/// SP-7a-c (GREEN): a lossy row in a Claude `Tail`, not grown. Main: the
+/// retention refuses (`RetentionIncompleteOrLossy`), no copy, nothing
+/// unreadable.
+#[test]
+fn fe_claude_sp7a_lossy_tail_not_grown_keeps_main_uncertified_path() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = claude_lossy_baseline();
+    let ((_, _, seen), counts) = observe(|| plain(&base.fixture, CLAUDE, base.index, &base.cache));
+    assert_eq!(seen.modes, (0, 1, 0));
+    assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
+    assert_eq!(counts.retention_incomplete_or_lossy, 1);
+    assert!(
+        base.cache.retained_checkpoint(&base.key).is_none(),
+        "no copy"
+    );
+}
+
+/// SP-7b-c (GREEN): a lossy row in `[s, frozen)` and an append after the
+/// open step. Lossy reads are excluded from H3c and follow main: one
+/// unreadable (main's `OpenRead`; with H1c, `ScopeObject` at revalidation),
+/// no checkpoint, copy or publication.
+#[test]
+fn fe_claude_sp7b_lossy_grown_tail_is_excluded_and_refused() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = claude_lossy_baseline();
+    let path = base.path.clone();
+    let appended = row_bytes(CLAUDE, 6..8);
+    let (_, tail, seen, _) = page_injecting(
+        &base.fixture,
+        CLAUDE,
+        base.index,
+        &base.cache,
+        is_tail,
+        |_| append_raw(&path, &appended),
+    );
+    assert_eq!(
+        (
+            seen.unreadable,
+            seen.causes[OPEN_READ] + seen.causes[SCOPE_OBJECT]
+        ),
+        (1, 1),
+        "SP-7b-c: one refusal; causes={:?}",
+        seen.causes
+    );
+    assert!(
+        base.cache.retained_checkpoint(&base.key).is_none(),
+        "SP-7b-c: no checkpoint or copy"
+    );
+    assert!(tail.snapshots.is_empty(), "SP-7b-c: nothing published");
+}
+
+/// SP-8c-c (RED): a grown Claude `Full(AuditDue)` earns no audit credit: FE
+/// publishes the prefix, the due debt stays staged at its deadline, and the
+/// next page is `Full(AuditDue)` again.
+///
+/// Red on main: D1 (one `OpenRead`).
+#[test]
+fn fe_claude_sp8c_grown_full_audit_due_keeps_debt_staged() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut base = baseline(CLAUDE, 4, 2);
+    let due = sampled_scan::now_seconds() - 1;
+    base.index
+        .files
+        .get_mut(&base.key)
+        .unwrap()
+        .set_unverified_deadline(due);
+    let path = base.path.clone();
+    let appended = row_bytes(CLAUDE, 6..9);
+    let index = std::mem::take(&mut base.index);
+    let (index, full, seen, read) =
+        page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
+            append_raw(&path, &appended)
+        });
+    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+    assert_prefix_published("SP-8c-c", &base, &index, full, &seen, &read, read.frozen);
+    assert_eq!(
+        index.files[&base.key].unverified_deadline(),
+        Some(due),
+        "SP-8c-c: no audit credit; the debt stays staged"
+    );
+    next_full("SP-8c-c", &base, index, AUDIT_DUE);
+}
+
+/// SP-11-c, Codex (GREEN): FE is Claude-only. A Codex in-page `Full` with an
+/// append after the open step keeps main's D1 failure (`OpenRead`).
+#[test]
+fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let base = baseline(source, 4, 2);
+    base.cache.clear();
+    let path = base.path.clone();
+    let appended = row_bytes(source, 6..8);
+    let (_, full, seen, read) = page_injecting(
+        &base.fixture,
+        source,
+        base.index,
+        &base.cache,
+        is_full,
+        |_| append_raw(&path, &appended),
+    );
+    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
+    assert_refused(
+        &base.cache,
+        &base.key,
+        &full,
+        &seen,
+        OPEN_READ,
+        "SP-11-c Codex",
+    );
+}
+
+/// SP-11-c, Pi (GREEN): Pi has no sampled acquisition, so no in-page read
+/// for H1c-H3c to change.
+#[test]
+fn fe_claude_sp11_pi_has_no_in_page_sampled_read() {
+    let root = std::env::temp_dir();
+    let scan = OwnedSourceScan::new(
+        SnapshotSource::Pi,
+        std::slice::from_ref(&root),
+        ScanIndex::default(),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_sampled_acquisition(
+        Arc::new(sampled_scan::SharedCache::default()),
+        Scope(NAMESPACE.into()),
+    );
+    assert!(scan.sampling.is_none(), "Pi reads stay unsampled");
+}
+
+/// SOURCE, s below the last committed size (GREEN): the last page committed
+/// a file ending in a complete but unterminated row (size C, main's
+/// trailing-line rule). The file is re-selected at size C and, during its
+/// in-page `Full`, the row's newline and more rows are appended. The last newline at or below frozen (= C) is the row's start,
+/// below C, so FE must publish nothing (never a weaker body): one refusal, no
+/// copy, and the committed entry stands.
+#[test]
+fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanFixture::new(CLAUDE);
+    let path = fixture.file.0.clone();
+    append_raw(&path, &row_bytes(CLAUDE, 0..4));
+    let last = row_bytes(CLAUDE, 4..5);
+    append_raw(&path, &last[..last.len() - 1]);
+    let committed = len(&path);
+    let key = local_index_key(&path);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (index, _, seen) = plain(&fixture, CLAUDE, ScanIndex::default(), &cache);
+    assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
+    assert_eq!(
+        index.files[&key].size_bytes, committed,
+        "precondition: the last committed size includes the unterminated row"
+    );
+    cache.clear();
+    touch(&path);
+    let mut completion = b"\n".to_vec();
+    completion.extend(row_bytes(CLAUDE, 5..7));
+    let append_path = path.clone();
+    let (index, full, seen, read) =
+        page_injecting(&fixture, CLAUDE, index, &cache, is_full, |_| {
+            append_raw(&append_path, &completion)
+        });
+    assert_eq!(read.frozen, committed, "precondition: frozen = C");
+    assert_eq!(
+        seen.unreadable, 1,
+        "SOURCE: refused; causes={:?}",
+        seen.causes
+    );
+    assert!(full.snapshots.is_empty(), "SOURCE: never a weaker body");
+    assert!(cache.retained_checkpoint(&key).is_none(), "no copy");
+    assert_eq!(
+        index.files[&key].size_bytes, committed,
+        "the committed entry stands"
+    );
+}
+
+/// D1 control (GREEN): in this fixture a quiescent sampled `Full` writes a
+/// source-verified D1 record of its requests, and a quiescent `Tail` (which
+/// owes its audit) writes an unverified one.
+#[test]
+fn fe_claude_d1_control_quiescent_full_verified_tail_unverified() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 0);
+    let record = base
+        .index
+        .claude_request_census_for_test()
+        .get(&base.key)
+        .expect("control: the Full writes a D1 record");
+    assert!(!record.unverified_for_test(), "control: Full is verified");
+    assert_eq!(
+        record.request_hashes_for_test(),
+        census_hashes(0..4).as_slice()
+    );
+    append_raw(&base.path, &row_bytes(CLAUDE, 4..6));
+    let (index, _, seen) = plain(&base.fixture, CLAUDE, base.index.clone(), &base.cache);
+    assert_eq!(seen.modes, (0, 1, 0));
+    let record = index
+        .claude_request_census_for_test()
+        .get(&base.key)
+        .expect("control: the Tail writes a D1 record");
+    assert!(record.unverified_for_test(), "control: Tail owes its audit");
+    assert_eq!(
+        record.request_hashes_for_test(),
+        census_hashes(0..6).as_slice()
+    );
+}
+
+/// SOURCE, D1 (RED): FE's prefix parse writes a D1 record of the prefix's
+/// requests that is never source-verified, and the next read replaces it
+/// with the grown file's requests.
+///
+/// Red on main: D1 (one `OpenRead`); main invalidates the record.
+#[test]
+fn fe_claude_source_prefix_d1_record_is_unverified_and_replaced_next_read() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let grown = grown_full();
+    assert_eq!(
+        grown.seen.unreadable, 0,
+        "SOURCE D1: no unreadable; causes={:?}",
+        grown.seen.causes
+    );
+    let record = grown
+        .index
+        .claude_request_census_for_test()
+        .get(&grown.base.key)
+        .expect("SOURCE D1: the prefix parse writes a record")
+        .clone();
+    assert!(
+        record.unverified_for_test(),
+        "SOURCE D1: a prefix record is never source-verified"
+    );
+    assert_eq!(
+        record.request_hashes_for_test(),
+        census_hashes(0..6).as_slice(),
+        "SOURCE D1: the record describes the prefix"
+    );
+    let (index, _) = next_full("SOURCE D1", &grown.base, grown.index, STATE_MISSING);
+    let next = index
+        .claude_request_census_for_test()
+        .get(&grown.base.key)
+        .expect("SOURCE D1: the next read writes a record");
+    assert_eq!(
+        next.request_hashes_for_test(),
+        census_hashes(0..9).as_slice(),
+        "SOURCE D1: replaced by the next read"
+    );
+}
+
+/// Proof control (GREEN): in this fixture a quiescent read with exactly
+/// matching API and trace evidence mints v1 at a healthy terminal.
+#[test]
+fn fe_claude_census_control_exact_api_rows_mint_v1() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (_fixture, mut index, result) = quiescent();
+    assert!(
+        mints_v1(&mut index, &result, 0..6),
+        "control: exact rows mint v1"
+    );
+    assert!(index.claude_usage_family_witnesses.contains_key(SESSION));
+}
+
+/// Proof diagnostic (GREEN, main's behavior, not a requirement): the fold
+/// accepts trace-owned API rows the transcript does not carry as auxiliary
+/// calls (`transcript ⊆ assigned`), so a body missing requests the API
+/// reports still mints v1. FE's "proof fails closed" therefore cannot rest
+/// on unequal request sets; the SOURCE rows below need an explicit guard.
+#[test]
+fn fe_claude_census_diag_main_folds_extra_api_rows_as_auxiliary() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (_fixture, mut index, result) = quiescent();
+    assert!(
+        mints_v1(&mut index, &result, 0..9),
+        "diagnostic: main folds the three extra rows and mints v1"
+    );
+}
+
+/// SOURCE, proof (RED): a prefix body never mints v1 or a family witness,
+/// even when the API evidence matches the prefix exactly.
+///
+/// Red on main: D1 (one `OpenRead`), so no prefix is published.
+#[test]
+fn fe_claude_source_prefix_never_mints_v1_or_witness() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut grown = grown_full();
+    assert_eq!(
+        grown.seen.unreadable, 0,
+        "SOURCE proof: no unreadable; causes={:?}",
+        grown.seen.causes
+    );
+    assert!(
+        !grown.result.snapshots.is_empty(),
+        "the prefix is published"
+    );
+    assert!(
+        !mints_v1(&mut grown.index, &grown.result, 0..6),
+        "SOURCE proof: no v1 from a prefix"
+    );
+    assert!(
+        !grown
+            .index
+            .claude_usage_family_witnesses
+            .contains_key(SESSION),
+        "SOURCE proof: no family witness from a prefix"
+    );
+}
+
+/// Census (RED): the published prefix enters pending as any read does: the
+/// member's request set is the prefix's, and the family stays valid.
+///
+/// Red on main: D1 (one `OpenRead`), so nothing reaches pending.
+#[test]
+fn fe_claude_census_prefix_enters_pending() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut grown = grown_full();
+    assert_eq!(
+        grown.seen.unreadable, 0,
+        "census pending: no unreadable; causes={:?}",
+        grown.seen.causes
+    );
+    let _ = record_claude_native_observations(&grown.result, &mut grown.index);
+    let pending = &grown.index.claude_usage_family_pending[SESSION];
+    assert!(!pending.invalid, "census pending: the family is valid");
+    assert_eq!(
+        pending.member_request_id_hashes.get(SESSION),
+        Some(&pending_hashes(0..6)),
+        "census pending: the prefix's requests"
+    );
+}
+
+/// Census (RED): a second read of the grown file in the same census window
+/// carries more requests, so pending counts `member_changed` and invalidates
+/// the family.
+///
+/// Red on main: D1 (one `OpenRead`) on the first read.
+#[test]
+fn fe_claude_census_reread_in_window_gives_member_changed() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut grown = grown_full();
+    assert_eq!(
+        grown.seen.unreadable, 0,
+        "census member_changed: no unreadable; causes={:?}",
+        grown.seen.causes
+    );
+    let _ = record_claude_native_observations(&grown.result, &mut grown.index);
+    let (mut index, next) = next_full(
+        "census member_changed",
+        &grown.base,
+        grown.index,
+        STATE_MISSING,
+    );
+    assert_eq!(
+        next.census_window_end, grown.result.census_window_end,
+        "precondition: one census window"
+    );
+    let observed = record_claude_native_observations(&next, &mut index);
+    assert_eq!(
+        observed.counts.page_invalidated_member_changed_count, 1,
+        "census member_changed: counted once"
+    );
+    assert!(
+        index.claude_usage_family_pending[SESSION].invalid,
+        "census member_changed: the family is invalid"
+    );
+}
+
+/// Census (RED): proof fails closed while the API evidence reports requests
+/// beyond the published prefix (rows 6..9 were appended during the read).
+///
+/// Red on main: D1 (one `OpenRead`), so no prefix is published.
+#[test]
+fn fe_claude_census_proof_fails_closed_while_api_rows_exceed_prefix() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut grown = grown_full();
+    assert_eq!(
+        grown.seen.unreadable, 0,
+        "census proof: no unreadable; causes={:?}",
+        grown.seen.causes
+    );
+    assert!(
+        !grown.result.snapshots.is_empty(),
+        "the prefix is published"
+    );
+    assert!(
+        !mints_v1(&mut grown.index, &grown.result, 0..9),
+        "census proof: fails closed while API rows exceed the prefix"
+    );
+    assert!(
+        !grown
+            .index
+            .claude_usage_family_witnesses
+            .contains_key(SESSION),
+        "census proof: no family witness"
+    );
+}
+
+/// Explicit SOURCE exclusion: unequal request sets alone are insufficient.
+/// This isolates the proof guard from the grown-reader failure: the body is
+/// present, the terminal healthy, and the D1 source certificate unverified.
+#[test]
+fn fe_claude_unverified_source_api_rows_beyond_prefix_cannot_mint_v1() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (fixture, mut index, result) = quiescent();
+    let key = local_index_key(&fixture.file.0);
+    let record = index
+        .claude_request_census_for_test()
+        .get(&key)
+        .unwrap()
+        .clone()
+        .with_unverified_for_test(true);
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record);
+    assert!(
+        !mints_v1(&mut index, &result, 0..9),
+        "SOURCE explicit guard: API rows beyond an unverified prefix cannot mint v1"
+    );
+    assert!(!index.claude_usage_family_witnesses.contains_key(SESSION));
+}
