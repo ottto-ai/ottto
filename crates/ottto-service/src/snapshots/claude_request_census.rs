@@ -728,29 +728,42 @@ impl ClaudeRequestCensus {
 
     /// Heap this census holds, measured: its shared buffers, boxed ledger
     /// groups, keys and its map slots (a B-tree slot share at two-thirds
-    /// node occupancy). One copy: the ledger is never cloned.
-    pub(crate) fn resident_bytes(&self) -> usize {
+    /// node occupancy). One copy: the ledger is never cloned. None when
+    /// `deadline` passes during the walk (checked before every record).
+    pub(crate) fn resident_bytes(&self, deadline: std::time::Instant) -> Option<usize> {
         let node =
             (std::mem::size_of::<String>() + std::mem::size_of::<ClaudeRequestCensusRecord>()) * 3
                 / 2;
-        self.records.iter().fold(0_usize, |bytes, (key, record)| {
-            let ledger = record.ledger.as_ref().map_or(0, |fields| {
-                std::mem::size_of::<ClaudeLedgerFields>()
-                    + fields.facts.as_ref().map_or(0, |facts| facts.len())
-            });
-            bytes
-                .saturating_add(node)
-                .saturating_add(key.capacity())
-                .saturating_add(shared_hashes_bytes(&record.request_hashes))
-                .saturating_add(ledger)
-        })
+        self.records
+            .iter()
+            .try_fold(0_usize, |bytes, (key, record)| {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                let ledger = record.ledger.as_ref().map_or(0, |fields| {
+                    std::mem::size_of::<ClaudeLedgerFields>()
+                        + fields.facts.as_ref().map_or(0, |facts| facts.len())
+                });
+                Some(
+                    bytes
+                        .saturating_add(node)
+                        .saturating_add(key.capacity())
+                        .saturating_add(shared_hashes_bytes(&record.request_hashes))
+                        .saturating_add(ledger),
+                )
+            })
     }
 
     /// Move every record of `other` in (a ledger shard), each against the
-    /// budgets like a decoded record. True when every record was kept.
-    pub(crate) fn absorb(&mut self, other: Self) -> bool {
+    /// budgets like a decoded record and against `max_records` in total (a
+    /// new key past it is dropped). True when every record was kept.
+    pub(crate) fn absorb(&mut self, other: Self, max_records: usize) -> bool {
         let mut kept = true;
         for (key, record) in other.records {
+            if self.records.len() >= max_records && !self.records.contains_key(&key) {
+                kept = false;
+                continue;
+            }
             kept &= self.insert_decoded(key, record);
         }
         kept

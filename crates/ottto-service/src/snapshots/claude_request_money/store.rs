@@ -735,8 +735,13 @@ fn admit_waiting(bytes: usize) -> Option<ShadowReservation> {
 /// dropped). A shard that is missing (when anything was saved), larger than
 /// a save ever writes, unreadable, malformed, lossy or holding a foreign key
 /// is damage: the ledger marks it and the shadow drops its telemetry
-/// certificate.
+/// certificate. So is every record past `LEDGER_MAX_RECORDS` over all shards
+/// (Sol R5-1: each shard's decoder limit alone admits more).
 fn load(support_dir: &Path) -> Option<ClaudeLedger> {
+    load_capped(support_dir, LEDGER_MAX_RECORDS)
+}
+
+fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
     let dir = support_dir.join(LEDGER_DIR);
     let mut ledger = ClaudeLedger::empty(false);
     let mut missing = Vec::new();
@@ -785,7 +790,7 @@ fn load(support_dir: &Path) -> Option<ClaudeLedger> {
             continue;
         };
         let before = ledger.census.serialized_total();
-        if !ledger.census.absorb(decoded) {
+        if !ledger.census.absorb(decoded, max_records) {
             ledger.load_damaged = true;
         }
         ledger.account(shard, before);
@@ -879,6 +884,12 @@ pub(crate) fn save_page_for_test(
 #[cfg(test)]
 pub(crate) fn load_for_test(support_dir: &Path) -> ClaudeLedger {
     load(support_dir).expect("the load is admitted")
+}
+
+/// A load under a smaller record cap (the real one needs 65,536 records).
+#[cfg(test)]
+pub(crate) fn load_capped_for_test(support_dir: &Path, max_records: usize) -> ClaudeLedger {
+    load_capped(support_dir, max_records).expect("the load is admitted")
 }
 
 #[cfg(test)]

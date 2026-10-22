@@ -32,7 +32,7 @@ const MAX_ROWS_PER_FILE: usize = 4096;
 /// Admission granularity.
 const FUNDS_CHUNK_BYTES: usize = 16 * 1024;
 /// Per-node share of a B-tree entry (key, value and node overhead).
-const MAP_ENTRY_BYTES: usize = 64;
+pub(super) const MAP_ENTRY_BYTES: usize = 64;
 
 static CAPTURE_RESERVED: AtomicUsize = AtomicUsize::new(0);
 
@@ -141,10 +141,34 @@ impl ClaudeResponseCapture {
     /// A capture for the Claude file at `path`, or None when the shadow is
     /// not armed for it.
     pub(crate) fn begin(path: &Path) -> Option<Self> {
-        super::capture_armed(path).map(|scope| Self {
+        let mut scope = None;
+        super::guarded(|| scope = super::capture_armed(path));
+        scope.map(|scope| Self {
             scope,
             ..Self::default()
         })
+    }
+
+    /// Every entry point the live finalizer calls runs here (StateMissing
+    /// r3): a panic in the capture ends in the shadow. It sets the panic
+    /// latch (the shadow is off for the process), the capture is refused
+    /// and never deposited, and the live parse goes on unchanged.
+    fn contained(&mut self, run: impl FnOnce(&mut Self)) {
+        if self.refused {
+            return;
+        }
+        let mut finished = false;
+        super::guarded(|| {
+            #[cfg(test)]
+            if PANIC_FOR_TEST.with(std::cell::Cell::get) {
+                panic!("synthetic capture panic");
+            }
+            run(self);
+            finished = true;
+        });
+        if !finished {
+            self.refuse();
+        }
     }
 
     pub(crate) fn is_refused(&self) -> bool {
@@ -165,6 +189,10 @@ impl ClaudeResponseCapture {
         count: usize,
         keys: impl Iterator<Item = (u64, &'k str)>,
     ) {
+        self.contained(|capture| capture.record_messages(count, keys));
+    }
+
+    fn record_messages<'k>(&mut self, count: usize, keys: impl Iterator<Item = (u64, &'k str)>) {
         if self.refused {
             return;
         }
@@ -194,6 +222,19 @@ impl ClaudeResponseCapture {
     /// model, reduced selector context and the row's billing fields (keys
     /// disjoint from the context's). Interned per file; admitted first.
     pub(crate) fn place(
+        &mut self,
+        sequence: u64,
+        bucket_start: &str,
+        model: &str,
+        context: &BTreeMap<String, String>,
+        billing: &[(&'static str, Option<&str>)],
+    ) {
+        self.contained(|capture| {
+            capture.record_place(sequence, bucket_start, model, context, billing)
+        });
+    }
+
+    fn record_place(
         &mut self,
         sequence: u64,
         bucket_start: &str,
@@ -277,6 +318,10 @@ impl ClaudeResponseCapture {
 
     /// A response the occurrence map replaced under the same request id.
     pub(crate) fn displaced(&mut self, request_hash: u64, prior: &ClaudeTranscriptUsageOccurrence) {
+        self.contained(|capture| capture.record_displaced(request_hash, prior));
+    }
+
+    fn record_displaced(&mut self, request_hash: u64, prior: &ClaudeTranscriptUsageOccurrence) {
         self.push_unit(CapturedUnit {
             kind: CapturedKind::Displaced(request_hash),
             sequence: prior.sequence,
@@ -290,6 +335,16 @@ impl ClaudeResponseCapture {
     /// A response with no request id: message-only when its key had a
     /// message id, else idless.
     pub(in crate::snapshots) fn unkeyed(
+        &mut self,
+        sequence: u64,
+        usage: &UsageTotals,
+        timestamp: Option<&str>,
+        model: Option<&str>,
+    ) {
+        self.contained(|capture| capture.record_unkeyed(sequence, usage, timestamp, model));
+    }
+
+    fn record_unkeyed(
         &mut self,
         sequence: u64,
         usage: &UsageTotals,
@@ -331,8 +386,16 @@ impl ClaudeResponseCapture {
     }
 
     /// Hand the finished capture to the store under the parse's index key
-    /// and fingerprint (replacing any earlier one).
-    pub(crate) fn deposit(mut self, index_key: String, fingerprint: String) {
+    /// and fingerprint (replacing any earlier one). After the panic latch
+    /// the capture is dropped instead (its funds are refunded).
+    pub(crate) fn deposit(self, index_key: String, fingerprint: String) {
+        if super::SHADOW_PANICKED.load(Ordering::Acquire) {
+            return;
+        }
+        super::guarded(move || self.keep(index_key, fingerprint));
+    }
+
+    fn keep(mut self, index_key: String, fingerprint: String) {
         if !self.refused
             && !self.funds.spend(
                 index_key.len()
@@ -394,6 +457,17 @@ pub(crate) fn purge_before(scope: &Path, before: Instant) -> u64 {
     let len = store.len();
     store.retain(|(entry_scope, _), entry| entry_scope != scope || entry.deposited >= before);
     (len - store.len()) as u64
+}
+
+#[cfg(test)]
+thread_local! {
+    static PANIC_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make every capture entry point on this thread panic (a capture bug).
+#[cfg(test)]
+pub(crate) fn set_panic_for_test(panic: bool) {
+    PANIC_FOR_TEST.with(|current| current.set(panic));
 }
 
 #[cfg(test)]

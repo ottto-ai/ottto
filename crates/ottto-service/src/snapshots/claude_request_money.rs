@@ -414,8 +414,9 @@ fn shadow_scope(support_dir: &Path) -> PathBuf {
 }
 
 /// The finalizer captures for the money shadow only where it is armed and
-/// not off (Sol R4-3): the panic latch, or the scope's last page saw the
-/// local kill switch. In tests: a transcript under the parent of an enabled
+/// not off (Sol R4-3): the panic latch, or the scope's last page (or the
+/// cycle before its first parse, `seed_shadow_off`) saw the local kill
+/// switch. In tests: a transcript under the parent of an enabled
 /// support directory (fixtures keep both side by side); in production:
 /// always.
 pub(crate) fn capture_armed(path: &Path) -> Option<PathBuf> {
@@ -440,6 +441,24 @@ pub(crate) fn capture_armed(path: &Path) -> Option<PathBuf> {
 /// Scopes whose last page found the shadow off (the kill switch file), and
 /// the last day an off page published its false coverage row.
 static SHADOW_OFF: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
+/// Scopes whose kill switch was checked before their first parse.
+static SHADOW_SEEDED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Once per process and scope, before the cycle's first parse: a kill
+/// switch present at start turns capture off before any page has seen it
+/// (StateMissing r3), so it also stops a capture that fails at startup. The
+/// scope's first off page then publishes its false row as usual.
+pub(crate) fn seed_shadow_off(support_dir: &Path) {
+    let scope = shadow_scope(support_dir);
+    let first = SHADOW_SEEDED
+        .lock()
+        .is_ok_and(|mut seeded| seeded.insert(scope.clone()));
+    if first && support_dir.join(SHADOW_OFF_FILE).exists() {
+        if let Ok(mut off) = SHADOW_OFF.lock() {
+            off.entry(scope).or_default();
+        }
+    }
+}
 
 /// The shadow is off for `support_dir` (panic latch or kill switch): the
 /// scope stops capturing, its waiting captures are dropped, and the first
@@ -911,6 +930,32 @@ impl FamilyRows {
     /// Rows this family writes: its grains and its family row.
     fn rows(&self) -> u64 {
         self.grains.len() as u64 + 1
+    }
+
+    /// What these rows hold once they move to the writer (Sol R5-2): a
+    /// fixed share per family and grain, plus every owned string and
+    /// selector entry of the grain keys at its capacity, so a long model or
+    /// selector is charged in full.
+    fn owned_bytes(&self) -> usize {
+        self.grains.keys().fold(
+            FAMILY_BYTES.saturating_add(self.row.family.capacity()),
+            |bytes, key| {
+                let (bucket_start, model, selector) = &key.live;
+                let selector = selector.iter().fold(0_usize, |bytes, (name, value)| {
+                    bytes
+                        .saturating_add(name.capacity())
+                        .saturating_add(value.capacity())
+                        .saturating_add(capture::MAP_ENTRY_BYTES)
+                });
+                bytes
+                    .saturating_add(GRAIN_BYTES)
+                    .saturating_add(key.member.capacity())
+                    .saturating_add(key.owner.capacity())
+                    .saturating_add(bucket_start.capacity())
+                    .saturating_add(model.capacity())
+                    .saturating_add(selector)
+            },
+        )
     }
 }
 
@@ -1593,7 +1638,7 @@ pub(crate) fn shadow_page_at(
     let mut families = Vec::with_capacity(bodies.len());
     let mut memos = Vec::with_capacity(bodies.len());
     let mut families_incomplete = 0_u64;
-    let mut grains = 0_usize;
+    let mut owned_bytes = 0_usize;
     for (root, body, union, absent_old, absent_old_unknown) in bodies {
         let complete = body.coverage_complete(census_complete);
         tally(&mut counts, &body, complete);
@@ -1664,11 +1709,12 @@ pub(crate) fn shadow_page_at(
             absent_old: (&absent_old).into(),
             absent_old_unknown,
         };
-        grains += body.grains.len();
-        families.push(FamilyRows {
+        let rows = FamilyRows {
             row,
             grains: body.grains,
-        });
+        };
+        owned_bytes = owned_bytes.saturating_add(rows.owned_bytes());
+        families.push(rows);
         // Only a complete body is a basis; it moves when its rows land.
         if complete {
             memos.push(PendingMemo {
@@ -1704,13 +1750,10 @@ pub(crate) fn shadow_page_at(
         rows_unavailable_roots: counts.rows_unavailable_roots,
         dropped: false,
     };
-    // The families move to the batch under its own admission (with the
-    // writer's one stream buffer); the page's admission ends here.
-    let batch_bytes = families
-        .len()
-        .saturating_mul(FAMILY_BYTES)
-        .saturating_add(grains.saturating_mul(GRAIN_BYTES))
-        .saturating_add(1024 + JSONL_WRITE_BUFFER_BYTES);
+    // The families move to the batch under its own admission (what they
+    // own, with the writer's one stream buffer); the page's admission ends
+    // here.
+    let batch_bytes = owned_bytes.saturating_add(1024 + JSONL_WRITE_BUFFER_BYTES);
     let batch = ShadowReservation::admit(batch_bytes).filter(|_| !faulted(PageFault::BatchRefused));
     counts.admitted_peak_bytes = budget.granted().saturating_add(batch_bytes) as u64;
     drop(budget);
