@@ -677,11 +677,6 @@ impl ClaudeRequestCensus {
         self.hash_total
     }
 
-    /// Records held, birth stubs included (an upper bound for walks).
-    pub(crate) fn record_count(&self) -> usize {
-        self.records.len()
-    }
-
     pub(crate) fn serialized_total(&self) -> usize {
         self.serialized_total
     }
