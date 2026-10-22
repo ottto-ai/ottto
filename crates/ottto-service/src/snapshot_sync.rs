@@ -422,6 +422,15 @@ fn settle_completed_upload(
 static CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// Keep the exact summary used by the checkpointed-upload log testable.
+fn checkpointed_hold_settlement_diagnostic() -> String {
+    format!(
+        "{} page(s) settled with terminal-bound holds",
+        CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+            .load(std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
 /// entities keep replay pending and owe a clean follow-up. A validated
 /// permanent refusal settles transport and traversal; its separate health
@@ -5701,10 +5710,9 @@ fn finish_sync_source(
             eprintln!(
                 "local snapshot upload checkpointed accepted siblings but left {count} \
                  unsettled entity(ies) pending for {}; a clean follow-up scan is required \
-                 ({} page(s) settled with terminal-bound holds)",
+                 ({})",
                 source.api_slug(),
-                CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                checkpointed_hold_settlement_diagnostic()
             );
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
