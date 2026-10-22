@@ -711,6 +711,8 @@ impl SnapshotEntityRejection {
                 "occurred_at_utc_normalization_out_of_range"
             }
             "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
+            // Logged by name; persisted as the old enum value `other`.
+            "original_pair_candidate_unproved" => "original_pair_candidate_unproved",
             _ => "other",
         }
     }

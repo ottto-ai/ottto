@@ -13,7 +13,6 @@ thread_local! {
 }
 
 /// The synthetic local scheduling clock of this test thread, if set.
-#[allow(dead_code)] // read by the re-offer clock once it exists
 pub(crate) fn clock() -> Option<u64> {
     CLOCK.with(Cell::get)
 }
