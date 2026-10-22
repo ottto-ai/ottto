@@ -210,6 +210,10 @@ pub(crate) struct ClaudeGrainKey {
 pub(crate) struct ClaudeEntityBody {
     pub(crate) grains: BTreeMap<(ClaudeLiveKey, Option<ClaudeRequestUsageOrigin>), ClaudeGrainSide>,
     pub(crate) counted: Vec<ClaudeCountedContribution>,
+    /// Some is original transcript provenance; None explicitly marks a side
+    /// call's observer-capable clock as unqualified for identity.
+    pub(crate) contribution_clocks: BTreeMap<u64, Option<(u64, bool)>>,
+    pub(crate) bucket_activity: BTreeMap<String, (i128, i128)>,
     pub(crate) removed: ClaudeMoneyTokens,
     pub(crate) removed_requests: u64,
     pub(crate) telemetry_owned_complete: bool,
@@ -217,6 +221,7 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) certificate_ok: bool,
     pub(crate) due_unix: Option<u64>,
     pub(crate) activity_unix: u64,
+    pub(crate) activity_nanos: i128,
     units: (ClaudeMoneyTokens, u64),
     parts: [(ClaudeMoneyTokens, u64); 4],
 }
@@ -236,6 +241,8 @@ impl Default for ClaudeEntityBody {
         Self {
             grains: BTreeMap::new(),
             counted: Vec::new(),
+            contribution_clocks: BTreeMap::new(),
+            bucket_activity: BTreeMap::new(),
             removed: ClaudeMoneyTokens::default(),
             removed_requests: 0,
             telemetry_owned_complete: true,
@@ -243,12 +250,22 @@ impl Default for ClaudeEntityBody {
             certificate_ok: true,
             due_unix: None,
             activity_unix: 0,
+            activity_nanos: 0,
             units: Default::default(),
             parts: Default::default(),
         }
     }
 }
 impl ClaudeEntityBody {
+    fn note_clock(&mut self, key: &ClaudeLiveKey, nanos: i128) {
+        let bounds = self
+            .bucket_activity
+            .entry(key.0.clone())
+            .or_insert((nanos, nanos));
+        bounds.0 = bounds.0.min(nanos);
+        bounds.1 = bounds.1.max(nanos);
+    }
+
     fn partition(&mut self, tokens: &ClaudeMoneyTokens, requests: u64, part: usize) {
         self.units.0.add(tokens);
         self.units.1 = self.units.1.saturating_add(requests);
@@ -405,6 +422,8 @@ struct Unit {
     tokens: ClaudeMoneyTokens,
     requests: u64,
     clock: u64,
+    clock_nanos: i128,
+    event_clock_complete: bool,
     message: u64,
     fingerprint: u64,
     /// The live row holding it (None: the live body does not carry it).
@@ -568,6 +587,12 @@ pub(crate) fn build_claude_request_body(
                 tokens,
                 requests: occurrence.usage.request_count,
                 clock,
+                clock_nanos: occurrence
+                    .timestamp
+                    .as_deref()
+                    .and_then(super::super::rfc3339_unix_nanos)
+                    .unwrap_or(i128::from(clock) * 1_000_000_000),
+                event_clock_complete: occurrence.event_clock_complete,
                 message,
                 fingerprint: claude_response_fingerprint(&tokens, model, clock, message),
                 live,
@@ -605,6 +630,10 @@ pub(crate) fn build_claude_request_body(
                 tokens: captured.tokens,
                 requests: captured.requests,
                 clock,
+                clock_nanos: captured
+                    .clock_nanos
+                    .unwrap_or(i128::from(clock) * 1_000_000_000),
+                event_clock_complete: captured.event_clock_complete,
                 message,
                 fingerprint: claude_response_fingerprint(
                     &captured.tokens,
@@ -861,6 +890,7 @@ pub(crate) fn build_claude_request_body(
                 let entity = body.entities.get_mut(member).expect("member");
                 entity.partition(&unit.tokens, unit.requests, 1);
                 entity.activity_unix = entity.activity_unix.max(unit.clock);
+                entity.activity_nanos = entity.activity_nanos.max(unit.clock_nanos);
                 if let Some(live) = &unit.live {
                     body.slice(
                         ClaudeGrainKey {
@@ -934,6 +964,7 @@ pub(crate) fn build_claude_request_body(
         let entity = body.entities.get_mut(member).expect("member");
         entity.partition(&unit.tokens, unit.requests, part);
         entity.activity_unix = entity.activity_unix.max(unit.clock);
+        entity.activity_nanos = entity.activity_nanos.max(unit.clock_nanos);
         if part == 3 {
             let due = unit.clock.saturating_add(MATURITY_SECONDS);
             entity.due_unix = Some(entity.due_unix.map_or(due, |old| old.min(due)));
@@ -947,6 +978,12 @@ pub(crate) fn build_claude_request_body(
                 };
                 let origin = matched.map(|_| ClaudeRequestUsageOrigin::TelemetryMatched);
                 entity.count(key.clone(), origin, &unit.tokens, unit.requests, matched);
+                entity.note_clock(key, unit.clock_nanos);
+                if let UnitKind::Request(hash) = unit.kind {
+                    entity
+                        .contribution_clocks
+                        .insert(hash, Some((unit.clock, unit.event_clock_complete)));
+                }
                 entity.counted.push(ClaudeCountedContribution {
                     key: key.clone(),
                     origin,
@@ -1139,6 +1176,12 @@ fn side_calls(
         let hash = row.request_hash;
         for entity in body.entities.values_mut() {
             entity.activity_unix = entity.activity_unix.max(row.clock);
+            entity.activity_nanos = entity.activity_nanos.max(
+                row.observed_at()
+                    .as_deref()
+                    .and_then(super::super::rfc3339_unix_nanos)
+                    .unwrap_or(i128::from(row.clock) * 1_000_000_000),
+            );
         }
         let named = family
             .trace
@@ -1234,6 +1277,14 @@ fn side_calls(
             if assigned_part == 0 {
                 if let Some(key) = &key {
                     entity.count(key.clone(), Some(origin), &row.tokens, 1, row.cost_micros);
+                    entity.note_clock(
+                        key,
+                        row.observed_at()
+                            .as_deref()
+                            .and_then(super::super::rfc3339_unix_nanos)
+                            .unwrap_or(i128::from(row.clock) * 1_000_000_000),
+                    );
+                    entity.contribution_clocks.insert(hash, None);
                     entity.counted.push(ClaudeCountedContribution {
                         key: key.clone(),
                         origin: Some(origin),

@@ -1987,23 +1987,31 @@ pub(crate) fn request_owned_grouping(
     use super::claude_request_ledger::ClaudeCountedBy;
     use super::claude_request_money::body::ClaudeRequestUsageOrigin;
     let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?;
-    let own = item
+    let mut own = item
         .claude_usage_occurrences
-        .keys()
-        .map(|id| {
+        .iter()
+        .map(|(id, occurrence)| {
             (
                 super::claude_request_census::claude_request_hash(id),
-                id.as_str(),
+                (
+                    id.as_str(),
+                    occurrence
+                        .timestamp
+                        .as_deref()
+                        .and_then(rfc3339_unix_seconds)
+                        .map(|clock| (clock, occurrence.event_clock_complete)),
+                ),
             )
         })
-        .chain(
-            evidence
-                .requests
-                .keys()
-                .filter(|(root, _)| *root == sink.root)
-                .map(|(_, id)| (super::claude_request_census::claude_request_hash(id), *id)),
-        )
         .collect::<BTreeMap<_, _>>();
+    for (_, id) in evidence
+        .requests
+        .keys()
+        .filter(|(root, _)| *root == sink.root)
+    {
+        own.entry(super::claude_request_census::claude_request_hash(id))
+            .or_insert((*id, None));
+    }
     for contribution in &entity.counted {
         let mut selector = SelectorCapture::default();
         for (name, value) in &contribution.key.2 {
@@ -2062,7 +2070,28 @@ pub(crate) fn request_owned_grouping(
         };
         let id = contribution
             .request
-            .and_then(|hash| own.get(&hash).copied());
+            .and_then(|hash| own.get(&hash).map(|(id, _)| *id));
+        let event_clock = contribution.request.and_then(|hash| {
+            match entity.contribution_clocks.get(&hash) {
+                Some(original) => *original,
+                // Narrow compatibility for callers that supply an existing
+                // transcript grouping: qualify only the matching original
+                // occurrence, never an auxiliary telemetry clock.
+                None if !matches!(
+                    contribution.origin,
+                    Some(
+                        ClaudeRequestUsageOrigin::TelemetryReported
+                            | ClaudeRequestUsageOrigin::TelemetryUnpriced
+                    )
+                ) =>
+                {
+                    own.get(&hash)
+                        .and_then(|(_, clock)| *clock)
+                        .filter(|(clock, _)| *clock == contribution.clock)
+                }
+                None => None,
+            }
+        });
         let identity = if contribution.by == ClaudeCountedBy::TelemetryProven {
             match id {
                 Some(id) => classify_ref(
@@ -2071,8 +2100,8 @@ pub(crate) fn request_owned_grouping(
                         root: &sink.root,
                         source_session_id: &item.source_session_id,
                         request_id: id,
-                        terminal_unix_seconds: Some(contribution.clock),
-                        event_clock_complete: true,
+                        terminal_unix_seconds: event_clock.map(|(clock, _)| clock),
+                        event_clock_complete: event_clock.is_some_and(|(_, complete)| complete),
                         marker: MarkerVerdict::None,
                         desktop: sink.desktop,
                         scan_unix_seconds: sink.scan_unix_seconds,
@@ -2401,5 +2430,113 @@ mod request_money_row_regressions {
             apply_grouped(&mut item, grouping).is_ok(),
             "actual emitter rows must reproduce, including origin and effort"
         );
+    }
+}
+
+#[cfg(test)]
+mod request_money_clock_regressions {
+    use super::*;
+    use crate::snapshots::claude_request_money::{self as money, body};
+    #[test]
+    fn original_clock_refusals_survive_transcript_and_side_call_grouping() {
+        let root = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
+        let request = "request-clock";
+        let at = "2026-08-02T09:17:23.125Z";
+        let clock = rfc3339_unix_seconds(at).unwrap();
+        let nanos = super::super::rfc3339_unix_nanos(at).unwrap();
+        let api = Default::default();
+        let trace = Default::default();
+        let row = ClaudeLocalOtelEvidence {
+            session_id: root.into(),
+            request_id: request.into(),
+            client_request_id: "client-clock".into(),
+            account_identifier_hash: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        let owner = ClaudeTraceOwnershipEvidence {
+            session_id: root.into(),
+            request_id: request.into(),
+            client_request_id: "client-clock".into(),
+            ..Default::default()
+        };
+        // This seam receives already validated evidence; vary only the original
+        // event-clock qualification while keeping owner/login/body constant.
+        let mut evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        evidence.requests.insert((root, request), Some(&row));
+        evidence.owners.insert((root, request), Some(&owner));
+        for (complete, side_call) in [(true, false), (false, false), (true, true)] {
+            let mut item = crate::snapshots::tests::sample_session_artifact_item();
+            item.source_session_id = root.into();
+            let hash = super::super::claude_request_census::claude_request_hash(request);
+            let tokens = money::ClaudeMoneyTokens {
+                input: 10,
+                ..Default::default()
+            };
+            if !side_call {
+                item.claude_usage_request_ids.insert(request.into());
+                item.claude_usage_occurrences.insert(
+                    request.into(),
+                    super::super::ClaudeTranscriptUsageOccurrence {
+                        sequence: 1,
+                        usage: UsageTotals {
+                            input_tokens: 10,
+                            request_count: 1,
+                            ..Default::default()
+                        },
+                        model: Some("claude-haiku-4-5".into()),
+                        selector: std::sync::Arc::new(SelectorCapture::default()),
+                        reasoning_effort: None,
+                        timestamp: Some(at.into()),
+                        event_clock_complete: complete,
+                        effective_input_context: 10,
+                    },
+                );
+            }
+            let origin = if side_call {
+                body::ClaudeRequestUsageOrigin::TelemetryReported
+            } else {
+                body::ClaudeRequestUsageOrigin::TelemetryMatched
+            };
+            let key = (
+                "2026-08-02T09:00:00Z".into(),
+                "claude-haiku-4-5".into(),
+                BTreeMap::new(),
+            );
+            let mut entity = body::ClaudeEntityBody::default();
+            entity.grains.insert(
+                (key.clone(), Some(origin)),
+                body::ClaudeGrainSide {
+                    tokens,
+                    requests: 1,
+                    cost_micros: 100,
+                    unpriced: 0,
+                    contributions: 1,
+                },
+            );
+            entity.counted.push(body::ClaudeCountedContribution {
+                key: key.clone(),
+                origin: Some(origin),
+                tokens,
+                requests: 1,
+                cost: Some(100),
+                request: Some(hash),
+                clock,
+                by: super::super::claude_request_ledger::ClaudeCountedBy::TelemetryProven,
+            });
+            entity
+                .contribution_clocks
+                .insert(hash, (!side_call).then_some((clock, complete)));
+            entity.bucket_activity.insert(key.0, (nanos, nanos));
+            assert!(money::emit_for_test(&mut item, &entity));
+            assert_eq!(item.usage_buckets[0].first_activity_at.as_deref(), Some(at));
+            assert_eq!(item.usage_buckets[0].last_activity_at.as_deref(), Some(at));
+            let grouping = request_owned_grouping(&item, &evidence, &entity).unwrap();
+            apply_grouped(&mut item, grouping).unwrap();
+            assert_eq!(
+                item.model_usage[0].account_identifier_hash.is_some(),
+                complete && !side_call
+            );
+            assert_eq!(item.request_identity_refusals > 0, !complete || side_call);
+        }
     }
 }

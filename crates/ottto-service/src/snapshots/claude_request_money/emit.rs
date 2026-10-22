@@ -116,11 +116,35 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
     item.unattributed_total_tokens = tokens.unattributed;
     item.reasoning_output_tokens = tokens.reasoning;
     item.request_count = requests;
+    let mut activity = entity.bucket_activity.clone();
+    for contribution in &entity.counted {
+        if !entity.bucket_activity.contains_key(&contribution.key.0) {
+            let nanos = i128::from(contribution.clock) * 1_000_000_000;
+            let bounds = activity
+                .entry(contribution.key.0.clone())
+                .or_insert((nanos, nanos));
+            bounds.0 = bounds.0.min(nanos);
+            bounds.1 = bounds.1.max(nanos);
+        }
+    }
+    let timestamp = |nanos: i128| {
+        time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+            .ok()
+            .and_then(|clock| {
+                clock
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+    };
     item.usage_buckets = buckets
         .into_iter()
         .map(|(bucket_start, model_usage)| SnapshotUsageBucket {
-            first_activity_at: Some(bucket_start.clone()),
-            last_activity_at: Some(bucket_start.clone()),
+            first_activity_at: activity
+                .get(&bucket_start)
+                .and_then(|(first, _)| timestamp(*first)),
+            last_activity_at: activity
+                .get(&bucket_start)
+                .and_then(|(_, last)| timestamp(*last)),
             bucket_start,
             model_usage,
         })
@@ -138,23 +162,17 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
     item.removed_request_count = Some(entity.removed_requests);
     item.removed_usage = Some(r);
     item.telemetry_owned_complete = Some(entity.telemetry_owned_complete);
-    if entity.activity_unix
+    let latest = entity
+        .activity_nanos
+        .max(i128::from(entity.activity_unix) * 1_000_000_000);
+    if latest
         > item
             .source_last_activity_at
             .as_deref()
-            .and_then(super::super::rfc3339_unix_seconds)
+            .and_then(super::super::rfc3339_unix_nanos)
             .unwrap_or(0)
     {
-        if let Ok(clock) = i64::try_from(entity.activity_unix)
-            .ok()
-            .and_then(|clock| time::OffsetDateTime::from_unix_timestamp(clock).ok())
-            .ok_or(())
-            .and_then(|clock| {
-                clock
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .map_err(|_| ())
-            })
-        {
+        if let Some(clock) = timestamp(latest) {
             item.source_last_activity_at = Some(clock.clone());
             item.source_ended_at = Some(clock);
         }

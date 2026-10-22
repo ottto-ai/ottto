@@ -2176,9 +2176,15 @@ pub(crate) fn live_page(
     let mut activity = BTreeMap::<&str, Option<String>>::new();
     for item in snapshots.iter() {
         let last = activity.entry(&item.source_session_id).or_default();
-        for value in [&item.source_last_activity_at, &item.source_ended_at] {
-            if value > last {
-                *last = value.clone();
+        for value in [&item.source_last_activity_at, &item.source_ended_at]
+            .into_iter()
+            .flatten()
+        {
+            if last
+                .as_ref()
+                .is_none_or(|prior| super::timestamp_is_after(value, prior))
+            {
+                *last = Some(value.clone());
             }
         }
     }
@@ -2234,12 +2240,20 @@ pub(crate) fn live_page(
                 .is_some_and(|entity| emit::apply(item, entity))
         {
             held.insert(item.source_session_id.clone());
-        } else if let Some(clock) = activity.get(&member_id) {
-            if clock > &item.source_last_activity_at {
-                item.source_last_activity_at = clock.clone();
+        } else if let Some(clock) = activity.get(&member_id).and_then(Option::as_ref) {
+            if item
+                .source_last_activity_at
+                .as_ref()
+                .is_none_or(|prior| super::timestamp_is_after(clock, prior))
+            {
+                item.source_last_activity_at = Some(clock.clone());
             }
-            if clock > &item.source_ended_at {
-                item.source_ended_at = clock.clone();
+            if item
+                .source_ended_at
+                .as_ref()
+                .is_none_or(|prior| super::timestamp_is_after(clock, prior))
+            {
+                item.source_ended_at = Some(clock.clone());
             }
         }
         if !held.contains(&member_id) {
