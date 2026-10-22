@@ -1154,6 +1154,65 @@ fn census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
     );
 }
 
+/// StateMissing M1: an unchanged re-parse of a record retired at 35 days
+/// (a backfill re-reading every file, a resume miss) is no derivation drift
+/// and leaves the record retired: neither the hashes nor the index bytes
+/// bounce back.
+#[test]
+fn census_retired_record_survives_an_unchanged_reparse() {
+    let scratch = crate::test_scratch::ScratchDir::new("census-retired-reparse");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "census-retired.jsonl",
+        &[census_response(
+            "census-retired",
+            Some("req_retired_1"),
+            "msg_retired_1",
+            1,
+            10,
+        )],
+    );
+    // Windows far enough past the file's mtime (now) to retire it.
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, "2027-03-01T09:00:00Z");
+    let key = census_key(&index, &root, "census-retired.jsonl");
+    let retired = index
+        .claude_request_census_for_test()
+        .record_for_test(&key)
+        .expect("record")
+        .clone();
+    assert_eq!(retired.retired_for_test(), Some(1), "retired at the terminal");
+    let hashes = index.claude_request_census_for_test().totals_for_test().0;
+    index
+        .files
+        .get_mut(&key)
+        .expect("entry")
+        .source_file_fingerprint
+        .clear();
+    census_scan(&root, &mut index, "2027-03-02T09:00:00Z");
+    let reparsed = index
+        .claude_request_census_for_test()
+        .record_for_test(&key)
+        .expect("reparsed record");
+    assert_eq!(
+        reparsed.fingerprint_hex_for_test(),
+        retired.fingerprint_hex_for_test()
+    );
+    assert_eq!(reparsed.retired_for_test(), Some(1), "still retired");
+    assert!(reparsed.request_hashes_for_test().is_empty());
+    assert_eq!(
+        index
+            .claude_request_census_shadow_for_test()
+            .derivation_drift_for_test(),
+        0
+    );
+    assert_eq!(
+        index.claude_request_census_for_test().totals_for_test().0,
+        hashes
+    );
+}
+
 /// A transcript of zero-usage responses only (API errors) yields no item, yet
 /// its request ids still reach the census and meet a peer's copy.
 #[test]

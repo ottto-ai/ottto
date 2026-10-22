@@ -500,11 +500,18 @@ pub(crate) struct ClaudeClassifyContext<'a, 'b> {
     pub(crate) sessions: &'b BTreeMap<String, String>,
     /// Per root whose trace was read: request hash -> trace-named member.
     pub(crate) trace: &'b BTreeMap<String, BTreeMap<u64, String>>,
-    /// The telemetry sweep read everything written before this time.
+    /// The telemetry certificate: the sweep read everything written before
+    /// this time (0 while any telemetry debt is open).
     pub(crate) telemetry_complete_through: u64,
+    /// The page deadline: body building stops past it (the page is refused).
+    pub(crate) deadline: std::time::Instant,
 }
 
 impl ClaudeClassifyContext<'_, '_> {
+    pub(crate) fn late(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+
     /// Telemetry keys claiming `hash`, sorted and unique.
     pub(crate) fn telemetry_claimants(&self, hash: u64) -> Vec<&str> {
         let mut claimants = self
@@ -790,7 +797,8 @@ pub(crate) struct ClaudeLedgerStateCounts {
 }
 
 /// What the index's transcript records and the money ledger hold. The
-/// ledger's resident heap is measured here, by walking it (once a page).
+/// ledger's resident heap is measured here, by walking it (the page line
+/// refreshes this walk at most once a minute).
 pub(crate) fn ledger_state_counts(
     census: &ClaudeRequestCensus,
     ledger: Option<&ClaudeLedger>,
@@ -832,6 +840,24 @@ pub(crate) fn ledger_state_counts(
         .records_with_prefix(super::claude_request_census::FAMILY_KEY_PREFIX)
         .count() as u64;
     counts
+}
+
+/// Refresh the totals of cached state counts (the walked fields stay).
+pub(crate) fn refresh_state_totals(
+    counts: &mut ClaudeLedgerStateCounts,
+    census: &ClaudeRequestCensus,
+    ledger: Option<&ClaudeLedger>,
+) {
+    let (aged, vanished) = super::claude_request_census::transcript_retirements();
+    counts.census_hashes = census.hash_total() as u64;
+    counts.census_serialized_bytes = census.serialized_total() as u64;
+    counts.transcript_retired_aged = aged;
+    counts.transcript_dropped_vanished = vanished;
+    if let Some(ledger) = ledger {
+        counts.ledger_hashes = ledger.census().hash_total() as u64;
+        counts.ledger_serialized_bytes = ledger.census().serialized_total() as u64;
+        counts.ledger_dirty_shards = ledger.dirty_shards() as u64;
+    }
 }
 
 /// The ledger is under pressure: its hashes or serialized bytes at `percent`

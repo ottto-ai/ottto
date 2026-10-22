@@ -9,31 +9,37 @@
 //! first byte of SHA-256 of the key) and `meta.json` (the sweep records).
 //! Only changed shards are rewritten, a bounded number per page.
 //!
-//! Crash order: a meta change that adds telemetry debt (a lost certificate)
-//! is written before any data shard of its batch; a meta change that
-//! advances a sweep is written only after every data shard is on disk. So a
-//! saved `complete_through` never covers a record the disk does not hold.
-//! A debt meta that fails to write holds back every later data shard of
-//! its directory, from any batch, until one lands.
+//! Crash order (Sol R3-2), one rule: when the telemetry certificate went to
+//! zero, a meta whose certificates are all ZERO is written as its own write
+//! before any data shard (whatever the in-memory meta says by then: a later
+//! sweep may already have advanced it). A meta carrying a certificate is
+//! only ever a final write, after every data shard dirty when it was taken
+//! is on disk and no shard of the directory has a failed write. So a saved
+//! `complete_through` never covers a record the disk does not hold. A zero
+//! meta that fails to write holds back every later data shard of its
+//! directory, from any batch, until one lands; a dropped one is retaken.
 //! A missing or corrupt shard at load is debt, never a silent loss.
 //!
 //! One writer thread does every file write of the shadow (diagnostics JSONL
 //! and ledger shards) and the ledger load, outside `SNAPSHOT_SYNC_LOCK`. Its
-//! outbox is bounded; each batch carries the admission of its own buffers.
-//! A full outbox drops the batch (counted; its shards stay dirty and its
-//! memos never move). Results come back to the next page.
+//! outbox is bounded; each batch carries the admission of its own buffers,
+//! and the load admits each shard's bytes and decoded records before
+//! reading it (Sol R3-4). A full outbox drops the batch (counted; its shards
+//! stay dirty and its memos never move). Results come back to the next page.
 
 use super::super::claude_request_census::{
-    decode_ledger_shard, ClaudeRequestCensus, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
-    SWEEP_KEY_PREFIX,
+    decode_ledger_shard, ClaudeLedgerSweep, ClaudeRequestCensus, ClaudeRequestCensusInsert,
+    ClaudeRequestCensusRecord, SWEEP_KEY_PREFIX,
 };
 use super::{ClaudeFamilyMemo, JsonlBatch, JsonlOutcome, ShadowReservation};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub(crate) const LEDGER_DIR: &str = "claude-request-ledger";
 const DATA_SHARDS: usize = 256;
@@ -42,8 +48,18 @@ const META: usize = DATA_SHARDS;
 const SHARDS: usize = DATA_SHARDS + 1;
 /// Batches waiting for the writer.
 const OUTBOX: usize = 4;
-/// Dirty shard bytes one page serializes (at least one shard).
+/// Dirty shard bytes one page serializes. A shard larger than this is never
+/// one page's work: it stays dirty (counted) and no certificate is written
+/// over it; the load refuses a file larger than this as damage.
 const SAVE_BYTES_PER_PAGE: usize = 8 * 1024 * 1024;
+/// Records serialized between two deadline checks.
+const SAVE_DEADLINE_STRIDE: usize = 1024;
+/// The load waits this long, in steps, for each shard's admission; then it
+/// gives up (nothing is lost: the next page asks for the load again).
+const LOAD_ADMIT_ATTEMPTS: u32 = 100;
+const LOAD_ADMIT_WAIT: Duration = Duration::from_millis(20);
+/// Admission per byte of a shard file: its raw bytes and its decoded records.
+const LOAD_BYTES_FACTOR: usize = 3;
 
 fn shard_of(key: &str) -> usize {
     if key.starts_with(SWEEP_KEY_PREFIX) {
@@ -68,12 +84,12 @@ pub(crate) struct ClaudeLedger {
     shard_bytes: Vec<usize>,
     /// Shards changed since their last write was handed to the writer.
     dirty: Vec<bool>,
-    /// The meta shard carries new debt: written before any data shard.
+    /// A certificate went to zero: a zero meta goes before any data shard.
     meta_debt: bool,
-    /// Families whose memo is in a batch not yet acknowledged.
-    pending_families: BTreeSet<String>,
     /// Where the next page's bounded save starts (fair rotation).
     next_save: usize,
+    /// Dirty shards the last save skipped as larger than a page's bound.
+    pub(crate) oversized_shards: u64,
     /// The load found a missing or corrupt shard.
     pub(crate) load_damaged: bool,
     /// Where the `mh:` round-robin resumes (process memory only: pruning
@@ -88,8 +104,8 @@ impl ClaudeLedger {
             shard_bytes: vec![0; SHARDS],
             dirty: vec![dirty; SHARDS],
             meta_debt: false,
-            pending_families: BTreeSet::new(),
             next_save: 0,
+            oversized_shards: 0,
             load_damaged: false,
             message_cursor: String::new(),
         }
@@ -141,15 +157,11 @@ impl ClaudeLedger {
         Some(record)
     }
 
-    /// The meta shard now carries debt (a lost certificate): it is written
-    /// before the data shards of the batch that carries it.
+    /// A certificate went to zero: the next save writes a zero meta before
+    /// any data shard.
     pub(crate) fn note_meta_debt(&mut self) {
         self.meta_debt = true;
         self.dirty[META] = true;
-    }
-
-    pub(crate) fn family_pending(&self, key: &str) -> bool {
-        self.pending_families.contains(key)
     }
 
     pub(crate) fn dirty_shards(&self) -> usize {
@@ -157,80 +169,117 @@ impl ClaudeLedger {
     }
 
     /// Serialize the dirty shards of this page's bounded save. The data
-    /// shards come in a fair rotation up to `SAVE_BYTES_PER_PAGE` (at least
-    /// one); the meta shard rides first when it carries debt, last when no
-    /// data shard stays dirty, else it waits. None when nothing is dirty or
-    /// its buffers are not admitted (everything stays dirty).
-    pub(crate) fn take_save(&mut self) -> Option<(ClaudeLedgerSave, ShadowReservation)> {
-        let mut selected = vec![false; SHARDS];
+    /// shards come in a fair rotation up to `SAVE_BYTES_PER_PAGE`. A zero
+    /// meta (every certificate 0) rides first when a certificate went to
+    /// zero; the current meta rides last only when no data shard stays
+    /// dirty. None when nothing is dirty, its buffers are not admitted or the
+    /// page deadline passes while serializing (everything stays dirty).
+    pub(crate) fn take_save(
+        &mut self,
+        deadline: Instant,
+    ) -> Option<(ClaudeLedgerSave, ShadowReservation)> {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let mut selected = vec![false; DATA_SHARDS];
         let mut bytes = 0_usize;
-        let mut count = 0_usize;
-        let start = self.next_save;
+        let mut next_save = self.next_save;
+        self.oversized_shards = 0;
         for step in 0..DATA_SHARDS {
-            let shard = (start + step) % DATA_SHARDS;
+            let shard = (self.next_save + step) % DATA_SHARDS;
             if !self.dirty[shard] {
                 continue;
             }
             let need = self.shard_bytes[shard] + 2;
-            if count > 0 && bytes + need > SAVE_BYTES_PER_PAGE {
+            if need > SAVE_BYTES_PER_PAGE {
+                self.oversized_shards += 1;
+                continue;
+            }
+            if bytes + need > SAVE_BYTES_PER_PAGE {
                 break;
             }
             selected[shard] = true;
             bytes += need;
-            count += 1;
-            self.next_save = (shard + 1) % DATA_SHARDS;
+            next_save = (shard + 1) % DATA_SHARDS;
         }
         let data_left = (0..DATA_SHARDS).any(|shard| self.dirty[shard] && !selected[shard]);
-        let meta = self.dirty[META] && (self.meta_debt || !data_left);
-        if meta {
-            selected[META] = true;
-            bytes += self.shard_bytes[META] + 2;
-            count += 1;
-        }
-        if count == 0 {
+        let zero_first = self.meta_debt;
+        let meta_last = self.dirty[META] && !data_left;
+        let metas = usize::from(zero_first) + usize::from(meta_last);
+        bytes += metas * (self.shard_bytes[META] + 2);
+        if !selected.contains(&true) && metas == 0 {
             return None;
         }
         let reservation = ShadowReservation::admit(bytes)?;
+        let open = |size: usize| {
+            let mut buffer = Vec::with_capacity(size + 2);
+            buffer.push(b'{');
+            buffer
+        };
         let mut buffers = BTreeMap::<usize, Vec<u8>>::new();
         for (shard, chosen) in selected.iter().enumerate() {
             if *chosen {
-                let mut buffer = Vec::with_capacity(self.shard_bytes[shard] + 2);
-                buffer.push(b'{');
-                buffers.insert(shard, buffer);
+                buffers.insert(shard, open(self.shard_bytes[shard]));
             }
         }
-        for (key, record) in self.census.records() {
-            let Some(buffer) = buffers.get_mut(&shard_of(key)) else {
-                continue;
-            };
-            if buffer.len() > 1 {
-                buffer.push(b',');
+        if !buffers.is_empty() {
+            for (position, (key, record)) in self.census.records().enumerate() {
+                if position % SAVE_DEADLINE_STRIDE == SAVE_DEADLINE_STRIDE - 1
+                    && Instant::now() >= deadline
+                {
+                    return None;
+                }
+                if key.starts_with(SWEEP_KEY_PREFIX) {
+                    continue;
+                }
+                if let Some(buffer) = buffers.get_mut(&shard_of(key)) {
+                    push_entry(buffer, key, record);
+                }
             }
-            // Writing into a Vec cannot fail; a failure would only shorten
-            // the shard, which its load then rejects as corrupt.
-            let _ = serde_json::to_writer(&mut *buffer, key);
-            buffer.push(b':');
-            let _ = serde_json::to_writer(&mut *buffer, record);
         }
-        let mut save = ClaudeLedgerSave::default();
-        for (shard, mut buffer) in buffers {
+        let mut zero = zero_first.then(|| open(self.shard_bytes[META]));
+        let mut current = meta_last.then(|| open(self.shard_bytes[META]));
+        for (key, record) in self.census.records_with_prefix(SWEEP_KEY_PREFIX) {
+            if let Some(buffer) = current.as_mut() {
+                push_entry(buffer, key, record);
+            }
+            if let Some(buffer) = zero.as_mut() {
+                match record.sweep() {
+                    Some((cursor, start, sweep)) => push_entry(
+                        buffer,
+                        key,
+                        &ClaudeRequestCensusRecord::sweep_record(*cursor, start, zeroed(sweep)),
+                    ),
+                    None => push_entry(buffer, key, record),
+                }
+            }
+        }
+        let close = |mut buffer: Vec<u8>| {
             buffer.push(b'}');
+            buffer
+        };
+        let mut save = ClaudeLedgerSave::default();
+        for (shard, buffer) in buffers {
             self.dirty[shard] = false;
-            if shard != META {
-                save.shards.push((shard, buffer));
-            } else if self.meta_debt {
-                save.meta_first = Some(buffer);
-            } else {
-                save.meta_last = Some(buffer);
-            }
+            save.shards.push((shard, close(buffer)));
         }
-        save.meta_debt = std::mem::take(&mut self.meta_debt) && save.meta_first.is_some();
+        if let Some(buffer) = zero {
+            // The current meta stays dirty until a final write carries it.
+            self.meta_debt = false;
+            save.meta_first = Some(close(buffer));
+            save.meta_debt = true;
+        }
+        if let Some(buffer) = current {
+            self.dirty[META] = false;
+            save.meta_last = Some(close(buffer));
+        }
+        self.next_save = next_save;
         Some((save, reservation))
     }
 
-    /// A batch that did not reach the disk: its shards are dirty again and
-    /// its memos never moved.
-    fn restore(&mut self, failed_shards: &[usize], meta: Option<bool>, memos: &[PendingMemo]) {
+    /// A batch that did not reach the disk: its shards are dirty again (a
+    /// zero meta among them is owed again).
+    fn restore(&mut self, failed_shards: &[usize], meta: Option<bool>) {
         for shard in failed_shards {
             self.dirty[*shard] = true;
         }
@@ -238,9 +287,26 @@ impl ClaudeLedger {
             self.dirty[META] = true;
             self.meta_debt |= debt;
         }
-        for memo in memos {
-            self.pending_families.remove(&memo.key);
-        }
+    }
+}
+
+fn push_entry(buffer: &mut Vec<u8>, key: &str, record: &ClaudeRequestCensusRecord) {
+    if buffer.len() > 1 {
+        buffer.push(b',');
+    }
+    // Writing into a Vec cannot fail; a failure would only shorten the
+    // shard, which its load then rejects as corrupt.
+    let _ = serde_json::to_writer(&mut *buffer, key);
+    buffer.push(b':');
+    let _ = serde_json::to_writer(&mut *buffer, record);
+}
+
+/// A sweep state as the zero meta saves it: no certificate, and a sweep
+/// that held one carries debt (a restart from it certifies nothing).
+fn zeroed(sweep: ClaudeLedgerSweep) -> ClaudeLedgerSweep {
+    ClaudeLedgerSweep {
+        complete_through: 0,
+        debt: sweep.debt.max(u64::from(sweep.complete_through > 0)),
     }
 }
 
@@ -414,19 +480,11 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
     }
 }
 
-/// Hand a page's batch to the writer; marks its memos pending. On a full
-/// outbox the batch comes back (the caller restores the ledger).
+/// Hand a page's batch to the writer. On a full outbox the batch comes back
+/// and its shards are dirty again.
 pub(crate) fn submit_batch(ledger: &mut ClaudeLedger, job: WriteJob) -> Result<(), Box<WriteJob>> {
-    let keys = job
-        .memos
-        .iter()
-        .map(|memo| memo.key.clone())
-        .collect::<Vec<_>>();
     match submit(Job::Write(Box::new(job))) {
-        Ok(()) => {
-            ledger.pending_families.extend(keys);
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(Job::Write(job)) => {
             if let Some(save) = &job.save {
                 let failed = save
@@ -436,7 +494,7 @@ pub(crate) fn submit_batch(ledger: &mut ClaudeLedger, job: WriteJob) -> Result<(
                     .collect::<Vec<_>>();
                 let meta = (save.meta_first.is_some() || save.meta_last.is_some())
                     .then_some(save.meta_debt);
-                ledger.restore(&failed, meta, &[]);
+                ledger.restore(&failed, meta);
             }
             Err(job)
         }
@@ -463,7 +521,7 @@ pub(crate) fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) -> Vec
         .and_then(|mut results| results.remove(support_dir))
         .unwrap_or_default();
     for result in &results {
-        ledger.restore(&result.failed_shards, result.meta_unwritten, &result.memos);
+        ledger.restore(&result.failed_shards, result.meta_unwritten);
     }
     results
 }
@@ -478,7 +536,16 @@ fn run_writer(receiver: Receiver<Job>) {
             Job::Load(support_dir) => {
                 let ledger = load(&support_dir);
                 if let Ok(mut ledgers) = LEDGERS.lock() {
-                    ledgers.insert(support_dir, Slot::Ready(Box::new(ledger)));
+                    match ledger {
+                        Some(ledger) => {
+                            ledgers.insert(support_dir, Slot::Ready(Box::new(ledger)));
+                        }
+                        // Not admitted: unloaded again, the next page asks.
+                        None => {
+                            LOADS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                            ledgers.remove(&support_dir);
+                        }
+                    }
                 }
             }
             Job::Write(job) => {
@@ -571,28 +638,66 @@ fn write_save(
     }
     if let Some(meta) = &save.meta_last {
         if blocked || !state.failed.is_empty() || !write_atomic(&shard_path(dir, META), meta) {
-            meta_unwritten = Some(false);
+            // A zero meta that failed before keeps its debt flag.
+            meta_unwritten.get_or_insert(false);
         }
     }
     (unwritten, meta_unwritten)
 }
 
-/// Read every shard. A shard that is missing (when anything was saved),
-/// unreadable, malformed, lossy or holding a foreign key is damage: the
-/// ledger marks it and the shadow drops its telemetry certificate.
-fn load(support_dir: &Path) -> ClaudeLedger {
+/// Loads given up because their admission never came (process memory).
+static LOADS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn loads_refused() -> u64 {
+    LOADS_REFUSED.load(Ordering::Relaxed)
+}
+
+/// Admit `bytes`, waiting (in steps) for pages and batches to release
+/// theirs; None when it never comes.
+fn admit_waiting(bytes: usize) -> Option<ShadowReservation> {
+    for attempt in 0..LOAD_ADMIT_ATTEMPTS {
+        if let Some(reservation) = ShadowReservation::admit(bytes) {
+            return Some(reservation);
+        }
+        if attempt + 1 < LOAD_ADMIT_ATTEMPTS {
+            std::thread::sleep(LOAD_ADMIT_WAIT);
+        }
+    }
+    None
+}
+
+/// Read every shard, each admitted (its bytes and decoded records) before
+/// it is read; None when an admission never comes (the partial ledger is
+/// dropped). A shard that is missing (when anything was saved), larger than
+/// a save ever writes, unreadable, malformed, lossy or holding a foreign key
+/// is damage: the ledger marks it and the shadow drops its telemetry
+/// certificate.
+fn load(support_dir: &Path) -> Option<ClaudeLedger> {
     let dir = support_dir.join(LEDGER_DIR);
     let mut ledger = ClaudeLedger::empty(false);
     let mut missing = Vec::new();
     let mut present = 0_usize;
     for shard in 0..SHARDS {
-        let bytes = match std::fs::File::open(shard_path(&dir, shard)) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                let limit = super::super::claude_request_census::MAX_RAW_BYTES as u64 + 1;
-                match file.take(limit).read_to_end(&mut bytes) {
-                    Ok(_) => bytes,
-                    Err(_) => {
+        let limit = SAVE_BYTES_PER_PAGE as u64;
+        let opened = std::fs::File::open(shard_path(&dir, shard)).and_then(|file| {
+            let len = file.metadata()?.len();
+            Ok((file, len))
+        });
+        let mut _admitted = None;
+        let bytes = match opened {
+            Ok((_, len)) if len > limit => {
+                ledger.load_damaged = true;
+                ledger.dirty[shard] = true;
+                continue;
+            }
+            Ok((file, len)) => {
+                _admitted = Some(admit_waiting(
+                    (len as usize).saturating_mul(LOAD_BYTES_FACTOR),
+                )?);
+                let mut bytes = Vec::with_capacity(len as usize);
+                match file.take(limit + 1).read_to_end(&mut bytes) {
+                    Ok(_) if bytes.len() as u64 <= limit => bytes,
+                    _ => {
                         ledger.load_damaged = true;
                         ledger.dirty[shard] = true;
                         continue;
@@ -630,7 +735,7 @@ fn load(support_dir: &Path) -> ClaudeLedger {
     for shard in missing {
         ledger.dirty[shard] = true;
     }
-    ledger
+    Some(ledger)
 }
 
 /// Wait until the writer has done everything handed to it so far.
@@ -693,14 +798,19 @@ pub(crate) fn save_page_for_test(
     ledger: &mut ClaudeLedger,
     failed: &mut WriterState,
 ) -> Option<(usize, bool, usize)> {
-    let (save, _reservation) = ledger.take_save()?;
+    let (save, _reservation) = ledger.take_save(Instant::now() + Duration::from_secs(60))?;
     let (unwritten, meta) = write_save(&support_dir.join(LEDGER_DIR), &save, failed);
-    ledger.restore(&unwritten, meta, &[]);
+    ledger.restore(&unwritten, meta);
     Some((save.shards(), save.meta_first.is_some(), unwritten.len()))
 }
 
 #[cfg(test)]
 pub(crate) fn load_for_test(support_dir: &Path) -> ClaudeLedger {
+    load(support_dir).expect("the load is admitted")
+}
+
+#[cfg(test)]
+pub(crate) fn try_load_for_test(support_dir: &Path) -> Option<ClaudeLedger> {
     load(support_dir)
 }
 
@@ -711,7 +821,17 @@ pub(crate) fn shard_path_for_test(support_dir: &Path, key: &str) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) fn take_save_for_test(ledger: &mut ClaudeLedger) -> Option<ClaudeLedgerSave> {
-    ledger.take_save().map(|(save, _reservation)| save)
+    ledger
+        .take_save(Instant::now() + Duration::from_secs(60))
+        .map(|(save, _reservation)| save)
+}
+
+#[cfg(test)]
+pub(crate) fn take_save_by_for_test(
+    ledger: &mut ClaudeLedger,
+    deadline: Instant,
+) -> Option<ClaudeLedgerSave> {
+    ledger.take_save(deadline).map(|(save, _reservation)| save)
 }
 
 #[cfg(test)]
@@ -735,6 +855,6 @@ pub(crate) fn restore_for_test(ledger: &mut ClaudeLedger, saves: &[&ClaudeLedger
             .collect::<Vec<_>>();
         let meta =
             (save.meta_first.is_some() || save.meta_last.is_some()).then_some(save.meta_debt);
-        ledger.restore(&shards, meta, &[]);
+        ledger.restore(&shards, meta);
     }
 }

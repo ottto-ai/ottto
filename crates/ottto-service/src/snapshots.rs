@@ -22136,7 +22136,7 @@ fn claude_opened_file_birth(
     {
         let created = metadata.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
         Some(claude_request_census::ClaudeRequestBirth {
-            unix_seconds: created.as_secs(),
+            unix_seconds: claude_birth_seconds(created.as_secs())?,
             device: metadata.dev(),
             inode: metadata.ino(),
         })
@@ -22146,6 +22146,14 @@ fn claude_opened_file_birth(
         let _ = metadata;
         None
     }
+}
+
+/// A birth (whole seconds) at or before 2020-01-01T00:00:00Z, the epoch or
+/// zero included, is a file system's placeholder: unknown, never the
+/// earliest owner.
+fn claude_birth_seconds(created_unix_seconds: u64) -> Option<u64> {
+    const CLAUDE_BIRTH_FLOOR_UNIX_SECONDS: u64 = 1_577_836_800;
+    (created_unix_seconds > CLAUDE_BIRTH_FLOOR_UNIX_SECONDS).then_some(created_unix_seconds)
 }
 
 #[allow(clippy::too_many_arguments)]
