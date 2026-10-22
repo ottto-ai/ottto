@@ -6,9 +6,10 @@
 //! its content and the Mac's runtime owner installs it; the daemon only reads
 //! it. MONEY P2 reuses this reader and file; there is no second list. Each
 //! line is the lowercase hex SHA-256 of one exact, full `source_session_id`.
-//! Families are listed by their ROOT digest (a member digest also matches,
-//! but a sibling's re-arm can re-read an unlisted root's members). Blank lines
-//! and `#` lines are ignored. No id, digest or path is logged; only counts.
+//! Families are listed by their ROOT digest. A member-only line still
+//! excludes its whole family: the caller closes the list over the indexed
+//! roots, so no sibling's adoption can cancel a carry or re-arm the listed
+//! member. Blank lines and `#` lines are ignored. No id, digest or path is logged; only counts.
 //!
 //! The list fails closed:
 //! - Never installed (no file, no seen-marker): adoption-only files whose
@@ -183,15 +184,32 @@ impl ReemissionExclusions {
         self.digests.is_empty()
     }
 
+    /// Close the list over families: a listed member also lists its root.
+    /// `members` yields (root id, member id) for each indexed subagent file.
+    pub(crate) fn close_over_roots(&mut self, members: impl Iterator<Item = (String, String)>) {
+        if self.is_empty() {
+            return;
+        }
+        let roots = members
+            .filter(|(_, member)| self.digests.contains(&digest(member)))
+            .map(|(root, _)| digest(&root))
+            .collect::<Vec<_>>();
+        self.digests.extend(roots);
+    }
+
     /// True when the exact full id of the family root or of this member is
-    /// listed.
+    /// listed. After `close_over_roots`, every member of a family with any
+    /// listed member matches through its root.
     pub(crate) fn excludes(&self, root_session_id: &str, member_session_id: &str) -> bool {
         !self.is_empty()
-            && [root_session_id, member_session_id].iter().any(|id| {
-                self.digests
-                    .contains(&format!("{:x}", Sha256::digest(id.as_bytes())))
-            })
+            && [root_session_id, member_session_id]
+                .iter()
+                .any(|id| self.digests.contains(&digest(id)))
     }
+}
+
+fn digest(id: &str) -> String {
+    format!("{:x}", Sha256::digest(id.as_bytes()))
 }
 
 fn write_seen_marker(path: &Path) -> std::io::Result<()> {
@@ -323,6 +341,25 @@ mod tests {
         let recorded = ReemissionExclusions::load(&dir);
         assert_eq!(recorded.state(), ListState::Installed);
         assert!(ReemissionExclusions::seen_marker_path(&dir).exists());
+    }
+
+    #[test]
+    fn a_listed_member_closes_over_its_family_root() {
+        let mut parsed =
+            ReemissionExclusions::parse(format!("{}\n", digest("root-b_agent-1")).as_bytes());
+        assert!(!parsed.excludes("root-b", "root-b"));
+        parsed.close_over_roots(
+            [
+                ("root-b".to_string(), "root-b_agent-1".to_string()),
+                ("root-b".to_string(), "root-b_agent-2".to_string()),
+                ("root-c".to_string(), "root-c_agent-1".to_string()),
+            ]
+            .into_iter(),
+        );
+        assert!(parsed.excludes("root-b", "root-b"));
+        assert!(parsed.excludes("root-b", "root-b_agent-2"));
+        assert!(!parsed.excludes("root-c", "root-c"));
+        assert!(!parsed.excludes("root-c", "root-c_agent-1"));
     }
 
     #[test]

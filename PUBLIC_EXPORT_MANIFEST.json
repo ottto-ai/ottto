@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 768,
-  "content_sha256": "14c49d1d8c0ba02249ec982172437fd908e6dfaf1f6cd02384e0ed44b3eff91a",
+  "content_sha256": "c33c4e962d8447a2e31866bcc0f2e883bad2f9919f8efc2f1019dc81a62ac0d2",
   "files": [
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "848cfb09342d45021151ea1d5eaea2df482cf60b3ef4d6627be87a89fa4688db",
-      "size_bytes": 3104602
+      "sha256": "3e1732edca6b211e8709fd9497594aa92ac50fd9a980cee9e85f90c512faab8c",
+      "size_bytes": 3109053
     },
     {
       "executable": false,
@@ -1532,8 +1532,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_reemission_exclusions.rs",
-      "sha256": "76ac0e57633c8c7b71e78ef4ab13d199f417516f25797aa7fefc960ab0090ff3",
-      "size_bytes": 15007
+      "sha256": "71adf3df84334c13c9fc415b168741417c622210c93a723dcf128b2703da88db",
+      "size_bytes": 16555
     },
     {
       "executable": false,
@@ -1777,8 +1777,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/stale_family_carry_tests.rs",
-      "sha256": "45a3c3699bcd914f0b906eb5537cc575d257f291766ff6a7ec0aa6a252b0a08e",
-      "size_bytes": 51123
+      "sha256": "accdee1f4a8ae0791821381190dd7dcf85ecaf51ecf9315178ecd4f02df12f4a",
+      "size_bytes": 52552
     },
     {
       "executable": false,
@@ -3548,8 +3548,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-claude-context-backfill-adoption.md",
-      "sha256": "a1f4ffcb6ba155717b4b3f4f1a555a0d1aa8e6b6e0e9b474e0763976f19c2d8f",
-      "size_bytes": 9095
+      "sha256": "11eb7ddda7855a4b060876d169edf70ed266c59b25a073fcc6a2a36b749cca3c",
+      "size_bytes": 9961
     },
     {
       "executable": false,
@@ -5379,7 +5379,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T10:44:41+00:00",
+  "generated_at": "2026-10-22T10:45:51+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 769,
   "public_roots": [
@@ -5418,5 +5418,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cde837631f339e270569410a62e731a8e4b47f42"
+  "source_commit": "ade34deea4d09690ad95650dd9c1750d5b07ae61"
 }

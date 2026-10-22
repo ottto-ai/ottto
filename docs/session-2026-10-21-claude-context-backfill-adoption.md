@@ -20,7 +20,11 @@ generation, so no body identity, progress generation or census state is reset.
 - `snapshots.rs`: a page budget for adoption-only files. A file is
   adoption-only when its first selecting gate is `BodyWitnessAdoption` and the
   same decision without that gate is `Skip`. The first 2,000 such files per page
-  (one page per sync cycle) are read. Later ones take the ordinary `Skip` path:
+  (one page per sync cycle) are read, and at most 4 GiB of them by file size
+  (`BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE`; the first such file of a page is
+  always admitted, so one oversized file still progresses alone). Both caps are
+  per destination-scoped Claude index per cycle: a Mac with two Claude
+  destinations reads up to twice as much. Later ones take the ordinary `Skip` path:
   the entry, its accepted body and its old revision stay unchanged, so a later
   page adopts them. Files selected for any other reason (new, changed, audit,
   authority quarantine retry, forced family, comparison target) are never
@@ -46,8 +50,11 @@ reader (`snapshots/claude_reemission_exclusions.rs`) and this file; there is no
 one exact, full Claude `source_session_id`; blank and `#` lines are ignored; at
 most 1,024 lines and 64 KiB. Families are listed by their ROOT digest, verified
 against the index's path-derived ids (root = file stem, subagent =
-`<root>_<stem>`). A member digest also matches, but a sibling's carry-cancel or
-proof re-arm can re-read members of an unlisted root, so list roots.
+`<root>_<stem>`). A member-only line still excludes its whole family: on each
+load the list is closed over the index's roots (a listed subagent adds its root
+digest), so no sibling's adoption can cancel a carry or re-arm the listed
+member (StateMissing N1). Listing roots stays the install rule, as defence in
+depth.
 
 - Read once per Claude cycle, before the scan. Other sources never read it.
 - The list fails closed (SOURCE Amendment 3):
@@ -136,13 +143,19 @@ the server are unchanged.
 - `claude_context_backfill_leaves_codex_and_pi_unselected` (Codex adoption is
   never held by the Claude list, whatever the file's age)
 - `claude_context_backfill_spreads_adoption_only_files_over_pages`
+- `claude_context_backfill_caps_adoption_only_bytes_per_page` (a byte budget
+  below every file admits one per page; one that fits two but not three spreads
+  six files over three pages)
+- `stale_family_carry_tests::c1b_member_only_reemission_line_excludes_the_carried_family_root`
 - `claude_context_backfill_quarantined_family_keeps_its_own_retry_gate`
-- `claude_context_backfill_skips_sessions_on_the_local_reemission_list`
+- `claude_context_backfill_skips_sessions_on_the_local_reemission_list` (a
+  member-only line keeps its whole family on the old stamp)
 - `claude_context_backfill_holds_old_entities_until_the_list_is_installed`
 - `claude_context_backfill_empty_list_installs_the_marker_and_adopts_old_entities`
 - `claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing`
   (also restart and index rebuild keep the marker)
 - `snapshots::claude_reemission_exclusions::tests` (never installed holds old
   and unknown only, empty list writes a 0600 marker and a later missing file
-  pauses, an unwritable marker pauses until written, listed root or member, malformed and oversized lists never write the
-  marker)
+  pauses, an unwritable marker pauses until written, a listed member closes
+  over its root, listed root or member, malformed and oversized lists never
+  write the marker)

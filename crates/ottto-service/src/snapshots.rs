@@ -16146,6 +16146,7 @@ pub(crate) struct OwnedSourceScan {
     /// Files parsed on this page only to adopt a new body-witness revision,
     /// and the ones deferred past `body_witness_adoption_page_budget`.
     body_witness_adoption_only_parses: usize,
+    body_witness_adoption_only_bytes: u64,
     body_witness_adoption_deferred: usize,
     body_witness_adoption_excluded: usize,
     body_witness_adoption_held_no_list: usize,
@@ -17037,6 +17038,7 @@ impl OwnedSourceScan {
             scanned_session_count,
             semantic_noop_count,
             body_witness_adoption_only_parses: 0,
+            body_witness_adoption_only_bytes: 0,
             body_witness_adoption_deferred: 0,
             body_witness_adoption_excluded: 0,
             body_witness_adoption_held_no_list: 0,
@@ -17176,6 +17178,7 @@ impl OwnedSourceScan {
             mut scanned_session_count,
             mut semantic_noop_count,
             mut body_witness_adoption_only_parses,
+            mut body_witness_adoption_only_bytes,
             mut body_witness_adoption_deferred,
             mut body_witness_adoption_excluded,
             mut body_witness_adoption_held_no_list,
@@ -20151,8 +20154,9 @@ impl OwnedSourceScan {
             if comparison_target {
                 decision = CandidateDecision::Parse;
             }
-            // One-time adoption pacing: past this page's budget, a file that
-            // only a new body-witness revision selects is skipped unchanged.
+            // One-time adoption pacing: past this page's file or byte budget,
+            // a file that only a new body-witness revision selects is skipped
+            // unchanged.
             // Its stamp stays old, so a later page adopts it. A file the local
             // re-emission list names is skipped the same way without using the
             // budget; an unreadable or vanished list defers every such file.
@@ -20179,8 +20183,13 @@ impl OwnedSourceScan {
                     decision = CandidateDecision::Skip;
                 } else if !index.claude_reemission_exclusions.pauses_adoption()
                     && body_witness_adoption_only_parses < body_witness_adoption_page_budget()
+                    && (body_witness_adoption_only_parses == 0
+                        || body_witness_adoption_only_bytes.saturating_add(candidate.size_bytes)
+                            <= body_witness_adoption_byte_budget())
                 {
                     body_witness_adoption_only_parses += 1;
+                    body_witness_adoption_only_bytes =
+                        body_witness_adoption_only_bytes.saturating_add(candidate.size_bytes);
                 } else {
                     body_witness_adoption_deferred += 1;
                     decision = CandidateDecision::Skip;
@@ -20964,6 +20973,7 @@ impl OwnedSourceScan {
             scanned_session_count,
             semantic_noop_count,
             body_witness_adoption_only_parses,
+            body_witness_adoption_only_bytes,
             body_witness_adoption_deferred,
             body_witness_adoption_excluded,
             body_witness_adoption_held_no_list,
@@ -29629,6 +29639,9 @@ fn unix_nanos(value: SystemTime) -> Option<u64> {
 /// The rest wait for later pages, which paces a one-time history re-read.
 /// Files selected for any other reason are never deferred.
 const BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE: usize = 2_000;
+/// Bytes of adoption-only files read per page (4 GiB). The first such file of
+/// a page is always admitted, whatever its size.
+const BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE: u64 = 16 * MAX_JSONL_FILE_BYTES;
 
 #[cfg(test)]
 thread_local! {
@@ -29649,6 +29662,28 @@ fn with_body_witness_adoption_page_budget<T>(budget: usize, run: impl FnOnce() -
     BODY_WITNESS_ADOPTION_TEST_PAGE_BUDGET.with(|slot| slot.set(Some(budget)));
     let value = run();
     BODY_WITNESS_ADOPTION_TEST_PAGE_BUDGET.with(|slot| slot.set(None));
+    value
+}
+
+#[cfg(test)]
+thread_local! {
+    static BODY_WITNESS_ADOPTION_TEST_BYTE_BUDGET: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn body_witness_adoption_byte_budget() -> u64 {
+    #[cfg(test)]
+    if let Some(budget) = BODY_WITNESS_ADOPTION_TEST_BYTE_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE
+}
+
+#[cfg(test)]
+fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> T) -> T {
+    BODY_WITNESS_ADOPTION_TEST_BYTE_BUDGET.with(|slot| slot.set(Some(budget)));
+    let value = run();
+    BODY_WITNESS_ADOPTION_TEST_BYTE_BUDGET.with(|slot| slot.set(None));
     value
 }
 
@@ -30063,8 +30098,15 @@ impl ScanIndex {
     /// Claude only, before scanning: read the local list of sessions the
     /// adoption re-read must not re-emit. A list that was installed once and
     /// is now missing pauses adoption and raises the local alarm.
+    /// A member-only line is closed over its indexed family root.
     pub fn load_claude_reemission_exclusions(&mut self, support_dir: &Path) {
-        self.claude_reemission_exclusions = ReemissionExclusions::load(support_dir);
+        let mut exclusions = ReemissionExclusions::load(support_dir);
+        exclusions.close_over_roots(self.files.keys().filter_map(|key| {
+            claude_index_path_member_ref(Path::new(key))
+                .filter(|member| member.subagent_stem.is_some())
+                .map(ClaudeIndexPathMemberRef::into_owned)
+        }));
+        self.claude_reemission_exclusions = exclusions;
         if self.claude_reemission_exclusions.state() == ListState::MissingAfterInstall {
             crate::local_resource_diagnostics::claude_reemission_list_missing();
         }
@@ -55847,6 +55889,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_context_backfill_caps_adoption_only_bytes_per_page() {
+        assert_eq!(
+            BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE,
+            4 * 1024 * 1024 * 1024
+        );
+        let pages = |byte_budget: u64, name: &str| {
+            let (home, root, mut index) = claude_context_backfill_fixture(name, 3);
+            let mut sizes = index
+                .files
+                .values()
+                .map(|entry| entry.size_bytes)
+                .collect::<Vec<_>>();
+            sizes.sort_unstable();
+            let parsed_per_page = with_body_witness_adoption_byte_budget(byte_budget, || {
+                let mut parsed_per_page = Vec::new();
+                loop {
+                    let previous = index.clone();
+                    let mut scan = claude_context_backfill_scan(
+                        &root,
+                        &mut index,
+                        MAX_BACKFILL_FILES_PER_SOURCE,
+                    );
+                    assert!(scan.census_complete, "deferral never holds the census");
+                    parsed_per_page.push(scan.scanned_file_count);
+                    index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+                    if scan.scanned_file_count == 0 || parsed_per_page.len() > 7 {
+                        break parsed_per_page;
+                    }
+                }
+            });
+            assert!(index
+                .files
+                .values()
+                .all(|entry| entry.effective_upload_body_witness_revision == 2));
+            let _ = fs::remove_dir_all(home);
+            (sizes, parsed_per_page)
+        };
+        // Every file is larger than the byte budget: each page still admits
+        // exactly one, so the re-read always progresses.
+        let (_, oversized) = pages(1, "claude-context-backfill-bytes-oversized");
+        assert_eq!(oversized, vec![1, 1, 1, 1, 1, 1, 0]);
+        // A budget that holds any two files but no three spreads six files
+        // over three pages, under a file budget that would admit all six.
+        let (sizes, _) = pages(u64::MAX, "claude-context-backfill-bytes-sizes");
+        let two = sizes[4] + sizes[5];
+        assert!(sizes[0] + sizes[1] + sizes[2] > two, "{sizes:?}");
+        let (_, paired) = pages(two, "claude-context-backfill-bytes-paired");
+        assert_eq!(paired, vec![2, 2, 2, 0]);
+    }
+
+    #[test]
     fn claude_context_backfill_quarantined_family_keeps_its_own_retry_gate() {
         let (home, root, mut index) =
             claude_context_backfill_fixture("claude-context-backfill-quarantine", 1);
@@ -55934,7 +56027,8 @@ mod tests {
         let session = |slot: usize| format!("aaaaaaaa-bbbb-4ccc-8ddd-{slot:012x}");
         let digest = |id: &str| format!("{:x}", Sha256::digest(id.as_bytes()));
         // Slot 0 by its family root (root and subagent), slot 1 by its
-        // subagent member only. Slot 2 and slot 1's root are not listed.
+        // subagent member only. The list is closed over family roots, so
+        // slot 1's root is excluded too (N1). Slot 2 is not listed.
         let listed_member = index
             .files
             .keys()
@@ -55952,8 +56046,8 @@ mod tests {
         )
         .unwrap();
         let excluded = |key: &str| {
-            claude_index_path_family_member(Path::new(key)).is_some_and(|(family_root, member)| {
-                family_root == session(0) || member == listed_member
+            claude_index_path_family_member(Path::new(key)).is_some_and(|(family_root, _)| {
+                family_root == session(0) || family_root == session(1)
             })
         };
         let revisions = |index: &ScanIndex| {
@@ -56011,11 +56105,14 @@ mod tests {
         .unwrap();
         index.load_claude_reemission_exclusions(&support);
         let previous = index.clone();
-        // Listed files never use the budget: three unlisted files fit in it.
-        let mut scan = with_body_witness_adoption_page_budget(3, || {
+        // Listed files never use the budget: the two unlisted files fit in it.
+        let mut scan = with_body_witness_adoption_page_budget(2, || {
             claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
         });
-        assert_eq!(scan.scanned_file_count, 3, "only the unlisted files adopt");
+        assert_eq!(
+            scan.scanned_file_count, 2,
+            "only the unlisted family adopts"
+        );
         assert!(scan.census_complete);
         let mut index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
         let mut settled = revisions(&index);
@@ -56025,12 +56122,12 @@ mod tests {
             vec![
                 (false, 2),
                 (false, 2),
-                (false, 2),
+                (true, 1),
                 (true, 1),
                 (true, 1),
                 (true, 1)
             ],
-            "listed files keep the old stamp"
+            "listed families keep the old stamp, including a member-only line's root"
         );
         index.load_claude_reemission_exclusions(&support);
         let held = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
@@ -56043,7 +56140,7 @@ mod tests {
         let previous = index.clone();
         let mut released =
             claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert_eq!(released.scanned_file_count, 3);
+        assert_eq!(released.scanned_file_count, 4);
         let index = claude_context_backfill_settle(&home, &previous, &mut released, &mut index);
         assert!(index
             .files
@@ -70012,7 +70109,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_deferred, body_witness_adoption_excluded, body_witness_adoption_held_no_list, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_only_bytes, body_witness_adoption_deferred, body_witness_adoption_excluded, body_witness_adoption_held_no_list, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
