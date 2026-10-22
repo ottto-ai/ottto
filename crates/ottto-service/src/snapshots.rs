@@ -22627,9 +22627,11 @@ impl OwnedSourceScan {
                 // child holds `DeferredRestart` instead of restarting again.
                 // Both are non-progressing held disclosure: nothing is admitted.
                 // U1a-2a (fix round 6): whether this parse is `DeferredRef` here
-                // with no ledger used and no step-map witness read (its parser's
-                // pending arm), the one deferral a later install's proof arm
-                // answers. In-memory, this completion only.
+                // with no ledger used and no step-map witness read. Together with
+                // the guard's N1 conjuncts (`proof_used` and `proof_refusal` both
+                // None) it identifies the parser's pending `_` arm, the one
+                // deferral a later install's proof arm answers; the flag alone
+                // does not. In-memory, this completion only.
                 let mut deferred_ref_unwitnessed = false;
                 if source == SnapshotSource::Codex && parsed_file.codex_parent_resolution_pending {
                     if parsed_file
