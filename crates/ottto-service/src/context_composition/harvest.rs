@@ -92,6 +92,11 @@ pub(super) fn build_report_for_scan(
 pub fn spawn_context_composition_sync() -> Result<()> {
     let home = crate::snapshot_sync::home_dir()?;
     let support_dir = default_support_dir();
+    if super::v2::changed_days_enabled() {
+        // The new-lines reader replaces this loop (off until the server
+        // accepts changed-days uploads).
+        return super::v2::spawn_v2_sync();
+    }
     std::thread::Builder::new()
         .name("ottto-context-composition-sync".to_string())
         .spawn(move || loop {

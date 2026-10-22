@@ -1671,10 +1671,17 @@ fn capture_on_rejected_account_hold_release_uploads_new_contract_tags() {
         .index
         .accepted_snapshot_fingerprint_recorded(&held_body.snapshot_fingerprint));
     let key = PipelineFixture::key(&held.index, PIPELINE_HELD_SESSION);
+    let old_key = PipelineFixture::key(&old.index, PIPELINE_HELD_SESSION);
+    // The file head is a digest of its entity set, not an entity fingerprint.
     assert_eq!(
-        held.index.files[&key].last_snapshot_fingerprint.as_deref(),
-        Some(old_body.snapshot_fingerprint.as_str())
+        held.index.files[&key].last_snapshot_fingerprint,
+        old.index.files[&old_key].last_snapshot_fingerprint
     );
+    assert_eq!(
+        held.index.file_snapshot_fingerprints[&key],
+        old.index.file_snapshot_fingerprints[&old_key]
+    );
+    assert!(held.index.file_snapshot_fingerprints[&key].contains(&old_body.snapshot_fingerprint));
     assert!(held.index.files[&key].source_file_fingerprint.is_empty());
 
     fixture.conflicting_creator = false; // Remove contradicting creator evidence.
