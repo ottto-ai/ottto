@@ -8,6 +8,9 @@
 //! statusLine `context_window`.
 
 use crate::context_file_counts::{load_or_create_salt, measure_file, FileCounts};
+use crate::instruction_inventory::{
+    build_instruction_inventory, default_login_claude_mode, InstructionInventory, InventoryPaths,
+};
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
@@ -15,10 +18,10 @@ use ottto_core::{compiled_release_version, default_support_dir, LocalDeviceBindi
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -30,6 +33,7 @@ const CONTEXT_MCP_COMMAND_TIMEOUT_SECS: u64 = 120;
 const CONTEXT_COMMAND_TIMEOUT: Duration = Duration::from_secs(CONTEXT_COMMAND_TIMEOUT_SECS);
 const CONTEXT_MCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(CONTEXT_MCP_COMMAND_TIMEOUT_SECS);
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const GIT_STDOUT_MAX_BYTES: usize = 1024 * 1024;
 const CONTEXT_MAX_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
 const RECENT_WORKSPACE_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_WORKSPACES_PER_CYCLE: usize = 12;
@@ -112,6 +116,9 @@ pub(crate) struct ContextFootprintIngestRequest {
     pub(crate) skills: Vec<ContextFootprintItemInput>,
     pub(crate) custom_agents: Vec<ContextFootprintItemInput>,
     pub(crate) mcp_tools: Vec<ContextFootprintMcpToolInput>,
+    /// Claude Code only; see `instruction_inventory`. Absent means unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) instruction_inventory: Option<InstructionInventory>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -306,6 +313,7 @@ fn harvest_source(
                 home,
                 machine_id,
                 workspace_labels_enabled,
+                inventory_paths_for_hint(Some(workspace_labels_enabled)),
             );
         }
         Err(_) if read_marker(&marker).as_deref() == Some(identity.as_str()) => {
@@ -322,7 +330,21 @@ fn harvest_source(
         home,
         machine_id,
         true,
+        inventory_paths_for_hint(None),
     )
+}
+
+/// Instruction paths leave the machine only when the hint explicitly says
+/// workspace labels are on. Without a hint the policy is unknown, so no
+/// inventory block is built at all.
+fn inventory_paths_for_hint(workspace_labels_enabled: Option<bool>) -> Option<InventoryPaths> {
+    workspace_labels_enabled.map(|enabled| {
+        if enabled {
+            InventoryPaths::Collect
+        } else {
+            InventoryPaths::Withhold
+        }
+    })
 }
 
 fn harvest_recent_workspaces(
@@ -333,6 +355,7 @@ fn harvest_recent_workspaces(
     home: &Path,
     machine_id: &str,
     workspace_labels_enabled: bool,
+    inventory_paths: Option<InventoryPaths>,
 ) -> Result<ContextHarvestOutcome> {
     let now = SystemTime::now();
     let mut workspaces = discover_recent_claude_workspaces(home, now);
@@ -360,6 +383,7 @@ fn harvest_recent_workspaces(
             machine_id,
             &env,
             workspace_labels_enabled,
+            inventory_paths,
             include_mcp_servers,
             home,
             salt.as_ref(),
@@ -414,6 +438,7 @@ fn build_request_for_workspace(
     machine_id: &str,
     env: &SpawnEnv,
     workspace_labels_enabled: bool,
+    inventory_paths: Option<InventoryPaths>,
     include_mcp_servers: bool,
     home: &Path,
     salt: Option<&[u8; 32]>,
@@ -440,7 +465,10 @@ fn build_request_for_workspace(
     let workspace_text = workspace.to_string_lossy();
     let workspace_hash = sha256_hex(&[workspace_text.as_ref()]);
     let repository_identity = resolve_repository_identity(workspace, workspace_labels_enabled);
-    measure_memory_files(&mut parsed, workspace, home, salt);
+    let observed = measure_memory_files(&mut parsed, workspace, home, salt);
+    let instruction_inventory = inventory_paths.and_then(|paths| {
+        build_instruction_inventory(workspace, &observed, default_login_claude_mode(home), paths)
+    });
     let config_hash = request_content_hash(&parsed)?;
     Ok(ContextFootprintIngestRequest {
         agent_source: "claude-code".to_string(),
@@ -471,6 +499,7 @@ fn build_request_for_workspace(
         skills: parsed.skills,
         custom_agents: parsed.custom_agents,
         mcp_tools: parsed.mcp_tools,
+        instruction_inventory,
     })
 }
 
@@ -641,7 +670,7 @@ pub(crate) fn resolve_repository_identity(
     workspace: &Path,
     labels_enabled: bool,
 ) -> RepositoryIdentity {
-    let Some(toplevel_raw) = git_stdout(workspace, &["rev-parse", "--show-toplevel"]) else {
+    let Some(toplevel) = git_toplevel(workspace) else {
         return RepositoryIdentity {
             repository_hash: None,
             repository_label: None,
@@ -650,7 +679,6 @@ pub(crate) fn resolve_repository_identity(
             workspace_kind: Some("non_git".to_string()),
         };
     };
-    let toplevel = absolutize_git_path(workspace, &toplevel_raw);
     let Some(common_dir_raw) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
         return RepositoryIdentity {
             repository_hash: None,
@@ -724,39 +752,92 @@ pub(crate) fn repository_main_checkout(workspace: &Path) -> Option<PathBuf> {
     )
 }
 
+pub(crate) fn git_toplevel(workspace: &Path) -> Option<PathBuf> {
+    git_stdout(workspace, &["rev-parse", "--show-toplevel"])
+        .map(|raw| absolutize_git_path(workspace, &raw))
+
+}
+
 fn git_stdout(workspace: &Path, args: &[&str]) -> Option<String> {
+    let bytes = git_stdout_capped(workspace, args, GIT_STDOUT_MAX_BYTES).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(4096).collect())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GitOutputError {
+    Failed,
+    TooLarge,
+    TimedOut,
+}
+
+/// Successful git stdout, read while git runs so output over the pipe buffer
+/// cannot stall it. Reading stops past `max_bytes` (git then gets SIGPIPE).
+/// On timeout the child is killed and reaped; a reader still held open by a
+/// descendant is left to finish on its own thread.
+pub(crate) fn git_stdout_capped(
+    dir: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> Result<Vec<u8>, GitOutputError> {
     let mut child = Command::new("git")
         .arg("-C")
-        .arg(workspace)
+        .arg(dir)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output().ok()?;
-                if !status.success() {
-                    return None;
-                }
-                let text = String::from_utf8(output.stdout).ok()?;
-                let trimmed = text.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                return Some(trimmed.chars().take(4096).collect());
-            }
-            Ok(None) if started.elapsed() >= GIT_COMMAND_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => return None,
-        }
+        .map_err(|_| GitOutputError::Failed)?;
+    let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
+    fn stop(
+        mut child: std::process::Child,
+        error: GitOutputError,
+    ) -> Result<Vec<u8>, GitOutputError> {
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(error)
     }
+    let Some(stdout) = child.stdout.take() else {
+        return stop(child, GitOutputError::Failed);
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("ottto-git-stdout".to_string())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let read = stdout
+                .take(max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = sender.send(read);
+        });
+    if spawned.is_err() {
+        return stop(child, GitOutputError::Failed);
+    }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => return stop(child, GitOutputError::TimedOut),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return stop(child, GitOutputError::Failed),
+        }
+    };
+    let bytes = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => return Err(GitOutputError::Failed),
+        Err(_) => return Err(GitOutputError::TimedOut),
+    };
+    if bytes.len() > max_bytes {
+        return Err(GitOutputError::TooLarge);
+    }
+    if !status.success() {
+        return Err(GitOutputError::Failed);
+    }
+    Ok(bytes)
 }
 
 /// The directory holding the main checkout of a repository whose shared git
@@ -933,12 +1014,15 @@ fn parse_memory_file_row(cells: &[String]) -> Option<ContextFootprintItemInput> 
     })
 }
 
+/// Measures each loaded memory file and returns the symlink-resolved paths
+/// of the Project/Local rows, which the instruction inventory compares with.
 fn measure_memory_files(
     parsed: &mut ParsedContextFootprint,
     workspace: &Path,
     home: &Path,
     salt: Option<&[u8; 32]>,
-) {
+) -> BTreeSet<PathBuf> {
+    let mut observed = BTreeSet::new();
     for item in &mut parsed.memory_files {
         let Some(raw_path) = item.local_path.take() else {
             continue;
@@ -950,6 +1034,11 @@ fn measure_memory_files(
         } else {
             workspace.join(raw_path)
         };
+        if item.source.as_deref().is_some_and(|source| {
+            source.eq_ignore_ascii_case("Project") || source.eq_ignore_ascii_case("Local")
+        }) {
+            observed.insert(canonical_or_self(&path));
+        }
         let auto_memory = item
             .source
             .as_deref()
@@ -959,6 +1048,7 @@ fn measure_memory_files(
             item.file_counts = counts;
         }
     }
+    observed
 }
 
 fn parse_named_item_row(cells: &[String], kind: &str) -> Option<ContextFootprintItemInput> {
@@ -1450,7 +1540,7 @@ fn request_content_hash(parsed: &ParsedContextFootprint) -> Result<String> {
 pub(crate) fn request_content_hash_for_request(
     request: &ContextFootprintIngestRequest,
 ) -> Result<String> {
-    let canonical = serde_json::to_vec(&json!({
+    let mut canonical = json!({
         "cache_schema": "context_footprint_request_v3",
         "agent_source": &request.agent_source,
         "machine_id": &request.machine_id,
@@ -1475,8 +1565,15 @@ pub(crate) fn request_content_hash_for_request(
         "skills": &request.skills,
         "custom_agents": &request.custom_agents,
         "mcp_tools": &request.mcp_tools,
-    }))
-    .map_err(|error| anyhow!("hash encode failed: {error}"))?;
+    });
+    // Only when present, so requests without a block keep their digest
+    // (Codex footprints included) and a new block alone forces one upload.
+    if let Some(inventory) = &request.instruction_inventory {
+        canonical["instruction_inventory"] = serde_json::to_value(inventory)
+            .map_err(|error| anyhow!("hash encode failed: {error}"))?;
+    }
+    let canonical =
+        serde_json::to_vec(&canonical).map_err(|error| anyhow!("hash encode failed: {error}"))?;
     Ok(sha256_bytes(&canonical))
 }
 
@@ -2122,7 +2219,12 @@ mod tests {
         fs::write(home.join(".claude/CLAUDE.md"), "synthetic user instruction").unwrap();
         let markdown = format!("**Tokens:** 10k / 200k (5%)\n### Memory Files\n| AutoMem | {} | 6k |\n| Project | AGENTS.md | 1k |\n| User | ~/.claude/CLAUDE.md | 1k |", memory_path.display());
         let mut parsed = parse_context_markdown(&markdown).unwrap();
-        measure_memory_files(&mut parsed, &workspace, &home, Some(&[7; 32]));
+        let observed = measure_memory_files(&mut parsed, &workspace, &home, Some(&[7; 32]));
+        // Only Project/Local rows, symlink-resolved, feed the inventory.
+        assert_eq!(
+            observed,
+            BTreeSet::from([workspace.join("AGENTS.md").canonicalize().unwrap()])
+        );
         assert_eq!(parsed.memory_files[0].file_counts.loaded_lines, Some(200));
         assert_eq!(
             parsed.memory_files[0].file_counts.truncated_by_limit,
@@ -2520,6 +2622,7 @@ mod tests {
             skills: Vec::new(),
             custom_agents: Vec::new(),
             mcp_tools: Vec::new(),
+            instruction_inventory: None,
         }
     }
 
@@ -2548,5 +2651,82 @@ mod tests {
             base_hash,
             request_content_hash_for_request(&labels_disabled).unwrap()
         );
+    }
+
+    #[test]
+    fn instruction_inventory_rides_upload_digest_only_when_present() {
+        let without = sample_request();
+        let encoded = serde_json::to_value(&without).unwrap();
+        assert!(encoded.get("instruction_inventory").is_none());
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/context-footprint/instruction-inventory-v1.json"
+        ))
+        .unwrap();
+        let inventory: InstructionInventory = serde_json::from_value(
+            fixture["variants"]["default_mode"]["instruction_inventory"].clone(),
+        )
+        .unwrap();
+        let mut with = without.clone();
+        with.instruction_inventory = Some(inventory.clone());
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["instruction_inventory"],
+            fixture["variants"]["default_mode"]["instruction_inventory"]
+        );
+        let mut resized = with.clone();
+        resized
+            .instruction_inventory
+            .as_mut()
+            .unwrap()
+            .files
+            .entries[3]
+            .file_bytes += 1;
+        let hashes = [&without, &with, &resized]
+            .map(|request| request_content_hash_for_request(request).unwrap());
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[1], hashes[2]);
+        assert_eq!(hashes[1], request_content_hash_for_request(&with).unwrap());
+    }
+
+    #[test]
+    fn instruction_paths_need_an_explicit_labels_on_hint() {
+        assert_eq!(inventory_paths_for_hint(None), None);
+        assert_eq!(
+            inventory_paths_for_hint(Some(false)),
+            Some(InventoryPaths::Withhold)
+        );
+        assert_eq!(
+            inventory_paths_for_hint(Some(true)),
+            Some(InventoryPaths::Collect)
+        );
+    }
+
+    #[test]
+    fn capped_git_output_drains_large_output_and_refuses_over_cap() {
+        let repo = init_git_repo("git-capped");
+        let blob = repo.join("blob");
+        fs::write(&blob, "x".repeat(300_000)).unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["hash-object", "-w", "blob"])
+            .output()
+            .unwrap();
+        let id = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let args = ["cat-file", "-p", id.as_str()];
+        assert_eq!(
+            git_stdout_capped(&repo, &args, GIT_STDOUT_MAX_BYTES)
+                .unwrap()
+                .len(),
+            300_000
+        );
+        assert_eq!(
+            git_stdout_capped(&repo, &args, 100_000),
+            Err(GitOutputError::TooLarge)
+        );
+        assert_eq!(
+            git_stdout_capped(&repo, &["cat-file", "-p", "missing"], 1024),
+            Err(GitOutputError::Failed)
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 }
