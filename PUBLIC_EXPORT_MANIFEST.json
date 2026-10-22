@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 776,
-  "content_sha256": "e8050c746eb3839920d350d666f821d99475bc0763bb3e14cde0ef91ef0f59cb",
+  "content_sha256": "70909aef3f9b3b31324a78e3f5eb1a3b582c670118a243e13b406a502b141ef0",
   "files": [
     {
       "executable": false,
@@ -1406,8 +1406,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/prior_index_lifetime_tests.rs",
-      "sha256": "a5426f312b1703abdc31eeb8059211d547ec2e6944921b5efb49c5fab84a429d",
-      "size_bytes": 28624
+      "sha256": "e896475059812053d5bdc67a810043cb394a9994f407a204870f4b62dd4fa7f2",
+      "size_bytes": 29827
     },
     {
       "executable": false,

@@ -412,6 +412,35 @@ struct MoneyCycle {
     allowance: Vec<NativeAllowance>,
 }
 
+/// Wall-clock stamps the arms cannot share (they run one after another and
+/// may straddle a second): nulled before the comparison.
+fn money_unclocked(mut value: serde_json::Value) -> serde_json::Value {
+    const CLOCKED: [&str; 5] = [
+        "retry_after_unix_seconds",
+        "last_scan_started_at",
+        "last_scan_finished_at",
+        "last_success_at",
+        "next_retry_at",
+    ];
+    fn walk(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, field) in map.iter_mut() {
+                    if CLOCKED.contains(&key.as_str()) {
+                        *field = serde_json::Value::Null;
+                    } else {
+                        walk(field);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    walk(&mut value);
+    value
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MoneyArm {
     Unarmed,
@@ -555,10 +584,20 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
         };
         MoneyCycle {
             ok: result.is_ok(),
-            index: serde_json::to_vec(&ScanIndex::load(&index_path).unwrap()).unwrap(),
+            index: serde_json::to_vec(&money_unclocked(
+                serde_json::to_value(ScanIndex::load(&index_path).unwrap()).unwrap(),
+            ))
+            .unwrap(),
             progress,
             offered: server.offered.lock().unwrap().clone(),
-            terminal: server.terminal.lock().unwrap().clone(),
+            terminal: server
+                .terminal
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(money_unclocked)
+                .collect(),
             allowance,
         }
     };
