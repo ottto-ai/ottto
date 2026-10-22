@@ -1250,6 +1250,10 @@ fn process_scope(
     let mut added = Vec::new();
     let mut updates = Vec::new();
     for (id, mut items) in groups {
+        if stats.cut || Instant::now() >= run.deadline {
+            stats.cut = true;
+            break;
+        }
         scope.files = legacy_groups.remove(&id).unwrap_or_default();
         if scope.load_shard(&path, id).is_err() {
             // A damaged shard never causes a transcript re-read. Other

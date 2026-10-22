@@ -746,6 +746,8 @@ fn real_scale_gate() {
                 let mut out = Writer::open(&layout.daily_claude(day, n), true);
                 write_claude(&mut out, &mut rng, &shape);
                 written += out.bytes;
+                drop(out);
+                set_mtime(&layout.daily_claude(day, n), clock.end_of(60 + day));
             }
             // Sessions still going from the day before.
             for n in (0..claude_files).rev().filter(|n| n % 4 != 3).take(20) {
@@ -756,6 +758,8 @@ fn real_scale_gate() {
                 let mut out = Writer::open(&path, true);
                 write_claude(&mut out, &mut rng, &shape);
                 written += out.bytes;
+                drop(out);
+                set_mtime(&path, clock.end_of(60 + day));
             }
             for n in 0..daily_codex {
                 let path = layout.daily_codex(day, n);
@@ -777,6 +781,8 @@ fn real_scale_gate() {
                     true,
                 );
                 written += out.bytes;
+                drop(out);
+                set_mtime(&path, clock.end_of(60 + day));
             }
             println!("[prepare] new_mib={:.1}", written as f64 / 1048576.0);
         }
@@ -897,6 +903,24 @@ fn run_v1(layout: &Layout, now: OffsetDateTime, baseline: u64) {
         };
         let identity = composition_scan_identity(label, window, true);
         let scans = discover_workspaces(&[root], now_system, deadline).unwrap();
+        if std::env::var("COMPOSITION_SCALE_BUILD").is_err() {
+            let day = std::env::var("COMPOSITION_SCALE_DAY")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let daily = match source {
+                Source::Claude => layout.daily_claude(day, 0),
+                Source::Codex => layout.daily_codex(day, 0),
+            };
+            if fs::metadata(&daily).is_ok_and(|m| m.len() > 0) {
+                assert!(
+                    scans
+                        .iter()
+                        .any(|scan| scan.files.iter().any(|(path, _)| *path == daily)),
+                    "new daily transcripts must be visible to today's v1 discovery"
+                );
+            }
+        }
         for mut scan in scans {
             // Fixture cwd is on the first line; the production BufReader
             // fetches min(file size, 8192) bytes to resolve it.
