@@ -2365,6 +2365,9 @@ fn an_overlong_row_is_charged_its_salvaged_timestamp_at_the_real_room() {
     let mut timestamp = b"2026-08-02T08:20:00Z".to_vec();
     timestamp.resize(15 << 20, b'0');
     write_with_overlong(&scene.child.path, &child_values(), &timestamp);
+    // P's record sealed at the hook's `now` (a later wall-clock seal is a
+    // clock regression to the side fence).
+    scene.settle_side(now);
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut page = PageBudget::default();
     scene.hook_in(&cache, &hook_pass(), &mut page, now);
