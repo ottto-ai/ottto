@@ -126,6 +126,7 @@ fn record_request(
     request: &SnapshotBatchRequest,
     now: i64,
 ) -> std::io::Result<u64> {
+    fs::create_dir_all(support)?;
     snapshots::start_verdict_store::record(
         support,
         "synthetic-destination",
@@ -151,21 +152,21 @@ fn final_verdict_bridge_both_ways_missing_and_expired_are_unmeasured() {
     let source = "claude-code";
     let id = &request.snapshots[0].source_session_id;
     let get = |when| {
-        snapshots::start_verdict_store::load(&env.root, "synthetic-destination", when)
+        snapshots::start_verdict_store::load(&env.state, "synthetic-destination", when)
             .get(source, id, when)
     };
     assert_eq!(get(now.unix_timestamp()), StartVerdict::NotMeasured);
-    let bytes = record_request(&env.root, &request, now.unix_timestamp()).unwrap();
+    let bytes = record_request(&env.state, &request, now.unix_timestamp()).unwrap();
     assert!(bytes > 0);
     assert_eq!(get(now.unix_timestamp()), StartVerdict::Measured);
     assert_eq!(
-        record_request(&env.root, &request, now.unix_timestamp()).unwrap(),
+        record_request(&env.state, &request, now.unix_timestamp()).unwrap(),
         0
     );
     let unmeasured = verdict_request(Source::Claude, &path, false);
-    assert!(record_request(&env.root, &unmeasured, now.unix_timestamp() + 1).unwrap() > 0);
+    assert!(record_request(&env.state, &unmeasured, now.unix_timestamp() + 1).unwrap() > 0);
     assert_eq!(get(now.unix_timestamp() + 1), StartVerdict::NotMeasured);
-    assert!(record_request(&env.root, &request, now.unix_timestamp() + 2).unwrap() > 0);
+    assert!(record_request(&env.state, &request, now.unix_timestamp() + 2).unwrap() > 0);
     assert_eq!(get(now.unix_timestamp() + 2), StartVerdict::Measured);
     assert_eq!(
         get(now.unix_timestamp() + 93 * 86_400),
@@ -173,7 +174,7 @@ fn final_verdict_bridge_both_ways_missing_and_expired_are_unmeasured() {
     );
     assert_eq!(
         snapshots::start_verdict_store::load(
-            &env.root,
+            &env.state,
             "synthetic-destination",
             now.unix_timestamp() + 2
         )
@@ -215,7 +216,7 @@ fn measured_starts_skip_opening_and_unmeasured_or_missing_count_it() {
             write_records(&path, &records);
             if let Some(measured) = verdict {
                 let request = verdict_request(source, &path, measured);
-                record_request(&env.root, &request, now.unix_timestamp()).unwrap();
+                record_request(&env.state, &request, now.unix_timestamp()).unwrap();
             }
             env.run(source, now, None);
             let agg = env.scope(source).agg;
@@ -339,7 +340,7 @@ fn measured_start_does_not_suppress_prompts_after_a_dormant_prefix() {
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600))
             .unwrap();
         let request = verdict_request(source, &path, true);
-        record_request(&env.root, &request, now.unix_timestamp()).unwrap();
+        record_request(&env.state, &request, now.unix_timestamp()).unwrap();
         let first = env.run(source, now, None);
         assert_eq!(first.files_read, 0);
         let later = "later prompt must count";

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 798,
-  "content_sha256": "015de6547318879201a18c4c00b8cee615ab5b0bf9fad5542d46a64dde1d660b",
+  "content_sha256": "908d3b4b75fa4ab7b6e1f1dc0bc20c9c277032e46ca6c7e6b85ff9efa1109a3c",
   "files": [
     {
       "executable": false,
@@ -1021,8 +1021,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/checkpoint.rs",
-      "sha256": "e73536bfabec70837f064c4ac0362f2a5c297efdf2c83ec438cf1125342850f8",
-      "size_bytes": 34454
+      "sha256": "36d020b57af58068fc77e6184bbf14b8326602485e476e3e913f530e5921562e",
+      "size_bytes": 34530
     },
     {
       "executable": false,
@@ -1056,8 +1056,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/harvest.rs",
-      "sha256": "f8c83d342c9b655f02cb05ff9448e21c097652978d5f483d1637a8fc96e5263b",
-      "size_bytes": 89856
+      "sha256": "35e9627e64cb64e09f4f4da20b12caa559949cf80f808e58f2946962bcbb0fa9",
+      "size_bytes": 91421
     },
     {
       "executable": false,
@@ -1084,15 +1084,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/tests.rs",
-      "sha256": "d89b8a4238b2566894d89c9178141d8659e0124e8abc227831da9ab5f2b641e5",
-      "size_bytes": 177721
+      "sha256": "f91412cda1a7fb05c2bce0aa068e1fff4d0ef03325e4199d63f3b2e4bdee6057",
+      "size_bytes": 188466
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/tests/a34.rs",
-      "sha256": "0dd7d08699379068b7c2655b17745416cf01b01b5ecbf3ceb13bf8671ca6b295",
-      "size_bytes": 15992
+      "sha256": "5c51177197c4d583cb685a6874ee4d560001530c42e2ccbc2ee80812a16b3cd0",
+      "size_bytes": 16034
     },
     {
       "executable": false,
@@ -1959,8 +1959,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/start_verdict_store.rs",
-      "sha256": "895593a2f70d77fe52b1004dcbab017a7066e6f23cee5ff9f8167efab946b3c9",
-      "size_bytes": 11376
+      "sha256": "59b798c5a76b768a38a40475410aca29b73e68e3f2abcefc28245e2d20793a1f",
+      "size_bytes": 12702
     },
     {
       "executable": false,
@@ -3807,8 +3807,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-composition-session-identity-verdicts.md",
-      "sha256": "c97960bfcace76ff3a3c1a868b7acf17bc81ac05dad28801886b08fec914ee25",
-      "size_bytes": 1975
+      "sha256": "2224b53c4003a78f480502aa0b198a0f5cb635f8eb928bf67dac8fe58d015a28",
+      "size_bytes": 2991
     },
     {
       "executable": false,
@@ -5589,7 +5589,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T16:59:14+00:00",
+  "generated_at": "2026-10-22T17:22:36+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 799,
   "public_roots": [
@@ -5628,5 +5628,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0fd92736248f34b3eb8b4cde684a2402496c20c2"
+  "source_commit": "83b9cc41e975141b72bd67216f03ac6b6c6e6697"
 }

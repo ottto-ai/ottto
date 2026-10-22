@@ -44,17 +44,28 @@ fn key(destination: &str, source: &str, id: &str) -> String {
 
 impl Verdicts {
     pub(crate) fn get(&self, source: &str, id: &str, now: i64) -> StartVerdict {
-        match self.0.get(&key(&self.1, source, id)) {
-            Some(entry) if entry.measured && entry.at >= now - KEEP_SECONDS && entry.at <= now => {
-                StartVerdict::Measured
-            }
-            _ => StartVerdict::NotMeasured,
-        }
+        self.lookup(source, id, now)
+            .unwrap_or(StartVerdict::NotMeasured)
+    }
+
+    /// Distinguish an explicit unmeasured verdict from a verdict still pending.
+    pub(crate) fn lookup(&self, source: &str, id: &str, now: i64) -> Option<StartVerdict> {
+        self.0
+            .get(&key(&self.1, source, id))
+            .filter(|entry| entry.at >= now - KEEP_SECONDS && entry.at <= now)
+            .map(|entry| {
+                if entry.measured {
+                    StartVerdict::Measured
+                } else {
+                    StartVerdict::NotMeasured
+                }
+            })
     }
 }
 
 /// Read once per composition process, independently of the daemon's cache.
-/// Missing, corrupt or oversized state is unmeasured, never a held file.
+/// Missing, corrupt or oversized state supplies no verdict. The reader bounds
+/// how long a fresh opening can wait before counting it as unmeasured.
 pub(crate) fn load(support: &Path, destination: &str, _now: i64) -> Verdicts {
     let mut verdicts = read(support).unwrap_or_default();
     verdicts.1 = destination.to_string();
@@ -256,6 +267,27 @@ mod tests {
             ..Default::default()
         }));
         item
+    }
+
+    #[test]
+    fn start_verdict_lookup_distinguishes_missing_and_explicit_unmeasured() {
+        let support = crate::test_scratch::private_dir("verdict-lookup");
+        let now = 1_790_000_000;
+        let current = "synthetic-destination";
+        record(&support, current, "codex", [&item("s", false)], now).unwrap();
+        let verdicts = load(&support, current, now);
+        assert_eq!(
+            verdicts.lookup("codex", "s", now),
+            Some(StartVerdict::NotMeasured)
+        );
+        assert_eq!(verdicts.lookup("codex", "missing", now), None);
+        assert_eq!(verdicts.lookup("codex", "s", now - 1), None);
+        assert_eq!(verdicts.lookup("codex", "s", now + KEEP_SECONDS + 1), None);
+        assert_eq!(
+            load(&support, "other-destination", now).lookup("codex", "s", now),
+            None
+        );
+        fs::remove_dir_all(support).unwrap();
     }
 
     #[test]
