@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 767,
-  "content_sha256": "9c15bde1dabbd9d6fbb84322d07f1c7c6d5e008430dd6cda77a60a732b9f31c0",
+  "candidate_file_count": 768,
+  "content_sha256": "04d06387c3ceb5779595782e8272c24533f05a17adc9fac600f3b766c7df4e9f",
   "files": [
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "e9de9c342def9aa12a3d0f8ed4597019d79ab06c1d9bb4856ef915ef66c6bda5",
-      "size_bytes": 3068783
+      "sha256": "5442766eb7739e4da856beeb125cae1280af98850ff262b1baac1dfb271c1eae",
+      "size_bytes": 3070225
     },
     {
       "executable": false,
@@ -1765,6 +1765,13 @@
       "path": "crates/ottto-service/src/snapshots/session_start.rs",
       "sha256": "f8b357a75e72e73d5598d233a019587b4920e3d2c91895b1d51aa23844802e70",
       "size_bytes": 129921
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/source_session_id_tests.rs",
+      "sha256": "731f35db3db68334c9f34475fdb4aec6173f0c3e54070254f95f33dff93f0592",
+      "size_bytes": 3821
     },
     {
       "executable": false,
@@ -5372,9 +5379,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T12:54:53+00:00",
+  "generated_at": "2026-10-22T14:48:52+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 768,
+  "output_file_count": 769,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5411,5 +5418,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9f5a929fa9e3f926e8b3ab7088343d7dfd717c3f"
+  "source_commit": "663835637345acf7c79f7cbad1efb506b8974c97"
 }
