@@ -519,6 +519,7 @@ mod tests {
             claude_context_curve_identity_complete: false,
             claude_context_curve_request_index_complete: false,
             claude_context_curve_owned_start_proven: false,
+            claude_file_birth: Default::default(),
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,

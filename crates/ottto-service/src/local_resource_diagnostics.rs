@@ -32,6 +32,12 @@ pub(crate) fn codex_memo_lifecycle_totals(source: &str) {
     }
 }
 
+/// Local alarm, once per process: a Claude context fold first withheld
+/// session scalars for a resource limit (SOURCE Amendment 7). Counts only.
+pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
+    traversal_point("claude_context_resource_withhold", "claude_code", counts);
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Source {
