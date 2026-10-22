@@ -2631,9 +2631,24 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
         "PRECONDITION_NOT_REACHED: a natural authority record"
     );
 
+    let checkpoint = ScanIndex::load(&fixture.index_path).expect("load bound index");
+    let record = checkpoint
+        .claude_authority_record_for_test(APC_ROOT)
+        .expect("natural authority record persists");
     let mut value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
             .expect("decode saved index");
+    // A held family can already be re-armed. Seed nonempty revisions (the
+    // record's where retained, otherwise a controlled synthetic one) so this
+    // drop must clear every member before real pages prove they are re-read.
+    for (member, key) in ApcFixture::family_keys(&checkpoint) {
+        let revision = record
+            .member_source_file_fingerprints
+            .get(&member)
+            .cloned()
+            .unwrap_or_else(|| "5".repeat(64));
+        value["files"][&key]["source_file_fingerprint"] = serde_json::json!(revision);
+    }
     value["claude_usage_authority_quarantine"][APC_ROOT]["proven_witness_fingerprint"] =
         serde_json::json!("9".repeat(64));
     std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
@@ -2656,7 +2671,7 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
             );
             let (now_drops, now_rearmed) = crate::snapshots::claude_authority_drops_for_test();
             assert_eq!(now_drops, drops + 1, "one load drop and no save drop");
-            assert!(now_rearmed > rearmed && now_rearmed - rearmed <= family.len());
+            assert_eq!(now_rearmed - rearmed, family.len());
         }
         reread.extend(page.parsed.intersection(&family).cloned());
         held.extend(page.held_sessions.intersection(&family).cloned());

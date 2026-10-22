@@ -2553,19 +2553,19 @@ fn apc_unbound_fixture() -> ScanIndex {
 /// The fail-closed shape of `index`: only the authority record and its
 /// pending proof go, and only that family's indexed members are re-armed.
 fn apc_without_unbound_record(index: &ScanIndex) -> Value {
-    let mut expected = serde_json::to_value(index).unwrap();
-    expected["claude_usage_authority_quarantine"]
-        .as_object_mut()
-        .unwrap()
-        .remove(APC_ROOT);
-    expected["claude_usage_family_pending"]
-        .as_object_mut()
-        .unwrap()
-        .remove(APC_ROOT);
+    let mut expected = index.clone();
+    expected.claude_usage_authority_quarantine.remove(APC_ROOT);
+    expected.claude_usage_family_pending.remove(APC_ROOT);
     for key in apc_keys() {
-        expected["files"][key.as_str()]["source_file_fingerprint"] = json!("");
+        expected
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
     }
-    expected
+    // Empty maps are omitted by ScanIndex's persisted representation.
+    serde_json::to_value(expected).unwrap()
 }
 
 #[test]
