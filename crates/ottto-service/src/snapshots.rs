@@ -20166,13 +20166,15 @@ impl OwnedSourceScan {
                 if index.claude_reemission_excluded(&candidate) {
                     body_witness_adoption_excluded += 1;
                     decision = CandidateDecision::Skip;
-                } else if index.claude_reemission_exclusions.holds_without_list(
-                    opened_file
-                        .metadata()
-                        .and_then(|metadata| metadata.created())
-                        .ok()
-                        .and_then(unix_seconds),
-                ) {
+                } else if source == SnapshotSource::ClaudeCode
+                    && index.claude_reemission_exclusions.holds_without_list(
+                        opened_file
+                            .metadata()
+                            .and_then(|metadata| metadata.created())
+                            .ok()
+                            .and_then(unix_seconds),
+                    )
+                {
                     body_witness_adoption_held_no_list += 1;
                     decision = CandidateDecision::Skip;
                 } else if !index.claude_reemission_exclusions.pauses_adoption()
@@ -55754,8 +55756,10 @@ mod tests {
             projection_adoption_fixture("claude-context-backfill-codex", 3);
         index.activate_effective_upload_body_witness_revision(1);
         let previous = index.clone();
-        let mut adopted =
-            projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        // The Claude-only list never holds Codex adoption, whatever its age.
+        let mut adopted = claude_reemission_exclusions::with_no_list_cutoff(u64::MAX, || {
+            projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
         assert_eq!(adopted.scanned_file_count, 3);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut adopted, &mut index);
         let accepted = adopted

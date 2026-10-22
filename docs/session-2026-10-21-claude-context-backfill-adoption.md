@@ -62,7 +62,9 @@ proof re-arm can re-read members of an unlisted root, so list roots.
   - Installed: the first well-formed read writes a 0600 seen-marker
     `claude_code-reemission-exclusions.seen` beside the list. An empty but
     well-formed file counts as installed. The marker is outside the rebuildable
-    scan index, so a restart or an index rebuild keeps it.
+    scan index, so a restart or an index rebuild keeps it. If the marker cannot
+    be written, adoption pauses (`marker_unwritable`) until it is, so a later
+    missing file is never mistaken for a list that was never installed.
   - Marker present and file missing: adoption pauses (budget 0, every
     adoption-only file deferred), the log line reports
     `body_witness_adoption_list=missing_after_install`, and each Claude cycle
@@ -71,7 +73,8 @@ proof re-arm can re-read members of an unlisted root, so list roots.
     service log (`local_resource_diagnostics`, local only, no wire field).
     Restoring the file (empty is fine) resumes.
   - Unreadable, oversized or malformed: adoption pauses that cycle, as before.
-  - Changed and new files are never held or paused by the list.
+  - Changed and new files are never held or paused by the list, and the hold
+    applies to Claude Code only (Codex and Pi never load the list).
 - A listed file is one whose family root id or own member id digest is in the
   list. When only the re-read selects it, it takes the ordinary Skip: no read,
   no upload, old stamp kept, no budget used. When its recovery settles, its line
@@ -80,7 +83,7 @@ proof re-arm can re-read members of an unlisted root, so list roots.
 - The parse-reason log line adds `body_witness_adoption_excluded=<n>`,
   `body_witness_adoption_held_no_list=<n>`,
   `body_witness_adoption_exclusions_invalid=<0|1>` and
-  `body_witness_adoption_list=<not_installed|installed|missing_after_install|unreadable>`.
+  `body_witness_adoption_list=<not_installed|installed|missing_after_install|unreadable|marker_unwritable>`.
   No id, digest or path is logged.
 
 ## Release rule
@@ -130,7 +133,8 @@ the server are unchanged.
 
 - `claude_context_backfill_selects_every_root_and_subagent_once`
 - `claude_context_backfill_resumes_after_restart_without_rereading_settled_files`
-- `claude_context_backfill_leaves_codex_and_pi_unselected`
+- `claude_context_backfill_leaves_codex_and_pi_unselected` (Codex adoption is
+  never held by the Claude list, whatever the file's age)
 - `claude_context_backfill_spreads_adoption_only_files_over_pages`
 - `claude_context_backfill_quarantined_family_keeps_its_own_retry_gate`
 - `claude_context_backfill_skips_sessions_on_the_local_reemission_list`
@@ -140,5 +144,5 @@ the server are unchanged.
   (also restart and index rebuild keep the marker)
 - `snapshots::claude_reemission_exclusions::tests` (never installed holds old
   and unknown only, empty list writes a 0600 marker and a later missing file
-  pauses, listed root or member, malformed and oversized lists never write the
+  pauses, an unwritable marker pauses until written, listed root or member, malformed and oversized lists never write the
   marker)

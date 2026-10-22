@@ -16,7 +16,9 @@
 //!   ones proceed. The protected sessions are all older than that.
 //! - Installed once: the first well-formed read (an empty file counts) writes
 //!   a 0600 seen-marker beside the list. The marker lives outside the
-//!   rebuildable scan index, so an index rebuild or a restart keeps it.
+//!   rebuildable scan index, so an index rebuild or a restart keeps it. Until
+//!   the marker is written, adoption pauses, so a later missing file can
+//!   never be mistaken for a list that was never installed.
 //! - Marker present and file missing: adoption pauses, the status reason says
 //!   so, and a local alarm is raised every cycle until the file is back.
 //! - Unreadable, oversized or malformed: adoption pauses.
@@ -47,6 +49,8 @@ pub(crate) enum ListState {
     MissingAfterInstall,
     /// Unreadable, oversized or malformed file, or an unreadable marker: paused.
     Unreadable,
+    /// A well-formed list whose seen-marker could not be written: paused.
+    MarkerUnwritable,
 }
 
 impl ListState {
@@ -56,6 +60,7 @@ impl ListState {
             Self::Installed => "installed",
             Self::MissingAfterInstall => "missing_after_install",
             Self::Unreadable => "unreadable",
+            Self::MarkerUnwritable => "marker_unwritable",
         }
     }
 }
@@ -102,14 +107,15 @@ impl ReemissionExclusions {
             Err(_) => return Self::with_state(ListState::Unreadable),
         };
         let mut bytes = Vec::new();
-        let loaded = match file.take(MAX_BYTES + 1).read_to_end(&mut bytes) {
+        let mut loaded = match file.take(MAX_BYTES + 1).read_to_end(&mut bytes) {
             Ok(_) if bytes.len() as u64 <= MAX_BYTES => Self::parse(&bytes),
             _ => Self::with_state(ListState::Unreadable),
         };
-        if loaded.state == ListState::Installed {
-            // Best effort: a failed write is retried next cycle. Until it
-            // lands, a missing file still holds every old entity.
-            let _ = write_seen_marker(&Self::seen_marker_path(support_dir));
+        if loaded.state == ListState::Installed
+            && write_seen_marker(&Self::seen_marker_path(support_dir)).is_err()
+        {
+            // Retried next cycle. Adoption waits for a durable marker.
+            loaded.state = ListState::MarkerUnwritable;
         }
         loaded
     }
@@ -157,12 +163,12 @@ impl ReemissionExclusions {
         self.state == ListState::Unreadable
     }
 
-    /// Adoption takes no file this cycle: the list is unreadable, or it was
-    /// installed once and is now missing.
+    /// Adoption takes no file this cycle: the list is unreadable, it was
+    /// installed once and is now missing, or its install is not yet recorded.
     pub(crate) fn pauses_adoption(&self) -> bool {
         matches!(
             self.state,
-            ListState::Unreadable | ListState::MissingAfterInstall
+            ListState::Unreadable | ListState::MissingAfterInstall | ListState::MarkerUnwritable
         )
     }
 
@@ -293,6 +299,30 @@ mod tests {
             ReemissionExclusions::load(&dir).state(),
             ListState::Installed
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_marker_pauses_until_the_install_is_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_scratch::ScratchDir::new("reemission-exclusions-unwritable");
+        let path = ReemissionExclusions::path(&dir);
+        let snapshots = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let set_mode = |mode| {
+            std::fs::set_permissions(&snapshots, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set_mode(0o500);
+        let unrecorded = ReemissionExclusions::load(&dir);
+        set_mode(0o700);
+        assert_eq!(unrecorded.state(), ListState::MarkerUnwritable);
+        assert_eq!(unrecorded.state().as_str(), "marker_unwritable");
+        assert!(unrecorded.pauses_adoption());
+        assert!(!ReemissionExclusions::seen_marker_path(&dir).exists());
+        let recorded = ReemissionExclusions::load(&dir);
+        assert_eq!(recorded.state(), ListState::Installed);
+        assert!(ReemissionExclusions::seen_marker_path(&dir).exists());
     }
 
     #[test]
