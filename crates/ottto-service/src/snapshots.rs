@@ -16666,7 +16666,22 @@ impl CodexProofReader {
     }
 
     /// One row (or one chunk of an overlong skip); the bytes it consumed.
-    fn step(&mut self) -> u64 {
+    /// Fix round 2c (DM1): `slack` is the room left by the step's charge. A
+    /// reader that has not taken its first `session_meta` decodes a framed
+    /// line `L` only if `2L + CODEX_PROOF_HEADER_RETAINED` fits it, and a
+    /// paused skip salvages only a buffered prefix it holds; otherwise
+    /// nothing is decoded or kept (`refused`).
+    fn step(&mut self, slack: usize) -> u64 {
+        let header = !self.parser.accumulator.codex_session_meta_seen;
+        self.parser.reader.retain_room = Some(RetainRoom {
+            line: if header {
+                Some(slack.saturating_sub(CODEX_PROOF_HEADER_RETAINED) / 2)
+            } else {
+                None
+            },
+            salvage: slack,
+            refused: false,
+        });
         let before = self.parser.reader.consumed_bytes();
         match self.parser.step() {
             Ok(complete) => self.done = complete,
@@ -16676,6 +16691,15 @@ impl CodexProofReader {
             }
         }
         self.parser.reader.consumed_bytes().saturating_sub(before)
+    }
+
+    /// Fix round 2c: the last step refused a line or salvage its room did
+    /// not hold.
+    fn refused(&self) -> bool {
+        self.parser
+            .reader
+            .retain_room
+            .is_some_and(|room| room.refused)
     }
 }
 
@@ -16750,6 +16774,26 @@ pub(in crate::snapshots) fn codex_proof_step_reserve() -> u64 {
         .saturating_add(1)
 }
 
+/// U1a-2a (fix round 2c, DM1; derivation in the U1a-2a deltas, fix round
+/// 2b): the most one line adds to the readers' retained state whatever its
+/// length or shape, beyond a first header's strings and a paused skip's
+/// salvage (charged by their known lengths): P's ledger row and ring slot
+/// and a child's paged signature (64-byte SHA-256 hex), and P's
+/// acquisition head/boundary samples and their staged copy
+/// (`SAMPLE_BYTES` each, at most doubled capacity).
+const CODEX_PROOF_LINE_RETAINED: usize = 4 * crate::transcript_acquisition::SAMPLE_BYTES + 1024;
+
+/// U1a-2a (fix round 2c, DM1): what a reader's first `session_meta` keeps
+/// beyond `2L` (its header strings: each a distinct string of the line,
+/// copied at most twice): a child's prelude parser with its two capped
+/// copies (id, cwd) and its client version (at most 64 bytes), and the
+/// creator evidence (two SHA-256 hex hashes and one RFC 3339 time).
+const CODEX_PROOF_HEADER_RETAINED: usize =
+    std::mem::size_of::<crate::codex_prelude_footprint::CodexPreludeParser>()
+        + 2 * crate::codex_prelude_footprint::MAX_SMALL_TEXT_BYTES
+        + 64
+        + 512;
+
 impl CodexProofReaders {
     pub(in crate::snapshots) fn new(
         parent_id: String,
@@ -16798,9 +16842,12 @@ impl CodexProofReaders {
     /// `room` (`proof_room` less the rest of the job) with one more line:
     /// an E3 estimate (the last walk, plus every byte consumed since, plus
     /// the buffers' capacity growth since), walked again every
-    /// `CHARGE_REFRESH_BYTES`, plus `MAX_JSONL_LINE_BYTES`. When it does
-    /// not fit, every reader buffer is shrunk and the readers walked once
-    /// more; still too large: `Memory`, before reading the line.
+    /// `CHARGE_REFRESH_BYTES`, plus `MAX_JSONL_LINE_BYTES` and
+    /// `CODEX_PROOF_LINE_RETAINED`. When it does not fit, every reader
+    /// buffer is shrunk and the readers walked once more; still too large:
+    /// `Memory`, before reading the line. Fix round 2c: a first header or
+    /// a salvage over the slack left is refused before it is decoded or
+    /// kept: `Memory` (`step_fits`).
     pub(in crate::snapshots) fn run(&mut self, budget: &mut u64, room: usize) -> CodexProofRun {
         let reserve = codex_proof_step_reserve();
         let mut walk = None;
@@ -16820,14 +16867,19 @@ impl CodexProofReaders {
             if *budget < reserve {
                 return CodexProofRun::Budget;
             }
-            if !self.step_fits(&mut walk, room) {
+            let Some(slack) = self.step_fits(&mut walk, room) else {
                 return CodexProofRun::Memory;
-            }
-            match trailing {
+            };
+            let refused = match trailing {
                 Some((at, next)) if self.parent.done || self.ring.get(next).is_some() => {
-                    self.step_child(at, next, budget);
+                    self.step_child(at, next, slack, budget)
                 }
-                trailing => self.step_parent(trailing.map(|(at, _)| at), budget),
+                trailing => self.step_parent(trailing.map(|(at, _)| at), slack, budget),
+            };
+            if refused {
+                // Fix round 2c: a header or salvage over its room. Nothing
+                // of it is kept; the job is dropped (`StepRefusedMemory`).
+                return CodexProofRun::Memory;
             }
             self.note_peak(room);
         }
@@ -16880,46 +16932,37 @@ impl CodexProofReaders {
         })
     }
 
-    /// R2-B1, owner note 4 (r79), fix rounds 2/2b (DM1): whether the
-    /// readers' charge before one more line fits `room` (`run`). From a walk
-    /// `W` (with buffer capacity `B`) and `s` bytes consumed since (`s <
-    /// CHARGE_REFRESH_BYTES`), the readers hold at most
+    /// R2-B1, owner note 4 (r79), fix round 2c (DM1): the room left for
+    /// the next line's retained growth (`run`), or `None`: no step. From a
+    /// walk `W` (with buffer capacity `B`) and `s` bytes consumed since
+    /// (`s < CHARGE_REFRESH_BYTES`), the readers hold at most
     /// `W + (W - B) + 2s + ΔB` before the next line, on E3's premise
     /// (retained growth at most twice the bytes consumed) plus one doubling
-    /// of every walked non-buffer container and the measured buffer growth;
-    /// one `MAX_JSONL_LINE_BYTES` is charged for the next line's buffer.
-    ///
-    /// Fix round 2b (DM1 ruling (a), derivation in the U1a-2a deltas):
-    /// the readers' retained growth for one line `L` is NOT a fixed `k`.
-    /// An ordinary line adds at most a fixed amount (P: its ledger row and
-    /// one ring slot, 64-byte signatures; the acquisition's head/boundary
-    /// samples, `SAMPLE_BYTES` each, and their staged copy; a child: its
-    /// paged signature and fixed-size digest/counters). Line-proportional
-    /// retention remains in two places: each reader's first `session_meta`
-    /// line keeps its header strings (`codex_creator_header_id` and
-    /// `source_session_id` both copy the id, `started_at` and
-    /// `last_activity_at` both copy the timestamp, `origin.*`,
-    /// `workspace_path`, `codex_parent_session_ref`: at most `2L`, once per
-    /// reader), and an overlong line's paused skip keeps its salvaged
-    /// timestamp (`skipping`, at most `L`, one per reader). So a step stays
-    /// within `room + k` for an ordinary line and within
-    /// `room + 2 × MAX_JSONL_LINE_BYTES` at those lines, not `room`.
-    /// Charging `2 × MAX_JSONL_LINE_BYTES` would exceed the whole proof room
-    /// (`STATE_BYTES` = 31 MiB) and refuse every step; the bound is a
-    /// disclosure for the parent's ruling. Like main's E3, the transient
-    /// `serde_json::Value` of a line being decoded is not charged. Fresh
-    /// walks use `s = 0`; a miss re-walks, then shrinks the buffers and
-    /// re-walks.
-    fn step_fits(&mut self, walk: &mut Option<ProofWalk>, room: usize) -> bool {
+    /// of every walked non-buffer container and the measured buffer growth.
+    /// The next line is charged `MAX_JSONL_LINE_BYTES` for its buffer and
+    /// `CODEX_PROOF_LINE_RETAINED` (k) for what any line keeps; what is left
+    /// is the slack. The two line classes that keep line-proportional bytes
+    /// are charged by a length known before they keep it (`RetainRoom`,
+    /// `CodexProofReader::step`): a reader's first `session_meta`, framed at
+    /// `L` bytes, `2L + CODEX_PROOF_HEADER_RETAINED`; a paused overlong
+    /// skip's salvage, its buffered prefix. Over the slack: nothing is kept
+    /// and the step is refused (`Memory`). So after every step the readers'
+    /// retained state is within `room`, for every line class. Excluded, as
+    /// in main's E3 and reported apart: the transient `serde_json::Value`
+    /// of a line while it is decoded (no whole-process bound is claimed).
+    /// Fresh walks use `s = 0`; a miss re-walks, then shrinks the buffers
+    /// and re-walks.
+    fn step_fits(&mut self, walk: &mut Option<ProofWalk>, room: usize) -> Option<usize> {
         let buffers = self.buffers();
         let worst = |walk: ProofWalk, since: usize, buffers: usize| {
             walk.charge
                 .checked_add(walk.charge.saturating_sub(walk.buffers))?
                 .checked_add(since.checked_mul(2)?)?
                 .checked_add(buffers.saturating_sub(walk.buffers))?
-                .checked_add(MAX_JSONL_LINE_BYTES)
+                .checked_add(MAX_JSONL_LINE_BYTES)?
+                .checked_add(CODEX_PROOF_LINE_RETAINED)
         };
-        let fits = |need: Option<usize>| need.is_some_and(|need| need <= room);
+        let slack = |need: Option<usize>| need.and_then(|need| room.checked_sub(need));
         let estimate = walk.and_then(|walk| {
             let since = self.consumed.checked_sub(walk.consumed)?;
             if since >= sampled_scan::codex_cursor::CHARGE_REFRESH_BYTES {
@@ -16927,19 +16970,20 @@ impl CodexProofReaders {
             }
             worst(walk, usize::try_from(since).ok()?, buffers)
         });
-        if fits(estimate) {
-            return true;
+        if let Some(slack) = slack(estimate) {
+            return Some(slack);
         }
         *walk = self.walk();
-        if fits(walk.and_then(|walk| worst(walk, 0, walk.buffers))) {
-            return true;
+        if let Some(slack) = slack(walk.and_then(|walk| worst(walk, 0, walk.buffers))) {
+            return Some(slack);
         }
         self.shrink_buffers();
         *walk = self.walk();
-        fits(walk.and_then(|walk| worst(walk, 0, walk.buffers)))
+        slack(walk.and_then(|walk| worst(walk, 0, walk.buffers)))
     }
 
-    fn step_child(&mut self, at: usize, next: u64, budget: &mut u64) {
+    /// One child step; whether it was refused (fix round 2c).
+    fn step_child(&mut self, at: usize, next: u64, slack: usize, budget: &mut u64) -> bool {
         let signature = self.ring.get(next).map(|(signature, _)| signature.clone());
         let child = &mut self.children[at];
         let accumulator = &mut child.reader.parser.accumulator;
@@ -16952,23 +16996,29 @@ impl CodexProofReaders {
                 signature,
             });
         }
-        let read = child.reader.step();
+        let read = child.reader.step(slack);
+        let refused = child.reader.refused();
         self.charge(read, budget);
+        refused
     }
 
-    fn step_parent(&mut self, trailing: Option<usize>, budget: &mut u64) {
-        let read = self.parent.step();
+    /// One P step; whether it was refused (fix round 2c).
+    fn step_parent(&mut self, trailing: Option<usize>, slack: usize, budget: &mut u64) -> bool {
+        let read = self.parent.step(slack);
         self.charge(read, budget);
+        if self.parent.refused() {
+            return true;
+        }
         let Some(signature) = self.parent.parser.accumulator.codex_proof_ledger_row.take() else {
-            return;
+            return false;
         };
         let Some(at) = trailing else {
             // Every child has a result: P alone, no window.
-            return;
+            return false;
         };
         let row_end = self.parent.parser.reader.consumed_bytes();
         if self.ring.push(&signature, row_end) {
-            return;
+            return false;
         }
         // The window cannot take P's next signature: the trailing child
         // cannot be served. It is undecidable; the rest retry once.
@@ -16985,6 +17035,7 @@ impl CodexProofReaders {
                 }
             }
         }
+        false
     }
 
     fn charge(&mut self, read: u64, budget: &mut u64) {
@@ -26645,6 +26696,30 @@ struct BoundedJsonlReader<R> {
     /// passed (S12); `LossySameObject` (ruling 2) is not a sealed-prefix
     /// certificate and permits only an uncertified publication.
     sealed_prefix: Option<sampled_scan::codex_cursor::FinishGrant>,
+    /// U1a-2a (fix round 2c, DM1): a proof reader's retained-growth room,
+    /// handed in before each step. `None` for every other reader: no check.
+    retain_room: Option<RetainRoom>,
+}
+
+/// U1a-2a (fix round 2c, DM1): the lengths a proof reader may still retain
+/// in one step, checked once the line is framed and before it is decoded or
+/// salvaged (the length hand-off; the charge is the proof job's). A line or
+/// salvage over its room is neither decoded nor kept: `refused`, and the
+/// reader does not resume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct RetainRoom {
+    /// Most framed bytes a line may have to be decoded; `None`: any.
+    pub(in crate::snapshots) line: Option<usize>,
+    /// Most buffered prefix bytes a paused overlong skip may salvage.
+    pub(in crate::snapshots) salvage: usize,
+    pub(in crate::snapshots) refused: bool,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for RetainRoom {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
 }
 
 impl<R: BufRead> BoundedJsonlReader<R> {
@@ -26665,6 +26740,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             last_line_end: 0,
             sealed_fragment: None,
             sealed_prefix: None,
+            retain_room: None,
         }
     }
 
@@ -26729,6 +26805,12 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         }
         if self.finished {
             return Ok(JsonlReaderStep::Complete(self.report));
+        }
+        if self.retain_room.is_some_and(|room| room.refused) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "a refused line cannot resume",
+            ));
         }
         if self.skipping.is_none() {
             self.buf.clear();
@@ -26819,6 +26901,16 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                             // The capped prefix is final once overflowed, so
                             // its salvage is taken now and the bytes dropped
                             // (E4): the same envelope the newline would give.
+                            // U1a-2a (fix round 2c): a proof reader salvages
+                            // only a prefix its room holds.
+                            if let Some(room) = self.retain_room.as_mut().filter(|room| {
+                                early.is_none()
+                                    && salvage_codex_envelope
+                                    && buf.len() > room.salvage
+                            }) {
+                                room.refused = true;
+                                return Ok(JsonlReaderStep::Partial);
+                            }
                             self.skipping = Some(early.take().unwrap_or_else(|| {
                                 EarlySalvage::take(buf, salvage_codex_envelope)
                             }));
@@ -26846,6 +26938,16 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             // Clean EOF with no pending bytes.
             self.finished = true;
             return Ok(JsonlReaderStep::Complete(*report));
+        }
+        // U1a-2a (fix round 2c): a proof reader decodes only a framed line
+        // its room holds; an overlong line decodes only its salvage.
+        if let Some(room) = self
+            .retain_room
+            .as_mut()
+            .filter(|room| !overflowed && room.line.is_some_and(|line| buf.len() > line))
+        {
+            room.refused = true;
+            return Ok(JsonlReaderStep::Partial);
         }
         apply_physical_line(
             buf,
@@ -74951,6 +75053,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
             last_line_end,
             sealed_fragment,
             sealed_prefix,
+            retain_room,
         } = self;
         c.add(reader.capacity())?;
         buf.heap_bound(c)?;
@@ -74967,6 +75070,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
         last_line_end.heap_bound(c)?;
         sealed_fragment.heap_bound(c)?;
         sealed_prefix.heap_bound(c)?;
+        retain_room.heap_bound(c)?;
         acquisition.heap_bound(c)
     }
 }
