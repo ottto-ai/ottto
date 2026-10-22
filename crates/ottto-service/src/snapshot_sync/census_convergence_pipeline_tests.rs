@@ -51,6 +51,8 @@ struct PipelinePage {
     fully_settled: bool,
     backfill_succeeded: bool,
     held: BTreeSet<String>,
+    /// Exact held bodies observed before production classification removes them.
+    held_bodies: Vec<SnapshotItem>,
     /// The page's hold classification, before settlement.
     progress_blocking: bool,
     uploaded: BTreeSet<String>,
@@ -271,6 +273,13 @@ impl PipelineFixture {
             },
         );
         before_classify(&mut index);
+        let held_fingerprints = disposition.quarantined_fingerprints(&scan.snapshots);
+        let held_bodies = scan
+            .snapshots
+            .iter()
+            .filter(|item| held_fingerprints.contains(&item.snapshot_fingerprint))
+            .cloned()
+            .collect();
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
             &mut index,
@@ -415,6 +424,7 @@ impl PipelineFixture {
             fully_settled,
             backfill_succeeded: census_complete && !census_withheld && fully_settled,
             held: holds.held_fingerprints,
+            held_bodies,
             progress_blocking: holds.progress_blocking,
             uploaded,
             uploaded_bodies,
@@ -535,10 +545,10 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
         .all(|fingerprint| baseline.accepted_snapshot_fingerprint_recorded(fingerprint)));
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
 
-    let counter_before = terminal_hold_settlement_count();
+    let counter_before = restorable_hold_settlement_count();
     let pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         counter_before,
         "Completed account hold adds zero"
     );
@@ -1317,14 +1327,14 @@ fn terminal_bound_hold_traversal(
 #[serial(source_manifests)]
 fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
     let _source_manifests = SourceManifestTestGuard::new();
-    let settled_before = terminal_hold_settlement_count();
+    let settled_before = restorable_hold_settlement_count();
     let (_fixture, baseline, first, last) = terminal_bound_hold_traversal(
         "claude-census-rejected-terminal-bound-hold",
         PipelineUpload::ServerRejected,
         false,
     );
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         settled_before + 1,
         "exactly one eligible Rejected settlement decision"
     );
@@ -1426,10 +1436,10 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
             true,
         ),
     ] {
-        let before = terminal_hold_settlement_count();
+        let before = restorable_hold_settlement_count();
         let (_fixture, _baseline, first, last) =
             terminal_bound_hold_traversal(name, upload, retry_pending);
-        assert_eq!(terminal_hold_settlement_count(), before, "{name}");
+        assert_eq!(restorable_hold_settlement_count(), before, "{name}");
         assert!(first.index.bounded_sweep_had_unsettled_upload(), "{name}");
         assert!(!last.scan.census_complete, "{name}: owes a clean follow-up");
         assert!(!last.backfill_succeeded, "{name}");
@@ -1441,7 +1451,7 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
 
     // Path (b): a replay reset leaves the bound terminal hold nothing to
     // restore, so a Rejected page still blocks.
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let fixture = PipelineFixture::new("claude-census-rejected-unrestorable-hold");
     fixture.baseline();
     fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
@@ -1465,14 +1475,15 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
     assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
 }
 
 // Every test that can increment this process-wide counter uses
 // serial(source_manifests), including APC pipeline and h357 hold tests.
 // Controls retain that lock across both readings; never reset the counter.
-fn terminal_hold_settlement_count() -> u64 {
-    CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS.load(std::sync::atomic::Ordering::Relaxed)
+fn restorable_hold_settlement_count() -> u64 {
+    CHECKPOINTED_PAGES_SETTLED_WITH_NON_PROGRESSING_RESTORABLE_HOLDS
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 const PIPELINE_REFUSED_SESSION: &str = PIPELINE_SESSIONS[1];
@@ -1532,7 +1543,7 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
         true,
     );
 
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let next = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
     let last = next.last().unwrap();
     assert!(last.scan.census_complete);
@@ -1563,7 +1574,7 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
         .index
         .context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         before,
         "Completed account-hold settlement does not increment the Rejected counter"
     );
@@ -1577,7 +1588,7 @@ fn checkpointed_hold_diagnostic_names_non_progressing_restorable_holds() {
         checkpointed_hold_settlement_diagnostic(),
         format!(
             "{} page(s) settled with non-progressing restorable holds",
-            terminal_hold_settlement_count()
+            restorable_hold_settlement_count()
         )
     );
 }
@@ -1630,7 +1641,7 @@ fn capture_on_rejected_account_hold_release_uploads_new_contract_tags() {
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
     fixture.append(PIPELINE_REFUSED_SESSION, "req_1_2");
     fixture.conflicting_creator = true;
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let held = with_cycle_contract_for_test(V2, || {
         fixture.page(
             "2026-08-02T10:00:00Z",
@@ -1642,15 +1653,14 @@ fn capture_on_rejected_account_hold_release_uploads_new_contract_tags() {
         )
     });
     assert_eq!(held.result, ResumableUploadResult::Rejected { count: 1 });
-    assert_eq!(terminal_hold_settlement_count(), before + 1);
+    assert_eq!(restorable_hold_settlement_count(), before + 1);
     assert_eq!(held.held.len(), 1);
     assert!(!held.progress_blocking);
     assert_eq!(held.index.claude_account_deferred_hold_count(), 1);
     assert!(!held.index.bounded_sweep_had_unsettled_upload());
     assert!(!held.fully_settled);
     let held_body = held
-        .scan
-        .snapshots
+        .held_bodies
         .iter()
         .find(|item| item.source_session_id == PIPELINE_HELD_SESSION)
         .expect("v2 account-held body parsed");
@@ -1703,7 +1713,7 @@ fn capture_on_rejected_account_hold_release_uploads_new_contract_tags() {
             Some(expected_org.as_str())
         );
     }
-    assert_eq!(terminal_hold_settlement_count(), before + 1);
+    assert_eq!(restorable_hold_settlement_count(), before + 1);
 }
 
 fn assert_real_rejected_hold(
@@ -1713,7 +1723,7 @@ fn assert_real_rejected_hold(
     reason: &'static str,
     account_hold: bool,
 ) {
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let first = fixture.page(
         "2026-08-02T09:00:00Z",
         cycle,
@@ -1723,7 +1733,7 @@ fn assert_real_rejected_hold(
         },
     );
     assert_eq!(first.result, ResumableUploadResult::Rejected { count: 1 });
-    assert_eq!(terminal_hold_settlement_count(), before + 1);
+    assert_eq!(restorable_hold_settlement_count(), before + 1);
     assert_eq!(first.held.len(), 1);
     assert_eq!(
         first.uploaded.len(),
@@ -1766,7 +1776,7 @@ fn assert_real_rejected_hold(
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     assert!(last.held.is_empty());
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         before + 1,
         "no-hold page adds zero"
     );
@@ -1901,7 +1911,7 @@ fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_co
         proven_owner_session: Some(PIPELINE_HELD_SESSION),
         ..PIPELINE_HOLD_CYCLE
     };
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let first = fixture.page_before_classify(
         "2026-08-02T09:00:00Z",
         &cycle,
@@ -1921,7 +1931,7 @@ fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_co
     let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
 }
 
 #[test]
@@ -1936,7 +1946,7 @@ fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
         proven_owner_session: Some(PIPELINE_HELD_SESSION),
         ..PIPELINE_HOLD_CYCLE
     };
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let first = fixture.page_before_classify(
         "2026-08-02T09:00:00Z",
         &cycle,
@@ -1964,7 +1974,7 @@ fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
     let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
 }
 
 #[test]
@@ -1975,7 +1985,7 @@ fn rejected_page_with_cap_refused_account_hold_blocks_without_counting() {
     let baseline = fixture.baseline();
     let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let first = fixture.page_before_classify(
         "2026-08-02T09:00:00Z",
         &PIPELINE_HOLD_CYCLE,
@@ -2009,7 +2019,7 @@ fn rejected_page_with_cap_refused_account_hold_blocks_without_counting() {
     );
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
 }
 
 #[test]
@@ -2025,7 +2035,7 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
         proven_owner_session: Some(PIPELINE_HELD_SESSION),
         ..PIPELINE_HOLD_CYCLE
     };
-    let before = terminal_hold_settlement_count();
+    let before = restorable_hold_settlement_count();
     let earlier = fixture.page(
         "2026-08-02T09:00:00Z",
         &cycle,
@@ -2036,7 +2046,7 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
         "earlier debt is unrelated to the later local hold"
     );
     assert!(earlier.index.bounded_sweep_had_unsettled_upload());
-    assert_eq!(terminal_hold_settlement_count(), before);
+    assert_eq!(restorable_hold_settlement_count(), before);
     let held_page = fixture.page(
         "2026-08-02T09:01:00Z",
         &cycle,
@@ -2045,7 +2055,7 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
     assert_eq!(held_page.held.len(), 1);
     assert!(!held_page.progress_blocking);
     assert_eq!(
-        terminal_hold_settlement_count(),
+        restorable_hold_settlement_count(),
         before + 1,
         "eligible decision still counted once"
     );
@@ -2057,13 +2067,13 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
     assert_eq!(last.scan.census_window_end, earlier.scan.census_window_end);
     assert!(!last.scan.census_complete);
     assert!(!last.backfill_succeeded);
-    assert_eq!(terminal_hold_settlement_count(), before + 1);
+    assert_eq!(restorable_hold_settlement_count(), before + 1);
     assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
 }
 
 #[test]
 #[serial(source_manifests)]
-fn no_hold_rejected_and_deferred_pages_never_increment_the_terminal_hold_counter() {
+fn no_hold_rejected_and_deferred_pages_never_increment_the_restorable_hold_counter() {
     let _source_manifests = SourceManifestTestGuard::new();
     for upload in [
         PipelineUpload::ServerRejected,
@@ -2075,13 +2085,13 @@ fn no_hold_rejected_and_deferred_pages_never_increment_the_terminal_hold_counter
             proven_owner_session: Some(PIPELINE_HELD_SESSION),
             ..PIPELINE_HOLD_CYCLE
         };
-        let before = terminal_hold_settlement_count();
+        let before = restorable_hold_settlement_count();
         let first = fixture.page("2026-08-02T09:00:00Z", &cycle, upload);
         assert!(first.held.is_empty());
         assert_eq!(
             first.index.bounded_sweep_had_unsettled_upload(),
             upload == PipelineUpload::ServerDeferred
         );
-        assert_eq!(terminal_hold_settlement_count(), before, "{upload:?}");
+        assert_eq!(restorable_hold_settlement_count(), before, "{upload:?}");
     }
 }

@@ -1,4 +1,4 @@
-# Checkpointed pages settled with terminal-bound holds
+# Checkpointed pages settled with non-progressing restorable holds
 
 A validated `Rejected` upload can settle traversal when every local hold is
 non-progressing and restorable through the same path as a `Completed` upload.
@@ -22,13 +22,13 @@ Settling an eligible later page never clears earlier traversal debt.
 ## Counter scope
 
 The existing checkpointed-upload log line includes
-`N page(s) settled with terminal-bound holds`. The content-free relaxed atomic
-`CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS` counts eligible settlement
+`N page(s) settled with non-progressing restorable holds`. The content-free relaxed atomic
+`CHECKPOINTED_PAGES_SETTLED_WITH_NON_PROGRESSING_RESTORABLE_HOLDS` counts eligible settlement
 **decisions across the process lifetime**. It increments exactly once when a
 `Rejected` page selects the non-progressing, restorable-hold branch, including
-recorded Claude account deferrals. The label uses the existing Completed hold
-classification; it does not imply every eligible account hold has terminal
-authority.
+recorded Claude account deferrals and literal holds. These holds need not
+have terminal authority; the label names the existing Completed eligibility
+predicate without asserting an authority reason.
 
 The increment precedes the durable index save. It counts neither durable-save
 successes nor unique pages, sources, windows, files or families. A repeated
@@ -52,5 +52,13 @@ counter deltas. Every test that can mutate this counter shares the
 the dominated-refusal/local-hold fixture. Counter tests retain that lock across
 both observations and never reset the process total.
 
-This follow-up changes tests and documentation only. CI supplies execution
-receipts; no local cargo command, tests or installed-runtime reads are needed.
+Capture-ON coverage accepts a v1 identity body, flips to v2, and puts a revised
+family with contradictory creator evidence on a real Rejected page. The durable
+restore keeps its accepted predecessor and reparse debt. After that account hold
+is released, the exact body sent to transport must carry v2 provenance and row
+identity evidence, and become durably accepted.
+
+The counter wording and identifier now describe all eligible holds accurately.
+This follow-up changes diagnostics, tests and documentation; settlement behavior
+is unchanged. CI supplies execution receipts; no local cargo command, tests or
+installed-runtime reads are needed.

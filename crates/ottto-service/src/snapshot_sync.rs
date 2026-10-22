@@ -417,16 +417,17 @@ fn settle_completed_upload(
     }
 }
 
-/// Process-local, content-free count of `Rejected` pages whose local holds
-/// were all terminal-bound and settled through the `Completed` restore path.
-static CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// Process-lifetime, content-free count of `Rejected` settlement decisions
+/// whose holds were non-progressing and restorable, including recorded
+/// account and literal holds. Incremented before the durable index save.
+static CHECKPOINTED_PAGES_SETTLED_WITH_NON_PROGRESSING_RESTORABLE_HOLDS:
+    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Keep the exact summary used by the checkpointed-upload log testable.
 fn checkpointed_hold_settlement_diagnostic() -> String {
     format!(
-        "{} page(s) settled with terminal-bound holds",
-        CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+        "{} page(s) settled with non-progressing restorable holds",
+        CHECKPOINTED_PAGES_SETTLED_WITH_NON_PROGRESSING_RESTORABLE_HOLDS
             .load(std::sync::atomic::Ordering::Relaxed)
     )
 }
@@ -445,7 +446,7 @@ fn settle_checkpointed_upload(
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
 ) -> UploadIndexSettlement {
-    let terminal_bound_holds = resolved_permanent_rejections
+    let restorable_holds = resolved_permanent_rejections
         && holds.any()
         && !holds.progress_blocking
         && index.locally_held_keys_restorable(
@@ -453,8 +454,8 @@ fn settle_checkpointed_upload(
             &holds.held_fingerprints,
             &holds.account_deferred_fingerprints,
         );
-    let mut index = if terminal_bound_holds {
-        CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+    let mut index = if restorable_holds {
+        CHECKPOINTED_PAGES_SETTLED_WITH_NON_PROGRESSING_RESTORABLE_HOLDS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         index.into_locally_held_keys_reverted(
             committed_index,
@@ -470,7 +471,7 @@ fn settle_checkpointed_upload(
     } else {
         index
     };
-    let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
+    let settled = resolved_permanent_rejections && (!holds.any() || restorable_holds);
     if !settled {
         index.mark_bounded_sweep_unsettled();
     }
@@ -3398,6 +3399,8 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         last_turn_context_tokens: item.last_turn_context_tokens,
         compaction_count: item.compaction_count,
         compaction_timestamps: item.compaction_timestamps.clone(),
+        compaction_events: item.compaction_events.clone(),
+        local_context_points: Vec::new(),
         compaction_total_pre_tokens: item.compaction_total_pre_tokens,
         compaction_total_post_tokens: item.compaction_total_post_tokens,
         compaction_total_cumulative_dropped_tokens: item.compaction_total_cumulative_dropped_tokens,
@@ -4755,7 +4758,7 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load(&index_path)?;
+    let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -9114,6 +9117,45 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::snapshots::finalize_scan_after_policy;
+    #[test]
+    fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
+        let root = crate::test_scratch::ScratchDir::new("retry-compaction-events");
+        let path = root.join("rollout-retry-compaction.jsonl");
+        let token = |at: &str, total: u64, last: u64| {
+            serde_json::json!({"type":"event_msg", "timestamp":at,
+            "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+            "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":total/10},
+            "last_token_usage":{"input_tokens":last,"cached_input_tokens":last/2,"output_tokens":last/10}}}})
+        };
+        let lines = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"retry-compaction"}}),
+            token("2026-10-07T11:00:00Z", 240_000, 240_000),
+            serde_json::json!({"timestamp":"2026-10-07T11:10:00Z","type":"compacted","payload":{"replacement_history":[]}}),
+            token("2026-10-07T11:20:00Z", 299_000, 59_000),
+        ];
+        let body = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, body).unwrap();
+        let mut item =
+            crate::snapshots::parse_codex_jsonl_file(&path, "2026-10-07T12:00:00Z", "fp".into())
+                .unwrap()
+                .remove(0);
+        item.cache_observations = None;
+        item.cache_base_head_etag = None;
+        assert_eq!(item.compaction_events.len(), 1);
+        assert!(!item.local_context_points.is_empty());
+
+        let copy = retry_ordinary_owned(&item).expect("ordinary item copies");
+
+        assert_eq!(copy.compaction_events, item.compaction_events);
+        assert!(copy.local_context_points.is_empty());
+        assert_eq!(
+            serde_json::to_value(&copy).unwrap()["compaction_events"],
+            serde_json::to_value(&item).unwrap()["compaction_events"]
+        );
+    }
     #[test]
     fn native_comparison_decision_records_bounded_base_fold_without_completion() {
         use crate::snapshots::claude_native_comparison::{lifecycle, Completion};
