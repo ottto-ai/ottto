@@ -5583,44 +5583,62 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     duplicate_census.census_complete = census_complete;
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
 
-    // SOURCE FE1: an unverified prefix/tail is observation only. API rows
-    // beyond it may be auxiliary calls, so unequal request sets do NOT fence
-    // proof. Explicitly exclude these roots from fresh and reconstructed
-    // proofs, witnesses, owned-start/2c and design-E/posture admission.
-    // Path membership is not a proof binding: a rediscovered/renamed file
-    // can retain a different logical session id. Bind current bodies by the
-    // exact revision that owns the durable unverified marker as well.
+    // SOURCE (B): only FE-published sealed prefixes are excluded. Ordinary
+    // EOF-recomposed Tail/Unchanged bodies keep positive proof/posture behavior
+    // while still owing their Full audit. D1 tail records used directly, without
+    // a complete current native body, remain observation-only evidence.
+    // Bind prefix provenance by exact revision as well as physical path: a
+    // logical family can differ from its index key, and D1 can be missing.
     let uncertified_revisions = index
         .files
         .values()
-        .filter(|entry| entry.has_unverified_source())
+        .filter(|entry| entry.has_prefix_provenance())
         .map(|entry| entry.source_file_fingerprint.as_str())
         .filter(|revision| !revision.is_empty())
         .collect::<BTreeSet<_>>();
     let mut uncertified_roots = index
         .claude_request_census
         .records()
-        .filter(|(_, record)| record.unverified_or_twin())
+        .filter(|(_, record)| {
+            record.unverified_or_twin()
+                && !(record.can_bind_recomposed_body()
+                    && snapshots.iter().any(|item| {
+                        item.source_file_fingerprint
+                            .as_deref()
+                            .is_some_and(|revision| {
+                                !uncertified_revisions.contains(revision)
+                                    && claude_request_census::fingerprint_matches(record, revision)
+                            })
+                    }))
+        })
         .map(|(key, _)| key)
         .chain(
             index
                 .files
                 .iter()
-                .filter(|(_, entry)| entry.has_unverified_source())
+                .filter(|(_, entry)| entry.has_prefix_provenance())
                 .map(|(key, _)| key),
         )
         .filter_map(|key| claude_index_path_family_member(Path::new(key)))
         .map(|(root, _)| root)
         .collect::<BTreeSet<_>>();
+    let mut prefix_excluded_bodies = 0u64;
     uncertified_roots.extend(
         snapshots
             .iter()
             .filter(|item| {
-                item.source_file_fingerprint
+                let prefix = item
+                    .source_file_fingerprint
                     .as_deref()
-                    .is_some_and(|revision| uncertified_revisions.contains(revision))
+                    .is_some_and(|revision| uncertified_revisions.contains(revision));
+                prefix_excluded_bodies = prefix_excluded_bodies.saturating_add(u64::from(prefix));
+                prefix
             })
             .map(claude_snapshot_family_root),
+    );
+    crate::local_resource_diagnostics::cache_lifecycle::add(
+        crate::local_resource_diagnostics::cache_lifecycle::Event::PrefixExcludedBody,
+        prefix_excluded_bodies,
     );
     drop(uncertified_revisions);
     let complete_families = if census_complete {
@@ -19701,6 +19719,31 @@ impl OwnedSourceScan {
                     } else if source_verified {
                         index.complete_full_audit(&index_key, &source_file_fingerprint);
                     }
+                    if source == SnapshotSource::ClaudeCode {
+                        if claude_grown_prefix {
+                            index.mark_sealed_prefix(&index_key, &source_file_fingerprint);
+                        } else if completed_acquisition.is_some()
+                            && cursor_fragment.is_none()
+                            && file_sampling.as_ref().is_some_and(|active| {
+                                !matches!(
+                                    active.mode,
+                                    crate::transcript_acquisition::ReadMode::Unchanged
+                                )
+                            })
+                            && state_census_complete
+                            && sidecar_census_complete
+                            && sampled_jsonl::loss_free_source_report(
+                                &report,
+                                recognized_usage_drop_count,
+                                dropped_usage_record_count,
+                            )
+                        {
+                            index.complete_native_recomposition(
+                                &index_key,
+                                &source_file_fingerprint,
+                            );
+                        }
+                    }
                     if let Some(fragment) = cursor_fragment {
                         index.stage_sampled_audit(
                             &index_key,
@@ -32761,14 +32804,8 @@ impl ScanIndex {
                     retained.source_file_fingerprint.clear();
                 }
             }
-            if let Some(due) = working.unverified_deadline() {
-                if let Some(retained) = result.files.get_mut(key) {
-                    retained.set_unverified_deadline(
-                        retained
-                            .unverified_deadline()
-                            .map_or(due, |old| old.min(due)),
-                    );
-                }
+            if let Some(retained) = result.files.get_mut(key) {
+                retained.carry_sampled_audit(working);
             }
         }
         result.restore_claude_empty_map_advances(empty_advances);
@@ -33370,8 +33407,7 @@ impl ScanIndex {
         let scan_identity_version = self
             .files
             .get(&key)
-            .and_then(ScanIndexEntry::unverified_deadline)
-            .map(sampled_audit::marker)
+            .map(ScanIndexEntry::carried_audit_version)
             .unwrap_or_else(|| LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
         // Carried like the body witness; a configured singleton parse then
         // sets it to that parse's decided version.

@@ -1180,7 +1180,12 @@ fn fe_claude_unverified_source_api_rows_beyond_prefix_cannot_mint_v1() {
     let mut grown = grown_full();
     assert_eq!(grown.seen.unreadable, 0);
     assert!(!grown.result.snapshots.is_empty());
-    assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
+    let (positive, counts) = observe(|| mints_v1(&mut grown.index, &grown.result, 0..9));
+    assert!(!positive);
+    assert_eq!(
+        counts.prefix_excluded_bodies,
+        grown.result.snapshots.len() as u64
+    );
     assert!(!grown
         .index
         .claude_usage_family_witnesses
@@ -1515,14 +1520,19 @@ fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
     );
     assert_eq!(seen.unreadable, 0);
     base.index = index;
-    assert!(!mints_v1(&mut base.index, &result, 0..9));
+    // Assess exclusion without carrying the separate same-window member-
+    // change invalidation into this provenance-recovery regression.
+    let mut prefix_observation = base.index.clone();
+    assert!(!mints_v1(&mut prefix_observation, &result, 0..9));
     assert!(base.cache.retained_checkpoint(&base.key).is_none());
     assert!(base
         .cache
         .retained()
         .unwrap()
         .insert(base.key.clone(), complete));
-    let (mut index, result, seen) = plain(&base.fixture, CLAUDE, base.index, &base.cache);
+    let ((mut index, result, seen), counts) =
+        observe(|| plain(&base.fixture, CLAUDE, base.index, &base.cache));
+    assert_eq!(counts.prefix_tag_clears, 1);
     assert_eq!(
         seen.modes,
         (0, 1, 0),
@@ -1539,4 +1549,70 @@ fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
         .unwrap()
         .unverified_or_twin());
     assert!(mints_v1(&mut index, &result, 0..9));
+}
+
+/// A later grown Tail publication still owes the prefix exclusion, even if
+/// its retained baseline was complete. Appending to a prefix is not clearing.
+#[test]
+fn fe_claude_prefix_then_grown_tail_does_not_clear_provenance() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut base = baseline(CLAUDE, 4, 2);
+    let complete = base.cache.take(&base.key).unwrap();
+    let path = base.path.clone();
+    let (index, _, seen, _) = page_injecting(
+        &base.fixture,
+        CLAUDE,
+        std::mem::take(&mut base.index),
+        &base.cache,
+        is_full,
+        |_| append_raw(&path, &row_bytes(CLAUDE, 6..9)),
+    );
+    assert_eq!(seen.unreadable, 0);
+    assert!(index.files[&base.key].has_prefix_provenance());
+    assert!(base
+        .cache
+        .retained()
+        .unwrap()
+        .insert(base.key.clone(), complete));
+    let ((mut index, result, seen, _), counts) = observe(|| {
+        page_injecting(
+            &base.fixture,
+            CLAUDE,
+            index,
+            &base.cache,
+            |mode| mode == ReadMode::Tail,
+            |_| append_raw(&path, &row_bytes(CLAUDE, 9..10)),
+        )
+    });
+    assert_eq!(seen.unreadable, 0);
+    assert_eq!(counts.prefix_tag_clears, 0);
+    assert!(index.files[&base.key].has_prefix_provenance());
+    assert!(!mints_v1(&mut index, &result, 0..10));
+}
+
+/// Review: terminal line loss can settle a page, but cannot use its matching
+/// unverified D1 record to grant proof merely by inheriting a clean old tag.
+#[test]
+fn fe_claude_lossy_tail_cannot_inherit_complete_provenance_for_d1_proof() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 1);
+    base.fixture
+        .file
+        .append(&json!({"type":"ignored", "padding":"x".repeat(MAX_JSONL_LINE_BYTES + 1024)}));
+    append_raw(&base.path, &row_bytes(CLAUDE, 5..6));
+    let (mut index, result, seen) = plain(&base.fixture, CLAUDE, base.index, &base.cache);
+    assert_eq!(seen.modes, (0, 1, 0));
+    assert!(!result.snapshots.is_empty());
+    assert!(base.cache.retained_checkpoint(&base.key).is_none());
+    assert!(index
+        .claude_request_census_for_test()
+        .get(&base.key)
+        .unwrap()
+        .unverified_or_twin());
+    assert!(!mints_v1(&mut index, &result, 0..9));
+    assert!(!index.claude_usage_family_witnesses.contains_key(SESSION));
 }

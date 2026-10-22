@@ -20,15 +20,31 @@ audit debt keeps its deadline. A Full with no earlier obligation prepares a
 bounded deadline before reading within the existing audit metadata-slot bound; a stable verified completion clears it, while
 a grown publication keeps it for the quiet audit.
 
-An unverified D1 source record or durable audit marker explicitly excludes its
-family from fresh or reconstructed proof and v1, owned-start certification,
-cache/curve admission and both strict and file-birth posture admission. API rows
-assigned by traces may legitimately exceed transcript request sets as auxiliary
-calls, so request-set inequality alone is insufficient. Historical witnesses and
-their demotion/hold accounting remain intact, but cannot authorize the prefix.
-Missing D1 records still fail closed through the durable audit marker. The
-marker also binds the emitted source-file fingerprint to its logical family,
-so physical-key drift cannot bypass the reconstruction exclusion.
+SOURCE ruling (B) narrows exclusion to FE-published sealed prefixes and D1 tail
+records used directly without native recomposition. A matching D1 record must
+also describe a current loss-free parse: terminal oversized-line settlement,
+path twins and stale or retired records cannot grant the recomposition exemption. Ordinary fully recomposed,
+EOF-revalidated Tail/Unchanged bodies retain proof, v1, owned-start, cache/curve
+and posture admission while continuing to owe their Full audit. API rows assigned
+by traces may exceed transcript request sets as auxiliary calls, so request-set
+inequality alone is insufficient. Historical witnesses remain available for
+existing demotion/hold accounting, but cannot authorize a prefix.
+
+Provenance uses the existing version string:
+`semantic_sync:v2+sampled_unverified:v2:<deadline>:p` for a prefix, or `:c` for a
+complete native recomposition. A known clean full identity also means complete;
+old, unknown, missing or malformed provenance fails closed. Tags remain within
+the existing 64-byte marker allocation. Record, replay, normalization, unsettled
+subset carry and save/load preserve prefix exclusion and the oldest deadline.
+Missing D1 is harmless: the tag binds the exact source-file fingerprint to its
+logical family even after physical-key drift.
+
+Only an EOF-revalidated loss-free native Full/Tail recomposition or Full audit
+can clear the tag, bound to the exact recorded fingerprint. A Tail replays a
+complete retained baseline; FE never inserts a prefix reduction. A later grown
+Tail publication keeps the prefix tag. Clearing provenance on a complete Tail
+keeps its audit deadline and does not mark its D1 record source-verified. Local
+content-free totals count `prefix_excluded_bodies` and `prefix_tag_clears`.
 
 The certificate accepts the append-only sample-preserving interior-rewrite
 residual. The existing quiet full audit repairs the observed body and emits
