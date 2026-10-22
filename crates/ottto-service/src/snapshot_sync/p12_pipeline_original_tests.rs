@@ -368,6 +368,7 @@ impl RearmFixture {
             account_witness: [7; 32],
             scan_started_at: collected_at.to_owned(),
             activity_hint: hint,
+            money_policy: None,
             receipt_window_days: 183,
             context_curve_enabled: true,
             cache_observations_enabled: false,

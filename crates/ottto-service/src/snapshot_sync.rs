@@ -4198,6 +4198,8 @@ struct SourcePreparation {
     account_witness: [u8; 32],
     scan_started_at: String,
     activity_hint: crate::snapshot_client::ActivityHintResponse,
+    // Captured before the hint's raw attribution key is consumed/zeroized.
+    money_policy: Option<[u8; 32]>,
     receipt_window_days: u64,
     context_curve_enabled: bool,
     cache_observations_enabled: bool,
@@ -4803,6 +4805,8 @@ fn prepare_sync_source(
         home,
         &scan_agent_status_collection.codex_scan_homes,
     )?;
+    let money_policy = source_money_resume(source, support_dir)
+        .then(|| money_resume::policy(activity_hint.clone()));
     let mut encoded_attribution_key = activity_hint.session_attribution_hmac_key.take();
     let attribution_context = SessionAttributionContext::from_activity_hint(
         source,
@@ -5082,6 +5086,7 @@ fn prepare_sync_source(
         account_witness,
         scan_started_at,
         activity_hint,
+        money_policy,
         receipt_window_days,
         context_curve_enabled,
         cache_observations_enabled,
@@ -5237,6 +5242,7 @@ async fn finish_sync_source_resume(
         account_witness,
         scan_started_at,
         activity_hint,
+        money_policy: _,
         receipt_window_days,
         context_curve_enabled,
         cache_observations_enabled,
@@ -5366,6 +5372,7 @@ async fn finish_sync_source_resume(
             comparison_completion.as_mut(),
             native_comparison_lease.as_mut(),
             money_memory.as_deref_mut(),
+            true,
         )
         .await;
         let (disposition, census_withheld, stats) = match applied {
@@ -7328,6 +7335,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         comparison,
         lease,
         None,
+        cfg!(test), // Production synchronous caller is snapshot-audit, not a collector.
     );
     #[cfg(test)]
     {
@@ -7351,6 +7359,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
     mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&mut crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     money_memory: Option<&mut money_resume::Memory>,
+    money_allowed: bool,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -7359,9 +7368,10 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
     ),
     crate::source_rotation::LocalRefusal,
 > {
-    let request_owned_live = comparison
-        .as_ref()
-        .map_or(true, |completion| !completion.filters_emission())
+    let request_owned_live = money_allowed
+        && comparison
+            .as_ref()
+            .map_or(true, |completion| !completion.filters_emission())
         && crate::snapshots::claude_request_money::request_owned_live(support_dir);
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
@@ -7741,7 +7751,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
     // its writer thread after this page. Never fails or changes the page.
-    if !request_owned_live {
+    if !request_owned_live && money_allowed {
         crate::snapshots::claude_request_money::shadow_page(
             support_dir,
             &scan_result.snapshots,
@@ -21511,7 +21521,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, money_policy, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 
