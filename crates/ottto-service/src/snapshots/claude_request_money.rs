@@ -12,7 +12,8 @@
 //! store (`store`), one in-memory copy per support directory: the index's
 //! bytes, live allowances, save and validation are the same armed or not.
 //! Its file writes (the B1 JSONL and the ledger's changed shards) are handed
-//! to one writer thread after the page, outside `SNAPSHOT_SYNC_LOCK`.
+//! to one writer thread after the page, outside `SNAPSHOT_SYNC_LOCK`; the
+//! JSONL rows are serialized there, from the page's built families.
 //!
 //! Each authoritative Claude page builds a second body beside the live one
 //! (`body::build_claude_request_body`), checks its certificate, and writes
@@ -25,16 +26,16 @@
 //! the exit criterion. The reader keeps each family's latest rows by
 //! `snapshot` (page sequence); nothing is deduplicated on the writer side. A
 //! page whose batch is dropped or not written owes a false coverage row to
-//! its day, written with the next batch. All of its memory is admitted
-//! before allocation against the shadow's own ceiling and its work runs
-//! under a deadline; a refusal skips the page's shadow, writes a false
-//! coverage row and is counted.
+//! its day (a marker file keeps the debt across a restart), written with the
+//! next batch. All of its memory is admitted before allocation against the
+//! shadow's own ceiling and its work runs under a deadline; a refusal skips
+//! the page's shadow, writes a false coverage row and is counted.
 //!
 //! The shadow never fails or stalls the live page: a panic is caught (the
 //! shadow is then off for the rest of the process, counted), every phase
 //! under the sync lock checks the page deadline, and a local file
 //! (`<support>/claude-request-money-shadow.off`) turns it off without a
-//! release.
+//! release. Off, it captures nothing either.
 
 pub(crate) mod body;
 pub(crate) mod capture;
@@ -411,23 +412,81 @@ fn shadow_scope(support_dir: &Path) -> PathBuf {
     }
 }
 
-/// The finalizer captures for the money shadow only where it is armed. In
-/// tests: a transcript under the parent of an enabled support directory
-/// (fixtures keep both side by side); in production: always.
+/// The finalizer captures for the money shadow only where it is armed and
+/// not off (Sol R4-3): the panic latch, or the scope's last page saw the
+/// local kill switch. In tests: a transcript under the parent of an enabled
+/// support directory (fixtures keep both side by side); in production:
+/// always.
 pub(crate) fn capture_armed(path: &Path) -> Option<PathBuf> {
+    if SHADOW_PANICKED.load(Ordering::Acquire) {
+        return None;
+    }
+    #[cfg(test)]
+    let scope = SHADOW_ENABLED_FOR_TEST
+        .lock()
+        .expect("shadow control")
+        .iter()
+        .find(|dir| dir.parent().is_some_and(|base| path.starts_with(base)))
+        .cloned();
+    #[cfg(not(test))]
+    let scope = {
+        let _ = path;
+        Some(PathBuf::new())
+    };
+    scope.filter(|scope| !SHADOW_OFF.lock().is_ok_and(|off| off.contains(scope)))
+}
+
+/// Scopes whose last page found the shadow off (the kill switch file).
+static SHADOW_OFF: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// The shadow is off for `support_dir` (panic latch or kill switch): the
+/// scope stops capturing and its waiting captures are dropped.
+fn shadow_off(support_dir: &Path) -> bool {
+    let scope = shadow_scope(support_dir);
+    let off = SHADOW_PANICKED.load(Ordering::Acquire) || support_dir.join(SHADOW_OFF_FILE).exists();
+    if let Ok(mut scopes) = SHADOW_OFF.lock() {
+        if off {
+            scopes.insert(scope.clone());
+        } else {
+            scopes.remove(&scope);
+        }
+    }
+    if off {
+        capture::purge_before(&scope, Instant::now());
+    }
+    off
+}
+
+/// Faults a test injects at the page's last gates (the caller's thread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum PageFault {
+    None,
+    /// The deadline passes just before the families are handed over.
+    LateAtHandOff,
+    /// The batch's admission is refused.
+    BatchRefused,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAGE_FAULT: std::cell::Cell<PageFault> = const { std::cell::Cell::new(PageFault::None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_page_fault_for_test(fault: PageFault) {
+    PAGE_FAULT.with(|current| current.set(fault));
+}
+
+fn faulted(fault: PageFault) -> bool {
     #[cfg(test)]
     {
-        SHADOW_ENABLED_FOR_TEST
-            .lock()
-            .expect("shadow control")
-            .iter()
-            .find(|dir| dir.parent().is_some_and(|base| path.starts_with(base)))
-            .cloned()
+        PAGE_FAULT.with(|current| current.get()) == fault
     }
     #[cfg(not(test))]
     {
-        let _ = path;
-        Some(PathBuf::new())
+        let _ = fault;
+        false
     }
 }
 
@@ -448,6 +507,10 @@ impl ShadowReservation {
             })
             .ok()
             .map(|_| Self(bytes))
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.0
     }
 }
 
@@ -623,6 +686,13 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) absent_members_old_known: u64,
     pub(crate) absent_members_old_unknown: u64,
     pub(crate) coverage_complete: u64,
+    /// The ledger state walk ran out of the page's time: its walked fields
+    /// are the last walk's (or zero).
+    pub(crate) state_counts_late: u64,
+    /// T-empty units a held-unbuilt-older rule would hold (SOURCE, count
+    /// only): an unbuilt file of the unit's group born before its holder,
+    /// or of unknown birth.
+    pub(crate) undecided_unbuilt_older: u64,
     /// Time under the sync lock, every phase included but this line's write.
     pub(crate) elapsed_us: u64,
 }
@@ -749,13 +819,13 @@ struct SignedRequestsTokens {
 
 /// One family's body (B1 `family` row).
 #[derive(Debug, Serialize)]
-struct FamilyRow<'a> {
+struct FamilyRow {
     row: &'static str,
     v: u8,
     counting: &'static str,
     snapshot: u64,
     observed_unix: u64,
-    family: &'a str,
+    family: String,
     category: ClaudeFamilyCategory,
     coverage_complete: bool,
     members_built: usize,
@@ -782,6 +852,20 @@ struct FamilyRow<'a> {
     /// Census `u` of the members not in this page, and how many were unknown.
     absent_old: RequestsTokens,
     absent_old_unknown: u64,
+}
+
+/// One family's rows as the page hands them to the writer: its family row
+/// and its differing slices, serialized there (outside the sync lock).
+pub(crate) struct FamilyRows {
+    row: FamilyRow,
+    grains: BTreeMap<ClaudeGrainKey, (ClaudeGrainSide, ClaudeGrainSide)>,
+}
+
+impl FamilyRows {
+    /// Rows this family writes: its grains and its family row.
+    fn rows(&self) -> u64 {
+        self.grains.len() as u64 + 1
+    }
 }
 
 /// The page's custody flag (B1 `coverage` row).
@@ -896,10 +980,7 @@ pub(crate) fn shadow_page(
     trace_report: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
 ) {
-    if !shadow_enabled(support_dir)
-        || SHADOW_PANICKED.load(Ordering::Acquire)
-        || support_dir.join(SHADOW_OFF_FILE).exists()
-    {
+    if !shadow_enabled(support_dir) || shadow_off(support_dir) {
         return;
     }
     guarded(|| {
@@ -1043,13 +1124,18 @@ pub(crate) fn shadow_page_at(
     let key_bytes = index.files.keys().map(String::len).sum::<usize>();
     // Census records of members the index no longer lists: the scope walks
     // them too.
-    let (residue_records, residue_key_bytes) = index
-        .claude_request_census
-        .records()
-        .filter(|(key, _)| !index.files.contains_key(*key))
-        .fold((0_usize, 0_usize), |(records, bytes), (key, _)| {
-            (records + 1, bytes.saturating_add(key.len()))
-        });
+    let (mut residue_records, mut residue_key_bytes) = (0_usize, 0_usize);
+    for (key, _) in index.claude_request_census.records() {
+        if Instant::now() >= deadline {
+            counts.refused_deadline = 1;
+            purge_captures(&scope_key, &mut counts);
+            return refuse(&end, None, index, roots.len(), counts);
+        }
+        if !index.files.contains_key(key) {
+            residue_records += 1;
+            residue_key_bytes = residue_key_bytes.saturating_add(key.len());
+        }
+    }
     let admission = occurrences
         .saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES)
         .saturating_add(row_charge(live_rows))
@@ -1358,6 +1444,7 @@ pub(crate) fn shadow_page_at(
         trace: &traces,
         telemetry_complete_through: complete_through,
         deadline,
+        unbuilt_older: std::cell::Cell::new(0),
     };
     let retired_roots =
         claude_request_ledger::roots_with_retired_records(&index.claude_request_census);
@@ -1443,6 +1530,7 @@ pub(crate) fn shadow_page_at(
         bodies.push((root, body, union, absent_old, absent_old_unknown));
     }
     // The page's borrowed evidence ends here: the ledger changes below.
+    counts.undecided_unbuilt_older = ctx.unbuilt_older.get();
     end.scope = scope.debt;
     drop(holders);
     drop(scope);
@@ -1453,16 +1541,16 @@ pub(crate) fn shadow_page_at(
 
     // Rows, memos and the coverage flag. Every family of the page writes its
     // rows (the day's cap bounds them); the reader keeps each family's latest
-    // by `snapshot`.
+    // by `snapshot`. The rows are serialized by the writer, outside the lock.
     let sweep_complete = telemetry_certified(ledger);
-    let mut lines = Vec::new();
+    let mut families = Vec::with_capacity(bodies.len());
     let mut memos = Vec::with_capacity(bodies.len());
     let mut families_incomplete = 0_u64;
+    let mut grains = 0_usize;
     for (root, body, union, absent_old, absent_old_unknown) in bodies {
         let complete = body.coverage_complete(census_complete);
         tally(&mut counts, &body, complete);
         families_incomplete += u64::from(!complete);
-        let family = hashed_id(root);
         let memo_key = family_key(root);
         // The removal delta's basis: the last complete body whose rows were
         // written (a memo moves only when its batch is published), named by
@@ -1497,16 +1585,13 @@ pub(crate) fn shadow_page_at(
         } else {
             counts.removed_change_unavailable += 1;
         }
-        for (key, (old, new)) in &body.grains {
-            lines.extend(grain_line(snapshot, &family, key, old, new));
-        }
         let row = FamilyRow {
             row: "family",
             v: JSONL_VERSION,
             counting: CLAUDE_REQUEST_COUNTING,
             snapshot,
             observed_unix: now,
-            family: &family,
+            family: hashed_id(root),
             category: body.category(),
             coverage_complete: complete,
             members_built: body.members_built,
@@ -1532,7 +1617,11 @@ pub(crate) fn shadow_page_at(
             absent_old: (&absent_old).into(),
             absent_old_unknown,
         };
-        lines.extend(serde_json::to_string(&row).ok());
+        grains += body.grains.len();
+        families.push(FamilyRows {
+            row,
+            grains: body.grains,
+        });
         // Only a complete body is a basis; it moves when its rows land.
         if complete {
             memos.push(PendingMemo {
@@ -1548,6 +1637,11 @@ pub(crate) fn shadow_page_at(
         }
     }
     counts.family_memos_dropped = drop_old_family_memos(ledger, now);
+    if Instant::now() >= deadline || faulted(PageFault::LateAtHandOff) {
+        // Late: the page's output is dropped, never published (Sol R4-2).
+        counts.refused_deadline = 1;
+        return refuse(&end, Some(ledger), index, roots.len(), counts);
+    }
     let page_complete = families_incomplete == 0 && census_complete && sweep_complete;
     counts.coverage_complete = u64::from(page_complete);
     let coverage = CoverageRow {
@@ -1563,12 +1657,15 @@ pub(crate) fn shadow_page_at(
         rows_unavailable_roots: counts.rows_unavailable_roots,
         dropped: false,
     };
-    // The rows move to the batch under their own admission (with the
+    // The families move to the batch under its own admission (with the
     // writer's one stream buffer); the page's admission ends here.
-    let line_bytes =
-        lines.iter().map(|line| line.len() + 1).sum::<usize>() + 1024 + JSONL_WRITE_BUFFER_BYTES;
-    let batch = ShadowReservation::admit(line_bytes);
-    counts.admitted_peak_bytes = budget.granted().saturating_add(line_bytes) as u64;
+    let batch_bytes = families
+        .len()
+        .saturating_mul(FAMILY_BYTES)
+        .saturating_add(grains.saturating_mul(GRAIN_BYTES))
+        .saturating_add(1024 + JSONL_WRITE_BUFFER_BYTES);
+    let batch = ShadowReservation::admit(batch_bytes).filter(|_| !faulted(PageFault::BatchRefused));
+    counts.admitted_peak_bytes = budget.granted().saturating_add(batch_bytes) as u64;
     drop(budget);
     let Some(reservation) = batch else {
         // The rows cannot be handed over: a refused page (a false coverage
@@ -1580,7 +1677,7 @@ pub(crate) fn shadow_page_at(
     hand_off(
         &end,
         Some(&mut *ledger),
-        lines,
+        families,
         coverage,
         memos,
         Some((reservation, JSONL_WRITE_BUFFER_BYTES)),
@@ -1645,7 +1742,7 @@ fn refuse(
 fn hand_off(
     end: &PageEnd<'_>,
     ledger: Option<&mut ClaudeLedger>,
-    rows: Vec<String>,
+    families: Vec<FamilyRows>,
     coverage: CoverageRow,
     memos: Vec<PendingMemo>,
     reservation: Option<(ShadowReservation, usize)>,
@@ -1672,12 +1769,12 @@ fn hand_off(
         counts.ledger_save_oversized = ledger.oversized_shards;
     }
     counts.ledger_loads_refused = store::loads_refused();
-    counts.jsonl_queued = rows.len() as u64 + 1;
+    counts.jsonl_queued = families.iter().map(FamilyRows::rows).sum::<u64>() + 1;
     let job = WriteJob {
         support_dir: end.support_dir.to_path_buf(),
         jsonl: JsonlBatch {
             now: end.now,
-            rows,
+            families,
             coverage,
             buffer_bytes,
         },
@@ -1712,22 +1809,28 @@ fn emit(
     counts: &mut ClaudeRequestMoneyShadowCounts,
 ) {
     let census = &index.claude_request_census;
-    let cached = STATE_COUNTS.lock().ok().and_then(|cache| {
-        cache
-            .get(end.support_dir)
-            .filter(|(at, _)| at.elapsed() < STATE_COUNTS_REFRESH)
-            .map(|(_, state)| *state)
-    });
-    let state = match cached {
-        Some(mut state) => {
-            claude_request_ledger::refresh_state_totals(&mut state, census, ledger);
-            state
-        }
-        None => {
-            let state = claude_request_ledger::ledger_state_counts(census, ledger);
+    let cached = STATE_COUNTS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(end.support_dir).copied());
+    let fresh = cached.filter(|(at, _)| at.elapsed() < STATE_COUNTS_REFRESH);
+    let walked = match fresh {
+        Some(_) => None,
+        None => claude_request_ledger::ledger_state_counts(census, ledger, end.deadline),
+    };
+    let state = match (walked, cached) {
+        (Some(state), _) => {
             if let (Some(_), Ok(mut cache)) = (ledger, STATE_COUNTS.lock()) {
                 cache.insert(end.support_dir.to_path_buf(), (Instant::now(), state));
             }
+            state
+        }
+        // Fresh, or the walk ran out of the page's time: the last walk's
+        // fields (none yet: zero) with current totals.
+        (None, cached) => {
+            counts.state_counts_late = u64::from(fresh.is_none());
+            let mut state = cached.map(|(_, state)| state).unwrap_or_default();
+            claude_request_ledger::refresh_state_totals(&mut state, census, ledger);
             state
         }
     };
@@ -1867,19 +1970,18 @@ fn tally(counts: &mut ClaudeRequestMoneyShadowCounts, body: &ClaudeRequestBody, 
     counts.requests_new += body.new.requests;
 }
 
-fn grain_line(
-    snapshot: u64,
-    family: &str,
-    key: &ClaudeGrainKey,
+fn grain_row<'a>(
+    family: &'a FamilyRow,
+    key: &'a ClaudeGrainKey,
     old: &ClaudeGrainSide,
     new: &ClaudeGrainSide,
-) -> Option<String> {
+) -> GrainRow<'a> {
     let (hour, model, selector) = &key.live;
-    serde_json::to_string(&GrainRow {
+    GrainRow {
         row: "grain",
         v: JSONL_VERSION,
-        snapshot,
-        family,
+        snapshot: family.snapshot,
+        family: &family.family,
         session: hashed_id(&key.member),
         owner: (!key.owner.is_empty()).then(|| hashed_id(&key.owner)),
         hour,
@@ -1889,8 +1991,7 @@ fn grain_line(
         category: key.category,
         old: old.into(),
         new: new.into(),
-    })
-    .ok()
+    }
 }
 
 /// The union revision a removal delta is bound to: the family's indexed
@@ -1934,34 +2035,102 @@ fn day_stamp(unix: u64) -> Option<String> {
 
 /// False coverage rows owed per support directory: day -> the earliest
 /// page that owes it (a dropped batch, or one whose rows were not written).
+/// Each debt is also a marker file in the day's directory (Sol R3-6), so a
+/// restart keeps it: the writer reads the markers back with every batch.
 static COVERAGE_OWED: Mutex<BTreeMap<PathBuf, BTreeMap<String, u64>>> = Mutex::new(BTreeMap::new());
 
-/// The page at `observed_unix` did not reach its day's file: the next batch
-/// writes a false coverage row there.
-fn owe_coverage(support_dir: &Path, observed_unix: u64) {
-    let (Some(day), Ok(mut owed)) = (day_stamp(observed_unix), COVERAGE_OWED.lock()) else {
-        return;
-    };
-    let slot = owed
-        .entry(support_dir.to_path_buf())
-        .or_default()
-        .entry(day)
-        .or_insert(observed_unix);
-    *slot = (*slot).min(observed_unix);
+fn day_path(dir: &Path, day: &str) -> PathBuf {
+    dir.join(format!("{JSONL_PREFIX}{day}.jsonl"))
 }
 
-fn take_owed_coverage(support_dir: &Path) -> BTreeMap<String, u64> {
-    COVERAGE_OWED
+/// The marker of a day's owed false coverage row (its content: the earliest
+/// owing page's `observed_unix`).
+fn owed_path(dir: &Path, day: &str) -> PathBuf {
+    dir.join(format!(".{JSONL_PREFIX}{day}.owed"))
+}
+
+/// The page at `observed_unix` did not reach its day's file: the next batch
+/// writes a false coverage row there. The marker is a few bytes, written
+/// once per owing day (a later debt of the same day keeps it).
+fn owe_coverage(support_dir: &Path, observed_unix: u64) {
+    let Some(day) = day_stamp(observed_unix) else {
+        return;
+    };
+    let dir = support_dir.join("diagnostics");
+    let marker = owed_path(&dir, &day);
+    if !marker.exists() && std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&marker, observed_unix.to_string());
+    }
+    if let Ok(mut owed) = COVERAGE_OWED.lock() {
+        let slot = owed
+            .entry(support_dir.to_path_buf())
+            .or_default()
+            .entry(day)
+            .or_insert(observed_unix);
+        *slot = (*slot).min(observed_unix);
+    }
+}
+
+/// A false row of `day` is on disk: its debt is settled.
+fn settle_owed(dir: &Path, day: &str) {
+    let _ = std::fs::remove_file(owed_path(dir, day));
+}
+
+/// The debts owed in `dir` (the process's and the markers on disk), taken.
+/// One listing per batch: it also drops own files older than `oldest`.
+fn take_owed_coverage(
+    support_dir: &Path,
+    dir: &Path,
+    oldest: Option<&str>,
+) -> BTreeMap<String, u64> {
+    let mut owed = COVERAGE_OWED
         .lock()
         .ok()
         .and_then(|mut owed| owed.remove(support_dir))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return owed;
+    };
+    for entry in entries.take(JSONL_MAX_DIR_ENTRIES).flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let marker = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_prefix(JSONL_PREFIX))
+            .and_then(|rest| rest.strip_suffix(".owed"));
+        let day = name
+            .strip_prefix(JSONL_PREFIX)
+            .and_then(|rest| rest.strip_suffix(".jsonl"))
+            .or(marker);
+        let Some(day) = day.filter(|day| day.len() == 8 && day.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        if oldest.is_some_and(|oldest| day < oldest) {
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        }
+        if marker.is_some() {
+            let observed = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            let slot = owed.entry(day.to_owned()).or_insert(observed);
+            *slot = (*slot).min(observed);
+        }
+    }
+    if let Some(oldest) = oldest {
+        owed.retain(|day, _| day.as_str() >= oldest);
+    }
+    owed
 }
 
-/// One page's rows for today's JSONL file (written by the writer).
+/// One page's rows for today's JSONL file (serialized by the writer).
 pub(crate) struct JsonlBatch {
     now: u64,
-    rows: Vec<String>,
+    families: Vec<FamilyRows>,
     coverage: CoverageRow,
     /// The admitted stream buffer (0: unbuffered).
     buffer_bytes: usize,
@@ -1990,160 +2159,205 @@ fn ends_mid_line(path: &Path) -> bool {
     file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
 }
 
-/// Append rows to a day's file through a stream buffer of `buffer_bytes`,
-/// first ending a row an earlier failed write left open. False when any
-/// write failed.
-fn append_rows<'a>(
-    path: &Path,
-    buffer_bytes: usize,
-    rows: impl IntoIterator<Item = &'a [u8]>,
-) -> bool {
-    let open_row = ends_mid_line(path);
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return false;
-    };
-    let mut writer = std::io::BufWriter::with_capacity(buffer_bytes, file);
-    let mut written = !open_row || writer.write_all(b"\n").is_ok();
-    for row in rows {
-        written = written && writer.write_all(row).is_ok() && writer.write_all(b"\n").is_ok();
+/// Rows appended to one day's file, each serialized straight into the
+/// batch's stream buffer (no copy of the rows), under the day's cap.
+struct DayFile {
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    /// Every write so far succeeded.
+    written: bool,
+    size: u64,
+    /// Ordinary rows stop here; past it go only false coverage rows.
+    room: u64,
+    /// A row did not fit under `room`: nothing ordinary goes after it.
+    sealed: bool,
+}
+
+impl DayFile {
+    /// Open for appending, first ending a row an earlier failed write left
+    /// open.
+    fn open(path: &Path, buffer_bytes: usize, room: u64) -> Self {
+        let open_row = ends_mid_line(path);
+        let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(|file| std::io::BufWriter::with_capacity(buffer_bytes, file));
+        let written = match writer.as_mut() {
+            Some(writer) => !open_row || writer.write_all(b"\n").is_ok(),
+            None => false,
+        };
+        Self {
+            writer,
+            written,
+            size: size + u64::from(open_row),
+            room,
+            sealed: false,
+        }
     }
-    written && writer.flush().is_ok()
+
+    /// Append `row` when it fits under `room`; the first that does not seals
+    /// the day.
+    fn push<T: Serialize>(&mut self, row: &T) -> bool {
+        if self.sealed {
+            return false;
+        }
+        let bytes = serialized_len(row) + 1;
+        if self.size + bytes > self.room {
+            self.sealed = true;
+            return false;
+        }
+        self.write(row, bytes);
+        true
+    }
+
+    /// Append a false coverage row under the day's hard cap.
+    fn push_false(&mut self, row: &CoverageRow) -> bool {
+        let bytes = serialized_len(row) + 1;
+        if self.size + bytes > JSONL_DAY_CAP_BYTES {
+            return false;
+        }
+        self.write(row, bytes);
+        true
+    }
+
+    fn write<T: Serialize>(&mut self, row: &T, bytes: u64) {
+        self.size += bytes;
+        self.written = self.written
+            && self.writer.as_mut().is_some_and(|writer| {
+                serde_json::to_writer(&mut *writer, row).is_ok() && writer.write_all(b"\n").is_ok()
+            });
+    }
+
+    /// True when every row reached the file.
+    fn finish(self) -> bool {
+        self.written && self.writer.is_some_and(|mut writer| writer.flush().is_ok())
+    }
+}
+
+/// Bytes `value` serializes to (counted, never buffered).
+fn serialized_len<T: Serialize>(value: &T) -> u64 {
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 /// Append a batch's rows and its coverage row to the day's capped file
-/// (streamed from the batch's own rows: no second copy), the false coverage
-/// rows earlier batches owe their days, and drop own files older than the
-/// retention window. When the day's cap would be passed, the file is sealed
+/// (serialized here, from the batch's families), the false coverage rows
+/// earlier batches owe their days, and drop own files older than the
+/// retention window. When the day's cap would be passed, the day is sealed
 /// with a false coverage row (`truncated`) and takes nothing more that day.
-/// A batch not written owes its day a false row. Failures are counted,
-/// never raised. Runs on the writer thread only.
+/// Past `room` there are only false coverage rows, so a file larger than
+/// `room` is sealed and its false row is on disk; a seal or debt that does
+/// not reach the file stays owed (Sol R4-1). Failures are counted, never
+/// raised. Runs on the writer thread only.
 fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
     let mut outcome = JsonlOutcome::default();
     let now = batch.now;
     let dir = support_dir.join("diagnostics");
-    let owed = take_owed_coverage(support_dir);
     let Some(today) = day_stamp(now).filter(|_| std::fs::create_dir_all(&dir).is_ok()) else {
         outcome.failed += 1;
-        for (_, observed) in owed {
-            owe_coverage(support_dir, observed);
-        }
         owe_coverage(support_dir, now);
         return outcome;
     };
-    let day_path = |day: &str| dir.join(format!("{JSONL_PREFIX}{day}.jsonl"));
-    let sealed_path = |day: &str| dir.join(format!(".{JSONL_PREFIX}{day}.sealed"));
+    let oldest = day_stamp(now.saturating_sub((JSONL_RETENTION_DAYS * 86_400) as u64));
+    let owed = take_owed_coverage(support_dir, &dir, oldest.as_deref());
     let mut owed_today = None;
     for (day, observed) in owed {
         if day == today {
             owed_today = Some(observed);
             continue;
         }
-        // A sealed day is already false.
-        if sealed_path(&day).exists() {
-            continue;
-        }
-        let row = serde_json::to_string(&CoverageRow::owed(observed)).unwrap_or_default();
-        if append_rows(&day_path(&day), 0, [row.as_bytes()]) {
+        let mut file = DayFile::open(&day_path(&dir, &day), 0, 0);
+        if file.push_false(&CoverageRow::owed(observed)) && file.finish() {
             outcome.owed_written += 1;
+            settle_owed(&dir, &day);
         } else {
             outcome.failed += 1;
             owe_coverage(support_dir, observed);
         }
     }
-    let path = day_path(&today);
-    if sealed_path(&today).exists() {
-        outcome.truncated += batch.rows.len() as u64;
+    let rows = batch.families.iter().map(FamilyRows::rows).sum::<u64>();
+    let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
+    let mut file = DayFile::open(&day_path(&dir, &today), batch.buffer_bytes, room);
+    if file.size > room {
+        // Sealed: nothing more today but a debt's false row.
+        outcome.truncated = rows;
+        if let Some(observed) = owed_today {
+            if file.push_false(&CoverageRow::owed(observed)) && file.finish() {
+                outcome.owed_written += 1;
+                settle_owed(&dir, &today);
+            } else {
+                outcome.failed += 1;
+                owe_coverage(support_dir, observed);
+            }
+        }
         return outcome;
     }
-    let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
-    let mut size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    let owed_row =
-        owed_today.and_then(|observed| serde_json::to_string(&CoverageRow::owed(observed)).ok());
-    let coverage_row = serde_json::to_string(&batch.coverage).unwrap_or_default();
-    // What fits under the day's cap, in order: the owed row, the rows, the
-    // page's coverage row. The first that does not fit seals the day.
-    let mut sealed = false;
-    let mut fits = |bytes: usize| {
-        let bytes = bytes as u64 + 1;
-        if sealed || size + bytes > room {
-            sealed = true;
-            return false;
+    // In order: the owed row, the rows, the page's coverage row. The first
+    // that does not fit seals the day.
+    let owed_fits = owed_today.is_some_and(|observed| file.push(&CoverageRow::owed(observed)));
+    let mut kept = 0_u64;
+    for family in &batch.families {
+        for (key, (old, new)) in &family.grains {
+            kept += u64::from(file.push(&grain_row(&family.row, key, old, new)));
         }
-        size += bytes;
-        true
-    };
-    let owed_fits = owed_row.as_ref().is_some_and(|row| fits(row.len()));
-    let kept = batch.rows.iter().filter(|row| fits(row.len())).count();
-    let coverage_fits = fits(coverage_row.len());
-    let seal_row = sealed.then(|| {
-        serde_json::to_string(&CoverageRow {
+        kept += u64::from(file.push(&family.row));
+    }
+    let coverage_fits = file.push(&batch.coverage);
+    let sealed = file.sealed;
+    let seal_written = sealed
+        && file.push_false(&CoverageRow {
             truncated: true,
             dropped: false,
             ..CoverageRow::owed(now)
-        })
-        .unwrap_or_default()
-    });
-    outcome.truncated = (batch.rows.len() - kept) as u64;
-    let rows = owed_row
-        .iter()
-        .filter(|_| owed_fits)
-        .map(String::as_bytes)
-        .chain(batch.rows[..kept].iter().map(String::as_bytes))
-        .chain(coverage_fits.then_some(coverage_row.as_bytes()))
-        .chain(seal_row.as_deref().map(str::as_bytes));
-    let written = append_rows(&path, batch.buffer_bytes, rows);
+        });
+    let written = file.finish() && sealed == seal_written;
+    outcome.truncated = rows - kept;
     if written {
-        outcome.rows = kept as u64 + u64::from(coverage_fits) + u64::from(sealed);
+        outcome.rows = kept + u64::from(coverage_fits) + u64::from(sealed);
         outcome.owed_written += u64::from(owed_fits);
+        outcome.sealed = u64::from(sealed);
+        if owed_today.is_some() {
+            // Its row, or the seal's false row, is on disk.
+            settle_owed(&dir, &today);
+        }
     } else {
         outcome.failed += 1;
         owe_coverage(support_dir, owed_today.unwrap_or(now).min(now));
     }
-    if sealed {
-        outcome.sealed = 1;
-        let _ = std::fs::write(sealed_path(&today), b"");
-    }
     outcome.published = written && !sealed;
-    if let Some(oldest) = day_stamp(now.saturating_sub((JSONL_RETENTION_DAYS * 86_400) as u64)) {
-        prune_jsonl(&dir, &oldest);
-    }
     outcome
-}
-
-/// Drop own day files (and seal markers) older than `oldest`.
-fn prune_jsonl(dir: &Path, oldest: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.take(JSONL_MAX_DIR_ENTRIES).flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let day = name
-            .strip_prefix(JSONL_PREFIX)
-            .and_then(|rest| rest.strip_suffix(".jsonl"))
-            .or_else(|| {
-                name.strip_prefix('.')
-                    .and_then(|name| name.strip_prefix(JSONL_PREFIX))
-                    .and_then(|rest| rest.strip_suffix(".sealed"))
-            });
-        let Some(day) = day else {
-            continue;
-        };
-        if day.len() == 8 && day.bytes().all(|byte| byte.is_ascii_digit()) && day < oldest {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
 }
 
 #[cfg(test)]
 pub(crate) fn owe_coverage_for_test(support_dir: &Path, observed_unix: u64) {
     owe_coverage(support_dir, observed_unix);
+}
+
+/// A restart: the process's owed-coverage latch is gone (the markers stay).
+#[cfg(test)]
+pub(crate) fn forget_owed_coverage_for_test(support_dir: &Path) {
+    if let Ok(mut owed) = COVERAGE_OWED.lock() {
+        owed.remove(support_dir);
+    }
+}
+
+/// The day's room for ordinary rows (past it, only false coverage rows).
+#[cfg(test)]
+pub(crate) fn jsonl_room_for_test() -> u64 {
+    JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES
 }
 
 #[cfg(test)]

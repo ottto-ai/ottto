@@ -4107,6 +4107,11 @@ impl SourcePreparation {
             let occupied = initialize
                 .then(|| self.native_incremental_owned_bytes(&state))
                 .flatten();
+            #[cfg(test)]
+            let remaining = self
+                .native_comparison_reservation
+                .as_ref()
+                .and_then(crate::source_rotation::PaidReservation::remaining_for_test);
             let paid = self
                 .native_comparison_reservation
                 .as_mut()
@@ -4117,6 +4122,12 @@ impl SourcePreparation {
                     occupied
                         .is_some_and(|bytes| paid.grow_for(bytes) && paid.record_allocated(bytes))
                 });
+            #[cfg(test)]
+            if initialize {
+                tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::note_native_allowance(
+                    remaining, occupied, paid,
+                );
+            }
             if !paid {
                 state.disable_native_comparison();
             }
@@ -4422,7 +4433,9 @@ fn try_collect_native_preparation_with_rotation(
     };
     // The original rotation calculates queue/parked/retained deductions. No
     // independently fabricated full-budget argument reaches the native caller.
-    crate::source_rotation::run(&mut owner, &[source], crate::source_rotation::PARKED_BUDGET);
+    let budget =
+        tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::rotation_budget();
+    crate::source_rotation::run(&mut owner, &[source], budget);
     if let Some(error) = owner.failure {
         return Err(error);
     }

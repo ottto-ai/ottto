@@ -68,6 +68,27 @@ pub(crate) fn after_retirement(retained: bool) {
         }
     });
 }
+/// The test collector's rotation budget and what the native allowance saw
+/// at each initialization: (remaining, needed, granted).
+type NativeAllowance = (Option<usize>, Option<usize>, bool);
+thread_local! {
+    static ROTATION: RefCell<(Option<usize>, Vec<NativeAllowance>)> =
+        const { RefCell::new((None, Vec::new())) };
+}
+pub(crate) fn rotation_budget() -> usize {
+    ROTATION.with(|state| state.borrow().0.unwrap_or(crate::source_rotation::PARKED_BUDGET))
+}
+pub(crate) fn note_native_allowance(remaining: Option<usize>, needed: Option<usize>, granted: bool) {
+    ROTATION.with(|state| state.borrow_mut().1.push((remaining, needed, granted)));
+}
+/// Run `collect` under `budget`; what the native allowance saw.
+fn with_rotation_budget<T>(budget: usize, collect: impl FnOnce() -> T) -> (T, Vec<NativeAllowance>) {
+    ROTATION.with(|state| *state.borrow_mut() = (Some(budget), Vec::new()));
+    let collected = collect();
+    let seen = ROTATION.with(|state| std::mem::take(&mut *state.borrow_mut()).1);
+    (collected, seen)
+}
+
 struct Guard;
 impl Guard {
     fn new(keep: bool, conflict_path: Option<PathBuf>, retry_clock: Option<u64>) -> Self {
@@ -377,4 +398,293 @@ fn prior_index_lifetime_retains_real_earned_receipt_path() {
         records[2].retained,
         "actual predecessor grant keeps P through durable save"
     );
+}
+
+/// What one real cycle of the money parity control left: the live outputs
+/// and the native allowance its collection saw.
+#[derive(Debug, PartialEq)]
+struct MoneyCycle {
+    ok: bool,
+    index: Vec<u8>,
+    progress: Option<Vec<u8>>,
+    offered: Vec<serde_json::Value>,
+    terminal: Vec<serde_json::Value>,
+    allowance: Vec<NativeAllowance>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MoneyArm {
+    Unarmed,
+    Armed,
+    /// Armed, with the shadow's whole memory ceiling held: the page refuses.
+    ShadowRefused,
+    /// Armed, with the output batch's admission refused after the page.
+    BatchRefused,
+}
+
+/// Daemon parent (P1 parity): ONE real authoritative-caller control. The
+/// real prepare, rotation and finish run unarmed and armed from the same
+/// saved state (a populated money ledger, reloaded), at a tight native
+/// allowance (exactly what the native comparison needs) and one byte under
+/// it, with and without a failed selected-index save (#588: a competing
+/// writer wins the final CAS). Armed arms include a refused shadow page and
+/// a refused output batch. Every arm makes the same live decisions: the same
+/// index and progress bytes, offered bodies, ACKs, finish result and native
+/// allowance decisions. As in `same_input_finish_pair`, each finish takes
+/// the budget's first completed native input.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_real_caller_parity_at_tight_allowances() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = IdentityPipelineHome::new();
+    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
+    let cadence = IdentityPipelineCadence::new();
+    let support = fixture.base.join("money-parity-support");
+    let secrets = fixture.base.join("money-parity-secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let server = FinishServer::new(FinishOutcome::Accept);
+    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+    let device = LocalDeviceBinding {
+        device_id: "money-parity-device".into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    write_native_bootstrap_sidecars(&fixture, &support);
+    let namespace = snapshot_upload_destination_namespace(&device, "device-secret");
+    let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+        &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
+        &namespace,
+    ));
+    large_prior_index(16).save(&index_path).unwrap();
+    let collection = || AgentStatusCollection {
+        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    };
+    let retry_clock = current_unix_seconds();
+    // The budget's first completed native input, shared by its arms.
+    let mut common = BTreeMap::<(usize, bool), (ScanIndex, SourceScanResult, String)>::new();
+    let mut cycle = |budget: usize, conflict: bool, arm: MoneyArm, shared: bool| -> MoneyCycle {
+        server.offered.lock().unwrap().clear();
+        server.terminal.lock().unwrap().clear();
+        cadence.next_due_cycle();
+        let daemon = test_daemon("otm_test");
+        let client = SnapshotApiClient::new(server.url.clone());
+        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        })
+        .unwrap()
+        .expect("actual due preparation");
+        let ((mut preparation, index, scan), allowance) =
+            with_rotation_budget(budget, || collect_native_preparation_with_rotation(frame, false));
+        let (index, scan) = if shared {
+            let (index, scan, started) = common
+                .entry((budget, conflict))
+                .or_insert_with(|| (index, scan, preparation.scan_started_at.clone()))
+                .clone();
+            preparation.scan_started_at = started;
+            (index, scan)
+        } else {
+            (index, scan)
+        };
+        let progress_path = preparation.upload_progress_path.clone();
+        let held = (arm == MoneyArm::ShadowRefused).then(|| {
+            money::ShadowReservation::admit(
+                money::SHADOW_MEMORY_CEILING_BYTES - money::reserved_for_test(),
+            )
+            .expect("hold the whole ceiling")
+        });
+        if arm == MoneyArm::BatchRefused {
+            money::set_page_fault_for_test(money::PageFault::BatchRefused);
+        }
+        let guard = Guard::new(false, conflict.then(|| index_path.clone()), Some(retry_clock));
+        let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                &mut retry,
+            )
+        });
+        drop(guard);
+        money::set_page_fault_for_test(money::PageFault::None);
+        drop(held);
+        let progress = match std::fs::read(progress_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read final upload progress: {error}"),
+        };
+        MoneyCycle {
+            ok: result.is_ok(),
+            index: serde_json::to_vec(&ScanIndex::load(&index_path).unwrap()).unwrap(),
+            progress,
+            offered: server.offered.lock().unwrap().clone(),
+            terminal: server.terminal.lock().unwrap().clone(),
+            allowance,
+        }
+    };
+
+    // Populate the money ledger with one armed cycle, save it and forget it;
+    // then a new response, so the compared cycle has work.
+    money::enable_shadow_for_test(&support);
+    let populated = cycle(
+        crate::source_rotation::PARKED_BUDGET,
+        false,
+        MoneyArm::Armed,
+        false,
+    );
+    assert!(populated.ok, "{populated:?}");
+    money::store::forget_for_test(&support);
+    assert!(support.join(money::store::LEDGER_DIR).join("meta.json").is_file());
+    let transcript = fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+    let mut lines = std::fs::read_to_string(&transcript).unwrap();
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(30))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    lines.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"timestamp": at, "type": "assistant", "sessionId": IDENTITY_PIPELINE_ROOT,
+            "requestId": "req_3", "message": {"id": "m3", "model": "claude-haiku-4-5",
+            "usage": {"input_tokens": 30, "output_tokens": 3}}})
+    ));
+    std::fs::write(&transcript, lines).unwrap();
+    fn files(dir: &Path, into: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files(&path, into);
+            } else {
+                into.push((path.clone(), std::fs::read(path).unwrap()));
+            }
+        }
+    }
+    // The support directory (index, progress, sidecars, ledger, diagnostics)
+    // is put back before every arm; the transcripts are only read.
+    let mut saved = Vec::new();
+    files(&support, &mut saved);
+    let mut run = |budget: usize, conflict: bool, arm: MoneyArm| {
+        std::fs::remove_dir_all(&support).unwrap();
+        for (path, bytes) in &saved {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        if arm == MoneyArm::Unarmed {
+            money::disable_shadow_for_test(&support);
+            money::store::forget_for_test(&support);
+        } else {
+            money::enable_shadow_for_test(&support);
+            let records = money::store::reload_for_test(&support);
+            assert!(records.is_some_and(|records| records > 0), "{records:?}");
+        }
+        let _ = money::take_shadow_lines_for_test();
+        let output = cycle(budget, conflict, arm, true);
+        money::store::flush();
+        let lines = money::take_shadow_lines_for_test();
+        let count = |name: &str| {
+            lines
+                .iter()
+                .map(|line| line["counts"][name].as_u64().unwrap())
+                .sum::<u64>()
+        };
+        match arm {
+            MoneyArm::Unarmed => assert!(lines.is_empty()),
+            MoneyArm::Armed => {
+                assert!(count("families") > 0, "{lines:?}");
+                assert_eq!(count("ledger_loading") + count("refused_budget"), 0, "{lines:?}");
+                assert!(lines
+                    .iter()
+                    .all(|line| line["ledger"]["telemetry_records"].as_u64() > Some(0)));
+            }
+            MoneyArm::ShadowRefused => {
+                assert!(!lines.is_empty());
+                assert_eq!(count("families"), 0, "{lines:?}");
+                assert_eq!(count("refused_budget"), lines.len() as u64, "{lines:?}");
+            }
+            MoneyArm::BatchRefused => {
+                assert!(count("families") > 0, "{lines:?}");
+                assert_eq!(count("refused_budget"), lines.len() as u64, "{lines:?}");
+                assert_eq!(count("coverage_complete"), 0, "{lines:?}");
+            }
+        }
+        assert_eq!(money::reserved_for_test(), 0, "{arm:?}: admission is released");
+        output
+    };
+
+    // The native comparison's exact need at the full budget, then a budget
+    // that leaves exactly that, and one byte less.
+    let full = run(crate::source_rotation::PARKED_BUDGET, false, MoneyArm::Unarmed);
+    let [(Some(remaining), Some(needed), true)] = full.allowance[..] else {
+        panic!("one granted native allowance: {:?}", full.allowance);
+    };
+    let tight = crate::source_rotation::PARKED_BUDGET - (remaining - needed);
+    for (budget, granted) in [(tight, true), (tight - 1, false)] {
+        for conflict in [false, true] {
+            let baseline = run(budget, conflict, MoneyArm::Unarmed);
+            let remaining = needed - usize::from(!granted);
+            assert_eq!(
+                baseline.allowance,
+                vec![(Some(remaining), Some(needed), granted)],
+                "budget {budget}: the tight allowance"
+            );
+            assert_eq!(baseline.ok, !conflict, "{baseline:?}");
+            let arms: &[MoneyArm] = if granted && !conflict {
+                &[MoneyArm::Armed, MoneyArm::ShadowRefused, MoneyArm::BatchRefused]
+            } else {
+                &[MoneyArm::Armed]
+            };
+            for arm in arms {
+                assert_eq!(
+                    run(budget, conflict, *arm),
+                    baseline,
+                    "{arm:?} at budget {budget}, conflict {conflict}: the same live decisions"
+                );
+            }
+        }
+    }
+    money::disable_shadow_for_test(&support);
+    writeln!(std::io::stderr().lock(), "money_shadow_parity: real_caller=true native_needed={needed} tight_budget={tight} below_refused=true failed_selected_save=true ledger_reloaded=true shadow_refused=true batch_refused=true").unwrap();
 }
