@@ -2639,6 +2639,71 @@ pub struct ScanIndex {
     effective_upload_body_witness_revision_excluded_source_files: BTreeSet<String>,
 }
 
+/// The production paths that set `bounded_sweep_had_unsettled_upload`.
+/// Diagnostic only: the traversal transition lines name them, and no gate
+/// reads them.
+#[allow(dead_code)] // tests-first scaffold; the fix commit records and logs these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsettledUploadCause {
+    /// A 429/503 shed left a partial checkpoint.
+    Shed,
+    /// Any other upload error left a partial checkpoint.
+    UploadError,
+    /// A 200 deferred conflicted entities.
+    DeferredConflict,
+    /// Permanent refusals settled beside a local hold.
+    RejectedWithHolds,
+    /// A completed upload kept progress-blocking local holds.
+    CompletedBlockingHolds,
+    /// Uploading would have demoted a proven Claude usage authority.
+    AuthorityCensusWithheld,
+    /// Legacy settlement reconciliation armed revisions.
+    LegacyReconcile,
+    /// An admission-limit re-offer armed revisions.
+    AdmissionReoffer,
+}
+
+#[allow(dead_code)] // tests-first scaffold
+impl UnsettledUploadCause {
+    const ALL: [Self; 8] = [
+        Self::Shed,
+        Self::UploadError,
+        Self::DeferredConflict,
+        Self::RejectedWithHolds,
+        Self::CompletedBlockingHolds,
+        Self::AuthorityCensusWithheld,
+        Self::LegacyReconcile,
+        Self::AdmissionReoffer,
+    ];
+
+    fn bit(self) -> u16 {
+        1 << self as u16
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Shed => "shed",
+            Self::UploadError => "upload_error",
+            Self::DeferredConflict => "deferred_conflict",
+            Self::RejectedWithHolds => "rejected_with_holds",
+            Self::CompletedBlockingHolds => "completed_blocking_holds",
+            Self::AuthorityCensusWithheld => "authority_census_withheld",
+            Self::LegacyReconcile => "legacy_reconcile",
+            Self::AdmissionReoffer => "admission_reoffer",
+        }
+    }
+
+    /// Fixed names of the set bits, in declaration order. Unknown bits from a
+    /// newer daemon are not named.
+    fn names(causes: u16) -> Vec<&'static str> {
+        Self::ALL
+            .into_iter()
+            .filter(|cause| causes & cause.bit() != 0)
+            .map(Self::name)
+            .collect()
+    }
+}
+
 impl Default for ScanIndex {
     fn default() -> Self {
         Self {
@@ -30195,6 +30260,14 @@ impl ScanIndex {
         self.bounded_sweep_had_unsettled_upload = true;
     }
 
+    /// Mark the sweep unsettled and record which path did it, for the
+    /// transition lines only.
+    #[allow(dead_code)] // tests-first scaffold
+    pub(crate) fn mark_bounded_sweep_unsettled_by(&mut self, cause: UnsettledUploadCause) {
+        let _ = cause;
+        self.mark_bounded_sweep_unsettled();
+    }
+
     /// Record the contract-5 contract a prepared Claude cycle builds bodies
     /// under. Any difference from the record, including an unknown record,
     /// sets the contract latch. A difference seen while a traversal is under
@@ -30218,6 +30291,11 @@ impl ScanIndex {
     #[cfg(test)]
     pub(crate) fn bounded_sweep_had_unsettled_upload(&self) -> bool {
         self.bounded_sweep_had_unsettled_upload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bounded_sweep_unsettled_cause_names(&self) -> Vec<&'static str> {
+        UnsettledUploadCause::names(0)
     }
 
     #[cfg(test)]

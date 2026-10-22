@@ -151,11 +151,15 @@ pub(super) fn retiring(
 mod tests {
     use super::*;
     use crate::local_resource_diagnostics::capture;
-    use crate::snapshots::{ensure_bounded_traversal, scan_source_roots, BACKFILL_WINDOW_DAYS};
+    use crate::snapshots::{
+        ensure_bounded_traversal, scan_source_roots, UnsettledUploadCause, BACKFILL_WINDOW_DAYS,
+    };
     use serde_json::{json, Value};
 
     const T0: &str = "2026-08-01T00:00:00Z";
     const T1: &str = "2026-08-01T00:01:00Z";
+    const T2: &str = "2026-08-01T00:02:00Z";
+    const T3: &str = "2026-08-01T00:03:00Z";
 
     fn start(index: &mut ScanIndex, now: &str, days: u64) -> Vec<Value> {
         capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &[], index, now, days)).1
@@ -303,9 +307,10 @@ mod tests {
             .unwrap();
         assert_eq!(retired["counts"]["reason"], "complete");
         assert_eq!(retired["counts"]["gates"]["census_complete"], true);
+        assert_eq!(retired["counts"]["unsettled_causes"], json!([]));
 
         start(&mut index, T1, BACKFILL_WINDOW_DAYS);
-        index.bounded_sweep_had_unsettled_upload = true;
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
         let (scan, rows) = capture(|| {
             scan_source_roots(
                 SnapshotSource::Pi,
@@ -326,6 +331,225 @@ mod tests {
         assert_eq!(retired["counts"]["raw_census_complete"], true);
         assert_eq!(retired["counts"]["gates"]["clean_followup"], true);
         assert_eq!(retired["counts"]["gates"]["census_complete"], false);
+        assert_eq!(retired["counts"]["unsettled_causes"], json!(["shed"]));
+
+        // The clean follow-up's start names the prior causes, then clears
+        // them with the flag.
+        let started = start(&mut index, T2, BACKFILL_WINDOW_DAYS);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["counts"]["prior_unsettled_upload"], true);
+        assert_eq!(
+            started[0]["counts"]["prior_unsettled_causes"],
+            json!(["shed"])
+        );
+        assert!(!index.bounded_sweep_had_unsettled_upload);
+        assert!(index.bounded_sweep_unsettled_cause_names().is_empty());
+        let started = start(&mut index, T3, BACKFILL_WINDOW_DAYS + 1);
+        assert_eq!(started[0]["counts"]["prior_unsettled_upload"], false);
+        assert_eq!(started[0]["counts"]["prior_unsettled_causes"], json!([]));
+    }
+
+    fn with_unsettled_causes(index: &ScanIndex, causes: u16) -> ScanIndex {
+        let mut value = serde_json::to_value(index).unwrap();
+        value["bounded_sweep_unsettled_causes"] = json!(causes);
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn without_unsettled_causes(index: &ScanIndex) -> Value {
+        let mut value = serde_json::to_value(index).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("bounded_sweep_unsettled_causes");
+        value
+    }
+
+    #[test]
+    fn unsettled_causes_persist_only_when_set_and_reset_with_the_flag() {
+        // Absent when empty: the persisted index is byte-identical to before.
+        let empty = ScanIndex::default();
+        let saved = serde_json::to_value(&empty).unwrap();
+        assert!(saved.get("bounded_sweep_unsettled_causes").is_none());
+        // An index saved before the causes existed loads unattributed.
+        let mut legacy = saved.clone();
+        legacy["bounded_sweep_had_unsettled_upload"] = json!(true);
+        let mut legacy: ScanIndex = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.bounded_sweep_had_unsettled_upload);
+        assert!(legacy.bounded_sweep_unsettled_cause_names().is_empty());
+        let started = start(&mut legacy, T0, BACKFILL_WINDOW_DAYS);
+        assert_eq!(started[0]["counts"]["prior_unsettled_upload"], true);
+        assert_eq!(started[0]["counts"]["prior_unsettled_causes"], json!([]));
+
+        // Every cause round-trips, in declaration order.
+        let mut marked = ScanIndex::default();
+        for cause in [
+            UnsettledUploadCause::AdmissionReoffer,
+            UnsettledUploadCause::Shed,
+            UnsettledUploadCause::LegacyReconcile,
+            UnsettledUploadCause::UploadError,
+            UnsettledUploadCause::AuthorityCensusWithheld,
+            UnsettledUploadCause::DeferredConflict,
+            UnsettledUploadCause::CompletedBlockingHolds,
+            UnsettledUploadCause::RejectedWithHolds,
+            UnsettledUploadCause::Shed,
+        ] {
+            marked.mark_bounded_sweep_unsettled_by(cause);
+        }
+        let all = [
+            "shed",
+            "upload_error",
+            "deferred_conflict",
+            "rejected_with_holds",
+            "completed_blocking_holds",
+            "authority_census_withheld",
+            "legacy_reconcile",
+            "admission_reoffer",
+        ];
+        assert_eq!(marked.bounded_sweep_unsettled_cause_names(), all);
+        let restored: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&marked).unwrap()).unwrap();
+        assert_eq!(restored.bounded_sweep_unsettled_cause_names(), all);
+
+        // A census-complete finalize clears them with the flag.
+        let mut index = ScanIndex::default();
+        let mut scan = scan_source_roots(
+            SnapshotSource::Pi,
+            &[],
+            &mut index,
+            T0,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap();
+        assert!(scan.census_complete);
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        crate::snapshots::finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Pi,
+            &mut scan,
+            &mut index,
+            |_| String::new(),
+        );
+        assert!(!index.bounded_sweep_had_unsettled_upload);
+        assert!(index.bounded_sweep_unsettled_cause_names().is_empty());
+
+        // So does a historical replay reset.
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::UploadError);
+        index.prepare_historical_replay("unsettled-cause-replay".into());
+        assert!(!index.bounded_sweep_had_unsettled_upload);
+        assert!(index.bounded_sweep_unsettled_cause_names().is_empty());
+    }
+
+    /// The causes are diagnostics only. An index that differs only in them
+    /// takes the same census, start, carry and epoch decisions.
+    #[test]
+    fn unsettled_causes_alone_change_no_gate() {
+        // Terminal: no clean follow-up is owed for causes without the flag.
+        for (flag, reason) in [(false, "complete"), (true, "complete_needs_clean_followup")] {
+            let mut plain = ScanIndex::default();
+            start(&mut plain, T0, BACKFILL_WINDOW_DAYS);
+            plain.bounded_sweep_had_unsettled_upload = flag;
+            let mut tagged = with_unsettled_causes(&plain, u16::MAX);
+            let mut outcomes = Vec::new();
+            for index in [&mut plain, &mut tagged] {
+                let (scan, rows) = capture(|| {
+                    scan_source_roots(SnapshotSource::Pi, &[], index, T0, BACKFILL_WINDOW_DAYS)
+                        .unwrap()
+                });
+                let retired = rows
+                    .iter()
+                    .find(|row| row["counts"]["event"] == "retiring")
+                    .unwrap();
+                assert_eq!(retired["counts"]["reason"], reason);
+                outcomes.push((
+                    scan.census_complete,
+                    retired["counts"]["gates"].clone(),
+                    without_unsettled_causes(index),
+                ));
+            }
+            assert_eq!(outcomes[0], outcomes[1], "flag={flag}");
+        }
+
+        // Finalize: the upload-context epoch advances exactly as without them.
+        for flag in [false, true] {
+            let mut plain = ScanIndex::default();
+            let mut scan = scan_source_roots(
+                SnapshotSource::Pi,
+                &[],
+                &mut plain,
+                T0,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap();
+            plain.bounded_sweep_had_unsettled_upload = flag;
+            let mut tagged = with_unsettled_causes(&plain, u16::MAX);
+            for index in [&mut plain, &mut tagged] {
+                index.activate_upload_context("unsettled-cause-context".into());
+                crate::snapshots::finalize_scan_after_policy_with_body_witness(
+                    SnapshotSource::Pi,
+                    &mut scan,
+                    index,
+                    |_| String::new(),
+                );
+            }
+            assert_eq!(
+                plain.upload_context_fingerprint.as_deref(),
+                (!flag).then_some("unsettled-cause-context")
+            );
+            assert_eq!(
+                without_unsettled_causes(&plain),
+                without_unsettled_causes(&tagged),
+                "flag={flag}"
+            );
+        }
+
+        // Claude start: the stale-family re-arm and carry read the flag only.
+        for flag in [false, true] {
+            let mut plain = ScanIndex::default();
+            plain.files.insert(
+                "/not-logged/private-session.jsonl".into(),
+                serde_json::from_value(json!({
+                    "size_bytes": 1, "modified_unix_seconds": 0,
+                    "source_file_fingerprint": "private-body-witness",
+                    "last_snapshot_fingerprint": null
+                }))
+                .unwrap(),
+            );
+            plain.claude_usage_family_pending.insert(
+                "private-session".into(),
+                super::super::ClaudeUsageFamilyPending {
+                    census_window_end: T0.into(),
+                    member_request_id_hashes: Default::default(),
+                    member_occurrences: Default::default(),
+                    invalid: false,
+                },
+            );
+            plain.bounded_sweep_had_unsettled_upload = flag;
+            let mut tagged = with_unsettled_causes(&plain, u16::MAX);
+            let mut outcomes = Vec::new();
+            for index in [&mut plain, &mut tagged] {
+                let (_, rows) = capture(|| {
+                    ensure_bounded_traversal(
+                        SnapshotSource::ClaudeCode,
+                        &[],
+                        index,
+                        T1,
+                        BACKFILL_WINDOW_DAYS,
+                    )
+                });
+                let counts = &rows[0]["counts"];
+                outcomes.push((
+                    [
+                        "prior_unsettled_upload",
+                        "stale_pending_families",
+                        "rearmed_index_files",
+                        "carried_pending_families",
+                        "carried_index_files",
+                    ]
+                    .map(|field| counts[field].clone()),
+                    without_unsettled_causes(index),
+                ));
+            }
+            assert_eq!(outcomes[0], outcomes[1], "flag={flag}");
+        }
     }
 
     #[test]
