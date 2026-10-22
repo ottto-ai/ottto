@@ -1097,3 +1097,83 @@ fn p2a_real_index_rebuild_latch_blocks_bootstrap_and_due_ratio_probe() {
     }
     restart_claude_reemission_stop_for_test();
 }
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn p2a_empty_files_settle_locally_once_without_stamping_stripped_or_prior_bodies() {
+    let home = temp_dir("p2a-empty-local-settlement");
+    let root = home.join("project");
+    fs::create_dir_all(&root).unwrap();
+    let session = "aaaaaaaa-bbbb-4ccc-8ddd-000000000123";
+    let path = root.join(format!("{session}.jsonl"));
+    fs::write(
+        &path,
+        format!(
+            "{}\n",
+            json!({"timestamp":"2026-08-23T18:20:00Z",
+        "type":"user","sessionId":session,"message":{"role":"user","content":"synthetic"}})
+        ),
+    )
+    .unwrap();
+    let support = p2a_support(&home);
+    let _live = money::LiveForTest::new(&support);
+    let mut index = ScanIndex::default();
+    let mut scan = p2a_scan(&root, &support, &mut index);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert!(scan.snapshots.is_empty());
+    assert_eq!(scan.pending_finalization.len(), 1);
+    let key = scan.pending_finalization[0].index_key.clone();
+    assert_eq!(scan.pending_finalization[0].parsed_snapshot_count, 0);
+    for adverse in ["stripped", "prior body", "incomplete", "protected"] {
+        let mut held_index = index.clone();
+        held_index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .effective_upload_body_witness_revision = 2;
+        let mut held_scan = scan.clone();
+        match adverse {
+            "stripped" => held_scan.pending_finalization[0].parsed_snapshot_count = 1,
+            "prior body" => {
+                held_scan.pending_finalization[0].previous_snapshot_fingerprint =
+                    Some("01".repeat(32))
+            }
+            "incomplete" => held_scan.pending_finalization[0].parse_complete = false,
+            "protected" => {
+                fs::write(
+                    support.join("snapshots/claude_code-reemission-exclusions.txt"),
+                    format!("{:x}\n", Sha256::digest(session.as_bytes())),
+                )
+                .unwrap();
+                held_index.load_claude_reemission_exclusions(&support);
+            }
+            _ => unreachable!(),
+        }
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut held_scan, &mut held_index);
+        assert_ne!(
+            held_index.files[&key].effective_upload_body_witness_revision, 3,
+            "{adverse}"
+        );
+    }
+    fs::write(
+        support.join("snapshots/claude_code-reemission-exclusions.txt"),
+        b"",
+    )
+    .unwrap();
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    assert_eq!(index.files[&key].effective_upload_body_witness_revision, 3);
+    assert!(index.confirmed_empty_files.contains(&key));
+    let saved = home.join("empty-index.json");
+    index.save(&saved).unwrap();
+    let mut reloaded = ScanIndex::load(&saved).unwrap();
+    assert_eq!(
+        reloaded.files[&key].effective_upload_body_witness_revision,
+        3
+    );
+    assert_eq!(
+        p2a_scan(&root, &support, &mut reloaded).scanned_file_count,
+        0,
+        "unchanged confirmed empty files must not consume adoption reads again"
+    );
+    let _ = fs::remove_dir_all(home);
+}

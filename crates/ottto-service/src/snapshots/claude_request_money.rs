@@ -628,6 +628,22 @@ impl ShadowReservation {
             .map(|_| Self(bytes))
     }
 
+    /// Transfer one retained graph's charge as its owned buffers change.
+    /// Growth is admitted before the graph may survive another yield.
+    pub(crate) fn resize(&mut self, bytes: usize) -> bool {
+        if bytes > self.0 {
+            let Some(mut extra) = Self::admit(bytes - self.0) else {
+                return false;
+            };
+            self.0 = bytes;
+            extra.0 = 0; // its charge moved into this reservation
+        } else {
+            SHADOW_RESERVED.fetch_sub(self.0 - bytes, Ordering::AcqRel);
+            self.0 = bytes;
+        }
+        true
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.0
     }

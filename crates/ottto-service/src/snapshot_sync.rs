@@ -5997,6 +5997,7 @@ fn finish_sync_source(
         daemon,
         _transport_cycle,
         retry,
+        None,
     ))
     .expect("gate-off finish has no asynchronous custody barrier")
 }
@@ -6021,6 +6022,7 @@ async fn finish_sync_source_resume(
     daemon: &LocalDaemon,
     _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
     retry: &mut live_snapshot_retry::LiveRetryOwner,
+    mut money_memory: Option<&mut money_resume::Memory>,
 ) -> Result<()> {
     let SourcePreparation {
         mut native_comparison_reservation,
@@ -6162,6 +6164,7 @@ async fn finish_sync_source_resume(
             prepared_claude_evidence,
             comparison_completion.as_mut(),
             native_comparison_lease.as_mut(),
+            money_memory.as_deref_mut(),
         )
         .await;
         let (disposition, census_withheld, stats) = match applied {
@@ -6450,17 +6453,9 @@ async fn finish_sync_source_resume(
             &scan_result.snapshots,
         );
     }
-    // Re-measure the transformed page before retaining it over offer/outcome
-    // receipts. This charge lasts through POST, exact ACK and selected save.
-    let _money_finish_funds = if source_money_resume(source, support_dir) {
-        Some((
-            money_resume::retain(&index)?,
-            money_resume::retain(&scan_result)?,
-            money_resume::retain(&upload_progress)?,
-        ))
-    } else {
-        None
-    };
+    if let Some(memory) = money_memory.as_deref_mut() {
+        memory.refresh(&index, &scan_result, Some(&upload_progress), 0)?;
+    }
     if source_money_resume(source, support_dir) {
         money_resume::until(|| {
             crate::snapshots::claude_request_money::prepare_money_offers(
@@ -6818,6 +6813,9 @@ async fn finish_sync_source_resume(
                     .map(|record| record.retry_after_unix_seconds)
             },
         );
+        if let Some(memory) = money_memory {
+            memory.refresh(&index, &scan_result, Some(&upload_progress), 0)?;
+        }
         money_resume::until(|| {
             crate::snapshots::claude_request_money::note_adoption_outcomes(
                 support_dir,
@@ -8223,12 +8221,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         prepared,
         comparison,
         lease,
+        None,
     ))
     .unwrap_or(Err(crate::source_rotation::LocalRefusal(
         "request money scheduling checkpoint pending",
     )))
 }
 
+#[allow(clippy::too_many_arguments)] // Shared evidence, comparison and one moving custody admission.
 async fn try_apply_claude_local_evidence_to_scan_resume(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -8237,6 +8237,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
     mut prepared: Option<PreparedClaudeLocalEvidence>,
     mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&mut crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    money_memory: Option<&mut money_resume::Memory>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -8465,26 +8466,13 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
         comparison.retire_native_fold_owner();
     }
 
-    // These baseline-loader graphs now survive a yield as well as the
-    // builder's independently admitted scratch. Do not park uncharged rows.
-    let _money_evidence_funds = if request_owned_live {
-        Some((
-            money_resume::retain(&api_report),
-            money_resume::retain(&trace_report),
-            money_resume::retain(&scan_result.snapshots),
-        ))
-    } else {
-        None
-    };
-    let _money_evidence_funds = match _money_evidence_funds {
-        Some((Ok(api), Ok(trace), Ok(snapshots))) => Some((api, trace, snapshots)),
-        Some(_) => {
-            return Err(crate::source_rotation::LocalRefusal(
-                "request money evidence retention refused",
-            ))
-        }
-        None => None,
-    };
+    if let Some(memory) = money_memory {
+        memory
+            .evidence(index, scan_result, &api_report, &trace_report)
+            .map_err(|_| {
+                crate::source_rotation::LocalRefusal("request money evidence retention refused")
+            })?;
+    }
     if request_owned_live {
         let mut groupings = BTreeMap::new();
         let holds = crate::snapshots::claude_request_money::live_page_resume(

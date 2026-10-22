@@ -336,6 +336,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 }
             }
             // All evidence/index/progress for the next cycle comes from disk.
+            money_resume::forget_for_test(&support);
             money::store::reload_for_test(&support).unwrap();
         }
     }

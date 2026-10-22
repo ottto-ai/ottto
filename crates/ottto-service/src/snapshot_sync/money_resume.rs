@@ -26,7 +26,6 @@ struct PendingFinish {
     destination: String,
     policy: crate::snapshot_client::ActivityHintResponse,
     client: SnapshotApiClient,
-    _reservation: crate::snapshots::claude_request_money::ShadowReservation,
 }
 static PENDING: Mutex<Option<PendingFinish>> = Mutex::new(None);
 
@@ -98,15 +97,59 @@ fn index_revision(path: &Path) -> Result<Option<FileRevision>> {
     }))
 }
 
-pub(super) fn retain<T: crate::heap_layout_bound::HeapLayoutBound>(
-    graph: &T,
-) -> Result<crate::snapshots::claude_request_money::ShadowReservation> {
-    let bytes = crate::heap_layout_bound::completed_bound(
+fn graph_bytes<T: crate::heap_layout_bound::HeapLayoutBound>(graph: &T) -> Result<usize> {
+    crate::heap_layout_bound::completed_bound(
         graph,
         crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES,
     )
-    .ok_or_else(refusal)?;
-    crate::snapshots::claude_request_money::ShadowReservation::admit(bytes).ok_or_else(refusal)
+    .ok_or_else(refusal)
+}
+
+/// One moving charge for the actual retained inputs. Refreshing replaces its
+/// scan/index/progress slots, rather than charging those same graphs again.
+pub(super) struct Memory {
+    funds: crate::snapshots::claude_request_money::ShadowReservation,
+    fixed: usize,
+    progress: usize,
+}
+impl Memory {
+    pub(super) fn refresh(
+        &mut self,
+        index: &ScanIndex,
+        scan: &SourceScanResult,
+        progress: Option<&SnapshotUploadProgress>,
+        evidence: usize,
+    ) -> Result<()> {
+        let progress = match progress {
+            Some(progress) => graph_bytes(progress)?,
+            None => self.progress,
+        };
+        let bytes = self
+            .fixed
+            .saturating_add(graph_bytes(index)?)
+            .saturating_add(graph_bytes(scan)?)
+            .saturating_add(progress)
+            .saturating_add(evidence);
+        if !self.funds.resize(bytes) {
+            return Err(refusal());
+        }
+        self.progress = progress;
+        Ok(())
+    }
+    pub(super) fn evidence(
+        &mut self,
+        index: &ScanIndex,
+        scan: &SourceScanResult,
+        api: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+        trace: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    ) -> Result<()> {
+        self.refresh(
+            index,
+            scan,
+            None,
+            graph_bytes(api)?.saturating_add(graph_bytes(trace)?),
+        )
+    }
 }
 
 fn poll(mut pending: PendingFinish) -> Result<()> {
@@ -210,11 +253,13 @@ pub(super) fn start(
             crate::heap_layout_bound::completed_bound(&scan, limit - bytes).map(|next| bytes + next)
         })
         .ok_or_else(refusal)?;
-    // A second input-graph charge covers the bounded metadata copies (hint,
-    // paths, destination/client) retained outside the moved preparation.
-    let context_bytes = device
-        .device_id
-        .len()
+    // Pay only the metadata that is actually copied outside the moved input
+    // graphs. In particular, never duplicate either entire index's charge.
+    let context_bytes = graph_bytes(&preparation.activity_hint)?
+        .saturating_add(graph_bytes(&preparation.receipt_client)?.saturating_mul(2))
+        .saturating_add(preparation.index_path.as_os_str().len())
+        .saturating_add(preparation.upload_destination_namespace.len())
+        .saturating_add(device.device_id.len())
         .saturating_add(device.machine_id.as_ref().map_or(0, String::len))
         .saturating_add(
             device
@@ -226,12 +271,23 @@ pub(super) fn start(
         .saturating_add(device_secret.len())
         .saturating_add(machine_id.len())
         .saturating_add(home.as_os_str().len())
-        .saturating_add(support_dir.as_os_str().len())
+        .saturating_add(support_dir.as_os_str().len().saturating_mul(2))
         .saturating_add(16384);
-    let reservation = crate::snapshots::claude_request_money::ShadowReservation::admit(
-        retained.saturating_mul(2).saturating_add(context_bytes),
+    let progress = graph_bytes(&preparation.upload_progress)?;
+    let fixed = retained
+        .saturating_sub(graph_bytes(&index)?)
+        .saturating_sub(graph_bytes(&scan)?)
+        .saturating_sub(progress)
+        .saturating_add(context_bytes);
+    let funds = crate::snapshots::claude_request_money::ShadowReservation::admit(
+        retained.saturating_add(context_bytes),
     )
     .ok_or_else(refusal)?;
+    let mut memory = Memory {
+        funds,
+        fixed,
+        progress,
+    };
     let path = preparation.index_path.clone();
     let revision = index_revision(&path)?;
     let exclusions_revision =
@@ -265,6 +321,7 @@ pub(super) fn start(
             &daemon,
             &mut transport,
             &mut retry,
+            Some(&mut memory),
         )
         .await
     };
@@ -288,7 +345,6 @@ pub(super) fn start(
         destination,
         policy: hint,
         client: resume_client,
-        _reservation: reservation,
     })
 }
 
@@ -300,5 +356,70 @@ pub(super) fn forget_for_test(support_dir: &Path) {
         .is_some_and(|pending| pending.support_dir == support_dir)
     {
         slot.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn moving_charge_does_not_stack_across_receipts_and_refused_growth_keeps_custody() {
+        use crate::snapshots::claude_request_money as money;
+        if !crate::heap_layout_bound::layout_supported() {
+            return;
+        }
+        money::store::flush();
+        let before = money::reserved_for_test();
+        let mut index = ScanIndex::default();
+        let scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut index,
+            "2026-08-23T18:40:00Z",
+            183,
+            16,
+            false,
+        )
+        .unwrap();
+        let progress = test_progress();
+        let charge = graph_bytes(&index).unwrap()
+            + graph_bytes(&scan).unwrap()
+            + graph_bytes(&progress).unwrap();
+        let mut memory = Memory {
+            funds: money::ShadowReservation::admit(charge).unwrap(),
+            fixed: 0,
+            progress: graph_bytes(&progress).unwrap(),
+        };
+        for _ in 0..16 {
+            memory.refresh(&index, &scan, Some(&progress), 0).unwrap();
+            assert_eq!(
+                money::reserved_for_test(),
+                before + charge,
+                "acknowledging another receipt must replace, not stack, the same graph's charge"
+            );
+        }
+        let cap = money::ShadowReservation::admit(
+            money::SHADOW_MEMORY_CEILING_BYTES - money::reserved_for_test(),
+        )
+        .unwrap();
+        assert!(memory.refresh(&index, &scan, Some(&progress), 1).is_err());
+        assert_eq!(
+            memory.funds.bytes(),
+            charge,
+            "failed growth cannot release existing custody"
+        );
+        drop(cap);
+        drop(memory);
+        assert_eq!(money::reserved_for_test(), before);
+    }
+
+    fn test_progress() -> SnapshotUploadProgress {
+        // Empty synthetic destination; no host account or credential access.
+        SnapshotUploadProgress::new(
+            "synthetic-money-destination".into(),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
     }
 }
