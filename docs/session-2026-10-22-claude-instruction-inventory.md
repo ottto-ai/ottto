@@ -33,16 +33,20 @@ whole-checkout walk):
 - Order: root files first, then every other path in bytewise order.
 - Bounds: 200 entries, 8 KiB serialized block (checked while adding entries with a
   512-byte reserve for other fields), 1 s cooperative time budget checked between
-  stats, git output capped at 1 MiB and drained while git runs, 2 s git timeout.
+  stats and observed checks, at most 1,000 nested `AGENTS.md` candidates and 2,000
+  memoized folders, git output capped at 1 MiB and drained while git runs, 2 s git
+  timeout. A single blocked `stat` cannot be interrupted.
 - Anything not established makes the list partial with a reason (`file_cap`,
   `size_cap`, `time_budget`, `stat_error`, `git_failed`, `paths_withheld`), never
   "missing". A tracked file deleted locally is simply not listed. A path the
   backend would refuse is withheld (`paths_withheld`) rather than rejecting the
   snapshot.
 
-Privacy: paths are collected only when the activity hint explicitly says
-workspace labels are on. With labels off the block carries only the mode and
-`paths_withheld`. When the hint cannot be read, no block is sent. The existing
+Privacy: paths are collected only when the activity hint explicitly sends
+`workspace_labels_enabled: true`. The hint decoder now records whether that field
+was sent; the labels themselves keep their old default. With labels off the block
+carries only the mode and `paths_withheld`. When the hint cannot be read or omits
+the field, no block is sent. The existing
 collection opt-outs remove the block with the rest of the capture.
 
 Upload: the block joins the existing upload-on-change digest only when present,
