@@ -3326,6 +3326,7 @@ fn sync_once_with_retry(
     crate::snapshots::claude_request_money::seed_shadow_off(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
+    let mut money_cycle = money_resume::CycleScope::new(daemon);
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -3340,6 +3341,10 @@ fn sync_once_with_retry(
         account_witness,
     );
     let enabled_sources = enabled_snapshot_sources(&device);
+    money_cycle.keep_claude(
+        enabled_sources.contains(&SnapshotSource::ClaudeCode)
+            && crate::snapshots::claude_request_money::request_owned_live(support_dir),
+    );
 
     if let Some(source) = enabled_sources.first().copied() {
         if let Err(error) = upload_local_health_projection_reporting(

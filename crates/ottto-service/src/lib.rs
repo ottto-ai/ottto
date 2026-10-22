@@ -849,6 +849,7 @@ impl LocalDaemon {
         state.pending_switch = None;
         state.sources.clear();
         state.clear_source_state();
+        snapshot_sync::money_resume::cancel_owner(self);
         state.connection = Some(LocalConnectionBinding {
             setup_run_id: setup_run_id.clone(),
             setup_run_token_expires_at: setup_run_token_expires_at.clone(),
@@ -966,6 +967,7 @@ impl LocalDaemon {
         state.pending_switch = None;
         state.sources.clear();
         state.clear_source_state();
+        snapshot_sync::money_resume::cancel_owner(self);
         Ok(AuthResetResponse {
             account: state.account.clone(),
             removed_account,
@@ -1548,6 +1550,7 @@ impl LocalDaemon {
     fn stop_authorized(&self) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
         state.running = false;
+        snapshot_sync::money_resume::cancel_owner(self);
         drop(state);
         agent_status_refresh::stop();
         agent_status::stop_codex_quota_scheduler();

@@ -26,8 +26,62 @@ struct PendingFinish {
     destination: String,
     policy: [u8; 32],
     client: SnapshotApiClient,
+    owner: std::sync::Weak<Mutex<crate::DaemonState>>,
 }
 static PENDING: Mutex<Option<PendingFinish>> = Mutex::new(None);
+
+// Cancellation is scoped to the daemon that owns the parked graph. Other
+// synthetic daemons/support directories cannot release each other's custody.
+fn cancel_weak(owner: &std::sync::Weak<Mutex<crate::DaemonState>>) {
+    let removed = {
+        let Ok(mut slot) = PENDING.lock() else {
+            return;
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|pending| pending.owner.ptr_eq(owner))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    // Drop the ledger guard/reservations and zeroizing secret outside PENDING.
+    drop(removed);
+}
+
+pub(crate) fn cancel_owner(daemon: &LocalDaemon) {
+    cancel_weak(&std::sync::Arc::downgrade(&daemon.inner));
+}
+
+/// Early credential/machine/account errors and a disabled Claude source can
+/// bypass preparation entirely. They still release speculative collection.
+/// Durable ledger/ACK custody remains in its existing independent stores.
+pub(super) struct CycleScope<'a> {
+    daemon: &'a LocalDaemon,
+    cancel: bool,
+}
+impl<'a> CycleScope<'a> {
+    pub(super) fn new(daemon: &'a LocalDaemon) -> Self {
+        Self {
+            daemon,
+            cancel: true,
+        }
+    }
+    pub(super) fn keep_claude(&mut self, enabled: bool) {
+        self.cancel = !enabled;
+        if !enabled {
+            cancel_owner(self.daemon);
+        }
+    }
+}
+impl Drop for CycleScope<'_> {
+    fn drop(&mut self) {
+        if self.cancel {
+            cancel_owner(self.daemon);
+        }
+    }
+}
 
 pub(crate) fn immediate<T>(future: impl Future<Output = T>) -> Option<T> {
     let mut future = std::pin::pin!(future);
@@ -203,7 +257,22 @@ fn poll(mut pending: PendingFinish) -> Result<()> {
             if slot.is_some() {
                 return Err(refusal());
             }
+            let owner = pending.owner.clone();
+            let witness = pending.account_witness;
             *slot = Some(pending);
+            drop(slot);
+            // Reset may race a poll while PENDING is temporarily empty. Check
+            // again AFTER publication; reset also cancels published work.
+            let current = owner.upgrade().and_then(|daemon| {
+                let state = daemon.lock().ok()?;
+                state
+                    .running
+                    .then(|| crate::snapshot_account_witness(&state.account))
+            });
+            if current != Some(witness) {
+                cancel_weak(&owner);
+                return Err(anyhow!("request money account custody withdrawn"));
+            }
             Err(refusal())
         }
     }
@@ -376,6 +445,7 @@ fn start_admitted(
     let machine_id = machine_id.to_owned();
     let home = home.to_owned();
     let support = support_dir.to_owned();
+    let owner = std::sync::Arc::downgrade(&daemon.inner);
     let daemon = daemon.clone();
     let future = async move {
         // Retained optional retry is Pi-only; Claude never owns that window.
@@ -419,6 +489,7 @@ fn start_admitted(
         destination,
         policy: hint,
         client: resume_client,
+        owner,
     })
 }
 
