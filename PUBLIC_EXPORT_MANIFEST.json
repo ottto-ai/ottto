@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 783,
-  "content_sha256": "70c166aebf39b5b87960d43146001fce793517471b35dd3f1ae0d4cc456956cf",
+  "content_sha256": "62cab7b78ad2fabc593e70b428b6ba487223dcf51d34df7d40849c77dd0e0d55",
   "files": [
     {
       "executable": false,
@@ -1819,8 +1819,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/p2a_adoption_tests.rs",
-      "sha256": "a712b3ec21bf6cc47baf9b373bc8f9233d2c6bfd5dd11b204856a1ce61c8edea",
-      "size_bytes": 26831
+      "sha256": "b0ff806df44e9212ac95d6163ba7ee5c4f0640da1118edfa0601a4cd9d80f536",
+      "size_bytes": 26921
     },
     {
       "executable": false,

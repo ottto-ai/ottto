@@ -586,10 +586,15 @@ fn p2a_union_resolves_pair_copies_before_request_conflicts_and_keeps_idless_line
         if !idless {
             assert_eq!(body.input_tokens, 30, "largest resolved contribution wins");
         }
-        assert!(body.usage_buckets.iter().all(|bucket|
-            bucket.first_activity_at.as_deref() == Some("2026-08-23T18:20:00Z")
-                && bucket.last_activity_at.as_deref() == Some("2026-08-23T18:20:00Z")),
-            "bucket activity uses counted events, not its hour boundary");
+        assert!(
+            body.usage_buckets
+                .iter()
+                .all(
+                    |bucket| bucket.first_activity_at.as_deref() == Some("2026-08-23T18:20:00Z")
+                        && bucket.last_activity_at.as_deref() == Some("2026-08-23T18:20:00Z")
+                ),
+            "bucket activity uses counted events, not its hour boundary"
+        );
         let _ = fs::remove_dir_all(home);
     }
 }
