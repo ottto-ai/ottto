@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 764,
-  "content_sha256": "59ac084bce412a170b3eda8fb44a330a530d1002f5bab61aa19a14d70285a973",
+  "candidate_file_count": 767,
+  "content_sha256": "6b0f4f5c52cbfd7facf8b7aa3ae85bec4f3e4f893348d3f5dcbffc3ccc379cb8",
   "files": [
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "22d8abab623cab98e5d41e62690941da698560aba6724416526a3fcbd87e31e6",
-      "size_bytes": 3054416
+      "sha256": "d7616e893a19cb03f79f6ff120b704ef226dc03c6ad0663a50a25d54cf859d01",
+      "size_bytes": 3055468
     },
     {
       "executable": false,
@@ -1770,8 +1770,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "1c0f7dd75844227e338d6917bc6226970ed57fcf1045af5503c6b48619b544ec",
-      "size_bytes": 107051
+      "sha256": "1d627fecc419c6ca2b7bcef3c56cc815990fb8019f190436be400308c1123109",
+      "size_bytes": 107085
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests.rs",
+      "sha256": "21da463f1cd5d15a684f14aba3a2d2e41e3c173c2a85128b5f72ae335dd4ce5e",
+      "size_bytes": 44148
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests/fe_claude_in_page_read_tests.rs",
+      "sha256": "53eecc3c359e8985100d7a125cb4a477faac4ac5e434a2bc8d6afb650cd8fe29",
+      "size_bytes": 41005
     },
     {
       "executable": false,
@@ -3575,6 +3589,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-21-stage2pre-red-fixtures.md",
+      "sha256": "05f88c7b57adf7496c0cbe94abaf25cb4aee1a3a4e93c01d2f11db2f8b8e38ef",
+      "size_bytes": 4132
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-21-tls-webpki-advisory-repair.md",
       "sha256": "ef62b022edc9e5a419dcd1e24d4509ae26d04a99355d05799cc8e87178ccd083",
       "size_bytes": 3566
@@ -5353,7 +5374,7 @@
   ],
   "generated_at": "2026-10-22T07:26:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 765,
+  "output_file_count": 768,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

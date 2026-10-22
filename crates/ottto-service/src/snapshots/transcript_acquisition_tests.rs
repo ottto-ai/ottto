@@ -2660,3 +2660,4 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
         assert_eq!(production_body(source, tail), production_body(source, full));
     }
 }
+mod stage2pre_in_page_tail_tests;
