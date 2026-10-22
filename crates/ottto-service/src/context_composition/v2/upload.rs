@@ -29,7 +29,7 @@ use super::{
     UPLOAD_TOP_FILES, UPLOAD_TOP_SERVERS, UPLOAD_TOP_SESSIONS, UPLOAD_TOP_TOOLS,
 };
 use crate::composition_kinds::{repo_relative, GitRootCache, Kind, Part};
-use crate::context_footprint::{safe_text, sha256_hex};
+use crate::context_footprint::sha256_hex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -316,6 +316,15 @@ fn iso(ts: i64) -> Option<String> {
 pub(super) const MAX_SERVER_CHARS: usize = 64;
 const MAX_LABEL_CHARS: usize = 255;
 const MAX_FILE_NAME_CHARS: usize = 512;
+
+/// Display-safe text as the server keeps it: whitespace normalized, no
+/// forbidden fragment, at most `max` characters, and no space left at the
+/// end by the cap.
+fn safe_text(raw: &str, max: usize) -> Option<String> {
+    let text = crate::context_footprint::safe_text(raw, max)?;
+    let text = text.trim_end();
+    (!text.is_empty()).then(|| text.to_string())
+}
 
 fn is_v2(kind: Kind) -> bool {
     #[cfg(test)]

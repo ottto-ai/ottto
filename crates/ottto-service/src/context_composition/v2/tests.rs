@@ -2436,6 +2436,8 @@ fn a_maximal_upload_meets_the_server_field_rules() {
                 long_server_tool.as_str(),
                 "two  spaces/tool",
                 "two spaces/tool",
+                // The cap would end this label in a space.
+                &format!("s/{} y", "x".repeat(61)),
             ]
             .map(str::to_string),
         )
@@ -2524,6 +2526,7 @@ fn a_maximal_upload_meets_the_server_field_rules() {
         .filter_map(|row| row["label"].as_str())
         .collect();
     assert!(labels.contains(long_label.chars().take(64).collect::<String>().as_str()));
+    assert!(labels.contains(format!("s/{}", "x".repeat(61)).as_str()));
     for gone in ["otel_server/tool", "/Users/me/tool", "bearer abc", "legacy"] {
         assert!(!labels.contains(gone), "{gone}");
     }
