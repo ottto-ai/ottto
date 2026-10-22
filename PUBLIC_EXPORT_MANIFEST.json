@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 780,
-  "content_sha256": "e5cf3d0bd9fc3cac955cacf8dd536b2cc3a3a21d60039244b89a61259f2a29e5",
+  "candidate_file_count": 781,
+  "content_sha256": "a14adf102f9a5b0f884ca2ab6c3aae7d5970c7e7120f994ed79c4bfb426e82ea",
   "files": [
     {
       "executable": false,
@@ -1322,8 +1322,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "5c6f2394dabfdfd68478973a80aad76c8b1978d77bffb722ceb71f6afdbf3d0d",
-      "size_bytes": 873538
+      "sha256": "33a5cfb063e18a8200a20afeb2269d0a0bb0390f915f943b7f93a10d78d17b1b",
+      "size_bytes": 874237
     },
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/stale_family_carry_pipeline_tests.rs",
-      "sha256": "c084ca2a4c846cca04ed735c2f1ab3f9e4c2fd6864c1133f4329bb6d9d969a94",
-      "size_bytes": 41118
+      "sha256": "d7db3e855b3809b9ed2a63d886efcfba3426217708e3e9ebfd4ab3e7075e31eb",
+      "size_bytes": 39380
     },
     {
       "executable": false,
@@ -1448,8 +1448,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "85b6a97c55094254c031795a2965e084ec1592d76a095a935b7f408fb1c992c1",
-      "size_bytes": 3127575
+      "sha256": "0eae3c64d66be77d6099956d6803eb14b000fa992e5a7fbc988031ebe12a9351",
+      "size_bytes": 3128678
     },
     {
       "executable": false,
@@ -1497,8 +1497,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "736010b87c2cc8e53d8d6b82a72275b38af8117401169fccd9db58a4b7315a53",
-      "size_bytes": 48526
+      "sha256": "fac50125231c489d375948db48c9a9adfd50be5eec66f5a2543cd05b9eeb727b",
+      "size_bytes": 50788
     },
     {
       "executable": false,
@@ -3694,9 +3694,16 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-22-patha-authority-hold-bridge.md",
+      "sha256": "1ab510b03779449d9c7a7967361e8063770bc092ddc97829e96b0dcdb97be5a1",
+      "size_bytes": 2416
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-22-terminal-bound-hold-settlement.md",
-      "sha256": "91910b543ceb6bdbc26bbd68ea651fb91c7cb71a17aaa6b3bd4366440c224340",
-      "size_bytes": 3304
+      "sha256": "b1ad2dc25d6e5f988930c958059b4902190c3113d7bf1dfb6a78feb6944b944e",
+      "size_bytes": 3472
     },
     {
       "executable": false,
@@ -5463,9 +5470,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T20:53:24+00:00",
+  "generated_at": "2026-10-22T23:13:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 781,
+  "output_file_count": 782,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5502,5 +5509,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "6bac7d905fa7d3ffb2f4941ec3537d590eb7b9f7"
+  "source_commit": "936bd7add2220111949bd5fd465bc5d03b3c69f8"
 }
