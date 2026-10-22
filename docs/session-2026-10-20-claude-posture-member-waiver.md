@@ -1,5 +1,8 @@
 # Claude posture member waiver
 
+Superseded by `session-2026-10-21-claude-context-file-birth.md`: the waiver
+and its tests were removed; the file birth rule decides instead.
+
 ## Problem
 
 The Claude duplicate-request census fences context posture for every Claude
