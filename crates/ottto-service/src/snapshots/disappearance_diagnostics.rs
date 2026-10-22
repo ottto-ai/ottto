@@ -54,6 +54,26 @@ impl Site {
     }
 }
 
+/// What a vanished Claude census member's retirement dropped with its index
+/// entry. Content-free and process-only, like the site split.
+#[cfg_attr(not(test), allow(dead_code))] // tests-first: wired by the fix commit
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Vanished {
+    /// Its unverified audit debt (SOURCE N2).
+    AuditDebtDropped,
+    /// Its request-census record (SOURCE N1).
+    RequestCensusRemoved,
+}
+const VANISHED: usize = 2;
+impl Vanished {
+    fn index(self) -> usize {
+        match self {
+            Self::AuditDebtDropped => 0,
+            Self::RequestCensusRemoved => 1,
+        }
+    }
+}
+
 fn source_index(source: SnapshotSource) -> usize {
     match source {
         SnapshotSource::Codex => 0,
@@ -65,6 +85,7 @@ fn source_index(source: SnapshotSource) -> usize {
 struct Counters {
     counts: [AtomicU64; 4],
     not_found_sites: [AtomicU64; SITES * OUTCOMES],
+    vanished: [AtomicU64; VANISHED],
     overflowed: AtomicBool,
 }
 impl Counters {
@@ -72,6 +93,7 @@ impl Counters {
         Self {
             counts: [const { AtomicU64::new(0) }; 4],
             not_found_sites: [const { AtomicU64::new(0) }; SITES * OUTCOMES],
+            vanished: [const { AtomicU64::new(0) }; VANISHED],
             overflowed: AtomicBool::new(false),
         }
     }
@@ -86,6 +108,9 @@ impl Counters {
     fn record_not_found_site(&self, site: Site, removal: bool) {
         self.bump(&self.not_found_sites[site.index() * OUTCOMES + usize::from(removal)]);
     }
+    fn record_vanished(&self, vanished: Vanished) {
+        self.bump(&self.vanished[vanished.index()]);
+    }
     fn snapshot(&self) -> Totals {
         Totals {
             version: 1,
@@ -96,6 +121,10 @@ impl Counters {
                     self.not_found_sites[site * OUTCOMES + outcome].load(Ordering::Relaxed)
                 })
             }),
+            vanished_audit_debt_dropped: self.vanished[Vanished::AuditDebtDropped.index()]
+                .load(Ordering::Relaxed),
+            vanished_request_census_removed: self.vanished[Vanished::RequestCensusRemoved.index()]
+                .load(Ordering::Relaxed),
             overflowed: self.overflowed.load(Ordering::Relaxed),
         }
     }
@@ -106,7 +135,8 @@ static TOTALS: [Counters; 3] = [const { Counters::new() }; 3];
 /// Fixed order: NotFound, unresolved root, changed preflight, changed target.
 /// `not_found_sites` splits the walk, candidate and open NotFounds by site in
 /// `Site` order, each `[loss, removal]`; NotFound in `counts` includes both,
-/// and root NotFounds have no site.
+/// and root NotFounds have no site. The `vanished_*` counts are what the
+/// page merge dropped with a vanished Claude member's retired entry.
 /// The sticky flag invalidates exact intervals; false is not a coherence proof.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Totals {
@@ -114,6 +144,8 @@ pub(super) struct Totals {
     scope: &'static str,
     counts: [u64; 4],
     not_found_sites: [[u64; OUTCOMES]; SITES],
+    vanished_audit_debt_dropped: u64,
+    vanished_request_census_removed: u64,
     overflowed: bool,
 }
 
@@ -158,6 +190,19 @@ pub(super) fn not_found_removal(source: SnapshotSource, site: Site) {
     record_not_found_site(source, site, true);
 }
 
+/// The page merge dropped `vanished` with a vanished Claude member's entry.
+#[cfg_attr(not(test), allow(dead_code))] // tests-first: wired by the fix commit
+pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
+    TOTALS[source_index(source)].record_vanished(vanished);
+    #[cfg(test)]
+    TEST_VANISHED_EVENTS.with(|events| {
+        if let Some(mut counts) = events.get() {
+            counts[source_index(source)][vanished.index()] += 1;
+            events.set(Some(counts));
+        }
+    });
+}
+
 pub(super) fn snapshot(source: SnapshotSource) -> Totals {
     TOTALS[source_index(source)].snapshot()
 }
@@ -169,6 +214,7 @@ type SiteEvents = [[[u64; OUTCOMES]; SITES]; 3];
 thread_local! {
     static TEST_EVENTS: std::cell::Cell<Option<[[u64; 4]; 3]>> = const { std::cell::Cell::new(None) };
     static TEST_SITE_EVENTS: std::cell::Cell<Option<SiteEvents>> = const { std::cell::Cell::new(None) };
+    static TEST_VANISHED_EVENTS: std::cell::Cell<Option<[[u64; VANISHED]; 3]>> = const { std::cell::Cell::new(None) };
 }
 
 /// Observe actual caller-thread producers without global resets or decision hooks.
@@ -204,6 +250,22 @@ pub(super) fn observe_sites<T>(f: impl FnOnce() -> T) -> (T, SiteEvents) {
     (result, counts)
 }
 
+/// The caller-thread vanished-member retirement counts, per source, `Vanished` order.
+#[cfg(test)]
+pub(super) fn observe_vanished<T>(f: impl FnOnce() -> T) -> (T, [[u64; VANISHED]; 3]) {
+    struct Reset(Option<[[u64; VANISHED]; 3]>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_VANISHED_EVENTS.with(|events| events.set(self.0));
+        }
+    }
+    let reset = Reset(TEST_VANISHED_EVENTS.with(|events| events.replace(Some([[0; VANISHED]; 3]))));
+    let result = f();
+    let counts = TEST_VANISHED_EVENTS.with(|events| events.get().unwrap());
+    drop(reset);
+    (result, counts)
+}
+
 #[cfg(test)]
 impl Totals {
     pub(super) fn maximum() -> Self {
@@ -212,6 +274,8 @@ impl Totals {
             scope: "process_lifetime_not_window",
             counts: [u64::MAX; 4],
             not_found_sites: [[u64::MAX; OUTCOMES]; SITES],
+            vanished_audit_debt_dropped: u64::MAX,
+            vanished_request_census_removed: u64::MAX,
             overflowed: true,
         }
     }
@@ -682,10 +746,10 @@ mod tests {
     }
 
     /// N-T3: main records the forced member's NotFound as loss in every such
-    /// generation. With the parent present it is a removal each time instead:
-    /// never disappeared, and the traversal no longer observes the member. The
-    /// existing retirement keeps an entry with unverified audit debt
-    /// (`remove_file_entry`), so the entry and its marker stay.
+    /// generation. With the parent present the first one is a removal that
+    /// retires the entry together with its unverified audit marker (SOURCE N2,
+    /// counted), so the next generation no longer enumerates the member and
+    /// records no NotFound at all.
     #[cfg(unix)]
     #[test]
     fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
@@ -693,40 +757,79 @@ mod tests {
         let member_key = local_index_key(&fixture.member_path);
         let mut index = fixture.index();
         for at in [NOW, RETRY] {
-            let ((pages, events), sites) = observe_sites(|| {
-                observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]))
+            let (((pages, events), sites), vanished) = observe_vanished(|| {
+                observe_sites(|| {
+                    observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]))
+                })
             });
+            let retired = u64::from(at == NOW);
             let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
-            expected_sites[1][Site::CandidateForcedIndex.index()] = [0, events[1][0]];
-            assert_eq!(sites, expected_sites, "{at}");
+            expected_sites[1][Site::CandidateForcedIndex.index()] = [0, retired];
+            assert_eq!(sites, expected_sites, "{at}: retired once");
+            assert_eq!(events, [[0; 4], [retired, 0, 0, 0], [0; 4]], "{at}");
+            assert_eq!(
+                vanished,
+                [[0; VANISHED], [retired, 0], [0; VANISHED]],
+                "{at}: the dropped audit debt is counted once"
+            );
             assert!(
                 pages.iter().all(|page| page.disappeared_file_count == 0),
                 "{at}: the forced member's absence beneath its present parent is not loss"
             );
-            // The first generation is forced by the quarantine revision. A
-            // later one is forced only while the record still disagrees.
-            if at == NOW {
-                assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
-            } else {
-                assert!(events[1][0] <= 1 && events[1][1..] == [0; 3], "{at}");
-                assert_eq!((events[0], events[2]), ([0; 4], [0; 4]), "{at}");
-            }
             let traversal = index.traversal.as_ref().expect("symlink keeps it red");
             assert!(!traversal.observed_index_keys.contains(&member_key));
             assert_eq!(traversal.counts.disappeared_file_count, 0);
             assert_eq!(traversal.counts.symlink_rejected_count, 1);
-            assert!(index
+            assert!(
+                !index.files.contains_key(&member_key),
+                "{at}: the entry and its marker are gone"
+            );
+            assert!(!index
                 .files
-                .get(&member_key)
-                .is_some_and(|entry| entry.has_unverified_source()));
+                .values()
+                .any(|entry| entry.has_unverified_source()));
         }
+    }
+
+    /// Control for N-T3: the same member with its parent directory missing is
+    /// not evidence of removal. Its NotFound stays loss, and the entry keeps
+    /// its unverified audit marker.
+    #[cfg(unix)]
+    #[test]
+    fn claude_audit_debt_member_below_missing_parent_keeps_entry_and_marker_red() {
+        let fixture = ForcedFamilyFixture::new("absence-forced-parent-gone");
+        let member_key = local_index_key(&fixture.member_path);
+        fs::remove_dir(fixture.member_path.parent().unwrap()).unwrap();
+        let mut index = fixture.index();
+        let (((pages, events), sites), vanished) = observe_vanished(|| {
+            observe_sites(|| observe(|| claude_generation(&mut index, &fixture.dir, NOW, 10, &[])))
+        });
+        let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
+        expected_sites[1][Site::CandidateForcedIndex.index()] = [1, 0];
+        assert_eq!(sites, expected_sites);
+        assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
+        assert_eq!(vanished, [[0; VANISHED]; 3]);
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page.disappeared_file_count)
+                .sum::<usize>(),
+            1
+        );
+        let traversal = index.traversal.as_ref().expect("the loss keeps it red");
+        assert!(traversal.counts.has_errors());
+        assert_eq!(traversal.counts.disappeared_file_count, 1);
+        assert!(index
+            .files
+            .get(&member_key)
+            .is_some_and(|entry| entry.has_unverified_source()));
     }
 
     /// Control: the quarantined family losing one member through N leaves the
     /// family's quarantine, witness, pending and holds exactly as the reviewed
     /// remove-hint retirement of the same member does. N adds no quarantine
     /// rule, so no held body is released by it, and the failure count moves at
-    /// most once.
+    /// most once. Only the vanished member's own entry and marker go (N2).
     #[cfg(unix)]
     #[test]
     fn claude_member_removal_matches_remove_hint_for_quarantined_family() {
@@ -753,13 +856,54 @@ mod tests {
                 "witnesses": index.claude_usage_family_witnesses,
                 "pending": index.claude_usage_family_pending,
                 "deferred_holds": index.claude_account_deferred_holds,
-                "member": index.files.get(&local_index_key(&fixture.member_path)),
             })
         };
         assert_eq!(family_state(&removal), family_state(&hinted));
+        assert!(!removal
+            .files
+            .contains_key(&local_index_key(&fixture.member_path)));
         if let Some(record) = removal.claude_usage_authority_quarantine.get(FORCED_ROOT) {
             assert!(record.failed_reconstruction_count <= failures_before.saturating_add(1));
         }
+    }
+
+    /// SOURCE N1: the request-census (D1) record of a member retired as a
+    /// removal goes with its entry, and that removal is counted.
+    #[test]
+    fn claude_vanished_member_drops_its_request_census_record_and_counts_it() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-request-census");
+        let first = "a1111111-1111-4111-8111-111111111111";
+        let second = "b2222222-2222-4222-8222-222222222222";
+        let first_path = dir.join(format!("{first}.jsonl"));
+        let second_path = dir.join(format!("{second}.jsonl"));
+        let second_key = local_index_key(&second_path);
+        fs::write(&first_path, claude_line(first, "request-first")).unwrap();
+        fs::write(&second_path, claude_line(second, "request-second")).unwrap();
+        let mut index = ScanIndex::default();
+        assert!(
+            claude_generation(&mut index, &dir, NOW, 1, &[])
+                .last()
+                .unwrap()
+                .census_complete
+        );
+        claude_page(&mut index, &dir, LATER, 1, &[]);
+        assert!(
+            index
+                .claude_request_census_for_test()
+                .get(&second_key)
+                .is_some(),
+            "precondition: the real parse recorded the member's census"
+        );
+        fs::remove_file(&second_path).unwrap();
+        let (pages, vanished) =
+            observe_vanished(|| claude_generation(&mut index, &dir, LATER, 1, &[]));
+        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
+        assert!(!index.files.contains_key(&second_key));
+        assert!(index
+            .claude_request_census_for_test()
+            .get(&second_key)
+            .is_none());
+        assert_eq!(vanished, [[0; VANISHED], [0, 1], [0; VANISHED]]);
     }
 
     /// Control: a single-file rename. The old path, deleted after the walk
@@ -1014,6 +1158,8 @@ mod tests {
                 "scope":"process_lifetime_not_window",
                 "counts":expected_counts,
                 "not_found_sites":([[0, 0]; SITES]),
+                "vanished_audit_debt_dropped":0,
+                "vanished_request_census_removed":0,
                 "overflowed":false})
             );
         }
@@ -1048,6 +1194,27 @@ mod tests {
         assert_eq!(sites.snapshot().not_found_sites[0], [0, 0]);
         assert!(sites.snapshot().overflowed);
 
+        // Vanished-member counts are their own slots and share the sticky flag.
+        let vanished = Counters::new();
+        vanished.record_vanished(Vanished::AuditDebtDropped);
+        vanished.record_vanished(Vanished::RequestCensusRemoved);
+        vanished.record_vanished(Vanished::RequestCensusRemoved);
+        let snapshot = vanished.snapshot();
+        assert_eq!(
+            (
+                snapshot.vanished_audit_debt_dropped,
+                snapshot.vanished_request_census_removed
+            ),
+            (1, 2)
+        );
+        assert_eq!(snapshot.counts, [0; 4]);
+        assert_eq!(snapshot.not_found_sites, [[0; OUTCOMES]; SITES]);
+        assert!(!snapshot.overflowed);
+        vanished.vanished[0].store(u64::MAX, Ordering::Relaxed);
+        vanished.record_vanished(Vanished::AuditDebtDropped);
+        assert_eq!(vanished.snapshot().vanished_audit_debt_dropped, 0);
+        assert!(vanished.snapshot().overflowed);
+
         // Model the observable between-instructions state of a wrapping writer.
         // Isolated primitive test only: this is NOT a scanner producer fixture.
         let between = Counters::new();
@@ -1064,8 +1231,8 @@ mod tests {
 
     #[test]
     fn fixed_storage_bounds_are_target_layout_checks_not_rss_or_capacity_claims() {
-        assert!(std::mem::size_of_val(&TOTALS) <= 360);
-        assert!(std::mem::size_of::<Totals>() <= 136);
+        assert!(std::mem::size_of_val(&TOTALS) <= 408);
+        assert!(std::mem::size_of::<Totals>() <= 152);
     }
 
     #[test]

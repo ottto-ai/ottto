@@ -1302,19 +1302,48 @@ fn envelope_experiment_two_successful_deferrals_use_locked_shed_restore_then_dis
     writeln!(std::io::stderr().lock(), "envelope_experiment_attempts: successful_deferrals=2 base_exits=1 no_renewal=true locked_shed_restore=true restart_native_priority=true age_unknown_count=1").unwrap();
 }
 
+/// Restores a file's original mode at teardown, also when an assertion panics.
+#[cfg(unix)]
+struct RestoreFileMode<'a>(&'a Path, fs::Permissions);
+#[cfg(unix)]
+impl Drop for RestoreFileMode<'_> {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.0, self.1.clone());
+    }
+}
+
+/// A failed read, not a deletion: a Claude file deleted beneath its present
+/// parent is a removal (N), so the failure is injected as a permission error.
+#[cfg(unix)]
 #[test]
 fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_rearm() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        // SAFETY: geteuid() is always-successful and has no preconditions.
+        unsafe { libc::geteuid() },
+        0,
+        "this test injects a failed open with chmod 000, which root reads through; run it as a non-root user"
+    );
     let fixture = SelectionFixture::new();
     let scope = envelope_selection_experiment::Scope::controlled();
     scope.register("family", BTreeSet::from([fixture.paths[0].clone()]));
     let native = fixture.prepare(fixture.previous.clone(), 1);
     assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
     let bytes = fs::read(&fixture.paths[0]).unwrap();
-    fs::remove_file(&fixture.paths[0]).unwrap(); // after frozen selection, before safe open
+    // After frozen selection, before safe open.
+    let unreadable = RestoreFileMode(
+        &fixture.paths[0],
+        fs::metadata(&fixture.paths[0]).unwrap().permissions(),
+    );
+    fs::set_permissions(&fixture.paths[0], fs::Permissions::from_mode(0o000)).unwrap();
     let ((index, scan), producer_events) =
         disappearance_diagnostics::observe(|| SelectionFixture::run(native));
-    assert_eq!(producer_events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
-    assert_eq!(scan.disappeared_file_count, 1);
+    assert_eq!(
+        producer_events, [[0; 4]; 3],
+        "a failed read is not a NotFound producer"
+    );
+    assert_eq!(scan.disappeared_file_count, 0);
+    assert_eq!(scan.unreadable_path_count, 1);
     assert!(scan.disappeared_file_count + scan.unreadable_path_count > 0);
     scope.defer_after_native("family", &scan);
     assert_eq!(scope.counts().unavailable, 1);
@@ -1343,6 +1372,7 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
         saved.accepted_snapshot_fingerprints,
         fixture.previous.accepted_snapshot_fingerprints
     );
+    drop(unreadable);
     fs::write(&fixture.paths[0], bytes).unwrap();
     drop(scope);
     let restarted = envelope_selection_experiment::Scope::restart();
