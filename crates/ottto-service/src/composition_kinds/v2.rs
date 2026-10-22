@@ -11,7 +11,7 @@
 //!   browser by server name, never by tool name (browser servers have a tool
 //!   called `computer`).
 
-use super::shell::{classify_shell, ShellClass, ShellSegment};
+use super::shell::{classify_shell, join_to, ShellClass, ShellSegment};
 use super::{
     is_memory_path, Author, CallClass, CallShare, ContentLabel, InnerItem, Kind, LineCtx, Part,
     Request1, SkipReason, ToolKey, Verdict,
@@ -356,7 +356,10 @@ pub(super) fn claude_tool(ctx: &LineCtx, name: &str, input: &Value) -> CallClass
     let tool = ToolKey::new(name);
     let shares = match name {
         "Bash" => shell_shares(&classify_shell(text("command").unwrap_or(""), ctx.cwd)),
-        "Read" | "NotebookRead" => vec![read_share(text("file_path"), Part::FileTool, 1)],
+        "Read" | "NotebookRead" => {
+            let path = text("file_path").and_then(|path| join_to(ctx.cwd, path));
+            vec![read_share(path.as_deref(), Part::FileTool, 1)]
+        }
         "Skill" => vec![share(Part::SkillFile, 1)],
         "Grep" | "Glob" | "LS" => vec![share(Part::Search, 1)],
         "BashOutput" => vec![share(Part::OtherCommands, 1)],
@@ -473,11 +476,16 @@ fn codex_function(name: &str, input: &str, cwd: Option<&Path>, depth: u8) -> Vec
     }
     if CODEX_FILE_TOOLS.contains(&base) {
         let arguments = serde_json::from_str::<Value>(input).ok();
+        let arguments = arguments.as_ref();
+        let workdir = arguments
+            .and_then(|arguments| arguments.get("workdir"))
+            .and_then(Value::as_str)
+            .map(Path::new);
         let path = arguments
-            .as_ref()
             .and_then(|arguments| arguments.get("path").or_else(|| arguments.get("file_path")))
-            .and_then(Value::as_str);
-        return vec![read_share(path, Part::FileTool, 1)];
+            .and_then(Value::as_str)
+            .and_then(|path| join_to(workdir.or(cwd), path));
+        return vec![read_share(path.as_deref(), Part::FileTool, 1)];
     }
     if CODEX_AGENT_TOOLS.contains(&base) {
         return vec![share(Part::AgentReports, 1)];
@@ -507,14 +515,33 @@ fn codex_shell_call(input: &str, cwd: Option<&Path>) -> Vec<CallShare> {
     shell_shares(&classify_shell(&command, workdir.or(cwd)))
 }
 
-/// `["bash", "-lc", "script"]` -> `script`; other arrays joined by spaces.
+/// `["bash", "-lc", "script"]` -> `script`; any other array becomes one
+/// command whose words are quoted, so an argument keeps its boundaries
+/// (`["cat", "my notes.md"]`) and never reads as shell syntax.
 pub(super) fn command_words_script(words: &[Value]) -> String {
     let words: Vec<&str> = words.iter().filter_map(Value::as_str).collect();
     match words.as_slice() {
         [.., flag, script] if flag.starts_with('-') && flag.ends_with('c') && words.len() >= 3 => {
             (*script).to_string()
         }
-        words => words.join(" "),
+        words => words
+            .iter()
+            .map(|word| shell_quote(word))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// `word` as one shell word: unchanged when plain, else single-quoted.
+fn shell_quote(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "_./:=@%+,-".contains(ch));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
 }
 
@@ -637,7 +664,7 @@ pub(super) fn item_shares(item: &InnerItem) -> Vec<CallShare> {
                 .iter()
                 .map(|entry| match entry.kind {
                     "read" => {
-                        let path = entry.path.and_then(|path| super::shell::join_to(cwd, path));
+                        let path = entry.path.and_then(|path| join_to(cwd, path));
                         read_share(path.as_deref(), Part::ShellRead, 1)
                     }
                     _ => share(Part::Search, 1),

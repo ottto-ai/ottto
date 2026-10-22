@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 764,
-  "content_sha256": "7713825aa791c04f89cbcb188f398b0a73b7a684bb67ef8bb3a656bb612d218c",
+  "content_sha256": "fe398e6906b7df8b7b5e37331a5826ab2cd4ea1dc4ab6eb2239658e070fcd901",
   "files": [
     {
       "executable": false,
@@ -923,15 +923,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/tests_v2.rs",
-      "sha256": "6c9b1b20337c4485fe5fa33368bd1d1e8464979380f64758ea01e5c8d34bb632",
-      "size_bytes": 53505
+      "sha256": "828776165d260fcf7f3af12267107207ec358e23a19dff4e206288cebe4db9aa",
+      "size_bytes": 55476
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/v2.rs",
-      "sha256": "5bd2e1d7e0728cd86c8ce21477dccf03e77bb4f370ce1ecb9d06c82723f5d681",
-      "size_bytes": 26261
+      "sha256": "d1b36f1532fbee6511e34ba37de68a22fe4be5315ed41d01300fc4a999f720af",
+      "size_bytes": 27229
     },
     {
       "executable": false,
@@ -3583,8 +3583,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-composition-kinds-v2.md",
-      "sha256": "20ad6e9819150701be84052dbd717464c59f90cfb41b42d2991edc20891345c8",
-      "size_bytes": 3434
+      "sha256": "01dcfdbab23511336ea5b06b9fcf23c69f9f43e818da3b8441ca4dc8b6bb0553",
+      "size_bytes": 3595
     },
     {
       "executable": false,

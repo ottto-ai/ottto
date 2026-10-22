@@ -446,6 +446,11 @@ fn claude_tools_by_name_and_server() {
     let call = claude_tool(&claude(), "mcp__Claude_Browser__computer", &json!({}));
     assert_eq!(call.tool.as_str(), "Claude_Browser/computer");
     assert_eq!(claude_tool(&claude(), "Read", &json!({})).file, None);
+    // A relative path joins to the working folder, as shell reads do.
+    let relative = claude_tool(&claude(), "Read", &json!({"file_path": "src/../lib/a.rs"}));
+    assert_eq!(relative.file.as_deref(), Some("/w/repo/lib/a.rs"));
+    let absolute = claude_tool(&claude(), "Read", &json!({"file_path": "/x/./y.md"}));
+    assert_eq!(absolute.file.as_deref(), Some("/x/y.md"));
 }
 
 #[test]
@@ -1135,6 +1140,17 @@ fn codex_calls_without_inner_items_fall_back_to_their_input() {
             r#"{"path": "/w/repo/shot.png"}"#,
             vec!["files_read/file_tool 10 /w/repo/shot.png"],
         ),
+        // Relative file-tool paths join to the working folder.
+        (
+            Some("read_file"),
+            r#"{"path": "src/main.rs"}"#,
+            vec!["files_read/file_tool 10 /w/repo/src/main.rs"],
+        ),
+        (
+            Some("view_image"),
+            r#"{"path": "shot.png", "workdir": "/x"}"#,
+            vec!["files_read/file_tool 10 /x/shot.png"],
+        ),
         (
             Some("apply_patch"),
             "*** Begin Patch",
@@ -1378,11 +1394,46 @@ fn command_arrays_give_their_script() {
         ),
         (json!(["bash", "-c", "x"]), "x"),
         (json!(["cat", "a.md"]), "cat a.md"),
+        (json!(["cat", "my notes.md"]), "cat 'my notes.md'"),
+        (json!(["cat", "a; git status"]), "cat 'a; git status'"),
+        (json!(["echo", "it's"]), "echo 'it'\\''s'"),
+        (json!(["printf", ""]), "printf ''"),
         (json!([]), ""),
     ];
     for (words, expected) in cases {
         assert_eq!(command_words_script(words.as_array().unwrap()), expected);
     }
+    // Quoted arguments keep their boundaries through the shell parser.
+    for (words, expected) in [
+        (
+            json!(["cat", "docs/my notes.md"]),
+            vec!["/w/repo/docs/my notes.md"],
+        ),
+        (
+            json!(["cat", "a; git status"]),
+            vec!["/w/repo/a; git status"],
+        ),
+        (json!(["cat", "it's.md"]), vec!["/w/repo/it's.md"]),
+    ] {
+        let script = command_words_script(words.as_array().unwrap());
+        assert_eq!(
+            classify_shell(&script, Some(Path::new(WORKSPACE))),
+            vec![ShellSegment {
+                class: ShellClass::Read,
+                paths: paths(&expected)
+            }],
+            "{script}"
+        );
+    }
+    let call = codex_call(
+        &codex(),
+        Some("shell"),
+        r#"{"command": ["cat", "a; git status"], "workdir": "/w/repo"}"#,
+    );
+    assert_eq!(
+        split(&call, 4),
+        ["files_read/shell_read 4 /w/repo/a; git status"]
+    );
 }
 
 #[test]

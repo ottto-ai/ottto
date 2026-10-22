@@ -38,7 +38,9 @@ checks every id the classifier produces against it.
   line's own working folder when the transcript records one.
 - `ClaudeAttachment.file_type` carries `files[].type` for `instructions` (one
   call per file) and `commandMode` for `queued_command`.
-- `codex_call` takes `namespace/name` when the call has a namespace.
+- `codex_call` takes `namespace/name` when the call has a namespace. For a
+  local-shell call, pass `command_words_script(action.command)` as the input:
+  it quotes each argument, so a file name with spaces or `;` stays one word.
 - `InnerItem::Command.command` is the script (`command_words_script` turns a
   `[shell, -lc, script]` array into it); a `file://` cwd is accepted.
 - `codex_cell` splits any kinds_version 2 call, Claude's included; a result
