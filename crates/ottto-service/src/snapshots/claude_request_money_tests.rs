@@ -1836,6 +1836,45 @@ fn money_ledger_load_damage_is_debt() {
     assert!(store::load_for_test(&support).load_damaged);
 }
 
+/// Sol R5-1: the record cap holds over all shards at load. Shards each valid
+/// on their own load no more than the cap in total; the records past it are
+/// damage (the page drops the certificate), never a breach of the bound.
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn money_ledger_load_caps_records_over_all_shards() {
+    let scratch = crate::test_scratch::ScratchDir::new("money-ledger-record-cap");
+    let support = scratch.join("support");
+    let mut ledger = ClaudeLedger::new_for_test();
+    let keys = (0..64)
+        .map(|number| telemetry_key(&format!("root-{number}")))
+        .collect::<Vec<_>>();
+    for key in &keys {
+        ledger.insert(
+            key.clone(),
+            ClaudeRequestCensusRecord::telemetry(
+                vec![1],
+                money_facts("root", 1),
+                ClaudeTelemetryTailState::default(),
+                1,
+            ),
+        );
+    }
+    money_save_all(&support, &mut ledger);
+    let shards = keys
+        .iter()
+        .map(|key| store::shard_path_for_test(&support, key))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(shards.len() > 1, "the records span shards");
+    let total = ledger.census().record_count();
+    let at_cap = store::load_capped_for_test(&support, total);
+    assert!(!at_cap.load_damaged);
+    assert_eq!(at_cap.census().record_count(), total);
+    let cap = total / 2;
+    let capped = store::load_capped_for_test(&support, cap);
+    assert!(capped.load_damaged, "the records past the cap are damage");
+    assert_eq!(capped.census().record_count(), cap);
+}
+
 /// The compact facts: every field round-trips through the record's blob,
 /// a root's rows read them back in hash order, and a realistic row costs
 /// about 20 bytes (the budget direction 1 sized).
@@ -2598,7 +2637,9 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     let index_bytes = index_census.exact_serialized_len_for_test();
     let census = ledger.census();
     let ledger_bytes = census.exact_serialized_len_for_test();
-    let ledger_resident = census.resident_bytes();
+    let ledger_resident = census
+        .resident_bytes(std::time::Instant::now() + std::time::Duration::from_secs(3600))
+        .expect("no deadline");
     // The structural resident bound (records, overhead, payload) holds.
     assert!(ledger_resident <= store::LEDGER_RESIDENT_BOUND_BYTES);
     let facts_rows = SIDECARS as u64 * SIDECAR_ROWS;

@@ -349,12 +349,16 @@ pub(crate) fn build_claude_request_body(
     // Side-call rows the reported live bodies already carry: hash -> member.
     let mut reported_side_calls = BTreeMap::<u64, (usize, ClaudeLiveKey)>::new();
     let mut family_hashes = BTreeSet::<u64>::new();
+    let mut position = 0_usize;
     for item in &family.items {
-        family_hashes.extend(
-            item.claude_usage_occurrences
-                .keys()
-                .map(|request_id| claude_request_hash(request_id)),
-        );
+        for request_id in item.claude_usage_occurrences.keys() {
+            if position % 1024 == 1023 && ctx.late() {
+                body.unbuilt = true;
+                return body;
+            }
+            position += 1;
+            family_hashes.insert(claude_request_hash(request_id));
+        }
     }
     for (member_index, item) in family.items.iter().enumerate() {
         // Past the page deadline the page is refused: stop building.

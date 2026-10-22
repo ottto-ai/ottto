@@ -890,7 +890,7 @@ pub(crate) fn ledger_state_counts(
     let records = ledger.census();
     counts.ledger_hashes = records.hash_total() as u64;
     counts.ledger_serialized_bytes = records.serialized_total() as u64;
-    counts.ledger_resident_bytes = records.resident_bytes() as u64;
+    counts.ledger_resident_bytes = records.resident_bytes(deadline)? as u64;
     counts.ledger_resident_bound_bytes =
         super::claude_request_money::store::LEDGER_RESIDENT_BOUND_BYTES as u64;
     counts.ledger_dirty_shards = ledger.dirty_shards() as u64;
@@ -909,9 +909,12 @@ pub(crate) fn ledger_state_counts(
         counts.message_records += 1;
         counts.message_hashes += record.request_hashes().len() as u64;
     }
-    counts.family_memos = records
-        .records_with_prefix(super::claude_request_census::FAMILY_KEY_PREFIX)
-        .count() as u64;
+    for _ in records.records_with_prefix(super::claude_request_census::FAMILY_KEY_PREFIX) {
+        if late() {
+            return None;
+        }
+        counts.family_memos += 1;
+    }
     (!late()).then_some(counts)
 }
 

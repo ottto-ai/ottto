@@ -533,6 +533,150 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     let _ = money::take_shadow_lines_for_test();
 }
 
+fn money_scan(fixture: &PipelineFixture) -> crate::snapshots::SourceScanResult {
+    crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.root),
+        &mut ScanIndex::default(),
+        "2026-08-02T08:00:00Z",
+        183,
+        16,
+        true,
+    )
+    .expect("scan synthetic Claude root")
+}
+
+/// StateMissing r3: a kill switch present when the process starts stops
+/// capture before any page has seen it (the cycle seeds it before its
+/// first parse), and a panic inside the capture ends in the shadow: the
+/// latch is set, the capture is dropped and the live parse is unchanged.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_capture_stops_at_start_and_contains_its_panics() {
+    let corpus = MoneyCorpus {
+        shadow: true,
+        copies_and_rows: true,
+        broken_sidecar: false,
+    };
+    let baseline_reserved = money::capture::capture_reserved();
+    let fixture = PipelineFixture::new("money-shadow-capture-start-off");
+    money_write_corpus(&fixture, corpus);
+    std::fs::write(fixture.support.join("claude-request-money-shadow.off"), b"").unwrap();
+    money::enable_shadow_for_test(&fixture.support);
+    money::seed_shadow_off(&fixture.support);
+    let _ = money_scan(&fixture);
+    assert_eq!(
+        money::capture::capture_reserved(),
+        baseline_reserved,
+        "the first parse with the switch present captures nothing"
+    );
+    money::disable_shadow_for_test(&fixture.support);
+
+    let fixture = PipelineFixture::new("money-shadow-capture-panic");
+    money_write_corpus(&fixture, corpus);
+    let unarmed = money_scan(&fixture);
+    money::enable_shadow_for_test(&fixture.support);
+    money::capture::set_panic_for_test(true);
+    let armed = money_scan(&fixture);
+    money::capture::set_panic_for_test(false);
+    // Reads and clears the latch the capture panic set.
+    let (panicked, _) = money::guarded_for_test(|| {});
+    money::disable_shadow_for_test(&fixture.support);
+    assert!(panicked, "the capture panic set the shadow's latch");
+    assert_eq!(
+        money::capture::capture_reserved(),
+        baseline_reserved,
+        "the panicked capture was dropped, never deposited"
+    );
+    assert_eq!(armed.snapshots.len(), unarmed.snapshots.len());
+    for (armed, unarmed) in armed.snapshots.iter().zip(&unarmed.snapshots) {
+        assert_eq!(
+            serde_json::to_value(armed).unwrap(),
+            serde_json::to_value(unarmed).unwrap()
+        );
+    }
+    assert_eq!(armed.census_complete, unarmed.census_complete);
+}
+
+/// Sol R5-2: the rows a page hands to the writer are admitted at what they
+/// own. A 64 KiB model on a copied response is charged in full on the grain
+/// that carries it (a flat share per grain would not); when that admission
+/// does not fit, the page is refused (a false coverage row, no memo moves)
+/// and every byte is refunded.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_batch_admits_long_models_in_full() {
+    const LONG: usize = 64 * 1024;
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    let long_model = format!("claude-haiku-4-5-{}", "x".repeat(LONG));
+    let page = |name: &str, model: &str, hold: usize| {
+        let fixture = PipelineFixture::new(name);
+        money_write_corpus(
+            &fixture,
+            MoneyCorpus {
+                shadow: true,
+                copies_and_rows: true,
+                broken_sidecar: false,
+            },
+        );
+        std::fs::write(
+            fixture.root.join(format!("{MONEY_PIPELINE_COPY}.jsonl")),
+            pipeline_transcript_line(MONEY_PIPELINE_COPY, "req_1_1", 7)
+                .replace("claude-haiku-4-5", model),
+        )
+        .unwrap();
+        money::enable_shadow_for_test(&fixture.support);
+        let mut index = ScanIndex::default();
+        let scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&fixture.root),
+            &mut index,
+            "2026-08-02T08:00:00Z",
+            183,
+            16,
+            true,
+        )
+        .expect("scan synthetic Claude root");
+        let held = (hold > 0).then(|| money::ShadowReservation::admit(hold).expect("hold"));
+        let counts = money::shadow_page_at(
+            &fixture.support,
+            &scan.snapshots,
+            &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            scan.census_complete,
+            response + 3600,
+        );
+        drop(held);
+        money::store::flush();
+        money::capture::purge_scope_for_test(&fixture.support);
+        money::disable_shadow_for_test(&fixture.support);
+        assert_eq!(money::reserved_for_test(), 0, "every admission is refunded");
+        (counts, money_jsonl_rows(&fixture.support))
+    };
+    let (short, _) = page("money-shadow-model-short", "claude-haiku-4-5", 0);
+    let (long, rows) = page("money-shadow-model-long", &long_model, 0);
+    assert_eq!(short.refused_budget, 0, "{short:?}");
+    assert_eq!(long.refused_budget, 0, "{long:?}");
+    assert!(
+        rows.iter()
+            .any(|row| row["row"] == "grain" && row["model"].as_str() == Some(long_model.as_str())),
+        "the long model reaches a grain: {rows:?}"
+    );
+    assert!(
+        long.admitted_peak_bytes >= short.admitted_peak_bytes + LONG as u64,
+        "the long model is charged: {} vs {}",
+        long.admitted_peak_bytes,
+        short.admitted_peak_bytes
+    );
+    let hold = money::SHADOW_MEMORY_CEILING_BYTES - long.admitted_peak_bytes as usize + 1;
+    let (refused, rows) = page("money-shadow-model-tight", &long_model, hold);
+    assert_eq!(refused.refused_budget, 1, "{refused:?}");
+    assert_eq!(refused.coverage_complete, 0, "{refused:?}");
+    assert!(rows.iter().all(|row| row["row"] == "coverage"), "{rows:?}");
+    assert!(rows.iter().any(|row| row["refused"] == true), "{rows:?}");
+}
+
 /// A sidecar that cannot be read (a directory in its place) never fails the
 /// page or changes it, and its family is never complete: a reader failure is
 /// not "no rows".
