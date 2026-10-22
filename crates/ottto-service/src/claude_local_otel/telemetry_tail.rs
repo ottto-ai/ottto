@@ -145,6 +145,8 @@ pub(crate) fn tail_file_memory(old_hashes: usize, read_bytes: u64) -> usize {
 pub(crate) struct ClaudeTelemetryTailCounts {
     pub(crate) dir_entries: u64,
     pub(crate) dir_entry_cap_hit: bool,
+    /// The listing (or an entry of it) failed: this sweep saw a subset.
+    pub(crate) enumeration_failed: bool,
     pub(crate) files_selected: u64,
     pub(crate) files_unchanged: u64,
     pub(crate) files_appended: u64,
@@ -189,7 +191,7 @@ impl ClaudeTelemetryTail {
             sweep_start = now_unix;
         }
         let selected = select_after(&dir, &cursor, budget, &mut counts);
-        if counts.dir_entry_cap_hit {
+        if counts.dir_entry_cap_hit || counts.enumeration_failed {
             // Enumeration saw a subset: this sweep cannot certify every file.
             sweep.debt = 1;
         }
@@ -300,8 +302,14 @@ fn select_after(
     budget: &ClaudeTelemetryTailBudget,
     counts: &mut ClaudeTelemetryTailCounts,
 ) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // No sidecar was ever written: nothing to read.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => {
+            counts.enumeration_failed = true;
+            return Vec::new();
+        }
     };
     let mut after = BinaryHeap::new();
     let mut smallest = BinaryHeap::new();
@@ -322,7 +330,10 @@ fn select_after(
             break;
         }
         counts.dir_entries += 1;
-        let Ok(entry) = entry else { continue };
+        let Ok(entry) = entry else {
+            counts.enumeration_failed = true;
+            continue;
+        };
         let name = entry.file_name();
         let Some(stem) = name.to_str().and_then(sidecar_stem) else {
             continue;
@@ -605,7 +616,12 @@ fn read_file(
     let (device, inode) = identity(&opened);
     // The extent is frozen at open: rows appended later wait for a page.
     let extent = opened.len();
-    let saved = census.get(&key).and_then(|record| record.tail().copied());
+    // An over-budget tombstone kept the position but none of the hashes:
+    // never a resume point (it is reread, and stays debt while refused).
+    let saved = census
+        .get(&key)
+        .filter(|record| !record.over_budget())
+        .and_then(|record| record.tail().copied());
     let resume = match saved {
         Some(state)
             if state.device == device
@@ -627,6 +643,7 @@ fn read_file(
     }
     if saved.is_some() && resume.is_none() {
         counts.files_rebuilt += 1;
+        crate::snapshots::claude_request_money::rows::invalidate_rows(stem);
     }
     // Admit this file's hashes before reading: its old hashes (moved, not
     // copied), the new ones it can collect and their merge.
@@ -898,6 +915,7 @@ fn audit_step(
         // boundary: a rewrite. Rebuilt from 0 by the next sweep.
         _ => {
             counts.audit_mismatches += 1;
+            crate::snapshots::claude_request_money::rows::invalidate_rows(stem);
             census.remove(&key);
         }
     }

@@ -1280,3 +1280,173 @@ fn money_scope_debt_blocks_negative_membership_claims() {
         ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned)
     );
 }
+
+/// AutoReview 1: two loss-free identity-incomplete records holding one
+/// message-only id go through ownership policy (one owner, one copy), never
+/// both held as stale.
+#[test]
+fn money_message_only_copies_pick_one_owner() {
+    let message = crate::snapshots::claude_request_money::claude_message_hash("msg_shared");
+    let mut index = ScanIndex::default();
+    let keys = ["/m/projects/-repo/P.jsonl", "/m/projects/-repo/Q.jsonl"];
+    for (key, seed) in keys.iter().zip(['p', 'q']) {
+        let mut entry = manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = money_fingerprint(seed);
+        index.files.insert((*key).to_owned(), entry);
+        index.claude_request_census_mut_for_test().insert_for_test(
+            key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &money_fingerprint(seed),
+                7,
+                ClaudeRequestCensusShape::IdentityIncomplete,
+                vec![],
+            )
+            .with_message_hashes_for_test(Some(vec![message])),
+        );
+    }
+    let census = index.claude_request_census_for_test();
+    let holders = crate::snapshots::claude_request_ledger::scan_holders(census, &[], &[message]);
+    let scope = ClaudeLedgerScope::build(&index, &BTreeSet::from(["-repo"]), &BTreeSet::new());
+    let empty_claims = BTreeMap::new();
+    let empty_events = BTreeMap::new();
+    let empty_traces = BTreeMap::new();
+    let ctx = ClaudeClassifyContext {
+        index: &index,
+        holders: &holders,
+        scope: &scope,
+        page_claims: &empty_claims,
+        first_event: &empty_events,
+        trace: &empty_traces,
+        telemetry_complete_through: 2_000_000_000,
+    };
+    let verdicts = keys.map(|key| ctx.classify_message(message, key));
+    assert!(
+        verdicts.contains(&ClaudeRequestVerdict::Counted(ClaudeCountedBy::PolicyOwned)),
+        "{verdicts:?}"
+    );
+    assert!(
+        verdicts.contains(&ClaudeRequestVerdict::Removed(ClaudeRemovedBy::Copy)),
+        "{verdicts:?}"
+    );
+}
+
+/// AutoReview 2: an over-budget telemetry tombstone keeps a position but no
+/// hashes; the tail rereads it instead of resuming it as complete.
+#[test]
+fn money_telemetry_tombstones_are_reread_not_resumed() {
+    let tail = MoneyTail::new("money-tail-tombstone");
+    let budget = ClaudeTelemetryTailBudget::default();
+    let session = "d4444444-4444-4444-8444-444444444444";
+    let key = telemetry_key(session);
+    tail.append(
+        session,
+        &money_api_line(session, "req_t", "2026-08-02T07:00:00Z"),
+    );
+    let mut census = ClaudeRequestCensus::default();
+    tail.advance(&mut census, &budget);
+    let state = *census.get(&key).unwrap().tail().unwrap();
+    census.insert_for_test(
+        &key,
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &money_fingerprint('e'),
+            7,
+            ClaudeRequestCensusShape::OverBudget,
+            vec![],
+        )
+        .with_tail(state),
+    );
+    let counts = tail.advance(&mut census, &budget);
+    assert_eq!(counts.files_unchanged, 0, "{counts:?}");
+    assert_eq!(counts.rows_valid, 1, "{counts:?}");
+    assert_eq!(
+        census.get(&key).unwrap().request_hashes(),
+        &[claude_request_hash("req_t")]
+    );
+}
+
+/// AutoReview 4: a store directory that cannot be listed is sweep debt,
+/// never a clean sweep (an absent one is a clean, empty sweep).
+#[test]
+fn money_telemetry_enumeration_failure_is_debt() {
+    let scratch = crate::test_scratch::ScratchDir::new("money-tail-enumeration");
+    let support = scratch.join("support");
+    let budget = ClaudeTelemetryTailBudget::default();
+    let mut census = ClaudeRequestCensus::default();
+    // Absent: nothing was ever written.
+    let counts =
+        ClaudeTelemetryTail::advance(&support, &mut census, 1_800_000_000, &budget, &mut money_work(1 << 20));
+    assert!(counts.sweep_wrapped && !counts.sweep_debt && !counts.enumeration_failed);
+    assert_eq!(telemetry_complete_through(&census), 1_800_000_000);
+    // Not a directory: the listing fails.
+    let store = support.join(crate::claude_local_otel::STORE_DIR);
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    std::fs::write(&store, b"").unwrap();
+    let mut census = ClaudeRequestCensus::default();
+    let counts =
+        ClaudeTelemetryTail::advance(&support, &mut census, 1_800_000_000, &budget, &mut money_work(1 << 20));
+    assert!(counts.enumeration_failed && counts.sweep_debt, "{counts:?}");
+    assert_eq!(telemetry_complete_through(&census), 0);
+}
+
+/// AutoReview 3: rows cached for a sidecar that is later rewritten in place
+/// (same inode, same length, same last bytes) are dropped once the tail's
+/// audit sees the rewrite, and the next reconstruction reads the new rows.
+#[test]
+fn money_rows_cache_follows_audited_rewrites() {
+    let tail = MoneyTail::new("money-rows-rewrite");
+    let budget = ClaudeTelemetryTailBudget::default();
+    let session = "e5555555-5555-4555-8555-555555555555";
+    tail.append(
+        session,
+        &money_api_line(session, "req_a1", "2026-08-02T07:00:00Z"),
+    );
+    tail.append(
+        session,
+        &money_api_line(session, "req_b2", "2026-08-02T07:00:01Z"),
+    );
+    let mut census = ClaudeRequestCensus::default();
+    tail.advance(&mut census, &budget);
+    let rows = |census: &mut ClaudeRequestCensus| {
+        let mut admit = |_: usize| true;
+        let mut out = reconstruct_rows(
+            &tail.support,
+            &[session],
+            census,
+            &mut money_work(1 << 20),
+            &mut admit,
+            &mut ClaudeRowCounts::default(),
+        );
+        match out.remove(session).unwrap() {
+            Reconstructed::Complete(rows) => rows
+                .iter()
+                .map(|row| row.request_hash)
+                .collect::<BTreeSet<_>>(),
+            Reconstructed::Unavailable => panic!("unavailable"),
+        }
+    };
+    assert!(rows(&mut census).contains(&claude_request_hash("req_a1")));
+    // Rewrite the first line's request id in place (same length).
+    let path = tail.path(session);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let rewritten = text.replacen("req_a1", "req_a9", 1);
+    assert_eq!(rewritten.len(), text.len());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all(rewritten.as_bytes())
+        .unwrap();
+    // The next day's audit catches it; the tail rebuilds the record.
+    let counts = tail.advance_with(
+        &mut census,
+        &budget,
+        1_800_000_000 + 86_400,
+        &mut money_work(16 << 20),
+    );
+    assert_eq!(counts.audit_mismatches, 1);
+    tail.advance(&mut census, &budget);
+    let after = rows(&mut census);
+    assert!(after.contains(&claude_request_hash("req_a9")), "{after:?}");
+    assert!(!after.contains(&claude_request_hash("req_a1")));
+    clear_row_cache_for_test(&tail.support);
+}

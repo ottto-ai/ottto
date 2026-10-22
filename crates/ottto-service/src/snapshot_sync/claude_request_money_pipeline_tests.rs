@@ -714,3 +714,30 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
     }
     assert_eq!(MONEY_DELIBERATE_DIFFERENCES.len(), 2);
 }
+
+/// AutoReview 5: when the JSONL cannot be written, no family memo moves
+/// (the reader never received those rows, so they are neither "unchanged"
+/// next time nor a removal basis), and the page is not coverage complete.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_memos_move_only_with_published_rows() {
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    let (fixture, mut index, scan) = money_armed_scan("money-shadow-unpublished");
+    std::fs::write(fixture.support.join("diagnostics"), b"not a directory").unwrap();
+    let counts = money::shadow_page_at(
+        &fixture.support,
+        &scan.snapshots,
+        &mut index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+        scan.census_complete,
+        response + 3600,
+    );
+    assert!(counts.jsonl_failed >= 1, "{counts:?}");
+    assert_eq!(counts.family_memos_withheld, counts.families, "{counts:?}");
+    assert_eq!(counts.coverage_complete, 0);
+    assert!(!index
+        .claude_request_census_for_test()
+        .records()
+        .any(|(key, _)| key.starts_with(crate::snapshots::claude_request_census::FAMILY_KEY_PREFIX)));
+}
