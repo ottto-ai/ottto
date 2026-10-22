@@ -296,6 +296,44 @@ fn money_birth_is_carried_only_for_the_same_object() {
     assert!(census.record_for_test(key).is_none());
 }
 
+/// Owner B's single read: the ledger birth and design E's birth rule come
+/// from one metadata read of the descriptor at open. Removing the path after
+/// open changes neither; device and inode are the opened object's.
+#[test]
+fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
+    let dir = temp_dir("money-birth-open-read");
+    let path = dir.join("d0000000-0000-4000-8000-00000000000d.jsonl");
+    fs::write(&path, "{}\n").expect("write transcript fixture");
+    let file = File::open(&path).expect("open transcript fixture");
+    let expected = file.metadata().expect("opened metadata");
+    let parser = OwnedJsonlParser::new(
+        file,
+        &path,
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .expect("claude parser");
+    fs::remove_file(&path).expect("remove transcript fixture");
+    let birth = parser
+        .claude_opened_birth
+        .expect("the test file system must report file birth");
+    assert!(parser.accumulator.claude_file_birth.is_root_with_birth_for_test());
+    let created = expected
+        .created()
+        .expect("created")
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch");
+    assert_eq!(birth.unix_seconds, created.as_secs());
+    #[cfg(unix)]
+    assert_eq!((birth.device, birth.inode), (expected.dev(), expected.ino()));
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Owner B's sanity floor: a creation time at or before 2020-01-01T00:00Z
 /// (zero and the epoch included) is unknown, never the earliest owner.
 #[test]
