@@ -183,16 +183,16 @@ fn p2a_adoption_pause_resume_and_consumed_evidence_stays_local() {
     for state in [1, 2, 3, 6] {
         crate::snapshot_sync::money_resume::drive_for_test(
             crate::snapshot_sync::money_resume::until(|| {
-                money::note_adoption_outcomes(&support, &index, &scan.snapshots, |_| state)
+                money::note_adoption_outcomes_receipt(&support, &index, &scan.snapshots, |_| state)
             }),
-        );
+        ).unwrap();
         money::store::reload_for_test(&support).unwrap();
         assert!(money::adoption_paused(&support, &index), "state {state}");
         crate::snapshot_sync::money_resume::drive_for_test(
             crate::snapshot_sync::money_resume::until(|| {
-                money::note_adoption_outcomes(&support, &index, &scan.snapshots, |_| 4)
+                money::note_adoption_outcomes_receipt(&support, &index, &scan.snapshots, |_| 4)
             }),
-        );
+        ).unwrap();
         money::store::reload_for_test(&support).unwrap();
         assert!(
             !money::adoption_paused(&support, &index),

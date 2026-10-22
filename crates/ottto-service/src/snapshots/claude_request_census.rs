@@ -727,6 +727,16 @@ impl ClaudeRequestCensus {
             .filter(|(_, record)| !record.is_birth_stub())
     }
 
+    pub(crate) fn records_after(
+        &self,
+        cursor: &str,
+    ) -> impl Iterator<Item = (&String, &ClaudeRequestCensusRecord)> {
+        self.records.range::<str, _>((
+            std::ops::Bound::Excluded(cursor),
+            std::ops::Bound::Unbounded,
+        ))
+    }
+
     pub(crate) fn hash_total(&self) -> usize {
         self.hash_total
     }
@@ -1227,15 +1237,18 @@ impl<R: std::io::Read> CensusRead<R> {
         }
         if self.seen_selection {
             for (key, entry) in &mut index.files {
+                // Empty physical files settle locally without an entity or
+                // ACK. Keep the same exception separate from selection loss.
+                let settled_empty = index.confirmed_empty_files.contains(key)
+                    && entry.last_snapshot_fingerprint.is_none()
+                    && entry.last_upload_body_witness.is_none()
+                    && index
+                        .file_snapshot_fingerprints
+                        .get(key)
+                        .map_or(true, BTreeSet::is_empty);
                 if entry.effective_upload_body_witness_revision >= 3
                     && !index.claude_money_files.contains_key(key)
-                    // A genuinely empty physical file has no logical entity
-                    // selection or ACK. Its ordinary durable empty checkpoint
-                    // is the local revision-3 settlement, just like the floor.
-                    && !(index.confirmed_empty_files.contains(key)
-                        && entry.last_snapshot_fingerprint.is_none()
-                        && entry.last_upload_body_witness.is_none()
-                        && index.file_snapshot_fingerprints.get(key).map_or(true, BTreeSet::is_empty))
+                    && !settled_empty
                     && !super::money_fingerprints_below_retention_floor(
                         index.file_snapshot_fingerprints.get(key),
                         &index.snapshot_activity_at,

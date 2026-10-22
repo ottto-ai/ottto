@@ -126,6 +126,9 @@ pub(crate) struct ClaudeLedger {
     barrier_needed: bool,
     custody_epoch: u64,
     durable_custody_epoch: u64,
+    live_refused_at: Option<(usize, usize)>,
+    pub(super) metadata_cursor: String,
+    pub(super) metadata_checkpoint: bool,
 }
 
 fn custody_key(key: &str) -> bool {
@@ -152,6 +155,9 @@ impl ClaudeLedger {
             barrier_needed: dirty,
             custody_epoch: 0,
             durable_custody_epoch: 0,
+            live_refused_at: None,
+            metadata_cursor: String::new(),
+            metadata_checkpoint: false,
         }
     }
 
@@ -456,7 +462,7 @@ enum Job {
 enum Slot {
     Loading,
     Ready(Box<ClaudeLedger>),
-    Busy,
+    Busy(bool),
 }
 
 static LEDGERS: Mutex<BTreeMap<PathBuf, Slot>> = Mutex::new(BTreeMap::new());
@@ -580,13 +586,13 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
     };
     match ledgers.remove(support_dir) {
         Some(Slot::Ready(ledger)) => {
-            ledgers.insert(support_dir.to_path_buf(), Slot::Busy);
+            ledgers.insert(support_dir.to_path_buf(), Slot::Busy(ledger.live_refused()));
             ClaudeLedgerAcquire::Ready(ClaudeLedgerGuard {
                 support_dir: support_dir.to_path_buf(),
                 ledger: Some(ledger),
             })
         }
-        Some(slot @ (Slot::Loading | Slot::Busy)) => {
+        Some(slot @ (Slot::Loading | Slot::Busy(_))) => {
             let loading = matches!(slot, Slot::Loading);
             ledgers.insert(support_dir.to_path_buf(), slot);
             if loading {
@@ -596,7 +602,7 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
             }
         }
         None if !support_dir.join(LEDGER_DIR).exists() => {
-            ledgers.insert(support_dir.to_path_buf(), Slot::Busy);
+            ledgers.insert(support_dir.to_path_buf(), Slot::Busy(false));
             ClaudeLedgerAcquire::Ready(ClaudeLedgerGuard {
                 support_dir: support_dir.to_path_buf(),
                 ledger: Some(Box::new(ClaudeLedger::empty(true))),
@@ -1115,12 +1121,66 @@ pub(in crate::snapshots) fn money_key(prefix: &str, index_key: &str) -> String {
     format!("{prefix}{:x}", Sha256::digest(index_key.as_bytes()))
 }
 
+/// Only an actual writer/load receipt may suspend a live continuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MoneyReceipt {
+    Ready,
+    Pending,
+    Refused,
+}
+
 impl ClaudeLedger {
+    fn live_refused(&self) -> bool {
+        self.live_refused_at.is_some_and(|(records, bytes)| {
+            self.census.record_count() >= records && self.census.serialized_total() >= bytes
+        })
+    }
+
     pub(super) fn put_money(&mut self, key: String, record: ClaudeRequestCensusRecord) -> bool {
         if self.get(&key) == Some(&record) {
             return true;
         }
-        self.insert(key, record) == ClaudeRequestCensusInsert::Stored
+        // The general census codec may replace an over-budget value with a
+        // lossy tombstone. Money custody must instead retain its predecessor.
+        let old = self.get(&key).cloned();
+        if self.insert(key.clone(), record) == ClaudeRequestCensusInsert::Stored {
+            return true;
+        }
+        self.remove(&key);
+        if let Some(old) = old {
+            self.insert(key, old);
+        }
+        false
+    }
+}
+
+pub(crate) fn live_refused(support: &Path) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return true;
+    };
+    match ledgers.get(support) {
+        Some(Slot::Ready(ledger)) => ledger.live_refused(),
+        Some(Slot::Busy(refused)) => *refused,
+        _ => false,
+    }
+}
+
+pub(crate) fn allow_live(support: &Path) {
+    if let Ok(mut ledgers) = LEDGERS.lock() {
+        if let Some(Slot::Ready(ledger)) = ledgers.get_mut(support) {
+            ledger.live_refused_at = None;
+        }
+    }
+}
+
+pub(crate) fn refuse_live(support: &Path) {
+    if let Ok(mut ledgers) = LEDGERS.lock() {
+        if let Some(Slot::Ready(ledger)) = ledgers.get_mut(support) {
+            ledger.live_refused_at = Some((
+                ledger.census.record_count(),
+                ledger.census.serialized_total(),
+            ));
+        }
     }
 }
 
@@ -1141,6 +1201,22 @@ pub(super) fn checkpoint_until(
     ledger: &mut ClaudeLedger,
     deadline: Instant,
 ) -> bool {
+    checkpoint_receipt_until(support_dir, ledger, deadline) == MoneyReceipt::Ready
+}
+
+pub(super) fn checkpoint_receipt(support_dir: &Path, ledger: &mut ClaudeLedger) -> MoneyReceipt {
+    checkpoint_receipt_until(
+        support_dir,
+        ledger,
+        Instant::now() + Duration::from_millis(100),
+    )
+}
+
+pub(super) fn checkpoint_receipt_until(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    deadline: Instant,
+) -> MoneyReceipt {
     // No wait and no durable I/O on the caller. A later page reacquires the
     // ledger and checks the completed writer receipt before POST or commit.
     if let Some((wait, shards, meta, epoch, complete)) = ledger.pending_checkpoint.take() {
@@ -1151,15 +1227,17 @@ pub(super) fn checkpoint_until(
                 ledger.barrier_needed = !durable;
                 if durable {
                     ledger.durable_custody_epoch = epoch;
+                } else if !failed.is_empty() || meta.is_some() {
+                    return MoneyReceipt::Refused;
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ledger.pending_checkpoint = Some((wait, shards, meta, epoch, complete));
-                return false;
+                return MoneyReceipt::Pending;
             }
             Err(_) => {
                 ledger.restore(&shards, meta);
-                return false;
+                return MoneyReceipt::Refused;
             }
         }
     }
@@ -1169,7 +1247,7 @@ pub(super) fn checkpoint_until(
         &mut super::ClaudeRequestMoneyShadowCounts::default(),
     );
     if !ledger.barrier_needed && ledger.custody_epoch == ledger.durable_custody_epoch {
-        return true;
+        return MoneyReceipt::Ready;
     }
     // Admit the boxed command and its directory before allocating either.
     let Some(allocation) = ShadowReservation::admit(
@@ -1177,7 +1255,7 @@ pub(super) fn checkpoint_until(
             .saturating_add(support_dir.as_os_str().len())
             .saturating_add(1024),
     ) else {
-        return false;
+        return MoneyReceipt::Refused;
     };
     let saved = if ledger.dirty_shards() == 0 {
         ShadowReservation::admit(0).map(|reservation| (ClaudeLedgerSave::default(), reservation))
@@ -1185,7 +1263,7 @@ pub(super) fn checkpoint_until(
         ledger.take_save(deadline)
     };
     let Some((save, reservation)) = saved else {
-        return false;
+        return MoneyReceipt::Refused;
     };
     let shards = save
         .shards
@@ -1203,10 +1281,10 @@ pub(super) fn checkpoint_until(
     .is_err()
     {
         ledger.restore(&shards, meta);
-        return false;
+        return MoneyReceipt::Refused;
     }
     ledger.pending_checkpoint = Some((wait, shards, meta, epoch, complete));
-    false
+    MoneyReceipt::Pending
 }
 
 #[cfg(test)]
