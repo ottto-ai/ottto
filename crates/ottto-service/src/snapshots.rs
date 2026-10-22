@@ -1096,16 +1096,18 @@ fn clear_claude_context_posture(item: &mut SnapshotItem) {
 /// Legacy pairing runs once for the summary and the sizes. Points are built
 /// only when the item's last activity is within the 75-minute output gate,
 /// in request order without collecting the requests. Returns how many
-/// shipped events sit next to an id-less response, for the local counters
-/// (always zero on the strict path, whose request ids are complete).
+/// shipped events sit next to an id-less response, and whether LOCAL points
+/// exceeded their work budget, for local counters only. `sequence_ordered`
+/// is true only for the strict fold's already sorted slice.
 fn set_claude_compaction_scalars<'a, I>(
     item: &mut SnapshotItem,
     owned_observations: &[ClaudeCompactionObservation],
     occurrences: I,
+    sequence_ordered: bool,
     is_own: impl Fn(&ClaudeTranscriptUsageOccurrence) -> bool,
-) -> compaction_events::ClaudeIdLessNeighbours
+) -> (compaction_events::ClaudeIdLessNeighbours, bool)
 where
-    I: Iterator<Item = &'a ClaudeTranscriptUsageOccurrence> + Clone,
+    I: ExactSizeIterator<Item = &'a ClaudeTranscriptUsageOccurrence> + Clone,
 {
     let paired = paired_claude_legacy_compactions(owned_observations);
     let (count, timestamps, metrics) =
@@ -1126,23 +1128,33 @@ where
         (metrics.metrics_count > 0).then_some(metrics.total_cumulative_dropped_tokens);
     item.compaction_total_duration_ms =
         (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
+    let mut points_refused = false;
     item.local_context_points =
         if local_context_points_recent(item.source_last_activity_at.as_deref(), &item.collected_at)
         {
-            LocalContextPoints::from_requests_by_sequence(
-                occurrences,
-                |occurrence| occurrence.sequence,
-                |occurrence| {
-                    is_own(occurrence).then_some((
-                        occurrence.timestamp.as_deref(),
-                        occurrence.effective_input_context,
-                    ))
-                },
-            )
+            let point = |occurrence: &'a ClaudeTranscriptUsageOccurrence| {
+                is_own(occurrence).then_some((
+                    occurrence.timestamp.as_deref(),
+                    occurrence.effective_input_context,
+                ))
+            };
+            if sequence_ordered {
+                LocalContextPoints::from_ordered_requests(occurrences, point)
+            } else {
+                LocalContextPoints::from_requests_by_sequence(
+                    occurrences,
+                    |occurrence| occurrence.sequence,
+                    point,
+                )
+                .unwrap_or_else(|| {
+                    points_refused = true;
+                    Vec::new()
+                })
+            }
         } else {
             Vec::new()
         };
-    id_less
+    (id_less, points_refused)
 }
 
 /// Replace Claude posture scalars from the same owned response suffix used by
@@ -1174,9 +1186,13 @@ fn rebuild_claude_context_posture(
         })
         .cloned()
         .collect::<Vec<_>>();
-    set_claude_compaction_scalars(item, &owned_observations, owned_occurrences.iter(), |_| {
-        true
-    });
+    set_claude_compaction_scalars(
+        item,
+        &owned_observations,
+        owned_occurrences.iter(),
+        true,
+        |_| true,
+    );
 }
 
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the

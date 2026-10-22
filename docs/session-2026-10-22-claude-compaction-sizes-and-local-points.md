@@ -66,9 +66,14 @@ order. Built only when the session's last activity is within 75 minutes of
 collection. Local only (`serde(skip)`). The requests are fed in sequence order
 without being collected: the strict path's slice is already in order (one
 pass); the file-birth path's request-id map is not, so
-`LocalContextPoints::from_requests_by_sequence` replays it in windows of 256
-`(sequence, position)` keys, one cheap pass per window. The result equals a
-stable sort by sequence.
+`LocalContextPoints::from_requests_by_sequence` replays it in fixed windows of
+4,096 `(sequence, position)` keys, at most eight passes. Its exact iterator
+length refuses maps above 32,768 entries before traversal. Admitted results
+equal a stable sort by sequence; refusal clears only the LOCAL points, never
+emits a partial curve, and increments
+`local_context_points_work_refused_session_count` on the existing local
+context-basis counter line. Compactions, first/peak/last, first-own request
+time, money, identity, upload decisions and tuple-clear rules stay unchanged.
 
 ## Weight
 
@@ -81,9 +86,14 @@ stable sort by sequence.
   entries. The legacy pairing set is built once and shared with the existing
   summary. Nothing 5b builds grows with the marker or request count. Items
   without an owned boundary: no request work.
-- Per fold, recent items only: points from a fixed window of 256 request
-  references (about 6 KB), `ceil(n / 256)` passes over the request map (one
-  pass when already in order); at most 64 points of 8 bytes kept.
+- Per fold, recent items only: unordered points use one fixed 4,096-entry
+  window (96 KiB for 24-byte reference tuples on 64-bit targets), at most
+  eight complete map traversals (`work <= 8*n` entry visits). No empty final
+  pass. Above the cap: zero point visits or scratch allocation. The strict
+  path consumes its already ordered slice once, without ordering scratch or
+  this cap. At most 64 points of 8 bytes are retained and charged as before.
+  Fold transients have no heap charging site; scratch capacity is structurally
+  fixed and asserted during selection.
 - Existing debt, not changed here: the Claude parser keeps one
   `ClaudeCompactionObservation` (at most 120 bytes) per marker for the whole
   parse, and the fold's existing summary and owned-boundary copies are as

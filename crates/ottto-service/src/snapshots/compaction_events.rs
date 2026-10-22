@@ -617,16 +617,13 @@ mod tests {
         assert!(occurrences.len() > 4 * LOCAL_CONTEXT_POINT_ORDER_WINDOW);
         let mut ordered = own().collect::<Vec<_>>();
         ordered.sort_by_key(|occurrence| occurrence.sequence);
-        let round_two = LocalContextPoints::from_requests_by_sequence(
-            ordered.iter().copied(),
-            |occurrence| occurrence.sequence,
-            |occurrence| {
+        let round_two =
+            LocalContextPoints::from_ordered_requests(ordered.iter().copied(), |occurrence| {
                 Some((
                     occurrence.timestamp.as_deref(),
                     occurrence.effective_input_context,
                 ))
-            },
-        );
+            });
         fn point(occurrence: &ClaudeTranscriptUsageOccurrence) -> Option<(Option<&str>, u64)> {
             is_own(occurrence).then_some((
                 occurrence.timestamp.as_deref(),
@@ -637,18 +634,15 @@ mod tests {
             occurrences.values(),
             |occurrence| occurrence.sequence,
             point,
-        );
+        )
+        .expect("within the work budget");
         assert!(!from_map.is_empty());
         assert!(from_map.len() <= 64);
         assert_eq!(from_map, round_two);
         // The strict fold passes a slice already in sequence order.
         let mut sorted = occurrences.values().cloned().collect::<Vec<_>>();
         sorted.sort_by_key(|occurrence| occurrence.sequence);
-        let from_slice = LocalContextPoints::from_requests_by_sequence(
-            sorted.iter(),
-            |occurrence| occurrence.sequence,
-            point,
-        );
+        let from_slice = LocalContextPoints::from_ordered_requests(sorted.iter(), point);
         assert_eq!(from_slice, round_two);
     }
 

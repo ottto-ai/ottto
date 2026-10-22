@@ -252,10 +252,14 @@ pub(super) fn apply_own_context_scalars(
     // (an untimed one counts as own there too), minus id-less responses,
     // which carry no occurrence. Moved out for the call, never cloned.
     let occurrences = std::mem::take(&mut item.claude_usage_occurrences);
-    let id_less = set_claude_compaction_scalars(item, &owned, occurrences.values(), |occurrence| {
-        birth.copied(occurrence.timestamp.as_deref()) != Some(true)
-    });
+    let (id_less, points_refused) =
+        set_claude_compaction_scalars(item, &owned, occurrences.values(), false, |occurrence| {
+            birth.copied(occurrence.timestamp.as_deref()) != Some(true)
+        });
     item.claude_usage_occurrences = occurrences;
+    counts.local_context_points_work_refused_session_count = counts
+        .local_context_points_work_refused_session_count
+        .saturating_add(u64::from(points_refused));
     counts.id_less_response_before_compaction_count = counts
         .id_less_response_before_compaction_count
         .saturating_add(id_less.before);
@@ -740,6 +744,9 @@ pub struct ClaudeContextFileBirthCounts {
     /// Shipped compactions whose response just after had no request id, so
     /// their `after` comes from a later request. Local only.
     pub id_less_response_after_compaction_count: u64,
+    /// Recent sessions whose unordered request map exceeded the LOCAL points
+    /// work budget. Does not withhold posture or affect upload/backfill.
+    pub local_context_points_work_refused_session_count: u64,
 }
 
 impl ClaudeContextFileBirthCounts {

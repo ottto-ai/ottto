@@ -30,8 +30,11 @@ const LOCAL_CONTEXT_POINT_BIG_CHANGE_TOKENS: u32 = 20_000;
 /// first pass over old transcripts holds no point lists.
 const LOCAL_CONTEXT_POINT_RECENT_SECONDS: i64 = 75 * 60;
 /// Requests ordered per pass when the fold's owned requests are not already
-/// in sequence order (Claude Code's request-id map): about 6 KB of scratch.
-pub(super) const LOCAL_CONTEXT_POINT_ORDER_WINDOW: usize = 256;
+/// in sequence order (Claude Code's request-id map): 96 KiB of scratch for
+/// reference entries on 64-bit targets. Fold transients have no heap charge
+/// site; this allocation is fixed, and retained points are charged below.
+pub(super) const LOCAL_CONTEXT_POINT_ORDER_WINDOW: usize = 4096;
+pub(super) const LOCAL_CONTEXT_POINT_ORDER_PASSES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalContextPoint {
@@ -133,46 +136,50 @@ impl LocalContextPoints {
         }
     }
 
-    /// Points over owned requests given in any order, fed to `push` in
-    /// `(sequence, input position)` order: exactly a stable sort by sequence,
-    /// so the result equals collecting and sorting the requests, but nothing
-    /// grows with the request count. Input already in sequence order (the
-    /// strict fold's sorted slice) is fed in one pass. Otherwise each pass
-    /// over `requests` selects the next `LOCAL_CONTEXT_POINT_ORDER_WINDOW`
-    /// keys after the last one fed, so scratch is that window whatever the
-    /// count, for `ceil(n / window)` cheap passes. Claude Code builds its list
-    /// this way in the ownership fold from the requests behind
-    /// first/peak/last. `point` returns `None` for a request that is not
-    /// owned, and is called once per request.
+    /// The strict fold already has sequence-ordered requests. Consume them
+    /// once, with no ordering scratch or unordered-input budget.
+    pub(super) fn from_ordered_requests<'a, T>(
+        requests: impl Iterator<Item = T>,
+        point: impl Fn(T) -> Option<(Option<&'a str>, u64)>,
+    ) -> Vec<LocalContextPoint> {
+        let mut points = Self::default();
+        for request in requests {
+            if let Some((at, prompt_tokens)) = point(request) {
+                points.push(at, prompt_tokens);
+            }
+        }
+        points.points
+    }
+
+    /// Feed unordered requests in `(sequence, input position)` order, exactly
+    /// like the previous stable sort. The exact iterator length is available
+    /// without visiting requests. Refuse LOCAL points before any work when
+    /// more than eight fixed windows would be needed: no partial curve.
+    /// Otherwise visit at most `LOCAL_CONTEXT_POINT_ORDER_PASSES * n` entries
+    /// with one fixed window of scratch and call `point` once per request.
     pub(super) fn from_requests_by_sequence<'a, T, I>(
         requests: I,
         sequence: impl Fn(T) -> u64,
         point: impl Fn(T) -> Option<(Option<&'a str>, u64)>,
-    ) -> Vec<LocalContextPoint>
+    ) -> Option<Vec<LocalContextPoint>>
     where
         T: Copy,
-        I: Iterator<Item = T> + Clone,
+        I: ExactSizeIterator<Item = T> + Clone,
     {
+        let count = requests.len();
+        if count > LOCAL_CONTEXT_POINT_ORDER_WINDOW * LOCAL_CONTEXT_POINT_ORDER_PASSES {
+            return None;
+        }
         let mut points = Self::default();
-        let mut feed = |request: T| {
-            if let Some((at, prompt_tokens)) = point(request) {
-                points.push(at, prompt_tokens);
-            }
-        };
-        let mut previous = None;
-        let in_order = requests.clone().all(|request| {
-            let sequence = sequence(request);
-            let in_order = !matches!(previous, Some(previous) if previous > sequence);
-            previous = Some(sequence);
-            in_order
-        });
-        if in_order {
-            requests.for_each(feed);
-            return points.points;
+        if count == 0 {
+            return Some(points.points);
         }
         let mut window = Vec::with_capacity(LOCAL_CONTEXT_POINT_ORDER_WINDOW);
         let mut fed: Option<(u64, usize)> = None;
-        loop {
+        // The range is a structural work bound, independent of input order.
+        // Use the exact count to avoid an extra empty pass at a full window.
+        let passes = count.div_ceil(LOCAL_CONTEXT_POINT_ORDER_WINDOW);
+        for _ in 0..passes {
             for (position, request) in requests.clone().enumerate() {
                 let key = (sequence(request), position);
                 if fed.is_some_and(|fed| key <= fed) {
@@ -187,14 +194,16 @@ impl LocalContextPoints {
                 let index = window.partition_point(|(kept, _)| *kept < key);
                 window.insert(index, (key, request));
                 debug_assert!(window.len() <= LOCAL_CONTEXT_POINT_ORDER_WINDOW);
+                debug_assert!(window.capacity() <= LOCAL_CONTEXT_POINT_ORDER_WINDOW);
             }
-            let full = window.len() == LOCAL_CONTEXT_POINT_ORDER_WINDOW;
             fed = window.last().map(|(key, _)| *key);
-            window.drain(..).for_each(|(_, request)| feed(request));
-            if !full {
-                return points.points;
+            for (_, request) in window.drain(..) {
+                if let Some((at, prompt_tokens)) = point(request) {
+                    points.push(at, prompt_tokens);
+                }
             }
         }
+        Some(points.points)
     }
 }
 
@@ -461,8 +470,9 @@ mod tests {
                 |(sequence, ..)| *sequence,
                 |(_, at, tokens, own)| own.then_some((Some(at.as_str()), *tokens)),
             )
+            .expect("within the work budget")
         };
-        // In order (one pass), and shuffled (two windows of 256).
+        // Stable sequence order and shuffled order; ties keep input order.
         let mut sorted = requests.iter().collect::<Vec<_>>();
         sorted.sort_by_key(|(sequence, ..)| *sequence);
         let in_order = build(&sorted);
@@ -489,5 +499,77 @@ mod tests {
         assert!(shuffled.len() <= LOCAL_CONTEXT_POINT_CAP);
         assert!(shuffled.capacity() <= LOCAL_CONTEXT_POINT_CAP);
         assert_eq!(shuffled.first().unwrap().at_unix_seconds, BASE);
+    }
+    #[test]
+    fn unordered_work_is_bounded_and_matches_the_previous_stable_sort() {
+        use std::cell::Cell;
+        let count = LOCAL_CONTEXT_POINT_ORDER_WINDOW * LOCAL_CONTEXT_POINT_ORDER_PASSES;
+        // Adversarial request-id order, sequence ties and copied/zero-size
+        // requests and enough points to exercise repeated output halving.
+        let requests = (0..count)
+            .rev()
+            .map(|index| {
+                (
+                    index as u64 / 2,
+                    at(BASE + index as u32 * 60),
+                    index as u64 * 1000,
+                )
+            })
+            .collect::<Vec<_>>();
+        fn point(request: &(u64, String, u64)) -> Option<(Option<&str>, u64)> {
+            (request.0 % 5 != 0).then_some((Some(request.1.as_str()), request.2))
+        }
+        let visits = Cell::new(0);
+        let points = LocalContextPoints::from_requests_by_sequence(
+            requests.iter().inspect(|_| visits.set(visits.get() + 1)),
+            |request| request.0,
+            point,
+        )
+        .expect("the exact maximum is admitted");
+        assert_eq!(visits.get(), LOCAL_CONTEXT_POINT_ORDER_PASSES * count);
+        let mut previous = requests.iter().collect::<Vec<_>>();
+        previous.sort_by_key(|request| request.0);
+        let mut oracle = LocalContextPoints::default();
+        for request in previous {
+            if let Some((at, tokens)) = point(request) {
+                oracle.push(at, tokens);
+            }
+        }
+        assert_eq!(points, oracle.points);
+        assert!(points.len() <= LOCAL_CONTEXT_POINT_CAP);
+
+        // Large streams refuse before traversal, not after a partial curve.
+        for count in [count + 1, 250_000] {
+            visits.set(0);
+            let refused = LocalContextPoints::from_requests_by_sequence(
+                (0..count).rev().inspect(|_| visits.set(visits.get() + 1)),
+                |index| index as u64,
+                |_| panic!("refused inputs must not build any points"),
+            );
+            assert_eq!(refused, None);
+            assert_eq!(visits.get(), 0);
+        }
+        assert_eq!(
+            LocalContextPoints::from_requests_by_sequence(
+                std::iter::empty::<usize>(),
+                |index| index as u64,
+                |_| None,
+            ),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn strict_ordered_input_is_one_pass_even_above_the_unordered_budget() {
+        use std::cell::Cell;
+        let count = LOCAL_CONTEXT_POINT_ORDER_WINDOW * LOCAL_CONTEXT_POINT_ORDER_PASSES + 1;
+        let visits = Cell::new(0);
+        let timestamp = at(BASE);
+        let points = LocalContextPoints::from_ordered_requests(
+            (0..count).inspect(|_| visits.set(visits.get() + 1)),
+            |_| Some((Some(timestamp.as_str()), 100)),
+        );
+        assert_eq!(visits.get(), count);
+        assert_eq!(points.len(), 1);
     }
 }

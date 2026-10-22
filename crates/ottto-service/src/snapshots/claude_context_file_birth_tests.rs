@@ -3069,3 +3069,95 @@ fn tail_and_full_read_give_the_same_first_own_request_time() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn points_work_refusal_preserves_every_other_snapshot_field() {
+    use super::local_context_points::{
+        LOCAL_CONTEXT_POINT_ORDER_PASSES, LOCAL_CONTEXT_POINT_ORDER_WINDOW,
+    };
+    let dir = temp_dir("claude-points-work-refusal");
+    let now = OffsetDateTime::now_utc();
+    let (_, mut item) = root_session(
+        &dir,
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
+            boundary(ROOT, &stamp(now, -28), 310, 50),
+            assistant(ROOT, "req_a3", &stamp(now, -27), 200),
+        ],
+    );
+    let template = item
+        .claude_usage_occurrences
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let count = LOCAL_CONTEXT_POINT_ORDER_WINDOW * LOCAL_CONTEXT_POINT_ORDER_PASSES + 1;
+    item.claude_usage_occurrences = (0..count)
+        .map(|index| {
+            let mut occurrence = template.clone();
+            occurrence.sequence = index as u64;
+            occurrence.timestamp = Some(stamp(now, -30 + index as i64 / 2000));
+            (format!("req_{:08}", count - index), occurrence)
+        })
+        .collect();
+    // A stale retained curve must be replaced with empty, never kept on refusal.
+    item.local_context_points = vec![LocalContextPoint {
+        at_unix_seconds: 1,
+        prompt_tokens: 9,
+    }];
+    item.first_own_request_at = item
+        .claude_usage_occurrences
+        .values()
+        .next()
+        .unwrap()
+        .timestamp
+        .clone();
+    let mut expected = item.clone();
+    // Every fixture record is owned (within the file-birth slack). Keep the
+    // parser's own first/peak/last, including the peak from request a2.
+    expected.first_turn_context_tokens = Some(100);
+    expected.peak_context_fill_tokens = Some(300);
+    expected.last_turn_context_tokens = Some(200);
+    let owned = item.claude_context_curve_boundaries.clone();
+    let mut ordered = item
+        .claude_usage_occurrences
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|occurrence| occurrence.sequence);
+    // Previous collect/stable-sort algorithm over this all-owned fixture.
+    let (id_less, refused) =
+        set_claude_compaction_scalars(&mut expected, &owned, ordered.iter(), true, |_| true);
+    assert!(!refused);
+    assert!(!expected.local_context_points.is_empty());
+    assert!(!expected.compaction_events.is_empty());
+    let mut counts = ClaudeContextFileBirthCounts::default();
+    claude_context_file_birth::apply_own_context_scalars(&mut item, &mut counts);
+    assert_eq!(counts.local_context_points_work_refused_session_count, 1);
+    assert!(
+        !counts.resource_withheld(),
+        "LOCAL refusal cannot block upload/backfill"
+    );
+    assert_eq!(
+        counts.id_less_response_before_compaction_count,
+        id_less.before
+    );
+    assert_eq!(
+        counts.id_less_response_after_compaction_count,
+        id_less.after
+    );
+    assert!(item.local_context_points.is_empty());
+    assert_eq!(
+        serde_json::to_value(&item).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    expected.local_context_points.clear();
+    // Includes serde-skipped state, money, identities, first-own time and all
+    // compaction fields, not merely a selected list of serialized fields.
+    assert_eq!(format!("{item:?}"), format!("{expected:?}"));
+    clear_claude_context_posture(&mut item);
+    assert_cleared(&item);
+    let _ = fs::remove_dir_all(dir);
+}
