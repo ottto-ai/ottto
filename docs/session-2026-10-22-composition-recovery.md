@@ -17,7 +17,9 @@ repair boundaries, and file quarantine decisions survive a crash before the
 single index write. Ordinary checkpoints recover their committed offsets without
 inferring repair debt from a decrease: a shorter offset can be a successful
 rewrite. Temporarily absent files retain pending fallback work. Reads beyond a
-full-read reservation remain for the next run. New state directories are flushed
+full-read reservation remain for the next run. If both the index and newest
+scope state are unavailable, tails recovered from the previous generation are
+charged to repair through their discovered ends. New state directories are flushed
 into their parents before committing children.
 
 The metrics line includes `state_fallbacks`, `scopes_quarantined`,

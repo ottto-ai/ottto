@@ -4475,3 +4475,39 @@ fn temporarily_missing_file_keeps_its_fallback_debt() {
     );
     env.cleanup();
 }
+
+#[test]
+fn lost_index_with_bad_current_state_charges_recovered_tails_to_repair() {
+    let env = Env::new("composition-v2-lost-index-fallback-budget");
+    let now = base_now();
+    let cwd = env.cwd();
+    let path = env.root.join("p/a.jsonl");
+    write_records(&path, &claude_turn(&cwd, now.date(), 1));
+    env.run(Source::Claude, now, None);
+    let second = claude_turn(&cwd, now.date(), 2);
+    append_records(&path, &second);
+    env.run(Source::Claude, now + time::Duration::days(1), None);
+    let third = claude_turn(&cwd, now.date(), 3);
+    append_records(&path, &third);
+    fs::write(manifest_of(&env, &cwd), b"{not json").unwrap();
+    fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+    let stats = env.run_with(
+        Source::Claude,
+        now + time::Duration::days(2),
+        None,
+        0,
+        &mut FolderResolver::default(),
+    );
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair, stats.repair_waiting),
+        (0, 0, 1)
+    );
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!(
+        stats.bytes_repair,
+        (body(&second).len() + body(&third).len()) as u64
+    );
+    assert_eq!(stats.bytes_new, 0);
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
+    env.cleanup();
+}

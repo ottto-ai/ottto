@@ -805,15 +805,17 @@ fn rebuild_pins(
         let hydrate = |mut scope: Scope| scope.load_all_shards(&path).ok().map(|()| scope);
         // Lost pins with unusable newest state: the previous generation's
         // checkpoints, whose older offsets make the scope's fallback catch up.
-        let Some(scope) = load_scope(&path, source, &scope_id)
+        let Some((scope, recovered_previous)) = load_scope(&path, source, &scope_id)
             .ok()
             .flatten()
             .and_then(hydrate)
+            .map(|scope| (scope, false))
             .or_else(|| {
                 (!only_uncommitted)
                     .then(|| load_previous(&path, source, &scope_id))
                     .flatten()
                     .and_then(hydrate)
+                    .map(|scope| (scope, true))
             })
         else {
             continue;
@@ -848,6 +850,22 @@ fn rebuild_pins(
         // debt. A shorter checkpoint can also be a successful rewrite.
         // Quarantined files may deliberately have no checkpoint at all.
         index.files.extend(scope.recovery_pins);
+        if recovered_previous {
+            // With both the index and newest generation unavailable, the
+            // old counted boundary cannot be trusted. Conservatively charge
+            // the entire outstanding tail at recovery to repair, never to
+            // uncapped new bytes. Later appends remain new.
+            for pin in index.files.values_mut() {
+                if pin.scope.as_deref() != Some(scope_id.as_str()) || pin.quarantined {
+                    continue;
+                }
+                let Ok(metadata) = fs::metadata(&pin.path) else {
+                    continue;
+                };
+                let end = metadata.len().max(pin.repair_to.unwrap_or(0));
+                pin.repair_to = (end > pin.start).then_some(end);
+            }
+        }
         if !scope.info.workspace_path.is_empty() {
             index
                 .cwd_scopes
