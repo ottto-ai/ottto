@@ -10,6 +10,7 @@ use crate::composition_kinds::{
     self as kinds, Agent, CallClass, ContentLabel, Kind, LineCtx, Verdict,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 use time::{Date, OffsetDateTime};
@@ -77,8 +78,8 @@ pub(crate) fn parse_codex_session(
                         .get("name")
                         .and_then(Value::as_str)
                         .or_else(|| (pt == "local_shell_call").then_some("local_shell"));
-                    let input = p.get("input").and_then(Value::as_str).unwrap_or("");
-                    callmap.insert(cid.to_string(), kinds::codex_call(&ctx, name, input));
+                    let input = codex_call_input(pt, p);
+                    callmap.insert(cid.to_string(), kinds::codex_call(&ctx, name, &input));
                 }
                 // Copied turns were requests of the session that wrote them.
                 if !copied[i] {
@@ -248,6 +249,32 @@ pub(crate) fn parse_codex_session(
 
     report.note_session_start(&session_id, session_min_ts);
     Ok(())
+}
+
+/// A call's own input text: `input` (custom-tool calls), else `arguments`
+/// (function calls), else the local-shell action's command words joined by
+/// spaces; "" when it has none.
+fn codex_call_input<'a>(
+    payload_type: &str,
+    payload: &'a serde_json::Map<String, Value>,
+) -> Cow<'a, str> {
+    let text = |key| payload.get(key).and_then(Value::as_str);
+    if let Some(input) = text("input") {
+        return Cow::Borrowed(input);
+    }
+    match payload_type {
+        "function_call" => Cow::Borrowed(text("arguments").unwrap_or("")),
+        "local_shell_call" => payload
+            .get("action")
+            .and_then(|action| action.get("command"))
+            .and_then(Value::as_array)
+            .map(|words| {
+                let words: Vec<&str> = words.iter().filter_map(Value::as_str).collect();
+                Cow::Owned(words.join(" "))
+            })
+            .unwrap_or_default(),
+        _ => Cow::Borrowed(""),
+    }
 }
 
 /// The counted text blocks of a user message, joined per kind (first-seen

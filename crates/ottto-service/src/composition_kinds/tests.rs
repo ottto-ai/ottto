@@ -373,6 +373,11 @@ fn wire_ids_and_parts() {
         ),
         (Part::BuiltInOther, "built_in_other", Kind::OtherTools),
         (
+            Part::StartNotMeasured,
+            "start_not_measured",
+            Kind::AutomaticAdditions,
+        ),
+        (
             Part::ToolDescriptionsLater,
             "tool_descriptions_later",
             Kind::AutomaticAdditions,
@@ -419,4 +424,15 @@ fn wire_ids_and_parts() {
         assert!(Kind::V2.contains(&kind));
     }
     assert_eq!(Part::Unsplit.kind(), None);
+
+    // The kinds_version 1 reader tracks no request-1 phase.
+    assert_eq!(claude().request_1, Request1::No);
+    assert_eq!(codex().request_1, Request1::No);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "has no kinds_version 1 slot")]
+fn v2_kind_has_no_v1_slot() {
+    Kind::FilesRead.index();
 }

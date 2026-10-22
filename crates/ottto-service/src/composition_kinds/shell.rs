@@ -70,8 +70,8 @@ fn is_repo_relative(path: &str) -> bool {
         && !path.split('/').any(|segment| segment == "..")
 }
 
-/// Admission's forbidden fragments for any plain path
-/// (`backend/app/schemas/context_footprint.py`), matched case-insensitively.
+/// Admission's forbidden fragments for any plain path (from the server's
+/// footprint schema), matched case-insensitively.
 const PLAIN_PATH_FORBIDDEN_FRAGMENTS: [&str; 15] = [
     "/users/",
     "\\users\\",

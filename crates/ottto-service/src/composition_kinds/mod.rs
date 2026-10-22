@@ -100,9 +100,13 @@ impl Kind {
         }
     }
 
-    /// Position in `ALL` (the v1 per-session slot); 0 for a kind outside it.
+    /// Position in `ALL` (the v1 per-session slot). Only kinds_version 1
+    /// kinds have a slot; a kinds_version 2 kind is a bug (debug builds
+    /// panic, release builds use slot 0).
     pub(crate) fn index(self) -> usize {
-        Kind::ALL.iter().position(|c| *c == self).unwrap_or(0)
+        let index = Kind::ALL.iter().position(|c| *c == self);
+        debug_assert!(index.is_some(), "{self:?} has no kinds_version 1 slot");
+        index.unwrap_or(0)
     }
 }
 
@@ -136,6 +140,9 @@ pub(crate) enum Part {
     BackgroundReports,
     BuiltInOther,
     // automatic_additions
+    /// Request-1 content of a session whose start the session-start facts
+    /// did not measure.
+    StartNotMeasured,
     ToolDescriptionsLater,
     ListsUpdated,
     InstructionsReloaded,
@@ -174,6 +181,7 @@ impl Part {
             Part::AgentReports => "agent_reports",
             Part::BackgroundReports => "background_reports",
             Part::BuiltInOther => "built_in_other",
+            Part::StartNotMeasured => "start_not_measured",
             Part::ToolDescriptionsLater => "tool_descriptions_later",
             Part::ListsUpdated => "lists_updated",
             Part::InstructionsReloaded => "instructions_reloaded",
@@ -207,7 +215,8 @@ impl Part {
             Part::Addon | Part::AgentReports | Part::BackgroundReports | Part::BuiltInOther => {
                 Kind::OtherTools
             }
-            Part::ToolDescriptionsLater
+            Part::StartNotMeasured
+            | Part::ToolDescriptionsLater
             | Part::ListsUpdated
             | Part::InstructionsReloaded
             | Part::MemoryReloaded
@@ -242,14 +251,29 @@ pub(crate) enum Author {
     Agent,
 }
 
+/// Whether a line belongs to the session's first request, and if so whether
+/// the session-start facts measured that start.
+#[allow(dead_code)] // kinds_version 1 tracks no request-1 phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Request1 {
+    /// The line is after the first request.
+    No,
+    /// The session-start facts measured this session's start, so composition
+    /// skips the line.
+    StartMeasured,
+    /// The session-start facts did not measure this session's start, so
+    /// composition counts the line under `automatic_additions`
+    /// `start_not_measured`.
+    StartNotMeasured,
+}
+
 /// What the reader knows about the line being classified.
 #[allow(dead_code)] // kinds_version 1 classification reads none of it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LineCtx<'a> {
     pub(crate) agent: Agent,
-    /// The line belongs to the session's first request (measured by the
-    /// session-start facts, so composition skips it).
-    pub(crate) in_request_1: bool,
+    /// Whether the line belongs to the session's first request.
+    pub(crate) request_1: Request1,
     pub(crate) cwd: Option<&'a Path>,
     /// The transcript writes the client's `rendered` text on attachments.
     pub(crate) file_has_rendered: bool,
@@ -262,7 +286,7 @@ impl LineCtx<'_> {
     pub(crate) fn v1(agent: Agent) -> Self {
         Self {
             agent,
-            in_request_1: false,
+            request_1: Request1::No,
             cwd: None,
             file_has_rendered: false,
             author: Author::You,
@@ -394,7 +418,8 @@ pub(crate) fn image(_ctx: &LineCtx, _call: Option<&CallClass>) -> Verdict {
 // -------------------------------------------------------------------------
 
 /// A function, custom-tool or local-shell call. `input` is the call's own
-/// input text ("" when it has none).
+/// input text: `input` for a custom-tool call, `arguments` for a function
+/// call, the action's command for a local-shell call ("" when it has none).
 pub(crate) fn codex_call(_ctx: &LineCtx, name: Option<&str>, _input: &str) -> CallClass {
     match name {
         Some(name) => CallClass::v1(codex_tool_category(name), ToolKey::new(name), None),
@@ -431,6 +456,10 @@ pub(crate) enum InnerItem<'a> {
     },
     Extension {
         name: &'a str,
+        output_chars: u64,
+    },
+    /// A web search the call ran.
+    WebSearch {
         output_chars: u64,
     },
 }
