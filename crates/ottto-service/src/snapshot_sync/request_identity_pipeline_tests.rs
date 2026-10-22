@@ -833,6 +833,12 @@ fn money_gate_off_saved_fixture_receipt() {
             .collect::<Vec<_>>();
         for (n, row) in rows.iter_mut().enumerate() {
             row.account_identifier_hash = Some(if n == 0 { "a" } else { "b" }.repeat(64));
+            row.account_identity_checked = true;
+            row.request_identity = Some(serde_json::from_value(serde_json::json!({
+                "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+                "account":{"origin":"resource","disposition":"complete","resource_hash":row.account_identifier_hash},
+                "organization":{"origin":"resource","disposition":"complete","resource_hash":"c".repeat(64)}
+            })).unwrap());
         }
         // Both a missing-trace row and an auxiliary observer-clock row are
         // present in the saved evidence, alongside the split logins/marker.

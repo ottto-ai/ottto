@@ -5261,13 +5261,6 @@ fn finish_sync_source(
     // This must precede upload-policy stripping: parent/root references are
     // identity evidence needed locally even when the org disables attribution
     // labels on the wire.
-    if source == SnapshotSource::ClaudeCode {
-        crate::snapshots::claude_request_money::reconcile_saved_money_offers(
-            support_dir,
-            &committed_index,
-            &[],
-        );
-    }
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     let mut actual_native_conjunction = false;
@@ -5556,6 +5549,13 @@ fn finish_sync_source(
         if !reoffers.is_empty() {
             upload_progress.save(&upload_progress_path)?;
         }
+    }
+    if source == SnapshotSource::ClaudeCode {
+        crate::snapshots::claude_request_money::reconcile_saved_money_offers(
+            support_dir,
+            &committed_index,
+            &scan_result.snapshots,
+        );
     }
     if source == SnapshotSource::ClaudeCode
         && !crate::snapshots::claude_request_money::prepare_money_offers(

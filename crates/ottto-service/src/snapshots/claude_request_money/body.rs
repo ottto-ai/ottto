@@ -1058,8 +1058,8 @@ pub(crate) fn build_claude_request_body(
         entity.held |= body.unbuilt || !body.rows_complete || body.held.requests > 0;
         entity.certify();
         body.certificate_ok &= entity.certificate_ok;
-        body.unbuilt |= entity.held;
     }
+    body.unbuilt |= body.entities.values().any(|entity| entity.held);
     // The emitter and shadow consume the same proposed grains. Old-side
     // slices retain their explanations; new sides are rebuilt from entities.
     finalize_shadow(&mut body, family);

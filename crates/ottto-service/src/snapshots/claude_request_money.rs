@@ -2281,6 +2281,46 @@ pub(crate) fn live_page(
     held
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn live_page_for_test(
+    support: &Path,
+    snapshots: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    complete: bool,
+    identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
+    groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
+) -> BTreeSet<String> {
+    let original = snapshots.clone();
+    for _ in 0..24 {
+        let held = live_page(
+            support, snapshots, index, api, trace, complete, identity, groupings,
+        );
+        if !checkpoint_pending(support) {
+            return held;
+        }
+        store::flush();
+        *snapshots = original.clone();
+        for item in &original {
+            if let Some(fp) = item.source_file_fingerprint.as_deref() {
+                for (key, entry) in &index.files {
+                    if entry.source_file_fingerprint == fp {
+                        let _ = super::parse_claude_code_jsonl_file(
+                            Path::new(key),
+                            &item.collected_at,
+                            fp.to_owned(),
+                        )
+                        .expect("retry parses fresh evidence/capture");
+                    }
+                }
+            }
+        }
+    }
+    panic!("writer receipt did not converge")
+}
+
 /// A page whose shadow does not take its captures: they are dropped by the
 /// next page (deposited before this one), and older ones now.
 fn purge_captures(scope_key: &Path, counts: &mut ClaudeRequestMoneyShadowCounts) {
@@ -3369,9 +3409,14 @@ pub(crate) fn prepare_money_offers(
             continue;
         }
         if let Some(discovery) = selection::discovery_revision(index, key) {
+            let discovery_key = store::money_key("union:", key);
+            let observed = ledger
+                .get(&discovery_key)
+                .filter(|record| record.money_revision() == discovery)
+                .map_or_else(|| page_now(support_dir), ClaudeRequestCensusRecord::window);
             if !ledger.put_money(
-                store::money_key("union:", key),
-                ClaudeRequestCensusRecord::money_debt(discovery, page_now(support_dir)),
+                discovery_key,
+                ClaudeRequestCensusRecord::money_debt(discovery, observed),
             ) {
                 return false;
             }
@@ -3581,6 +3626,18 @@ fn reconcile_money_offers(
         return;
     };
     let by_source = union_items_by_source(index, snapshots);
+    let by_member = snapshots
+        .iter()
+        .map(|item| {
+            (
+                (
+                    claude_snapshot_family_root_ref(item),
+                    item.source_session_id.as_str(),
+                ),
+                item.snapshot_fingerprint.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let current = index
         .files
         .iter()
@@ -3591,7 +3648,12 @@ fn reconcile_money_offers(
                     entry,
                     by_source
                         .get(entry.source_file_fingerprint.as_str())
-                        .map(|item| item.snapshot_fingerprint.as_str()),
+                        .map(|item| item.snapshot_fingerprint.as_str())
+                        .or_else(|| {
+                            logical_family_member(index, key).and_then(|(root, member)| {
+                                by_member.get(&(root.as_str(), member.as_str())).copied()
+                            })
+                        }),
                 ),
             )
         })
@@ -4120,6 +4182,48 @@ fn stage_money_watch(
 mod scheduling_reconciliation_tests {
     use super::super::claude_request_census::ClaudeTelemetryTailState;
     use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn saved_offer_reconciliation_bounds_changed_and_deleted_bodies() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-offer-churn");
+        let mut index = ScanIndex::default();
+        let key = "/fixture/.claude/projects/group/a.jsonl".to_owned();
+        let fp = "01".repeat(32);
+        index.files.insert(key.clone(), serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":fp,"last_snapshot_fingerprint":null})).unwrap());
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        item.source_file_fingerprint = Some(fp);
+        item.snapshot_fingerprint = format!("{:064x}", 63);
+        let mut ledger = ClaudeLedger::new_for_test();
+        for n in 0..64 {
+            ledger.put_money(
+                format!("{}:{n:064x}", store::money_key("offer:", &key)),
+                ClaudeRequestCensusRecord::money_debt([1; 32], n),
+            );
+        }
+        let dirty = store::money_key("dirty:", &key);
+        ledger.put_money(
+            dirty.clone(),
+            ClaudeRequestCensusRecord::money_debt([1; 32], 0),
+        );
+        reconcile_money_offers(
+            &mut ledger,
+            &index,
+            &[item],
+            Instant::now() + PAGE_MAX_ELAPSED,
+        );
+        assert_eq!(ledger.census().records_with_prefix("offer:").count(), 1);
+        assert!(ledger.get(&dirty).is_some());
+        index.files.clear();
+        reconcile_money_offers(&mut ledger, &index, &[], Instant::now() + PAGE_MAX_ELAPSED);
+        assert!(store::checkpoint_for_test(&scratch, &mut ledger));
+        let restored = store::load_for_test(&scratch);
+        assert_eq!(restored.census().records_with_prefix("offer:").count(), 0);
+        assert!(
+            restored.get(&dirty).is_some(),
+            "offer cleanup cannot settle current debt"
+        );
+    }
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]

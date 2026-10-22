@@ -124,6 +124,16 @@ pub(crate) struct ClaudeLedger {
     pub(crate) synthetic_cursor: String,
     pending_checkpoint: Option<PendingCheckpoint>,
     barrier_needed: bool,
+    custody_epoch: u64,
+    durable_custody_epoch: u64,
+}
+
+fn custody_key(key: &str) -> bool {
+    [
+        "due:", "dirty:", "offer:", "hold:", "watch:", "unbuilt:", "adopt:", "union:", "ever:",
+    ]
+    .iter()
+    .any(|prefix| key.starts_with(prefix))
 }
 
 impl ClaudeLedger {
@@ -140,6 +150,8 @@ impl ClaudeLedger {
             synthetic_cursor: String::new(),
             pending_checkpoint: None,
             barrier_needed: dirty,
+            custody_epoch: 0,
+            durable_custody_epoch: 0,
         }
     }
 
@@ -166,6 +178,9 @@ impl ClaudeLedger {
         if self.census.record_count() >= LEDGER_MAX_RECORDS && self.census.get(&key).is_none() {
             return ClaudeRequestCensusInsert::Refused;
         }
+        if custody_key(&key) && self.get(&key) != Some(&record) {
+            self.custody_epoch = self.custody_epoch.wrapping_add(1);
+        }
         let shard = shard_of(&key);
         let before = self.census.serialized_total();
         let outcome = self.census.insert(key, record);
@@ -176,6 +191,9 @@ impl ClaudeLedger {
     pub(crate) fn remove(&mut self, key: &str) {
         if self.census.get(key).is_none() {
             return;
+        }
+        if custody_key(key) {
+            self.custody_epoch = self.custody_epoch.wrapping_add(1);
         }
         let shard = shard_of(key);
         let before = self.census.serialized_total();
@@ -405,6 +423,8 @@ type PendingCheckpoint = (
     Receiver<(Vec<usize>, Option<bool>)>,
     Vec<usize>,
     Option<bool>,
+    u64,
+    bool,
 );
 
 type CheckpointPayload = (
@@ -588,7 +608,6 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
 /// Hand a page's batch to the writer. On a full outbox the batch comes back
 /// and its shards are dirty again.
 pub(crate) fn submit_batch(ledger: &mut ClaudeLedger, job: WriteJob) -> Result<(), Box<WriteJob>> {
-    ledger.barrier_needed = true;
     let submitted = submit(Job::Write(Box::new(job)));
     match submitted {
         Ok(()) => Ok(()),
@@ -1092,22 +1111,26 @@ impl ClaudeLedger {
     }
 }
 
-/// Complete one bounded save before any new live offer or bound local hold
-/// can advance the index. A busy/dead writer, admission failure or timeout is
-/// retry debt. The guard stays exclusive; a timed-out save is dirtied again.
-/// This barrier deliberately has no network or credential side effects.
+/// Complete a custody epoch before a new live offer or bound hold advances.
+/// Diagnostic memos may keep changing while a receipt is in flight; they do
+/// not invalidate durable due/dirty/offer/watch authority. A partial save or
+/// failed shard never acknowledges the epoch. No caller-side disk wait.
 pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
     // No wait and no durable I/O on the caller. A later page reacquires the
     // ledger and checks the completed writer receipt before POST or commit.
     let deadline = Instant::now() + Duration::from_millis(100);
-    if let Some((wait, shards, meta)) = ledger.pending_checkpoint.take() {
+    if let Some((wait, shards, meta, epoch, complete)) = ledger.pending_checkpoint.take() {
         match wait.try_recv() {
             Ok((failed, meta)) => {
+                let durable = complete && failed.is_empty() && meta.is_none();
                 ledger.restore(&failed, meta);
-                ledger.barrier_needed = false;
+                ledger.barrier_needed = !durable;
+                if durable {
+                    ledger.durable_custody_epoch = epoch;
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ledger.pending_checkpoint = Some((wait, shards, meta));
+                ledger.pending_checkpoint = Some((wait, shards, meta, epoch, complete));
                 return false;
             }
             Err(_) => {
@@ -1121,7 +1144,7 @@ pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool 
         ledger,
         &mut super::ClaudeRequestMoneyShadowCounts::default(),
     );
-    if ledger.dirty_shards() == 0 && !ledger.barrier_needed {
+    if !ledger.barrier_needed && ledger.custody_epoch == ledger.durable_custody_epoch {
         return true;
     }
     // Admit the boxed command and its directory before allocating either.
@@ -1146,6 +1169,8 @@ pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool 
         .map(|(shard, _)| *shard)
         .collect::<Vec<_>>();
     let meta = (save.meta_first.is_some() || save.meta_last.is_some()).then_some(save.meta_debt);
+    let epoch = ledger.custody_epoch;
+    let complete = ledger.dirty_shards() == 0;
     let (done, wait) = sync_channel(1);
     if submit(Job::Checkpoint(
         Box::new((support_dir.to_path_buf(), save, reservation, done)),
@@ -1156,15 +1181,19 @@ pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool 
         ledger.restore(&shards, meta);
         return false;
     }
-    ledger.pending_checkpoint = Some((wait, shards, meta));
+    ledger.pending_checkpoint = Some((wait, shards, meta, epoch, complete));
     false
 }
 
 #[cfg(test)]
 pub(crate) fn checkpoint_for_test(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
     for _ in 0..8 {
-        if checkpoint(support_dir, ledger) {
+        let durable = checkpoint(support_dir, ledger);
+        if durable && ledger.dirty_shards() == 0 {
             return true;
+        }
+        if ledger.dirty_shards() > 0 {
+            ledger.barrier_needed = true;
         }
         flush();
     }
@@ -1475,6 +1504,43 @@ mod refused_intent_tests {
             .get(&support)
             .unwrap()
             .contains_key(&day));
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn diagnostic_memo_does_not_recreate_a_durable_custody_barrier() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-custody-receipt");
+        let mut ledger = ClaudeLedger::new_for_test();
+        ledger.put_money(
+            "dirty:fixture".into(),
+            ClaudeRequestCensusRecord::money_debt([1; 32], 0),
+        );
+        assert!(!checkpoint(&scratch, &mut ledger));
+        flush();
+        ledger.insert(
+            "fam:diagnostic".into(),
+            ClaudeRequestCensusRecord::money_debt([9; 32], 1),
+        );
+        assert!(
+            checkpoint(&scratch, &mut ledger),
+            "unrelated diagnostic debt cannot prevent POST forever"
+        );
+        ledger.put_money(
+            "dirty:fixture".into(),
+            ClaudeRequestCensusRecord::money_debt([2; 32], 0),
+        );
+        assert!(
+            !checkpoint(&scratch, &mut ledger),
+            "changed custody needs its own receipt"
+        );
+        assert!(checkpoint_for_test(&scratch, &mut ledger));
+        assert_eq!(
+            load_for_test(&scratch)
+                .get("dirty:fixture")
+                .unwrap()
+                .money_revision(),
+            [2; 32]
+        );
     }
 
     #[test]

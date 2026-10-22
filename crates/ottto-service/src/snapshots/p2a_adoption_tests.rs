@@ -35,6 +35,11 @@ fn p2a_support(home: &Path) -> PathBuf {
     )
     .unwrap();
     money::store::reload_for_test(&support).unwrap();
+    if let money::store::ClaudeLedgerAcquire::Ready(mut ledger) = money::store::acquire(&support) {
+        assert!(money::store::checkpoint_for_test(&support, &mut ledger));
+    } else {
+        panic!("ready fixture ledger");
+    }
     support
 }
 
@@ -211,7 +216,7 @@ fn p2a_real_scan_union_partial_files_primary_promotion_and_project_refusal() {
         b"{\"type\":\"assistant\",\"timestamp\":\"2026-08-23T18:02:00Z\",\"sessionId\":\"aaaaaaaa-bbbb-4ccc-8ddd-000000000000\",\"requestId\":\"union-extra\",\"message\":{\"id\":\"union-extra-m\",\"model\":\"claude-haiku-4-5\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n").unwrap();
     let mut scan = p2a_scan(&root, &support, &mut index);
     assert_eq!(scan.snapshots.len(), 3, "actual physical parsers");
-    let held = money::live_page(
+    let held = money::live_page_for_test(
         &support,
         &mut scan.snapshots,
         &index,
@@ -299,7 +304,7 @@ fn p2a_real_scan_union_partial_files_primary_promotion_and_project_refusal() {
         entry.effective_upload_body_witness_revision = 1;
     }
     let mut promoted = p2a_scan(&root, &support, &mut index);
-    let held = money::live_page(
+    let held = money::live_page_for_test(
         &support,
         &mut promoted.snapshots,
         &index,
@@ -338,7 +343,7 @@ fn p2a_real_scan_union_partial_files_primary_promotion_and_project_refusal() {
         true,
     )
     .unwrap();
-    let held = money::live_page(
+    let held = money::live_page_for_test(
         &support,
         &mut foreign_scan.snapshots,
         &index,
@@ -421,7 +426,7 @@ fn p2a_known_union_selects_complete_group_before_small_page_boundary() {
             .all(|item| item.source_session_id == "aaaaaaaa-bbbb-4ccc-8ddd-000000000000"),
         "an unrelated member must not split this known union's physical files"
     );
-    let held = money::live_page(
+    let held = money::live_page_for_test(
         &support,
         &mut page.snapshots,
         &index,
@@ -465,7 +470,7 @@ fn p2a_held_new_alias_discovery_survives_partial_index_rollback() {
         page.snapshots[0].source_file_fingerprint.as_deref(),
         Some(index.files[&alias_key].source_file_fingerprint.as_str())
     );
-    let held = money::live_page(
+    let held = money::live_page_for_test(
         &support,
         &mut page.snapshots,
         &index,
@@ -514,7 +519,7 @@ fn p2a_held_new_alias_discovery_survives_partial_index_rollback() {
         .snapshots
         .iter()
         .all(|item| item.source_session_id == "aaaaaaaa-bbbb-4ccc-8ddd-000000000000"));
-    let held = money::live_page(
+    let held = money::live_page_for_test(
         &support,
         &mut recovered.snapshots,
         &restarted,
@@ -577,7 +582,7 @@ fn p2a_union_resolves_pair_copies_before_request_conflicts_and_keeps_idless_line
                 source_created_at: Some(format!("2026-08-23T18:00:{position:02}Z")),
             });
         }
-        let held = money::live_page(
+        let held = money::live_page_for_test(
             &support,
             &mut scan.snapshots,
             &index,
@@ -653,7 +658,7 @@ fn p2a_alias_representative_is_global_and_retained_telemetry_uses_logical_root()
             }));
         index.claude_request_census.insert(key, record);
     }
-    let held = money::live_page(
+    let held = money::live_page_for_test(
         &support,
         &mut scan.snapshots,
         &index,
@@ -737,7 +742,7 @@ fn p2a_protected_alias_keeps_ordinary_body_without_new_custody_hold() {
         "only the newly changed alias needs its ordinary parse"
     );
     let before = serde_json::to_vec(&page.snapshots).unwrap();
-    let held = money::live_page(
+    let held = money::live_page_for_test(
         &support,
         &mut page.snapshots,
         &index,
@@ -791,7 +796,7 @@ fn p2a_root_telemetry_does_not_move_an_inactive_child_past_the_account_cutoff() 
         evidence: BTreeMap::from([(session.to_owned(), vec![row])]),
         ..Default::default()
     };
-    assert!(money::live_page(
+    assert!(money::live_page_for_test(
         &support,
         &mut scan.snapshots,
         &index,
