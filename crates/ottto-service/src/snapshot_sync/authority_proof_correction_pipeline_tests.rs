@@ -650,6 +650,7 @@ impl ApcFixture {
                                     body_witness_digest: None,
                                     head_etag: None,
                                     head_challenge: None,
+                                    unchanged_basis: None,
                                 })
                                 .collect(),
                         };

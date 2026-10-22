@@ -682,6 +682,12 @@ pub struct SnapshotEntityRef {
     pub head_etag: Option<String>,
     #[serde(default)]
     pub head_challenge: Option<String>,
+    /// Set only on an `unchanged` ref the server settled because its stored
+    /// head already covers this body's usage (`usage_identical`,
+    /// `dominated_by_head`). The server did NOT store this body, so no
+    /// body-scoped state may be recorded as stored. Read, never persisted.
+    #[serde(default)]
+    pub unchanged_basis: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -980,6 +986,7 @@ impl SnapshotBatchResponse {
                 body_witness_digest: None,
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             };
             validate_snapshot_entity_ref(&reference)?;
             if !rejection.permanent {
@@ -4006,6 +4013,7 @@ mod tests {
             body_witness_digest: None,
             head_etag: None,
             head_challenge: None,
+            unchanged_basis: None,
         }
     }
 
@@ -4049,6 +4057,7 @@ mod tests {
                 body_witness_digest: Some(crate::snapshots::snapshot_upload_body_witness(&item)),
                 head_etag: Some("e".repeat(64)),
                 head_challenge: None,
+                unchanged_basis: None,
             }],
         );
         let reference = &ack.accepted_entities[0];
