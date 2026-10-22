@@ -1346,6 +1346,8 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
             true,
             |_, _| match case {
                 "shed" => Err(anyhow::Error::new(UploadShed {
+                    request_owned_route_unavailable: false,
+
                     status: 429,
                     retry_after: None,
                     code: None,

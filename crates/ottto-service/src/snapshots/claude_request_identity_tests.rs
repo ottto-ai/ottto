@@ -4196,3 +4196,146 @@ fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
     assert_eq!(bodies[0], bodies[1]);
     let _ = fs::remove_dir_all(dir);
 }
+
+// SI-approved deliberate money differences are exercised by the conservation
+// suite: copied requests leave the copy; side calls appear on the unproven
+// path. For unchanged counted units, contract-5 parts and refusals must remain
+// equal. Policy winners, two-owner winners and idless units remain untagged;
+// a missing trace row is still IncompleteEvidence, never a live-card relaxation.
+fn p2a_identity_entity(
+    item: &SnapshotItem,
+) -> crate::snapshots::claude_request_money::body::ClaudeEntityBody {
+    use crate::snapshots::claude_request_money::{
+        body::{ClaudeCountedContribution, ClaudeEntityBody},
+        ClaudeMoneyTokens,
+    };
+    let mut entity = ClaudeEntityBody::default();
+    for (id, occurrence) in &item.claude_usage_occurrences {
+        let (hour, _) =
+            activity_bucket_from_timestamp(occurrence.timestamp.as_deref().unwrap()).unwrap();
+        let (_, context, _) = build_row_identity(
+            occurrence.model.as_deref().unwrap(),
+            &occurrence.selector,
+            occurrence.reasoning_effort.as_deref(),
+        );
+        entity.counted.push(ClaudeCountedContribution {
+            key: (hour, occurrence.model.clone().unwrap(), context),
+            origin: None,
+            tokens: ClaudeMoneyTokens::from_usage(&occurrence.usage),
+            requests: occurrence.usage.request_count,
+            cost: None,
+            request: Some(crate::snapshots::claude_request_census::claude_request_hash(id)),
+            clock: rfc3339_unix_seconds(occurrence.timestamp.as_deref().unwrap()).unwrap(),
+            by: crate::snapshots::claude_request_ledger::ClaudeCountedBy::TelemetryProven,
+        });
+    }
+    entity
+}
+
+#[test]
+fn p2a_si_parity_keeps_second_login_parts_and_missing_trace_refusal() {
+    let dir = temp_dir("p2a-si-parity");
+    let raw = parse_session(&dir, &owned_session()).remove(0);
+    for trace_gap in [false, true] {
+        let (mut api, mut trace) = owned_session_reports();
+        let row = &mut api.evidence.get_mut(ROOT).unwrap()[1];
+        row.account_identifier_hash = Some("b".repeat(64));
+        *row = signed(row.clone());
+        if trace_gap {
+            trace
+                .evidence
+                .get_mut(ROOT)
+                .unwrap()
+                .retain(|row| row.request_id != "req_3");
+        }
+        let (_, legacy) = tag_one(&raw, &api, &trace);
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let entity = p2a_identity_entity(&raw);
+        let mut literal = raw.clone();
+        literal.usage_accounting_contract =
+            Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT.into());
+        literal.telemetry_owned_complete = Some(true);
+        let grouping = identity::request_owned_grouping(&literal, &evidence, &entity).unwrap();
+        identity::apply_grouped(&mut literal, grouping).unwrap();
+        assert_eq!(
+            tagged_body(&literal),
+            tagged_body(&legacy),
+            "trace_gap={trace_gap}"
+        );
+        assert_usage_conserved(&literal, &raw);
+        let (logins, untagged) = identity_shares(&literal);
+        assert_eq!(
+            logins[&"b".repeat(64)].0,
+            1,
+            "second account never folded into main login"
+        );
+        assert_eq!(untagged.0, u64::from(trace_gap));
+        assert_eq!(literal.request_identity_refusals, u64::from(trace_gap));
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn p2a_si_policy_two_owner_and_idless_units_stay_untagged_despite_telemetry() {
+    use crate::snapshots::claude_request_ledger::ClaudeCountedBy;
+    let dir = temp_dir("p2a-si-no-policy-tags");
+    let raw = parse_session(&dir, &owned_session()).remove(0);
+    let (api, trace) = owned_session_reports();
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    for by in [
+        ClaudeCountedBy::Owned,
+        ClaudeCountedBy::PolicyOwned,
+        ClaudeCountedBy::TwoOwnerWinner,
+        ClaudeCountedBy::Idless,
+    ] {
+        let mut entity = p2a_identity_entity(&raw);
+        for unit in &mut entity.counted {
+            unit.by = by;
+        }
+        entity.telemetry_owned_complete = false;
+        let mut item = raw.clone();
+        let grouping = identity::request_owned_grouping(&item, &evidence, &entity).unwrap();
+        identity::apply_grouped(&mut item, grouping).unwrap();
+        assert_usage_conserved(&item, &raw);
+        assert!(
+            item.request_evidence.is_empty(),
+            "{by:?}: doubt never names"
+        );
+        assert_eq!(identity_shares(&item), (BTreeMap::new(), (3, 0)));
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn p2a_si_all_55_trace_named_subagents_keep_per_item_contract5_accounts() {
+    let dir = temp_dir("p2a-si-55-subagents");
+    let raw = parse_session(&dir, &owned_session()).remove(0);
+    let mut named = 0;
+    for number in 0..55 {
+        let agent = format!("{number:016x}");
+        let mut child = raw.clone();
+        child.source_session_id = claude_trace_owner_session_id(ROOT, &agent);
+        child.attribution_facts.clear();
+        let (api, mut trace) = owned_session_reports();
+        for row in trace.evidence.get_mut(ROOT).unwrap() {
+            row.agent_id = agent.clone();
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+        }
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let entity = p2a_identity_entity(&child);
+        let grouping = identity::request_owned_grouping(&child, &evidence, &entity).unwrap();
+        identity::apply_grouped(&mut child, grouping).unwrap();
+        assert_eq!(
+            identity_shares(&child),
+            (BTreeMap::from([(OWNER_A.into(), (3, 0))]), (0, 0))
+        );
+        assert_eq!(child.request_identity_refusals, 0);
+        named += 1;
+    }
+    assert_eq!(named, 55);
+    let _ = fs::remove_dir_all(dir);
+}

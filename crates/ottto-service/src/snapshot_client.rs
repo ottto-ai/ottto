@@ -191,6 +191,7 @@ pub struct UploadShed {
     pub retry_after: Option<Duration>,
     /// The backend's error code when it is one the daemon recognizes. Only
     /// this fixed name survives; the rest of the response body is discarded.
+    pub request_owned_route_unavailable: bool,
     pub code: Option<UploadShedCode>,
 }
 
@@ -297,6 +298,7 @@ fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
         status,
         retry_after,
         code,
+        request_owned_route_unavailable: false,
     }
 }
 
@@ -778,6 +780,11 @@ impl SnapshotEntityRejection {
             "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
             // Logged by name; persisted as the old enum value `other`.
             "original_pair_candidate_unproved" => "original_pair_candidate_unproved",
+            "claude_request_owned_usage_contract_mismatch" => {
+                "claude_request_owned_usage_contract_mismatch"
+            }
+            "usage_decrease_held_for_review" => "usage_decrease_held_for_review",
+            "usage_decrease_refused_after_review" => "usage_decrease_refused_after_review",
             _ => "other",
         }
     }
@@ -1048,7 +1055,12 @@ impl SnapshotBatchResponse {
                 unchanged_basis: None,
             };
             validate_snapshot_entity_ref(&reference)?;
-            if !rejection.permanent {
+            if !rejection.permanent
+                && !matches!(
+                    rejection.safe_reason(),
+                    "usage_decrease_held_for_review" | "usage_decrease_refused_after_review"
+                )
+            {
                 return Err(anyhow!("snapshot ACK contains invalid rejection"));
             }
             record_snapshot_ack_occurrences(
@@ -2069,7 +2081,7 @@ impl SnapshotApiClient {
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let shed = shed_from_response(code, response);
+                let mut shed = shed_from_response(code, response.clone());
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,
@@ -2078,6 +2090,20 @@ impl SnapshotApiClient {
                     shed.retry_after.map(|retry_after| retry_after.as_secs()),
                     retry.is_some(),
                 );
+                // Inspect only the closed route code after recording header evidence.
+                shed.request_owned_route_unavailable =
+                    serde_json::from_reader::<_, serde_json::Value>(std::io::Read::take(
+                        response.into_reader(),
+                        16 * 1024,
+                    ))
+                    .ok()
+                    .and_then(|body| {
+                        body.pointer("/details/code")
+                            .and_then(|code| code.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                        == Some("request_owned_usage_route_unavailable");
                 Err(anyhow::Error::new(shed))
             }
             // 401/403 means relay authorization failed, not schema drift.
@@ -4998,4 +5024,31 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
 #[cfg(test)]
 pub(crate) fn retention_gzip_probe(body: &[u8]) -> Option<Vec<u8>> {
     gzip_snapshot_batch(body, true)
+}
+
+#[cfg(test)]
+mod request_owned_ack_tests {
+    use super::*;
+    #[test]
+    fn nonpermanent_ack_is_accepted_only_for_the_two_review_reasons() {
+        let fingerprint = "a".repeat(64);
+        for reason in [
+            "usage_decrease_held_for_review",
+            "usage_decrease_refused_after_review",
+            "claude_request_owned_usage_contract_mismatch",
+            "other",
+        ] {
+            let response: SnapshotBatchResponse = serde_json::from_value(serde_json::json!({
+                "accepted": 0, "sessions_reconciled": 0, "session_ids": [], "disabled": false, "disabled_reason": null,
+                "rejected_entities": [{"source_session_id":"session", "snapshot_fingerprint":fingerprint, "reason": reason, "detail":"", "permanent":false}]
+            })).unwrap();
+            let valid =
+                response.validate_entity_ack_identities([("session", fingerprint.as_str())]);
+            assert_eq!(
+                valid.is_ok(),
+                reason.starts_with("usage_decrease_"),
+                "{reason}: {valid:?}"
+            );
+        }
+    }
 }

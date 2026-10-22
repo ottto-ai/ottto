@@ -424,6 +424,30 @@ impl ClaudeRequestCensusRecord {
         }
     }
 
+    /// Scheduling uses the existing bounded scalar codec, in the ledger only.
+    /// The fingerprint is the evidence revision; the window is its deadline.
+    /// Watch records share the observed hash buffer so removals can find former
+    /// dependents without copying telemetry facts or raw provider identifiers.
+    pub(crate) fn money_debt(revision: [u8; 32], deadline: u64) -> Self {
+        Self::bookkeeping(revision, deadline)
+    }
+
+    pub(crate) fn money_revision(&self) -> [u8; 32] {
+        self.source_file_fingerprint
+    }
+
+    pub(crate) fn money_watch(&self, revision: [u8; 32]) -> Self {
+        Self {
+            request_hashes: self.shared_request_hashes(),
+            shape: if self.request_hashes().is_empty() {
+                ClaudeRequestCensusShape::Empty
+            } else {
+                ClaudeRequestCensusShape::Exact
+            },
+            ..Self::bookkeeping(revision, 0)
+        }
+    }
+
     /// A `sweep:` record: cursor bytes, the sweep's start and its state.
     pub(crate) fn sweep_record(
         cursor: [u8; 32],
@@ -578,6 +602,11 @@ pub(crate) fn is_ledger_key(key: &str) -> bool {
         || key.starts_with(SWEEP_KEY_PREFIX)
         || key.starts_with(FAMILY_KEY_PREFIX)
         || key.starts_with(MESSAGE_KEY_PREFIX)
+        || [
+            "due:", "dirty:", "offer:", "hold:", "watch:", "unbuilt:", "adopt:", "union:", "ever:",
+        ]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
 }
 
 /// The `mh:` key of a transcript's index key.
@@ -678,6 +707,17 @@ impl ClaudeRequestCensus {
         self.records
             .get(key)
             .filter(|record| !record.is_birth_stub())
+    }
+
+    /// File custody includes birth-only tombstones; they remain unknown
+    /// evidence until a verified parse replaces them.
+    pub(crate) fn retained_file_keys(&self) -> impl Iterator<Item = &String> {
+        self.records.keys().filter(|key| key.starts_with('/'))
+    }
+
+    /// Birth custody survives invalidation even when the request record does not.
+    pub(crate) fn retained_birth(&self, key: &str) -> Option<ClaudeRequestBirth> {
+        self.records.get(key)?.birth()
     }
 
     /// Every record; birth stubs are skipped.
@@ -1075,7 +1115,7 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
 /// Derive positional slots from Serde's own field metadata rather than pinning
 /// offsets to ScanIndex's declaration order. JSON struct sequences are accepted
 /// by the old reader too; they need the same evidence bounds as object fields.
-fn sequence_fields() -> (usize, usize) {
+fn sequence_fields() -> (usize, usize, usize) {
     struct Fields<'a>(&'a mut Option<&'static [&'static str]>);
     impl<'de> Deserializer<'de> for Fields<'_> {
         type Error = serde::de::value::Error;
@@ -1097,7 +1137,7 @@ fn sequence_fields() -> (usize, usize) {
             tuple_struct map enum identifier ignored_any
         }
     }
-    static SLOTS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    static SLOTS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
     *SLOTS.get_or_init(|| {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
@@ -1111,6 +1151,7 @@ fn sequence_fields() -> (usize, usize) {
         (
             slot("claude_request_census"),
             slot("claude_request_census_shadow"),
+            slot("claude_money_files"),
         )
     })
 }
@@ -1122,7 +1163,7 @@ struct CensusRead<R> {
     depth: usize,
     root_array: bool,
     array_index: usize,
-    sequence_fields: (usize, usize),
+    sequence_fields: (usize, usize, usize),
     quoted: bool,
     escaped: bool,
     expect_key: bool,
@@ -1132,6 +1173,9 @@ struct CensusRead<R> {
     duplicate_shadow: bool,
     shadow_key: bool,
     shadow_state: bool,
+    selection_state: bool,
+    seen_selection: bool,
+    duplicate_selection: bool,
     capture: bool,
     #[cfg(test)]
     read_calls: usize,
@@ -1158,6 +1202,9 @@ impl<R: std::io::Read> CensusRead<R> {
             duplicate_shadow: false,
             shadow_key: false,
             shadow_state: false,
+            selection_state: false,
+            seen_selection: false,
+            duplicate_selection: false,
             capture: false,
             #[cfg(test)]
             read_calls: 0,
@@ -1175,6 +1222,24 @@ impl<R: std::io::Read> CensusRead<R> {
     }
 
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
+        if self.duplicate_selection {
+            index.claude_money_files.clear();
+        }
+        if self.seen_selection {
+            for (key, entry) in &mut index.files {
+                if entry.effective_upload_body_witness_revision >= 3
+                    && !index.claude_money_files.contains_key(key)
+                    && !super::money_fingerprints_below_retention_floor(
+                        index.file_snapshot_fingerprints.get(key),
+                        &index.snapshot_activity_at,
+                    )
+                {
+                    entry.effective_upload_body_witness_revision = 2;
+                    index.claude_request_census.invalidate_keeping_birth(key);
+                }
+            }
+        }
+
         if self.duplicate_census {
             index.claude_request_census = ClaudeRequestCensus::default();
         }
@@ -1204,9 +1269,18 @@ impl<R: std::io::Read> CensusRead<R> {
             }
         }
         self.shadow_key = false;
+        self.selection_state = false;
         if !self.quoted {
             if let Ok(name) = serde_json::from_slice::<String>(&key) {
                 let duplicate = match name.as_str() {
+                    "claude_money_files" => {
+                        self.shadow_key = true;
+                        self.selection_state = true;
+                        let duplicate = self.seen_selection;
+                        self.seen_selection = true;
+                        self.duplicate_selection |= duplicate;
+                        duplicate
+                    }
                     "claude_request_census" => {
                         self.shadow_key = true;
                         self.shadow_state = false;
@@ -1293,7 +1367,13 @@ impl<R: std::io::Read> CensusRead<R> {
         // Parsing is isolated from the enclosing index, including numeric
         // conversion and wrong-token errors. Only canonical, finite tokens
         // leave this reader. JSON syntax outside the optional field is intact.
-        Ok(if self.shadow_state {
+        Ok(if self.selection_state {
+            let mut isolated = serde_json::Deserializer::from_slice(&bytes);
+            let state =
+                super::claude_request_money::decode_selections(&mut isolated).unwrap_or_default();
+            drop(bytes);
+            serde_json::to_vec(&state).expect("selection serialization")
+        } else if self.shadow_state {
             let state = serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
                 .unwrap_or_default();
             drop(bytes);
@@ -1333,9 +1413,12 @@ impl<R: std::io::Read> CensusRead<R> {
             && !byte.is_ascii_whitespace()
             && !matches!(byte, b',' | b']')
             && (self.array_index == self.sequence_fields.0
-                || self.array_index == self.sequence_fields.1)
+                || self.array_index == self.sequence_fields.1
+                || self.array_index == self.sequence_fields.2)
         {
             self.shadow_state = self.array_index == self.sequence_fields.1;
+            self.selection_state = self.array_index == self.sequence_fields.2;
+            self.seen_selection |= self.selection_state;
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);
             return self.next();
@@ -2063,7 +2146,7 @@ fn lower_hex(bytes: &[u8]) -> bool {
         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
-fn decode_fingerprint(value: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_fingerprint(value: &str) -> Option<[u8; 32]> {
     let bytes = value.as_bytes();
     if bytes.len() != 64 || !lower_hex(bytes) {
         return None;
@@ -2255,8 +2338,18 @@ pub(crate) fn record_claude_request_census(
         return;
     }
     let window = rfc3339_unix_seconds(parse.census_window_end).unwrap_or_default();
+    // A complete, verified physical file can name its logical entity from
+    // content. Path aliases remain distinct census/evidence records; E's
+    // per-file posture and account/project refusal are unchanged.
+    let logical_owner = match items {
+        [item] if parse.complete && parse.source_verified => (
+            claude_snapshot_family_root_ref(item).to_owned(),
+            item.source_session_id.clone(),
+        ),
+        _ => path_owner,
+    };
     let Some(record) = claude_request_census_record(
-        &path_owner,
+        &logical_owner,
         items,
         parse.itemless_request_hashes,
         parse.source_file_fingerprint,

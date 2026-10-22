@@ -2397,6 +2397,9 @@ fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold()
         );
     }
     let limit = state.file_limit;
+    let money_before = serde_json::to_value(&state.index).unwrap()["claude_money_files"].clone();
+    let index_bound_before =
+        crate::heap_layout_bound::completed_bound(&state.index, usize::MAX).unwrap();
     let selection = state.acquire_native_comparison_targets(&mut qualification);
     assert_eq!(selection.matched_roots, 1);
     assert_eq!(selection.queued, 2);
@@ -2410,8 +2413,18 @@ fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold()
         state.scanned_file_count, 1,
         "enqueue is not a successful read"
     );
-    let mut state = pause_native_comparison(state);
+    let (mut state, allocations) =
+        crate::retry_allocation_probe::measure(|| pause_native_comparison(state));
+    eprintln!("comparison target requested allocation peak={} allocations={} existing_file_budget={limit} RSS_UNMEASURED=true", allocations.requested_peak_with_overlap, allocations.allocations);
     assert_eq!(state.scanned_file_count, 3);
+    assert_eq!(
+        serde_json::to_value(&state.index).unwrap()["claude_money_files"],
+        money_before,
+        "actual comparison targets must allocate no logical-member metadata"
+    );
+    let index_bound_after =
+        crate::heap_layout_bound::completed_bound(&state.index, usize::MAX).unwrap();
+    eprintln!("comparison target allocation: money_metadata_delta=0 index_bound_before={index_bound_before} index_bound_after={index_bound_after} unchanged_native_budget={limit} RSS_UNMEASURED=true");
     assert_eq!(state.snapshots.len(), 3);
     assert_eq!(state.pending_finalization.len(), 3);
     assert!(state

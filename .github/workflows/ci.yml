@@ -6,6 +6,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      money_base_comparison:
+        description: Compare the saved gate-off fixtures with main
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -128,3 +133,34 @@ jobs:
       - name: Connector advisory audit
         run: cargo audit --deny warnings
         working-directory: crates
+
+  money-base-comparison:
+    name: Saved money gate-off comparison
+    if: github.event_name == 'workflow_dispatch' && inputs.money_base_comparison
+    timeout-minutes: 40
+    runs-on: macos-15
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+      OTTTO_REQUIRE_LAYOUT: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Compare real callers against identical saved inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OTTTO_MONEY_PARITY_ROOT="$RUNNER_TEMP/money-saved-inputs"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/money-parity-target"
+          git worktree add --detach "$RUNNER_TEMP/money-base" 72a632550d7c5a2720aa62e662d07a568292a8c7
+          cp crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs "$RUNNER_TEMP/money-base/crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs"
+          OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-base.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
+          OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-head.json" cargo test -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
+          diff -u "$RUNNER_TEMP/money-base.json" "$RUNNER_TEMP/money-head.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: money-gate-off-receipts
+          path: ${{ runner.temp }}/money-*.json
