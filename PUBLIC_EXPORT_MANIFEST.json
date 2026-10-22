@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 792,
-  "content_sha256": "15e6fc1f0c8f2bf2c8cbeab846951c577e80629affd50b1f096d7a0a7274111b",
+  "content_sha256": "1d09ad5e56444308f6c59f698202008ac6f1ade9d092b542bd851aed700b9762",
   "files": [
     {
       "executable": false,
@@ -3758,8 +3758,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-composition-run-health-audit.md",
-      "sha256": "96d88ccba4708eca610f5ecd1ff933cb92f0c3f948055eacae9d6fc86f9a6435",
-      "size_bytes": 3968
+      "sha256": "d92ef8b81478537aed94a7aa12905e5f74da0e81a7ad5cd1d87b122ca46bf1ba",
+      "size_bytes": 3976
     },
     {
       "executable": false,
@@ -5547,7 +5547,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T15:29:21+00:00",
+  "generated_at": "2026-10-22T15:31:26+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 793,
   "public_roots": [
@@ -5586,5 +5586,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3dfd53b6ebb224fed2eabeec4759a58299a03a55"
+  "source_commit": "f0ac31171c90725ba178326c32bead3daa7fe994"
 }
