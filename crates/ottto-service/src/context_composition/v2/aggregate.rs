@@ -12,6 +12,7 @@ use super::{KEEP_DAYS, MAX_ALL_FILES, MAX_ALL_TOOLS, MAX_FILES_PER_DAY, PERIOD_D
 use crate::composition_kinds::{Kind, Part};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use time::Date;
 
 /// A UTC day as its Julian day number.
@@ -282,7 +283,7 @@ impl Bucket {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct FileKey {
-    pub(super) path: Box<str>,
+    pub(super) path: Arc<str>,
     pub(super) kind: Kind,
     pub(super) part: Part,
 }
@@ -355,8 +356,13 @@ pub(super) struct SessionTotals {
 
 impl SessionTotals {
     fn add(&mut self, day: Day, kind: Kind, tokens: u64) {
-        let at = self.days.binary_search_by_key(&day, |row| row.0)
-            .unwrap_or_else(|at| { self.days.insert(at, (day, Vec::new())); at });
+        let at = self
+            .days
+            .binary_search_by_key(&day, |row| row.0)
+            .unwrap_or_else(|at| {
+                self.days.insert(at, (day, Vec::new()));
+                at
+            });
         let kinds = &mut self.days[at].1;
         match kinds.binary_search_by_key(&kind, |row| row.0) {
             Ok(at) => kinds[at].1 += tokens,
@@ -381,7 +387,7 @@ pub(super) struct Aggregate {
     /// Kept for the 30-day period only, while `all_tools.sessions` counts
     /// every session ever seen: a session that comes back after 30 days
     /// counts again there (an overcount, documented as a difference).
-    pub(super) tool_sessions: BTreeMap<(Box<str>, u64), Day>,
+    pub(super) tool_sessions: BTreeMap<(Arc<str>, u64), Day>,
     pub(super) sessions: BTreeMap<Box<str>, SessionTotals>,
     /// The commit generation that last changed each day's rows.
     pub(super) day_generation: BTreeMap<Day, u64>,
@@ -503,7 +509,10 @@ impl Sink<'_> {
                 .entry((item.day, item.slot.kind))
                 .or_default() += item.tokens;
         }
-        self.agg.sessions.entry(item.session.into()).or_default()
+        self.agg
+            .sessions
+            .entry(item.session.into())
+            .or_default()
             .add(item.day, item.slot.kind, item.tokens);
         true
     }
@@ -573,7 +582,7 @@ impl Sink<'_> {
             entry.tokens += tokens;
             entry.kind = Some(kind);
         }
-        let pair = (Box::<str>::from(tool), session_hash(session));
+        let pair = (Arc::<str>::from(tool), session_hash(session));
         let first_seen = !self.base.tool_sessions.contains_key(&pair)
             && !self.agg.tool_sessions.contains_key(&pair);
         let last = self.agg.tool_sessions.entry(pair).or_insert(day);
@@ -647,7 +656,9 @@ impl Aggregate {
                 into.started = Some(into.started.map_or(ts, |started| started.min(ts)));
             }
             for (day, kinds) in totals.days {
-                for (kind, tokens) in kinds { into.add(day, kind, tokens); }
+                for (kind, tokens) in kinds {
+                    into.add(day, kind, tokens);
+                }
             }
         }
         for (day, generation) in delta.day_generation {
@@ -715,7 +726,9 @@ impl Aggregate {
                     let kinds = &mut totals.days[at].1;
                     if let Ok(k) = kinds.binary_search_by_key(kind, |row| row.0) {
                         kinds[k].1 = kinds[k].1.saturating_sub(*tokens);
-                        if kinds[k].1 == 0 { kinds.remove(k); }
+                        if kinds[k].1 == 0 {
+                            kinds.remove(k);
+                        }
                     }
                 }
             }
@@ -752,7 +765,13 @@ impl Aggregate {
         let sessions: usize = self
             .sessions
             .values()
-            .map(|totals| 48 + totals.days.iter().map(|(_, kinds)| 24 + kinds.capacity() * 16).sum::<usize>())
+            .map(|totals| {
+                48 + totals
+                    .days
+                    .iter()
+                    .map(|(_, kinds)| 24 + kinds.capacity() * 16)
+                    .sum::<usize>()
+            })
             .sum();
         (self.days.len()
             + self.day_parts.len()
@@ -1022,7 +1041,7 @@ impl StoredAggregate {
                 .map(|((day, key), totals)| {
                     (
                         *day,
-                        key.path.clone(),
+                        Box::<str>::from(&*key.path),
                         Id(key.kind),
                         Id(key.part),
                         totals.events,
@@ -1036,7 +1055,7 @@ impl StoredAggregate {
                 .iter()
                 .map(|(key, totals)| {
                     (
-                        key.path.clone(),
+                        Box::<str>::from(&*key.path),
                         Id(key.kind),
                         Id(key.part),
                         totals.events,
@@ -1074,7 +1093,7 @@ impl StoredAggregate {
             tool_sessions: agg
                 .tool_sessions
                 .iter()
-                .map(|((tool, session), day)| (tool.clone(), *session, *day))
+                .map(|((tool, session), day)| (Box::<str>::from(&**tool), *session, *day))
                 .collect(),
             sessions: agg
                 .sessions
@@ -1110,7 +1129,17 @@ impl StoredAggregate {
     /// Rebuild the totals (unknown ids already failed the load).
     pub(super) fn into_aggregate(self) -> Aggregate {
         let slot = |Id(kind), Id(part), server| Slot { kind, part, server };
-        let file_key = |path, Id(kind), Id(part)| FileKey { path, kind, part };
+        let mut names: BTreeMap<Box<str>, Arc<str>> = BTreeMap::new();
+        let mut file_key = |path: Box<str>, Id(kind), Id(part)| {
+            let interned = names
+                .entry(path.clone())
+                .or_insert_with(|| Arc::from(&*path));
+            FileKey {
+                path: interned.clone(),
+                kind,
+                part,
+            }
+        };
         let mut agg = Aggregate::default();
         for (day, Id(kind), values) in self.days {
             agg.days.insert((day, kind), Bucket::from_array(values));
@@ -1165,8 +1194,12 @@ impl StoredAggregate {
                 },
             );
         }
+        let mut tools: BTreeMap<Box<str>, Arc<str>> = BTreeMap::new();
         for (tool, session, day) in self.tool_sessions {
-            agg.tool_sessions.insert((tool, session), day);
+            let interned = tools
+                .entry(tool.clone())
+                .or_insert_with(|| Arc::from(&*tool));
+            agg.tool_sessions.insert((interned.clone(), session), day);
         }
         for (session, started, days) in self.sessions {
             let days = days

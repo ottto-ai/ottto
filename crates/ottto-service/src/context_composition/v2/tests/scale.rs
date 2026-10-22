@@ -24,6 +24,7 @@
 //!   run makes the build's idle files cold; the second shows a steady day.
 //! - `load`: the memory each scope's state takes once loaded.
 
+use super::super::harvest::thread_cpu_micros;
 use super::*;
 use std::io::{BufWriter, Write};
 
@@ -558,6 +559,16 @@ fn report(
     results: &[(Source, SourceStats, Counting)],
 ) {
     let peak = max_rss_bytes();
+    let (state_read, written) = super::super::checkpoint::IO_BYTES.with(|io| io.get());
+    println!(
+        "[{phase}] bytes_read={} bytes_written={} bytes_fsynced={}",
+        state_read, written, written
+    );
+    println!(
+        "[{phase}] rss_after_mib={:.2} rss_after_above_start_mib={:.2}",
+        rss_bytes() as f64 / 1048576.0,
+        rss_bytes().saturating_sub(baseline) as f64 / 1048576.0
+    );
     println!(
         "[{phase}] peak_rss_above_start_mib={:.1} (start {:.1} MiB, peak {:.1} MiB)",
         (peak.saturating_sub(baseline)) as f64 / 1048576.0,
@@ -620,7 +631,23 @@ fn real_scale_gate() {
         dir: PathBuf::from(dir),
     };
     let clock_path = layout.dir.join("clock.json");
-    let baseline = max_rss_bytes();
+    let baseline = rss_bytes();
+    super::super::checkpoint::IO_BYTES.with(|io| io.set((0, 0)));
+    if phase == "scan" || phase == "v1" {
+        let clock: Clock = serde_json::from_slice(&fs::read(&clock_path).unwrap()).unwrap();
+        let now = if std::env::var("COMPOSITION_SCALE_BUILD").is_ok() {
+            clock.build_now()
+        } else {
+            clock.daily_now(day)
+        };
+        if phase == "v1" {
+            run_v1(&layout, now, baseline);
+        } else {
+            let results = run_both(&layout, now);
+            report("scan", &layout, baseline, &results);
+        }
+        return;
+    }
     match phase.as_str() {
         "build" => {
             assert!(!layout.state().exists(), "build into an empty folder");
@@ -694,6 +721,9 @@ fn real_scale_gate() {
                 }
             }
             println!("[build] fixture_mib={:.1}", written as f64 / 1048576.0);
+            if std::env::var("COMPOSITION_SCALE_GENERATE_ONLY").is_ok() {
+                return;
+            }
             let results = run_both(&layout, clock.build_now());
             report("build", &layout, baseline, &results);
         }
@@ -800,4 +830,144 @@ fn real_scale_gate() {
             println!("unknown COMPOSITION_SCALE_PHASE {other:?}: build, prepare, daily or load")
         }
     }
+}
+
+/// Current resident pages, independent of the process high-water mark.
+fn rss_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // proc_pidinfo returns a public process task-info record. The first
+        // two u64 fields are virtual_size and resident_size.
+        extern "C" {
+            fn proc_pidinfo(
+                pid: i32,
+                flavor: i32,
+                arg: u64,
+                buffer: *mut std::ffi::c_void,
+                size: i32,
+            ) -> i32;
+        }
+        let mut fields = [0u64; 16];
+        // SAFETY: the buffer has room for the 96-byte proc_taskinfo record.
+        let got = unsafe {
+            proc_pidinfo(
+                std::process::id() as i32,
+                4,
+                0,
+                fields.as_mut_ptr().cast(),
+                std::mem::size_of_val(&fields) as i32,
+            )
+        };
+        assert!(got >= 16);
+        fields[1]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        max_rss_bytes()
+    }
+}
+
+/// Today's v1 harvest core, with only its clock and network boundary
+/// supplied by the harness. Discovery, settle/cache decisions, full parsing,
+/// canonical request/hash and cache writes call the production functions.
+fn run_v1(layout: &Layout, now: OffsetDateTime, baseline: u64) {
+    use super::super::super::{
+        cache::*, discovery::*, harvest::*, payload::build_request, MAX_TRANSCRIPT_BYTES,
+    };
+    use time::format_description::well_known::Rfc3339;
+    let support = layout.dir.join("state-v1");
+    let window = DateWindow {
+        floor: (now - time::Duration::days(91)).date(),
+        today: now.date(),
+    };
+    let now_system: std::time::SystemTime = now.into();
+    let start = Instant::now();
+    let cpu = thread_cpu_micros().unwrap();
+    let mut read = 0u64;
+    let mut written = 0u64;
+    for (source, root) in [
+        (Source::Claude, layout.claude()),
+        (Source::Codex, layout.codex()),
+    ] {
+        let deadline = Instant::now() + Duration::from_secs(1800);
+        let label = source.label();
+        let agent = match source {
+            Source::Claude => crate::snapshots::SnapshotSource::ClaudeCode,
+            Source::Codex => crate::snapshots::SnapshotSource::Codex,
+        };
+        let identity = composition_scan_identity(label, window, true);
+        let scans = discover_workspaces(&[root], now_system, deadline).unwrap();
+        for mut scan in scans {
+            // Fixture cwd is on the first line; the production BufReader
+            // fetches min(file size, 8192) bytes to resolve it.
+            read += scan
+                .files
+                .iter()
+                .map(|(p, _)| fs::metadata(p).unwrap().len().min(8192))
+                .sum::<u64>();
+            let path = cache_path(
+                &support,
+                label,
+                &sha256_hex(&[&scan.workspace.to_string_lossy()]),
+            );
+            read += fs::metadata(&path).map_or(0, |m| m.len());
+            let cache = read_cache(&path);
+            retain_settled_files(
+                &mut scan.files,
+                now_system,
+                cache.as_ref().map(|c| &c.files),
+            );
+            let signature = workspace_files_signature(&scan.files, deadline).unwrap();
+            if !should_rescan(
+                cache.as_ref(),
+                "device|machine|api",
+                label,
+                &signature,
+                &identity,
+                now,
+            ) {
+                continue;
+            }
+            read += scan
+                .files
+                .iter()
+                .map(|(p, _)| fs::metadata(p).unwrap().len())
+                .filter(|size| *size <= MAX_TRANSCRIPT_BYTES)
+                .sum::<u64>();
+            let report = build_report_for_scan(&scan, &signature, agent, window, deadline).unwrap();
+            if let Some(request) =
+                build_request(&report, &scan.workspace, "machine-scale", label, true)
+            {
+                let hash = request_content_hash(&request).unwrap();
+                let _upload = serde_json::to_value(&request).unwrap();
+                write_cache(
+                    &path,
+                    &CompositionCacheEntry {
+                        identity: "device|machine|api".into(),
+                        agent_source: label.into(),
+                        files: signature,
+                        scan_identity: identity.clone(),
+                        payload_sha256: hash,
+                        posted_at: now.format(&Rfc3339).unwrap(),
+                    },
+                );
+                written += fs::metadata(&path).unwrap().len();
+            }
+        }
+    }
+    let cpu = thread_cpu_micros().unwrap() - cpu;
+    println!("[v1] peak_rss_above_start_mib={:.2} rss_after_mib={:.2} rss_after_above_start_mib={:.2} cpu_s={:.3} wall_s={:.3} bytes_read={} bytes_written={} bytes_fsynced=0",
+        max_rss_bytes().saturating_sub(baseline) as f64 / 1048576.0, rss_bytes() as f64 / 1048576.0,
+        rss_bytes().saturating_sub(baseline) as f64 / 1048576.0, cpu as f64 / 1e6, start.elapsed().as_secs_f64(), read, written);
+    let mut state = 0;
+    for entry in fs::read_dir(support.join("context_composition"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry.metadata().unwrap().is_file() {
+            state += entry.metadata().unwrap().len();
+        }
+    }
+    println!("[v1] state_bytes={state}");
 }

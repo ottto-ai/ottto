@@ -12,15 +12,25 @@
 //! never lets one file count in two scopes; the scope state stays the truth
 //! for offsets.
 
-use super::aggregate::{stable_hash, Day, Id, Slot, StoredContribution};
+use super::aggregate::{stable_hash, Day, Slot, StoredContribution};
 use super::scope::ScopeInfo;
 use super::{MAX_OPEN_CALLS, STATE_SCHEMA};
-use crate::composition_kinds::{CallClass, CallShare, Kind, Part, ToolKey};
+use crate::composition_kinds::{CallClass, CallShare, ToolKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
+
+#[cfg(test)]
+thread_local! { pub(super) static IO_BYTES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) }; }
+#[cfg(test)]
+pub(super) fn record_read(bytes: u64) {
+    IO_BYTES.with(|io| {
+        let (read, write) = io.get();
+        io.set((read + bytes, write));
+    });
+}
 
 // -------------------------------------------------------------------------
 // Atomic writes.
@@ -28,7 +38,7 @@ use std::path::Path;
 
 /// Write a file atomically: `write` fills a temp file, then fsync, rename,
 /// directory fsync.
-fn write_atomic<T>(
+pub(super) fn write_atomic<T>(
     path: &Path,
     write: impl FnOnce(&mut File) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
@@ -46,6 +56,11 @@ fn write_atomic<T>(
         let mut file = File::create(&temp)?;
         let written = write(&mut file)?;
         file.sync_all()?;
+        #[cfg(test)]
+        IO_BYTES.with(|io| {
+            let (read, write) = io.get();
+            io.set((read, write + file.metadata().map_or(0, |m| m.len())));
+        });
         written
     };
     fs::rename(&temp, path)?;
@@ -56,12 +71,35 @@ fn write_atomic<T>(
 /// Write `value` as JSON, streamed to the file (never one buffer of the
 /// whole state); returns the bytes written.
 pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<u64> {
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("index-"))
+    {
+        return write_packed(path, value);
+    }
     write_atomic(path, |file| {
         let mut out = Counting {
             inner: BufWriter::new(file),
             bytes: 0,
         };
         serde_json::to_writer(&mut out, value).map_err(std::io::Error::other)?;
+        out.inner.flush()?;
+        Ok(out.bytes)
+    })
+}
+
+/// Stream local state through a bounded compressor, then fsync and rename.
+pub(super) fn write_packed<T: Serialize>(path: &Path, value: &T) -> std::io::Result<u64> {
+    write_atomic(path, |file| {
+        let out = Counting {
+            inner: BufWriter::new(file),
+            bytes: 0,
+        };
+        let encoder = zstd::stream::write::Encoder::new(out, 1)?;
+        let mut buffer = BufWriter::new(encoder);
+        serde_json::to_writer(&mut buffer, value).map_err(std::io::Error::other)?;
+        let encoder = buffer.into_inner().map_err(|error| error.into_error())?;
+        let mut out = encoder.finish()?;
         out.inner.flush()?;
         Ok(out.bytes)
     })
@@ -89,9 +127,24 @@ impl<W: Write> Write for Counting<W> {
 /// state); `Ok(None)` means there is none.
 pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, ()> {
     match File::open(path) {
-        Ok(file) => serde_json::from_reader(std::io::BufReader::new(file))
-            .map(Some)
-            .map_err(|_| ()),
+        Ok(mut file) => {
+            #[cfg(test)]
+            record_read(file.metadata().map_or(0, |m| m.len()));
+            use std::io::{Read, Seek};
+            let mut magic = [0; 4];
+            let size = file.read(&mut magic).map_err(|_| ())?;
+            file.rewind().map_err(|_| ())?;
+            if size == 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+                let decoder = zstd::stream::read::Decoder::new(file).map_err(|_| ())?;
+                serde_json::from_reader(std::io::BufReader::new(decoder))
+                    .map(Some)
+                    .map_err(|_| ())
+            } else {
+                serde_json::from_reader(std::io::BufReader::new(file))
+                    .map(Some)
+                    .map_err(|_| ())
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(()),
     }
@@ -399,6 +452,9 @@ pub(super) struct ParseState {
     /// Earliest line timestamp, unix seconds.
     pub(super) min_ts: Option<i64>,
     pub(super) has_rendered: bool,
+    /// The first model response closed request 1. Old checkpoints infer this
+    /// from their saved response/call state instead of re-reading history.
+    pub(super) request1_closed: bool,
     pub(super) cwd: Option<Box<str>>,
 }
 
@@ -457,7 +513,7 @@ impl ParseState {
 }
 
 /// Open tokens of one day and slot: day, kind, part, add-on server, tokens.
-type OpenRow = (Day, Id<Kind>, Id<Part>, Option<Box<str>>, u64);
+type OpenRow = (Day, String, String, Option<Box<str>>, u64);
 
 /// A call share as stored: kind, part, weight, file and add-on tool.
 type StoredShare = (String, String, u32, Option<String>, Option<String>);
@@ -495,10 +551,24 @@ pub(super) struct StoredParse {
     own_lines: u64,
     min_ts: Option<i64>,
     has_rendered: bool,
+    request1_closed: bool,
     cwd: Option<String>,
 }
 
 impl StoredParse {
+    /// A malformed open row only abandons this file's parse state. Keep its
+    /// identity and earlier totals without reading its prefix again.
+    pub(super) fn restart_state(&self) -> ParseState {
+        ParseState {
+            session: self.session.as_str().into(),
+            agent_author: self.agent_author,
+            request1_closed: true,
+            cwd: self.cwd.as_deref().map(Into::into),
+            copied: self.copied,
+            ..ParseState::default()
+        }
+    }
+
     /// Bytes held in memory, approximately.
     pub(super) fn accounted_bytes(&self) -> usize {
         160 + self.session.len()
@@ -515,13 +585,13 @@ impl StoredParse {
     /// tokens (later residency then lands on that part). Returns whether
     /// rows were merged.
     fn fold_open_by_kind(&mut self) -> bool {
-        type Folded = (Id<Part>, Option<Box<str>>, u64, u64);
+        type Folded = (String, Option<Box<str>>, u64, u64);
         let before = self.open.len();
-        let mut by_kind: BTreeMap<(Day, Id<Kind>), Folded> = BTreeMap::new();
+        let mut by_kind: BTreeMap<(Day, String), Folded> = BTreeMap::new();
         for (day, kind, part, server, tokens) in std::mem::take(&mut self.open) {
             let entry = by_kind
                 .entry((day, kind))
-                .or_insert_with(|| (part, server.clone(), tokens, 0));
+                .or_insert_with(|| (part.clone(), server.clone(), tokens, 0));
             if tokens > entry.2 {
                 (entry.0, entry.1, entry.2) = (part, server, tokens);
             }
@@ -577,8 +647,8 @@ impl StoredParse {
                 .map(|(day, slot, tokens)| {
                     (
                         *day,
-                        Id(slot.kind),
-                        Id(slot.part),
+                        slot.kind.as_str().to_string(),
+                        slot.part.as_str().to_string(),
                         slot.server.clone(),
                         *tokens,
                     )
@@ -589,6 +659,7 @@ impl StoredParse {
             own_lines: state.own_lines,
             min_ts: state.min_ts,
             has_rendered: state.has_rendered,
+            request1_closed: state.request1_closed,
             cwd: state.cwd.as_deref().map(str::to_string),
         }
     }
@@ -627,10 +698,20 @@ impl StoredParse {
         let open = self
             .open
             .into_iter()
-            .map(|(day, Id(kind), Id(part), server, tokens)| {
-                (day, Slot { kind, part, server }, tokens)
+            .map(|(day, kind, part, server, tokens)| {
+                Some((
+                    day,
+                    Slot {
+                        kind: kind_from_str(&kind)?,
+                        part: part_from_str(&part)?,
+                        server,
+                    },
+                    tokens,
+                ))
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
+        let request1_closed =
+            self.request1_closed || self.last_assistant.is_some() || self.call_seq > 0;
         Some(ParseState {
             session: self.session.into(),
             agent_author: self.agent_author,
@@ -647,6 +728,7 @@ impl StoredParse {
             own_lines: self.own_lines,
             min_ts: self.min_ts,
             has_rendered: self.has_rendered,
+            request1_closed,
             cwd: self.cwd.map(Into::into),
         })
     }
@@ -709,6 +791,8 @@ pub(super) fn fingerprint(file: &File, at: u64, len: u64) -> std::io::Result<Fin
             break;
         }
         read += count;
+        #[cfg(test)]
+        record_read(count as u64);
     }
     bytes.truncate(read);
     use sha2::{Digest, Sha256};

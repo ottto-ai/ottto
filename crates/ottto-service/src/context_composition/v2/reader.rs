@@ -9,6 +9,26 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
+#[cfg(not(test))]
+type ReaderFile = File;
+
+#[cfg(test)]
+struct ReaderFile(File);
+#[cfg(test)]
+impl From<File> for ReaderFile {
+    fn from(file: File) -> Self {
+        Self(file)
+    }
+}
+#[cfg(test)]
+impl Read for ReaderFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.0.read(buffer)?;
+        super::checkpoint::record_read(read as u64);
+        Ok(read)
+    }
+}
+
 /// Lines longer than this are skipped, never buffered.
 pub(super) const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 const READ_BUFFER_BYTES: usize = 256 * 1024;
@@ -21,7 +41,7 @@ pub(super) enum LineEvent<'a> {
 }
 
 pub(super) struct LineReader {
-    reader: BufReader<File>,
+    reader: BufReader<ReaderFile>,
     /// Offset of the first byte not yet consumed.
     pos: u64,
     /// The length at open: nothing past it is read.
@@ -45,7 +65,7 @@ impl LineReader {
     ) -> std::io::Result<Self> {
         file.seek(SeekFrom::Start(offset))?;
         Ok(Self {
-            reader: BufReader::with_capacity(READ_BUFFER_BYTES, file),
+            reader: BufReader::with_capacity(READ_BUFFER_BYTES, file.into()),
             pos: offset,
             end: end.max(offset),
             line: Vec::new(),

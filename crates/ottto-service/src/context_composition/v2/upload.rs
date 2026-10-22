@@ -772,21 +772,9 @@ fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<File
     rows
 }
 
-/// The session a transcript belongs to: a Claude subagent's transcript
-/// (`<session> (subagent:<id>)`) folds into its parent session; any other
-/// counts alone.
-fn parent_session(session: &str) -> &str {
-    match session.find(" (subagent:") {
-        Some(at) if session.ends_with(')') => &session[..at],
-        _ => session,
-    }
-}
-
-/// Fill each top file's session counts from the checkpoints' own per-day
-/// file rows (and a cold checkpoint's last day per file), for the days still
-/// in the window: no state of its own.
+/// Fill top-file counts from the incremental membership multiset.
 fn count_file_sessions(scope: &Scope, window: Window, rows: &mut [FileRow]) {
-    let mut sessions: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = rows
+    let mut sessions: BTreeMap<&str, (BTreeSet<u64>, BTreeSet<u64>)> = rows
         .iter()
         .map(|row| (row.relative_path_or_name.as_str(), Default::default()))
         .collect();
@@ -797,22 +785,28 @@ fn count_file_sessions(scope: &Scope, window: Window, rows: &mut [FileRow]) {
             (name_hash(name), name)
         })
         .collect();
-    for checkpoint in scope.files.values() {
-        let Some(session) = checkpoint.contribution.session() else {
+    for (hash, session, day) in &scope.file_sessions {
+        if !window.contains(*day) {
+            continue;
+        }
+        let Some(path) = by_hash.get(hash) else {
             continue;
         };
-        let session = parent_session(session);
-        // Names in state are the safe names the rows carry.
-        let warm = checkpoint.contribution.file_days();
-        let cold = checkpoint.cold.iter().flat_map(|cold| {
-            cold.files()
-                .filter_map(|(hash, day)| Some((day, *by_hash.get(&hash)?)))
-        });
-        for (day, path) in warm.chain(cold) {
+        if let Some((all, recent)) = sessions.get_mut(path) {
+            all.insert(*session);
+            if *day >= window.period_floor {
+                recent.insert(*session);
+            }
+        }
+    }
+    // In-memory test scopes can be assembled without a persisted manifest.
+    for checkpoint in scope.files.values() {
+        for (hash, session, day) in super::scope::checkpoint_members(checkpoint) {
             if !window.contains(day) {
                 continue;
             }
-            if let Some((all, recent)) = sessions.get_mut(path) {
+            if let Some((all, recent)) = by_hash.get(&hash).and_then(|name| sessions.get_mut(name))
+            {
                 all.insert(session);
                 if day >= window.period_floor {
                     recent.insert(session);

@@ -110,6 +110,15 @@ pub(super) fn head_identity(lines: &[&str], path: &Path) -> HeadIdentity {
 
 /// Handle one Codex line.
 pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8]) {
+    if !state.request1_closed && out.kinds == KindsVersion::V2 {
+        // The shared parser determines exactly when the input closes. Its
+        // closure decision depends on this row, so no prior text is retained.
+        if let Ok(row) = serde_json::from_slice::<Value>(line) {
+            let mut parser = crate::codex_prelude_footprint::CodexPreludeParser::matching_only(0);
+            parser.observe(&row);
+            state.request1_closed = parser.prelude().input_closed;
+        }
+    }
     if codex_never_counted(line) {
         out.stats.prefix_skipped += 1;
         return;
@@ -183,7 +192,13 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     } else {
         Author::You
     };
-    let ctx = out.ctx(Agent::Codex, cwd.as_deref().map(Path::new), false, author);
+    let ctx = out.ctx(
+        state,
+        Agent::Codex,
+        cwd.as_deref().map(Path::new),
+        false,
+        author,
+    );
     let payload_type = payload.kind.str();
     let payload_type = payload_type.as_deref().unwrap_or("");
     match payload_type {

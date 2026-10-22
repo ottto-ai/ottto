@@ -98,6 +98,7 @@ impl LineSink<'_> {
     /// The classifier's context for one line.
     pub(super) fn ctx<'p>(
         &self,
+        state: &ParseState,
         agent: Agent,
         cwd: Option<&'p Path>,
         file_has_rendered: bool,
@@ -105,8 +106,19 @@ impl LineSink<'_> {
     ) -> LineCtx<'p> {
         match self.kinds {
             KindsVersion::V1 => LineCtx::v1(agent),
-            // The request-1 phase is not tracked yet: every line is after it.
-            KindsVersion::V2 => LineCtx::v2(agent, Request1::No, cwd, file_has_rendered, author),
+            // No saved daemon verdict is exposed here yet. Until one is,
+            // unmeasured input is labelled explicitly and never an ordinary kind.
+            KindsVersion::V2 => LineCtx::v2(
+                agent,
+                if state.request1_closed {
+                    Request1::No
+                } else {
+                    Request1::StartNotMeasured
+                },
+                cwd,
+                file_has_rendered,
+                author,
+            ),
         }
     }
 
@@ -333,11 +345,23 @@ fn head_scan(
 
 /// The first complete lines of a transcript (bounded), for its identity,
 /// and the bytes read.
-pub(super) fn head_lines(path: &Path) -> std::io::Result<(Vec<String>, u64)> {
+pub(super) fn head_lines(source: Source, path: &Path) -> std::io::Result<(Vec<String>, u64)> {
     let mut lines = Vec::new();
     let bytes = head_scan(path, None, |text| {
         lines.push(text.to_string());
-        true
+        // Stop once the first-sight identity is complete. Large outputs
+        // following a metadata row are never needed for identity.
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(text) else {
+            return true;
+        };
+        match source {
+            Source::Codex => row["type"] != "session_meta",
+            Source::Claude => {
+                !(row["sessionId"].is_string()
+                    && row["isSidechain"].is_boolean()
+                    && (row["isSidechain"] == false || row["agentId"].is_string()))
+            }
+        }
     })?;
     Ok((lines, bytes))
 }
@@ -364,6 +388,9 @@ pub(super) fn head_cwds(path: &Path, deadline: Instant) -> std::io::Result<(Vec<
             if !cwds.iter().any(|seen| seen == cwd) {
                 cwds.push(cwd.to_string());
             }
+            if Path::new(cwd).is_dir() {
+                return false;
+            }
         }
         true
     })?;
@@ -373,7 +400,7 @@ pub(super) fn head_cwds(path: &Path, deadline: Instant) -> std::io::Result<(Vec<
 /// A fresh parse state for a transcript first read at `offset` (0 for a
 /// full read), and the head bytes read to build it.
 pub(super) fn new_parse_state(source: Source, path: &Path, offset: u64) -> (ParseState, u64) {
-    let (lines, bytes) = head_lines(path).unwrap_or_default();
+    let (lines, bytes) = head_lines(source, path).unwrap_or_default();
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     let mut state = ParseState::default();
     match source {

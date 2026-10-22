@@ -32,8 +32,8 @@ use super::checkpoint::{
 };
 use super::file::{head_cwds, new_parse_state, read_lines, LineSink, LineStats, Names, Source};
 use super::scope::{
-    linked_worktrees, load_scope, resolved_missing, save_scope, scope_path, GitScopeResolver,
-    Scope, ScopeInfo, ScopeResolver,
+    checkpoint_members, linked_worktrees, load_scope, resolved_missing, save_scope, scope_path,
+    shard_id, update_members, GitScopeResolver, Scope, ScopeInfo, ScopeResolver,
 };
 use super::upload::{upload_scope, UploadOutcome, UploadResult, UploadTarget, Uploader};
 use super::{
@@ -533,9 +533,19 @@ fn copy_key_text(path: &Path) -> String {
         .join("/")
 }
 
-/// Every `.jsonl` (and compressed `.jsonl.zst`) under the roots.
-fn walk(roots: &[PathBuf]) -> (BTreeMap<String, Vec<Found>>, BTreeSet<String>) {
-    fn visit(dir: &Path, found: &mut BTreeMap<String, Vec<Found>>, zst: &mut BTreeSet<String>) {
+/// Stream directory entries. Unchanged files update their pin in place;
+/// only files needing work retain a path/metadata row after the visit.
+fn walk(
+    roots: &[PathBuf],
+    index: &mut Index,
+    today: Day,
+    stats: &mut SourceStats,
+) -> (
+    BTreeMap<String, Vec<Found>>,
+    BTreeSet<String>,
+    BTreeSet<u64>,
+) {
+    fn visit(dir: &Path, callback: &mut impl FnMut(PathBuf, Metadata, bool)) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
         };
@@ -545,7 +555,7 @@ fn walk(roots: &[PathBuf]) -> (BTreeMap<String, Vec<Found>>, BTreeSet<String>) {
                 continue;
             };
             if metadata.is_dir() {
-                visit(&path, found, zst);
+                visit(&path, callback);
                 continue;
             }
             if !metadata.is_file() {
@@ -554,29 +564,80 @@ fn walk(roots: &[PathBuf]) -> (BTreeMap<String, Vec<Found>>, BTreeSet<String>) {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if name.ends_with(".jsonl") {
-                found
-                    .entry(copy_key_text(&path))
-                    .or_default()
-                    .push(Found::new(path, &metadata));
-            } else if let Some(stem) = name.strip_suffix(".zst") {
-                if stem.ends_with(".jsonl") {
-                    zst.insert(copy_key_text(&path.with_file_name(stem)));
-                }
+                callback(path, metadata, false);
+            } else if name.ends_with(".jsonl.zst") {
+                callback(
+                    path.with_file_name(name.trim_end_matches(".zst")),
+                    metadata,
+                    true,
+                );
             }
         }
     }
-    let mut found = BTreeMap::new();
-    let mut zst = BTreeSet::new();
+    let mut found: BTreeMap<String, Vec<Found>> = BTreeMap::new();
+    let mut archived = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut callback = |path: PathBuf, metadata: Metadata, compressed: bool| {
+        let key = copy_key_text(&path);
+        if compressed {
+            archived.insert(key);
+            return;
+        }
+        let hash = super::aggregate::stable_hash(key.as_bytes());
+        if !seen.insert(hash) {
+            stats.duplicates += 1;
+        }
+        if let Some(pin) = index.files.get_mut(&key) {
+            pin.last_seen = today;
+            let identity = file_identity(&metadata);
+            if (pin.dev, pin.ino) == identity && pin.path != path.to_string_lossy() {
+                pin.path = path.to_string_lossy().into_owned();
+                stats.moved += 1;
+            }
+            if (pin.dev, pin.ino) == identity
+                && metadata.len() == pin.size
+                && stamp(&metadata) == pin.mtime
+                && !pin.waiting
+                && (pin.start >= metadata.len() || pin.unscoped || pin.done || pin.quarantined)
+            {
+                return;
+            }
+            // The pinned copy wins unless this candidate is larger and
+            // still contains the committed prefix (checked below).
+            if (pin.dev, pin.ino) != identity
+                && pin.path != path.to_string_lossy()
+                && Path::new(&pin.path).is_file()
+            {
+                let larger = metadata.len() > pin.size
+                    && File::open(&path)
+                        .is_ok_and(|file| prefix_matches(&file, pin.start, pin.head, pin.tail));
+                if !larger {
+                    return;
+                }
+                stats.switched += 1;
+            }
+        }
+        found
+            .entry(key)
+            .or_default()
+            .push(Found::new(path, &metadata));
+    };
     for root in roots {
-        visit(root, &mut found, &mut zst);
+        visit(root, &mut callback);
     }
-    (found, zst)
+    (found, archived, seen)
 }
 
 /// Bad pins: rebuild them from the scope states, whose checkpoints hold each
 /// file's path, identity, offset, size and scope. Files no scope holds start
 /// over as found-but-old.
-fn rebuild_pins(state_dir: &Path, source: Source, index: &mut Index, today: Day) -> u64 {
+fn rebuild_pins(
+    state_dir: &Path,
+    source: Source,
+    index: &mut Index,
+    today: Day,
+    newer_than: Option<std::time::SystemTime>,
+) -> u64 {
     let Ok(entries) = fs::read_dir(state_dir.join("scopes")) else {
         return 0;
     };
@@ -593,9 +654,20 @@ fn rebuild_pins(state_dir: &Path, source: Source, index: &mut Index, today: Day)
         else {
             continue;
         };
-        let Ok(Some(scope)) = load_scope(&entry.path(), source, &scope_id) else {
+        if newer_than.is_some_and(|cut| {
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified <= cut)
+        }) {
+            continue;
+        }
+        let Ok(Some(mut scope)) = load_scope(&entry.path(), source, &scope_id) else {
             continue;
         };
+        if scope.load_all_shards(&entry.path()).is_err() {
+            continue;
+        }
         for (key, checkpoint) in &scope.files {
             index.files.insert(
                 key.clone(),
@@ -634,7 +706,43 @@ fn rebuild_pins(state_dir: &Path, source: Source, index: &mut Index, today: Day)
     rebuilt
 }
 
+/// Run in its own allocation scope, then release allocator caches after
+/// every index, shard and upload buffer has been dropped.
 pub(super) fn run_source(
+    run: &mut Run,
+    source: Source,
+    roots: &[PathBuf],
+    target: Option<UploadTarget>,
+) -> SourceStats {
+    let started = Instant::now();
+    let cpu_started = thread_cpu_micros();
+    let mut stats = run_source_inner(run, source, roots, target);
+    release_memory();
+    finish(&mut stats, started, cpu_started);
+    stats
+}
+
+pub(super) fn release_memory() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone requests relief from all system malloc zones.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: asks the process allocator to release free pages.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+}
+
+fn run_source_inner(
     run: &mut Run,
     source: Source,
     roots: &[PathBuf],
@@ -654,15 +762,22 @@ pub(super) fn run_source(
             stats.bad_state += 1;
             let mut index = Index::new(now_secs);
             index.last_scan_started = Some(now_secs);
-            stats.pins_rebuilt = rebuild_pins(&run.state_dir, source, &mut index, today);
+            stats.pins_rebuilt = rebuild_pins(&run.state_dir, source, &mut index, today, None);
             (index, false)
         }
     };
+    // A manifest committed after the single pins write is a completed scope
+    // from an interrupted run. Recover offsets and first-sight assignments
+    // from state only; never re-read transcript bytes.
+    if let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) {
+        stats.pins_rebuilt +=
+            rebuild_pins(&run.state_dir, source, &mut index, today, Some(modified));
+    }
     let previous_scan = index.last_scan_started;
     index.last_scan_started = Some(now_secs);
 
     // Discovery: pick one copy per key and decide what needs reading.
-    let (found, archived) = walk(roots);
+    let (found, archived, seen) = walk(roots, &mut index, today, &mut stats);
     let mut work: Vec<Work> = Vec::new();
     let mut present: BTreeMap<String, Found> = BTreeMap::new();
     for (key, mut copies) in found {
@@ -694,7 +809,7 @@ pub(super) fn run_source(
                 copies.remove(0)
             }
         };
-        stats.duplicates += copies.len() as u64;
+        // Duplicate entries were counted while streaming the walk.
         present.insert(key, chosen);
     }
     for (key, file) in &present {
@@ -778,7 +893,7 @@ pub(super) fn run_source(
         }
     }
     for key in &archived {
-        if present.contains_key(key) {
+        if seen.contains(&super::aggregate::stable_hash(key.as_bytes())) {
             continue;
         }
         if let Some(pin) = index.files.get_mut(key) {
@@ -848,16 +963,6 @@ pub(super) fn run_source(
         let waiting = index.files.get(&item.key).is_some_and(|pin| pin.waiting);
         !waiting || item.mode != Mode::Forward
     });
-
-    // Pins first, so no file ever counts in two scopes.
-    match write_json(&path, &index) {
-        Ok(bytes) => stats.state_bytes += bytes,
-        Err(_) => {
-            stats.scopes_failed += 1;
-            finish(&mut stats, started, cpu_started);
-            return stats;
-        }
-    }
 
     let mut by_scope: BTreeMap<String, Vec<Work>> = BTreeMap::new();
     for item in work {
@@ -1091,7 +1196,14 @@ fn process_scope(
                 .filter(|(_, pin)| {
                     pin.scope.as_deref() == Some(scope_id) && !pin.done && !pin.quarantined
                 })
-                .filter_map(|(key, _)| Some((key.clone(), present.get(key)?.clone())))
+                .filter_map(|(key, pin)| {
+                    let found = present.get(key).cloned().or_else(|| {
+                        let path = PathBuf::from(&pin.path);
+                        let metadata = fs::metadata(&path).ok()?;
+                        Some(Found::new(path, &metadata))
+                    })?;
+                    Some((key.clone(), found))
+                })
                 .collect();
             files.sort_by_key(|(_, found)| std::cmp::Reverse(found.stamp));
             items.clear();
@@ -1108,109 +1220,165 @@ fn process_scope(
             Scope::new(scope_id, info)
         }
     };
-    // The loaded checkpoints and totals stay in memory for the whole scope
-    // (loading streams the file).
-    let held = scope.accounted_bytes();
-    stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(held);
     let generation = scope.generation + 1;
-    // Oldest transcript first (a stable order).
-    items.sort_by(|a, b| {
-        let created = |item: &Work| {
-            scope
+    let legacy = std::mem::take(&mut scope.files);
+    let mut groups: BTreeMap<u16, Vec<Work>> = BTreeMap::new();
+    for item in items.drain(..) {
+        groups.entry(shard_id(&item.key)).or_default().push(item);
+    }
+    // Migration reads state only, never transcript history. The switch has
+    // not shipped, but preserve existing local checkpoints when upgrading.
+    let mut legacy_groups: BTreeMap<u16, BTreeMap<String, Checkpoint>> = BTreeMap::new();
+    for (key, checkpoint) in legacy {
+        scope.file_sessions.extend(checkpoint_members(&checkpoint));
+        let id = shard_id(&key);
+        groups.entry(id).or_default();
+        legacy_groups.entry(id).or_default().insert(key, checkpoint);
+    }
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut updates = Vec::new();
+    for (id, mut items) in groups {
+        scope.files = legacy_groups.remove(&id).unwrap_or_default();
+        if scope.load_shard(&path, id).is_err() {
+            // A damaged shard never causes a transcript re-read. Other
+            // shards and the saved totals remain usable; alert once per run.
+            stats.bad_state += 1;
+            scope.files.clear();
+            for item in &mut items {
+                item.mode = Mode::RestartAtEnd;
+            }
+        }
+        let held = scope.accounted_bytes();
+        stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(held);
+        // Oldest transcript first (a stable order).
+        items.sort_by(|a, b| {
+            let created = |item: &Work| {
+                scope
+                    .files
+                    .get(&item.key)
+                    .map_or(item.found.birth, |checkpoint| checkpoint.created)
+            };
+            created(a)
+                .cmp(&created(b))
+                .then_with(|| a.found.path.cmp(&b.found.path))
+        });
+        let today = window.today;
+        let mut read_files: Vec<(String, Checkpoint)> = Vec::new();
+        for item in items {
+            if Instant::now() >= run.deadline {
+                stats.cut = true;
+                break;
+            }
+            let Some((start, first_seen)) = index
                 .files
                 .get(&item.key)
-                .map_or(item.found.birth, |checkpoint| checkpoint.created)
-        };
-        created(a)
-            .cmp(&created(b))
-            .then_with(|| a.found.path.cmp(&b.found.path))
-    });
-    let today = window.today;
-    let mut read_files: Vec<(String, Checkpoint)> = Vec::new();
-    for item in items {
-        if Instant::now() >= run.deadline {
-            stats.cut = true;
-            break;
-        }
-        let Some((start, first_seen)) = index
-            .files
-            .get(&item.key)
-            .map(|pin| (pin.start, pin.first_seen))
-        else {
-            continue;
-        };
-        match read_file(
-            run, source, &mut scope, &item, start, first_seen, window, generation, names, held,
-            stats,
-        ) {
-            Ok(Some(Outcome::Read(checkpoint))) => {
-                read_files.push((item.key, *checkpoint));
-            }
-            Ok(Some(Outcome::Waiting)) => {
-                if let Some(pin) = index.files.get_mut(&item.key) {
-                    pin.waiting = true;
+                .map(|pin| (pin.start, pin.first_seen))
+            else {
+                continue;
+            };
+            match read_file(
+                run, source, &mut scope, &item, start, first_seen, window, generation, names, held,
+                stats,
+            ) {
+                Ok(Some(Outcome::Read(checkpoint))) => {
+                    if let Some(old) = scope.files.get(&item.key) {
+                        removed.extend(checkpoint_members(old));
+                    }
+                    added.extend(checkpoint_members(&checkpoint));
+                    read_files.push((item.key, *checkpoint));
                 }
-            }
-            Ok(None) => {}
-            Err(ReadFailed) => {
-                // Nothing of this read counted; the rest of the scope
-                // commits. Retried the next day, then quarantined.
-                stats.files_failed += 1;
-                if let Some(pin) = index.files.get_mut(&item.key) {
-                    pin.failures = pin.failures.saturating_add(1);
-                    if pin.failures >= QUARANTINE_AFTER {
-                        pin.quarantined = true;
-                        stats.quarantined += 1;
+                Ok(Some(Outcome::Waiting)) => {
+                    if let Some(pin) = index.files.get_mut(&item.key) {
+                        pin.waiting = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(ReadFailed) => {
+                    // Nothing of this read counted; the rest of the scope
+                    // commits. Retried the next day, then quarantined.
+                    stats.files_failed += 1;
+                    if let Some(pin) = index.files.get_mut(&item.key) {
+                        pin.failures = pin.failures.saturating_add(1);
+                        if pin.failures >= QUARANTINE_AFTER {
+                            pin.quarantined = true;
+                            stats.quarantined += 1;
+                        }
                     }
                 }
             }
         }
-    }
 
-    let read_keys: Vec<String> = read_files.iter().map(|(key, _)| key.clone()).collect();
-    scope.files.extend(read_files);
-    // Files unchanged for `COLD_AFTER_SECS` and not read now go cold.
-    let cold_before = run.now.unix_timestamp() - COLD_AFTER_SECS;
-    let read_now: BTreeSet<&str> = read_keys.iter().map(String::as_str).collect();
-    let mut compacted = 0;
-    // Checkpoints follow their pins: a file forgotten by the pins is gone.
-    // A pin with no scope (rebuilt pins that lost it) is pinned here again,
-    // never dropped.
-    let mut repin = Vec::new();
-    scope.files.retain(|key, checkpoint| {
-        let Some(pin) = index.files.get(key) else {
-            return false;
-        };
-        match pin.scope.as_deref() {
-            Some(scope) if scope == scope_id => {}
-            None => repin.push(key.clone()),
-            Some(_) => return false,
+        let read_keys: Vec<String> = read_files.iter().map(|(key, _)| key.clone()).collect();
+        scope.files.extend(read_files);
+        // Files unchanged for `COLD_AFTER_SECS` and not read now go cold.
+        let cold_before = run.now.unix_timestamp() - COLD_AFTER_SECS;
+        let read_now: BTreeSet<&str> = read_keys.iter().map(String::as_str).collect();
+        let mut compacted = 0;
+        // Checkpoints follow their pins: a file forgotten by the pins is gone.
+        // A pin with no scope (rebuilt pins that lost it) is pinned here again,
+        // never dropped.
+        let mut repin = Vec::new();
+        scope.files.retain(|key, checkpoint| {
+            let Some(pin) = index.files.get(key) else {
+                return false;
+            };
+            match pin.scope.as_deref() {
+                Some(scope) if scope == scope_id => {}
+                None => repin.push(key.clone()),
+                Some(_) => return false,
+            }
+            if pin.last_seen == today {
+                checkpoint.last_seen = today;
+            }
+            if pin.done {
+                checkpoint.status = Status::Done;
+            }
+            checkpoint.prune(window.floor);
+            if checkpoint.mtime.0 < cold_before
+                && !read_now.contains(key.as_str())
+                && checkpoint.compact()
+            {
+                compacted += 1;
+            }
+            true
+        });
+        stats.cold_compacted += compacted;
+        for key in repin {
+            if let Some(pin) = index.files.get_mut(&key) {
+                pin.scope = Some(scope_id.to_string());
+            }
         }
-        if pin.last_seen == today {
-            checkpoint.last_seen = today;
+        for key in read_keys {
+            if let (Some(checkpoint), Some(old)) = (scope.files.get(&key), index.files.get(&key)) {
+                let mut pin = old.clone();
+                pin.start = checkpoint.offset;
+                pin.size = checkpoint.size;
+                pin.mtime = checkpoint.mtime;
+                pin.dev = checkpoint.dev;
+                pin.ino = checkpoint.ino;
+                pin.path = checkpoint.path.clone();
+                pin.head = checkpoint.head;
+                pin.tail = checkpoint.tail;
+                pin.waiting = false;
+                pin.failures = 0;
+                updates.push((key, pin));
+            }
         }
-        if pin.done {
-            checkpoint.status = Status::Done;
+        match scope.save_shard(&path, id, generation) {
+            Ok(bytes) => stats.state_bytes += bytes,
+            Err(_) => {
+                stats.scopes_failed += 1;
+                return None;
+            }
         }
-        checkpoint.prune(window.floor);
-        if checkpoint.mtime.0 < cold_before
-            && !read_now.contains(key.as_str())
-            && checkpoint.compact()
-        {
-            compacted += 1;
-        }
-        true
-    });
-    stats.cold_compacted += compacted;
-    scope.agg.prune(window);
-    if scope
-        .agg
-        .day_generation
-        .values()
-        .any(|day_generation| *day_generation == generation)
-    {
-        scope.generation = generation;
+        scope.files.clear();
     }
+    update_members(&mut scope.file_sessions, removed, added, window.floor);
+    scope.agg.prune(window);
+    // Every checkpoint commit advances generation, even when all new lines
+    // were intentionally skipped. Generation names must never be overwritten.
+    scope.generation = generation;
 
     #[cfg(test)]
     if tests::fail_scope_commit() {
@@ -1229,26 +1397,9 @@ fn process_scope(
         }
     }
     stats.scopes_committed += 1;
-    for key in repin {
-        if let Some(pin) = index.files.get_mut(&key) {
-            pin.scope = Some(scope_id.to_string());
-        }
-    }
-    for key in read_keys {
-        let (Some(pin), Some(checkpoint)) = (index.files.get_mut(&key), scope.files.get(&key))
-        else {
-            continue;
-        };
-        pin.start = checkpoint.offset;
-        pin.size = checkpoint.size;
-        pin.mtime = checkpoint.mtime;
-        pin.dev = checkpoint.dev;
-        pin.ino = checkpoint.ino;
-        pin.path = checkpoint.path.clone();
-        pin.head = checkpoint.head;
-        pin.tail = checkpoint.tail;
-        pin.waiting = false;
-        pin.failures = 0;
+    scope.clean_shards(&path);
+    for (key, pin) in updates {
+        index.files.insert(key, pin);
     }
     index
         .scope_generations
@@ -1300,14 +1451,17 @@ fn read_file(
     let file_stamp = stamp(&metadata);
     let existing = scope.files.get(&item.key);
     let mut mode = item.mode;
+    if existing.is_some_and(|checkpoint| checkpoint.parse.clone().into_state().is_none()) {
+        stats.bad_state += 1;
+        stats.repair_restarted += 1;
+        mode = Mode::RestartAtEnd;
+    }
     if mode == Mode::Forward {
         if let Some(checkpoint) = existing {
             if checkpoint.status == Status::Done {
                 return Ok(None);
             }
-            let rewritten = size < checkpoint.offset
-                || !fingerprints_match(&file, checkpoint)
-                || checkpoint.parse.clone().into_state().is_none();
+            let rewritten = size < checkpoint.offset || !fingerprints_match(&file, checkpoint);
             if rewritten && checkpoint.cold.is_some() {
                 stats.cold_restarted += 1;
                 mode = Mode::RestartAtEnd;
@@ -1332,6 +1486,9 @@ fn read_file(
         |checkpoint| checkpoint.created,
     );
     let mut old_share = None;
+    let restart_state = (mode == Mode::RestartAtEnd)
+        .then(|| existing.as_ref().map(|old| old.parse.restart_state()))
+        .flatten();
     let cold = existing
         .as_ref()
         .and_then(|checkpoint| checkpoint.cold.clone());
@@ -1363,7 +1520,10 @@ fn read_file(
             if mode == Mode::Forward && offset == 0 {
                 stats.new_files += 1;
             }
-            let (state, head_bytes) = new_parse_state(source, &item.found.path, offset);
+            let (state, head_bytes) = match restart_state {
+                Some(state) => (state, 0),
+                None => new_parse_state(source, &item.found.path, offset),
+            };
             stats.bytes_head += head_bytes;
             (
                 Checkpoint {

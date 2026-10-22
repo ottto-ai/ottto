@@ -245,7 +245,11 @@ fn v2_sessions(agg: &Aggregate) -> BTreeMap<String, u64> {
         .map(|(id, totals)| {
             (
                 id.to_string(),
-                totals.days.iter().flat_map(|(_, kinds)| kinds.iter().map(|(_, tokens)| tokens)).sum(),
+                totals
+                    .days
+                    .iter()
+                    .flat_map(|(_, kinds)| kinds.iter().map(|(_, tokens)| tokens))
+                    .sum(),
             )
         })
         .collect()
@@ -918,13 +922,10 @@ impl Env {
 
     fn scope(&self, source: Source) -> super::scope::Scope {
         let scope_id = sha256_hex(&[self.cwd().as_str()]);
-        load_scope(
-            &scope_path(&self.state, source, &scope_id),
-            source,
-            &scope_id,
-        )
-        .unwrap()
-        .unwrap()
+        let path = scope_path(&self.state, source, &scope_id);
+        let mut scope = load_scope(&path, source, &scope_id).unwrap().unwrap();
+        scope.load_all_shards(&path).unwrap();
+        scope
     }
 
     fn cleanup(self) {
@@ -1230,7 +1231,11 @@ fn failed_read_counts_nothing_and_keeps_the_rest_of_the_scope() {
     let day = now.date();
     let cwd = env.cwd();
     let path = env.root.join("p/s.jsonl");
-    let other = env.root.join("p/other.jsonl");
+    let same_shard = (0..10_000)
+        .map(|n| format!("other{n}.jsonl"))
+        .find(|key| super::scope::shard_id(key) == super::scope::shard_id("idle.jsonl"))
+        .unwrap();
+    let other = env.root.join("p").join(same_shard);
     write_records(&path, &claude_turn(&cwd, day, 1));
     write_records(&other, &claude_turn(&cwd, day, 10));
     env.run(Source::Claude, now, None);
@@ -1309,7 +1314,9 @@ fn codex_archive_move_and_compression_never_read_again() {
     );
     env.run(Source::Codex, next, None);
     let scope = env.scope(Source::Codex);
-    assert_eq!(scope.files[name].status, super::checkpoint::Status::Done);
+    assert!(read_index(&env.state, Source::Codex).files[name].done);
+    // An archive-only discovery does not read or rewrite its checkpoint shard.
+    assert_eq!(scope.files[name].status, super::checkpoint::Status::Live);
     env.cleanup();
 }
 
@@ -1646,8 +1653,9 @@ fn scope_key_is_stable_across_worktrees() {
     );
     assert_eq!(stats.unscoped, 0);
     assert!(stats.bytes_new > 0);
-    let index: Index =
-        serde_json::from_slice(&fs::read(state.join("index-claude-code.json")).unwrap()).unwrap();
+    let index: Index = super::checkpoint::read_json(&state.join("index-claude-code.json"))
+        .unwrap()
+        .unwrap();
     assert_eq!(index.scope_info.len(), 1);
     assert_eq!(
         index.scope_info[&main_scope].workspace_hash,
@@ -1665,7 +1673,10 @@ fn scope_key_is_stable_across_worktrees() {
     .unwrap();
     let names: BTreeSet<&str> = scope.agg.all_files.keys().map(|key| &*key.path).collect();
     assert_eq!(names, BTreeSet::from(["src/w.rs", "x.rs"]));
-    let stored = fs::read_to_string(scope_path(&state, Source::Claude, &main_scope)).unwrap();
+    let stored = serde_json::to_string(&super::aggregate::StoredAggregate::from_aggregate(
+        &scope.agg,
+    ))
+    .unwrap();
     assert!(!stored.contains(&in_worktree("src")));
     fs::remove_dir_all(base).unwrap();
 }
@@ -1791,7 +1802,13 @@ fn v2_splits_match_one_read_with_calls_open_across_a_checkpoint() {
 #[test]
 fn results_split_over_their_shares_and_tools() {
     let dir = scratch("composition-v2-result-shares");
-    let (claude, codex) = every_family("/w", fallback_date());
+    let (mut claude, mut codex) = every_family("/w", fallback_date());
+    let reloads: Vec<_> = claude
+        .iter()
+        .filter(|row| row["type"] == "attachment" || row["message"]["content"].is_string())
+        .cloned()
+        .collect();
+    claude.extend(reloads);
     let path = dir.join("claude.jsonl");
     write_records(&path, &claude);
     let reading = read_whole(Source::Claude, &[&path]);
@@ -1852,6 +1869,7 @@ fn results_split_over_their_shares_and_tools() {
     assert_eq!(tools["Bash"], (1, bash_tokens));
     assert_eq!(tools["github/search_code"].0, 1);
 
+    codex.push(codex[1].clone());
     // A Codex cell: the command, the add-on call and the search each take
     // their share; the add-on share counts under its own tool and server.
     let path = dir.join("codex.jsonl");
@@ -1887,7 +1905,10 @@ fn results_split_over_their_shares_and_tools() {
         .filter(|(_, kind, _)| kind == "automatic_additions")
         .map(|(part, ..)| part.as_str())
         .collect();
-    assert_eq!(developer, BTreeSet::from(["environment", "other"]));
+    assert_eq!(
+        developer,
+        BTreeSet::from(["environment", "other", "start_not_measured"])
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1993,7 +2014,11 @@ fn idle_checkpoints_go_cold_and_a_cold_rewrite_restarts_at_its_end() {
     // file unchanged for over two days) goes cold: its totals stay, its
     // share is dropped, and it still counts as a session that read the file.
     let later = now + time::Duration::days(13);
-    let other = env.root.join("p/other.jsonl");
+    let same_shard = (0..10_000)
+        .map(|n| format!("other{n}.jsonl"))
+        .find(|key| super::scope::shard_id(key) == super::scope::shard_id("idle.jsonl"))
+        .unwrap();
+    let other = env.root.join("p").join(same_shard);
     write_records(
         &other,
         &as_session(claude_read_turn(&cwd, later.date(), 3, &file), "s2"),
@@ -2230,7 +2255,9 @@ fn git_in(dir: &Path, args: &[&str]) {
 }
 
 fn read_index(state: &Path, source: Source) -> Index {
-    serde_json::from_slice(&fs::read(harvest::index_path(state, source)).unwrap()).unwrap()
+    super::checkpoint::read_json(&harvest::index_path(state, source))
+        .unwrap()
+        .unwrap()
 }
 
 #[test]
@@ -2310,6 +2337,10 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
     )
     .unwrap()
     .unwrap();
+    let mut scope = scope;
+    scope
+        .load_all_shards(&scope_path(&state, Source::Claude, &scope_id))
+        .unwrap();
     assert_eq!(scope.files.len(), 2);
     // The gone worktree's entry is dropped once nothing waits for it.
     assert!(!index
@@ -3154,3 +3185,263 @@ fn a_maximal_upload_meets_the_server_field_rules() {
 }
 
 mod scale;
+
+#[test]
+fn incremental_scope_totals_equal_full_recompute_after_appends() {
+    let env = Env::new("composition-incremental-recompute");
+    let now = base_now();
+    let cwd = env.cwd();
+    let paths: Vec<_> = (0..12)
+        .map(|n| env.root.join(format!("p/s{n}.jsonl")))
+        .collect();
+    for (n, path) in paths.iter().enumerate() {
+        write_records(
+            path,
+            &as_session(
+                claude_read_turn(&cwd, now.date(), 1, &format!("{cwd}/src/f{}.rs", n % 3)),
+                &format!("session{n}"),
+            ),
+        );
+    }
+    env.run(Source::Claude, now, None);
+    for (n, path) in paths.iter().enumerate().filter(|(n, _)| n % 2 == 0) {
+        append_records(
+            path,
+            &as_session(
+                claude_read_turn(
+                    &cwd,
+                    now.date(),
+                    2,
+                    &format!("{cwd}/src/f{}.rs", (n + 1) % 3),
+                ),
+                &format!("session{n}"),
+            ),
+        );
+    }
+    env.run(Source::Claude, now + time::Duration::days(1), None);
+    let mut full = Reading::in_workspace(&env.workspace);
+    for path in &paths {
+        full.read(Source::Claude, path, 1, &[]);
+    }
+    let scope = env.scope(Source::Claude);
+    assert_same_totals(&scope.agg, &full.agg);
+    let mut recomputed: Vec<_> = scope
+        .files
+        .values()
+        .flat_map(super::scope::checkpoint_members)
+        .collect();
+    recomputed.sort_unstable();
+    assert_eq!(scope.file_sessions, recomputed);
+    env.cleanup();
+}
+
+#[test]
+fn shard_write_before_manifest_commit_keeps_old_checkpoint_recoverable() {
+    let env = Env::new("composition-shard-crash");
+    let now = base_now();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&env.cwd(), now.date(), 1));
+    env.run(Source::Claude, now, None);
+    let mut scope = env.scope(Source::Claude);
+    let manifest = scope_path(&env.state, Source::Claude, &scope.scope_id);
+    let old_offset = scope.files["s.jsonl"].offset;
+    scope.files.get_mut("s.jsonl").unwrap().offset += 123;
+    scope
+        .save_shard(
+            &manifest,
+            super::scope::shard_id("s.jsonl"),
+            scope.generation + 1,
+        )
+        .unwrap();
+    // Simulate exit after the immutable shard write, before the manifest.
+    let recovered = env.scope(Source::Claude);
+    assert_eq!(recovered.files["s.jsonl"].offset, old_offset);
+    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(stats.bad_state, 0);
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
+    env.cleanup();
+}
+
+#[test]
+fn unknown_open_id_restarts_only_that_checkpoint_without_reading_history() {
+    for unknown in ["kind", "part"] {
+        let env = Env::new(&format!("composition-unknown-open-{unknown}"));
+        let now = base_now();
+        let path = env.root.join("p/a.jsonl");
+        let other = env.root.join("p/b.jsonl");
+        for path in [&path, &other] {
+            write_records(path, &claude_turn(&env.cwd(), now.date(), 1));
+        }
+        env.run(Source::Claude, now, None);
+        let mut scope = env.scope(Source::Claude);
+        let manifest = scope_path(&env.state, Source::Claude, &scope.scope_id);
+        let checkpoint = scope.files.get_mut("a.jsonl").unwrap();
+        let mut encoded = serde_json::to_value(&*checkpoint).unwrap();
+        let at = if unknown == "kind" { 1 } else { 2 };
+        encoded["parse"]["open"][0][at] = json!("future_id");
+        *checkpoint = serde_json::from_value(encoded).unwrap();
+        let id = super::scope::shard_id("a.jsonl");
+        scope
+            .files
+            .retain(|key, _| super::scope::shard_id(key) == id);
+        scope.generation += 1;
+        scope.save_shard(&manifest, id, scope.generation).unwrap();
+        super::scope::save_scope(&manifest, Source::Claude, &scope).unwrap();
+        append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
+        let more = claude_turn(&env.cwd(), now.date(), 3);
+        append_records(&other, &more);
+        let before = total_tokens(&env.scope(Source::Claude).agg);
+        let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+        assert_eq!(
+            (stats.bad_state, stats.repair_restarted, stats.bytes_repair),
+            (1, 1, 0)
+        );
+        assert_eq!(stats.bytes_new, body(&more).len() as u64);
+        assert!(total_tokens(&env.scope(Source::Claude).agg) > before);
+        assert_eq!(
+            env.scope(Source::Claude).files["a.jsonl"].offset,
+            fs::metadata(&path).unwrap().len()
+        );
+        env.cleanup();
+    }
+}
+
+#[test]
+fn unmodified_shard_is_not_read_or_rewritten() {
+    let env = Env::new("composition-untouched-shard");
+    let now = base_now();
+    let a = env.root.join("p/a.jsonl");
+    let b = env.root.join("p/b.jsonl");
+    assert_ne!(
+        super::scope::shard_id("a.jsonl"),
+        super::scope::shard_id("b.jsonl")
+    );
+    for path in [&a, &b] {
+        write_records(path, &claude_turn(&env.cwd(), now.date(), 1));
+    }
+    env.run(Source::Claude, now, None);
+    let scope = env.scope(Source::Claude);
+    let manifest = scope_path(&env.state, Source::Claude, &scope.scope_id);
+    let id = super::scope::shard_id("a.jsonl");
+    let shard = manifest.with_extension(format!("s{id:03}.{}.zst", scope.generation));
+    // A deliberately unreadable payload proves the path was never opened.
+    fs::write(&shard, b"not state").unwrap();
+    let modified = fs::metadata(&shard).unwrap().modified().unwrap();
+    append_records(&b, &claude_turn(&env.cwd(), now.date(), 2));
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(stats.bad_state, 0);
+    assert_eq!(fs::read(&shard).unwrap(), b"not state");
+    assert_eq!(fs::metadata(&shard).unwrap().modified().unwrap(), modified);
+    env.cleanup();
+}
+
+#[test]
+fn request_one_is_unmeasured_until_the_first_model_response_including_splits() {
+    for source in [Source::Claude, Source::Codex] {
+        let dir = scratch("composition-request-one");
+        let path = dir.join("s.jsonl");
+        let (claude, codex) = every_family("/w", fallback_date());
+        let records = match source {
+            Source::Claude => claude,
+            Source::Codex => codex,
+        };
+        let first_response = match source {
+            Source::Claude => 5,
+            Source::Codex => 3,
+        };
+        write_records(&path, &records[..first_response]);
+        let reading = read_whole(source, &[&path]);
+        assert!(!reading.agg.all_parts.is_empty());
+        assert!(reading
+            .agg
+            .all_parts
+            .keys()
+            .all(|slot| slot.kind == Kind::AutomaticAdditions
+                && slot.part == crate::composition_kinds::Part::StartNotMeasured));
+        write_records(&path, &records);
+        assert_split_parity(Reading::default, source, &[&path]);
+        let reading = read_whole(source, &[&path]);
+        assert!(reading
+            .agg
+            .all_parts
+            .keys()
+            .any(|slot| slot.kind == Kind::FilesRead));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn local_open_call_paths_never_appear_in_uploads() {
+    let env = Env::new("composition-open-path-privacy");
+    let now = base_now();
+    let secret_path = format!("{}/private-scratch/src/example.rs", env.cwd());
+    let records = claude_read_turn(&env.cwd(), now.date(), 1, &secret_path);
+    let path = env.root.join("p/s.jsonl");
+    // Persist a call whose result has not arrived yet.
+    write_records(&path, &records[..1]);
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
+    let scope = env.scope(Source::Claude);
+    let stored = serde_json::to_string(&scope.files["s.jsonl"]).unwrap();
+    assert!(stored.contains(&secret_path));
+    assert!(!serde_json::to_string(&capture.payloads)
+        .unwrap()
+        .contains(&env.cwd()));
+    append_records(&path, &records[1..]);
+    env.run(
+        Source::Claude,
+        now + time::Duration::days(1),
+        Some(&mut capture),
+    );
+    let wire = serde_json::to_string(&capture.payloads).unwrap();
+    assert!(!wire.contains(&secret_path));
+    assert!(!wire.contains(&env.cwd()));
+    assert!(wire.contains("example.rs"));
+    env.cleanup();
+}
+
+#[test]
+fn shared_max_fixture_contains_per_file_session_counts() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/context-composition/kinds_v2_max.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture["kinds_version"], 2);
+    for row in fixture["top_files"].as_array().unwrap() {
+        assert!(
+            row["session_count"].as_u64().unwrap() >= row["session_count_30d"].as_u64().unwrap()
+        );
+    }
+}
+
+#[test]
+fn committed_manifest_recovers_a_crash_before_the_single_pins_write() {
+    let env = Env::new("composition-manifest-pins-crash");
+    let now = base_now();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&env.cwd(), now.date(), 1));
+    env.run(Source::Claude, now, None);
+    let index = harvest::index_path(&env.state, Source::Claude);
+    let old = fs::read(&index).unwrap();
+    let modified = fs::metadata(&index).unwrap().modified().unwrap();
+    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
+    env.run(Source::Claude, now + time::Duration::days(1), None);
+    let expected = env.scope(Source::Claude).agg;
+    // Keep the scope commit, restore the pre-run pins and their timestamp.
+    fs::write(&index, old).unwrap();
+    File::options()
+        .write(true)
+        .open(&index)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair, stats.bad_state),
+        (0, 0, 0)
+    );
+    assert_eq!(stats.pins_rebuilt, 1);
+    assert_eq!(env.scope(Source::Claude).agg, expected);
+    env.cleanup();
+}

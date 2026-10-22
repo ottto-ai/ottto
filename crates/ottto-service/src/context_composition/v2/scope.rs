@@ -6,8 +6,9 @@
 //! recomputed, so worktrees coming and going never change it. Each file is
 //! pinned to the scope it was first read in, even after its folder is gone.
 
+use super::aggregate::{stable_hash, Day};
 use super::aggregate::{Aggregate, AggregateRef, StoredAggregate};
-use super::checkpoint::{read_json, write_json, Checkpoint};
+use super::checkpoint::{read_json, write_json, write_packed, Checkpoint};
 use super::file::Source;
 use super::STATE_SCHEMA;
 use crate::context_footprint::{
@@ -116,6 +117,29 @@ impl ScopeResolver for GitScopeResolver {
     }
 }
 
+/// Immutable generation files keep the previous manifest valid until commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ShardRef {
+    generation: u64,
+    sha: String,
+}
+
+pub(super) const SHARDS: u16 = 256;
+pub(super) fn shard_id(key: &str) -> u16 {
+    (stable_hash(key.as_bytes()) % u64::from(SHARDS)) as u16
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Shard {
+    schema: u32,
+    generation: u64,
+    files: BTreeMap<String, Checkpoint>,
+}
+
+/// A compact membership multiset. One row per transcript/name at its last
+/// access day. Duplicate sessions are collapsed only when building top rows.
+pub(super) type FileSession = (u32, u64, Day);
+
 /// One scope's state on disk.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct StoredScope {
@@ -124,8 +148,16 @@ pub(super) struct StoredScope {
     scope_id: String,
     info: ScopeInfo,
     generation: u64,
+    #[serde(default)]
     files: BTreeMap<String, Checkpoint>,
+    #[serde(default)]
     aggregate: StoredAggregate,
+    #[serde(default)]
+    shards: BTreeMap<u16, ShardRef>,
+    #[serde(default)]
+    file_sessions: Vec<FileSession>,
+    #[serde(default)]
+    totals: Option<ShardRef>,
 }
 
 /// The same layout, borrowed for writing.
@@ -136,8 +168,14 @@ struct StoredScopeRef<'a> {
     scope_id: &'a str,
     info: &'a ScopeInfo,
     generation: u64,
-    files: &'a BTreeMap<String, Checkpoint>,
-    aggregate: AggregateRef<'a>,
+    shards: &'a BTreeMap<u16, ShardRef>,
+    totals: ShardRef,
+}
+
+#[derive(Deserialize)]
+struct StoredTotals {
+    aggregate: StoredAggregate,
+    file_sessions: Vec<FileSession>,
 }
 
 /// One scope's state in memory.
@@ -149,12 +187,16 @@ pub(super) struct Scope {
     pub(super) generation: u64,
     pub(super) files: BTreeMap<String, Checkpoint>,
     pub(super) agg: Aggregate,
+    pub(super) shards: BTreeMap<u16, ShardRef>,
+    pub(super) file_sessions: Vec<FileSession>,
 }
 
 impl Scope {
     /// Bytes held in memory, approximately: totals and checkpoints.
     pub(super) fn accounted_bytes(&self) -> usize {
         self.agg.accounted_bytes()
+            + self.file_sessions.capacity() * std::mem::size_of::<FileSession>()
+            + self.shards.len() * 128
             + self
                 .files
                 .iter()
@@ -169,6 +211,8 @@ impl Scope {
             generation: 0,
             files: BTreeMap::new(),
             agg: Aggregate::default(),
+            shards: BTreeMap::new(),
+            file_sessions: Vec::new(),
         }
     }
 }
@@ -264,31 +308,231 @@ pub(super) fn load_scope(path: &Path, source: Source, scope_id: &str) -> Result<
     {
         return Err(());
     }
-    let agg = stored.aggregate.into_aggregate();
+    let (agg, file_sessions) = if let Some(reference) = stored.totals {
+        let file = path.with_extension(format!("totals.{}.zst", reference.generation));
+        if file_sha(&file).map_err(|_| ())? != reference.sha {
+            return Err(());
+        }
+        let totals: StoredTotals = read_json(&file)?.ok_or(())?;
+        (totals.aggregate.into_aggregate(), totals.file_sessions)
+    } else {
+        (stored.aggregate.into_aggregate(), stored.file_sessions)
+    };
     Ok(Some(Scope {
         scope_id: stored.scope_id,
         info: stored.info,
         generation: stored.generation,
         files: stored.files,
         agg,
+        shards: stored.shards,
+        file_sessions,
     }))
 }
 
 /// Write a scope atomically; returns its size in bytes.
 pub(super) fn save_scope(path: &Path, source: Source, scope: &Scope) -> std::io::Result<u64> {
-    write_json(
-        path,
-        &StoredScopeRef {
-            schema: STATE_SCHEMA,
-            agent: source.label(),
-            scope_id: &scope.scope_id,
-            info: &scope.info,
-            generation: scope.generation,
-            files: &scope.files,
+    #[derive(Serialize)]
+    struct Totals<'a> {
+        aggregate: AggregateRef<'a>,
+        file_sessions: &'a [FileSession],
+    }
+    let file = path.with_extension(format!("totals.{}.zst", scope.generation));
+    let bytes = write_packed(
+        &file,
+        &Totals {
             aggregate: AggregateRef {
                 agg: &scope.agg,
                 generations: true,
             },
+            file_sessions: &scope.file_sessions,
         },
-    )
+    )?;
+    let sha = file_sha(&file)?;
+    let manifest = StoredScopeRef {
+        schema: STATE_SCHEMA,
+        agent: source.label(),
+        scope_id: &scope.scope_id,
+        info: &scope.info,
+        generation: scope.generation,
+        shards: &scope.shards,
+        totals: ShardRef {
+            generation: scope.generation,
+            sha,
+        },
+    };
+    Ok(bytes + write_json(path, &manifest)?)
+}
+
+fn shard_path(path: &Path, id: u16, generation: u64) -> PathBuf {
+    path.with_extension(format!("s{id:03}.{generation}.zst"))
+}
+
+impl Scope {
+    /// Only the shard selected by changed bytes is read. Legacy unpublished
+    /// state is migrated on its first commit without reading transcripts.
+    pub(super) fn load_shard(&mut self, path: &Path, id: u16) -> Result<(), ()> {
+        if let Some(reference) = self.shards.get(&id) {
+            let file = shard_path(path, id, reference.generation);
+            if file_sha(&file).map_err(|_| ())? != reference.sha {
+                return Err(());
+            }
+            let shard: Shard = read_json(&file)?.ok_or(())?;
+            if shard.schema != STATE_SCHEMA
+                || shard.generation != reference.generation
+                || shard.files.keys().any(|key| shard_id(key) != id)
+            {
+                return Err(());
+            }
+            self.files = shard.files;
+        }
+        Ok(())
+    }
+
+    pub(super) fn save_shard(
+        &mut self,
+        path: &Path,
+        id: u16,
+        generation: u64,
+    ) -> std::io::Result<u64> {
+        let file = shard_path(path, id, generation);
+        #[derive(Serialize)]
+        struct ShardRef<'a> {
+            schema: u32,
+            generation: u64,
+            files: &'a BTreeMap<String, Checkpoint>,
+        }
+        let bytes = write_packed(
+            &file,
+            &ShardRef {
+                schema: STATE_SCHEMA,
+                generation,
+                files: &self.files,
+            },
+        )?;
+        let sha = file_sha(&file)?;
+        self.shards.insert(id, self::ShardRef { generation, sha });
+        Ok(bytes)
+    }
+
+    /// Recovery and test inspection only. The daily path never hydrates all
+    /// checkpoints; it holds one changed shard at a time.
+    pub(super) fn load_all_shards(&mut self, path: &Path) -> Result<(), ()> {
+        let mut all = std::mem::take(&mut self.files);
+        for id in self.shards.keys().copied().collect::<Vec<_>>() {
+            self.load_shard(path, id)?;
+            all.append(&mut self.files);
+        }
+        self.files = all;
+        Ok(())
+    }
+
+    /// Remove obsolete generations only after the new manifest is durable.
+    pub(super) fn clean_shards(&self, path: &Path) {
+        let Some(dir) = path.parent() else { return };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            return;
+        };
+        let prefix = format!("{stem}.s");
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            if let Some(rest) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix(&format!("{stem}.totals.")))
+            {
+                if rest
+                    .strip_suffix(".zst")
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .is_some_and(|g| g != self.generation)
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                continue;
+            }
+            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+                continue;
+            };
+            let mut parts = rest.split('.');
+            let (Some(id), Some(generation), Some("zst"), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (Ok(id), Ok(generation)) = (id.parse::<u16>(), generation.parse::<u64>()) else {
+                continue;
+            };
+            if !self
+                .shards
+                .get(&id)
+                .is_some_and(|r| r.generation == generation)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn file_sha(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    #[cfg(test)]
+    super::checkpoint::record_read(file.metadata()?.len());
+    let mut digest = Sha256::new();
+    let mut buf = [0; 16 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub(super) fn checkpoint_members(checkpoint: &Checkpoint) -> Vec<FileSession> {
+    use super::checkpoint::name_hash;
+    let Some(session) = checkpoint.contribution.session() else {
+        return Vec::new();
+    };
+    let session = session.split(" (subagent:").next().unwrap_or(session);
+    let session = stable_hash(session.as_bytes());
+    let mut names = BTreeMap::new();
+    for (hash, day) in checkpoint.cold.iter().flat_map(|c| c.files()).chain(
+        checkpoint
+            .contribution
+            .file_days()
+            .map(|(day, name)| (name_hash(name), day)),
+    ) {
+        let latest = names.entry(hash).or_insert(day);
+        *latest = (*latest).max(day);
+    }
+    names
+        .into_iter()
+        .map(|(name, day)| (name, session, day))
+        .collect()
+}
+
+/// Multiset subtraction/addition, once per scope, without loading unchanged shards.
+pub(super) fn update_members(
+    rows: &mut Vec<FileSession>,
+    mut remove: Vec<FileSession>,
+    add: Vec<FileSession>,
+    floor: Day,
+) {
+    rows.sort_unstable();
+    remove.sort_unstable();
+    let mut remove = remove.into_iter().peekable();
+    rows.retain(|row| {
+        while remove.peek().is_some_and(|old| old < row) {
+            remove.next();
+        }
+        if remove.peek() == Some(row) {
+            remove.next();
+            false
+        } else {
+            row.2 >= floor
+        }
+    });
+    rows.extend(add.into_iter().filter(|row| row.2 >= floor));
+    rows.sort_unstable();
 }

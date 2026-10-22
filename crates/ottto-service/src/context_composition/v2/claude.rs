@@ -128,6 +128,7 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         _ => None,
     };
     if line_type == "assistant" {
+        state.request1_closed = true;
         let id: Option<Box<str>> = message
             .as_ref()
             .and_then(|message| message.id.str().map(|id| id.as_ref().into()));
@@ -150,6 +151,7 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     };
     let cwd = state.cwd.clone();
     let ctx = out.ctx(
+        state,
         Agent::Claude,
         cwd.as_deref().map(Path::new),
         state.has_rendered,
@@ -324,7 +326,13 @@ fn attachment(
         has_rendered,
     };
     // This line may be the file's first with `rendered` text.
-    let ctx = out.ctx(Agent::Claude, ctx.cwd, state.has_rendered, ctx.author);
+    let ctx = out.ctx(
+        state,
+        Agent::Claude,
+        ctx.cwd,
+        state.has_rendered,
+        ctx.author,
+    );
     match kinds::claude_attachment(&ctx, &facts) {
         Verdict::Count { kind, part } => {
             let text = serialize_attachment(&att);
