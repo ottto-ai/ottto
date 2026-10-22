@@ -488,7 +488,19 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     std::fs::write(&off, b"").unwrap();
     let _ = scan(&mut ScanIndex::default());
     assert!(money::capture::capture_reserved() > baseline_reserved);
-    let rows_on = money_jsonl_rows(&fixture.support).len();
+    // The off pages run on the real clock (the fixture's rows are older and
+    // the writer's retention may drop them): count the rows since then.
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let off_rows = || {
+        money_jsonl_rows(&fixture.support)
+            .into_iter()
+            .filter(|row| row["row"] == "coverage")
+            .filter(|row| row["observed_unix"].as_u64().is_some_and(|at| at >= since))
+            .collect::<Vec<_>>()
+    };
     page();
     assert_eq!(
         money::capture::capture_reserved(),
@@ -497,9 +509,9 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     );
     // StateMissing B: the day's first off page writes one false coverage
     // row, so the part of the day the shadow skipped never reads complete.
-    let rows = money_jsonl_rows(&fixture.support);
-    assert_eq!(rows.len(), rows_on + 1, "one row for the off day");
-    let row = rows.last().unwrap();
+    let rows = off_rows();
+    assert_eq!(rows.len(), 1, "one row for the off day: {rows:?}");
+    let row = &rows[0];
     assert_eq!(row["row"], "coverage", "{row}");
     assert_eq!(row["coverage_complete"], false, "{row}");
     assert_eq!(row["refused"], true, "{row}");
@@ -510,11 +522,7 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
         "a parse while the shadow is off captures nothing"
     );
     page();
-    assert_eq!(
-        money_jsonl_rows(&fixture.support).len(),
-        rows_on + 1,
-        "later off pages of the day write nothing"
-    );
+    assert_eq!(off_rows().len(), 1, "later off pages of the day write nothing");
     std::fs::remove_file(&off).unwrap();
     page();
     let _ = scan(&mut ScanIndex::default());
