@@ -11,8 +11,9 @@ const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
 const SECOND: &str = "b0000000-0000-4000-8000-00000000000b";
 const OTHER_ROOT: &str = "c0000000-0000-4000-8000-00000000000c";
 const COPIED: i64 = -2 * 24 * 60 * 60;
-const CONTEXT_KEYS: [&str; 9] = [
+const CONTEXT_KEYS: [&str; 10] = [
     "compaction_count",
+    "compaction_events",
     "compaction_timestamps",
     "compaction_total_cumulative_dropped_tokens",
     "compaction_total_duration_ms",
@@ -173,6 +174,16 @@ fn assert_cleared(item: &SnapshotItem) {
     assert_eq!(item.compaction_total_post_tokens, None);
     assert_eq!(item.compaction_total_cumulative_dropped_tokens, None);
     assert_eq!(item.compaction_total_duration_ms, None);
+    assert!(item.compaction_events.is_empty());
+    assert!(item.local_context_points.is_empty());
+}
+
+/// Prompt sizes of the item's Mac-local points, oldest first.
+fn point_sizes(item: &SnapshotItem) -> Vec<u32> {
+    item.local_context_points
+        .iter()
+        .map(|point| point.prompt_tokens)
+        .collect()
 }
 
 fn inherited_start(item: &SnapshotItem) -> Option<SnapshotSessionStart> {
@@ -249,9 +260,25 @@ fn rewind_copy_counts_only_own_records() {
     assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
     assert_eq!(posture(&item), (Some(100), Some(300), Some(150), Some(1)));
     let own_boundary = stamp(now, -28);
-    assert_eq!(item.compaction_timestamps, vec![own_boundary]);
+    assert_eq!(item.compaction_timestamps, vec![own_boundary.clone()]);
     assert_eq!(item.compaction_total_pre_tokens, Some(310));
     assert_eq!(item.compaction_total_post_tokens, Some(50));
+    // Sizes come from own requests only: the copied boundaries have no
+    // event, and the copied request between req_a3 and req_a4 is never a size.
+    assert_eq!(
+        item.compaction_events,
+        vec![SnapshotCompactionEvent {
+            at: own_boundary.clone(),
+            before: Some(300),
+            after: Some(200),
+            trigger: Some("auto".to_string()),
+        }]
+    );
+    // Local points: the same own requests as first/peak/last.
+    let points = point_sizes(&item);
+    assert_eq!(points.first(), Some(&100));
+    assert_eq!(points.last(), Some(&150));
+    assert!(points.iter().all(|size| *size <= 300), "{points:?}");
     // The opening was copied: the session did not start here.
     assert_eq!(
         item.session_start.as_deref(),
@@ -1624,6 +1651,19 @@ fn telemetry_proven_session_keeps_todays_numbers() {
         strict.compaction_total_pre_tokens
     );
     assert_eq!(birth.session_start, strict.session_start);
+    // Both writers build sizes and points through one helper: same values.
+    assert_eq!(
+        strict.compaction_events,
+        vec![SnapshotCompactionEvent {
+            at: stamp(now, -28),
+            before: Some(300),
+            after: Some(200),
+            trigger: Some("auto".to_string()),
+        }]
+    );
+    assert_eq!(birth.compaction_events, strict.compaction_events);
+    assert!(!strict.local_context_points.is_empty());
+    assert_eq!(birth.local_context_points, strict.local_context_points);
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -2499,4 +2539,143 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
     ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
     assert!(!claude_reemission_stop_latched());
     let _ = fs::remove_dir_all(home);
+}
+
+// ---- Compaction sizes and local points (daemon 5b) --------------------------
+
+#[test]
+fn withheld_item_clears_sizes_and_points_with_the_tuple() {
+    let dir = temp_dir("claude-file-birth-sizes-withheld");
+    let now = OffsetDateTime::now_utc();
+    let (path, mut parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            boundary(ROOT, &stamp(now, -29), 110, 50),
+            assistant(ROOT, "req_a2", &stamp(now, -28), 200),
+        ],
+    );
+    parsed.claude_file_birth.forget_birth_for_test();
+    // Stale values from an earlier pass must not survive a withhold.
+    parsed.compaction_events = vec![SnapshotCompactionEvent {
+        at: stamp(now, -29),
+        before: Some(100),
+        after: Some(200),
+        trigger: None,
+    }];
+    parsed.local_context_points = vec![LocalContextPoint {
+        at_unix_seconds: 1,
+        prompt_tokens: 100,
+    }];
+    let mut items = vec![parsed];
+    let mut index = indexed(&[&path], true);
+
+    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+
+    assert_eq!(
+        disposition.posture_admission(ROOT),
+        Some("withheld_unknown_birth")
+    );
+    assert_cleared(&items[0]);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn incomplete_identity_ships_sizes_from_the_own_set() {
+    let dir = temp_dir("claude-file-birth-sizes-id-less");
+    let now = OffsetDateTime::now_utc();
+    let (path, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            id_less_assistant(ROOT, &stamp(now, -31), 500),
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            boundary(ROOT, &stamp(now, -29), 110, 50),
+            assistant(ROOT, "req_a2", &stamp(now, -28), 200),
+        ],
+    );
+    assert!(!parsed.claude_context_curve_identity_complete);
+    let evidence = reports(&[(ROOT, "req_a1", 1, 100), (ROOT, "req_a2", 2, 200)], true);
+    for fence_closed in [false, true] {
+        let mut items = vec![parsed.clone()];
+        let mut index = indexed(&[&path], fence_closed);
+        fold(&mut items, &evidence, &mut index, true);
+        let item = &items[0];
+        // Strict with incomplete identity and file birth both ship the
+        // own-only tuple, so both ship own-only sizes and points.
+        assert_eq!(
+            item.compaction_events,
+            vec![SnapshotCompactionEvent {
+                at: stamp(now, -29),
+                before: Some(100),
+                after: Some(200),
+                trigger: Some("auto".to_string()),
+            }],
+            "fence_closed={fence_closed}"
+        );
+        // An id-less response has no occurrence, so it is never a size or a
+        // point (first/peak still read it).
+        assert_eq!(
+            point_sizes(item),
+            vec![100, 200],
+            "fence_closed={fence_closed}"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn folded_sizes_and_points_leave_every_identity_unchanged() {
+    let dir = temp_dir("claude-file-birth-sizes-identity");
+    let now = OffsetDateTime::now_utc();
+    let (path, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
+            boundary(ROOT, &stamp(now, -28), 310, 50),
+            assistant(ROOT, "req_a3", &stamp(now, -27), 200),
+        ],
+    );
+    let mut items = vec![parsed];
+    let mut index = indexed(&[&path], true);
+    fold(&mut items, &no_reports(), &mut index, true);
+    let item = items.remove(0);
+    assert_eq!(item.compaction_events.len(), 1);
+    assert!(!item.local_context_points.is_empty());
+    let mut bare = item.clone();
+    bare.compaction_events.clear();
+    bare.local_context_points.clear();
+    let claude = SnapshotSource::ClaudeCode;
+    let policy = valid_v6_batch_request().upload_policy;
+    assert_eq!(
+        snapshot_fingerprint(claude, &item),
+        snapshot_fingerprint(claude, &bare)
+    );
+    assert_eq!(
+        snapshot_semantic_component_hashes(claude, &item),
+        snapshot_semantic_component_hashes(claude, &bare)
+    );
+    assert_eq!(
+        snapshot_semantic_envelope(claude, &item, policy),
+        snapshot_semantic_envelope(claude, &bare, policy)
+    );
+    assert_eq!(
+        snapshot_upload_body_witness(&item),
+        snapshot_upload_body_witness(&bare)
+    );
+    assert_eq!(
+        snapshot_upload_body_witness_version(&item),
+        snapshot_upload_body_witness_version(&bare)
+    );
+    // Sizes ride the upload; points never do.
+    let wire = serde_json::to_value(&item).expect("serialize body");
+    assert_eq!(
+        wire["compaction_events"],
+        serde_json::json!([{"at": stamp(now, -28), "before": 300, "after": 200, "trigger": "auto"}])
+    );
+    assert!(wire.get("local_context_points").is_none());
+    let _ = fs::remove_dir_all(dir);
 }

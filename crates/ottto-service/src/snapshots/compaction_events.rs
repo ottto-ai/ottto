@@ -11,12 +11,22 @@
 //! The list is additive evidence only. It is deliberately outside the
 //! `context_posture` component, the content hash and the body witness, so it
 //! never re-mints session identity and needs no parser or scan identity bump.
+//!
+//! Codex builds its list at finish from sizes noted during the parse. Claude
+//! Code builds it only in the ownership fold (`claude_compaction_events`),
+//! from the same owned boundaries and requests as the session's
+//! first/peak/last, so a copied request is never a size.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use serde::Serialize;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use super::MAX_COMPACTION_TIMESTAMPS;
+use super::{
+    paired_claude_legacy_compactions, ClaudeCompactionKind, ClaudeCompactionObservation,
+    ClaudeTranscriptUsageOccurrence, MAX_COMPACTION_TIMESTAMPS,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SnapshotCompactionEvent {
@@ -37,16 +47,177 @@ crate::heap_layout_bound::fields!(SnapshotCompactionEvent; at, before, after, tr
 /// events' `at` values: sorted by `at`, one event per distinct `at` (the first
 /// in parse order wins), newest `MAX_COMPACTION_TIMESTAMPS` kept.
 pub(crate) fn bounded_compaction_events(
-    mut events: Vec<SnapshotCompactionEvent>,
+    events: Vec<SnapshotCompactionEvent>,
 ) -> Vec<SnapshotCompactionEvent> {
+    bounded_by_at(events, |event| &event.at)
+}
+
+fn bounded_by_at<T>(mut entries: Vec<T>, at: impl Fn(&T) -> &str) -> Vec<T> {
     // Stable sort, so equal timestamps keep parse order for the dedup below.
-    events.sort_by(|left, right| left.at.cmp(&right.at));
-    events.dedup_by(|later, earlier| later.at == earlier.at);
-    if events.len() > MAX_COMPACTION_TIMESTAMPS {
-        events.split_off(events.len() - MAX_COMPACTION_TIMESTAMPS)
+    entries.sort_by(|left, right| at(left).cmp(at(right)));
+    entries.dedup_by(|later, earlier| at(later) == at(earlier));
+    if entries.len() > MAX_COMPACTION_TIMESTAMPS {
+        entries.split_off(entries.len() - MAX_COMPACTION_TIMESTAMPS)
     } else {
-        events
+        entries
     }
+}
+
+/// Gap between a Claude Code automatic compaction and the last owned request
+/// before it that marks the compaction idle. Claude Code compacts an idle
+/// session shortly before its one-hour prompt cache expires (about 54 minutes
+/// observed); a transcript marker saying `idle` wins when present.
+const CLAUDE_IDLE_COMPACTION_GAP_SECONDS: i64 = 50 * 60;
+
+/// `compactMetadata.trigger` of a Claude Code `compact_boundary`, read on the
+/// boundary line only. Unknown values stay `None`. Local, never serialized;
+/// the upload carries the closed string from `wire`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClaudeCompactionTrigger {
+    Auto,
+    Manual,
+    Idle,
+}
+
+impl ClaudeCompactionTrigger {
+    pub(super) fn from_marker(value: Option<&str>) -> Option<Self> {
+        match value? {
+            "auto" => Some(Self::Auto),
+            "manual" => Some(Self::Manual),
+            "idle" => Some(Self::Idle),
+            _ => None,
+        }
+    }
+
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeCompactionTrigger {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// Sizes and trigger for exactly the events `claude_compaction_summary`
+/// lists for the same `owned_observations`: every boundary plus every legacy
+/// summary #676's pairing leaves unpaired, each with a timestamp, bounded like
+/// `bounded_compaction_timestamps`, so `at` matches `compaction_timestamps`
+/// entry for entry. `own_requests` are the owned requests behind the item's
+/// first/peak/last, in any order:
+/// - `before` = the owned non-zero request with the largest sequence below
+///   the boundary's `response_count_before`;
+/// - `after` = the owned non-zero request with the smallest sequence at or
+///   above it, absent until one is seen.
+///
+/// One pass over the requests, memory bounded by the (at most 64) events, and
+/// no work at all for an item without an owned boundary. Called only by the
+/// fold's posture writers through `set_claude_compaction_scalars`, never by
+/// `finish()`.
+pub(super) fn claude_compaction_events<'a>(
+    owned_observations: &[ClaudeCompactionObservation],
+    own_requests: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
+) -> Vec<SnapshotCompactionEvent> {
+    let paired = paired_claude_legacy_compactions(owned_observations);
+    let candidates = owned_observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            observation.kind == ClaudeCompactionKind::CurrentBoundary || !paired.contains(index)
+        })
+        .filter_map(|(_, observation)| Some((observation.timestamp.as_deref()?, observation)))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let candidates = bounded_by_at(candidates, |(at, _)| at);
+
+    // Cut points between requests, ascending. Gap `g` holds the requests with
+    // `cuts[g - 1] <= sequence < cuts[g]`; gap 0 is before the first cut.
+    let cuts = candidates
+        .iter()
+        .map(|(_, observation)| observation.response_count_before)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut gaps = vec![ClaudeRequestGap::default(); cuts.len() + 1];
+    for request in own_requests {
+        if request.effective_input_context == 0 {
+            continue;
+        }
+        let gap = &mut gaps[cuts.partition_point(|cut| *cut <= request.sequence)];
+        if !matches!(gap.last, Some((sequence, ..)) if sequence >= request.sequence) {
+            gap.last = Some((
+                request.sequence,
+                request.effective_input_context,
+                request.timestamp.as_deref(),
+            ));
+        }
+        if !matches!(gap.first, Some((sequence, _)) if sequence <= request.sequence) {
+            gap.first = Some((request.sequence, request.effective_input_context));
+        }
+    }
+    // before[k]: the latest request at or before gap k; after[k]: the earliest
+    // request in gap k + 1 or later.
+    let mut before = Vec::with_capacity(cuts.len());
+    let mut latest = None;
+    for gap in &gaps[..cuts.len()] {
+        latest = gap.last.or(latest);
+        before.push(latest);
+    }
+    let mut after = vec![None; cuts.len()];
+    let mut earliest = None;
+    for (index, gap) in gaps.iter().enumerate().skip(1).rev() {
+        earliest = gap.first.or(earliest);
+        after[index - 1] = earliest;
+    }
+
+    candidates
+        .into_iter()
+        .map(|(at, observation)| {
+            let cut = cuts.partition_point(|cut| *cut < observation.response_count_before);
+            let before = before[cut];
+            let trigger = match observation.trigger {
+                Some(ClaudeCompactionTrigger::Auto)
+                    if idle_gap(before.and_then(|(_, _, timestamp)| timestamp), at) =>
+                {
+                    Some(ClaudeCompactionTrigger::Idle)
+                }
+                trigger => trigger,
+            };
+            SnapshotCompactionEvent {
+                at: at.to_string(),
+                before: before.map(|(_, context, _)| context),
+                after: after[cut].map(|(_, context)| context),
+                trigger: trigger.map(|trigger| trigger.wire().to_string()),
+            }
+        })
+        .collect()
+}
+
+/// The owned requests of one gap between compactions that the sizes need:
+/// the last one (with its time, for the idle rule) and the first one.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClaudeRequestGap<'a> {
+    last: Option<(u64, u64, Option<&'a str>)>,
+    first: Option<(u64, u64)>,
+}
+
+fn idle_gap(last_request_at: Option<&str>, compaction_at: &str) -> bool {
+    let parse = |value: &str| OffsetDateTime::parse(value, &Rfc3339).ok();
+    last_request_at
+        .and_then(parse)
+        .zip(parse(compaction_at))
+        .is_some_and(|(last, compaction)| {
+            (compaction - last).whole_seconds() >= CLAUDE_IDLE_COMPACTION_GAP_SECONDS
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

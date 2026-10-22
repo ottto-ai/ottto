@@ -245,17 +245,18 @@ pub(super) fn apply_own_context_scalars(item: &mut SnapshotItem) {
         .filter(|observation| birth.owned_boundary(observation))
         .cloned()
         .collect::<Vec<_>>();
-    let (count, timestamps, metrics) = claude_compaction_summary(&owned);
-    item.compaction_count = Some(count);
-    item.compaction_timestamps = timestamps;
-    item.compaction_total_pre_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
-    item.compaction_total_post_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_post_tokens);
-    item.compaction_total_cumulative_dropped_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_cumulative_dropped_tokens);
-    item.compaction_total_duration_ms =
-        (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
+    // The own requests are the responses `observe_response` counted as own
+    // (an untimed one counts as own there too), minus id-less responses,
+    // which carry no occurrence. Moved out for the call, never cloned.
+    let occurrences = std::mem::take(&mut item.claude_usage_occurrences);
+    set_claude_compaction_scalars(
+        item,
+        &owned,
+        occurrences
+            .values()
+            .filter(|occurrence| birth.copied(occurrence.timestamp.as_deref()) != Some(true)),
+    );
+    item.claude_usage_occurrences = occurrences;
 }
 
 /// Why an item without a provider-proven start kept or lost its scalars.

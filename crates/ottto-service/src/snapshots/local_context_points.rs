@@ -123,18 +123,36 @@ impl LocalContextPoints {
         last_activity_at: Option<&str>,
         now: &str,
     ) -> Vec<LocalContextPoint> {
-        let recent = last_activity_at
-            .and_then(|last| OffsetDateTime::parse(last, &Rfc3339).ok())
-            .zip(OffsetDateTime::parse(now, &Rfc3339).ok())
-            .is_some_and(|(last, now)| {
-                (now - last).whole_seconds() <= LOCAL_CONTEXT_POINT_RECENT_SECONDS
-            });
-        if recent {
+        if local_context_points_recent(last_activity_at, now) {
             self.points
         } else {
             Vec::new()
         }
     }
+
+    /// Points over owned requests already in transcript order, `(timestamp,
+    /// prompt size)` each. Claude Code builds its list this way in the
+    /// ownership fold from the requests behind first/peak/last.
+    pub(super) fn from_ordered_requests<'a>(
+        requests: impl Iterator<Item = (Option<&'a str>, u64)>,
+    ) -> Vec<LocalContextPoint> {
+        let mut points = Self::default();
+        for (at, prompt_tokens) in requests {
+            points.push(at, prompt_tokens);
+        }
+        points.points
+    }
+}
+
+/// Whether a session whose last activity is `last_activity_at` may carry
+/// points at `now` (the 75-minute output gate).
+pub(super) fn local_context_points_recent(last_activity_at: Option<&str>, now: &str) -> bool {
+    last_activity_at
+        .and_then(|last| OffsetDateTime::parse(last, &Rfc3339).ok())
+        .zip(OffsetDateTime::parse(now, &Rfc3339).ok())
+        .is_some_and(|(last, now)| {
+            (now - last).whole_seconds() <= LOCAL_CONTEXT_POINT_RECENT_SECONDS
+        })
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for LocalContextPoints {
@@ -342,5 +360,39 @@ mod tests {
             .into_recent(Some(&last), &at(BASE + 75 * 60 + 1))
             .is_empty());
         assert!(points.into_recent(None, &at(BASE)).is_empty());
+        assert!(local_context_points_recent(
+            Some(&last),
+            &at(BASE + 75 * 60)
+        ));
+        assert!(!local_context_points_recent(
+            Some(&last),
+            &at(BASE + 75 * 60 + 1)
+        ));
+    }
+
+    #[test]
+    fn ordered_requests_follow_the_same_rule_and_cap() {
+        // One request per minute for five hours, big steps every 7 minutes.
+        let requests = (0..300_u32)
+            .map(|minute| {
+                let tokens: u64 = if minute % 7 == 0 { 400_000 } else { 50_000 };
+                (at(BASE + minute * 60), tokens)
+            })
+            .chain([(String::from("not a time"), 9), (at(BASE + 300 * 60), 0)])
+            .collect::<Vec<_>>();
+        let mut pushed = LocalContextPoints::default();
+        for (at, tokens) in &requests {
+            pushed.push(Some(at), *tokens);
+        }
+        let built = LocalContextPoints::from_ordered_requests(
+            requests
+                .iter()
+                .map(|(at, tokens)| (Some(at.as_str()), *tokens)),
+        );
+        assert_eq!(built, pushed.points);
+        assert!(built.len() <= LOCAL_CONTEXT_POINT_CAP);
+        assert!(built.capacity() <= LOCAL_CONTEXT_POINT_CAP);
+        assert_eq!(built.first().unwrap().at_unix_seconds, BASE);
+        assert_eq!(built.last().unwrap().at_unix_seconds, BASE + 299 * 60);
     }
 }

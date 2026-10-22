@@ -46,8 +46,8 @@ pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
 mod compaction_events;
 pub(crate) use compaction_events::bounded_compaction_events;
-use compaction_events::CodexCompactionSizes;
 pub use compaction_events::SnapshotCompactionEvent;
+use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
 #[cfg(test)]
 mod codex_counting_v2_tests;
 mod codex_counting_version;
@@ -83,7 +83,7 @@ mod launch_demand_tests;
 mod launcher_recognition_tests;
 mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
-use local_context_points::LocalContextPoints;
+use local_context_points::{local_context_points_recent, LocalContextPoints};
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod sampled_audit;
@@ -882,6 +882,9 @@ pub(crate) struct ClaudeCompactionObservation {
     /// one that names a parent outside its boundary's chain is its own event,
     /// so only a summary without any link may pair by time.
     has_parent_link: bool,
+    /// `compactMetadata.trigger` of a current boundary; `None` for a legacy
+    /// summary or an unknown value. Fits the struct's existing padding.
+    trigger: Option<ClaudeCompactionTrigger>,
 }
 
 // The time fallback consumes unlinked legacy summaries greedily in
@@ -1057,10 +1060,57 @@ fn clear_claude_context_posture(item: &mut SnapshotItem) {
     item.last_turn_context_tokens = None;
     item.compaction_count = None;
     item.compaction_timestamps.clear();
+    item.compaction_events.clear();
+    item.local_context_points.clear();
     item.compaction_total_pre_tokens = None;
     item.compaction_total_post_tokens = None;
     item.compaction_total_cumulative_dropped_tokens = None;
     item.compaction_total_duration_ms = None;
+}
+
+/// The compaction tuple (count, timestamps, four totals), the compaction
+/// sizes and the Mac-local context points of a Claude Code item, all from one
+/// owned set: `owned_observations` and `own_requests` (the requests behind
+/// first/peak/last, any order). Both posture writers call this, so the two
+/// paths cannot drift; `clear_claude_context_posture` clears the same fields
+/// and `finish()` never builds Claude sizes or points.
+///
+/// Points are built only when the item's last activity is within the
+/// 75-minute output gate; only then are the owned requests ordered.
+fn set_claude_compaction_scalars<'a, I>(
+    item: &mut SnapshotItem,
+    owned_observations: &[ClaudeCompactionObservation],
+    own_requests: I,
+) where
+    I: Iterator<Item = &'a ClaudeTranscriptUsageOccurrence> + Clone,
+{
+    let (count, timestamps, metrics) = claude_compaction_summary(owned_observations);
+    item.compaction_count = Some(count);
+    item.compaction_timestamps = timestamps;
+    item.compaction_events =
+        compaction_events::claude_compaction_events(owned_observations, own_requests.clone());
+    item.compaction_total_pre_tokens =
+        (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
+    item.compaction_total_post_tokens =
+        (metrics.metrics_count > 0).then_some(metrics.total_post_tokens);
+    item.compaction_total_cumulative_dropped_tokens =
+        (metrics.metrics_count > 0).then_some(metrics.total_cumulative_dropped_tokens);
+    item.compaction_total_duration_ms =
+        (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
+    item.local_context_points =
+        if local_context_points_recent(item.source_last_activity_at.as_deref(), &item.collected_at)
+        {
+            let mut ordered = own_requests.collect::<Vec<_>>();
+            ordered.sort_by_key(|occurrence| occurrence.sequence);
+            LocalContextPoints::from_ordered_requests(ordered.into_iter().map(|occurrence| {
+                (
+                    occurrence.timestamp.as_deref(),
+                    occurrence.effective_input_context,
+                )
+            }))
+        } else {
+            Vec::new()
+        };
 }
 
 /// Replace Claude posture scalars from the same owned response suffix used by
@@ -1092,17 +1142,7 @@ fn rebuild_claude_context_posture(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let (count, timestamps, metrics) = claude_compaction_summary(&owned_observations);
-    item.compaction_count = Some(count);
-    item.compaction_timestamps = timestamps;
-    item.compaction_total_pre_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
-    item.compaction_total_post_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_post_tokens);
-    item.compaction_total_cumulative_dropped_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_cumulative_dropped_tokens);
-    item.compaction_total_duration_ms =
-        (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
+    set_claude_compaction_scalars(item, &owned_observations, owned_occurrences.iter());
 }
 
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the
@@ -29364,6 +29404,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 response_count_before: accumulator.claude_response_sequence,
                 pair_key,
                 has_parent_link: value.get("parentUuid").and_then(Value::as_str).is_some(),
+                trigger: None,
             });
     }
     if is_current_compaction {
@@ -29394,6 +29435,11 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 response_count_before: accumulator.claude_response_sequence,
                 pair_key: Some(pair_key),
                 has_parent_link: value.get("parentUuid").and_then(Value::as_str).is_some(),
+                trigger: ClaudeCompactionTrigger::from_marker(
+                    value
+                        .pointer("/compactMetadata/trigger")
+                        .and_then(Value::as_str),
+                ),
             });
     }
     accumulator.note_time(timestamp.clone());
@@ -56842,6 +56888,7 @@ mod tests {
                 response_count_before,
                 pair_key: None,
                 has_parent_link: false,
+                trigger: None,
             };
         let legacy = ClaudeCompactionKind::LegacySummary;
         let current = ClaudeCompactionKind::CurrentBoundary;
@@ -56897,6 +56944,7 @@ mod tests {
             response_count_before: 0,
             pair_key: None,
             has_parent_link: false,
+            trigger: None,
         };
         let legacy = ClaudeCompactionKind::LegacySummary;
         let current = ClaudeCompactionKind::CurrentBoundary;
@@ -57220,6 +57268,244 @@ mod tests {
             .map(|boundary| boundary.timestamp)
             .collect::<Vec<_>>();
         assert_eq!(curve, vec![Some("2026-10-20T12:03:05Z".to_string())]);
+        // No owned request: the owned event has no sizes at all.
+        assert_eq!(
+            item.compaction_events,
+            vec![SnapshotCompactionEvent {
+                at: "2026-10-20T12:03:05Z".to_string(),
+                before: None,
+                after: None,
+                trigger: Some("auto".to_string()),
+            }]
+        );
+
+        // With the owned suffix (sequence 1 on), the copied pair has no event
+        // and the copied request (50) is never a before.
+        let mut owned = item
+            .claude_usage_occurrences
+            .values()
+            .filter(|occurrence| occurrence.sequence >= 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        owned.sort_by_key(|occurrence| occurrence.sequence);
+        assert_eq!(owned.len(), 1);
+        rebuild_claude_context_posture(&mut item, &owned, Some(1));
+        assert_eq!(
+            item.compaction_events,
+            vec![SnapshotCompactionEvent {
+                at: "2026-10-20T12:03:05Z".to_string(),
+                before: Some(60),
+                after: None,
+                trigger: Some("auto".to_string()),
+            }]
+        );
+        assert_eq!(
+            item.local_context_points
+                .iter()
+                .map(|point| point.prompt_tokens)
+                .collect::<Vec<_>>(),
+            vec![60]
+        );
+    }
+
+    fn claude_line_at(at: OffsetDateTime) -> String {
+        at.format(&Rfc3339).expect("format fixture timestamp")
+    }
+
+    fn claude_sized_request(timestamp: &str, request: &str, input_tokens: u64) -> String {
+        format!(
+            "{{\"timestamp\":\"{timestamp}\",\"sessionId\":\"claude-sizes\",\"type\":\"assistant\",\"requestId\":\"{request}\",\"message\":{{\"id\":\"msg_{request}\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":{input_tokens},\"output_tokens\":1}}}}}}"
+        )
+    }
+
+    fn claude_sized_boundary(timestamp: &str, trigger: &str) -> String {
+        format!(
+            "{{\"timestamp\":\"{timestamp}\",\"sessionId\":\"claude-sizes\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"trigger\":\"{trigger}\",\"preTokens\":1}}}}"
+        )
+    }
+
+    /// Rebuild with every request owned, as the strict fold does for an
+    /// exclusive root.
+    fn rebuild_all_owned(item: &mut SnapshotItem) {
+        let mut owned = item
+            .claude_usage_occurrences
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        owned.sort_by_key(|occurrence| occurrence.sequence);
+        rebuild_claude_context_posture(item, &owned, None);
+    }
+
+    #[test]
+    fn claude_compaction_events_take_owned_sizes_and_trigger() {
+        let lines = [
+            claude_sized_request("2026-10-20T10:00:00Z", "req_s1", 100_000),
+            // Zero-size requests are never a before or an after.
+            claude_sized_request("2026-10-20T10:01:00Z", "req_s2", 0),
+            claude_sized_boundary("2026-10-20T10:02:00Z", "manual"),
+            claude_sized_request("2026-10-20T10:03:00Z", "req_s3", 0),
+            claude_sized_request("2026-10-20T10:04:00Z", "req_s4", 30_000),
+            claude_sized_request("2026-10-20T10:05:00Z", "req_s5", 150_000),
+            // 55 idle minutes before an automatic compaction: idle.
+            claude_sized_boundary("2026-10-20T11:00:00Z", "auto"),
+            claude_sized_request("2026-10-20T11:00:30Z", "req_s6", 40_000),
+            // Claude Code's own idle marker.
+            claude_sized_boundary("2026-10-20T11:01:00Z", "idle"),
+            claude_sized_request("2026-10-20T11:02:00Z", "req_s7", 45_000),
+            // A legacy summary alone is an event with no trigger.
+            "{\"timestamp\":\"2026-10-20T11:03:00Z\",\"uuid\":\"summary-alone\",\"parentUuid\":\"unrelated\",\"sessionId\":\"claude-sizes\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}".to_string(),
+            // Two minutes after the last request: automatic, after pending.
+            claude_sized_boundary("2026-10-20T11:04:00Z", "auto"),
+        ];
+        let lines = lines.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut item = parse_claude_compaction_fixture("claude-compaction-sizes", &lines);
+        // finish() never builds Claude sizes or points; only the fold does.
+        assert_eq!(item.claude_context_curve_boundaries.len(), 5);
+        assert!(item.compaction_events.is_empty());
+        assert!(item.local_context_points.is_empty());
+
+        rebuild_all_owned(&mut item);
+
+        let event = |at: &str, before, after, trigger: Option<&str>| SnapshotCompactionEvent {
+            at: at.to_string(),
+            before,
+            after,
+            trigger: trigger.map(str::to_string),
+        };
+        assert_eq!(
+            item.compaction_events,
+            vec![
+                event(
+                    "2026-10-20T10:02:00Z",
+                    Some(100_000),
+                    Some(30_000),
+                    Some("manual")
+                ),
+                event(
+                    "2026-10-20T11:00:00Z",
+                    Some(150_000),
+                    Some(40_000),
+                    Some("idle")
+                ),
+                event(
+                    "2026-10-20T11:01:00Z",
+                    Some(40_000),
+                    Some(45_000),
+                    Some("idle")
+                ),
+                event("2026-10-20T11:03:00Z", Some(45_000), None, None),
+                event("2026-10-20T11:04:00Z", Some(45_000), None, Some("auto")),
+            ]
+        );
+        assert_eq!(
+            item.compaction_events
+                .iter()
+                .map(|event| event.at.clone())
+                .collect::<Vec<_>>(),
+            item.compaction_timestamps
+        );
+        assert_eq!(item.compaction_count, Some(5));
+
+        // The helper reads the owned requests in any order.
+        let reversed = super::compaction_events::claude_compaction_events(
+            &item.claude_context_curve_boundaries,
+            item.claude_usage_occurrences.values().rev(),
+        );
+        assert_eq!(reversed, item.compaction_events);
+
+        // Local points: the same requests as first/peak/last, in order.
+        let seconds = |at: &str| {
+            u32::try_from(
+                OffsetDateTime::parse(at, &Rfc3339)
+                    .unwrap()
+                    .unix_timestamp(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            item.local_context_points
+                .iter()
+                .map(|point| (point.at_unix_seconds, point.prompt_tokens))
+                .collect::<Vec<_>>(),
+            vec![
+                (seconds("2026-10-20T10:00:00Z"), 100_000),
+                (seconds("2026-10-20T10:04:00Z"), 30_000),
+                (seconds("2026-10-20T10:05:00Z"), 150_000),
+                (seconds("2026-10-20T11:02:00Z"), 45_000),
+            ]
+        );
+        assert_eq!(item.first_turn_context_tokens, Some(100_000));
+        assert_eq!(item.peak_context_fill_tokens, Some(150_000));
+        assert_eq!(item.last_turn_context_tokens, Some(45_000));
+
+        // Once the next owned request is seen, the pending afters fill.
+        let mut grown_lines = lines.clone();
+        let next = claude_sized_request("2026-10-20T11:05:00Z", "req_s8", 47_000);
+        grown_lines.push(&next);
+        let mut grown =
+            parse_claude_compaction_fixture("claude-compaction-sizes-grown", &grown_lines);
+        rebuild_all_owned(&mut grown);
+        assert_eq!(grown.compaction_events[3].after, Some(47_000));
+        assert_eq!(grown.compaction_events[4].after, Some(47_000));
+        assert_eq!(grown.compaction_events[..3], item.compaction_events[..3]);
+
+        // The clear drops sizes and points with the rest of the tuple.
+        clear_claude_context_posture(&mut item);
+        assert!(item.compaction_events.is_empty());
+        assert!(item.local_context_points.is_empty());
+        assert!(item.compaction_timestamps.is_empty());
+    }
+
+    #[test]
+    fn claude_compaction_events_keep_the_newest_64_and_match_timestamps() {
+        let start = OffsetDateTime::parse("2026-10-20T08:00:00Z", &Rfc3339).unwrap();
+        let mut lines = Vec::new();
+        for index in 0..70_i64 {
+            let request_at = start + time::Duration::seconds(index * 120);
+            lines.push(claude_sized_request(
+                &claude_line_at(request_at),
+                &format!("req_cap_{index}"),
+                1_000 + index as u64,
+            ));
+            lines.push(claude_sized_boundary(
+                &claude_line_at(request_at + time::Duration::seconds(30)),
+                "auto",
+            ));
+        }
+        let lines = lines.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut item = parse_claude_compaction_fixture("claude-compaction-sizes-cap", &lines);
+        rebuild_all_owned(&mut item);
+
+        assert_eq!(item.compaction_count, Some(70));
+        assert_eq!(item.compaction_events.len(), MAX_COMPACTION_TIMESTAMPS);
+        assert_eq!(
+            item.compaction_events
+                .iter()
+                .map(|event| event.at.clone())
+                .collect::<Vec<_>>(),
+            item.compaction_timestamps
+        );
+        let first = &item.compaction_events[0];
+        assert_eq!((first.before, first.after), (Some(1_006), Some(1_007)));
+        let last = item.compaction_events.last().unwrap();
+        assert_eq!((last.before, last.after), (Some(1_069), None));
+        assert!(item
+            .compaction_events
+            .iter()
+            .all(|event| event.trigger.as_deref() == Some("auto")));
+        // Last activity is 100 minutes before collection: no local points.
+        assert!(item.local_context_points.is_empty());
+    }
+
+    #[test]
+    fn claude_compaction_observation_keeps_its_size_with_the_trigger() {
+        // The trigger byte sits in existing padding: retained boundaries do
+        // not grow.
+        assert_eq!(std::mem::size_of::<ClaudeCompactionObservation>(), 120);
+        assert_eq!(
+            std::mem::size_of::<Option<super::compaction_events::ClaudeCompactionTrigger>>(),
+            1
+        );
     }
 
     #[test]
@@ -75174,7 +75460,7 @@ crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, select
 crate::heap_layout_bound::fields!(CandidateFile; scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; census_window_end, account_identifier_hash, evidence_request_count, members, member_request_id_hashes, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier_hash, evidence_request_count, members, member_request_id_fingerprints);
-crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link);
+crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link, trigger);
 crate::heap_layout_bound::fields!(ClaudeDesktopIdentityEvidence; account_identifier_hash, provider_workspace_hash, source_created_at, imported);
 crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id);
 crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
