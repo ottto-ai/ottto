@@ -1117,6 +1117,22 @@ impl SnapshotUploadProgress {
         );
     }
 
+    /// The server answered `unchanged` with an `unchanged_basis`: it did not
+    /// store this body. Hold the exact body terminally, like a permanent
+    /// refusal of the same body before that answer existed, but record no
+    /// refusal: no usage was rejected. A changed body is a new fingerprint and
+    /// is offered again; a historical replay rearms it once.
+    fn hold_unstored_body(&mut self, fingerprint: &str, body_witness: &str) {
+        self.quarantine_body(fingerprint, body_witness);
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("quarantine just recorded");
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        record.retry_after_unix_seconds = 0;
+    }
+
     fn quarantine_retryable_body(&mut self, fingerprint: &str, body_witness: &str) {
         self.quarantine_body(fingerprint, body_witness);
         let record = self
@@ -3153,6 +3169,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The money shadow's kill switch, seen before this process's first parse.
+    crate::snapshots::claude_request_money::seed_shadow_off(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -3347,6 +3365,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_context_curve_identity_complete: false,
         claude_context_curve_request_index_complete: false,
         claude_context_curve_owned_start_proven: false,
+        claude_file_birth: item.claude_file_birth,
         activity_summary: item.activity_summary.clone(),
         tool_usage: item.tool_usage.clone(),
         tool_usage_truncated: item.tool_usage_truncated,
@@ -4090,6 +4109,11 @@ impl SourcePreparation {
             let occupied = initialize
                 .then(|| self.native_incremental_owned_bytes(&state))
                 .flatten();
+            #[cfg(test)]
+            let remaining = self
+                .native_comparison_reservation
+                .as_ref()
+                .and_then(crate::source_rotation::PaidReservation::remaining_for_test);
             let paid = self
                 .native_comparison_reservation
                 .as_mut()
@@ -4100,6 +4124,12 @@ impl SourcePreparation {
                     occupied
                         .is_some_and(|bytes| paid.grow_for(bytes) && paid.record_allocated(bytes))
                 });
+            #[cfg(test)]
+            if initialize {
+                tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::note_native_allowance(
+                    remaining, occupied, paid,
+                );
+            }
             if !paid {
                 state.disable_native_comparison();
             }
@@ -4405,7 +4435,9 @@ fn try_collect_native_preparation_with_rotation(
     };
     // The original rotation calculates queue/parked/retained deductions. No
     // independently fabricated full-budget argument reaches the native caller.
-    crate::source_rotation::run(&mut owner, &[source], crate::source_rotation::PARKED_BUDGET);
+    let budget =
+        tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::rotation_budget();
+    crate::source_rotation::run(&mut owner, &[source], budget);
     if let Some(error) = owner.failure {
         return Err(error);
     }
@@ -5113,6 +5145,9 @@ fn finish_sync_source(
                 evidence_started.elapsed().as_millis(),
                 crate::snapshots::claude_api_cache_creation_rejection_count()
             );
+        }
+        if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
+            eprintln!("local snapshot sync: claude context basis counts={counts}");
         }
         actual_native_conjunction =
             crate::snapshots::claude_native_comparison::actual_native_conjunction(&disposition)
@@ -6336,6 +6371,12 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+    /// How this pass's Claude context scalars were decided (proof or file
+    /// birth rule) and why any were withheld. Local only, never uploaded.
+    /// Logged on its own line; kept out of this struct's serialized form so
+    /// the counts line and snapshot-audit stay unchanged.
+    #[serde(skip)]
+    pub context_file_birth: crate::snapshots::ClaudeContextFileBirthCounts,
 }
 
 struct PreparedTraceRead {
@@ -6853,7 +6894,21 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     stats.paired_sidecar_root_count = usage_roots.len();
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
-    let paired_roots = usage_roots.iter().cloned().collect();
+    let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
+    // Context scalars only: API rows of roots without a sidecar pair still
+    // veto (never prove) the file birth rule. Moved, not cloned.
+    let mut veto_api_rows = crate::snapshots::ClaudeVetoApiRows::new();
+    let unpaired = api_read
+        .evidence
+        .keys()
+        .filter(|root| !paired_roots.contains(*root))
+        .cloned()
+        .collect::<Vec<_>>();
+    for root in unpaired {
+        if let Some(rows) = api_read.evidence.remove(&root) {
+            veto_api_rows.insert(root, rows);
+        }
+    }
     api_read.retain_roots(&paired_roots);
     if let Some(early) = prepared.as_mut() {
         api_read.move_remaining_for_strict(&mut early.api, &paired_roots);
@@ -6878,6 +6933,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
+            if let Some(rows) = api.evidence.remove(&root_session_id) {
+                veto_api_rows.insert(root_session_id.clone(), rows);
+            }
             if emission_permitted {
                 identity_unhealthy_roots.insert(root_session_id);
             }
@@ -6939,7 +6997,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             .or_else(|| {
                 lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
             }),
+        &veto_api_rows,
     );
+    drop(veto_api_rows);
     if let Some(fallback) = comparison
         .as_deref()
         .and_then(|comparison| comparison.fallback.as_ref())
@@ -7027,6 +7087,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .count();
     stats.duplicate_census = disposition.duplicate_census;
+    stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
         census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),
@@ -7040,6 +7101,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
+    // P1 per-request money, shadow only: reads this page's final items, the
+    // index and the rows loaded above; writes only its own ledger, through
+    // its writer thread after this page. Never fails or changes the page.
+    crate::snapshots::claude_request_money::shadow_page(
+        support_dir,
+        &scan_result.snapshots,
+        index,
+        &api_report,
+        &trace_report,
+        scan_result.census_complete,
+    );
     Ok((disposition, census_withheld, stats))
 }
 
@@ -7372,11 +7444,22 @@ where
                     .insert(cache_session_key(&entity.source_session_id), head.clone());
             }
         }
+        // An unchanged ref with `unchanged_basis` means the server did not
+        // store this body (its head already covers the usage). Nothing
+        // body-scoped is recorded as stored: the exact body is held instead,
+        // so it is offered once per change and never marked emitted.
+        let not_stored = response
+            .unchanged_entities
+            .iter()
+            .filter(|entity| entity.unchanged_basis.is_some())
+            .map(|entity| entity.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
         let settled = response
             .accepted_entities
             .iter()
             .chain(&response.unchanged_entities)
             .map(|entity| entity.snapshot_fingerprint.as_str())
+            .filter(|fingerprint| !not_stored.contains(fingerprint))
             .collect::<BTreeSet<_>>();
         for index in indices {
             let item = &items[*index];
@@ -7384,7 +7467,22 @@ where
             if settled.contains(item_fingerprint) {
                 progress.record_body(item_fingerprint, &body_witness(item));
                 progress.record_cache_state(item, false)?;
+            } else if not_stored.contains(item_fingerprint) {
+                progress.hold_unstored_body(item_fingerprint, &body_witness(item));
             }
+        }
+        if !not_stored.is_empty() {
+            let usage_identical = response
+                .unchanged_entities
+                .iter()
+                .filter(|entity| entity.unchanged_basis.as_deref() == Some("usage_identical"))
+                .count();
+            eprintln!(
+                "local snapshot unchanged not stored for {poison_scope}: count={} \
+                 usage_identical={usage_identical} other={}; exact bodies held, not marked emitted",
+                not_stored.len(),
+                not_stored.len().saturating_sub(usage_identical),
+            );
         }
         let rejected = response
             .rejected_entities
@@ -9198,6 +9296,7 @@ mod tests {
                         body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -9509,6 +9608,7 @@ mod tests {
                         body_witness_digest: None,
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     })
                     .collect();
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
@@ -9555,6 +9655,7 @@ mod tests {
                             .then(|| "e".repeat(64)),
                         head_challenge: (item.snapshot_fingerprint == sibling.snapshot_fingerprint)
                             .then(|| "c".repeat(64)),
+                        unchanged_basis: None,
                     };
                     if item.snapshot_fingerprint == sibling.snapshot_fingerprint {
                         response.conflict_entities.push(reference);
@@ -9679,6 +9780,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(&sibling)),
                         head_etag: Some("e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -9878,6 +9980,7 @@ mod tests {
                         )),
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -10070,6 +10173,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: None,
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack(&request)?;
                 Ok(response)
@@ -10151,6 +10255,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: Some("e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -10319,6 +10424,7 @@ mod tests {
                     body_witness_digest: Some(snapshot_upload_body_witness(item)),
                     head_etag: head,
                     head_challenge: None,
+                    unchanged_basis: None,
                 });
             ack.validate_entity_ack_with_head_cas(&request, enforce)?;
             Ok(ack)
@@ -10739,6 +10845,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -10856,6 +10963,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: None,
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack(&request)?;
                 Ok(response)
@@ -10929,6 +11037,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -10978,6 +11087,7 @@ mod tests {
                         body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -11077,6 +11187,7 @@ mod tests {
                     body_witness_digest: None,
                     head_etag: enforce.then(|| "e".repeat(64)),
                     head_challenge: None,
+                    unchanged_basis: None,
                 };
                 if enforce {
                     response.unchanged_entities.push(reference);
@@ -11123,6 +11234,192 @@ mod tests {
         assert!(progress.accepted_cache_heads.is_empty());
     }
 
+    /// R9 (SOURCE Amendment 2, option (i)): an `unchanged` ACK whose
+    /// `unchanged_basis` says the server did not store the body never marks
+    /// it emitted. The exact body is held, so it is offered once per change;
+    /// a plain `unchanged` ACK still settles as stored. Both server bases.
+    #[test]
+    fn unchanged_ack_with_usage_identical_does_not_mark_emitted() {
+        for basis in [Some("usage_identical"), Some("dominated_by_head"), None] {
+            let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+            item.context_curve = None;
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            let fingerprint = item.snapshot_fingerprint.clone();
+            let body = snapshot_upload_body_witness(&item);
+            let mut response = accepted_batch(1);
+            response.entity_ack_contract =
+                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            response
+                .unchanged_entities
+                .push(crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: fingerprint.clone(),
+                    occurrence_count: 1,
+                    body_witness_version: None,
+                    body_witness_digest: None,
+                    head_etag: None,
+                    head_challenge: None,
+                    unchanged_basis: basis.map(str::to_string),
+                });
+            let mut progress = test_upload_progress();
+            let mut requests = 0;
+            for _ in 0..2 {
+                let mut accepted = 0;
+                let result = upload_resumable_batches_with_body_witness(
+                    &[item.clone()],
+                    &unique_poison_scope(),
+                    &mut progress,
+                    &mut accepted,
+                    |item| item.snapshot_fingerprint.as_str(),
+                    snapshot_upload_body_witness,
+                    |_| {
+                        requests += 1;
+                        Ok(response.clone())
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(result, ResumableUploadResult::Completed, "{basis:?}");
+            }
+            assert_eq!(requests, 1, "{basis:?}: one body per change");
+            assert!(progress.contains_body(&fingerprint, &body), "{basis:?}");
+            assert!(progress.permanent_rejections.is_empty(), "{basis:?}");
+            if basis.is_none() {
+                assert!(progress.accepted_fingerprints.contains(&fingerprint));
+                assert_eq!(progress.accepted_body_witnesses[&fingerprint], body);
+                assert!(!progress.quarantined_fingerprints.contains_key(&fingerprint));
+                continue;
+            }
+            assert!(
+                !progress.accepted_fingerprints.contains(&fingerprint),
+                "usage_identical is not stored: never marked emitted"
+            );
+            assert!(!progress.accepted_body_witnesses.contains_key(&fingerprint));
+            let held = &progress.quarantined_fingerprints[&fingerprint];
+            assert_eq!(
+                held.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal
+            );
+            assert_eq!(held.upload_body_witness.as_deref(), Some(body.as_str()));
+            // The hold survives the cycle through the index, like a refusal.
+            let mut next_cycle = test_upload_progress();
+            next_cycle.prepare_quarantine_retries(&progress.quarantined_fingerprints);
+            assert!(next_cycle.contains_body(&fingerprint, &body));
+            assert!(!next_cycle.accepted_fingerprints.contains(&fingerprint));
+        }
+    }
+
+    /// COST condition: a held body (an `unchanged` ACK with a basis) never
+    /// blocks a later, different body of the same session. Unchanged ACK,
+    /// then local growth, then the grown body is offered and accepted, in the
+    /// same cycle and in the next one (hold carried through the index).
+    #[test]
+    fn held_unchanged_body_never_blocks_a_later_different_body() {
+        for (basis, next_cycle) in [
+            ("usage_identical", false),
+            ("dominated_by_head", false),
+            ("usage_identical", true),
+            ("dominated_by_head", true),
+        ] {
+            let case = format!("{basis} next_cycle={next_cycle}");
+            let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+            item.context_curve = None;
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            let held = item.snapshot_fingerprint.clone();
+            let mut grown = item.clone();
+            grown.output_tokens += 1;
+            grown.snapshot_fingerprint =
+                crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &grown);
+            assert_ne!(grown.snapshot_fingerprint, held, "{case}");
+            let grown_body = snapshot_upload_body_witness(&grown);
+            let ack = |unchanged: bool, fingerprint: &str| {
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                let reference = crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: fingerprint.to_string(),
+                    occurrence_count: 1,
+                    body_witness_version: None,
+                    body_witness_digest: None,
+                    head_etag: None,
+                    head_challenge: None,
+                    unchanged_basis: unchanged.then(|| basis.to_string()),
+                };
+                if unchanged {
+                    response.unchanged_entities.push(reference);
+                } else {
+                    response.accepted_entities.push(reference);
+                }
+                response
+            };
+            let upload =
+                |progress: &mut SnapshotUploadProgress,
+                 body: &SnapshotItem,
+                 response: crate::snapshot_client::SnapshotBatchResponse| {
+                    let mut offered = Vec::new();
+                    let mut accepted = 0;
+                    let result = upload_resumable_batches_with_body_witness(
+                        std::slice::from_ref(body),
+                        &unique_poison_scope(),
+                        progress,
+                        &mut accepted,
+                        |item| item.snapshot_fingerprint.as_str(),
+                        snapshot_upload_body_witness,
+                        |items: Vec<SnapshotItem>| {
+                            offered
+                                .extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
+                            Ok(response.clone())
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                    assert_eq!(result, ResumableUploadResult::Completed, "{case}");
+                    offered
+                };
+            let mut progress = test_upload_progress();
+            assert_eq!(
+                upload(&mut progress, &item, ack(true, &held)),
+                std::slice::from_ref(&held),
+                "{case}"
+            );
+            assert!(
+                progress.quarantined_fingerprints.contains_key(&held),
+                "{case}"
+            );
+            if next_cycle {
+                let mut carried = test_upload_progress();
+                carried.prepare_quarantine_retries(&progress.quarantined_fingerprints);
+                progress = carried;
+            }
+            // Local growth: a different body of the same session is offered
+            // despite the hold, and the server's acceptance is recorded.
+            assert_eq!(
+                upload(
+                    &mut progress,
+                    &grown,
+                    ack(false, &grown.snapshot_fingerprint)
+                ),
+                std::slice::from_ref(&grown.snapshot_fingerprint),
+                "{case}"
+            );
+            assert!(
+                progress
+                    .accepted_fingerprints
+                    .contains(&grown.snapshot_fingerprint),
+                "{case}"
+            );
+            assert_eq!(
+                progress.accepted_body_witnesses[&grown.snapshot_fingerprint], grown_body,
+                "{case}"
+            );
+            assert!(progress.permanent_rejections.is_empty(), "{case}");
+            assert!(!progress.accepted_fingerprints.contains(&held), "{case}");
+        }
+    }
+
     #[test]
     fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
         for outcome in ["accepted", "unchanged", "legacy"] {
@@ -11160,6 +11457,7 @@ mod tests {
                     body_witness_digest: None,
                     head_etag: None,
                     head_challenge: None,
+                    unchanged_basis: None,
                 };
                 if outcome == "accepted" {
                     response.accepted_entities.push(reference);
@@ -11214,6 +11512,7 @@ mod tests {
                             body_witness_digest: None,
                             head_etag: Some("2".repeat(64)),
                             head_challenge: None,
+                            unchanged_basis: None,
                         });
                     let mut request = request.clone();
                     request.snapshots = items;
@@ -11356,6 +11655,7 @@ mod tests {
                         "66".repeat(32)
                     }),
                     head_challenge: None,
+                    unchanged_basis: None,
                 });
             response.validate_entity_ack(&request).unwrap();
             let mut accepted = 0;
@@ -11435,6 +11735,7 @@ mod tests {
                 body_witness_digest: Some(snapshot_upload_body_witness(&item)),
                 head_etag: Some("e".repeat(64)),
                 head_challenge: None,
+                unchanged_basis: None,
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),
@@ -11832,6 +12133,7 @@ mod tests {
                     body_witness_digest: proof,
                     head_etag: None,
                     head_challenge: None,
+                    unchanged_basis: None,
                 };
                 let response = crate::snapshot_client::SnapshotBatchResponse {
                     accepted: 1,
@@ -12084,6 +12386,7 @@ mod tests {
                         body_witness_digest: None,
                         head_etag: None,
                         head_challenge: None,
+                        unchanged_basis: None,
                     }],
                 })
             },
@@ -12328,6 +12631,7 @@ mod tests {
             body_witness_digest: None,
             head_etag: None,
             head_challenge: None,
+            unchanged_basis: None,
         }
     }
 
@@ -12454,6 +12758,7 @@ mod tests {
                         body_witness_digest: None,
                         head_etag: None,
                         head_challenge: None,
+                        unchanged_basis: None,
                     }],
                     unchanged_entities: Vec::new(),
                     rejected_entities: vec![crate::snapshot_client::SnapshotEntityRejection {
@@ -18947,6 +19252,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
+    mod claude_request_money_pipeline_tests {
+        include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
+    }
     mod p12_base_exit_tests {
         include!("snapshot_sync/p12_base_exit_tests.rs");
     }
@@ -20333,6 +20641,7 @@ mod tests {
                         body_witness_digest: Some(body.clone()),
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
+                        unchanged_basis: None,
                     });
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
