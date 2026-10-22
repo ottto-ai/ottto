@@ -408,6 +408,13 @@ pub(crate) fn capture_message_hashes(index_key: &str, fingerprint: &str) -> Opti
         .then(|| entry.capture.message_only_hashes())
 }
 
+#[cfg(test)]
+pub(crate) fn purge_scope_for_test(scope: &Path) {
+    if let Ok(mut store) = STORE.lock() {
+        store.retain(|(entry_scope, _), _| entry_scope != scope);
+    }
+}
+
 pub(crate) fn capture_reserved() -> usize {
     CAPTURE_RESERVED.load(Ordering::Acquire)
 }

@@ -1246,7 +1246,7 @@ fn money_scope_debt_blocks_negative_membership_claims() {
         .files
         .get_mut(&ledger.a)
         .unwrap()
-        .source_file_fingerprint = money_fingerprint('z');
+        .source_file_fingerprint = money_fingerprint('f');
     assert_eq!(
         ledger.classify("req_own", &ledger.b, "B", &none),
         ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Scope)
@@ -1270,7 +1270,7 @@ fn money_scope_debt_blocks_negative_membership_claims() {
     // A brand-new file (never built) does not block.
     let mut ledger = MoneyLedger::new(&[], &[], &["req_own"]);
     let mut entry = manifest_index_entry(None);
-    entry.source_file_fingerprint = money_fingerprint('n');
+    entry.source_file_fingerprint = money_fingerprint('9');
     ledger
         .index
         .files
@@ -1289,7 +1289,7 @@ fn money_message_only_copies_pick_one_owner() {
     let message = crate::snapshots::claude_request_money::claude_message_hash("msg_shared");
     let mut index = ScanIndex::default();
     let keys = ["/m/projects/-repo/P.jsonl", "/m/projects/-repo/Q.jsonl"];
-    for (key, seed) in keys.iter().zip(['p', 'q']) {
+    for (key, seed) in keys.iter().zip(['1', '2']) {
         let mut entry = manifest_index_entry(Some("body"));
         entry.source_file_fingerprint = money_fingerprint(seed);
         index.files.insert((*key).to_owned(), entry);
@@ -1425,10 +1425,15 @@ fn money_rows_cache_follows_audited_rewrites() {
         }
     };
     assert!(rows(&mut census).contains(&claude_request_hash("req_a1")));
-    // Rewrite the first line's request id in place (same length).
+    // Rewrite the first line in place with another valid row of the same
+    // length (its own evidence fingerprint), keeping the last line.
     let path = tail.path(session);
     let text = std::fs::read_to_string(&path).unwrap();
-    let rewritten = text.replacen("req_a1", "req_a9", 1);
+    let first = money_api_line(session, "req_a1", "2026-08-02T07:00:00Z");
+    let replacement = money_api_line(session, "req_a9", "2026-08-02T07:00:00Z");
+    assert_eq!(replacement.len(), first.len());
+    let rewritten = text.replacen(&first, &replacement, 1);
+    assert_ne!(rewritten, text);
     assert_eq!(rewritten.len(), text.len());
     std::fs::OpenOptions::new()
         .write(true)
