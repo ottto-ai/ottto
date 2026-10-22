@@ -15,7 +15,6 @@
 //!   measurement over them, with no whole-line `Value` trees.
 //! - `claude`, `codex`: the per-line handlers, resumable at any line.
 //! - `aggregate`: per-scope totals and the residency of open lines.
-//! - `ownership`: which Claude records a scope already counted.
 //! - `checkpoint`: per-file checkpoints, file pins and the run record.
 //! - `scope`: the stable repository scope a file belongs to.
 //! - `harvest`: the daily run (gate, budgets, discovery, commit per scope).
@@ -35,7 +34,6 @@ mod codex;
 mod decode;
 mod file;
 mod harvest;
-mod ownership;
 mod reader;
 mod scope;
 mod upload;
@@ -50,21 +48,29 @@ use std::time::Duration;
 /// before its uploads can land. Flip to `true` in the release that ships the
 /// reader.
 const CHANGED_DAYS_UPLOAD_ENABLED: bool = false;
-/// Development override for the switch above (truthy value turns it on).
-/// The server refuses changed-days uploads until its write path ships.
+/// Development override for the switch above (truthy value turns it on;
+/// debug builds only). The server refuses changed-days uploads until its
+/// write path ships.
 const CHANGED_DAYS_ENV: &str = "OTTTO_CONTEXT_COMPOSITION_CHANGED_DAYS";
 
 pub(super) fn changed_days_enabled() -> bool {
+    // The override works in debug builds only: in a release build it would
+    // stop the kinds_version 1 uploads and spend the once-per-install first
+    // run before the server accepts changed days.
     CHANGED_DAYS_UPLOAD_ENABLED
-        || std::env::var(CHANGED_DAYS_ENV)
-            .map(|value| super::harvest::is_truthy(&value))
-            .unwrap_or(false)
+        || (cfg!(debug_assertions)
+            && std::env::var(CHANGED_DAYS_ENV)
+                .map(|value| super::harvest::is_truthy(&value))
+                .unwrap_or(false))
 }
 
 /// Local state folder, under the composition state folder.
 const STATE_DIR: &str = "v2";
 /// Bumped when the local state layout changes incompatibly; a mismatch reads
-/// as bad state (a full read within budget, never a failure).
+/// as bad state (a full read within budget, never a failure). Once released,
+/// a layout change must ship a migration of the old state instead of a bump:
+/// a bump re-reads every file within the repair budget, which the
+/// forward-only rule for methodology changes forbids.
 const STATE_SCHEMA: u32 = 1;
 /// Parser identity recorded on each checkpoint at its first read. Changing it
 /// never re-reads old bytes.
@@ -94,8 +100,10 @@ const LIVE_AT_INSTALL: Duration = Duration::from_secs(24 * 60 * 60);
 const KEEP_DAYS: i32 = 92;
 /// Days of per-day file, tool and part maps (the 30-day period).
 const PERIOD_DAYS: i32 = 30;
-/// Days of Claude record ids kept for copied-history checks.
-const OWNERSHIP_DAYS: i32 = 14;
+/// A Claude record dated more than this before its transcript was born (or
+/// first seen) was copied from an earlier transcript by a resume or fork: it
+/// adds residency only. Copies keep their original timestamps.
+const COPIED_SLACK_SECS: i64 = 60;
 /// Pins and checkpoints of files gone this long are dropped.
 const FORGET_MISSING_DAYS: i32 = 30;
 

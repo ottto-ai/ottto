@@ -8,9 +8,7 @@
 //! compaction. That equals the whole-file multiplier of the kinds_version 1
 //! reader and can stop and resume at any line.
 
-use super::{
-    KEEP_DAYS, MAX_ALL_FILES, MAX_ALL_TOOLS, MAX_FILES_PER_DAY, OWNERSHIP_DAYS, PERIOD_DAYS,
-};
+use super::{KEEP_DAYS, MAX_ALL_FILES, MAX_ALL_TOOLS, MAX_FILES_PER_DAY, PERIOD_DAYS};
 use crate::composition_kinds::{Kind, Part};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -285,6 +283,13 @@ pub(super) struct ToolTotals {
 }
 
 impl ToolTotals {
+    fn add(&mut self, other: &ToolTotals) {
+        self.calls += other.calls;
+        self.tokens += other.tokens;
+        self.sessions += other.sessions;
+        self.kind = other.kind.or(self.kind);
+    }
+
     /// Remove a share; true when nothing is left.
     fn take(&mut self, calls: u64, tokens: u64) -> bool {
         self.calls = self.calls.saturating_sub(calls);
@@ -313,6 +318,9 @@ pub(super) struct Aggregate {
     pub(super) day_tools: BTreeMap<(Day, Box<str>), ToolTotals>,
     pub(super) all_tools: BTreeMap<Box<str>, ToolTotals>,
     /// Last day each (tool, session hash) pair was seen, for distinct counts.
+    /// Kept for the 30-day period only, while `all_tools.sessions` counts
+    /// every session ever seen: a session that comes back after 30 days
+    /// counts again there (an overcount, documented as a difference).
     pub(super) tool_sessions: BTreeMap<(Box<str>, u64), Day>,
     pub(super) sessions: BTreeMap<Box<str>, SessionTotals>,
     /// The commit generation that last changed each day's rows.
@@ -357,10 +365,6 @@ impl Window {
     pub(super) fn contains(&self, day: Day) -> bool {
         day >= self.floor && day <= self.today
     }
-
-    pub(super) fn ownership_floor(&self) -> Day {
-        self.today - (OWNERSHIP_DAYS - 1)
-    }
 }
 
 /// One counted item.
@@ -374,8 +378,13 @@ pub(super) struct Entered<'a> {
     pub(super) ts: Option<i64>,
 }
 
-/// Writes counted items into a scope's totals and the file's contribution.
+/// Writes counted items into one read's own totals and the file's
+/// contribution. The read's totals join the scope's only when the read
+/// succeeds (`Aggregate::merge`), so a failed read leaves the scope as it was.
 pub(super) struct Sink<'a> {
+    /// The scope's committed totals (read only: distinct-session checks).
+    pub(super) base: &'a Aggregate,
+    /// This read's totals.
     pub(super) agg: &'a mut Aggregate,
     pub(super) contribution: &'a mut Contribution,
     pub(super) window: Window,
@@ -513,7 +522,8 @@ impl Sink<'_> {
             entry.kind = Some(kind);
         }
         let pair = (Box::<str>::from(tool), session_hash(session));
-        let first_seen = !self.agg.tool_sessions.contains_key(&pair);
+        let first_seen = !self.base.tool_sessions.contains_key(&pair)
+            && !self.agg.tool_sessions.contains_key(&pair);
         let last = self.agg.tool_sessions.entry(pair).or_insert(day);
         *last = (*last).max(day);
         let entry = self.agg.all_tools.entry(tool.into()).or_default();
@@ -527,17 +537,76 @@ impl Sink<'_> {
     /// items.
     pub(super) fn session_start(&mut self, session: &str, ts: Option<i64>) {
         let Some(ts) = ts else { return };
-        if let Some(totals) = self.agg.sessions.get_mut(session) {
+        if self.agg.sessions.contains_key(session) || self.base.sessions.contains_key(session) {
+            let totals = self.agg.sessions.entry(session.into()).or_default();
             totals.started = Some(totals.started.map_or(ts, |started| started.min(ts)));
         }
     }
 }
 
 pub(super) fn session_hash(session: &str) -> u64 {
-    super::ownership::stable_hash(session.as_bytes())
+    stable_hash(session.as_bytes())
+}
+
+/// FNV-1a 64: stable across builds and platforms (state is persisted).
+pub(super) fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 impl Aggregate {
+    /// Add one successful read's totals (see `Sink`).
+    pub(super) fn merge(&mut self, delta: Aggregate) {
+        for (key, bucket) in delta.days {
+            self.days.entry(key).or_default().add(&bucket);
+        }
+        for (key, bucket) in delta.day_parts {
+            self.day_parts.entry(key).or_default().add(&bucket);
+        }
+        for (key, bucket) in delta.all_parts {
+            self.all_parts.entry(key).or_default().add(&bucket);
+        }
+        for (key, totals) in delta.day_files {
+            self.day_files.entry(key).or_default().merge(&totals);
+        }
+        for (key, totals) in delta.all_files {
+            self.all_files.entry(key).or_default().merge(&totals);
+        }
+        for (key, totals) in delta.day_tools {
+            self.day_tools.entry(key).or_default().add(&totals);
+        }
+        for (key, totals) in delta.all_tools {
+            self.all_tools.entry(key).or_default().add(&totals);
+        }
+        for (key, day) in delta.tool_sessions {
+            let last = self.tool_sessions.entry(key).or_insert(day);
+            *last = (*last).max(day);
+        }
+        for (session, totals) in delta.sessions {
+            if totals.days.is_empty() && !self.sessions.contains_key(&session) {
+                continue;
+            }
+            let into = self.sessions.entry(session).or_default();
+            if let Some(ts) = totals.started {
+                into.started = Some(into.started.map_or(ts, |started| started.min(ts)));
+            }
+            for (day, kinds) in totals.days {
+                let into_day = into.days.entry(day).or_default();
+                for (kind, tokens) in kinds {
+                    *into_day.entry(kind).or_default() += tokens;
+                }
+            }
+        }
+        for (day, generation) in delta.day_generation {
+            let into = self.day_generation.entry(day).or_insert(generation);
+            *into = (*into).max(generation);
+        }
+    }
+
     /// Remove a file's earlier contribution before it is read again. Daily
     /// rows that reach zero are kept (as zeros), so the changed-days upload
     /// sends them and the server's earlier values are replaced.
@@ -710,6 +779,13 @@ pub(super) struct StoredAggregate {
 }
 
 impl StoredAggregate {
+    /// The same totals without the commit generations (for comparing two
+    /// states by content).
+    pub(super) fn without_generations(mut self) -> Self {
+        self.day_generation.clear();
+        self
+    }
+
     pub(super) fn from_aggregate(agg: &Aggregate) -> Self {
         let slot_parts = |slot: &Slot| {
             (

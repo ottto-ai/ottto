@@ -4,8 +4,9 @@
 //! boundary, partial last lines, a checkpoint round trip between pieces)
 //! gives the same totals as one read, and one read gives the kinds_version 1
 //! golden numbers. Runs: forward-only first run, restart, crash, rewrite,
-//! archive moves, line guard, stable scope key, changed-days upload and bad
-//! state.
+//! archive moves, line guard, stable scope key, worktrees gone before their
+//! first read, copied history, failed reads, changed-days upload, the
+//! server's field rules and bad state.
 
 use super::super::claude::parse_claude_session;
 use super::super::codex::parse_codex_session;
@@ -20,7 +21,6 @@ use super::checkpoint::{CopiedMode, Index, ParseState, StoredParse};
 use super::decode::{claude_never_counted, codex_never_counted, content_chars_and_images, Raw};
 use super::file::{new_parse_state, read_lines, LineSink, LineStats, Source};
 use super::harvest::{begin_run, run_source, Run, SourceStats};
-use super::ownership::Ownership;
 use super::reader::{LineEvent, LineReader};
 use super::scope::{load_scope, scope_path, ScopeInfo, ScopeResolver};
 use super::upload::{UploadTarget, Uploader};
@@ -77,9 +77,10 @@ fn wide() -> Window {
 #[derive(Default)]
 struct Reading {
     agg: Aggregate,
-    ownership: Ownership,
     stats: LineStats,
     contributions: BTreeMap<u32, Contribution>,
+    /// Per file id: Claude records dated before this are copied history.
+    copied_before: BTreeMap<u32, i64>,
 }
 
 impl Reading {
@@ -88,21 +89,23 @@ impl Reading {
     /// pieces, as a checkpoint does.
     fn read(&mut self, source: Source, path: &Path, file_id: u32, cuts: &[u64]) {
         let len = fs::metadata(path).unwrap().len();
-        let mut state = new_parse_state(source, path, 0);
+        let mut state = new_parse_state(source, path, 0).0;
         let mut offset = 0u64;
         let mut skipping = false;
+        let base = Aggregate::default();
+        let copied_before = self.copied_before.get(&file_id).copied();
         for end in cuts.iter().copied().chain([len]) {
             state = StoredParse::from_state(&state).into_state().unwrap();
             let contribution = self.contributions.entry(file_id).or_default();
             let mut out = LineSink {
                 sink: Sink {
+                    base: &base,
                     agg: &mut self.agg,
                     contribution,
                     window: wide(),
                     generation: 1,
                 },
-                ownership: (source == Source::Claude).then_some(&mut self.ownership),
-                file_id,
+                copied_before,
                 fallback_day: day_of(fallback_date()),
                 stats: &mut self.stats,
             };
@@ -525,33 +528,64 @@ fn codex_goldens_match_v1_and_any_split() {
 #[test]
 fn claude_copied_records_count_once_in_either_order() {
     let dir = scratch("composition-v2-claude-copies");
-    let attachment = |uuid: &str, session: &str| json!({"type":"attachment","uuid":uuid,"sessionId":session,"attachment":{"content":"same harness text"}});
-    let turn = |uuid: &str, session: &str, id: &str| json!({"type":"assistant","uuid":uuid,"sessionId":session,"message":{"id":id,"content":[]}});
+    let at = |second: u32| format!("2026-07-19T10:{:02}:{:02}Z", second / 60, second % 60);
+    let attachment = |uuid: &str, session: &str, second: u32| json!({"type":"attachment","uuid":uuid,"sessionId":session,"timestamp":at(second),"attachment":{"content":"same harness text"}});
+    let turn = |uuid: &str, session: &str, id: &str, second: u32| json!({"type":"assistant","uuid":uuid,"sessionId":session,"timestamp":at(second),"message":{"id":id,"content":[]}});
     let original = dir.join("original.jsonl");
-    write_records(&original, &[attachment("u1", "A"), turn("u2", "A", "m1")]);
+    write_records(
+        &original,
+        &[attachment("u1", "A", 1), turn("u2", "A", "m1", 2)],
+    );
+    // A resume made later copies the first records with their timestamps.
     let resumed = dir.join("resumed.jsonl");
     write_records(
         &resumed,
         &[
-            attachment("u1", "B"),
-            turn("u2", "B", "m1"),
-            attachment("u3", "B"),
-            turn("u4", "B", "m2"),
+            attachment("u1", "B", 1),
+            turn("u2", "B", "m1", 2),
+            attachment("u3", "B", 200),
+            turn("u4", "B", "m2", 201),
         ],
     );
-    for order in [[&original, &resumed], [&resumed, &original]] {
+    let born = |second: i64| {
+        OffsetDateTime::parse(&at(0), &time::format_description::well_known::Rfc3339)
+            .unwrap()
+            .unix_timestamp()
+            + second
+    };
+    // In creation order this equals kinds_version 1 (which keeps the first
+    // copy read); in any other order the totals stay the same.
+    let mut totals = Vec::new();
+    for (order, births) in [
+        ([&original, &resumed], [born(0), born(120)]),
+        ([&resumed, &original], [born(120), born(0)]),
+    ] {
         let refs: Vec<&Path> = order.iter().map(|path| path.as_path()).collect();
-        let whole = read_whole(Source::Claude, &refs);
-        assert_matches_v1(&v1_claude(&refs), &whole);
-        assert_split_parity(Source::Claude, &refs);
+        let mut whole = Reading::default();
+        for (index, path) in refs.iter().enumerate() {
+            let id = index as u32 + 1;
+            whole
+                .copied_before
+                .insert(id, births[index] - COPIED_SLACK_SECS);
+            whole.read(Source::Claude, path, id, &[]);
+        }
+        if totals.is_empty() {
+            assert_matches_v1(&v1_claude(&refs), &whole);
+        }
+        totals.push((v2_rows(&whole.agg), v2_sessions(&whole.agg)));
     }
-    // A full re-read of a file ignores its own records.
-    let mut reading = read_whole(Source::Claude, &[&original, &resumed]);
-    let before = reading.agg.clone();
-    let contribution = reading.contributions.remove(&1).unwrap();
-    reading.agg.subtract(&contribution, 1);
-    reading.read(Source::Claude, &original, 1, &[]);
-    assert_eq!(v2_rows(&reading.agg), v2_rows(&before));
+    assert_eq!(totals[0], totals[1]);
+    // Within the slack a record is the transcript's own.
+    let mut reading = Reading::default();
+    reading
+        .copied_before
+        .insert(1, born(30) - COPIED_SLACK_SECS);
+    reading.read(Source::Claude, &resumed, 1, &[]);
+    assert_eq!(reading.stats.lines, 4);
+    assert_eq!(
+        v2_rows(&reading.agg),
+        v2_rows(&read_whole(Source::Claude, &[&resumed]).agg)
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -634,18 +668,19 @@ fn codex_inner_items_wait_with_their_open_call() {
     );
     let file = File::open(&path).unwrap();
     let len = fs::metadata(&path).unwrap().len();
-    let mut state = new_parse_state(Source::Codex, &path, 0);
+    let mut state = new_parse_state(Source::Codex, &path, 0).0;
     let mut reading = Reading::default();
     let mut contribution = Contribution::default();
+    let base = Aggregate::default();
     let mut out = LineSink {
         sink: Sink {
+            base: &base,
             agg: &mut reading.agg,
             contribution: &mut contribution,
             window: wide(),
             generation: 1,
         },
-        ownership: None,
-        file_id: 1,
+        copied_before: None,
         fallback_day: day_of(fallback_date()),
         stats: &mut reading.stats,
     };
@@ -701,7 +736,7 @@ fn codex_head_identity_sets_copied_mode() {
     for (meta, expected) in cases {
         let path = dir.join("head.jsonl");
         write_records(&path, &[json!({"type":"session_meta","payload":meta})]);
-        assert_eq!(new_parse_state(Source::Codex, &path, 0).copied, expected);
+        assert_eq!(new_parse_state(Source::Codex, &path, 0).0.copied, expected);
     }
     // Read from the middle, a legacy subagent fork is past its trigger.
     let path = dir.join("head.jsonl");
@@ -712,7 +747,7 @@ fn codex_head_identity_sets_copied_mode() {
         ],
     );
     assert_eq!(
-        new_parse_state(Source::Codex, &path, 10).copied,
+        new_parse_state(Source::Codex, &path, 10).0.copied,
         CopiedMode::Own
     );
     fs::remove_dir_all(dir).unwrap();
@@ -739,6 +774,7 @@ impl ScopeResolver for FolderResolver {
                 workspace_hash: scope,
                 workspace_path: text.into_owned(),
                 identity: Default::default(),
+                common_dir: None,
             },
         ))
     }
@@ -860,8 +896,9 @@ fn claude_turn(cwd: &str, day: Date, n: u32) -> Vec<Value> {
 }
 
 fn base_now() -> OffsetDateTime {
-    // Ten days back, so files created during a test are born after it.
-    OffsetDateTime::now_utc() - time::Duration::days(10)
+    // Midnight ten days back, so files created during a test are born after
+    // it and fixture lines (dated from midnight on) are not copied history.
+    (OffsetDateTime::now_utc() - time::Duration::days(10)).replace_time(time::Time::MIDNIGHT)
 }
 
 fn total_tokens(agg: &Aggregate) -> u64 {
@@ -956,26 +993,20 @@ fn crash_before_scope_commit_never_double_counts() {
     let resumed = env.root.join("p/resumed.jsonl");
     write_records(&resumed, &claude_turn(&cwd, day, 1));
 
-    // Crash: the pins and the ownership log are written, the scope is not.
+    // Crash: the pins are written, the scope is not.
+    let later = now + time::Duration::hours(1);
     harvest::tests::set_fail_scope_commit(true);
-    let stats = env.run(Source::Claude, now + time::Duration::hours(1), None);
+    let stats = env.run(Source::Claude, later, None);
     harvest::tests::set_fail_scope_commit(false);
     assert_eq!((stats.scopes_failed, stats.scopes_committed), (1, 0));
-    let scope_id = sha256_hex(&[cwd.as_str()]);
-    let log_dir = super::scope::ownership_dir(&env.state, Source::Claude, &scope_id);
-    let log = fs::read_dir(&log_dir)
-        .unwrap()
-        .flatten()
-        .next()
-        .unwrap()
-        .path();
-    let uncommitted = fs::metadata(&log).unwrap().len();
 
     env.run(Source::Claude, now + time::Duration::hours(2), None);
-    // The log was cut back to its committed length before appending.
-    assert_eq!(fs::metadata(&log).unwrap().len(), uncommitted);
     let mut whole = Reading::default();
     whole.read(Source::Claude, &path, 1, &[]);
+    // The resumed file was first seen by the crashed run.
+    whole
+        .copied_before
+        .insert(2, later.unix_timestamp() - COPIED_SLACK_SECS);
     whole.read(Source::Claude, &resumed, 2, &[]);
     assert_eq!(v2_rows(&env.scope(Source::Claude).agg), v2_rows(&whole.agg));
     env.cleanup();
@@ -1039,6 +1070,7 @@ fn assert_same_totals(actual: &Aggregate, expected: &Aggregate) {
 
 #[test]
 fn rewritten_files_are_read_again_within_the_budget() {
+    super::upload::tests::set_accept_v1_kinds(true);
     let env = Env::new("composition-v2-rewrite");
     let now = base_now();
     let day = now.date();
@@ -1136,21 +1168,37 @@ fn full_re_read_keeps_history_past_the_window() {
 }
 
 #[test]
-fn failed_read_drops_the_scope_update() {
+fn failed_read_counts_nothing_and_keeps_the_rest_of_the_scope() {
     let env = Env::new("composition-v2-failed-read");
     let now = base_now();
     let day = now.date();
     let cwd = env.cwd();
     let path = env.root.join("p/s.jsonl");
+    let other = env.root.join("p/other.jsonl");
     write_records(&path, &claude_turn(&cwd, day, 1));
+    write_records(&other, &claude_turn(&cwd, day, 10));
     env.run(Source::Claude, now, None);
     append_records(&path, &claude_turn(&cwd, day, 2));
-    harvest::tests::set_fail_read(true);
+    append_records(&other, &claude_turn(&cwd, day, 11));
+    harvest::tests::set_fail_read(Some(&path));
     let stats = env.run(Source::Claude, now + time::Duration::hours(1), None);
-    harvest::tests::set_fail_read(false);
-    assert_eq!((stats.scopes_failed, stats.scopes_committed), (1, 0));
+    harvest::tests::set_fail_read(None);
+    assert_eq!(
+        (
+            stats.scopes_failed,
+            stats.scopes_committed,
+            stats.files_failed
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        stats.bytes_failed,
+        body(&claude_turn(&cwd, day, 2)).len() as u64
+    );
+    // The other file committed; the failed one is read again next time.
     env.run(Source::Claude, now + time::Duration::hours(2), None);
-    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
+    let whole = read_whole(Source::Claude, &[&path, &other]);
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), v2_rows(&whole.agg));
     env.cleanup();
 }
 
@@ -1191,6 +1239,49 @@ fn codex_archive_move_and_compression_never_read_again() {
         (stats.archived, stats.bytes_new + stats.bytes_repair),
         (1, 0)
     );
+    // The scope's next commit marks its checkpoint done, so pins rebuilt
+    // from the scope never read it again.
+    let next = now + time::Duration::days(3);
+    let other = env
+        .root
+        .join("sessions/2026/10/02/rollout-2026-10-02T00-00-00-def.jsonl");
+    write_records(
+        &other,
+        &[
+            json!({"type":"session_meta","timestamp":ts(next.date(), 0),"payload":{"id":"def","cwd":cwd}}),
+        ],
+    );
+    env.run(Source::Codex, next, None);
+    let scope = env.scope(Source::Codex);
+    assert_eq!(scope.files[name].status, super::checkpoint::Status::Done);
+    env.cleanup();
+}
+
+#[test]
+fn a_scope_without_pins_for_the_window_is_no_longer_refreshed() {
+    let env = Env::new("composition-v2-retired-scope");
+    let now = base_now();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&env.cwd(), now.date(), 1));
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
+    fs::remove_file(&path).unwrap();
+    // The pins forget the file; the week-old upload is still refreshed.
+    env.run(
+        Source::Claude,
+        now + time::Duration::days(40),
+        Some(&mut capture),
+    );
+    assert_eq!(capture.payloads.len(), 2);
+    let index = read_index(&env.state, Source::Claude);
+    assert!(index.files.is_empty() && index.cwd_scopes.is_empty());
+    // No pin for the whole window: left alone.
+    env.run(
+        Source::Claude,
+        now + time::Duration::days(100),
+        Some(&mut capture),
+    );
+    assert_eq!(capture.payloads.len(), 2);
     env.cleanup();
 }
 
@@ -1264,6 +1355,7 @@ fn bad_state_reads_again_and_never_fails() {
 
 #[test]
 fn rebuilt_scope_uploads_every_rebuilt_day() {
+    super::upload::tests::set_accept_v1_kinds(true);
     let env = Env::new("composition-v2-rebuilt-upload");
     let now = base_now();
     let day = now.date();
@@ -1305,6 +1397,7 @@ fn rebuilt_scope_uploads_every_rebuilt_day() {
 
 #[test]
 fn changed_days_upload() {
+    super::upload::tests::set_accept_v1_kinds(true);
     let env = Env::new("composition-v2-upload");
     let now = base_now();
     let day = now.date();
@@ -1537,7 +1630,7 @@ fn parse_state_round_trips() {
 #[ignore]
 fn measure_synthetic_large_workspace() {
     let env = Env::new("composition-v2-measure");
-    let now = OffsetDateTime::now_utc();
+    let now = base_now();
     let day = now.date();
     let cwd = env.cwd();
     let files: usize = std::env::var("COMPOSITION_MEASURE_FILES")
@@ -1629,4 +1722,814 @@ fn dir_bytes(dir: &Path) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+// -------------------------------------------------------------------------
+// Review regressions: worktrees, copied history, failures, pins, scoping,
+// copies, uploads.
+// -------------------------------------------------------------------------
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+fn read_index(state: &Path, source: Source) -> Index {
+    serde_json::from_slice(&fs::read(harvest::index_path(state, source)).unwrap()).unwrap()
+}
+
+#[test]
+fn worktree_removed_before_its_first_read_counts_in_its_repository() {
+    let base = scratch("composition-v2-wt-gone");
+    let main = base.join("repo");
+    fs::create_dir_all(&main).unwrap();
+    git_in(&main, &["init", "-q"]);
+    git_in(
+        &main,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    let root = base.join("transcripts");
+    let state = base.join("state");
+    let now = base_now();
+    write_records(
+        &root.join("p/main.jsonl"),
+        &claude_turn(&main.to_string_lossy(), now.date(), 1),
+    );
+    let run = |now: OffsetDateTime| {
+        let mut resolver = super::scope::GitScopeResolver;
+        let mut run = Run {
+            state_dir: state.clone(),
+            now,
+            deadline: Instant::now() + Duration::from_secs(120),
+            resolver: &mut resolver,
+            repair_left: REPAIR_BYTES_PER_DAY,
+        };
+        run_source(&mut run, Source::Claude, std::slice::from_ref(&root), None)
+    };
+    run(now);
+    // Between two daily runs: a worktree is created, used and removed; an
+    // hourly wake sees it while it exists.
+    let worktree = base.join("wt-task");
+    git_in(
+        &main,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    let next = now + time::Duration::days(1);
+    write_records(
+        &root.join("p/task.jsonl"),
+        &claude_turn(&worktree.to_string_lossy(), next.date(), 2),
+    );
+    let mut cache = harvest::WorktreeCache::default();
+    let today = day_of(now.date());
+    assert_eq!(harvest::map_worktrees(&state, today, &mut cache), 1);
+    // A second wake with nothing new reads no pins and adds nothing.
+    assert_eq!(harvest::map_worktrees(&state, today, &mut cache), 0);
+    git_in(
+        &main,
+        &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+    );
+    let stats = run(next);
+    assert_eq!((stats.unscoped, stats.scan_errors), (0, 0));
+    assert!(stats.bytes_new > 0);
+    let index = read_index(&state, Source::Claude);
+    assert_eq!(index.scope_info.len(), 1);
+    let scope_id = index.files["main.jsonl"].scope.clone().unwrap();
+    assert_eq!(
+        index.files["task.jsonl"].scope.as_deref(),
+        Some(scope_id.as_str())
+    );
+    let scope = load_scope(
+        &scope_path(&state, Source::Claude, &scope_id),
+        Source::Claude,
+        &scope_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(scope.files.len(), 2);
+    // The gone worktree's entry is dropped once nothing waits for it.
+    assert!(!index
+        .cwd_scopes
+        .keys()
+        .any(|folder| folder.ends_with("wt-task")));
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn bad_index_rebuilds_pins_and_keeps_every_checkpoint() {
+    let env = Env::new("composition-v2-bad-index-sibling");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let a = env.root.join("p/a.jsonl");
+    let b = env.root.join("p/b.jsonl");
+    write_records(&a, &claude_turn(&cwd, day, 1));
+    write_records(&b, &claude_turn(&cwd, day, 10));
+    env.run(Source::Claude, now, None);
+    assert_eq!(env.scope(Source::Claude).files.len(), 2);
+    fs::write(env.state.join("index-claude-code.json"), b"[]").unwrap();
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!((stats.bad_state, stats.pins_rebuilt), (1, 2));
+    assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
+    append_records(&a, &claude_turn(&cwd, day, 2));
+    env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(env.scope(Source::Claude).files.len(), 2);
+    append_records(&b, &claude_turn(&cwd, day, 11));
+    env.run(Source::Claude, now + time::Duration::days(3), None);
+    let whole = read_whole(Source::Claude, &[&a, &b]);
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), v2_rows(&whole.agg));
+    env.cleanup();
+}
+
+#[test]
+fn failing_file_is_retried_once_then_quarantined() {
+    let env = Env::new("composition-v2-failed-quarantine");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&cwd, day, 1));
+    env.run(Source::Claude, now, None);
+    let committed = env.scope(Source::Claude).agg;
+    harvest::tests::set_fail_read(Some(&path));
+    let mut seen = Vec::new();
+    for n in 2..5u32 {
+        append_records(&path, &claude_turn(&cwd, day, n));
+        let stats = env.run(Source::Claude, now + time::Duration::days(n as i64), None);
+        seen.push((stats.lines.lines, stats.bytes_failed > 0, stats.quarantined));
+    }
+    harvest::tests::set_fail_read(None);
+    // Failed, retried once (with the day's new lines), then quarantined.
+    assert_eq!(seen, vec![(3, true, 0), (6, true, 1), (0, false, 0)]);
+    append_records(&path, &claude_turn(&cwd, day, 5));
+    let stats = env.run(Source::Claude, now + time::Duration::days(5), None);
+    assert_eq!(stats.lines.lines, 0);
+    assert_eq!(env.scope(Source::Claude).agg, committed);
+    env.cleanup();
+}
+
+#[test]
+fn resume_of_a_dormant_file_adds_residency_only_to_copied_days() {
+    let env = Env::new("composition-v2-dormant-resume");
+    let now = base_now();
+    let day = now.date();
+    let old_day = day - time::Duration::days(20);
+    let cwd = env.cwd();
+    let old = env.root.join("p/old.jsonl");
+    write_records(&old, &claude_turn(&cwd, old_day, 1));
+    File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600))
+        .unwrap();
+    let stats = env.run(Source::Claude, now, None);
+    assert_eq!(
+        stats.bytes_new + stats.bytes_repair,
+        0,
+        "dormant at install"
+    );
+    // A resume after install copies the old records (same ids and times).
+    let next = now + time::Duration::days(1);
+    let resumed = env.root.join("p/resumed.jsonl");
+    let mut records = claude_turn(&cwd, old_day, 1);
+    records.extend(claude_turn(&cwd, next.date(), 2));
+    write_records(&resumed, &records);
+    env.run(Source::Claude, next, None);
+    let agg = env.scope(Source::Claude).agg;
+    let on = |date: Date| -> (u64, u64) {
+        agg.days
+            .iter()
+            .filter(|((row_day, _), _)| *row_day == day_of(date))
+            .fold((0, 0), |sum, (_, bucket)| {
+                (sum.0 + bucket.events, sum.1 + bucket.tokens)
+            })
+    };
+    assert_eq!(on(old_day), (0, 0), "copied history never enters again");
+    assert!(on(next.date()).1 > 0, "the resume's own lines count");
+    env.cleanup();
+}
+
+/// Fails to resolve while `fail` is set.
+#[derive(Default)]
+struct FlakyResolver {
+    fail: bool,
+    inner: FolderResolver,
+}
+
+impl ScopeResolver for FlakyResolver {
+    fn resolve(&mut self, cwd: &Path) -> Option<(String, ScopeInfo)> {
+        (!self.fail).then(|| self.inner.resolve(cwd)).flatten()
+    }
+}
+
+#[test]
+fn failed_scoping_is_retried_and_unscoped_files_wait_for_a_change() {
+    let env = Env::new("composition-v2-scoping-retry");
+    let now = base_now();
+    let cwd = env.cwd();
+    write_records(
+        &env.root.join("p/a.jsonl"),
+        &claude_turn(&cwd, now.date(), 1),
+    );
+    env.run(Source::Claude, now, None);
+    // A new file in another folder whose scoping fails once.
+    let other = env.workspace.join("other");
+    fs::create_dir_all(&other).unwrap();
+    let next = now + time::Duration::days(1);
+    let b = env.root.join("p/b.jsonl");
+    write_records(&b, &claude_turn(&other.to_string_lossy(), next.date(), 2));
+    // A new file that names no folder in its first 64 lines.
+    let filler = json!({"type":"user","sessionId":"n","message":{"content":"hi"}});
+    let mut records = vec![filler.clone(); 70];
+    records.extend(claude_turn(&cwd, next.date(), 3));
+    let nowhere = env.root.join("p/nowhere.jsonl");
+    write_records(&nowhere, &records);
+    let mut flaky = FlakyResolver {
+        fail: true,
+        ..Default::default()
+    };
+    let stats = env.run_with(Source::Claude, next, None, REPAIR_BYTES_PER_DAY, &mut flaky);
+    assert_eq!((stats.scan_errors, stats.unscoped), (1, 1));
+    // The head scan stops at 64 lines and its bytes are counted.
+    let head = 64 * body(std::slice::from_ref(&filler)).len() as u64;
+    assert!(stats.bytes_head >= head && stats.bytes_head < 2 * head);
+    flaky.fail = false;
+    let stats = env.run_with(
+        Source::Claude,
+        next + time::Duration::days(1),
+        None,
+        REPAIR_BYTES_PER_DAY,
+        &mut flaky,
+    );
+    assert_eq!(stats.bytes_new, fs::metadata(&b).unwrap().len());
+    assert_eq!(
+        stats.unscoped, 0,
+        "an unscoped file is scanned again only when it changes"
+    );
+    env.cleanup();
+}
+
+#[test]
+fn larger_copy_with_the_same_read_bytes_takes_over() {
+    let env = Env::new("composition-v2-larger-copy");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let first = env.root.join("a/s.jsonl");
+    write_records(&first, &claude_turn(&cwd, day, 1));
+    env.run(Source::Claude, now, None);
+    // The session goes on in a copy in another folder; the pinned copy
+    // stops growing.
+    let second = env.root.join("b/s.jsonl");
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    fs::copy(&first, &second).unwrap();
+    append_records(&second, &claude_turn(&cwd, day, 2));
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(stats.switched, 1);
+    assert_eq!(
+        stats.bytes_new,
+        body(&claude_turn(&cwd, day, 2)).len() as u64
+    );
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&second));
+    env.cleanup();
+}
+
+#[test]
+fn oldest_open_call_is_evicted_first() {
+    let mut state = ParseState::default();
+    let class = crate::composition_kinds::CallClass::unmatched;
+    assert!(!state.open_call("z-first".into(), class()));
+    for n in 0..MAX_OPEN_CALLS - 1 {
+        assert!(!state.open_call(format!("a{n:05}").into(), class()));
+    }
+    assert!(state.open_call("a-last".into(), class()));
+    assert!(!state.open_calls.contains_key("z-first"));
+    assert!(state.open_calls.contains_key("a00000"));
+    // The order survives a checkpoint.
+    let mut state = StoredParse::from_state(&state).into_state().unwrap();
+    assert!(state.open_call("b-next".into(), class()));
+    assert!(!state.open_calls.contains_key("a00000"));
+}
+
+#[test]
+fn sources_alternate_by_day() {
+    let first = |day: Day| harvest::source_order(day)[0].1;
+    assert_eq!(first(10), Source::Claude);
+    assert_eq!(first(11), Source::Codex);
+}
+
+#[test]
+fn a_re_read_that_changes_nothing_does_not_upload() {
+    let env = Env::new("composition-v2-same-content");
+    let now = base_now();
+    let cwd = env.cwd();
+    let path = env.root.join("p/s.jsonl");
+    let records = claude_turn(&cwd, now.date(), 1);
+    write_records(&path, &records);
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
+    assert_eq!(capture.payloads.len(), 1);
+    // Same records, other bytes: a full re-read with the same totals.
+    let spaced: String = records
+        .iter()
+        .map(|record| format!("{record} \n"))
+        .collect();
+    fs::write(&path, spaced).unwrap();
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(1),
+        Some(&mut capture),
+    );
+    assert!(stats.bytes_repair > 0);
+    assert_eq!((stats.upload_unchanged, capture.payloads.len()), (1, 1));
+    let scope = env.scope(Source::Claude);
+    let ack: super::upload::UploadAck = serde_json::from_slice(
+        &fs::read(super::upload::ack_path(
+            &env.state,
+            Source::Claude,
+            &scope.scope_id,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ack.generation, scope.generation);
+    env.cleanup();
+}
+
+#[test]
+fn a_v2_upload_never_carries_a_v1_kind() {
+    let env = Env::new("composition-v2-guard");
+    let now = base_now();
+    let cwd = env.cwd();
+    write_records(
+        &env.root.join("p/s.jsonl"),
+        &claude_read_turn(&cwd, now.date(), 1, "/w/src/a.rs"),
+    );
+    let mut capture = Capture::default();
+    // Fixture lines classify to kinds_version 1 ids until the v2 classifier
+    // lands: every such row is dropped and counted.
+    let stats = env.run(Source::Claude, now, Some(&mut capture));
+    assert!(stats.upload_dropped_non_v2 > 0);
+    let payload = &capture.payloads[0];
+    let v2: BTreeSet<&str> = Kind::V2.iter().map(|kind| kind.as_str()).collect();
+    let field = |list: &str, key: &str| -> Vec<String> {
+        payload[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row[key].as_str().unwrap().to_string())
+            .collect()
+    };
+    for (list, key) in [
+        ("daily_aggregates", "category"),
+        ("top_files", "category"),
+        ("sessions", "top_kind"),
+        ("parts", "kind"),
+        ("tools", "kind"),
+    ] {
+        for kind in field(list, key) {
+            assert!(v2.contains(kind.as_str()), "{list}.{key} = {kind}");
+        }
+    }
+    env.cleanup();
+}
+
+// The server's field rules for a kinds_version 2 upload, copied (not
+// imported) from its request schema: wire ids, part to kind, display-safe
+// text, lengths, caps and uniqueness.
+
+const SERVER_PART_KIND: [(&str, &str); 31] = [
+    ("shell_read", "files_read"),
+    ("file_tool", "files_read"),
+    ("skill_file", "files_read"),
+    ("instructions_later", "files_read"),
+    ("memory_file", "files_read"),
+    ("git", "command_output"),
+    ("search", "command_output"),
+    ("tests_builds", "command_output"),
+    ("other_commands", "command_output"),
+    ("app_control", "computer_use"),
+    ("screenshots", "computer_use"),
+    ("web", "web_and_browser"),
+    ("browser", "web_and_browser"),
+    ("addon", "other_tools"),
+    ("agent_reports", "other_tools"),
+    ("background_reports", "other_tools"),
+    ("built_in_other", "other_tools"),
+    ("tool_descriptions_later", "automatic_additions"),
+    ("lists_updated", "automatic_additions"),
+    ("instructions_reloaded", "automatic_additions"),
+    ("memory_reloaded", "automatic_additions"),
+    ("compaction_summary", "automatic_additions"),
+    ("reminders", "automatic_additions"),
+    ("environment", "automatic_additions"),
+    ("hook_output", "automatic_additions"),
+    ("files_mentioned", "automatic_additions"),
+    ("files_changed", "automatic_additions"),
+    ("start_not_measured", "automatic_additions"),
+    ("other", "automatic_additions"),
+    ("by_you", "your_prompts"),
+    ("by_agent", "your_prompts"),
+];
+
+const SERVER_KINDS: [&str; 7] = [
+    "files_read",
+    "command_output",
+    "computer_use",
+    "web_and_browser",
+    "other_tools",
+    "automatic_additions",
+    "your_prompts",
+];
+
+const SERVER_FORBIDDEN_TEXT: [&str; 15] = [
+    "/users/",
+    "\\users\\",
+    "/home/",
+    "\\home\\",
+    "file://",
+    "transcript_path",
+    "workspace_path",
+    "full_transcript_path",
+    "authorization:",
+    "bearer ",
+    "otdev_",
+    "otsi_",
+    "otsr_",
+    "otel_",
+    "otrelay_",
+];
+
+/// Display-safe text the server keeps as sent: normalized whitespace, no
+/// forbidden fragment, within `max` characters.
+fn server_text(field: &str, value: &Value, max: usize) -> Result<String, String> {
+    let text = value.as_str().ok_or(format!("{field}: not text"))?;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() || normalized != text {
+        return Err(format!("{field}: blank or not normalized: {text:?}"));
+    }
+    if text.chars().count() > max {
+        return Err(format!("{field}: longer than {max}"));
+    }
+    let lowered = text.to_lowercase();
+    if let Some(fragment) = SERVER_FORBIDDEN_TEXT.iter().find(|f| lowered.contains(**f)) {
+        return Err(format!("{field}: contains {fragment:?}"));
+    }
+    Ok(text.to_string())
+}
+
+fn ymd_date(text: &str) -> Option<Date> {
+    let mut parts = text.splitn(3, '-').map(str::parse::<u32>);
+    let (year, month, day) = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    Date::from_calendar_date(year as i32, Month::try_from(month as u8).ok()?, day as u8).ok()
+}
+
+fn check_server_rules(payload: &Value) -> Result<(), String> {
+    let kinds: BTreeSet<&str> = SERVER_KINDS.into_iter().collect();
+    let part_kind: BTreeMap<&str, &str> = SERVER_PART_KIND.into_iter().collect();
+    let date = |field: &str| -> Result<Date, String> {
+        let text = payload[field].as_str().ok_or(format!("{field} missing"))?;
+        ymd_date(text).ok_or(format!("{field}: {text}"))
+    };
+    if payload["kinds_version"] != 2 {
+        return Err("kinds_version".into());
+    }
+    let (start, end, floor) = (
+        date("window_start")?,
+        date("window_end")?,
+        date("retention_floor")?,
+    );
+    if end < start || (end - start).whole_days() + 1 > 92 || floor > end {
+        return Err("window".into());
+    }
+    for (field, min, max) in [("machine_id", 1, 128), ("workspace_hash", 16, 128)] {
+        let len = payload[field].as_str().map_or(0, str::len);
+        if len < min || len > max {
+            return Err(format!("{field} length"));
+        }
+    }
+    for (label, source) in [
+        ("workspace_label", "workspace_label_source"),
+        ("repository_label", "repository_label_source"),
+    ] {
+        if !payload[label].is_null() {
+            let text = server_text(label, &payload[label], 255)?;
+            if payload[source].is_null() {
+                return Err(format!("{source} missing"));
+            }
+            if label == "repository_label" && (text.contains('/') || text.contains("://")) {
+                return Err("repository_label".into());
+            }
+        }
+    }
+    let rows = |list: &str| payload[list].as_array().cloned().unwrap_or_default();
+    let mut seen = BTreeSet::new();
+    let daily = rows("daily_aggregates");
+    if daily.len() > 92 * 10 {
+        return Err("daily cap".into());
+    }
+    for row in &daily {
+        let day = ymd_date(row["date"].as_str().unwrap_or("")).ok_or("daily date")?;
+        let kind = row["category"].as_str().unwrap_or("");
+        if day < start
+            || day > end
+            || !kinds.contains(kind)
+            || !seen.insert((day, kind.to_string()))
+        {
+            return Err(format!("daily row {row}"));
+        }
+    }
+    let files = rows("top_files");
+    if files.len() > 100 {
+        return Err("files cap".into());
+    }
+    for row in &files {
+        let name = server_text("relative_path_or_name", &row["relative_path_or_name"], 512)?;
+        if name.starts_with(['/', '\\', '~'])
+            || name.contains(":/")
+            || name.contains(":\\")
+            || name.replace('\\', "/").split('/').any(|part| part == "..")
+        {
+            return Err(format!("file name {name}"));
+        }
+        let kind = row["category"].as_str().unwrap_or("");
+        if !kinds.contains(kind) {
+            return Err(format!("file kind {kind}"));
+        }
+        if let Some(part) = row["part"].as_str() {
+            if part_kind.get(part) != Some(&kind) {
+                return Err(format!("file part {part}"));
+            }
+        }
+    }
+    let sessions = rows("sessions");
+    if sessions.len() > 200 {
+        return Err("sessions cap".into());
+    }
+    for row in &sessions {
+        let hash = row["session_id_hash"].as_str().unwrap_or("");
+        let kind = row["top_kind"].as_str().unwrap_or("");
+        if hash.len() < 8
+            || hash.len() > 128
+            || !kinds.contains(kind)
+            || !row["top_category"].is_null()
+        {
+            return Err(format!("session {row}"));
+        }
+    }
+    let mut per_period: BTreeMap<(String, &str), usize> = BTreeMap::new();
+    let mut unique = BTreeSet::new();
+    let parts = rows("parts");
+    for row in &parts {
+        let (kind, part) = (
+            row["kind"].as_str().unwrap_or(""),
+            row["part"].as_str().unwrap_or(""),
+        );
+        if part_kind.get(part) != Some(&kind) {
+            return Err(format!("part {part} under {kind}"));
+        }
+        let server = if row["server"].is_null() {
+            None
+        } else {
+            if part != "addon" {
+                return Err("server off the addon part".into());
+            }
+            Some(server_text("part server", &row["server"], 64)?)
+        };
+        let window = row["window"].as_str().unwrap_or("").to_string();
+        if !unique.insert((window.clone(), part.to_string(), server)) {
+            return Err(format!("repeated part {row}"));
+        }
+        *per_period.entry((window, "parts")).or_default() += 1;
+    }
+    for row in &rows("tools") {
+        let label = server_text("tool label", &row["label"], 64)?;
+        let server = if row["server"].is_null() {
+            None
+        } else {
+            let server = server_text("tool server", &row["server"], 64)?;
+            if !label.starts_with(&format!("{server}/")) {
+                return Err(format!("tool label {label} without its server"));
+            }
+            Some(server)
+        };
+        if !kinds.contains(row["kind"].as_str().unwrap_or("")) {
+            return Err(format!("tool kind {row}"));
+        }
+        let window = row["window"].as_str().unwrap_or("").to_string();
+        if !unique.insert((window.clone(), label, server)) {
+            return Err(format!("repeated tool {row}"));
+        }
+        *per_period.entry((window, "tools")).or_default() += 1;
+    }
+    for ((window, list), count) in per_period {
+        let cap = if list == "parts" { 48 } else { 20 };
+        if count > cap || !["30d", "all"].contains(&window.as_str()) {
+            return Err(format!("{list} in {window}: {count}"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_maximal_upload_meets_the_server_field_rules() {
+    use super::aggregate::{Bucket, FileKey, FileTotals, Slot, ToolTotals};
+    use super::scope::{SavedIdentity, Scope};
+    use crate::composition_kinds::Part;
+    // Every Rust part maps to the server's kind.
+    let server_parts: BTreeMap<&str, &str> = SERVER_PART_KIND.into_iter().collect();
+    for part in ALL_PARTS.iter().filter(|part| part.kind().is_some()) {
+        assert_eq!(
+            server_parts.get(part.as_str()).copied(),
+            part.kind().map(|kind| kind.as_str()),
+            "{}",
+            part.as_str()
+        );
+    }
+    let now = base_now();
+    let today = day_of(now.date());
+    let window = Window::ending(today);
+    let mut scope = Scope::new(
+        "scope",
+        ScopeInfo {
+            workspace_hash: "f".repeat(64),
+            workspace_path: "/w/repo".into(),
+            identity: SavedIdentity {
+                repository_hash: Some("e".repeat(64)),
+                repository_label: Some("repo".into()),
+                repository_label_source: Some("git_root".into()),
+                repository_identity_source: Some("git_common_dir".into()),
+                workspace_kind: Some("linked_worktree".into()),
+                workspace_label: Some("repo".into()),
+            },
+            common_dir: None,
+        },
+    );
+    let bucket = |tokens: u64| Bucket {
+        events: 1,
+        tokens,
+        residency: tokens,
+        images: 0,
+    };
+    let agg = &mut scope.agg;
+    for day in window.floor..=today {
+        for kind in Kind::V2.iter().copied().chain([Kind::ShellOutput]) {
+            agg.days.insert((day, kind), bucket(10));
+        }
+        agg.day_generation.insert(day, 1);
+    }
+    let mut slots: Vec<(Slot, u64)> = ALL_PARTS
+        .iter()
+        .filter_map(|part| Some((Slot::plain(part.kind()?, *part), 10)))
+        .collect();
+    slots.push((Slot::plain(Kind::ShellOutput, Part::Unsplit), 10));
+    let long_server = "s".repeat(70);
+    let servers: Vec<String> = (0..14)
+        .map(|n| format!("server{n}"))
+        .chain(["otel_collector", &long_server, "two  spaces", "two spaces"].map(str::to_string))
+        .collect();
+    for (n, server) in servers.iter().enumerate() {
+        let slot = Slot {
+            kind: Kind::OtherTools,
+            part: Part::Addon,
+            server: Some(server.as_str().into()),
+        };
+        slots.push((slot, 10_000 - n as u64));
+    }
+    for (slot, tokens) in slots {
+        agg.day_parts.insert((today, slot.clone()), bucket(tokens));
+        agg.all_parts.insert(slot, bucket(tokens));
+    }
+    let long_label = format!("server1/{}", "t".repeat(80));
+    let long_server_tool = format!("{long_server}/tool");
+    let tools: Vec<String> = (0..30)
+        .map(|n| format!("tool{n}"))
+        .chain(
+            [
+                "otel_server/tool",
+                "/Users/me/tool",
+                "bearer abc",
+                long_label.as_str(),
+                long_server_tool.as_str(),
+                "two  spaces/tool",
+                "two spaces/tool",
+            ]
+            .map(str::to_string),
+        )
+        .collect();
+    for (n, tool) in tools.iter().enumerate() {
+        let totals = ToolTotals {
+            calls: 1,
+            // The special labels rank first, so the top 20 holds them.
+            tokens: if n >= 30 {
+                2_000 + n as u64
+            } else {
+                1_000 - n as u64
+            },
+            sessions: 1,
+            kind: Some(Kind::CommandOutput),
+        };
+        agg.day_tools.insert((today, tool.as_str().into()), totals);
+        agg.all_tools.insert(tool.as_str().into(), totals);
+    }
+    agg.all_tools.insert(
+        "legacy".into(),
+        ToolTotals {
+            calls: 1,
+            tokens: 5_000,
+            sessions: 1,
+            kind: Some(Kind::ShellOutput),
+        },
+    );
+    for n in 0..150 {
+        let key = FileKey {
+            path: format!("/w/repo/src/file{n}.rs").into(),
+            kind: Kind::FilesRead,
+            part: Part::FileTool,
+        };
+        let totals = FileTotals {
+            events: 1,
+            tokens: 1_000 + n,
+            last: Some(now.unix_timestamp()),
+        };
+        agg.day_files.insert((today, key.clone()), totals);
+        agg.all_files.insert(key, totals);
+    }
+    for n in 0..300u64 {
+        let kind = if n == 0 {
+            Kind::ShellOutput
+        } else {
+            Kind::FilesRead
+        };
+        let totals = agg
+            .sessions
+            .entry(format!("session-{n}").into())
+            .or_default();
+        totals.started = Some(now.unix_timestamp());
+        totals.days.insert(today, BTreeMap::from([(kind, 10 + n)]));
+    }
+    let mut capture = Capture::default();
+    let target = UploadTarget {
+        uploader: &mut capture,
+        machine_id: "machine-test",
+        destination: "device|machine|api",
+        labels_enabled: true,
+    };
+    let (request, dropped) =
+        super::upload::build_request(&scope, Source::Claude, &target, now, window, 0);
+    let payload = serde_json::to_value(&request).unwrap();
+    check_server_rules(&payload).unwrap();
+    // Unsafe and long servers join "other add-ons"; unsafe tools drop.
+    let part_servers: BTreeSet<&str> = payload["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["server"].as_str())
+        .collect();
+    assert!(part_servers.contains("two spaces"));
+    assert!(!part_servers.contains("otel_collector"));
+    assert!(!part_servers.iter().any(|server| server.len() > 64));
+    assert!(payload["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["part"] == "addon" && row["server"].is_null()));
+    let labels: BTreeSet<&str> = payload["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["label"].as_str())
+        .collect();
+    assert!(labels.contains(long_label.chars().take(64).collect::<String>().as_str()));
+    for gone in ["otel_server/tool", "/Users/me/tool", "bearer abc", "legacy"] {
+        assert!(!labels.contains(gone), "{gone}");
+    }
+    assert!(!labels.iter().any(|label| label.starts_with(&long_server)));
+    // 92 daily rows, the unsplit part (twice), the legacy tool and session.
+    assert_eq!(dropped.non_v2, 92 + 2 + 1 + 1);
+    // Servers (otel and long, per period) and tools (four per period).
+    assert_eq!(dropped.unsafe_text, 2 * 2 + 4 * 2);
 }

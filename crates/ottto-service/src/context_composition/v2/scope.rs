@@ -6,7 +6,7 @@
 //! recomputed, so worktrees coming and going never change it. Each file is
 //! pinned to the scope it was first read in, even after its folder is gone.
 
-use super::aggregate::{Aggregate, Day, StoredAggregate};
+use super::aggregate::{Aggregate, StoredAggregate};
 use super::checkpoint::{read_json, write_json, Checkpoint};
 use super::file::Source;
 use super::STATE_SCHEMA;
@@ -37,6 +37,10 @@ pub(super) struct ScopeInfo {
     /// Local only (labels and repo-relative file names); never uploaded.
     pub(super) workspace_path: String,
     pub(super) identity: SavedIdentity,
+    /// The repository's shared git folder (local only): its linked
+    /// worktrees are mapped to this scope while they exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) common_dir: Option<String>,
 }
 
 pub(super) trait ScopeResolver {
@@ -67,12 +71,13 @@ impl ScopeResolver for GitScopeResolver {
                         workspace_kind: identity.workspace_kind,
                         workspace_label: workspace_label(cwd),
                     },
+                    common_dir: None,
                 },
             ));
         };
         // The main checkout, when it still exists and is the same
         // repository; else the folder itself.
-        let (path, identity) = repository_main_checkout(cwd)
+        let main = repository_main_checkout(cwd)
             .filter(|main| main.is_dir())
             .map(|main| {
                 let main_identity = resolve_repository_identity(&main, true);
@@ -80,8 +85,14 @@ impl ScopeResolver for GitScopeResolver {
             })
             .filter(|(_, main_identity)| {
                 main_identity.repository_hash.as_deref() == Some(repository_hash.as_str())
-            })
-            .unwrap_or_else(|| (cwd.to_path_buf(), identity));
+            });
+        // The usual layout keeps the shared git folder in the main checkout.
+        let common_dir = main
+            .as_ref()
+            .map(|(main, _)| main.join(".git"))
+            .filter(|dir| dir.is_dir())
+            .map(|dir| dir.to_string_lossy().into_owned());
+        let (path, identity) = main.unwrap_or_else(|| (cwd.to_path_buf(), identity));
         let text = path.to_string_lossy().into_owned();
         Some((
             repository_hash,
@@ -99,6 +110,7 @@ impl ScopeResolver for GitScopeResolver {
                     workspace_kind: identity.workspace_kind,
                 },
                 workspace_path: text,
+                common_dir,
             },
         ))
     }
@@ -112,10 +124,8 @@ pub(super) struct StoredScope {
     scope_id: String,
     info: ScopeInfo,
     generation: u64,
-    next_file_id: u32,
     files: BTreeMap<String, Checkpoint>,
     aggregate: StoredAggregate,
-    ownership_logs: Vec<(Day, u64)>,
 }
 
 /// The same layout, borrowed for writing.
@@ -126,10 +136,8 @@ struct StoredScopeRef<'a> {
     scope_id: &'a str,
     info: &'a ScopeInfo,
     generation: u64,
-    next_file_id: u32,
     files: &'a BTreeMap<String, Checkpoint>,
     aggregate: StoredAggregate,
-    ownership_logs: Vec<(Day, u64)>,
 }
 
 /// One scope's state in memory.
@@ -139,10 +147,8 @@ pub(super) struct Scope {
     pub(super) info: ScopeInfo,
     /// Bumped by each commit that changed totals.
     pub(super) generation: u64,
-    pub(super) next_file_id: u32,
     pub(super) files: BTreeMap<String, Checkpoint>,
     pub(super) agg: Aggregate,
-    pub(super) ownership_logs: BTreeMap<Day, u64>,
 }
 
 impl Scope {
@@ -151,17 +157,79 @@ impl Scope {
             scope_id: scope_id.to_string(),
             info,
             generation: 0,
-            next_file_id: 1,
             files: BTreeMap::new(),
             agg: Aggregate::default(),
-            ownership_logs: BTreeMap::new(),
         }
     }
+}
 
-    pub(super) fn allocate_file_id(&mut self) -> u32 {
-        let id = self.next_file_id;
-        self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
-        id
+/// Linked worktrees are capped per repository, so a runaway folder never
+/// grows the pins.
+const MAX_WORKTREES: usize = 4096;
+
+/// The linked worktrees a shared git folder knows, read from its
+/// `worktrees/*/gitdir` files (no git process).
+pub(super) fn linked_worktrees(common_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) else {
+        return Vec::new();
+    };
+    let mut worktrees = Vec::new();
+    for entry in entries.flatten().take(MAX_WORKTREES) {
+        let mut text = String::new();
+        let read = std::fs::File::open(entry.path().join("gitdir")).and_then(|file| {
+            std::io::Read::read_to_string(&mut std::io::Read::take(file, 4096), &mut text)
+        });
+        if read.is_err() {
+            continue;
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let gitdir = Path::new(text);
+        let gitdir = if gitdir.is_absolute() {
+            gitdir.to_path_buf()
+        } else {
+            lexical_join(&entry.path(), gitdir)
+        };
+        if let Some(worktree) = gitdir.parent() {
+            worktrees.push(worktree.to_path_buf());
+        }
+    }
+    worktrees
+}
+
+/// `base` joined with a relative `path`, with `.` and `..` resolved by name.
+fn lexical_join(base: &Path, path: &Path) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// A folder that no longer exists, written with its nearest existing parent
+/// resolved (symbolic links followed), the way git records worktree paths.
+/// `None` when that changes nothing.
+pub(super) fn resolved_missing(path: &Path) -> Option<PathBuf> {
+    let mut rest = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(resolved) = current.canonicalize() {
+            let mut out = resolved;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return (out != path).then_some(out);
+        }
+        rest.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
     }
 }
 
@@ -173,12 +241,6 @@ pub(super) fn scope_path(state_dir: &Path, source: Source, scope_id: &str) -> Pa
     state_dir
         .join("scopes")
         .join(format!("{}.json", scope_file_stem(source, scope_id)))
-}
-
-pub(super) fn ownership_dir(state_dir: &Path, source: Source, scope_id: &str) -> PathBuf {
-    state_dir
-        .join("uuids")
-        .join(scope_file_stem(source, scope_id))
 }
 
 /// Load a scope. `Err` = the file exists but cannot be used (bad state).
@@ -197,10 +259,8 @@ pub(super) fn load_scope(path: &Path, source: Source, scope_id: &str) -> Result<
         scope_id: stored.scope_id,
         info: stored.info,
         generation: stored.generation,
-        next_file_id: stored.next_file_id.max(1),
         files: stored.files,
         agg,
-        ownership_logs: stored.ownership_logs.into_iter().collect(),
     }))
 }
 
@@ -214,14 +274,8 @@ pub(super) fn save_scope(path: &Path, source: Source, scope: &Scope) -> std::io:
             scope_id: &scope.scope_id,
             info: &scope.info,
             generation: scope.generation,
-            next_file_id: scope.next_file_id,
             files: &scope.files,
             aggregate: StoredAggregate::from_aggregate(&scope.agg),
-            ownership_logs: scope
-                .ownership_logs
-                .iter()
-                .map(|(day, length)| (*day, *length))
-                .collect(),
         },
     )
 }

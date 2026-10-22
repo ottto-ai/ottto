@@ -10,14 +10,14 @@ use super::super::codex::codex_mcp_result_text_and_images;
 use super::super::measure::{basename_stem, estimate_text_tokens, python_json_dumps};
 use super::super::IMAGE_NOMINAL_TOKENS;
 use super::aggregate::{Day, Slot};
-use super::checkpoint::{CopiedMode, OpenCall, ParseState, SavedItem};
+use super::checkpoint::{CopiedMode, ParseState, SavedItem};
 use super::decode::{
     codex_never_counted, content_chars_and_images, decode_view, line_timestamp,
     output_chars_and_images, tokens_for_chars, BlockView, CodexLine, CodexPayload, ItemView,
     Joined, Raw, SessionMetaView,
 };
 use super::file::LineSink;
-use super::{MAX_ITEMS_PER_CALL, MAX_OPEN_CALLS};
+use super::MAX_ITEMS_PER_CALL;
 use crate::composition_kinds::{
     self as kinds, Agent, Author, CallClass, ContentLabel, InnerItem, Kind, LineCtx, ParsedCommand,
     Request1, Verdict,
@@ -199,18 +199,10 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
                 });
                 let input = call_input(payload_type, &payload);
                 let class = kinds::codex_call(&ctx, name.as_deref(), &input);
-                if state.open_calls.len() >= MAX_OPEN_CALLS {
-                    out.stats.dropped_calls += 1;
-                    state.open_calls.pop_first();
-                }
                 let id: Box<str> = call_id.as_ref().into();
-                state.open_calls.insert(
-                    id.clone(),
-                    OpenCall {
-                        class,
-                        items: Vec::new(),
-                    },
-                );
+                if state.open_call(id.clone(), class) {
+                    out.stats.dropped_calls += 1;
+                }
                 state.last_call = Some(id);
             }
             // Copied turns were requests of the session that wrote them.

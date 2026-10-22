@@ -14,7 +14,7 @@
 
 use super::aggregate::{Day, Slot, StoredContribution};
 use super::scope::ScopeInfo;
-use super::STATE_SCHEMA;
+use super::{MAX_OPEN_CALLS, STATE_SCHEMA};
 use crate::composition_kinds::{CallClass, Kind, Part, ToolKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -102,6 +102,26 @@ pub(super) struct Pin {
     #[serde(default)]
     pub(super) done: bool,
     pub(super) last_seen: Day,
+    /// When the pins first saw the file (unix seconds).
+    #[serde(default)]
+    pub(super) first_seen: i64,
+    /// Its first lines name no folder that exists or is known: scanned again
+    /// only when the file changes.
+    #[serde(default)]
+    pub(super) unscoped: bool,
+    /// Reads that failed in a row; the second one quarantines the file.
+    #[serde(default)]
+    pub(super) failures: u8,
+    /// Failed twice in a row: never read again (counted), until another file
+    /// takes its place.
+    #[serde(default)]
+    pub(super) quarantined: bool,
+    /// Fingerprints of the bytes before `start` (as the checkpoint's), so a
+    /// larger copy of the same transcript can take over.
+    #[serde(default)]
+    pub(super) head: Fingerprint,
+    #[serde(default)]
+    pub(super) tail: Fingerprint,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -113,13 +133,19 @@ pub(super) struct Index {
     /// Start of the previous run, unix seconds: files born later are new.
     pub(super) last_scan_started: Option<i64>,
     pub(super) files: BTreeMap<String, Pin>,
-    /// Folder -> scope id.
+    /// Folder -> scope id: folders resolved by a read, and the linked
+    /// worktrees of each repository scope (recorded hourly while they exist,
+    /// so a transcript whose worktree is gone by its first read still finds
+    /// its scope).
     pub(super) cwd_scopes: BTreeMap<String, String>,
     /// Each scope as first seen (its upload key never changes).
     pub(super) scope_info: BTreeMap<String, ScopeInfo>,
     /// Each scope's last committed generation, for uploads of scopes not
     /// read in a run.
     pub(super) scope_generations: BTreeMap<String, u64>,
+    /// The last day a pin named each scope. A scope no pin named for
+    /// `KEEP_DAYS` is no longer refreshed.
+    pub(super) scope_last_pinned: BTreeMap<String, Day>,
 }
 
 impl Index {
@@ -158,9 +184,8 @@ pub(super) struct Checkpoint {
     pub(super) path: String,
     pub(super) dev: u64,
     pub(super) ino: u64,
-    /// Tags this file's record ids in the ownership logs.
-    pub(super) file_id: u32,
-    /// Birth time (unix seconds), for creation-order processing.
+    /// Birth time, or first sight when earlier (unix seconds). Claude
+    /// records dated well before it are copied history.
     pub(super) created: i64,
     pub(super) offset: u64,
     /// Stopped inside a line over the line guard.
@@ -235,6 +260,8 @@ pub(super) enum SavedItem {
 pub(super) struct OpenCall {
     pub(super) class: CallClass,
     pub(super) items: Vec<SavedItem>,
+    /// Order of arrival, so the oldest open call is the one evicted.
+    pub(super) seq: u64,
 }
 
 /// The parse state at a checkpoint's offset.
@@ -246,6 +273,8 @@ pub(super) struct ParseState {
     pub(super) agent_author: bool,
     pub(super) last_assistant: LastAssistant,
     pub(super) open_calls: BTreeMap<Box<str>, OpenCall>,
+    /// The next open call's arrival number.
+    pub(super) call_seq: u64,
     /// The most recent call still open (inner items attach to it).
     pub(super) last_call: Option<Box<str>>,
     /// Tokens of lines entered since the last compaction, per day and slot.
@@ -274,6 +303,34 @@ impl ParseState {
         }
     }
 
+    /// Open a call; at `MAX_OPEN_CALLS` the oldest open call is dropped
+    /// first. Returns whether one was dropped.
+    pub(super) fn open_call(&mut self, id: Box<str>, class: CallClass) -> bool {
+        let mut evicted = false;
+        if self.open_calls.len() >= MAX_OPEN_CALLS && !self.open_calls.contains_key(&id) {
+            let oldest = self
+                .open_calls
+                .iter()
+                .min_by_key(|(_, call)| call.seq)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                self.open_calls.remove(&oldest);
+                evicted = true;
+            }
+        }
+        let seq = self.call_seq;
+        self.call_seq += 1;
+        self.open_calls.insert(
+            id,
+            OpenCall {
+                class,
+                items: Vec::new(),
+                seq,
+            },
+        );
+        evicted
+    }
+
     pub(super) fn note_ts(&mut self, ts: Option<i64>) {
         if let Some(ts) = ts {
             self.min_ts = Some(self.min_ts.map_or(ts, |min| min.min(ts)));
@@ -294,6 +351,7 @@ pub(super) struct StoredCall {
     tool: String,
     file: Option<String>,
     items: Vec<SavedItem>,
+    seq: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -304,6 +362,7 @@ pub(super) struct StoredParse {
     /// Absent before any assistant message; `Some(None)` after one with no id.
     last_assistant: Option<Option<String>>,
     open_calls: Vec<StoredCall>,
+    call_seq: u64,
     last_call: Option<String>,
     open: Vec<(Day, String, String, Option<String>, u64)>,
     copied: CopiedMode,
@@ -333,8 +392,10 @@ impl StoredParse {
                     tool: call.class.tool.as_str().to_string(),
                     file: call.class.file.as_deref().map(str::to_string),
                     items: call.items.clone(),
+                    seq: call.seq,
                 })
                 .collect(),
+            call_seq: state.call_seq,
             last_call: state.last_call.as_deref().map(str::to_string),
             open: state
                 .open
@@ -376,6 +437,7 @@ impl StoredParse {
                 OpenCall {
                     class: class(&call.kind, &call.part, &call.tool, call.file)?,
                     items: call.items,
+                    seq: call.seq,
                 },
             );
         }
@@ -401,6 +463,7 @@ impl StoredParse {
                 Some(id) => LastAssistant::Id(id.map(Into::into)),
             },
             open_calls,
+            call_seq: self.call_seq,
             last_call: self.last_call.map(Into::into),
             open,
             copied: self.copied,
@@ -440,12 +503,24 @@ pub(super) fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
 
 /// Birth time (unix seconds), else modification time.
 pub(super) fn birth_secs(metadata: &fs::Metadata) -> i64 {
+    born_secs(metadata)
+        .or_else(|| {
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_secs() as i64)
+        })
+        .unwrap_or(0)
+}
+
+/// Birth time (unix seconds) where the file system records one.
+pub(super) fn born_secs(metadata: &fs::Metadata) -> Option<i64> {
     metadata
         .created()
-        .or_else(|_| metadata.modified())
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_secs() as i64)
+        .map(|since| since.as_secs() as i64)
 }
 
 /// Fingerprint of `len` bytes at `at` (fewer when the file is shorter).
@@ -495,8 +570,18 @@ pub(super) fn fingerprints(
 
 /// Whether the file still holds the bytes a checkpoint read.
 pub(super) fn fingerprints_match(file: &File, checkpoint: &Checkpoint) -> bool {
-    let head = fingerprint(file, 0, u64::from(checkpoint.head.len));
-    let tail_len = u64::from(checkpoint.tail.len);
-    let tail = fingerprint(file, checkpoint.offset.saturating_sub(tail_len), tail_len);
-    matches!((head, tail), (Ok(head), Ok(tail)) if head == checkpoint.head && tail == checkpoint.tail)
+    prefix_matches(file, checkpoint.offset, checkpoint.head, checkpoint.tail)
+}
+
+/// Whether the file's bytes before `offset` have these fingerprints.
+pub(super) fn prefix_matches(
+    file: &File,
+    offset: u64,
+    expected_head: Fingerprint,
+    expected_tail: Fingerprint,
+) -> bool {
+    let head = fingerprint(file, 0, u64::from(expected_head.len));
+    let tail_len = u64::from(expected_tail.len);
+    let tail = fingerprint(file, offset.saturating_sub(tail_len), tail_len);
+    matches!((head, tail), (Ok(head), Ok(tail)) if head == expected_head && tail == expected_tail)
 }

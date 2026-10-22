@@ -6,20 +6,19 @@
 //! (`super::super::claude`); the differences are deliberate and listed in
 //! the module tests: a result's call is looked up among calls seen earlier
 //! in the file (and used once), the session id is fixed by the first lines,
-//! an undated line counts on the day it is read, and the client's
-//! prompt-snapshot and deferred-tools records are never counted.
+//! an undated line counts on the day it is read, the client's
+//! prompt-snapshot and deferred-tools records are never counted, and copied
+//! history is found by its timestamp, not its record id.
 
 use super::super::measure::{basename, basename_stem, serialize_attachment};
 use super::super::IMAGE_NOMINAL_TOKENS;
 use super::aggregate::{Day, Slot};
-use super::checkpoint::{LastAssistant, OpenCall, ParseState};
+use super::checkpoint::{LastAssistant, ParseState};
 use super::decode::{
     claude_never_counted, claude_never_counted_type, content_chars_and_images, decode_view,
     line_timestamp, tokens_for_chars, BlockView, ClaudeLine, Joined, MessageView, Raw,
 };
 use super::file::LineSink;
-use super::ownership::stable_hash;
-use super::MAX_OPEN_CALLS;
 use crate::composition_kinds::{
     self as kinds, Agent, Author, CallClass, ClaudeAttachment, LineCtx, Request1, Verdict,
 };
@@ -95,17 +94,13 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     let line_type = view.kind.str();
     let line_type = line_type.as_deref().unwrap_or("");
 
-    let copied = match (view.uuid.str(), out.ownership.as_deref_mut()) {
-        (Some(uuid), Some(ownership)) => {
-            let hash = stable_hash(uuid.as_bytes());
-            let copied = ownership.counted_elsewhere(hash, out.file_id);
-            if !copied {
-                ownership.add(hash, out.file_id);
-            }
-            copied
-        }
-        _ => false,
-    };
+    // A resume or fork copies earlier records with their original
+    // timestamps; a record dated before this transcript was born entered
+    // context where it was first written.
+    let copied = matches!(
+        (ts_secs, out.copied_before),
+        (Some(ts), Some(before)) if ts < before
+    );
     if copied {
         state.copied_lines += 1;
     } else {
@@ -182,17 +177,9 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         let name = block.name.str();
         let input = block.input.value().unwrap_or(Value::Null);
         let class = kinds::claude_tool(&ctx, name.as_deref().unwrap_or(""), &input);
-        if state.open_calls.len() >= MAX_OPEN_CALLS {
+        if state.open_call(id.as_ref().into(), class) {
             out.stats.dropped_calls += 1;
-            state.open_calls.pop_first();
         }
-        state.open_calls.insert(
-            id.as_ref().into(),
-            OpenCall {
-                class,
-                items: Vec::new(),
-            },
-        );
     }
 
     if line_type == "attachment" {

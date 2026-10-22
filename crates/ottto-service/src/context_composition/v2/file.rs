@@ -4,7 +4,6 @@
 
 use super::aggregate::{Day, Entered, Sink, Slot};
 use super::checkpoint::ParseState;
-use super::ownership::Ownership;
 use super::reader::{LineEvent, LineReader};
 use super::{claude, codex};
 use crate::composition_kinds::Kind;
@@ -39,12 +38,11 @@ pub(super) struct LineStats {
     pub(super) dropped_items: u64,
 }
 
-/// What line handlers write to: the scope's totals, the record ownership
-/// (Claude) and the counters.
+/// What line handlers write to: the scope's totals and the counters.
 pub(super) struct LineSink<'a> {
     pub(super) sink: Sink<'a>,
-    pub(super) ownership: Option<&'a mut Ownership>,
-    pub(super) file_id: u32,
+    /// Claude records dated before this (unix seconds) are copied history.
+    pub(super) copied_before: Option<i64>,
     /// Day for lines without a timestamp: the day they are read.
     pub(super) fallback_day: Day,
     pub(super) stats: &'a mut LineStats,
@@ -113,6 +111,12 @@ pub(super) struct ReadEnd {
     pub(super) buffer_bytes: usize,
 }
 
+/// A read that failed part way, and the bytes it read before failing.
+#[derive(Debug)]
+pub(super) struct ReadError {
+    pub(super) bytes: u64,
+}
+
 /// Read complete lines from `offset` to `end` (the length at open).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn read_lines(
@@ -124,8 +128,9 @@ pub(super) fn read_lines(
     state: &mut ParseState,
     out: &mut LineSink,
     deadline: Instant,
-) -> std::io::Result<ReadEnd> {
-    let mut reader = LineReader::open(file, offset, end, skipping)?;
+) -> Result<ReadEnd, ReadError> {
+    let mut reader =
+        LineReader::open(file, offset, end, skipping).map_err(|_| ReadError { bytes: 0 })?;
     let mut cut = false;
     let mut count = 0u64;
     let mut buffer_bytes = 0usize;
@@ -135,7 +140,15 @@ pub(super) fn read_lines(
             break;
         }
         count += 1;
-        match reader.next_event()? {
+        let event = match reader.next_event() {
+            Ok(event) => event,
+            Err(_) => {
+                return Err(ReadError {
+                    bytes: reader.position() - offset,
+                })
+            }
+        };
+        match event {
             None => break,
             Some(LineEvent::TooLong) => out.stats.too_long += 1,
             Some(LineEvent::Line(line)) => match source {
@@ -158,13 +171,25 @@ const HEAD_LINES: usize = 64;
 const HEAD_BYTES: u64 = 8 * 1024 * 1024;
 const HEAD_LINE_GUARD: usize = 4 * 1024 * 1024;
 
-/// The first complete lines of a transcript (bounded), for its identity.
-pub(super) fn head_lines(path: &Path) -> std::io::Result<Vec<String>> {
+/// The first complete lines of a transcript (at most `HEAD_LINES` within
+/// `HEAD_BYTES`), each handed to `each` until it returns false, and the bytes
+/// read.
+fn head_scan(
+    path: &Path,
+    deadline: Option<Instant>,
+    mut each: impl FnMut(&str) -> bool,
+) -> std::io::Result<u64> {
     let file = File::open(path)?;
     let len = file.metadata()?.len();
     let mut reader = LineReader::with_guard(file, 0, len.min(HEAD_BYTES), false, HEAD_LINE_GUARD)?;
-    let mut lines = Vec::new();
-    while lines.len() < HEAD_LINES {
+    let mut lines = 0usize;
+    while lines < HEAD_LINES {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "run wall cap reached",
+            ));
+        }
         match reader.next_event()? {
             None => break,
             Some(LineEvent::TooLong) => continue,
@@ -172,19 +197,61 @@ pub(super) fn head_lines(path: &Path) -> std::io::Result<Vec<String>> {
                 if let Ok(text) = std::str::from_utf8(line) {
                     let text = text.trim();
                     if !text.is_empty() {
-                        lines.push(text.to_string());
+                        lines += 1;
+                        if !each(text) {
+                            break;
+                        }
                     }
                 }
             }
         }
     }
-    Ok(lines)
+    Ok(reader.position())
+}
+
+/// The first complete lines of a transcript (bounded), for its identity,
+/// and the bytes read.
+pub(super) fn head_lines(path: &Path) -> std::io::Result<(Vec<String>, u64)> {
+    let mut lines = Vec::new();
+    let bytes = head_scan(path, None, |text| {
+        lines.push(text.to_string());
+        true
+    })?;
+    Ok((lines, bytes))
+}
+
+/// The folders a transcript's first lines name (bounded like
+/// `head_lines`), in order and without repeats, and the bytes read.
+pub(super) fn head_cwds(path: &Path, deadline: Instant) -> std::io::Result<(Vec<String>, u64)> {
+    let mut cwds: Vec<String> = Vec::new();
+    let bytes = head_scan(path, Some(deadline), |text| {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return true;
+        };
+        let cwd = value
+            .get("cwd")
+            .or_else(|| value.get("payload").and_then(|payload| payload.get("cwd")))
+            .or_else(|| {
+                value
+                    .get("turn_context")
+                    .and_then(|context| context.get("payload"))
+                    .and_then(|payload| payload.get("cwd"))
+            })
+            .and_then(serde_json::Value::as_str);
+        if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
+            if !cwds.iter().any(|seen| seen == cwd) {
+                cwds.push(cwd.to_string());
+            }
+        }
+        true
+    })?;
+    Ok((cwds, bytes))
 }
 
 /// A fresh parse state for a transcript first read at `offset` (0 for a
-/// full read).
-pub(super) fn new_parse_state(source: Source, path: &Path, offset: u64) -> ParseState {
-    let lines = head_lines(path).unwrap_or_default();
+/// full read), and the head bytes read to build it.
+pub(super) fn new_parse_state(source: Source, path: &Path, offset: u64) -> (ParseState, u64) {
+    let (lines, bytes) = head_lines(path).unwrap_or_default();
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     let mut state = ParseState::default();
     match source {
@@ -205,5 +272,5 @@ pub(super) fn new_parse_state(source: Source, path: &Path, offset: u64) -> Parse
             }
         }
     }
-    state
+    (state, bytes)
 }
