@@ -5670,6 +5670,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             index
                 .claude_usage_family_witnesses
                 .insert(root_session_id.clone(), family.witness.clone());
+            index.rebind_retry_pending_claude_authority(root_session_id);
         }
     } else if census_complete {
         // Report availability is not evidence that a previously proven
@@ -6201,20 +6202,19 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .claude_usage_authority_quarantine
             .get(root_session_id)
             .is_some_and(|record| record.proof_correction.is_some());
-        let corrected_witness = correction_failed
-            .then(|| {
-                index
-                    .claude_usage_family_witnesses
-                    .get(root_session_id)
-                    .map(claude_usage_family_witness_fingerprint)
-            })
-            .flatten();
-        let Some(proven_witness_fingerprint) = corrected_witness
-            .as_ref()
-            .or_else(|| witness_fingerprints_before.get(root_session_id))
-        else {
+        let current_witness = index.claude_usage_family_witnesses.get(root_session_id);
+        let proven_witness_fingerprint = current_witness
+            .map(claude_usage_family_witness_fingerprint)
+            .or_else(|| witness_fingerprints_before.get(root_session_id).cloned());
+        let Some(proven_witness_fingerprint) = proven_witness_fingerprint.as_ref() else {
             continue;
         };
+        // A prior digest cannot bind a new record after census pruning. Keep
+        // the page's demotion hold; load contains any existing orphan record.
+        // No-witness policy remains pending the source owner's ruling.
+        if current_witness.is_none() {
+            continue;
+        }
         let mut member_source_file_fingerprints = index
             .files
             .iter()
@@ -30734,24 +30734,27 @@ impl ScanIndex {
                     && index
                         .quarantined_snapshot_fingerprints
                         .values()
-                        .all(snapshot_quarantine_deadline_is_bounded)
-                    && index
-                        .claude_usage_authority_quarantine
-                        .values()
-                        .all(claude_usage_authority_deadline_is_bounded)
-                    && index.claude_usage_authority_quarantine.iter().all(
-                        |(root_session_id, quarantine)| {
-                            index
-                                .claude_usage_family_witnesses
-                                .get(root_session_id)
-                                .is_some_and(|witness| {
-                                    claude_usage_family_witness_fingerprint(witness)
-                                        == quarantine.proven_witness_fingerprint
-                                })
-                        },
-                    ) =>
+                        .all(snapshot_quarantine_deadline_is_bounded) =>
             {
                 if index.canonicalize_codex_identity_keys() {
+                    let before = index.claude_usage_authority_quarantine.len();
+                    let witnesses = &index.claude_usage_family_witnesses;
+                    let pending = &mut index.claude_usage_family_pending;
+                    index
+                        .claude_usage_authority_quarantine
+                        .retain(|root, record| {
+                            let bound = witnesses.get(root).is_some_and(|witness| {
+                                claude_usage_authority_preserves_pending(record, witness)
+                            });
+                            if !bound {
+                                pending.remove(root);
+                            }
+                            bound
+                        });
+                    let dropped = before - index.claude_usage_authority_quarantine.len();
+                    if dropped > 0 {
+                        eprintln!("local snapshot scan index dropped {dropped} unbound Claude usage authority record(s); their families re-prove or re-demote on the next pass");
+                    }
                     Ok(index)
                 } else {
                     quarantine_invalid_scan_index(path)
@@ -30777,6 +30780,25 @@ impl ScanIndex {
         self.save_internal(path, Some(cap))
     }
     fn save_internal(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
+        let unbound = self
+            .claude_usage_authority_quarantine
+            .iter()
+            .filter(|(root, record)| {
+                !self
+                    .claude_usage_family_witnesses
+                    .get(*root)
+                    .is_some_and(|witness| {
+                        claude_usage_authority_preserves_pending(record, witness)
+                    })
+            })
+            .count();
+        if unbound > 0 {
+            eprintln!("local snapshot scan index saving {unbound} unbound Claude usage authority record(s)");
+        }
+        debug_assert_eq!(
+            unbound, 0,
+            "every Claude authority record must be bound on save"
+        );
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;

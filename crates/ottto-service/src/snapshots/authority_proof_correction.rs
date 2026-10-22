@@ -106,6 +106,22 @@ impl ScanIndex {
         });
     }
 
+    // RetryPending members were held, never uploaded under the old proof.
+    // Reproof changes only their binding; no correction grant or retry reset.
+    fn rebind_retry_pending_claude_authority(&mut self, root: &str) {
+        let Some(witness) = self.claude_usage_family_witnesses.get(root) else {
+            return;
+        };
+        let Some(record) = self.claude_usage_authority_quarantine.get_mut(root) else {
+            return;
+        };
+        if record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            && claude_usage_authority_deadline_is_bounded(record)
+        {
+            record.proven_witness_fingerprint = claude_usage_family_witness_fingerprint(witness);
+        }
+    }
+
     // M1: only the existing complete healthy census can retire absent grants.
     fn retire_absent_claude_proof_corrections(
         &mut self,
@@ -266,9 +282,24 @@ impl ScanIndex {
                         .insert(advance.member, previous);
                 }
                 None => {
-                    record
-                        .member_source_file_fingerprints
-                        .remove(&advance.member);
+                    if record.proof_correction.as_ref().is_some_and(|correction| {
+                        correction.owed_member_ids.contains(&advance.member)
+                    }) {
+                        // No prior pair exists to restore. Preserve the debt
+                        // with a domain-separated nonmatching revision: the
+                        // reverted empty facts cannot certify completion.
+                        record.member_source_file_fingerprints.insert(
+                            advance.member,
+                            sha256_hex(&[
+                                "claude_empty_map_restore_missing_previous:v1",
+                                &advance.revision,
+                            ]),
+                        );
+                    } else {
+                        record
+                            .member_source_file_fingerprints
+                            .remove(&advance.member);
+                    }
                 }
             }
         }

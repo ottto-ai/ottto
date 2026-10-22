@@ -404,9 +404,9 @@ fn apc_load_value(scratch: &Path, name: &str, value: &Value) -> (ScanIndex, bool
 /// T5/R7 strict load: the proof, record digest and retained witness are one
 /// binding; owed is non-empty and a subset of the recorded members; contract
 /// v2 exactly when a correction is present, on a terminal record. Every other
-/// shape quarantines the whole index, as a misbound record did before.
+/// shape drops only the authority record and its pending proof state.
 #[test]
-fn invalid_correction_states_fail_the_whole_index_closed() {
+fn invalid_correction_states_drop_only_the_affected_authority_record() {
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-load");
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
@@ -489,10 +489,16 @@ fn invalid_correction_states_fail_the_whole_index_closed() {
         let mut value = valid.clone();
         mutate(&mut value["claude_usage_authority_quarantine"][APC_ROOT]);
         let (loaded, quarantined) = apc_load_value(&scratch, name, &value);
-        assert!(quarantined, "{name}: the whole index is quarantined");
+        assert!(!quarantined, "{name}: the rest of the index survives");
+        assert_eq!(loaded.generation, index.generation, "{name}");
+        assert_eq!(
+            serde_json::to_value(&loaded.files).unwrap(),
+            serde_json::to_value(&index.files).unwrap(),
+            "{name}"
+        );
         assert!(
-            loaded.files.is_empty(),
-            "{name}: rebuilt from a fresh index"
+            !loaded.claude_usage_family_pending.contains_key(APC_ROOT),
+            "{name}"
         );
         assert!(
             loaded.claude_usage_authority_quarantine.is_empty(),
