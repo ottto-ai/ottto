@@ -2591,6 +2591,27 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
     assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
 }
 
+#[test]
+fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
+    let scratch = crate::test_scratch::ScratchDir::new("authority-load-no-rebuild-stop");
+    let index = apc_unbound_fixture();
+    let path = scratch.join("index.json");
+    fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+    let marker = ReemissionExclusions::seen_marker_path(&scratch);
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(marker, "").unwrap();
+    let loaded =
+        ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &scratch).unwrap();
+    assert!(path.exists(), "the index was kept, not quarantined");
+    assert_eq!(loaded.generation, 29);
+    assert_eq!(
+        serde_json::to_value(loaded).unwrap(),
+        apc_without_unbound_record(&index)
+    );
+    assert!(!claude_reemission_stop_latched());
+    assert_eq!(claude_reemission_stop_reason(), "none");
+}
+
 /// SOURCE F1: an existing orphan fails closed for its one record at save, in
 /// debug and release alike; the save succeeds and the result loads as is.
 #[test]

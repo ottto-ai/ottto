@@ -19676,11 +19676,7 @@ impl OwnedSourceScan {
                         body_witness_adoption_held_no_list,
                         u8::from(index.claude_reemission_exclusions.is_invalid()),
                         index.claude_reemission_exclusions.state().as_str(),
-                        if claude_reemission_stop_latched() {
-                            "evidence_bound_withheld"
-                        } else {
-                            "none"
-                        },
+                        claude_reemission_stop_reason(),
                         claude_reemission_stop_withheld_folds()
                     );
                 }
@@ -29927,7 +29923,7 @@ fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> 
     value
 }
 
-// SOURCE Amendments 7 and 10: the stop latch of the one-time Claude re-read.
+// SOURCE Amendments 7, 10 and 11: the stop latch of the one-time Claude re-read.
 // The first Claude fold whose counts report `resource_withheld()` (a family
 // over its evidence bound, or a full remembered-veto table) latches the stop:
 // Claude adoption then takes no adoption-only file (budget 0, reason
@@ -29935,9 +29931,34 @@ fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> 
 // does not clear it; a restart is the human reset. In memory only, process-wide
 // across Claude destinations. One local alarm when it sets, at most one
 // reminder an hour while it holds.
+// An empty generation-0 index loaded while the exclusion seen-marker exists
+// also latches it, including a quarantined index or a new pairing destination.
+#[derive(Debug, Clone, Copy)]
+enum ClaudeReemissionStopCause {
+    EvidenceBound,
+    IndexRebuild,
+}
+
+impl ClaudeReemissionStopCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EvidenceBound => "evidence_bound",
+            Self::IndexRebuild => "index_rebuild",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::EvidenceBound => "evidence_bound_withheld",
+            Self::IndexRebuild => "index_rebuild_withheld",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ClaudeReemissionStop {
     latched: bool,
+    cause: ClaudeReemissionStopCause,
     /// Folds in this process that withheld for a resource limit.
     withheld_folds: u64,
     last_alarm: Option<std::time::Instant>,
@@ -29947,6 +29968,7 @@ impl ClaudeReemissionStop {
     const fn new() -> Self {
         Self {
             latched: false,
+            cause: ClaudeReemissionStopCause::EvidenceBound,
             withheld_folds: 0,
             last_alarm: None,
         }
@@ -29960,6 +29982,7 @@ const CLAUDE_REEMISSION_STOP_MAX_ROOT_REFS: usize = 16;
 
 #[derive(Serialize)]
 struct ClaudeReemissionStopAlarm {
+    cause: &'static str,
     withheld_evidence_bound_session_count: usize,
     remembered_veto_overflowed: bool,
     withheld_folds: u64,
@@ -30006,6 +30029,22 @@ fn note_claude_reemission_stop_at(
     over_bound_roots: &BTreeSet<String>,
     now: std::time::Instant,
 ) {
+    note_claude_reemission_stop_with_cause_at(
+        counts,
+        over_bound_roots,
+        counts
+            .resource_withheld()
+            .then_some(ClaudeReemissionStopCause::EvidenceBound),
+        now,
+    );
+}
+
+fn note_claude_reemission_stop_with_cause_at(
+    counts: &ClaudeContextFileBirthCounts,
+    over_bound_roots: &BTreeSet<String>,
+    cause: Option<ClaudeReemissionStopCause>,
+    now: std::time::Instant,
+) {
     let withheld = counts.resource_withheld();
     let alarm = with_claude_reemission_stop(|stop| {
         if withheld {
@@ -30022,21 +30061,23 @@ fn note_claude_reemission_stop_at(
                 return None;
             }
             true
-        } else if withheld {
+        } else if let Some(cause) = cause {
             stop.latched = true;
+            stop.cause = cause;
             false
         } else {
             return None;
         };
         stop.last_alarm = Some(now);
-        Some((reminder, stop.withheld_folds))
+        Some((reminder, stop.withheld_folds, stop.cause))
     });
-    let Some((reminder, withheld_folds)) = alarm else {
+    let Some((reminder, withheld_folds, cause)) = alarm else {
         return;
     };
     crate::local_resource_diagnostics::claude_reemission_stop_latched(
         reminder,
         &ClaudeReemissionStopAlarm {
+            cause: cause.as_str(),
             withheld_evidence_bound_session_count: counts
                 .total
                 .withheld_evidence_bound_session_count,
@@ -30054,6 +30095,16 @@ fn note_claude_reemission_stop_at(
 
 fn claude_reemission_stop_latched() -> bool {
     with_claude_reemission_stop(|stop| stop.latched)
+}
+
+fn claude_reemission_stop_reason() -> &'static str {
+    with_claude_reemission_stop(|stop| {
+        if stop.latched {
+            stop.cause.reason()
+        } else {
+            "none"
+        }
+    })
 }
 
 fn claude_reemission_stop_withheld_folds() -> u64 {
@@ -31229,6 +31280,31 @@ impl ScanIndex {
                 record.upload_body_witness.as_deref() != Some(body_witness)
                     || self.quarantine_requires_retry(fingerprint)
             })
+    }
+
+    /// Source-aware daemon load, before replay preparation can save/advance
+    /// the generation. The durable exclusion marker is the active signal:
+    /// there is no separate durable adoption-complete marker. A quarantine
+    /// rebuild returns the same empty generation-0 index as an absent file.
+    pub(crate) fn load_for_snapshot_source(
+        path: &Path,
+        source: SnapshotSource,
+        support_dir: &Path,
+    ) -> Result<Self> {
+        let index = Self::load(path)?;
+        if source == SnapshotSource::ClaudeCode
+            && index.generation == 0
+            && index.files.is_empty()
+            && fs::symlink_metadata(ReemissionExclusions::seen_marker_path(support_dir)).is_ok()
+        {
+            note_claude_reemission_stop_with_cause_at(
+                &ClaudeContextFileBirthCounts::default(),
+                &BTreeSet::new(),
+                Some(ClaudeReemissionStopCause::IndexRebuild),
+                std::time::Instant::now(),
+            );
+        }
+        Ok(index)
     }
 
     pub fn load(path: &Path) -> Result<Self> {
