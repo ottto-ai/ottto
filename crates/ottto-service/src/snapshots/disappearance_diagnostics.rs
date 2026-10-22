@@ -56,7 +56,7 @@ impl Site {
 
 /// What a vanished Claude census member's retirement dropped with its index
 /// entry. Content-free and process-only, like the site split.
-#[cfg_attr(not(test), allow(dead_code))] // tests-first: wired by the fix commit
+#[allow(dead_code)] // tests-first: wired by the fix commit
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Vanished {
     /// Its unverified audit debt (SOURCE N2).
@@ -191,7 +191,7 @@ pub(super) fn not_found_removal(source: SnapshotSource, site: Site) {
 }
 
 /// The page merge dropped `vanished` with a vanished Claude member's entry.
-#[cfg_attr(not(test), allow(dead_code))] // tests-first: wired by the fix commit
+#[allow(dead_code)] // tests-first: wired by the fix commit
 pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
     TOTALS[source_index(source)].record_vanished(vanished);
     #[cfg(test)]

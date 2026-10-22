@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 749,
-  "content_sha256": "76f6421744133fed5a24cf67c1e9afd4e0801a67fd8fe01e12f5eafafd679064",
+  "content_sha256": "3253368b6ebb5f80246d414b93c382039e2e07915efeca490156e180d8f0a0ca",
   "files": [
     {
       "executable": false,
@@ -1567,8 +1567,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/disappearance_diagnostics.rs",
-      "sha256": "8e61142934c75360f960e92dce9b1de2081fcb43edb0b58d6821b067c553d7cf",
-      "size_bytes": 53795
+      "sha256": "7f6d45ad4ab05d412ea493ec562eb26a8e5781dc327584f26d769446fa1090b8",
+      "size_bytes": 53753
     },
     {
       "executable": false,
@@ -5246,7 +5246,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T00:39:07+00:00",
+  "generated_at": "2026-10-22T00:54:41+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 750,
   "public_roots": [
@@ -5285,5 +5285,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e7f4a143c4fa21e5f7b2e0356c5978bb20b3effa"
+  "source_commit": "273c1d31df3a6a83d24564b11ade21f4e05e1479"
 }
