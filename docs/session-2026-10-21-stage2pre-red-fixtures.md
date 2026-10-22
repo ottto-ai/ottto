@@ -53,3 +53,31 @@ exactly the appended bytes.
 - Unchanged-mode growth (SP-10) keeps main's behavior.
 
 Tests ran only in CI; no local build or test was run.
+
+## FE: the Claude twin (2026-10-22)
+
+FE caps Claude in-page `Full` and `Tail` reads at the frozen length and
+publishes the sealed prefix `[0, s)` as a certificate only: no checkpoint,
+copy, cache insert or audit credit; the prepared debt is re-staged and the
+index keeps the opened stamp. SOURCE gave a qualified YES; c22's ACK of the
+production seam is pending, so this round is test-only.
+
+- New child module
+  `stage2pre_in_page_tail_tests/fe_claude_in_page_read_tests.rs`, registered
+  with one line at the end of `stage2pre_in_page_tail_tests.rs`. Every test is
+  prefixed `fe_claude_`. The Codex rows are unchanged.
+- No new seam: the rows reuse `with_after_reader_eof`.
+- RED: SP-1c, SP-1c', SP-2a-c, SP-2c-c, SP-D2c (Full and Tail), the Claude
+  SP-5 residual (SOURCE FE2), SP-8c-c, and the SOURCE and census rows
+  (prefix D1 record unverified and replaced, no v1 or witness from a prefix,
+  prefix in pending, in-window re-read gives `member_changed`, proof fails
+  closed while API rows exceed the prefix).
+- GREEN: SP-2b-c (Tail and Full), SP-3a/4/5a/5b/5c-c, SP-7a/7b-c, SP-11-c
+  (Codex Full, Pi), `s` below the last committed size publishes nothing, a D1
+  record control, a proof control, and one diagnostic of main.
+- Diagnostic finding: main's authority fold accepts trace-owned API rows the
+  transcript lacks as auxiliary calls (`transcript ⊆ assigned`), so a body
+  missing requests still mints v1. FE's "proof fails closed" cannot rest on
+  unequal request sets; the SOURCE rows need an explicit guard.
+- Stage2-pre's `sp11_claude_in_page_tail_with_append_keeps_main_failure` pins
+  the Claude D1 failure FE replaces; the FE production change must update it.

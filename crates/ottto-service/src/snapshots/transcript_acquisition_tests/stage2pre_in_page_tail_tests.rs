@@ -1243,3 +1243,5 @@ fn sp11_claude_in_page_tail_with_append_keeps_main_failure() {
     );
     assert_refused(&base.cache, &base.key, &tail, &seen, OPEN_READ, "SP-11");
 }
+
+mod fe_claude_in_page_read_tests;

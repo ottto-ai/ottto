@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 766,
-  "content_sha256": "f7d933ffb508f67a4c07865aead561331924caf9d57a6ba3463613212cbd4b56",
+  "candidate_file_count": 767,
+  "content_sha256": "6b0f4f5c52cbfd7facf8b7aa3ae85bec4f3e4f893348d3f5dcbffc3ccc379cb8",
   "files": [
     {
       "executable": false,
@@ -1777,8 +1777,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests.rs",
-      "sha256": "1387c588693a20cb6d266e2aa6b17347c2f5d998fc68dc1bfc2f57e56bbe56b7",
-      "size_bytes": 44113
+      "sha256": "21da463f1cd5d15a684f14aba3a2d2e41e3c173c2a85128b5f72ae335dd4ce5e",
+      "size_bytes": 44148
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests/fe_claude_in_page_read_tests.rs",
+      "sha256": "53eecc3c359e8985100d7a125cb4a477faac4ac5e434a2bc8d6afb650cd8fe29",
+      "size_bytes": 41005
     },
     {
       "executable": false,
@@ -3583,8 +3590,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-stage2pre-red-fixtures.md",
-      "sha256": "43faeb9ec8888bbb45a2ad3f36eb57a678332a8e92881b0afad9cac5afe138d9",
-      "size_bytes": 2448
+      "sha256": "05f88c7b57adf7496c0cbe94abaf25cb4aee1a3a4e93c01d2f11db2f8b8e38ef",
+      "size_bytes": 4132
     },
     {
       "executable": false,
@@ -5367,7 +5374,7 @@
   ],
   "generated_at": "2026-10-22T07:26:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 767,
+  "output_file_count": 768,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
