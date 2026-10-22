@@ -1,17 +1,18 @@
 //! P1 per-request money ledger (shadow only): who owns each Claude request id.
 //!
-//! The ledger has no resident index. Its records are #664's census
-//! (`claude_request_census`): transcript records keyed by file and telemetry
-//! records keyed `otel:<sha256 of the root session id>`. A page sorts its own
-//! request hashes once and intersects them with every record's sorted hashes,
-//! which is O(total hashes · log page hashes) work per page and no memory
-//! kept between pages (design v2 §2.3 planned a SoA owner index; P1 measures
-//! the scan first, see the PR body).
+//! The ledger has no resident owner index. Its holders are #664's census
+//! records: the scan index's transcript records (keyed by file) and the
+//! money ledger's own records (`claude_request_money::store`): telemetry
+//! `otel:<sha256 of the root session id>` and message-only `mh:<file key>`.
+//! A page sorts its own request hashes once and intersects them with every
+//! record's sorted hashes, which is O(total hashes · log page hashes) work
+//! per page under the page deadline and no memory kept between pages
+//! (design v2 §2.3 planned a SoA owner index; P1 measures the scan first).
 //!
 //! The classifier is design v2 §3, one verdict per key:
 //! - two or more telemetry roots: the root whose telemetry was first seen
-//!   earliest (its first event time, then its telemetry key) wins; every
-//!   other root's copies are explicit two-owner losers;
+//!   earliest (its first event time, then its session id) wins; every other
+//!   root's copies are explicit two-owner losers;
 //! - one telemetry root R: a copy outside R's family is removed; inside it,
 //!   the only holder, else the member R's trace names, else the earliest
 //!   first-seen birth, then the member id;
@@ -28,19 +29,21 @@
 //! Nothing here feeds a live decision: verdicts only shape the shadow body.
 
 use super::claude_request_census::{
-    is_ledger_key, ClaudeRequestCensus, ClaudeRequestCensusRecord,
-    MAX_CLAUDE_REQUEST_CENSUS_HASHES, TELEMETRY_KEY_PREFIX,
+    message_key, ClaudeRequestCensus, ClaudeRequestCensusRecord, MAX_CLAUDE_REQUEST_CENSUS_HASHES,
+    MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES, MESSAGE_KEY_PREFIX, TELEMETRY_KEY_PREFIX,
 };
+use super::claude_request_money::store::ClaudeLedger;
 use super::{claude_index_path_family_member, ScanIndex};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
+use std::time::Instant;
 
 /// Holders kept per hash; more makes the id undecided, never a guess.
 pub(crate) const MAX_HOLDERS_PER_HASH: usize = 16;
 
-/// Telemetry pressure retirement starts at 90% of the shared hash budget and
-/// retires the oldest telemetry records until 80%.
+/// Telemetry pressure retirement starts at 90% of the ledger's hash or
+/// serialized budget and retires the oldest telemetry records until 80%.
 const PRESSURE_START_PERCENT: usize = 90;
 const PRESSURE_TARGET_PERCENT: usize = 80;
 
@@ -86,7 +89,8 @@ pub(crate) enum ClaudeUndecidedBy {
     MessageUnknown,
     /// The telemetry sweep has not read past the unit's clock.
     TelemetryUnswept,
-    /// Two telemetry roots and one's first event time is unknown.
+    /// Two telemetry roots and one's first event time (or, at a tie, its
+    /// session id) is unknown.
     TelemetryOrder,
     /// Several in-family holders and the root's trace was not read.
     TraceUnavailable,
@@ -107,7 +111,8 @@ pub(crate) enum ClaudeRequestVerdict {
 #[derive(Debug, Default)]
 pub(crate) struct ClaudeRequestHolders<'a> {
     transcript: BTreeMap<u64, Vec<&'a str>>,
-    /// Message-only (`M`) ids by the transcript records' `mh`.
+    /// Message-only (`M`) ids by the ledger's `mh:` records of the current
+    /// transcript revisions, as transcript keys.
     message: BTreeMap<u64, Vec<&'a str>>,
     telemetry: BTreeMap<u64, Vec<&'a str>>,
     overflow: BTreeSet<u64>,
@@ -115,16 +120,18 @@ pub(crate) struct ClaudeRequestHolders<'a> {
     pub(crate) compared: u64,
 }
 
-/// Bytes `scan_holders` may allocate for `page_hashes` hashes, charged by the
-/// shadow's admission before the scan runs.
-pub(crate) fn holders_bound(page_hashes: usize) -> usize {
-    // Three map entries (node share) plus a full holder vector each.
-    page_hashes.saturating_mul(3 * (64 + MAX_HOLDERS_PER_HASH * 16))
-}
+/// What one holder adds to the holder maps, charged before it is added: a
+/// map entry's node share and its vector's growth.
+const HOLD_BYTES: usize = 128;
 
 /// The hashes present in both sorted lists, probing the shorter list into
 /// the longer one.
-fn intersect(left: &[u64], right: &[u64], compared: &mut u64, mut found: impl FnMut(u64)) {
+fn intersect(
+    left: &[u64],
+    right: &[u64],
+    compared: &mut u64,
+    mut found: impl FnMut(u64) -> bool,
+) -> bool {
     let (short, long) = if left.len() <= right.len() {
         (left, right)
     } else {
@@ -132,66 +139,121 @@ fn intersect(left: &[u64], right: &[u64], compared: &mut u64, mut found: impl Fn
     };
     for hash in short {
         *compared += 1;
-        if long.binary_search(hash).is_ok() {
-            found(*hash);
+        if long.binary_search(hash).is_ok() && !found(*hash) {
+            return false;
         }
     }
+    true
 }
 
+/// Add `key` as a holder of `hash`; false when its memory is not admitted.
 fn hold<'a>(
     map: &mut BTreeMap<u64, Vec<&'a str>>,
     overflow: &mut BTreeSet<u64>,
+    charge: &mut dyn FnMut(usize) -> bool,
     hash: u64,
     key: &'a str,
-) {
+) -> bool {
+    if !charge(HOLD_BYTES) {
+        return false;
+    }
     let list = map.entry(hash).or_default();
     if list.len() < MAX_HOLDERS_PER_HASH {
         list.push(key);
     } else {
         overflow.insert(hash);
     }
+    true
 }
 
 /// Intersect the page's sorted unique request and message-only hashes with
-/// every record. A retired record holds no hashes and so is never a holder;
-/// birth stubs are no records.
+/// every transcript record (`index`) and every telemetry and message-only
+/// record (`ledger`). A retired record holds no hashes and so is never a
+/// holder; birth stubs are no records; a `mh:` record of another revision
+/// than its file's record is no holder. Every holder's memory is admitted
+/// by `charge` first. None when the deadline passed or memory was refused.
 pub(crate) fn scan_holders<'a>(
-    census: &'a ClaudeRequestCensus,
+    index: &'a ClaudeRequestCensus,
+    ledger: &'a ClaudeRequestCensus,
     page_hashes: &[u64],
     page_message_hashes: &[u64],
-) -> ClaudeRequestHolders<'a> {
+    deadline: Instant,
+    charge: &mut dyn FnMut(usize) -> bool,
+) -> Option<ClaudeRequestHolders<'a>> {
     let mut holders = ClaudeRequestHolders::default();
-    for (key, record) in census.records() {
-        let telemetry = key.starts_with(TELEMETRY_KEY_PREFIX);
-        if !telemetry && is_ledger_key(key) {
-            continue;
-        }
-        if !telemetry {
-            if let Some(hashes) = record.message_hashes() {
-                let ClaudeRequestHolders {
-                    message,
-                    overflow,
-                    compared,
-                    ..
-                } = &mut holders;
-                intersect(hashes, page_message_hashes, compared, |hash| {
-                    hold(message, overflow, hash, key)
-                });
-            }
-        }
+    let late = || Instant::now() >= deadline;
+    for (key, record) in index.records() {
         let ClaudeRequestHolders {
             transcript,
-            telemetry: telemetry_map,
             overflow,
             compared,
             ..
         } = &mut holders;
-        let map = if telemetry { telemetry_map } else { transcript };
-        intersect(record.request_hashes(), page_hashes, compared, |hash| {
-            hold(map, overflow, hash, key)
-        });
+        if late()
+            || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
+                hold(transcript, overflow, &mut *charge, hash, key)
+            })
+        {
+            return None;
+        }
     }
-    holders
+    for (key, record) in ledger.records_with_prefix(TELEMETRY_KEY_PREFIX) {
+        let ClaudeRequestHolders {
+            telemetry,
+            overflow,
+            compared,
+            ..
+        } = &mut holders;
+        if late()
+            || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
+                hold(telemetry, overflow, &mut *charge, hash, key)
+            })
+        {
+            return None;
+        }
+    }
+    if !page_message_hashes.is_empty() {
+        for (key, record) in ledger.records_with_prefix(MESSAGE_KEY_PREFIX) {
+            if late() {
+                return None;
+            }
+            let file_key = &key[MESSAGE_KEY_PREFIX.len()..];
+            if !index
+                .get(file_key)
+                .is_some_and(|file| file.same_fingerprint(record))
+            {
+                continue;
+            }
+            let ClaudeRequestHolders {
+                message,
+                overflow,
+                compared,
+                ..
+            } = &mut holders;
+            if !intersect(
+                record.request_hashes(),
+                page_message_hashes,
+                compared,
+                |hash| hold(message, overflow, &mut *charge, hash, file_key),
+            ) {
+                return None;
+            }
+        }
+    }
+    Some(holders)
+}
+
+/// The ledger knows the message-only ids of `key`'s current transcript
+/// record: its `mh:` record is of the same revision.
+pub(crate) fn message_known(
+    index: &ClaudeRequestCensus,
+    ledger: &ClaudeRequestCensus,
+    key: &str,
+) -> bool {
+    index
+        .get(key)
+        .zip(ledger.get(&message_key(key)))
+        .is_some_and(|(file, messages)| file.same_fingerprint(messages))
 }
 
 impl<'a> ClaudeRequestHolders<'a> {
@@ -279,7 +341,7 @@ impl ClaudeScopeDebt {
 #[derive(Debug, Clone, Copy, Default)]
 struct FileDebt(ClaudeScopeDebt);
 
-fn file_debt(index: &ScanIndex, key: &str) -> FileDebt {
+fn file_debt(index: &ScanIndex, ledger: &ClaudeRequestCensus, key: &str) -> FileDebt {
     let mut debt = ClaudeScopeDebt::default();
     let Some(entry) = index.files.get(key) else {
         return FileDebt(debt);
@@ -307,7 +369,7 @@ fn file_debt(index: &ScanIndex, key: &str) -> FileDebt {
             } else if record.unverified_or_twin() {
                 debt.unverified = 1;
             }
-            if record.message_hashes().is_none() {
+            if !message_known(&index.claude_request_census, ledger, key) {
                 debt.message_unknown = 1;
             }
         }
@@ -337,14 +399,20 @@ pub(crate) fn scope_bound(files: usize, key_bytes: usize) -> usize {
 }
 
 impl ClaudeLedgerScope {
-    /// The groups and families of the page's `roots` and `groups`.
+    /// The groups and families of the page's `roots` and `groups`. None when
+    /// the deadline passed.
     pub(crate) fn build(
         index: &ScanIndex,
+        ledger: &ClaudeRequestCensus,
         page_groups: &BTreeSet<&str>,
         page_roots: &BTreeSet<&str>,
-    ) -> Self {
+        deadline: Instant,
+    ) -> Option<Self> {
         let mut scope = Self::default();
         for key in index.files.keys() {
+            if Instant::now() >= deadline {
+                return None;
+            }
             if index.confirmed_empty_files.contains(key) {
                 continue;
             }
@@ -357,7 +425,7 @@ impl ClaudeLedgerScope {
             if !in_group && !in_family {
                 continue;
             }
-            let FileDebt(debt) = file_debt(index, key);
+            let FileDebt(debt) = file_debt(index, ledger, key);
             scope.debt.add(&debt);
             if let Some(group) = group.filter(|_| in_group) {
                 scope
@@ -370,7 +438,7 @@ impl ClaudeLedgerScope {
                 scope.families.entry(root).or_default().add(&debt);
             }
         }
-        scope
+        Some(scope)
     }
 
     /// The group of `own_key` blocks a negative claim (its own file aside).
@@ -402,14 +470,19 @@ impl ClaudeLedgerScope {
 /// Per page: what the classifier knows about telemetry and traces.
 pub(crate) struct ClaudeClassifyContext<'a, 'b> {
     pub(crate) index: &'a ScanIndex,
+    /// The money ledger's records (telemetry, message-only).
+    pub(crate) ledger: &'a ClaudeRequestCensus,
     pub(crate) holders: &'b ClaudeRequestHolders<'a>,
     pub(crate) scope: &'b ClaudeLedgerScope,
     /// Page roots' own telemetry claims (rows read this page), by hash:
-    /// telemetry keys beside the census ones.
-    pub(crate) page_claims: &'b BTreeMap<u64, Vec<String>>,
-    /// First event time (unix seconds) per telemetry key; 0 or missing is
-    /// unknown.
+    /// telemetry keys beside the ledger's records.
+    pub(crate) page_claims: &'b BTreeMap<u64, Vec<&'b str>>,
+    /// First event time (unix seconds) of the page roots' rows, per
+    /// telemetry key (beside the ledger records' own).
     pub(crate) first_event: &'b BTreeMap<String, u64>,
+    /// The page roots' session ids, per telemetry key (beside the session
+    /// the ledger records' facts name).
+    pub(crate) sessions: &'b BTreeMap<String, String>,
     /// Per root whose trace was read: request hash -> trace-named member.
     pub(crate) trace: &'b BTreeMap<String, BTreeMap<u64, String>>,
     /// The telemetry sweep read everything written before this time.
@@ -424,13 +497,7 @@ impl ClaudeClassifyContext<'_, '_> {
             .telemetry_holders(hash)
             .iter()
             .copied()
-            .chain(
-                self.page_claims
-                    .get(&hash)
-                    .into_iter()
-                    .flatten()
-                    .map(String::as_str),
-            )
+            .chain(self.page_claims.get(&hash).into_iter().flatten().copied())
             .collect::<Vec<_>>();
         claimants.sort_unstable();
         claimants.dedup();
@@ -438,18 +505,56 @@ impl ClaudeClassifyContext<'_, '_> {
     }
 
     /// The winning telemetry key among `claimants` (two or more): the
-    /// earliest first event, then the key. None when any time is unknown.
+    /// earliest first event, then the smallest root session id (design v2
+    /// §3). None when any time is unknown, or a tied root's session is.
     pub(crate) fn two_owner_winner<'c>(&self, claimants: &[&'c str]) -> Option<&'c str> {
         let mut ranked = Vec::with_capacity(claimants.len());
         for key in claimants {
-            let first = self
-                .first_event
-                .get(*key)
-                .copied()
-                .filter(|time| *time > 0)?;
-            ranked.push((first, *key));
+            ranked.push((self.first_event_of(key)?, *key));
         }
-        ranked.into_iter().min().map(|(_, key)| key)
+        let earliest = ranked.iter().map(|(first, _)| *first).min()?;
+        let mut tied = ranked
+            .into_iter()
+            .filter(|(first, _)| *first == earliest)
+            .map(|(_, key)| key);
+        let first = tied.next()?;
+        let mut winner = (self.session_of(first)?, first);
+        for key in tied {
+            let session = self.session_of(key)?;
+            if session == winner.0 {
+                // One session spelled into two keys cannot be ordered.
+                return None;
+            }
+            winner = winner.min((session, key));
+        }
+        Some(winner.1)
+    }
+
+    /// The earliest known event time of a telemetry key's rows (the
+    /// ledger's record and this page's rows); None when unknown.
+    fn first_event_of(&self, key: &str) -> Option<u64> {
+        let stored = self
+            .ledger
+            .get(key)
+            .and_then(ClaudeRequestCensusRecord::tail)
+            .map(|tail| tail.first_event_unix)
+            .filter(|time| *time > 0);
+        let page = self.first_event.get(key).copied().filter(|time| *time > 0);
+        match (stored, page) {
+            (Some(stored), Some(page)) => Some(stored.min(page)),
+            (stored, page) => stored.or(page),
+        }
+    }
+
+    /// The root session id of a telemetry key: a page root's, else the one
+    /// its ledger record's facts name.
+    fn session_of(&self, key: &str) -> Option<String> {
+        if let Some(session) = self.sessions.get(key) {
+            return Some(session.clone());
+        }
+        let blob = self.ledger.get(key)?.facts()?;
+        let header = super::claude_request_money::facts::ClaudeFacts::open(blob)?.header;
+        (!header.session.is_empty()).then_some(header.session)
     }
 
     fn telemetry_swept(&self, clock: u64) -> bool {
@@ -491,7 +596,7 @@ impl ClaudeClassifyContext<'_, '_> {
             if holders.len() == 1 {
                 return ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned);
             }
-            return match birth_policy(self.index, &holders) {
+            return match birth_policy(self.index, self.ledger, &holders) {
                 Ok(winner) if winner == own_key => {
                     ClaudeRequestVerdict::Counted(ClaudeCountedBy::PolicyOwned)
                 }
@@ -550,7 +655,7 @@ impl ClaudeClassifyContext<'_, '_> {
                 };
             }
         }
-        match birth_policy(self.index, &in_family) {
+        match birth_policy(self.index, self.ledger, &in_family) {
             Ok(winner) if winner == own_key => {
                 ClaudeRequestVerdict::Counted(ClaudeCountedBy::PolicyOwned)
             }
@@ -572,7 +677,7 @@ impl ClaudeClassifyContext<'_, '_> {
         if holders.len() == 1 {
             return ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned);
         }
-        match birth_policy(self.index, &holders) {
+        match birth_policy(self.index, self.ledger, &holders) {
             Ok(winner) if winner == own_key => {
                 ClaudeRequestVerdict::Counted(ClaudeCountedBy::PolicyOwned)
             }
@@ -594,15 +699,23 @@ fn holders_with<'k>(holders: &[&'k str], own_key: &'k str) -> Vec<&'k str> {
 /// Several holders: the earliest first-seen birth wins, then the member id
 /// (then the key, for path twins). Every holder must be current at its
 /// entry's fingerprint, and births all known or all unknown.
-fn birth_policy<'k>(index: &ScanIndex, holders: &[&'k str]) -> Result<&'k str, ClaudeUndecidedBy> {
+fn birth_policy<'k>(
+    index: &ScanIndex,
+    ledger: &ClaudeRequestCensus,
+    holders: &[&'k str],
+) -> Result<&'k str, ClaudeUndecidedBy> {
     let mut ranked = Vec::with_capacity(holders.len());
     for key in holders {
+        let census = &index.claude_request_census;
         let record = index
             .files
             .get(*key)
-            .zip(index.claude_request_census.get(key))
+            .zip(census.get(key))
             .filter(|(entry, record): &(_, &ClaudeRequestCensusRecord)| {
-                record.current_holder_for(&entry.source_file_fingerprint)
+                record.current_holder_for(
+                    &entry.source_file_fingerprint,
+                    message_known(census, ledger, key),
+                )
             })
             .map(|(_, record)| record)
             .ok_or(ClaudeUndecidedBy::StaleHolder)?;
@@ -630,7 +743,7 @@ fn birth_policy<'k>(index: &ScanIndex, holders: &[&'k str]) -> Result<&'k str, C
 pub(crate) fn roots_with_retired_records(census: &ClaudeRequestCensus) -> BTreeSet<String> {
     census
         .records()
-        .filter(|(key, record)| !is_ledger_key(key) && record.retired().is_some())
+        .filter(|(_, record)| record.retired().is_some())
         .filter_map(|(key, _)| {
             claude_index_path_family_member(Path::new(key)).map(|(root, _)| root)
         })
@@ -643,66 +756,94 @@ pub(crate) struct ClaudeLedgerStateCounts {
     pub(crate) transcript_retired_records: u64,
     pub(crate) transcript_retired_aged: u64,
     pub(crate) transcript_dropped_vanished: u64,
-    pub(crate) telemetry_records: u64,
-    pub(crate) telemetry_retired_records: u64,
-    pub(crate) telemetry_hashes: u64,
-    pub(crate) message_hashes: u64,
-    pub(crate) family_memos: u64,
-    pub(crate) census_hashes: u64,
-    pub(crate) census_serialized_bytes: u64,
-    pub(crate) ledger_serialized_bytes: u64,
     /// Transcript records carrying a census `u` / without one (unknown).
     pub(crate) transcript_u_known: u64,
     pub(crate) transcript_u_unknown: u64,
+    pub(crate) census_hashes: u64,
+    pub(crate) census_serialized_bytes: u64,
+    pub(crate) telemetry_records: u64,
+    pub(crate) telemetry_retired_records: u64,
+    pub(crate) telemetry_hashes: u64,
+    pub(crate) message_records: u64,
+    pub(crate) message_hashes: u64,
+    pub(crate) family_memos: u64,
+    /// The money ledger's own budget use and measured resident heap.
+    pub(crate) ledger_hashes: u64,
+    pub(crate) ledger_serialized_bytes: u64,
+    pub(crate) ledger_resident_bytes: u64,
+    pub(crate) ledger_dirty_shards: u64,
 }
 
-pub(crate) fn ledger_state_counts(census: &ClaudeRequestCensus) -> ClaudeLedgerStateCounts {
-    let (ledger_hashes, message_hashes, ledger_bytes) = census.ledger_totals();
+/// What the index's transcript records and the money ledger hold. The
+/// ledger's resident heap is measured here, by walking it (once a page).
+pub(crate) fn ledger_state_counts(
+    census: &ClaudeRequestCensus,
+    ledger: Option<&ClaudeLedger>,
+) -> ClaudeLedgerStateCounts {
     let (aged, vanished) = super::claude_request_census::transcript_retirements();
     let mut counts = ClaudeLedgerStateCounts {
         census_hashes: census.hash_total() as u64,
         census_serialized_bytes: census.serialized_total() as u64,
-        ledger_serialized_bytes: ledger_bytes as u64,
-        telemetry_hashes: ledger_hashes as u64,
-        message_hashes: message_hashes as u64,
         transcript_retired_aged: aged,
         transcript_dropped_vanished: vanished,
         ..ClaudeLedgerStateCounts::default()
     };
-    for (key, record) in census.records() {
-        if key.starts_with(TELEMETRY_KEY_PREFIX) {
-            counts.telemetry_records += 1;
-            counts.telemetry_retired_records += u64::from(record.retired().is_some());
-        } else if key.starts_with(super::claude_request_census::FAMILY_KEY_PREFIX) {
-            counts.family_memos += 1;
-        } else if !is_ledger_key(key) {
-            counts.transcript_records += 1;
-            counts.transcript_retired_records += u64::from(record.retired().is_some());
-            match record.old_path_usage() {
-                Some(_) => counts.transcript_u_known += 1,
-                None => counts.transcript_u_unknown += 1,
-            }
+    for (_, record) in census.records() {
+        counts.transcript_records += 1;
+        counts.transcript_retired_records += u64::from(record.retired().is_some());
+        match record.old_path_usage() {
+            Some(_) => counts.transcript_u_known += 1,
+            None => counts.transcript_u_unknown += 1,
         }
     }
+    let Some(ledger) = ledger else {
+        return counts;
+    };
+    let records = ledger.census();
+    counts.ledger_hashes = records.hash_total() as u64;
+    counts.ledger_serialized_bytes = records.serialized_total() as u64;
+    counts.ledger_resident_bytes = records.resident_bytes() as u64;
+    counts.ledger_dirty_shards = ledger.dirty_shards() as u64;
+    for (_, record) in records.records_with_prefix(TELEMETRY_KEY_PREFIX) {
+        counts.telemetry_records += 1;
+        counts.telemetry_retired_records += u64::from(record.retired().is_some());
+        counts.telemetry_hashes += record.request_hashes().len() as u64;
+    }
+    for (_, record) in records.records_with_prefix(MESSAGE_KEY_PREFIX) {
+        counts.message_records += 1;
+        counts.message_hashes += record.request_hashes().len() as u64;
+    }
+    counts.family_memos = records
+        .records_with_prefix(super::claude_request_census::FAMILY_KEY_PREFIX)
+        .count() as u64;
     counts
 }
 
-/// Telemetry retirement under budget pressure only: at 90% of the shared hash
-/// budget, retire the telemetry records with the oldest last append until the
-/// total is at 80%. A retired telemetry record keeps its tail (the reader
-/// never re-adds consumed rows), so its old ids lose their telemetry claim:
-/// a later transcript copy of one falls back to policy. Records are retired
-/// in place (taken and reinserted without copying a hash). Returns how many.
-pub(crate) fn retire_telemetry_under_pressure(census: &mut ClaudeRequestCensus) -> u64 {
-    let cap = MAX_CLAUDE_REQUEST_CENSUS_HASHES;
-    if census.hash_total().saturating_mul(100) < cap * PRESSURE_START_PERCENT {
+/// The ledger is under pressure: its hashes or serialized bytes at `percent`
+/// of their budgets.
+fn pressure(ledger: &ClaudeLedger, percent: usize) -> bool {
+    let census = ledger.census();
+    census.hash_total().saturating_mul(100) >= MAX_CLAUDE_REQUEST_CENSUS_HASHES * percent
+        || census.serialized_total().saturating_mul(100)
+            >= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES * percent
+}
+
+/// Telemetry retirement under budget pressure only: at 90% of the ledger's
+/// hash or serialized budget, retire the telemetry records with the oldest
+/// last append until both are under 80%. A retired telemetry record keeps
+/// its tail (the reader never re-adds consumed rows), so its old ids lose
+/// their telemetry claim and its money is unavailable: a later transcript
+/// copy of one falls back to policy. Records are retired in place (taken and
+/// reinserted without copying a hash). Returns how many; the caller drops
+/// the telemetry certificate when any had claims.
+pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger) -> u64 {
+    if !pressure(ledger, PRESSURE_START_PERCENT) {
         return 0;
     }
-    let mut candidates = census
-        .records()
-        .filter(|(key, record)| {
-            key.starts_with(TELEMETRY_KEY_PREFIX) && !record.request_hashes().is_empty()
-        })
+    let mut candidates = ledger
+        .census()
+        .records_with_prefix(TELEMETRY_KEY_PREFIX)
+        .filter(|(_, record)| !record.request_hashes().is_empty())
         .map(|(key, record)| {
             (
                 record.tail().map_or(0, |tail| tail.last_append_unix),
@@ -713,12 +854,12 @@ pub(crate) fn retire_telemetry_under_pressure(census: &mut ClaudeRequestCensus) 
     candidates.sort_unstable();
     let mut retired = 0;
     for (_, key) in candidates {
-        if census.hash_total().saturating_mul(100) <= cap * PRESSURE_TARGET_PERCENT {
+        if !pressure(ledger, PRESSURE_TARGET_PERCENT) {
             break;
         }
-        if let Some(mut record) = census.take(&key) {
+        if let Some(mut record) = ledger.take(&key) {
             record.retire();
-            let _ = census.insert(key, record);
+            let _ = ledger.insert(key, record);
             retired += 1;
         }
     }

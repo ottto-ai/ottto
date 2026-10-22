@@ -7086,9 +7086,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
-    // P1 per-request money, shadow only: reads this page's final items and
-    // the rows loaded above; writes only its own census records. Never fails
-    // or changes the page.
+    // P1 per-request money, shadow only: reads this page's final items, the
+    // index and the rows loaded above; writes only its own ledger, through
+    // its writer thread after this page. Never fails or changes the page.
     crate::snapshots::claude_request_money::shadow_page(
         support_dir,
         &scan_result.snapshots,

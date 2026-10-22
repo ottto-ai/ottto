@@ -7,6 +7,13 @@
 //! reservation) records which live bucket row each response went to, its
 //! message identity and the responses the occurrence map does not keep.
 //!
+//! The shadow reads the scan index and never writes it. Its ledger (the
+//! telemetry facts, message-only ids, sweeps and family memos) is its own
+//! store (`store`), one in-memory copy per support directory: the index's
+//! bytes, live allowances, save and validation are the same armed or not.
+//! Its file writes (the B1 JSONL and the ledger's changed shards) are handed
+//! to one writer thread after the page, outside `SNAPSHOT_SYNC_LOCK`.
+//!
 //! Each authoritative Claude page builds a second body beside the live one
 //! (`body::build_claude_request_body`), checks its certificate, and writes
 //! the B1 pricing rows: one `grain` row per differing slice (hour, model,
@@ -16,16 +23,19 @@
 //! page, a truncated day, an unbuilt member, a held unit, unread rows, an
 //! unfinished telemetry sweep) leaves the day unusable for the exit
 //! criterion. All of its memory is admitted before allocation against the
-//! shadow's own ceilings; a refusal skips the page's shadow, writes a false
-//! coverage row and is counted.
+//! shadow's own ceiling and its work runs under a deadline; a refusal skips
+//! the page's shadow, writes a false coverage row and is counted.
 
 pub(crate) mod body;
 pub(crate) mod capture;
+pub(crate) mod facts;
 pub(crate) mod rows;
+pub(crate) mod store;
 
 use super::claude_request_census::{
-    claude_request_hash, family_key, telemetry_key, ClaudeFamilyMemo, ClaudeRequestCensus,
-    ClaudeRequestCensusRecord, FAMILY_KEY_PREFIX, TELEMETRY_KEY_PREFIX,
+    claude_request_hash, family_key, fingerprint_matches, message_key, telemetry_key,
+    ClaudeFamilyMemo, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord, FAMILY_KEY_PREFIX,
+    MESSAGE_KEY_PREFIX,
 };
 use super::claude_request_ledger::{
     self, ClaudeClassifyContext, ClaudeCountedBy, ClaudeLedgerScope, ClaudeUndecidedBy,
@@ -35,8 +45,9 @@ use super::{
     claude_trace_owner_session_id, ScanIndex, SnapshotItem, UsageTotals,
 };
 use crate::claude_local_otel::telemetry_tail::{
-    tail_fixed_memory, telemetry_complete_through, ClaudeLedgerWork, ClaudeTelemetryTail,
-    ClaudeTelemetryTailBudget, ClaudeTelemetryTailCounts,
+    drop_certificate, tail_fixed_memory, telemetry_certified, telemetry_complete_through,
+    ClaudeLedgerWork, ClaudeRootTelemetry, ClaudeTelemetryTail, ClaudeTelemetryTailBudget,
+    ClaudeTelemetryTailCounts,
 };
 use crate::claude_local_otel::{ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport};
 use body::{
@@ -44,7 +55,7 @@ use body::{
     ClaudeGrainSide, ClaudeRequestBody,
 };
 pub(crate) use capture::ClaudeResponseCapture;
-use rows::{ClaudeApiRow, ClaudeRootRows, ClaudeRowCounts, Reconstructed};
+use rows::{ClaudeRootRows, ClaudeRowCounts};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,6 +64,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use store::{ClaudeLedger, ClaudeLedgerAcquire, PendingMemo, WriteJob};
 
 pub(crate) const CLAUDE_REQUEST_COUNTING: &str = "claude_request_counting:v1";
 /// Row format of the JSONL (B1 reader `claude_money_shadow_report.py`).
@@ -61,18 +73,19 @@ const JSONL_VERSION: u8 = 2;
 /// A unit younger than this is immature: deferred, neither counted nor removed.
 pub(crate) const MATURITY_SECONDS: u64 = 60;
 
-/// Aggregate transient shadow memory ceiling (all concurrent pages).
+/// Aggregate transient shadow memory ceiling (all concurrent pages and the
+/// batches waiting for the writer).
 pub(crate) const SHADOW_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
-/// The ledger's persistent state in the index (telemetry and message-only
-/// hashes, sweeps and family memos), funded for its whole lifetime: the
-/// working index, the committed clone and the save buffer.
-pub(crate) const LEDGER_FUNDING_CEILING_BYTES: usize = 96 * 1024 * 1024;
-const LEDGER_COPIES: usize = 3;
 
-/// The shared per-page work budget of every shadow reader.
+/// The shared per-page I/O budget of every shadow reader.
 const WORK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const WORK_MAX_STATS: u64 = 1024;
 const WORK_MAX_ELAPSED: Duration = Duration::from_millis(250);
+/// The whole page's deadline: enumeration, the census intersections, the
+/// scope, grouping, the bodies and the rows. Past it the page is refused.
+const PAGE_MAX_ELAPSED: Duration = Duration::from_secs(2);
+/// A growing structure's admission step.
+const GROWTH_STEP_BYTES: usize = 256 * 1024;
 
 /// Daily JSONL: per-day byte cap and days kept. The last bytes of the cap
 /// are kept for the seal row (a false coverage row naming the truncation).
@@ -83,6 +96,8 @@ const JSONL_PREFIX: &str = "claude-request-money-shadow-";
 const JSONL_MAX_DIR_ENTRIES: usize = 1024;
 /// Family memos older than this (no page rebuilt the family) are dropped.
 const FAMILY_MEMO_RETENTION_SECONDS: u64 = 35 * 86_400;
+/// `mh:` records checked against their file's record per page.
+const MESSAGE_PRUNE_PER_PAGE: usize = 256;
 
 // Per-element admission charges (bytes), generous for the owned strings.
 const UNIT_BYTES: usize = 512;
@@ -90,6 +105,8 @@ const LIVE_ROW_BYTES: usize = 768;
 const GRAIN_BYTES: usize = 2048;
 const FAMILY_BYTES: usize = 8192;
 const TRACE_ROW_BYTES: usize = 160;
+/// One page hash in the page's hash list, claim map and collision map.
+const PAGE_HASH_BYTES: usize = 160;
 
 // ---------------------------------------------------------------- normalizer
 
@@ -330,6 +347,14 @@ pub(crate) fn enable_shadow_for_test(support_dir: &Path) {
         .push(support_dir.to_path_buf());
 }
 
+#[cfg(test)]
+pub(crate) fn disable_shadow_for_test(support_dir: &Path) {
+    SHADOW_ENABLED_FOR_TEST
+        .lock()
+        .expect("shadow control")
+        .retain(|dir| dir != support_dir);
+}
+
 fn shadow_enabled(support_dir: &Path) -> bool {
     #[cfg(test)]
     {
@@ -406,28 +431,42 @@ impl Drop for ShadowReservation {
     }
 }
 
-/// The ledger's persistent state, funded while it lives in the index.
-static LEDGER_FUNDED: AtomicUsize = AtomicUsize::new(0);
-
-/// Bytes the ledger's records hold in the index, times its copies.
-pub(crate) fn ledger_funding_need(census: &ClaudeRequestCensus) -> usize {
-    let (ledger_hashes, message_hashes, ledger_bytes) = census.ledger_totals();
-    ledger_hashes
-        .saturating_add(message_hashes)
-        .saturating_mul(8)
-        .saturating_add(ledger_bytes)
-        .saturating_mul(LEDGER_COPIES)
+/// A page's admission that grows in steps: every step is admitted before
+/// the memory it covers is allocated.
+struct ShadowBudget {
+    reservations: Vec<ShadowReservation>,
+    granted: usize,
+    used: usize,
 }
 
-/// Re-size the persistent funding to the ledger's current need. False when
-/// it no longer fits: the ledger must not grow (the tail stops; debt).
-fn fund_ledger(census: &ClaudeRequestCensus) -> bool {
-    let need = ledger_funding_need(census);
-    LEDGER_FUNDED
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |_| {
-            (need <= LEDGER_FUNDING_CEILING_BYTES).then_some(need)
-        })
-        .is_ok()
+impl ShadowBudget {
+    fn new(base: ShadowReservation) -> Self {
+        let granted = base.0;
+        Self {
+            reservations: vec![base],
+            granted,
+            used: granted,
+        }
+    }
+
+    /// Admit `bytes` more; false (nothing admitted) when the ceiling refuses.
+    fn charge(&mut self, bytes: usize) -> bool {
+        let used = self.used.saturating_add(bytes);
+        if used > self.granted {
+            let step = (used - self.granted).max(GROWTH_STEP_BYTES);
+            let Some(reservation) = ShadowReservation::admit(step) else {
+                return false;
+            };
+            self.granted += step;
+            self.reservations.push(reservation);
+        }
+        self.used = used;
+        true
+    }
+
+    fn granted(&self) -> usize {
+        self.granted
+    }
 }
 
 // ---------------------------------------------------------------- counts
@@ -504,23 +543,49 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) requests_new: u64,
     pub(crate) holders_compared: u64,
     pub(crate) admission_bytes: u64,
+    /// The page's largest admission held at once (its grown budget and its
+    /// batch's rows).
+    pub(crate) admitted_peak_bytes: u64,
     pub(crate) refused_budget: u64,
-    pub(crate) ledger_unfunded: u64,
-    pub(crate) ledger_funded_bytes: u64,
+    /// The page's work ran past its deadline: refused, nothing written but
+    /// the ledger's own progress.
+    pub(crate) refused_deadline: u64,
+    /// The writer is still loading this support directory's ledger.
+    pub(crate) ledger_loading: u64,
+    /// No writer, or the ledger is held elsewhere.
+    pub(crate) ledger_unavailable: u64,
+    /// The ledger load found a missing or corrupt shard (debt).
+    pub(crate) ledger_load_damaged: u64,
+    pub(crate) message_records_written: u64,
+    pub(crate) message_records_refused: u64,
+    pub(crate) message_records_pruned: u64,
+    pub(crate) ledger_save_shards: u64,
+    pub(crate) ledger_save_bytes: u64,
+    /// The page's dirty shards were not admitted (they wait).
+    pub(crate) ledger_save_refused: u64,
+    /// The writer's outbox was full: the batch was dropped.
+    pub(crate) batch_dropped: u64,
     pub(crate) captures_taken: u64,
     pub(crate) captures_purged: u64,
     pub(crate) capture_reserved_bytes: u64,
     pub(crate) work_stopped: u64,
     pub(crate) telemetry_retired_pressure: u64,
     pub(crate) family_memos_dropped: u64,
-    /// Memos not advanced because the page's rows were not all written.
+    /// Memos not advanced because their batch's rows were not all written
+    /// (reported by the page after the write).
     pub(crate) family_memos_withheld: u64,
+    /// Families whose previous memo is still in a batch being written.
+    pub(crate) family_memos_pending: u64,
     pub(crate) removed_change_available: u64,
     pub(crate) removed_change_unavailable: u64,
+    /// The writer's JSONL outcome of the batches finished since the last
+    /// page (rows are written after the page, outside the sync lock).
     pub(crate) jsonl_rows: u64,
     pub(crate) jsonl_truncated: u64,
     pub(crate) jsonl_sealed: u64,
     pub(crate) jsonl_failed: u64,
+    /// Rows this page handed to the writer.
+    pub(crate) jsonl_queued: u64,
     /// Members not in the page whose census `u` was known / unknown
     /// (advisory, shadow only).
     pub(crate) absent_members_old_known: u64,
@@ -673,6 +738,8 @@ struct FamilyRow<'a> {
     /// null with `removed_change_unavailable` naming why.
     removed_change: Option<SignedRequestsTokens>,
     removed_change_basis: Option<&'static str>,
+    /// The `snapshot` of the family row the change is measured from.
+    removed_change_basis_snapshot: Option<u64>,
     removed_change_unavailable: Option<&'static str>,
     held: RequestsTokens,
     held_reasons: Vec<&'static str>,
@@ -685,7 +752,7 @@ struct FamilyRow<'a> {
 }
 
 /// The page's custody flag (B1 `coverage` row).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CoverageRow {
     row: &'static str,
     v: u8,
@@ -764,13 +831,13 @@ static LAST_SHADOW: Mutex<BTreeMap<PathBuf, Instant>> = Mutex::new(BTreeMap::new
 // ---------------------------------------------------------------- shadow
 
 /// The P1 shadow of one authoritative Claude page. Reads the page's final
-/// items, the strict rows and traces the live path already loaded and the
-/// captures of this page's parses; mutates only the census's ledger records
-/// (`otel:`, `sweep:`, `fam:`). Never fails the page.
+/// items, the index, the strict rows and traces the live path already loaded
+/// and the captures of this page's parses; mutates only its own ledger. Never
+/// fails the page.
 pub(crate) fn shadow_page(
     support_dir: &Path,
     snapshots: &[SnapshotItem],
-    index: &mut ScanIndex,
+    index: &ScanIndex,
     api_report: &ClaudeLocalOtelLoadReport,
     trace_report: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
@@ -789,16 +856,25 @@ pub(crate) fn shadow_page(
     );
 }
 
-/// Index keys of each (root, member) and the indexed members of each root.
+/// Index keys of each page (root, member) and the indexed members of each
+/// page root.
 type FamilyMembers = (
     BTreeMap<(String, String), Vec<String>>,
     BTreeMap<String, BTreeSet<String>>,
 );
 
-fn family_members(index: &ScanIndex, roots: &BTreeSet<&str>) -> FamilyMembers {
+/// None when the deadline passed.
+fn family_members(
+    index: &ScanIndex,
+    roots: &BTreeSet<&str>,
+    deadline: Instant,
+) -> Option<FamilyMembers> {
     let mut member_keys = BTreeMap::<(String, String), Vec<String>>::new();
     let mut members = BTreeMap::<String, BTreeSet<String>>::new();
     for key in index.files.keys() {
+        if Instant::now() >= deadline {
+            return None;
+        }
         let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
             continue;
         };
@@ -814,80 +890,58 @@ fn family_members(index: &ScanIndex, roots: &BTreeSet<&str>) -> FamilyMembers {
             .or_default()
             .push(key.clone());
     }
-    (member_keys, members)
+    Some((member_keys, members))
+}
+
+/// What one page hands to the writer and the log.
+struct PageEnd<'a> {
+    support_dir: &'a Path,
+    now: u64,
+    census_complete: bool,
+    started: Instant,
+    tail: ClaudeTelemetryTailCounts,
+    rows: ClaudeRowCounts,
+    scope: claude_request_ledger::ClaudeScopeDebt,
 }
 
 pub(crate) fn shadow_page_at(
     support_dir: &Path,
     snapshots: &[SnapshotItem],
-    index: &mut ScanIndex,
+    index: &ScanIndex,
     api_report: &ClaudeLocalOtelLoadReport,
     trace_report: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
+    let deadline = started + PAGE_MAX_ELAPSED;
     let mut counts = ClaudeRequestMoneyShadowCounts::default();
     let scope_key = shadow_scope(support_dir);
     let snapshot = next_snapshot();
     let tail_budget = ClaudeTelemetryTailBudget::default();
+    let mut end = PageEnd {
+        support_dir,
+        now,
+        census_complete,
+        started,
+        tail: ClaudeTelemetryTailCounts::default(),
+        rows: ClaudeRowCounts::default(),
+        scope: claude_request_ledger::ClaudeScopeDebt::default(),
+    };
+    // The page's roots (a pointer per item) are the only allocation before
+    // admission: everything else is admitted first, from the page's counts.
     let roots = snapshots
         .iter()
         .map(claude_snapshot_family_root_ref)
         .collect::<BTreeSet<_>>();
-    let (member_keys, indexed_members) = family_members(index, &roots);
-    let key_of = |root: &str, member: &str| {
-        member_keys
-            .get(&(root.to_owned(), member.to_owned()))
-            .filter(|keys| keys.len() == 1)
-            .map(|keys| keys[0].clone())
-    };
-
-    // Take this page's captures first: they are funded by the capture
-    // budget and freed whatever the page decides.
-    let mut captures = BTreeMap::<(String, String), ClaudeResponseCapture>::new();
-    for item in snapshots {
-        let root = claude_snapshot_family_root_ref(item);
-        let Some(key) = key_of(root, &item.source_session_id) else {
-            continue;
-        };
-        let fingerprints = [
-            item.source_file_fingerprint.clone(),
-            index
-                .files
-                .get(&key)
-                .map(|entry| entry.source_file_fingerprint.clone()),
-        ];
-        if let Some(capture) = fingerprints
-            .iter()
-            .flatten()
-            .find_map(|fingerprint| capture::take_capture(&scope_key, &key, fingerprint))
-        {
-            counts.captures_taken += 1;
-            captures.insert((root.to_owned(), item.source_session_id.clone()), capture);
-        }
-    }
-    if let Ok(mut last) = LAST_SHADOW.lock() {
-        if let Some(previous) = last.insert(scope_key.clone(), Instant::now()) {
-            counts.captures_purged = capture::purge_before(&scope_key, previous);
-        }
-    }
-    counts.capture_reserved_bytes = capture::capture_reserved() as u64;
-
-    // Admission before any allocation: units, live rows, bucket rows, the
-    // holders, the scope, grains, families, traces and the tail's fixed
-    // memory. Reconstructed rows and the tail's per-file hashes are admitted
-    // as they come.
-    let units = snapshots
+    let occurrences = snapshots
         .iter()
         .map(|item| item.claude_usage_occurrences.len())
-        .sum::<usize>()
-        .saturating_add(captures.values().map(|c| c.units().len()).sum::<usize>());
+        .sum::<usize>();
     let live_rows = roots
         .iter()
         .filter_map(|root| api_report.evidence.get(*root))
-        .flatten()
-        .map(rows::row_bound)
+        .map(Vec::len)
         .sum::<usize>();
     let trace_rows = roots
         .iter()
@@ -900,161 +954,216 @@ pub(crate) fn shadow_page_at(
         .map(|bucket| bucket.model_usage.len())
         .sum::<usize>();
     let key_bytes = index.files.keys().map(String::len).sum::<usize>();
-    let admission = units
+    let admission = occurrences
         .saturating_mul(UNIT_BYTES + GRAIN_BYTES)
-        .saturating_add(live_rows.saturating_mul(2))
+        .saturating_add(rows::rows_bound(live_rows))
+        .saturating_add(
+            occurrences
+                .saturating_add(live_rows)
+                .saturating_mul(PAGE_HASH_BYTES),
+        )
         .saturating_add(trace_rows.saturating_mul(TRACE_ROW_BYTES))
         .saturating_add(bucket_rows.saturating_mul(LIVE_ROW_BYTES))
-        .saturating_add(claude_request_ledger::holders_bound(
-            units.saturating_add(live_rows / 64),
-        ))
         .saturating_add(claude_request_ledger::scope_bound(
             index.files.len(),
             key_bytes,
         ))
         .saturating_add(roots.len().saturating_mul(FAMILY_BYTES))
         .saturating_add(index.files.len().saturating_mul(64))
+        .saturating_add(key_bytes)
+        .saturating_add(snapshots.len().saturating_mul(64))
         .saturating_add(tail_fixed_memory(&tail_budget));
     counts.admission_bytes = admission as u64;
-    let Some(_reservation) = ShadowReservation::admit(admission) else {
+    let Some(base) = ShadowReservation::admit(admission) else {
         counts.refused_budget = 1;
-        counts.elapsed_us = started.elapsed().as_micros() as u64;
-        append_jsonl(
-            support_dir,
-            now,
-            &[],
-            Some(CoverageRow {
-                row: "coverage",
-                v: JSONL_VERSION,
-                observed_unix: now,
-                coverage_complete: false,
-                families: roots.len() as u64,
-                families_incomplete: roots.len() as u64,
-                refused: true,
-                truncated: false,
-                telemetry_sweep_complete: false,
-                rows_unavailable_roots: 0,
-            }),
-            &mut counts,
-        );
-        emit_line(&ShadowLine {
-            counting: CLAUDE_REQUEST_COUNTING,
-            census_complete,
-            counts: &counts,
-            tail: &ClaudeTelemetryTailCounts::default(),
-            rows: &ClaudeRowCounts::default(),
-            scope: &claude_request_ledger::ClaudeScopeDebt::default(),
-            ledger: &claude_request_ledger::ledger_state_counts(&index.claude_request_census),
-        });
-        return counts;
+        purge_captures(&scope_key, &mut counts);
+        return refuse(&end, None, index, roots.len(), counts);
     };
-
-    // The ledger: advance the telemetry sweep under the shared work budget,
-    // only while its persistent state is funded.
-    let mut work = ClaudeLedgerWork::new(WORK_MAX_BYTES, WORK_MAX_STATS, WORK_MAX_ELAPSED);
-    let tail = if fund_ledger(&index.claude_request_census) {
-        let tail = ClaudeTelemetryTail::advance(
-            support_dir,
-            &mut index.claude_request_census,
-            now,
-            &tail_budget,
-            &mut work,
-        );
-        counts.telemetry_retired_pressure = claude_request_ledger::retire_telemetry_under_pressure(
-            &mut index.claude_request_census,
-        );
-        tail
-    } else {
-        counts.ledger_unfunded = 1;
-        ClaudeTelemetryTailCounts::default()
-    };
-
-    // Rows: the live load's, else the fair resumable reconstruction.
-    let mut row_counts = ClaudeRowCounts::default();
-    let mut root_rows = BTreeMap::<String, Option<ClaudeRootRows>>::new();
-    let mut missing = Vec::new();
-    for &root in &roots {
-        match api_report.evidence.get(root) {
-            Some(evidence) => {
-                row_counts.roots_live += 1;
-                let mut converted = Vec::with_capacity(evidence.len());
-                let mut refused = 0;
-                for row in evidence {
-                    match ClaudeApiRow::from_evidence(row, root) {
-                        Some(row) => converted.push(row),
-                        None => refused += 1,
-                    }
-                }
-                row_counts.rows_refused += refused;
-                root_rows.insert(
-                    root.to_owned(),
-                    (refused == 0).then(|| ClaudeRootRows::new(converted)),
-                );
+    let mut budget = ShadowBudget::new(base);
+    let mut guard = match store::acquire(support_dir) {
+        ClaudeLedgerAcquire::Ready(guard) => guard,
+        acquired => {
+            match acquired {
+                ClaudeLedgerAcquire::Loading => counts.ledger_loading = 1,
+                _ => counts.ledger_unavailable = 1,
             }
-            None => missing.push(root),
+            purge_captures(&scope_key, &mut counts);
+            return refuse(&end, None, index, roots.len(), counts);
+        }
+    };
+    let ledger: &mut ClaudeLedger = &mut guard;
+    apply_results(support_dir, ledger, &mut counts);
+    if std::mem::take(&mut ledger.load_damaged) {
+        // A shard was lost: its claims are gone, so is the certificate.
+        counts.ledger_load_damaged = 1;
+        drop_certificate(ledger, now);
+        end.tail.certificate_dropped += 1;
+    }
+
+    let Some((member_keys, indexed_members)) = family_members(index, &roots, deadline) else {
+        counts.refused_deadline = 1;
+        purge_captures(&scope_key, &mut counts);
+        return refuse(&end, Some(ledger), index, roots.len(), counts);
+    };
+    let key_of = |root: &str, member: &str| {
+        member_keys
+            .get(&(root.to_owned(), member.to_owned()))
+            .filter(|keys| keys.len() == 1)
+            .map(|keys| keys[0].clone())
+    };
+    // The items of each root, grouped once.
+    let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
+    for item in snapshots {
+        by_root
+            .entry(claude_snapshot_family_root_ref(item))
+            .or_default()
+            .push(item);
+    }
+
+    // Take this page's captures (funded by the capture budget, freed
+    // whatever the page decides) and record each parse's message-only ids.
+    let mut captures = BTreeMap::<(String, String), ClaudeResponseCapture>::new();
+    for item in snapshots {
+        let root = claude_snapshot_family_root_ref(item);
+        let Some(key) = key_of(root, &item.source_session_id) else {
+            continue;
+        };
+        let fingerprints = [
+            item.source_file_fingerprint.as_deref(),
+            index
+                .files
+                .get(&key)
+                .map(|entry| entry.source_file_fingerprint.as_str()),
+        ];
+        let taken = fingerprints.iter().flatten().find_map(|fingerprint| {
+            capture::take_capture(&scope_key, &key, fingerprint)
+                .map(|capture| (*fingerprint, capture))
+        });
+        if let Some((fingerprint, capture)) = taken {
+            counts.captures_taken += 1;
+            note_message_record(ledger, index, &key, fingerprint, &capture, &mut counts);
+            captures.insert((root.to_owned(), item.source_session_id.clone()), capture);
         }
     }
-    let mut copy_reservations = Vec::new();
-    let mut admit_copy = |bytes: usize| match ShadowReservation::admit(bytes) {
-        Some(reservation) => {
-            copy_reservations.push(reservation);
-            true
+    if let Ok(mut last) = LAST_SHADOW.lock() {
+        if let Some(previous) = last.insert(scope_key.clone(), Instant::now()) {
+            counts.captures_purged = capture::purge_before(&scope_key, previous);
         }
-        None => false,
-    };
-    for (root, outcome) in rows::reconstruct_rows(
-        support_dir,
-        &missing,
-        &mut index.claude_request_census,
-        &mut work,
-        &mut admit_copy,
-        &mut row_counts,
-    ) {
-        let rows = match outcome {
-            Reconstructed::Complete(rows) => Some(ClaudeRootRows::new(rows)),
-            Reconstructed::Unavailable => None,
+    }
+    counts.capture_reserved_bytes = capture::capture_reserved() as u64;
+    let captured_units = captures
+        .values()
+        .map(|capture| capture.units().len())
+        .sum::<usize>();
+    if !budget.charge(captured_units.saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES)) {
+        counts.refused_budget = 1;
+        return refuse(&end, Some(ledger), index, roots.len(), counts);
+    }
+
+    // The ledger: the page roots' sidecars first (the live load did not keep
+    // them), then a slice of the sweep, under the shared work budget.
+    let mut work = ClaudeLedgerWork::new(WORK_MAX_BYTES, WORK_MAX_STATS, WORK_MAX_ELAPSED);
+    let unloaded = roots
+        .iter()
+        .copied()
+        .filter(|root| !api_report.evidence.contains_key(*root))
+        .collect::<Vec<_>>();
+    let (tail, root_states) =
+        ClaudeTelemetryTail::advance(support_dir, ledger, now, &tail_budget, &unloaded, &mut work);
+    let dropped = end.tail.certificate_dropped;
+    end.tail = tail;
+    end.tail.certificate_dropped += dropped;
+    counts.telemetry_retired_pressure =
+        claude_request_ledger::retire_telemetry_under_pressure(ledger);
+    if counts.telemetry_retired_pressure > 0 {
+        drop_certificate(ledger, now);
+        end.tail.certificate_dropped += 1;
+    }
+    prune_message_records(ledger, index, &mut counts);
+    counts.work_stopped = u64::from(work.stopped);
+
+    // Rows: the live load's, else the facts the tail just brought current.
+    let mut root_rows = BTreeMap::<&str, Option<ClaudeRootRows>>::new();
+    for &root in &roots {
+        let rows = match api_report.evidence.get(root) {
+            Some(evidence) => {
+                end.rows.roots_live += 1;
+                let (rows, refused) = ClaudeRootRows::from_live(evidence, root);
+                end.rows.rows_refused += refused;
+                rows
+            }
+            None => match root_states.get(root) {
+                Some(ClaudeRootTelemetry::Absent) => {
+                    end.rows.roots_absent += 1;
+                    Some(ClaudeRootRows::default())
+                }
+                Some(ClaudeRootTelemetry::Current) => match ledger.get(&telemetry_key(root)) {
+                    Some(record)
+                        if budget.charge(rows::rows_bound(record.request_hashes().len())) =>
+                    {
+                        match ClaudeRootRows::from_record(record) {
+                            Some(rows) => {
+                                end.rows.roots_from_facts += 1;
+                                end.rows.rows_decoded += rows.len() as u64;
+                                Some(rows)
+                            }
+                            None => {
+                                end.rows.roots_unavailable += 1;
+                                None
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        end.rows.roots_refused_memory += 1;
+                        None
+                    }
+                    None => {
+                        end.rows.roots_unavailable += 1;
+                        None
+                    }
+                },
+                _ => {
+                    end.rows.roots_behind += 1;
+                    None
+                }
+            },
         };
         root_rows.insert(root, rows);
     }
-    counts.work_stopped = u64::from(work.stopped);
     for rows in root_rows.values().flatten() {
-        row_counts.rows_conflicting += rows.conflicts;
+        end.rows.rows_conflicting += rows.conflicts;
     }
-    counts.rows_live_roots = row_counts.roots_live;
-    counts.rows_refused = row_counts.rows_refused;
-    counts.rows_conflicting = row_counts.rows_conflicting;
+    counts.rows_live_roots = end.rows.roots_live;
+    counts.rows_refused = end.rows.rows_refused;
+    counts.rows_conflicting = end.rows.rows_conflicting;
     counts.rows_unavailable_roots = root_rows.values().filter(|rows| rows.is_none()).count() as u64;
 
-    // Telemetry claims, first-event times and traces of the page's roots.
-    let mut page_claims = BTreeMap::<u64, Vec<String>>::new();
+    // The page roots' own claims (their rows may be ahead of the ledger),
+    // first-event times, sessions and traces.
+    let root_keys = roots
+        .iter()
+        .map(|root| (*root, telemetry_key(root)))
+        .collect::<BTreeMap<_, _>>();
+    let mut page_claims = BTreeMap::<u64, Vec<&str>>::new();
     let mut first_event = BTreeMap::<String, u64>::new();
-    for (key, record) in index.claude_request_census.records() {
-        if let Some(tail) = record
-            .tail()
-            .filter(|_| key.starts_with(TELEMETRY_KEY_PREFIX))
-        {
-            first_event.insert(key.clone(), tail.first_event_unix);
-        }
-    }
+    let mut sessions = BTreeMap::<String, String>::new();
     for (root, rows) in &root_rows {
+        let key = &root_keys[root];
+        sessions.insert(key.clone(), (*root).to_owned());
         let Some(rows) = rows else { continue };
-        let key = telemetry_key(root);
-        let earliest = rows
+        if let Some(earliest) = rows
             .iter()
             .map(|row| row.clock)
             .filter(|clock| *clock > 0)
-            .min();
-        if let Some(earliest) = earliest {
-            let slot = first_event.entry(key.clone()).or_insert(0);
-            if *slot == 0 || earliest < *slot {
-                *slot = earliest;
-            }
+            .min()
+        {
+            first_event.insert(key.clone(), earliest);
         }
         for row in rows.iter() {
             page_claims
                 .entry(row.request_hash)
                 .or_default()
-                .push(key.clone());
+                .push(key.as_str());
         }
     }
     let mut traces = BTreeMap::<String, BTreeMap<u64, String>>::new();
@@ -1110,12 +1219,23 @@ pub(crate) fn shadow_page_at(
     page_message_hashes.sort_unstable();
     page_message_hashes.dedup();
 
-    let index_ref: &ScanIndex = index;
+    let ledger_view: &ClaudeLedger = ledger;
     let holders = claude_request_ledger::scan_holders(
-        &index_ref.claude_request_census,
+        &index.claude_request_census,
+        ledger_view.census(),
         &page_hashes,
         &page_message_hashes,
+        deadline,
+        &mut |bytes| budget.charge(bytes),
     );
+    let Some(holders) = holders else {
+        if Instant::now() >= deadline {
+            counts.refused_deadline = 1;
+        } else {
+            counts.refused_budget = 1;
+        }
+        return refuse(&end, Some(ledger), index, roots.len(), counts);
+    };
     counts.holders_compared = holders.compared;
     let page_groups = snapshots
         .iter()
@@ -1130,26 +1250,35 @@ pub(crate) fn shadow_page_at(
         .iter()
         .filter_map(|key| claude_request_ledger::claude_project_group(key))
         .collect::<BTreeSet<_>>();
-    let scope = ClaudeLedgerScope::build(index_ref, &page_groups, &roots);
-    let complete_through = telemetry_complete_through(&index_ref.claude_request_census);
+    let Some(scope) =
+        ClaudeLedgerScope::build(index, ledger_view.census(), &page_groups, &roots, deadline)
+    else {
+        drop(holders);
+        counts.refused_deadline = 1;
+        return refuse(&end, Some(ledger), index, roots.len(), counts);
+    };
+    let complete_through = telemetry_complete_through(ledger_view);
     let ctx = ClaudeClassifyContext {
-        index: index_ref,
+        index,
+        ledger: ledger_view.census(),
         holders: &holders,
         scope: &scope,
         page_claims: &page_claims,
         first_event: &first_event,
+        sessions: &sessions,
         trace: &traces,
         telemetry_complete_through: complete_through,
     };
     let retired_roots =
-        claude_request_ledger::roots_with_retired_records(&index_ref.claude_request_census);
+        claude_request_ledger::roots_with_retired_records(&index.claude_request_census);
 
-    let mut bodies = Vec::new();
-    for &root in &roots {
-        let items = snapshots
-            .iter()
-            .filter(|item| claude_snapshot_family_root_ref(item) == root)
-            .collect::<Vec<_>>();
+    let mut bodies = Vec::with_capacity(by_root.len());
+    let mut late = false;
+    for (&root, items) in &by_root {
+        if Instant::now() >= deadline {
+            late = true;
+            break;
+        }
         let keys = items
             .iter()
             .map(|item| {
@@ -1163,7 +1292,7 @@ pub(crate) fn shadow_page_at(
         let members = indexed_members.get(root).unwrap_or(&empty);
         let total = members.len().max(items.len());
         let mut family_captures = BTreeMap::new();
-        for item in &items {
+        for item in items {
             if let Some(capture) =
                 captures.remove(&(root.to_owned(), item.source_session_id.clone()))
             {
@@ -1173,15 +1302,19 @@ pub(crate) fn shadow_page_at(
         // Members not in this page: their census `u` (what the old path last
         // built for that file), advisory only. Missing, malformed or stale
         // is unknown, never zero.
+        let present = items
+            .iter()
+            .map(|item| item.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
         let mut absent_old = ClaudeMoneyTotals::default();
         let mut absent_old_unknown = 0_u64;
         for member in members {
-            if items.iter().any(|item| item.source_session_id == *member) {
+            if present.contains(member.as_str()) {
                 continue;
             }
             let usage = key_of(root, member).and_then(|key| {
-                let entry = index_ref.files.get(&key)?;
-                let record = index_ref.claude_request_census.get(&key)?;
+                let entry = index.files.get(&key)?;
+                let record = index.claude_request_census.get(&key)?;
                 record
                     .current_for(&entry.source_file_fingerprint)
                     .then(|| record.old_path_usage())
@@ -1200,7 +1333,7 @@ pub(crate) fn shadow_page_at(
         }
         let family = ClaudeFamilyInput {
             root,
-            items,
+            items: items.clone(),
             member_keys: keys,
             indexed_members: members,
             members_total: total,
@@ -1215,15 +1348,19 @@ pub(crate) fn shadow_page_at(
         let union = union_revision(members);
         bodies.push((root, body, union, absent_old, absent_old_unknown));
     }
-    // The page's borrowed evidence ends here: the ledger records change below.
-    let scope_debt = scope.debt;
+    // The page's borrowed evidence ends here: the ledger changes below.
+    end.scope = scope.debt;
     drop(holders);
     drop(scope);
+    if late {
+        counts.refused_deadline = 1;
+        return refuse(&end, Some(ledger), index, roots.len(), counts);
+    }
 
     // Rows, memos and the coverage flag.
-    let sweep_complete = complete_through > 0 && !tail.sweep_debt;
+    let sweep_complete = telemetry_certified(ledger);
     let mut lines = Vec::new();
-    let mut pending_memos = Vec::with_capacity(bodies.len());
+    let mut memos = Vec::with_capacity(bodies.len());
     let mut families_incomplete = 0_u64;
     for (root, body, union, absent_old, absent_old_unknown) in bodies {
         let complete = body.coverage_complete(census_complete);
@@ -1231,12 +1368,16 @@ pub(crate) fn shadow_page_at(
         families_incomplete += u64::from(!complete);
         let family = hashed_id(root);
         let memo_key = family_key(root);
-        let memo = index
-            .claude_request_census
+        // A memo still in a batch being written is no basis yet.
+        let pending = ledger.family_pending(&memo_key);
+        counts.family_memos_pending += u64::from(pending);
+        let memo = ledger
             .get(&memo_key)
             .and_then(ClaudeRequestCensusRecord::family_memo)
-            .map(|(revision, memo)| (*revision, memo));
+            .map(|(revision, memo)| (*revision, memo))
+            .filter(|_| !pending);
         let (removed_change, basis, unavailable) = match (complete, memo) {
+            _ if pending => (None, None, Some("previous_unpublished")),
             (false, _) => (None, None, Some("body_incomplete")),
             (true, None) => (None, None, Some("no_previous_body")),
             (true, Some((revision, _))) if revision != union => (None, None, Some("union_changed")),
@@ -1252,10 +1393,22 @@ pub(crate) fn shadow_page_at(
                 None,
             ),
         };
+        let basis_snapshot = removed_change
+            .as_ref()
+            .and(memo)
+            .map(|(_, memo)| memo.snapshot);
         if removed_change.is_some() {
             counts.removed_change_available += 1;
         } else {
             counts.removed_change_unavailable += 1;
+        }
+        // Skip a family whose rows did not change since its last written
+        // ones today (the reader keeps each family's latest snapshot); never
+        // while its previous rows are still being written.
+        let digest = rows_digest(now, &body, complete);
+        if memo.is_some_and(|(_, memo)| memo.rows_digest == digest) {
+            counts.families_rows_unchanged += 1;
+            continue;
         }
         let mut family_lines = Vec::with_capacity(body.grains.len() + 1);
         for (key, (old, new)) in &body.grains {
@@ -1279,6 +1432,7 @@ pub(crate) fn shadow_page_at(
             removed: (&body.removed).into(),
             removed_change,
             removed_change_basis: basis,
+            removed_change_basis_snapshot: basis_snapshot,
             removed_change_unavailable: unavailable,
             held: (&body.held).into(),
             held_reasons: body
@@ -1293,23 +1447,21 @@ pub(crate) fn shadow_page_at(
             absent_old_unknown,
         };
         family_lines.push(serde_json::to_string(&row).ok());
-        // Skip a family whose rows did not change since its last write today
-        // (the reader keeps each family's latest snapshot).
-        let digest = rows_digest(now, &body, complete);
-        let unchanged = memo.is_some_and(|(_, memo)| memo.rows_digest == digest);
-        if unchanged {
-            counts.families_rows_unchanged += 1;
-        } else {
-            lines.extend(family_lines.into_iter().flatten());
+        lines.extend(family_lines.into_iter().flatten());
+        if pending {
+            // Its basis moves when the earlier batch is acknowledged.
+            continue;
         }
-        // The memo: removals move only with a complete body.
-        let next = match (complete, memo) {
+        // The memo: removals move only with a complete body, which is then
+        // the basis (this row's snapshot) of the next removal delta.
+        let (revision, next) = match (complete, memo) {
             (true, _) => (
                 union,
                 ClaudeFamilyMemo {
                     removed_requests: body.removed.requests,
                     removed_tokens: body.removed.tokens,
                     rows_digest: digest,
+                    snapshot,
                 },
             ),
             (false, Some((revision, memo))) => (
@@ -1325,13 +1477,20 @@ pub(crate) fn shadow_page_at(
                     removed_requests: u64::MAX,
                     removed_tokens: u64::MAX,
                     rows_digest: digest,
+                    snapshot: 0,
                 },
             ),
         };
-        pending_memos.push((memo_key, next.0, next.1));
+        memos.push(PendingMemo {
+            key: memo_key,
+            revision,
+            observed_unix: now,
+            memo: next,
+        });
     }
-    counts.family_memos_dropped = drop_old_family_memos(&mut index.claude_request_census, now);
+    counts.family_memos_dropped = drop_old_family_memos(ledger, now);
     let page_complete = families_incomplete == 0 && census_complete && sweep_complete;
+    counts.coverage_complete = u64::from(page_complete);
     let coverage = CoverageRow {
         row: "coverage",
         v: JSONL_VERSION,
@@ -1344,36 +1503,243 @@ pub(crate) fn shadow_page_at(
         telemetry_sweep_complete: sweep_complete,
         rows_unavailable_roots: counts.rows_unavailable_roots,
     };
-    let published = append_jsonl(support_dir, now, &lines, Some(coverage), &mut counts);
-    // A memo is the reader's basis (unchanged rows, the next removal delta):
-    // it moves only when the rows it describes were written.
-    if published {
-        for (key, revision, memo) in pending_memos {
-            let _ = index.claude_request_census.insert(
-                key,
-                ClaudeRequestCensusRecord::family_record(revision, now, memo),
-            );
+    // The rows move to the batch under their own admission; the page's
+    // admission ends here.
+    let line_bytes = lines.iter().map(|line| line.len() + 1).sum::<usize>() + 1024;
+    let batch = ShadowReservation::admit(line_bytes);
+    counts.admitted_peak_bytes = budget.granted().saturating_add(line_bytes) as u64;
+    drop(budget);
+    let (lines, memos, reservation) = match batch {
+        Some(reservation) => (lines, memos, Some(reservation)),
+        None => {
+            counts.refused_budget = 1;
+            (Vec::new(), Vec::new(), None)
         }
-    } else {
-        counts.family_memos_withheld = pending_memos.len() as u64;
+    };
+    hand_off(
+        &end,
+        Some(&mut *ledger),
+        lines,
+        coverage,
+        memos,
+        reservation,
+        &mut counts,
+    );
+    emit(&end, Some(&*ledger), index, &mut counts);
+    counts
+}
+
+/// A page whose shadow does not take its captures: they are dropped by the
+/// next page (deposited before this one), and older ones now.
+fn purge_captures(scope_key: &Path, counts: &mut ClaudeRequestMoneyShadowCounts) {
+    if let Ok(mut last) = LAST_SHADOW.lock() {
+        if let Some(previous) = last.insert(scope_key.to_path_buf(), Instant::now()) {
+            counts.captures_purged = capture::purge_before(scope_key, previous);
+        }
     }
-    counts.coverage_complete = u64::from(page_complete && published);
-    // The ledger's persistent funding follows what it now holds.
-    if !fund_ledger(&index.claude_request_census) {
-        counts.ledger_unfunded = 1;
+}
+
+/// A refused page: a false coverage row (and the ledger's own progress) go
+/// to the writer; nothing else is written.
+fn refuse(
+    end: &PageEnd<'_>,
+    mut ledger: Option<&mut ClaudeLedger>,
+    index: &ScanIndex,
+    families: usize,
+    mut counts: ClaudeRequestMoneyShadowCounts,
+) -> ClaudeRequestMoneyShadowCounts {
+    let coverage = CoverageRow {
+        row: "coverage",
+        v: JSONL_VERSION,
+        observed_unix: end.now,
+        coverage_complete: false,
+        families: families as u64,
+        families_incomplete: families as u64,
+        refused: true,
+        truncated: false,
+        telemetry_sweep_complete: false,
+        rows_unavailable_roots: 0,
+    };
+    let reservation = ShadowReservation::admit(1024);
+    hand_off(
+        end,
+        ledger.as_deref_mut(),
+        Vec::new(),
+        coverage,
+        Vec::new(),
+        reservation,
+        &mut counts,
+    );
+    emit(end, ledger.as_deref(), index, &mut counts);
+    counts
+}
+
+/// Hand the page's rows, its coverage row, its memos and the ledger's
+/// bounded save to the writer (after the page, outside the sync lock).
+fn hand_off(
+    end: &PageEnd<'_>,
+    ledger: Option<&mut ClaudeLedger>,
+    rows: Vec<String>,
+    coverage: CoverageRow,
+    memos: Vec<PendingMemo>,
+    reservation: Option<ShadowReservation>,
+    counts: &mut ClaudeRequestMoneyShadowCounts,
+) {
+    let mut reservations = reservation.into_iter().collect::<Vec<_>>();
+    let mut save = None;
+    let mut ledger = ledger;
+    if let Some(ledger) = ledger.as_deref_mut() {
+        match ledger.take_save() {
+            Some((taken, reservation)) => {
+                counts.ledger_save_shards = taken.shards() as u64;
+                counts.ledger_save_bytes = taken.bytes() as u64;
+                reservations.push(reservation);
+                save = Some(taken);
+            }
+            None => counts.ledger_save_refused = u64::from(ledger.dirty_shards() > 0),
+        }
     }
-    counts.ledger_funded_bytes = LEDGER_FUNDED.load(Ordering::Acquire) as u64;
-    counts.elapsed_us = started.elapsed().as_micros() as u64;
+    counts.jsonl_queued = rows.len() as u64 + 1;
+    let job = WriteJob {
+        support_dir: end.support_dir.to_path_buf(),
+        jsonl: JsonlBatch {
+            now: end.now,
+            rows,
+            coverage,
+        },
+        memos,
+        save,
+        reservations,
+    };
+    let outcome = match ledger {
+        Some(ledger) => store::submit_batch(ledger, job),
+        None => store::submit_unledgered(job),
+    };
+    if let Err(job) = outcome {
+        counts.batch_dropped = 1;
+        counts.family_memos_withheld += job.memos.len() as u64;
+    }
+}
+
+/// The page's log line (its counts, the tail's, the rows', the scope's and
+/// the state of the index's records and the ledger).
+fn emit(
+    end: &PageEnd<'_>,
+    ledger: Option<&ClaudeLedger>,
+    index: &ScanIndex,
+    counts: &mut ClaudeRequestMoneyShadowCounts,
+) {
+    counts.elapsed_us = end.started.elapsed().as_micros() as u64;
     emit_line(&ShadowLine {
         counting: CLAUDE_REQUEST_COUNTING,
-        census_complete,
-        counts: &counts,
-        tail: &tail,
-        rows: &row_counts,
-        scope: &scope_debt,
-        ledger: &claude_request_ledger::ledger_state_counts(&index.claude_request_census),
+        census_complete: end.census_complete,
+        counts,
+        tail: &end.tail,
+        rows: &end.rows,
+        scope: &end.scope,
+        ledger: &claude_request_ledger::ledger_state_counts(&index.claude_request_census, ledger),
     });
-    counts
+}
+
+/// The writer's outcome of earlier batches: JSONL counts, and the memos of
+/// published batches move now (each refused if the ledger has no room).
+fn apply_results(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    counts: &mut ClaudeRequestMoneyShadowCounts,
+) {
+    for result in store::take_results(support_dir, ledger) {
+        counts.jsonl_rows += result.jsonl.rows;
+        counts.jsonl_truncated += result.jsonl.truncated;
+        counts.jsonl_sealed += result.jsonl.sealed;
+        counts.jsonl_failed += result.jsonl.failed;
+        if !result.jsonl.published {
+            counts.family_memos_withheld += result.memos.len() as u64;
+            continue;
+        }
+        for memo in result.memos {
+            let record = ClaudeRequestCensusRecord::family_record(
+                memo.revision,
+                memo.observed_unix,
+                memo.memo,
+            );
+            let fits = ledger.census().serialized_headroom() >= memo.key.len() + 1024;
+            let stored =
+                fits && ledger.insert(memo.key, record) == ClaudeRequestCensusInsert::Stored;
+            counts.family_memos_withheld += u64::from(!stored);
+        }
+    }
+}
+
+/// Record the message-only ids one parse's capture saw as the ledger's
+/// `mh:` record of that file, bound to the file record's revision. Its
+/// growth is checked against the ledger's budgets before anything changes.
+fn note_message_record(
+    ledger: &mut ClaudeLedger,
+    index: &ScanIndex,
+    key: &str,
+    fingerprint: &str,
+    capture: &ClaudeResponseCapture,
+    counts: &mut ClaudeRequestMoneyShadowCounts,
+) {
+    if capture.is_refused() {
+        return;
+    }
+    let Some(record) = index
+        .claude_request_census
+        .get(key)
+        .filter(|record| fingerprint_matches(record, fingerprint))
+    else {
+        return;
+    };
+    let next = ClaudeRequestCensusRecord::message_record(record, capture.message_only_hashes());
+    let message = message_key(key);
+    if ledger.get(&message) == Some(&next) {
+        return;
+    }
+    let hashes = next.request_hashes().len();
+    let census = ledger.census();
+    let fits = census.hash_headroom() >= hashes
+        && census.serialized_headroom() >= hashes * 11 + message.len() + 512;
+    if fits && ledger.insert(message, next) == ClaudeRequestCensusInsert::Stored {
+        counts.message_records_written += 1;
+    } else {
+        counts.message_records_refused += 1;
+    }
+}
+
+/// A bounded round-robin over the `mh:` records: one whose file record is
+/// gone, retired or of another revision is dropped.
+fn prune_message_records(
+    ledger: &mut ClaudeLedger,
+    index: &ScanIndex,
+    counts: &mut ClaudeRequestMoneyShadowCounts,
+) {
+    let cursor = std::mem::take(&mut ledger.message_cursor);
+    let due = ledger
+        .census()
+        .records_with_prefix(MESSAGE_KEY_PREFIX)
+        .filter(|(key, _)| key.as_str() > cursor.as_str())
+        .take(MESSAGE_PRUNE_PER_PAGE)
+        .map(|(key, record)| {
+            let file = &key[MESSAGE_KEY_PREFIX.len()..];
+            let current = index
+                .claude_request_census
+                .get(file)
+                .is_some_and(|file| file.same_fingerprint(record) && file.retired().is_none());
+            (key.clone(), current)
+        })
+        .collect::<Vec<_>>();
+    let wrapped = due.len() < MESSAGE_PRUNE_PER_PAGE;
+    let mut last = String::new();
+    for (key, current) in due {
+        if !current {
+            ledger.remove(&key);
+            counts.message_records_pruned += 1;
+        }
+        last = key;
+    }
+    ledger.message_cursor = if wrapped { String::new() } else { last };
 }
 
 fn tally(counts: &mut ClaudeRequestMoneyShadowCounts, body: &ClaudeRequestBody, complete: bool) {
@@ -1466,19 +1832,16 @@ fn rows_digest(now: u64, body: &ClaudeRequestBody, complete: bool) -> u64 {
 }
 
 /// Drop family memos no page rebuilt within the retention window.
-fn drop_old_family_memos(census: &mut ClaudeRequestCensus, now: u64) -> u64 {
+fn drop_old_family_memos(ledger: &mut ClaudeLedger, now: u64) -> u64 {
     let cutoff = now.saturating_sub(FAMILY_MEMO_RETENTION_SECONDS);
-    let stale = census
-        .records()
-        .filter(|(key, record)| {
-            key.starts_with(FAMILY_KEY_PREFIX)
-                && record.family_memo().is_some()
-                && record.window() < cutoff
-        })
+    let stale = ledger
+        .census()
+        .records_with_prefix(FAMILY_KEY_PREFIX)
+        .filter(|(_, record)| record.family_memo().is_some() && record.window() < cutoff)
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     for key in &stale {
-        census.remove(key);
+        ledger.remove(key);
     }
     stale.len() as u64
 }
@@ -1499,52 +1862,66 @@ fn day_stamp(unix: u64) -> Option<String> {
 /// a coverage row is written when it changes (and once per day file).
 static LAST_COVERAGE: Mutex<BTreeMap<PathBuf, (String, bool)>> = Mutex::new(BTreeMap::new());
 
-/// Append the page's rows and its coverage row to today's capped file and
+/// One page's rows for today's JSONL file (written by the writer).
+pub(crate) struct JsonlBatch {
+    now: u64,
+    rows: Vec<String>,
+    coverage: CoverageRow,
+}
+
+/// What the writer did with one batch's rows.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct JsonlOutcome {
+    pub(crate) rows: u64,
+    pub(crate) truncated: u64,
+    pub(crate) sealed: u64,
+    pub(crate) failed: u64,
+    /// Every row and the coverage row were written.
+    pub(crate) published: bool,
+}
+
+/// Append a batch's rows and its coverage row to the day's capped file and
 /// drop own files older than the retention window. When the day's cap would
 /// be passed, the file is sealed with a false coverage row (`truncated`)
 /// and takes nothing more that day. Failures are counted, never raised.
-/// True when every row and the coverage row were written (published).
-fn append_jsonl(
-    support_dir: &Path,
-    now: u64,
-    rows: &[String],
-    coverage: Option<CoverageRow>,
-    counts: &mut ClaudeRequestMoneyShadowCounts,
-) -> bool {
+/// Runs on the writer thread only.
+fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
+    let mut outcome = JsonlOutcome::default();
+    let now = batch.now;
     let Some(today) = day_stamp(now) else {
-        counts.jsonl_failed += 1;
-        return false;
+        outcome.failed += 1;
+        return outcome;
     };
     let dir = support_dir.join("diagnostics");
     if std::fs::create_dir_all(&dir).is_err() {
-        counts.jsonl_failed += 1;
-        return false;
+        outcome.failed += 1;
+        return outcome;
     }
     let path = dir.join(format!("{JSONL_PREFIX}{today}.jsonl"));
     let mut size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
     let sealed_marker = dir.join(format!(".{JSONL_PREFIX}{today}.sealed"));
     if sealed_marker.exists() {
-        counts.jsonl_truncated += rows.len() as u64;
-        return false;
+        outcome.truncated += batch.rows.len() as u64;
+        return outcome;
     }
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
     let mut buffer = Vec::new();
     let mut sealed = false;
-    for row in rows {
+    for row in &batch.rows {
         let bytes = row.len() as u64 + 1;
         if size + bytes > room {
-            counts.jsonl_truncated += 1;
+            outcome.truncated += 1;
             sealed = true;
             continue;
         }
         size += bytes;
         buffer.extend_from_slice(row.as_bytes());
         buffer.push(b'\n');
-        counts.jsonl_rows += 1;
+        outcome.rows += 1;
     }
     let coverage = if sealed {
-        counts.jsonl_sealed = 1;
-        Some(CoverageRow {
+        outcome.sealed = 1;
+        CoverageRow {
             row: "coverage",
             v: JSONL_VERSION,
             observed_unix: now,
@@ -1555,23 +1932,21 @@ fn append_jsonl(
             truncated: true,
             telemetry_sweep_complete: false,
             rows_unavailable_roots: 0,
-        })
+        }
     } else {
-        coverage
+        batch.coverage.clone()
     };
+    let flag = coverage.coverage_complete;
+    let changed = LAST_COVERAGE.lock().map_or(true, |last| {
+        last.get(support_dir) != Some(&(today.clone(), flag))
+    });
     let mut coverage_flag = None;
-    if let Some(coverage) = coverage {
-        let flag = coverage.coverage_complete;
-        let changed = LAST_COVERAGE.lock().map_or(true, |last| {
-            last.get(support_dir) != Some(&(today.clone(), flag))
-        });
-        if changed || sealed || !path.exists() {
-            coverage_flag = Some(flag);
-            if let Ok(json) = serde_json::to_string(&coverage) {
-                buffer.extend_from_slice(json.as_bytes());
-                buffer.push(b'\n');
-                counts.jsonl_rows += 1;
-            }
+    if changed || sealed || !path.exists() {
+        coverage_flag = Some(flag);
+        if let Ok(json) = serde_json::to_string(&coverage) {
+            buffer.extend_from_slice(json.as_bytes());
+            buffer.push(b'\n');
+            outcome.rows += 1;
         }
     }
     let mut written = true;
@@ -1583,21 +1958,30 @@ fn append_jsonl(
             .and_then(|mut file| file.write_all(&buffer))
             .is_ok();
         if !written {
-            counts.jsonl_failed += 1;
+            outcome.failed += 1;
         }
     }
-    // The last written coverage flag moves only with a successful write.
-    if let (true, Some(flag), Ok(mut last)) = (written, coverage_flag, LAST_COVERAGE.lock()) {
-        last.insert(support_dir.to_path_buf(), (today.clone(), flag));
+    // The last written coverage flag moves only with a successful write; a
+    // failed one forgets it, so the next batch writes its flag again.
+    if let Ok(mut last) = LAST_COVERAGE.lock() {
+        match (written, coverage_flag) {
+            (true, Some(flag)) => {
+                last.insert(support_dir.to_path_buf(), (today.clone(), flag));
+            }
+            (false, _) => {
+                last.remove(support_dir);
+            }
+            _ => {}
+        }
     }
     if sealed {
         let _ = std::fs::write(&sealed_marker, b"");
     }
-    let published = written && !sealed;
+    outcome.published = written && !sealed;
     if let Some(oldest) = day_stamp(now.saturating_sub((JSONL_RETENTION_DAYS * 86_400) as u64)) {
         prune_jsonl(&dir, &oldest);
     }
-    published
+    outcome
 }
 
 /// Drop own day files (and seal markers) older than `oldest`.
