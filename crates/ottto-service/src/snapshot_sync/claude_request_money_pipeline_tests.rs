@@ -1781,3 +1781,95 @@ fn p2a_whole_file_copy_same_session_emits_one_union_with_mac_wide_distinct_ids()
     assert_eq!(requests, PIPELINE_SESSIONS.len() as u64);
     assert_eq!(ids.len(), PIPELINE_SESSIONS.len());
 }
+
+
+#[test]
+#[serial(client_report)]
+fn p2a_literal_semantic_422_isolates_poison_and_accepts_healthy_sibling() {
+    use crate::client_report::{observe, reset_for_test, ClientReportReason};
+    reset_for_test();
+    let scope = unique_poison_scope();
+    let items = vec![p2a_wire_body(1), p2a_wire_body(2)];
+    let bad = p2a_fp(&items[0]).to_owned();
+    let good = p2a_fp(&items[1]).to_owned();
+    let mut progress = test_upload_progress();
+    let mut accepted = 0;
+    let mut attempts = 0;
+    let result = upload_resumable_batches_with_body_witness(
+        &items,
+        &scope,
+        &mut progress,
+        &mut accepted,
+        p2a_fp,
+        p2a_witness,
+        |batch| {
+            attempts += 1;
+            if batch.iter().any(|item| p2a_fp(item) == bad) {
+                Err(anyhow::Error::new(BatchRejected { status: 422, body_excerpt: Some(
+                    r#"{"detail":[{"loc":["body","snapshots",0,"removed_usage","input_tokens"],"type":"greater_than_equal"}]}"#.into()) }))
+            } else {
+                Ok(accepted_batch(batch.len()))
+            }
+        },
+        |_| Ok(()),
+    );
+    assert!(result.is_err());
+    assert_eq!(attempts, 3);
+    assert_eq!(accepted, 1);
+    assert!(progress.accepted_fingerprints.contains(&good));
+    assert!(!progress.accepted_fingerprints.contains(&bad));
+    assert!(progress
+        .quarantined_fingerprints
+        .values()
+        .all(|record| record.version_skew_attempts == 0));
+    assert_eq!(observe().quantity(ClientReportReason::Poisoned), 1);
+    assert!(counted_poison_fingerprints_for_test(&scope).contains(&bad));
+    assert!(!counted_poison_fingerprints_for_test(&scope).contains(&good));
+    reset_for_test();
+}
+
+#[test]
+#[serial(client_report)]
+fn p2a_confirmed_literal_skew_keeps_ordinary_sibling_collecting() {
+    use crate::client_report::{observe, reset_for_test, ClientReportReason};
+    reset_for_test();
+    let scope = unique_poison_scope();
+    let mut ordinary = p2a_wire_body(2);
+    for field in [
+        "usage_accounting_contract",
+        "removed_usage",
+        "removed_request_count",
+        "telemetry_owned_complete",
+    ] {
+        ordinary.as_object_mut().unwrap().remove(field);
+    }
+    let items = vec![p2a_wire_body(1), ordinary];
+    let bad = p2a_fp(&items[0]).to_owned();
+    let good = p2a_fp(&items[1]).to_owned();
+    let mut progress = test_upload_progress();
+    let mut accepted = 0;
+    let mut attempts = 0;
+    let result = upload_resumable_batches_with_body_witness(
+        &items, &scope, &mut progress, &mut accepted, p2a_fp, p2a_witness,
+        |batch| {
+            attempts += 1;
+            if batch.iter().any(|item| p2a_fp(item) == bad) {
+                Err(anyhow::Error::new(BatchRejected { status: 422, body_excerpt: Some(
+                    r#"{"detail":[{"loc":["body","snapshots",0,"usage_accounting_contract"],"type":"literal_error"}]}"#.into()) }))
+            } else { Ok(accepted_batch(batch.len())) }
+        }, |_| Ok(()),
+    ).unwrap();
+    assert!(
+        matches!(result, ResumableUploadResult::Shed { retry_after: Some(delay) } if delay == Duration::from_secs(1800))
+    );
+    assert_eq!(attempts, 2);
+    assert_eq!(accepted, 1);
+    assert!(progress.accepted_fingerprints.contains(&good));
+    assert_eq!(progress.quarantined_fingerprints.len(), 1);
+    assert_eq!(
+        progress.quarantined_fingerprints[&bad].version_skew_attempts,
+        1
+    );
+    assert_eq!(observe().quantity(ClientReportReason::Poisoned), 0);
+    reset_for_test();
+}

@@ -1142,7 +1142,7 @@ impl ClaudeLedger {
         }
         // The general census codec may replace an over-budget value with a
         // lossy tombstone. Money custody must instead retain its predecessor.
-        let old = self.get(&key).cloned();
+        let old = self.take(&key);
         if self.insert(key.clone(), record) == ClaudeRequestCensusInsert::Stored {
             return true;
         }

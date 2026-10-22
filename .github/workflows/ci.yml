@@ -153,11 +153,12 @@ jobs:
         run: |
           set -euo pipefail
           export OTTTO_MONEY_PARITY_ROOT="$RUNNER_TEMP/money-saved-inputs"
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/money-parity-target"
+          # Separate targets force each source tree to compile independently.
+          # Shared targets can reuse the base binary after a worktree switch.
           git worktree add --detach "$RUNNER_TEMP/money-base" dba838f067ed58f8d45f6af1a6cabae1e08fc837
           cp crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs "$RUNNER_TEMP/money-base/crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs"
-          OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-base.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
-          OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-head.json" cargo test -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-base-target" OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-base.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-head.json" cargo test -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
           diff -u "$RUNNER_TEMP/money-base.json" "$RUNNER_TEMP/money-head.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
