@@ -16,10 +16,12 @@
 //!   under `SnapshotProgressLock`.
 //!
 //! Taking the same lock therefore proves no writer is between creating and
-//! settling such a file. The lock is necessary but not trusted alone: the
-//! file must also be an old, single-link regular file owned by this user
-//! whose recorded writer pid no longer exists, and its identity must be
-//! unchanged immediately before the unlink. Any doubt keeps the file.
+//! settling such a file. Only a single-link lock file owned by this user is
+//! ever flocked, so a hard-linked copy of another tree's live lock is not.
+//! The lock is necessary but not trusted alone: the file must also be an
+//! old, single-link regular file owned by this user whose recorded writer
+//! pid no longer exists, and its identity must be unchanged immediately
+//! before the unlink. Any doubt keeps the file.
 //!
 //! Holding a free lock is not harmless either: every writer takes it
 //! without blocking, so a save that another daemon starts while the sweep
@@ -29,9 +31,11 @@
 //! taken, while any other process of this user runs an executable named
 //! `ottto-service`: the process table is read before the pass applies
 //! anything and again before every lock attempt, and once it shows such a
-//! process, or cannot be read before the time budget runs out, the rest of
-//! the pass applies nothing (`skipped.other_daemon`). The startup pass runs before this daemon
-//! starts any worker of its own. What remains is a daemon launched between
+//! process, or cannot be read completely before the time budget runs out,
+//! the rest of the pass applies nothing (`skipped.other_daemon`). An empty
+//! table, one without this process, or a live process of this user whose
+//! name or executable cannot be read all count as unreadable. The startup
+//! pass runs before this daemon starts any worker of its own. What remains is a daemon launched between
 //! the last process-table read and the unlink, a window of a few syscalls;
 //! launchd starts one instance per label, so that needs a second, manually
 //! started daemon racing the first one's startup, and even then its save
@@ -285,7 +289,7 @@ fn is_daemon_path(path: &Path) -> bool {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod process_table {
-    use std::mem::{size_of, MaybeUninit};
+    use std::mem::size_of;
 
     /// `PROC_PIDT_SHORTBSDINFO` and `struct proc_bsdshortinfo` from
     /// `<sys/proc_info.h>`. Unlike the full BSD info, the kernel serves it
@@ -294,40 +298,108 @@ mod process_table {
     const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
 
     #[repr(C)]
+    #[derive(Clone, Copy, Default)]
     #[allow(dead_code)] // Mirrors the C layout; only some fields are read.
-    struct ShortBsdInfo {
-        pid: u32,
-        ppid: u32,
-        pgid: u32,
-        status: u32,
-        comm: [u8; 16],
-        flags: u32,
-        uid: libc::uid_t,
-        gid: libc::gid_t,
-        ruid: libc::uid_t,
-        rgid: libc::gid_t,
-        svuid: libc::uid_t,
-        svgid: libc::gid_t,
-        rfu: u32,
+    pub(super) struct ShortBsdInfo {
+        pub(super) pid: u32,
+        pub(super) ppid: u32,
+        pub(super) pgid: u32,
+        pub(super) status: u32,
+        pub(super) comm: [u8; 16],
+        pub(super) flags: u32,
+        pub(super) uid: libc::uid_t,
+        pub(super) gid: libc::gid_t,
+        pub(super) ruid: libc::uid_t,
+        pub(super) rgid: libc::gid_t,
+        pub(super) svuid: libc::uid_t,
+        pub(super) svgid: libc::gid_t,
+        pub(super) rfu: u32,
     }
 
-    fn all_pids() -> std::io::Result<Vec<libc::pid_t>> {
-        for _ in 0..4 {
-            let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-            if estimate <= 0 {
-                return Err(std::io::Error::last_os_error());
+    /// A libproc call's C return value and the errno read right after it.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Raw {
+        pub(super) value: libc::c_int,
+        pub(super) errno: i32,
+    }
+
+    /// The three libproc calls, behind a seam so tests can make them fail.
+    pub(super) trait Libproc {
+        /// `proc_listallpids`; an empty buffer asks for an estimate.
+        fn list_all_pids(&self, pids: &mut [libc::pid_t]) -> Raw;
+        /// `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`.
+        fn short_info(&self, pid: libc::pid_t, info: &mut ShortBsdInfo) -> Raw;
+        /// `proc_pidpath`.
+        fn path(&self, pid: libc::pid_t, buffer: &mut [u8]) -> Raw;
+    }
+
+    struct Native;
+
+    fn raw(value: libc::c_int) -> Raw {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        Raw { value, errno }
+    }
+
+    impl Libproc for Native {
+        fn list_all_pids(&self, pids: &mut [libc::pid_t]) -> Raw {
+            if pids.is_empty() {
+                return raw(unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) });
             }
-            let capacity = estimate as usize + 256;
+            let Ok(bytes) = libc::c_int::try_from(std::mem::size_of_val(pids)) else {
+                return Raw {
+                    value: -1,
+                    errno: libc::EOVERFLOW,
+                };
+            };
+            raw(unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) })
+        }
+
+        fn short_info(&self, pid: libc::pid_t, info: &mut ShortBsdInfo) -> Raw {
+            raw(unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    PROC_PIDT_SHORTBSDINFO,
+                    0,
+                    (info as *mut ShortBsdInfo).cast(),
+                    size_of::<ShortBsdInfo>() as libc::c_int,
+                )
+            })
+        }
+
+        fn path(&self, pid: libc::pid_t, buffer: &mut [u8]) -> Raw {
+            let size = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+            raw(unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), size) })
+        }
+    }
+
+    fn failure(call: Raw) -> std::io::Error {
+        match call.errno {
+            0 => std::io::Error::other("process table call failed without an error"),
+            errno => std::io::Error::from_raw_os_error(errno),
+        }
+    }
+
+    fn all_pids(api: &dyn Libproc, own: libc::pid_t) -> std::io::Result<Vec<libc::pid_t>> {
+        for _ in 0..4 {
+            // libproc returns 0, not -1, when the underlying syscall fails,
+            // so an empty table is a failure too.
+            let estimate = api.list_all_pids(&mut []);
+            if estimate.value <= 0 {
+                return Err(failure(estimate));
+            }
+            let capacity = estimate.value as usize + 256;
             let mut pids = vec![0 as libc::pid_t; capacity];
-            let bytes = libc::c_int::try_from(capacity * size_of::<libc::pid_t>())
-                .map_err(std::io::Error::other)?;
-            let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-            if count < 0 {
-                return Err(std::io::Error::last_os_error());
+            let count = api.list_all_pids(&mut pids);
+            if count.value <= 0 {
+                return Err(failure(count));
             }
             // A full buffer may have been truncated; ask again.
-            if (count as usize) < capacity {
-                pids.truncate(count as usize);
+            if (count.value as usize) < capacity {
+                pids.truncate(count.value as usize);
+                // A table without this very process is not the whole table.
+                if !pids.contains(&own) {
+                    return Err(std::io::Error::other("process table without this process"));
+                }
                 return Ok(pids);
             }
         }
@@ -337,61 +409,69 @@ mod process_table {
     pub(super) fn other_daemon_running(
         out_of_time: &mut dyn FnMut() -> bool,
     ) -> std::io::Result<bool> {
-        let own = std::process::id();
-        let uid = unsafe { libc::getuid() };
-        for pid in all_pids()? {
+        let own = libc::pid_t::try_from(std::process::id()).map_err(std::io::Error::other)?;
+        other_daemon_running_with(&Native, own, unsafe { libc::getuid() }, out_of_time)
+    }
+
+    /// Only ESRCH (the process exited since the listing) is ignored; any
+    /// other failure to read a process leaves its identity unknown, which
+    /// fails the whole read.
+    pub(super) fn other_daemon_running_with(
+        api: &dyn Libproc,
+        own: libc::pid_t,
+        uid: libc::uid_t,
+        out_of_time: &mut dyn FnMut() -> bool,
+    ) -> std::io::Result<bool> {
+        for pid in all_pids(api, own)? {
             if out_of_time() {
                 return Err(super::timed_out());
             }
-            if pid <= 0 || pid as u32 == own {
+            if pid <= 0 || pid == own {
                 continue;
             }
-            let mut info = MaybeUninit::<ShortBsdInfo>::zeroed();
-            let size = size_of::<ShortBsdInfo>() as libc::c_int;
-            let filled = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    PROC_PIDT_SHORTBSDINFO,
-                    0,
-                    info.as_mut_ptr().cast(),
-                    size,
-                )
-            };
-            if filled <= 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    // Exited since the listing.
+            let mut info = ShortBsdInfo::default();
+            let filled = api.short_info(pid, &mut info);
+            if filled.value <= 0 {
+                if filled.errno == libc::ESRCH {
                     continue;
                 }
-                return Err(error);
+                return Err(failure(filled));
             }
-            if filled != size {
+            if filled.value != size_of::<ShortBsdInfo>() as libc::c_int {
                 return Err(std::io::Error::other("short process info"));
             }
-            let info = unsafe { info.assume_init() };
             if info.uid != uid && info.ruid != uid {
                 continue;
             }
             // `comm` is the executed file's name, cut at 16 bytes, which is
             // longer than the daemon's name.
             let comm = info.comm.split(|byte| *byte == 0).next().unwrap_or(&[]);
-            if super::is_daemon_name(comm)
-                || pid_path(pid).is_some_and(|path| super::is_daemon_path(&path))
-            {
+            if super::is_daemon_name(comm) {
+                return Ok(true);
+            }
+            if pid_path(api, pid)?.is_some_and(|path| super::is_daemon_path(&path)) {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    fn pid_path(pid: libc::pid_t) -> Option<std::path::PathBuf> {
+    /// `None` only when the process exited.
+    fn pid_path(
+        api: &dyn Libproc,
+        pid: libc::pid_t,
+    ) -> std::io::Result<Option<std::path::PathBuf>> {
         use std::os::unix::ffi::OsStrExt;
         let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        let length =
-            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
-        let length = usize::try_from(length).ok().filter(|length| *length > 0)?;
-        buffer.truncate(length);
-        Some(std::ffi::OsStr::from_bytes(&buffer).into())
+        let length = api.path(pid, &mut buffer);
+        if length.value <= 0 {
+            if length.errno == libc::ESRCH {
+                return Ok(None);
+            }
+            return Err(failure(length));
+        }
+        buffer.truncate((length.value as usize).min(buffer.len()));
+        Ok(Some(std::ffi::OsStr::from_bytes(&buffer).into()))
     }
 }
 
@@ -408,6 +488,7 @@ mod process_table {
     ) -> std::io::Result<bool> {
         let own = std::process::id();
         let uid = unsafe { libc::getuid() };
+        let mut saw_own = false;
         for entry in std::fs::read_dir("/proc")? {
             if out_of_time() {
                 return Err(super::timed_out());
@@ -421,6 +502,7 @@ mod process_table {
                 continue;
             };
             if pid == own {
+                saw_own = true;
                 continue;
             }
             let dir = entry.path();
@@ -447,13 +529,24 @@ mod process_table {
                 Err(error) => return Err(error),
             };
             let comm = comm.strip_suffix(b"\n").unwrap_or(&comm);
-            let exe = std::fs::read_link(dir.join("exe")).ok().map(|exe| {
-                let exe = exe.to_string_lossy().into_owned();
-                std::path::PathBuf::from(exe.strip_suffix(" (deleted)").unwrap_or(&exe))
-            });
-            if super::is_daemon_name(comm) || exe.is_some_and(|exe| super::is_daemon_path(&exe)) {
+            if super::is_daemon_name(comm) {
                 return Ok(true);
             }
+            // An unreadable executable link of a live process of this user
+            // leaves its identity unknown, which fails the whole read.
+            let exe = match std::fs::read_link(dir.join("exe")) {
+                Ok(exe) => exe.to_string_lossy().into_owned(),
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let exe = std::path::PathBuf::from(exe.strip_suffix(" (deleted)").unwrap_or(&exe));
+            if super::is_daemon_path(&exe) {
+                return Ok(true);
+            }
+        }
+        // A table without this very process is not the whole table.
+        if !saw_own {
+            return Err(std::io::Error::other("process table without this process"));
         }
         Ok(false)
     }
@@ -1167,8 +1260,15 @@ impl Sweep<'_> {
         let Ok(lock_name) = CString::new(format!("{}.lock", artifact.base)) else {
             return not_checked(Verdict::Error, bytes);
         };
+        // A hard-linked lock may be another tree's live lock: never flock it.
         let lock_identity = match stat_at(dir, &lock_name) {
-            Ok(identity) if identity.is_regular() && identity.uid == self.policy.uid => identity,
+            Ok(identity)
+                if identity.is_regular()
+                    && identity.uid == self.policy.uid
+                    && identity.nlink == 1 =>
+            {
+                identity
+            }
             Ok(_) => return not_checked(Verdict::Skip(SkipReason::UnsafeEntry), bytes),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return not_checked(Verdict::Skip(SkipReason::NoLockFile), bytes)
@@ -1245,7 +1345,11 @@ impl Sweep<'_> {
             Err(_) => return Err(LockFailure::Error),
         };
         match stat_fd(fd.as_raw_fd()) {
-            Ok(opened) if opened.same_object(expected) && opened.is_regular() => {}
+            Ok(opened) if opened.same_object(expected) && opened.is_regular() => {
+                if opened.nlink != 1 {
+                    return Err(LockFailure::Skip(SkipReason::UnsafeEntry));
+                }
+            }
             Ok(_) => return Err(LockFailure::Skip(SkipReason::Changed)),
             Err(_) => return Err(LockFailure::Error),
         }

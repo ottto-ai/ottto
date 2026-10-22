@@ -1327,3 +1327,301 @@ fn deadline_during_the_process_table_read_applies_nothing() {
         assert!(lock_is_free(lock));
     }
 }
+
+#[test]
+fn hardlinked_lock_is_never_flocked() {
+    let f = fixture();
+    let orphan = plant_orphan(&f.dest, INDEX);
+    let lock = f.dest.join(format!("{INDEX}.lock"));
+    // Another tree's live lock, the same inode under a second name.
+    let live_lock = f.root.join("live.lock");
+    fs::hard_link(&lock, &live_lock).unwrap();
+    let live_holder = hold_lock(&live_lock);
+    let policy = Policy {
+        before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+        ..names_and_locks_only()
+    };
+
+    let report = apply(&f.support, &policy);
+
+    // A flock attempt would have counted the held lock as `locked`.
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.skipped.unsafe_entry, 1);
+    assert_eq!(report.skipped.locked, 0);
+    assert!(orphan.exists() && lock.exists() && live_lock.exists());
+    drop(live_holder);
+    assert!(lock_is_free(&lock));
+    let plan = sweep(&f.support, Mode::Plan, &policy, true);
+    assert_eq!(plan.skipped.unsafe_entry, 1);
+    assert_eq!(plan.candidates, 0);
+}
+
+#[test]
+fn lock_hardlinked_after_the_first_look_is_never_flocked() {
+    let f = fixture();
+    plant_orphan(&f.dest, INDEX);
+    let lock = f.dest.join(format!("{INDEX}.lock"));
+    let lock_name = CString::new(format!("{INDEX}.lock")).unwrap();
+    let dir = fs::File::open(&f.dest).expect("open destination");
+    let expected = stat_at(dir.as_raw_fd(), &lock_name).expect("first look");
+    assert_eq!(expected.nlink, 1);
+    // Linked between the first look and the open.
+    let live_lock = f.root.join("live.lock");
+    fs::hard_link(&lock, &live_lock).unwrap();
+    let live_holder = hold_lock(&live_lock);
+    let policy = names_and_locks_only();
+    let sweep = Sweep {
+        mode: Mode::Apply,
+        policy: &policy,
+        started: Instant::now(),
+        record_entries: false,
+        report: SweepReport::default(),
+        deadline_checks: 0,
+    };
+
+    let result = sweep.lock(dir.as_raw_fd(), &lock_name, &expected);
+
+    // Refused before the flock, which would have reported `Locked`.
+    assert!(matches!(
+        result,
+        Err(LockFailure::Skip(SkipReason::UnsafeEntry))
+    ));
+    drop(live_holder);
+    assert!(lock_is_free(&lock));
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod native_process_table {
+    use super::*;
+    use crate::local_state_sweep::process_table::{
+        other_daemon_running_with, Libproc, Raw, ShortBsdInfo,
+    };
+    use std::collections::HashMap;
+
+    const STRANGER: libc::pid_t = 4_242;
+    const VANISHED: libc::pid_t = 4_243;
+    const OTHER_USER: libc::pid_t = 4_244;
+
+    fn ok(value: usize) -> Raw {
+        Raw {
+            value: value as libc::c_int,
+            errno: 0,
+        }
+    }
+
+    fn failed(value: libc::c_int, errno: i32) -> Raw {
+        Raw { value, errno }
+    }
+
+    fn own() -> libc::pid_t {
+        std::process::id() as libc::pid_t
+    }
+
+    fn uid() -> libc::uid_t {
+        unsafe { libc::getuid() }
+    }
+
+    fn process(comm: &str, uid: libc::uid_t) -> ShortBsdInfo {
+        let mut info = ShortBsdInfo {
+            uid,
+            ruid: uid,
+            ..ShortBsdInfo::default()
+        };
+        info.comm[..comm.len()].copy_from_slice(comm.as_bytes());
+        info
+    }
+
+    /// Answers like libproc from fixed tables; an unknown pid has exited.
+    struct FakeLibproc {
+        estimate: Raw,
+        /// The second, buffer-filling listing; `None` lists `pids`.
+        fill: Option<Raw>,
+        pids: Vec<libc::pid_t>,
+        info: HashMap<libc::pid_t, Result<ShortBsdInfo, i32>>,
+        paths: HashMap<libc::pid_t, Result<&'static str, i32>>,
+    }
+
+    impl FakeLibproc {
+        /// This process, a same-user shell and an other-user daemon.
+        fn healthy() -> Self {
+            Self {
+                estimate: ok(3),
+                fill: None,
+                pids: vec![own(), STRANGER, OTHER_USER],
+                info: HashMap::from([
+                    (STRANGER, Ok(process("zsh", uid()))),
+                    (OTHER_USER, Ok(process(DAEMON_EXECUTABLE, uid() + 1))),
+                ]),
+                paths: HashMap::from([(STRANGER, Ok("/bin/zsh"))]),
+            }
+        }
+
+        fn read(&self) -> std::io::Result<bool> {
+            other_daemon_running_with(self, own(), uid(), &mut || false)
+        }
+    }
+
+    impl Libproc for FakeLibproc {
+        fn list_all_pids(&self, pids: &mut [libc::pid_t]) -> Raw {
+            if pids.is_empty() {
+                return self.estimate;
+            }
+            if let Some(fill) = self.fill {
+                return fill;
+            }
+            pids[..self.pids.len()].copy_from_slice(&self.pids);
+            ok(self.pids.len())
+        }
+
+        fn short_info(&self, pid: libc::pid_t, info: &mut ShortBsdInfo) -> Raw {
+            match self.info.get(&pid) {
+                Some(Ok(found)) => {
+                    *info = *found;
+                    ok(std::mem::size_of::<ShortBsdInfo>())
+                }
+                Some(Err(errno)) => failed(0, *errno),
+                None => failed(0, libc::ESRCH),
+            }
+        }
+
+        fn path(&self, pid: libc::pid_t, buffer: &mut [u8]) -> Raw {
+            match self.paths.get(&pid) {
+                Some(Ok(path)) => {
+                    buffer[..path.len()].copy_from_slice(path.as_bytes());
+                    ok(path.len())
+                }
+                Some(Err(errno)) => failed(0, *errno),
+                None => failed(0, libc::ESRCH),
+            }
+        }
+    }
+
+    /// A startup-like pass over three old orphans whose only process-table
+    /// source is `api`.
+    fn sweep_with(api: FakeLibproc) -> (Fixture, Vec<(PathBuf, PathBuf)>, SweepReport) {
+        let f = fixture();
+        let planted = plant_three_orphans(&f.dest);
+        let policy = Policy {
+            other_daemon: OtherDaemonCheck::Probe(Box::new(
+                move |out_of_time: &mut dyn FnMut() -> bool| {
+                    other_daemon_running_with(&api, own(), uid(), out_of_time)
+                },
+            )),
+            ..names_and_locks_only()
+        };
+        let report = apply(&f.support, &policy);
+        (f, planted, report)
+    }
+
+    /// Nothing applied and every lock free, never taken.
+    fn assert_applied_nothing(api: FakeLibproc) {
+        let f = fixture();
+        let planted = plant_three_orphans(&f.dest);
+        let policy = Policy {
+            other_daemon: OtherDaemonCheck::Probe(Box::new(
+                move |out_of_time: &mut dyn FnMut() -> bool| {
+                    other_daemon_running_with(&api, own(), uid(), out_of_time)
+                },
+            )),
+            before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+            ..names_and_locks_only()
+        };
+
+        let report = apply(&f.support, &policy);
+
+        assert_eq!(report.other_daemon_check, OtherDaemonState::ProbeFailed);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.skipped.other_daemon, 3);
+        for (orphan, lock) in &planted {
+            assert!(orphan.exists());
+            assert!(lock_is_free(lock));
+        }
+    }
+
+    #[test]
+    fn healthy_table_without_a_daemon_lets_the_pass_apply() {
+        assert!(!FakeLibproc::healthy().read().expect("readable"));
+        let (_f, planted, report) = sweep_with(FakeLibproc::healthy());
+        assert_eq!(report.other_daemon_check, OtherDaemonState::Clear);
+        assert_eq!(report.removed, 3);
+        for (orphan, lock) in &planted {
+            assert!(!orphan.exists());
+            assert!(lock_is_free(lock));
+        }
+    }
+
+    #[test]
+    fn same_user_daemon_is_found_by_name_or_by_path() {
+        let mut by_name = FakeLibproc::healthy();
+        by_name
+            .info
+            .insert(STRANGER, Ok(process(DAEMON_EXECUTABLE, uid())));
+        // Found without asking for the path.
+        by_name.paths.insert(STRANGER, Err(libc::EPERM));
+        assert!(by_name.read().expect("readable"));
+
+        let mut by_path = FakeLibproc::healthy();
+        by_path
+            .paths
+            .insert(STRANGER, Ok("/opt/ottto/bin/ottto-service"));
+        assert!(by_path.read().expect("readable"));
+    }
+
+    #[test]
+    fn zero_process_count_applies_nothing() {
+        // libproc's wrapper returns 0, not -1, when its syscall fails.
+        let mut no_estimate = FakeLibproc::healthy();
+        no_estimate.estimate = failed(0, 0);
+        assert!(no_estimate.read().is_err());
+        assert_applied_nothing(no_estimate);
+
+        let mut no_fill = FakeLibproc::healthy();
+        no_fill.fill = Some(failed(0, libc::EPERM));
+        assert!(no_fill.read().is_err());
+        assert_applied_nothing(no_fill);
+
+        let mut negative = FakeLibproc::healthy();
+        negative.fill = Some(failed(-1, libc::EINVAL));
+        assert!(negative.read().is_err());
+        assert_applied_nothing(negative);
+    }
+
+    #[test]
+    fn table_without_this_process_applies_nothing() {
+        let mut partial = FakeLibproc::healthy();
+        partial.pids.retain(|pid| *pid != own());
+        assert!(partial.read().is_err());
+        assert_applied_nothing(partial);
+    }
+
+    #[test]
+    fn unreadable_process_of_this_user_applies_nothing() {
+        for errno in [libc::EPERM, libc::ENOENT, libc::EINVAL, 0] {
+            let mut path_failed = FakeLibproc::healthy();
+            path_failed.paths.insert(STRANGER, Err(errno));
+            assert!(path_failed.read().is_err(), "path errno {errno}");
+            assert_applied_nothing(path_failed);
+
+            let mut info_failed = FakeLibproc::healthy();
+            info_failed.info.insert(STRANGER, Err(errno));
+            assert!(info_failed.read().is_err(), "info errno {errno}");
+            assert_applied_nothing(info_failed);
+        }
+    }
+
+    #[test]
+    fn processes_that_exited_since_the_listing_are_ignored() {
+        let mut api = FakeLibproc::healthy();
+        api.pids.push(VANISHED);
+        // Exited before its info was read.
+        api.info.insert(VANISHED, Err(libc::ESRCH));
+        // Exited between its info and its path.
+        api.paths.insert(STRANGER, Err(libc::ESRCH));
+        assert!(!api.read().expect("readable"));
+
+        let (_f, planted, report) = sweep_with(api);
+        assert_eq!(report.other_daemon_check, OtherDaemonState::Clear);
+        assert_eq!(report.removed, 3);
+        assert!(planted.iter().all(|(orphan, _)| !orphan.exists()));
+    }
+}
