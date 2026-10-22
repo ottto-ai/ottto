@@ -416,6 +416,15 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
     let (loaded, quarantined) = apc_load_value(&scratch, "valid", &valid);
     assert!(!quarantined);
     assert_eq!(serde_json::to_value(&loaded).unwrap(), valid);
+    // The dropped record's members re-arm so the next pass re-reads them.
+    let mut rearmed = index.files.clone();
+    for key in apc_keys() {
+        rearmed
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
 
     let old_digest = claude_usage_family_witness_fingerprint(&apc_witness('e'));
     type RecordMutation = Box<dyn Fn(&mut Value)>;
@@ -493,7 +502,7 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
         assert_eq!(loaded.generation, index.generation, "{name}");
         assert_eq!(
             serde_json::to_value(&loaded.files).unwrap(),
-            serde_json::to_value(&index.files).unwrap(),
+            serde_json::to_value(&rearmed).unwrap(),
             "{name}"
         );
         assert!(
@@ -2477,6 +2486,7 @@ fn witness_removed_while_member_demotes_does_not_quarantine_index() {
     );
     items[0].claude_usage_request_ids.clear();
     items[0].claude_usage_occurrences.clear();
+    let unwitnessed = claude_authority_unwitnessed_demotions_for_test();
     apply_claude_reported_usage_with_index_limits_and_current_files(
         &mut items,
         &api,
@@ -2500,14 +2510,18 @@ fn witness_removed_while_member_demotes_does_not_quarantine_index() {
         !index.claude_usage_authority_quarantine.contains_key(&root),
         "no witness means no new authority record"
     );
+    assert_eq!(
+        claude_authority_unwitnessed_demotions_for_test(),
+        unwitnessed + 1,
+        "SOURCE U3: the unwitnessed demotion is counted"
+    );
     let count = index.files.len();
     let loaded = apc_save_reload(&mut index, &scratch.join("index.json"));
     assert_eq!(loaded.files.len(), count);
 }
 
-#[test]
-fn load_drops_unbound_authority_record_and_keeps_index() {
-    let scratch = crate::test_scratch::ScratchDir::new("authority-load-containment");
+/// An index whose authority record is unbound: unbound on load or on save.
+fn apc_unbound_fixture() -> ScanIndex {
     let mut index = apc_terminal_fixture();
     index.generation = 29;
     let record = index
@@ -2528,7 +2542,18 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
     index
         .quarantined_snapshot_fingerprints
         .insert(apc_hex('8'), refusal);
-    let mut expected = serde_json::to_value(&index).unwrap();
+    // An unrelated indexed file that must keep its revision.
+    index.files.insert(
+        "/synthetic/proof-correction/f2222222-2222-4222-8222-222222222222.jsonl".to_string(),
+        apc_entry(&apc_hex('6'), &apc_hex('5')),
+    );
+    index
+}
+
+/// The fail-closed shape of `index`: only the authority record and its
+/// pending proof go, and only that family's indexed members are re-armed.
+fn apc_without_unbound_record(index: &ScanIndex) -> Value {
+    let mut expected = serde_json::to_value(index).unwrap();
     expected["claude_usage_authority_quarantine"]
         .as_object_mut()
         .unwrap()
@@ -2537,15 +2562,65 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
         .as_object_mut()
         .unwrap()
         .remove(APC_ROOT);
+    for key in apc_keys() {
+        expected["files"][key.as_str()]["source_file_fingerprint"] = json!("");
+    }
+    expected
+}
+
+#[test]
+fn load_drops_unbound_authority_record_and_keeps_index() {
+    let scratch = crate::test_scratch::ScratchDir::new("authority-load-containment");
+    let index = apc_unbound_fixture();
+    let expected = apc_without_unbound_record(&index);
+    let (drops, rearmed) = claude_authority_drops_for_test();
     let (loaded, quarantined) =
         apc_load_value(&scratch, "unbound", &serde_json::to_value(&index).unwrap());
     assert!(
         !quarantined,
         "one unbound record cannot quarantine the whole index"
     );
+    assert_eq!(
+        claude_authority_drops_for_test(),
+        (drops + 1, rearmed + apc_keys().len()),
+        "one record dropped; only its family's members re-armed"
+    );
     assert_eq!(loaded.generation, 29);
     assert_eq!(loaded.snapshot_unproven_terminal_count(), 1);
     assert_eq!(loaded.snapshot_superseded_terminal_count(), 1);
+    assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
+}
+
+/// SOURCE F1: an existing orphan fails closed for its one record at save, in
+/// debug and release alike; the save succeeds and the result loads as is.
+#[test]
+fn save_drops_existing_orphan_authority_record_and_succeeds() {
+    let scratch = crate::test_scratch::ScratchDir::new("authority-save-containment");
+    let path = scratch.join("index.json");
+    let mut index = apc_unbound_fixture();
+    index.generation = 0;
+    let mut expected = apc_without_unbound_record(&index);
+    expected["generation"] = json!(1);
+    let (drops, rearmed) = claude_authority_drops_for_test();
+    index
+        .save(&path)
+        .expect("an orphan record never fails the save");
+    assert_eq!(
+        claude_authority_drops_for_test(),
+        (drops + 1, rearmed + apc_keys().len())
+    );
+    assert_eq!(serde_json::to_value(&index).unwrap(), expected);
+    let (loaded, quarantined) = apc_load_value(
+        &scratch,
+        "saved",
+        &serde_json::from_slice(&fs::read(&path).unwrap()).unwrap(),
+    );
+    assert!(!quarantined, "load accepts the saved result");
+    assert_eq!(
+        claude_authority_drops_for_test(),
+        (drops + 1, rearmed + apc_keys().len()),
+        "nothing is left to drop on load"
+    );
     assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
 }
 

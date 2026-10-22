@@ -48,6 +48,42 @@ impl ClaudeProofCorrectionCandidate {
     }
 }
 
+/// Content-free counts of unbound Claude authority records dropped on load or
+/// save, of the indexed family members re-armed with them, and of demotions
+/// that found no current witness and so formed no record (SOURCE U3).
+static CLAUDE_AUTHORITY_DROPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CLAUDE_AUTHORITY_DROP_REARMED_FILES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const CLAUDE_AUTHORITY_DROP_LOGGED_REFS: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_AUTHORITY_DROPS_FOR_TEST: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    static CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// This thread's dropped records and re-armed files.
+#[cfg(test)]
+pub(crate) fn claude_authority_drops_for_test() -> (usize, usize) {
+    CLAUDE_AUTHORITY_DROPS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn claude_authority_unwitnessed_demotions_for_test() -> usize {
+    CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+fn count_claude_authority_unwitnessed_demotion() {
+    CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
+}
+
 fn claude_authority_record_contract_is_valid(
     record: &ClaudeUsageAuthorityQuarantineRecord,
 ) -> bool {
@@ -120,6 +156,70 @@ impl ScanIndex {
         {
             record.proven_witness_fingerprint = claude_usage_family_witness_fingerprint(witness);
         }
+    }
+
+    // SOURCE ruling: an unbound or ill-formed record fails closed alone, on
+    // load and on save, with its pending proof state. Terminal refusals and
+    // the upload ledger stay. Its indexed members are re-armed, bounded by
+    // family size, so the next pass re-reads the family and re-forms the
+    // record against the current witness, or leaves unproven residue.
+    fn drop_unbound_claude_authority_records(&mut self, stage: &str) {
+        let witnesses = &self.claude_usage_family_witnesses;
+        let unbound = self
+            .claude_usage_authority_quarantine
+            .iter()
+            .filter(|(root, record)| {
+                !witnesses.get(*root).is_some_and(|witness| {
+                    claude_usage_authority_preserves_pending(record, witness)
+                })
+            })
+            .map(|(root, _)| root.clone())
+            .collect::<BTreeSet<_>>();
+        if unbound.is_empty() {
+            return;
+        }
+        for root in &unbound {
+            self.claude_usage_authority_quarantine.remove(root);
+            self.claude_usage_family_pending.remove(root);
+        }
+        let mut rearmed = 0_usize;
+        for (index_key, entry) in &mut self.files {
+            if claude_index_path_member_ref(Path::new(index_key))
+                .is_some_and(|member| unbound.contains(member.root))
+                && !entry.source_file_fingerprint.is_empty()
+            {
+                entry.source_file_fingerprint.clear();
+                rearmed += 1;
+            }
+        }
+        CLAUDE_AUTHORITY_DROPS.fetch_add(unbound.len(), std::sync::atomic::Ordering::Relaxed);
+        CLAUDE_AUTHORITY_DROP_REARMED_FILES
+            .fetch_add(rearmed, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        CLAUDE_AUTHORITY_DROPS_FOR_TEST.with(|cell| {
+            let (drops, files) = cell.get();
+            cell.set((drops + unbound.len(), files + rearmed));
+        });
+        let family_refs = unbound
+            .iter()
+            .take(CLAUDE_AUTHORITY_DROP_LOGGED_REFS)
+            .map(|root| {
+                sha256_hex(&["claude_authority_drop_family_ref:v1", root.as_str()])[..12]
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "local snapshot scan index {stage} dropped {} unbound Claude usage authority record(s) \
+             [family_ref_sha256 {family_refs}{}]; authority_drop_rearmed_files={rearmed}; those \
+             families re-prove or stay unproven residue on the next pass",
+            unbound.len(),
+            if unbound.len() > CLAUDE_AUTHORITY_DROP_LOGGED_REFS {
+                ",..."
+            } else {
+                ""
+            }
+        );
     }
 
     // M1: only the existing complete healthy census can retire absent grants.

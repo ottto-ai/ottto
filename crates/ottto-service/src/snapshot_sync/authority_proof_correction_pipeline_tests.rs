@@ -2607,3 +2607,94 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
     }
     panic!("PRECONDITION_NOT_REACHED: withheld raw-complete native terminal with RetryPending");
 }
+
+/// CONTROLLED: after a natural authority record forms, its persisted binding
+/// is broken by hand. Load drops only that record, re-arms only its family's
+/// members, and real pages re-read those unchanged members: the record
+/// re-forms bound to the current witness, or with no witness left the family
+/// stays unproven residue with no record. Nothing is stranded.
+#[test]
+#[serial(source_manifests)]
+fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("authority-unbound-rearm", false);
+    fixture.establish();
+    let family = apc_family_sessions();
+    fixture.append_family_request(Some(APC_AGENTS[0]), "req_unbound", 4);
+    let formed = (0..2 * APC_MAX_PAGES).any(|number| {
+        let page = fixture.page(&format!("2026-08-02T10:{number:02}:00Z"), ApcUpload::Accept);
+        fixture.assert_durable(&page, 10);
+        page.record().is_some()
+    });
+    assert!(
+        formed,
+        "PRECONDITION_NOT_REACHED: a natural authority record"
+    );
+
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
+            .expect("decode saved index");
+    value["claude_usage_authority_quarantine"][APC_ROOT]["proven_witness_fingerprint"] =
+        serde_json::json!("9".repeat(64));
+    std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
+        .expect("write unbound index");
+
+    let (drops, rearmed) = crate::snapshots::claude_authority_drops_for_test();
+    let mut reread = BTreeSet::new();
+    let mut held = BTreeSet::new();
+    for number in 0..2 * APC_MAX_PAGES {
+        let page = fixture.page(&format!("2026-08-02T12:{number:02}:00Z"), ApcUpload::Accept);
+        fixture.assert_durable(&page, 12);
+        if number == 0 {
+            assert!(page.record_before().is_none(), "load drops the record");
+            let keys = ApcFixture::family_keys(&page.before);
+            assert_eq!(keys.len(), family.len());
+            assert!(
+                keys.values()
+                    .all(|key| page.before.files[key].source_file_fingerprint.is_empty()),
+                "every family member is re-armed"
+            );
+            let (now_drops, now_rearmed) = crate::snapshots::claude_authority_drops_for_test();
+            assert_eq!(now_drops, drops + 1, "one load drop and no save drop");
+            assert!(now_rearmed > rearmed && now_rearmed - rearmed <= family.len());
+        }
+        reread.extend(page.parsed.intersection(&family).cloned());
+        held.extend(page.held_sessions.intersection(&family).cloned());
+        if reread != family {
+            continue;
+        }
+        let witness = page
+            .index
+            .claude_usage_family_witness_digest_for_test(APC_ROOT);
+        let outcome = match (witness, page.record()) {
+            (Some(witness), Some(record)) => {
+                assert!(record.bound_to_retained_witness);
+                assert_eq!(
+                    record.proven_witness_fingerprint, witness,
+                    "the record re-forms bound to the current witness"
+                );
+                "reformed_bound"
+            }
+            (None, record) => {
+                assert!(record.is_none(), "no witness forms no record");
+                "unproven_residue"
+            }
+            (Some(_), None) => {
+                assert!(held.is_empty(), "a family held again keeps a bound record");
+                "proven_without_hold"
+            }
+        };
+        let line = serde_json::json!({
+            "receipt": "claude_authority_unbound_drop_rearm:v1",
+            "outcome": outcome,
+            "reread_page_count": number + 1,
+            "family_member_count": family.len(),
+            "held_member_count": held.len(),
+        });
+        std::io::stderr()
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("write drop receipt");
+        return;
+    }
+    panic!("the re-armed family is re-read within two bounded generations");
+}
