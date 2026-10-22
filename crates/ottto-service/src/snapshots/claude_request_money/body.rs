@@ -1300,7 +1300,10 @@ fn side_calls(
                             ClaudeCountedBy::TelemetryProven
                         },
                     });
-                    entity.telemetry_owned_complete &= !two_owner;
+                    // Auxiliary API clocks are not qualified original event
+                    // clocks in RequestSink yet. A counted side call therefore
+                    // stays untagged (BadClock) and cannot satisfy SI W1.
+                    entity.telemetry_owned_complete = false;
                 } else {
                     entity.held = true;
                 }

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 783,
-  "content_sha256": "b75e083a4403079f8be80dbeb43c10c3b6803bce3962ef998977fa57d7e11c67",
+  "content_sha256": "900d284dfa1096ba045061684c0da4f2f19e2e6d9ac27bd5c97ae87205e02f30",
   "files": [
     {
       "executable": false,
@@ -1322,8 +1322,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "f91af3c37641c32665a8c3edb482dae76edf1bf862ff47e54cb62411a073ef67",
-      "size_bytes": 895616
+      "sha256": "971c7171cb42fefc323741b6318b4ff99790f96282e8982aac3bd6fcf1aa8e8d",
+      "size_bytes": 895506
     },
     {
       "executable": false,
@@ -1350,8 +1350,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/claude_request_money_pipeline_tests.rs",
-      "sha256": "50e65ad9f93bb98551b278aaca5b8df0e492fe951cf9f6a2b0f4a702047931d2",
-      "size_bytes": 66229
+      "sha256": "1eec52933b5be960c47de04e6b8c7d00a3baf2933ae72364ff4057acb38b43b8",
+      "size_bytes": 66241
     },
     {
       "executable": false,
@@ -1455,8 +1455,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "7a7b359da366da73515f70c8324121b892175b6ca271dd58aa60a40a67e5bfc8",
-      "size_bytes": 3146131
+      "sha256": "c4993d5ffde5ffcfa520cac9dd385f6fec746ed9b2f260529b21424ad2e047cf",
+      "size_bytes": 3146000
     },
     {
       "executable": false,
@@ -1616,8 +1616,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/body.rs",
-      "sha256": "a53633b1f9e2d09d874f8e59070b391a0c38f996acbfe075c1dcfbfadbbf4a4e",
-      "size_bytes": 55417
+      "sha256": "1613990348658c37352669e1eee2b60ab93587262fcd22264688eebe83bd51bc",
+      "size_bytes": 55643
     },
     {
       "executable": false,
@@ -1665,8 +1665,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money_tests.rs",
-      "sha256": "cc3327129151c5b3b8da42ef0e74c0126b6a4aa309155e6b03f186df6e97915b",
-      "size_bytes": 154505
+      "sha256": "1322a45028a5fc7c8a3e392a0aafb17a503bf09489e7e6fdb0cbd7f1db69c7cd",
+      "size_bytes": 157264
     },
     {
       "executable": false,

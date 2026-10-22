@@ -2836,7 +2836,7 @@ mod p2a_conservation {
         fn transcript(&mut self, session: &str, text: &str, birth: u64) {
             let path = self
                 .scratch
-                .join(&format!("projects/-repo/{session}.jsonl"));
+                .join(format!("projects/-repo/{session}.jsonl"));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, text).unwrap();
             let fp = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
@@ -3278,8 +3278,20 @@ mod p2a_conservation {
             &[(H7, 1, 28), (H8, 1, 30)],
             0,
             Default::default(),
-            true,
+            false,
         );
+        let evidence = identity::ScanEvidence::new(&c.api, &c.trace, BTreeSet::new(), None);
+        let mut emitted = c.items[A].clone();
+        assert!(money::emit_for_test(&mut emitted, &before.entities[A]));
+        assert_eq!(emitted.telemetry_owned_complete, Some(false));
+        let grouping =
+            identity::request_owned_grouping(&emitted, &evidence, &before.entities[A]).unwrap();
+        identity::apply_grouped(&mut emitted, grouping).unwrap();
+        assert_eq!(
+            emitted.request_identity_refusals, 1,
+            "side call keeps BadClock"
+        );
+        assert_eq!(emitted.request_count, 2);
         c.transcript(
             A,
             &(line(A, "r1", "m1", H7, 11) + &line(A, "r2", "m2", H8, 13)),
@@ -3296,12 +3308,58 @@ mod p2a_conservation {
             Default::default(),
             true,
         );
+        let mut emitted = c.items[A].clone();
+        assert!(money::emit_for_test(&mut emitted, &after.entities[A]));
+        assert_eq!(emitted.telemetry_owned_complete, Some(true));
         assert_eq!(
             sum_entity(&before.entities[A]),
             sum_entity(&after.entities[A])
         );
         assert_mac_distinct(&[&before], 2);
         assert_mac_distinct(&[&after], 2);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_bad_clock_side_calls_clear_w1_for_priced_and_unpriced_bodies() {
+        for priced in [true, false] {
+            let mut c = Corpus::new("p2a-side-call-w1");
+            c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+            c.telemetry(A, "r1", H7, 11, 'a', true);
+            c.restart();
+            let baseline = c.build(A, NOW);
+            assert!(baseline.entities[A].telemetry_owned_complete);
+            c.telemetry(A, "side", H8, 13, 'b', priced);
+            c.restart();
+            let body = c.build(A, NOW);
+            assert_entity(
+                &c,
+                A,
+                &body,
+                &[(H7, 1, 28), (H8, 1, 30)],
+                0,
+                Default::default(),
+                false,
+            );
+            let entity = &body.entities[A];
+            let mut item = c.items[A].clone();
+            assert!(money::emit_for_test(&mut item, entity));
+            assert_eq!(item.telemetry_owned_complete, Some(false));
+            let evidence = identity::ScanEvidence::new(&c.api, &c.trace, BTreeSet::new(), None);
+            let grouping = identity::request_owned_grouping(&item, &evidence, entity).unwrap();
+            identity::apply_grouped(&mut item, grouping).unwrap();
+            assert_eq!(item.request_count, 2);
+            assert_eq!(item.request_identity_refusals, 1);
+            let side = item
+                .usage_buckets
+                .iter()
+                .find(|bucket| bucket.bucket_start == H8)
+                .unwrap();
+            assert!(side.model_usage.iter().all(|row| row.evidence_ref.is_none()
+                && row.account_identifier_hash.is_none()
+                && row.identity_parts.is_none()));
+            assert_eq!(item.telemetry_owned_complete, Some(false));
+        }
     }
 
     #[test]
@@ -3780,15 +3838,16 @@ mod p2a_conservation {
                 untagged += row.request_count;
             }
         }
+        assert_eq!(tagged, BTreeMap::from([("a".repeat(64), 1)]));
         assert_eq!(
-            tagged,
-            BTreeMap::from([("a".repeat(64), 1), ("b".repeat(64), 1)])
+            untagged, 2,
+            "idless and the side call without an original clock stay untagged"
         );
-        assert_eq!(untagged, 1, "idless never borrows either telemetry login");
         assert_eq!(item.request_count, 3);
         // Deliberate differences from the two legacy paths: the copy drops
         // r1; the unproven root gains its own side call. Existing requests
-        // retain their own checked login, and idless stays untagged.
+        // retain their own checked login; idless and the side call without
+        // an original transcript clock stay untagged.
     }
 
     #[test]

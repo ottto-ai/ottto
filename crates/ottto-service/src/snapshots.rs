@@ -34526,8 +34526,6 @@ mod tests {
     mod claude_request_census_tests {
         include!("snapshots/claude_request_census_tests.rs");
     }
-    // Imported fixture path temporaries preserve their existing spelling.
-    #[allow(clippy::needless_borrows_for_generic_args)]
     mod claude_request_money_tests {
         include!("snapshots/claude_request_money_tests.rs");
     }

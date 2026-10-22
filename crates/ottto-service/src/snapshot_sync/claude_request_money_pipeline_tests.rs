@@ -1570,7 +1570,7 @@ fn p2a_old_v1_head_is_replaced_by_literal_and_exact_ack_is_not_old_settlement() 
     .unwrap();
     let mut offered = Vec::new();
     upload_resumable_batches_with_body_witness(
-        &[literal.clone()],
+        std::slice::from_ref(&literal),
         &scope,
         &mut progress,
         &mut accepted,
