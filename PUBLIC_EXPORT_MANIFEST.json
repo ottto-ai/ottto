@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 778,
-  "content_sha256": "ee502233ba60efc3e2cb09a6ddfb7b38f2e75d641f5f59d1eb4368dab4f2bbf3",
+  "content_sha256": "fff6652b8d980b7d0fd0c48a6c603b4df1722894bd4943c6ac3b047ee5ea8fd3",
   "files": [
     {
       "executable": false,
@@ -1329,8 +1329,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/authority_proof_correction_pipeline_tests.rs",
-      "sha256": "84368dcd27bb3d810e6b71c6b5a38ece910e04a42416926e6384b0a5c8c6464c",
-      "size_bytes": 105239
+      "sha256": "34e3205de81e6199524c348eb956cdc35600fccbe5aebb9f8d107685f869732b",
+      "size_bytes": 115629
     },
     {
       "executable": false,
@@ -1455,8 +1455,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b5a1508bdc5cac5c44a7e9397572724b91b6a7739cf74f18baaca510b0581ff8",
-      "size_bytes": 3076536
+      "sha256": "4cf6028d5042eb67f28cd04c61d0a296992bef38b8dae950932ec74cc95e772d",
+      "size_bytes": 3076302
     },
     {
       "executable": false,
@@ -1469,15 +1469,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/authority_proof_correction.rs",
-      "sha256": "2b957175dce008789ea95d94c074652bc3caa7ad3cec9a8a9860c4bb742b567c",
-      "size_bytes": 30098
+      "sha256": "0fbdc2da53023a933dcde4f854daface1e1112bfa7784c5a438488a2c5fe3b66",
+      "size_bytes": 35948
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/authority_proof_correction_tests.rs",
-      "sha256": "8f87b03456d179036fdffa4ebf6cbfd0e82ac242cc8eb60203d991b5f6677135",
-      "size_bytes": 96860
+      "sha256": "620ffb2b3361ec432847b1cb4a825b541df9bc60055f775c489f43abf6f638ae",
+      "size_bytes": 108468
     },
     {
       "executable": false,
@@ -5449,7 +5449,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T16:29:11+00:00",
+  "generated_at": "2026-10-22T16:29:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 779,
   "public_roots": [
@@ -5488,5 +5488,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bab756ab22d1ef3fadbd5c9b057eb63f4d64d0fd"
+  "source_commit": "c0f973c909f57b0ec0734f29f51ed24a97c82b5b"
 }
