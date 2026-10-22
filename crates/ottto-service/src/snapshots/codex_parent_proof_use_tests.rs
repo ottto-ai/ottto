@@ -1359,8 +1359,8 @@ fn an_ordinary_proof_line_retains_a_fixed_amount_whatever_its_length_or_shape() 
 /// Fix round 2b (DM1 reader evidence): what a fixed `k` cannot cover. A
 /// reader's first header keeps its strings (the id twice: at least
 /// `2 × id`), and an overlong line's paused skip keeps its salvaged
-/// timestamp: both line-proportional, so fix round 2c charges them by
-/// their known lengths (`a_first_header_is_charged_...`,
+/// timestamp: both line-proportional, so fix rounds 2c/3 charge them by
+/// their known lengths (`a_first_header_is_charged_its_kept_strings_...`,
 /// `a_salvage_over_its_room_is_not_taken`). A decision-only child whose header
 /// takes the legacy arm keeps no decoded record (count-only), however
 /// container-heavy the header.
@@ -2065,8 +2065,8 @@ fn a_save_outage_page_leaves_the_retired_record_for_an_open_gate() {
     );
 }
 
-// Fix round 2c (DM1): the two line-proportional classes are charged by a
-// length known before they keep anything.
+// Fix rounds 2c/3 (DM1, DL1, DB2): the two line-proportional classes are
+// charged by a length known before they keep anything.
 
 /// The need `run` charges before a step from a fresh walk:
 /// `W + (W - B) + MAX_JSONL_LINE_BYTES + CODEX_PROOF_LINE_RETAINED`.
@@ -2075,13 +2075,14 @@ fn fresh_need(job: &CodexProofReaders) -> usize {
     walked + (walked - job.buffers()) + MAX_JSONL_LINE_BYTES + CODEX_PROOF_LINE_RETAINED
 }
 
-/// A first header framed at `L` bytes is decoded only when `2L +
-/// CODEX_PROOF_HEADER_RETAINED` fits the slack after the step's charge.
-/// One byte short: `Memory`, and none of its header state is kept. With
-/// that room: admitted, and its measured growth (P's and a child's) stays
-/// within the charge.
+/// Fix round 3 (DL1): a first header is kept only when the strings it keeps
+/// (`codex_proof_header_retained`, after decode) fit the slack after the
+/// step's charge. One byte short: `Memory`, and none of its header state is
+/// kept. With that room: admitted, and its measured growth (P's and a
+/// child's) stays within the charge. A header whose bulk is not kept (a
+/// ~15 MiB `base_instructions`) is charged its kept strings only.
 #[test]
-fn a_first_header_is_charged_twice_its_framed_length_before_it_is_decoded() {
+fn a_first_header_is_charged_its_kept_strings_after_it_is_decoded() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2094,8 +2095,8 @@ fn a_first_header_is_charged_twice_its_framed_length_before_it_is_decoded() {
         "thread_source": "user",
     }});
     write_values(&parent, &values);
-    let framed = serde_json::to_string(&values[0]).unwrap().len();
-    let charge = 2 * framed + CODEX_PROOF_HEADER_RETAINED;
+    let charge = codex_proof_header_retained(&values[0], &values[0]["payload"]);
+    assert!(charge >= 4 * big, "id twice, cwd, originator: {charge}");
 
     let mut job = job_of(&parent, &[]);
     let (before, room) = (retained(&job), fresh_need(&job) + charge - 1);
@@ -2113,6 +2114,11 @@ fn a_first_header_is_charged_twice_its_framed_length_before_it_is_decoded() {
         .retain_room
         .is_some_and(|room| room.refused));
     assert!(retained(&job) <= before + CODEX_PROOF_LINE_RETAINED);
+    // R1-L1: a refused reader steps nothing, whatever its room.
+    let consumed = job.parent.parser.reader.consumed_bytes();
+    assert_eq!(job.parent.step(usize::MAX), 0);
+    assert!(job.parent.refused());
+    assert_eq!(job.parent.parser.reader.consumed_bytes(), consumed);
 
     let mut job = job_of(&parent, &[]);
     let (before, room) = (retained(&job), fresh_need(&job) + charge);
@@ -2126,6 +2132,21 @@ fn a_first_header_is_charged_twice_its_framed_length_before_it_is_decoded() {
         "{grew} > {charge}"
     );
 
+    // Bulk the header does not keep: charged its kept strings, admitted
+    // in a slack far below its framed length.
+    values[0] = json!({"timestamp": "2026-08-02T08:00:00Z", "type": "session_meta", "payload": {
+        "id": PARENT, "thread_source": "user", "base_instructions": {"text": "b".repeat(15 << 20)},
+    }});
+    write_values(&parent, &values);
+    let charge = codex_proof_header_retained(&values[0], &values[0]["payload"]);
+    assert!(charge < 1 << 20, "{charge}");
+    let mut job = job_of(&parent, &[]);
+    let room = fresh_need(&job) + charge;
+    let mut budget = codex_proof_step_reserve();
+    assert_eq!(job.run(&mut budget, room), CodexProofRun::Budget);
+    assert!(job.parent.parser.accumulator.codex_session_meta_seen);
+    assert!(!job.parent.refused());
+
     // A child's first header (its prelude parser too) within its charge.
     write_values(&parent, &parent_values());
     let child = rollout(&root, CHILD);
@@ -2135,7 +2156,6 @@ fn a_first_header_is_charged_twice_its_framed_length_before_it_is_decoded() {
         "cwd": "c".repeat(big), "originator": "o".repeat(big), "cli_version": "0.99.0",
     }});
     write_values(&child, &rows);
-    let framed = serde_json::to_string(&rows[0]).unwrap().len();
     let mut job = job_of(&parent, &[&child]);
     let grew = loop {
         let seen = job.children[0]
@@ -2155,15 +2175,17 @@ fn a_first_header_is_charged_twice_its_framed_length_before_it_is_decoded() {
         }
         assert_eq!(run, CodexProofRun::Budget);
     };
-    let charge = 2 * framed + CODEX_PROOF_HEADER_RETAINED + CODEX_PROOF_LINE_RETAINED;
+    let charge =
+        codex_proof_header_retained(&rows[0], &rows[0]["payload"]) + CODEX_PROOF_LINE_RETAINED;
     assert!(grew >= 2 * big as isize, "cwd and originator: {grew}");
     assert!(grew <= charge as isize, "{grew} > {charge}");
     let _ = fs::remove_dir_all(root);
 }
 
-/// A paused overlong skip salvages only a buffered prefix its slack holds:
+/// Fix round 3 (DB2): a paused overlong skip keeps its salvage only if the
+/// extracted timestamp's capacity fits its slack (not the buffered prefix):
 /// one byte short, nothing is salvaged and the step is refused (`Memory`);
-/// with the prefix's room, the salvage is kept.
+/// with the timestamp's room, the salvage is kept.
 #[test]
 fn a_salvage_over_its_room_is_not_taken() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2187,13 +2209,29 @@ fn a_salvage_over_its_room_is_not_taken() {
     bytes.extend_from_slice(b"\"}}\n");
     fs::write(&parent, bytes).unwrap();
     sampled_scan::codex_cursor::with_test_limits(2048, 8192, 64 * 1024, || {
+        // The timestamp's capacity, from a salvage kept in ample room.
+        let mut job = job_of(&parent, &[]);
+        let (_, _, header) = one_step(&mut job);
+        assert!(header);
+        let room = fresh_need(&job) + MAX_JSONL_LINE_BYTES;
+        let mut budget = codex_proof_step_reserve();
+        assert_eq!(job.run(&mut budget, room), CodexProofRun::Budget);
+        let cap = job
+            .parent
+            .parser
+            .reader
+            .skipping
+            .as_ref()
+            .and_then(|salvage| salvage.envelope.as_ref())
+            .map(|envelope| envelope.timestamp.capacity())
+            .unwrap();
+        assert!((4 << 20..MAX_JSONL_LINE_BYTES).contains(&cap), "{cap}");
         for (short, salvaged) in [(1, false), (0, true)] {
             let mut job = job_of(&parent, &[]);
             let (_, _, header) = one_step(&mut job);
             assert!(header);
             let before = retained(&job);
-            // The capped prefix is `MAX_JSONL_LINE_BYTES` buffered bytes.
-            let room = fresh_need(&job) + MAX_JSONL_LINE_BYTES - short;
+            let room = fresh_need(&job) + cap - short;
             let mut budget = codex_proof_step_reserve();
             let run = job.run(&mut budget, room);
             let reader = &job.parent.parser.reader;
@@ -2204,16 +2242,22 @@ fn a_salvage_over_its_room_is_not_taken() {
                 assert_eq!(run, CodexProofRun::Memory);
                 assert!(reader.retain_room.is_some_and(|room| room.refused));
                 assert!(retained(&job) <= before + CODEX_PROOF_LINE_RETAINED);
+                // R1-L1: a refused reader steps nothing, whatever its room.
+                let consumed = job.parent.parser.reader.consumed_bytes();
+                assert_eq!(job.parent.step(usize::MAX), 0);
+                assert!(job.parent.refused());
+                assert_eq!(job.parent.parser.reader.consumed_bytes(), consumed);
             }
         }
     });
     let _ = fs::remove_dir_all(root);
 }
 
-/// A max-length first header cannot fit any proof room (`2L` alone is
-/// near 32 MiB): the hook frames it, refuses it before decoding
-/// (`StepRefusedMemory`, paced), keeps no job and proves nothing; inside
-/// the backoff nothing is read.
+/// A max-length first header cannot fit any proof room (its kept
+/// originator alone is near 16 MiB, over any slack): the hook frames and
+/// decodes it, refuses it before keeping any of it (`StepRefusedMemory`,
+/// paced), keeps no job and proves nothing; inside the backoff nothing is
+/// read.
 #[test]
 fn a_header_over_its_room_is_refused_paced_and_keeps_nothing() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2236,6 +2280,95 @@ fn a_header_over_its_room_is_refused_paced_and_keeps_nothing() {
         "the header was framed: {}",
         spent(&page)
     );
+    let owed = scene.owed_entry();
+    assert_eq!(owed.outcome, ProofOutcome::StepRefusedMemory as u8);
+    assert_eq!((owed.attempts, &owed.wake), (1, &ProofWake::Backoff));
+    assert!(owed.not_before_unix_seconds > now);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    assert_eq!(spent(&page), 0, "inside the backoff: nothing");
+}
+
+/// `values` with one overlong row (`timestamp` first, then a payload past
+/// `MAX_JSONL_LINE_BYTES` by 1 MiB) before its row 3.
+fn write_with_overlong(path: &Path, values: &[Value], timestamp: &[u8]) {
+    let mut bytes = Vec::new();
+    for (row, value) in values.iter().enumerate() {
+        if row == 3 {
+            bytes.extend_from_slice(b"{\"timestamp\":\"");
+            bytes.extend_from_slice(timestamp);
+            bytes.extend_from_slice(
+                b"\",\"ordinal\":9,\"type\":\"response_item\",\"payload\":{\"content\":\"",
+            );
+            bytes.resize(bytes.len() + MAX_JSONL_LINE_BYTES + (1 << 20), b'y');
+            bytes.extend_from_slice(b"\"}}\n");
+        }
+        bytes.extend_from_slice(serde_json::to_string(value).unwrap().as_bytes());
+        bytes.push(b'\n');
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+/// Fix round 3 (DB2), at the real proof room through the hook: an overlong
+/// row (over 17 MiB) whose salvage keeps a 27-byte timestamp is skipped
+/// through and its salvage kept. In the deciding child: the child decides
+/// and the hook proves it as without the row. In P: P is read to its end
+/// and finishes under its own lossy rule (`ParentLossy`), not a memory
+/// refusal. The same row with a timestamp over any slack (15 MiB: the room
+/// is under `MAX_JSONL_LINE_BYTES` + 14 MiB) keeps no salvage:
+/// `StepRefusedMemory`, paced, and nothing is read inside the backoff.
+#[test]
+fn an_overlong_row_is_charged_its_salvaged_timestamp_at_the_real_room() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let now = sampled_scan::now_seconds();
+    let short = b"2026-08-02T08:20:00.500000Z";
+
+    let mut scene = Scene::owed("hook-overlong-child");
+    write_with_overlong(&scene.child.path, &child_values(), short);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let key = scene.key();
+    for _ in 0..4 {
+        if matches!(
+            scene.index.codex_parent_prefix_proofs.get(&key),
+            Some(CodexParentProofState::Proven(_))
+        ) {
+            break;
+        }
+        let mut page = PageBudget::default();
+        scene.hook(&cache, &mut page);
+    }
+    let proof = scene.proof();
+    assert_eq!((proof.matched, proof.owned), (2, true));
+    assert_eq!(cache.proof_suspended_for_test(), None);
+
+    let mut scene = Scene::owed("hook-overlong-parent");
+    write_with_overlong(&scene.parent, &parent_values(), short);
+    scene.settle_side(now);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    let parent_len = fs::metadata(&scene.parent).unwrap().len();
+    assert!(
+        spent(&page) > parent_len,
+        "P read to its end: {}",
+        spent(&page)
+    );
+    let owed = scene.owed_entry();
+    assert_eq!(owed.outcome, ProofOutcome::ParentLossy as u8, "{owed:?}");
+    assert_eq!(owed.attempts, 1);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+
+    let mut scene = Scene::owed("hook-overlong-refused");
+    let mut timestamp = b"2026-08-02T08:20:00Z".to_vec();
+    timestamp.resize(15 << 20, b'0');
+    write_with_overlong(&scene.child.path, &child_values(), &timestamp);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    assert!(spent(&page) > SIDE_FENCE_READ_BYTES + (15 << 20));
     let owed = scene.owed_entry();
     assert_eq!(owed.outcome, ProofOutcome::StepRefusedMemory as u8);
     assert_eq!((owed.attempts, &owed.wake), (1, &ProofWake::Backoff));

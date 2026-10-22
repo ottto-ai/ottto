@@ -1092,7 +1092,11 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
     assert!(index.codex_parent_side.is_empty());
     // Fix round 2 (DM2): a stale record whose pace is active (a floor, or
     // a `not_before` ahead of the sweep's clock) is kept; an expired pace
-    // (no floor, `not_before` passed) prunes as before.
+    // (no floor, `not_before` passed) prunes as before. Fix round 3 (DL2):
+    // the floor-0 legs are function-level controls of the sweep's rule
+    // only; no producer writes a floor-0 pace (every carried pace has
+    // `attempts_floor: SIDE_REQUEST_EVICT_ATTEMPTS - 1`), so a carried pace is
+    // never epoch-pruned.
     for (pace, pruned) in [
         (
             SidePace {

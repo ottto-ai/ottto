@@ -661,17 +661,21 @@ pub(super) fn completion_copy_budget(
     (budget, step)
 }
 
-/// U1a-2a (R2-B3, fix round 2 DB1, c22 ruling (b)): main's copy budget
-/// funds two equal shares at once, a retained copy and finish/output
+/// U1a-2a (R2-B3, fix round 2 DB1, c22 ruling (b); fix round 3 DM3): main's
+/// copy budget funds two shares at once, a retained copy and finish/output
 /// (`ClaudeResponses::finish_copy_budget`), so before main allocates
 /// against `budget` (its completion's clone and finish), a suspended proof
 /// larger than what both shares leave of `step`'s room is retired:
 /// `proof + copy + finish/output <= room`, the room main's view
-/// (`bound_for_main`) measured without the proof. Where no copy can be
-/// allocated (`budget == 0`, which an unknown room always gives) nothing is
-/// retired: no proof drops on unavailable inputs. Non-allocating steps never
-/// call this, and M1 Path A (`admit_tail_copy`) clones nothing at its
-/// zero-budget step.
+/// (`bound_for_main`) measured without the proof. Both clones admit a copy
+/// only within `min(budget, ENTRY_BYTES)` before they allocate it
+/// (`retain_reduction`'s `retention_bound`, `retain_sealed_prefix`'s
+/// `admitted`), so the copy's share is `min(budget, ENTRY_BYTES)`. The
+/// caller passes 0 where its completion cannot retain a copy. Where no copy
+/// can be allocated (`budget == 0`, which an unknown room always gives)
+/// nothing is retired: no proof drops on unavailable inputs. Non-allocating
+/// steps never call this, and M1 Path A (`admit_tail_copy`) clones nothing
+/// at its zero-budget step.
 pub(super) fn retire_proof_beside_copy(
     sampling: Option<&Context>,
     budget: usize,
@@ -685,7 +689,7 @@ pub(super) fn retire_proof_beside_copy(
     };
     context
         .cache
-        .retire_proof_over_room(room.saturating_sub(budget.saturating_mul(2)));
+        .retire_proof_over_room(room.saturating_sub(copy_shares(budget)));
     #[cfg(test)]
     COPY_RETIRE_PROBE.with(|probe| {
         let whole = crate::heap_layout_bound::bound(context, STATE_BYTES);
@@ -699,6 +703,12 @@ pub(super) fn retire_proof_beside_copy(
             budget,
         }))
     });
+}
+
+/// U1a-2a (fix round 3, DM3): the finish/output share plus the copy's share,
+/// which both clones cap at `ENTRY_BYTES` before they allocate.
+fn copy_shares(budget: usize) -> usize {
+    budget.saturating_add(budget.min(ENTRY_BYTES))
 }
 
 /// Tests only: what `retire_proof_beside_copy` saw right after its retire.
@@ -717,7 +727,7 @@ pub(super) struct CopyRetireProbe {
 #[cfg(test)]
 impl CopyRetireProbe {
     /// At the clone: the walk's resident + the proof + the active + both
-    /// shares fit `STATE_BYTES`.
+    /// shares (`copy_shares`) fit `STATE_BYTES`.
     pub(super) fn fits(&self) -> bool {
         self.resident
             .zip(self.proof)
@@ -725,7 +735,7 @@ impl CopyRetireProbe {
                 resident
                     .checked_add(proof)?
                     .checked_add(self.used)?
-                    .checked_add(self.budget.checked_mul(2)?)
+                    .checked_add(copy_shares(self.budget))
             })
             .is_some_and(|total| total <= STATE_BYTES)
     }

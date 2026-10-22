@@ -7,6 +7,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES;
+use crate::transcript_cache::ENTRY_BYTES;
 
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "019fa111-2222-7333-8444-555555555555";
@@ -8888,12 +8889,12 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
     });
 }
 
-/// R2-B3, fix round 2 DB1 (c22 ruling (b)): main's copy budget funds two
-/// equal shares, so where it is allocated against
-/// (`retire_proof_beside_copy`) a suspended proof over `room - 2 * budget`
-/// is retired, even one the copy's share alone leaves room for
-/// (`room - budget - 1`); then `bound(context)` + copy + finish/output fit
-/// `STATE_BYTES`. `copy_budget_step` itself retires nothing, and nothing is
+/// R2-B3, fix round 2 DB1 (c22 ruling (b)), fix round 3 DM3: main's copy
+/// budget funds two shares, so where it is allocated against
+/// (`retire_proof_beside_copy`) a suspended proof over `room - budget -
+/// min(budget, ENTRY_BYTES)` is retired, even one the finish/output share
+/// alone leaves room for (`room - budget - 1`); then `bound(context)` +
+/// copy + finish/output fit `STATE_BYTES`. `copy_budget_step` itself retires nothing, and nothing is
 /// retired where no copy is allocated (budget 0, as an unknown room gives):
 /// no drop on unavailable inputs. The retired job keeps only its `seq`s.
 #[test]
@@ -8913,7 +8914,7 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
     let job = proof_job("ns-a", "/idx/a.json", "inc-1", room - without - 1 - fixed);
     let charge = proof_charge(&job);
     assert!(
-        charge > room - 2 * without && charge < room - without,
+        charge > room - without - without.min(ENTRY_BYTES) && charge < room - without,
         "{charge}"
     );
     assert!(suspend(&cache, job), "fits the free room alone");
@@ -9003,6 +9004,156 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
         assert!(probe.budget > 0);
         assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
         assert!(probe.fits(), "{probe:?}");
+    });
+}
+
+/// Fix round 3 (DM3(2)): with a room whose budget is over `ENTRY_BYTES`,
+/// the copy's share is the 8 MiB cap, so a suspended proof that fits
+/// beside both shares (`room - budget - ENTRY_BYTES`) is kept where main
+/// allocates, and the whole still fits `STATE_BYTES` at the clone.
+#[test]
+fn a_proof_beside_a_capped_copy_share_is_kept() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let context = main_context(&cache);
+    let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
+    let room = step.room().expect("a measured room");
+    assert!(budget > ENTRY_BYTES, "precondition: a large room: {budget}");
+    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
+    let job = proof_job(
+        "ns-a",
+        "/idx/a.json",
+        "inc-1",
+        room - budget - ENTRY_BYTES - fixed - 4096,
+    );
+    let charge = proof_charge(&job);
+    assert!(charge < room - budget - ENTRY_BYTES, "{charge}");
+    assert!(
+        charge > room - 2 * budget,
+        "fix round 2 retired it: {charge}"
+    );
+    assert!(suspend(&cache, job));
+    super::super::copy_retire_probe();
+    let ((), counts) =
+        observe(|| super::super::retire_proof_beside_copy(Some(&context), budget, step));
+    assert!(cache.proof_suspended_for_test().is_some(), "kept");
+    assert_eq!(proof_drops(counts), 0);
+    let probe = super::super::copy_retire_probe().expect("probed");
+    assert!(
+        probe.proof.is_some_and(|proof| proof >= charge),
+        "{probe:?}"
+    );
+    assert!(probe.fits(), "{probe:?}");
+}
+
+/// Fix round 3 (DM3, DL3), the completion site of an ordinary (not cursor)
+/// singleton read: it retains its copy with a budget over `ENTRY_BYTES`,
+/// and retires a suspended proof only over what both shares leave of the
+/// room: a third of the state budget is retired before the clone; one that
+/// fits beside the finish/output share and the 8 MiB-capped copy is kept.
+/// Either way the whole fits `STATE_BYTES` at the clone.
+#[test]
+fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let room = {
+        let cache = Arc::new(SharedCache::default());
+        let context = main_context(&cache);
+        let (_, step) = super::super::copy_budget_step(Some(&context), None, false);
+        step.room().expect("a measured room")
+    };
+    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
+    assert!(room / 2 > ENTRY_BYTES + (2 << 20), "precondition: {room}");
+    let beside = room / 2 - ENTRY_BYTES - (1 << 20) - fixed;
+    for (bytes, retired) in [(STATE_BYTES / 3, true), (beside, false)] {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        assert!(suspend(
+            &cache,
+            proof_job("ns-a", "/idx/a.json", "inc-1", bytes)
+        ));
+        super::super::copy_retire_probe();
+        let (_, counts) = observe(|| {
+            page_in(
+                &fixture,
+                ScanIndex::default(),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+            )
+        });
+        assert_eq!(counter(&cache, |c| c.jobs_paused), 0, "not a cursor job");
+        assert!(cache.take(&key).is_some(), "the copy is retained");
+        let probe = super::super::copy_retire_probe().expect("probed");
+        assert!(probe.budget > ENTRY_BYTES, "{probe:?}");
+        assert!(probe.fits(), "{probe:?}");
+        assert_eq!(cache.proof_suspended_for_test().is_none(), retired);
+        assert_eq!(proof_drops(counts), u64::from(retired));
+        if retired {
+            assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
+        } else {
+            assert!(probe.proof.is_some_and(|proof| proof >= bytes), "{probe:?}");
+        }
+    }
+}
+
+/// Fix round 3 (DM3(1)): a completion that cannot retain a copy (an
+/// incomplete sidecar census: the cursor job publishes unverified, with no
+/// certificate) passes no copy budget, so a suspended proof of a third of
+/// the state budget is kept through every page, its completion included.
+#[test]
+fn a_completion_that_retains_no_copy_keeps_the_proof() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    let incomplete = |scan: &mut OwnedSourceScan| scan.sidecar_census_complete = false;
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        assert!(suspend(
+            &cache,
+            proof_job("ns-a", "/idx/a.json", "inc-1", STATE_BYTES / 3)
+        ));
+        super::super::copy_retire_probe();
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let ((next, _, _), counts) = observe(|| {
+                page_with(
+                    &fixture,
+                    index,
+                    Some(Arc::clone(&cache)),
+                    "cursor-fixture",
+                    NOW,
+                    incomplete,
+                )
+            });
+            index = next;
+            assert_eq!(proof_drops(counts), 0);
+            assert!(cache.proof_suspended_for_test().is_some(), "kept");
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert!(cache.retained_checkpoint(&key).is_none(), "no copy kept");
+        assert!(
+            super::super::copy_retire_probe().is_none(),
+            "no budgeted retire"
+        );
     });
 }
 
