@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 764,
-  "content_sha256": "d90200dc98902bfff4c2a11527dbb93c39057594cc478a6e62fcdfe5e6e2bb29",
+  "content_sha256": "d77e6a52f999da6a344cddf3d10f5ebf02af2412a8f9902d6d647a86e4f0cf1d",
   "files": [
     {
       "executable": false,
@@ -1315,8 +1315,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "97b1f85677dc1e154871460fa6bf7f2964e71a00f0bc891c36c4c5da000dab40",
-      "size_bytes": 856486
+      "sha256": "b73492101c9725e2e7c1ab70cc51e811a3632400e8ce73ea73b061e71410974f",
+      "size_bytes": 862584
     },
     {
       "executable": false,
@@ -1329,8 +1329,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/census_convergence_pipeline_tests.rs",
-      "sha256": "0b0b9cd2d778b336fb1b931ca14ac4d610633b2a2b79d99e82623fa33e99b506",
-      "size_bytes": 47091
+      "sha256": "315172197c717bf2d99e8ad1d93a251f9cb7edadd2872d58f4130fb29b22c30a",
+      "size_bytes": 51200
     },
     {
       "executable": false,
@@ -1371,8 +1371,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p12_pipeline_original_tests.rs",
-      "sha256": "a33b6a4ce22ea2ec425540633dfd64edb6e3c9570f4611bffb4e896153356b35",
-      "size_bytes": 111863
+      "sha256": "bb7a2474394c96286efb2fc576c1c7d4809433301cc32181a36bf695d6dcd3d8",
+      "size_bytes": 111913
     },
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "a1c4df76816f26e06956ee83331b82cfe73d73f806d93919a48bb43931e06623",
-      "size_bytes": 3076617
+      "sha256": "1372151e433a1bb6ee75f1d493cf176fa92dd27a0c607f8a2f8c56454134670d",
+      "size_bytes": 3080030
     },
     {
       "executable": false,
@@ -1777,8 +1777,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/traversal_transition.rs",
-      "sha256": "5d0a8427e949725b43dbe0a70857a512a94a027c38ccea5d1ce6afb18a8314df",
-      "size_bytes": 19752
+      "sha256": "de3e668818e9d50da67e0030535da3bd6449a7a103687001c2cac15ebd74c4ba",
+      "size_bytes": 30280
     },
     {
       "executable": false,
@@ -5351,7 +5351,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T08:39:21+00:00",
+  "generated_at": "2026-10-22T10:21:05+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 765,
   "public_roots": [
@@ -5390,5 +5390,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d15f6f53298ee1ffdc47615c67019ed434c0b771"
+  "source_commit": "5ce8a0a6609ed09dc03fb26b2b64d759a5c45bb8"
 }
