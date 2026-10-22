@@ -2737,13 +2737,23 @@ fn snapshot_quarantine_deadline_is_bounded_at(record: &SnapshotQuarantineRecord,
                     if record.failed_reconstruction_count != 1
                         || record.upload_body_witness.is_none()
                         || hold.stage > 2
-                        || hold.first_held_unix > now
-                        || hold.day_start_unix > now
+                        || hold.first_held_unix
+                            > now
+                                .saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2))
+                        || hold.day_start_unix
+                            > now
+                                .saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2))
                     {
                         return false;
                     }
-                    let base = hold.base_seconds(now);
+                    // Keep the existing bounded rollback tolerance. A hold
+                    // written just before a clock correction is not corrupt
+                    // and must not discard unrelated destination custody.
+                    // Preserve counters/timestamps: rollback grants no retries.
+                    let held_now = now.max(hold.first_held_unix).max(hold.day_start_unix);
+                    let base = hold.base_seconds(held_now);
                     base.saturating_add(base / 4)
+                        .saturating_add(held_now.saturating_sub(now))
                 }
                 None => SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
             };
@@ -36522,6 +36532,49 @@ mod tests {
             &far_future,
             original_now
         ));
+    }
+
+    #[test]
+    fn server_hold_deadlines_tolerate_bounded_rollback_without_new_allowance() {
+        let original_now = 4_000_000_u64;
+        for kind in [SnapshotHoldKind::Held, SnapshotHoldKind::Refused] {
+            for stage in 0..=2 {
+                let hold = SnapshotHoldRetry {
+                    kind,
+                    stage,
+                    first_held_unix: original_now,
+                    day_start_unix: original_now,
+                    retries_in_day: 6,
+                };
+                let record = SnapshotQuarantineRecord {
+                    witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                    retry_after_unix_seconds: hold.retry_after("fixture", original_now),
+                    upload_body_witness: Some("a".repeat(64)),
+                    failed_reconstruction_count: 1,
+                    disposition: SnapshotQuarantineDisposition::RetryPending,
+                    hold: Some(hold),
+                    version_skew_attempts: 0,
+                };
+                assert!(snapshot_quarantine_deadline_is_bounded_at(
+                    &record,
+                    original_now - 1
+                ));
+                assert!(!record.hold.as_ref().unwrap().allowance(original_now - 1));
+                let rollback = SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2);
+                assert!(!snapshot_quarantine_deadline_is_bounded_at(
+                    &record,
+                    original_now - rollback - 1
+                ));
+                let corrupt = SnapshotQuarantineRecord {
+                    retry_after_unix_seconds: u64::MAX,
+                    ..record
+                };
+                assert!(!snapshot_quarantine_deadline_is_bounded_at(
+                    &corrupt,
+                    original_now - 1
+                ));
+            }
+        }
     }
 
     fn legacy_shaped_index(mut index: ScanIndex) -> ScanIndex {
