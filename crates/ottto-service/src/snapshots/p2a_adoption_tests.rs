@@ -438,7 +438,7 @@ fn p2a_held_new_alias_discovery_survives_partial_index_rollback() {
     index.load_claude_reemission_exclusions(&support);
     let mut page = scan_source_roots_with_limit(
         SnapshotSource::ClaudeCode,
-        &[root.clone()],
+        std::slice::from_ref(&root),
         &mut index,
         "2026-08-23T18:40:00Z",
         BACKFILL_WINDOW_DAYS,
@@ -740,5 +740,75 @@ fn p2a_protected_alias_keeps_ordinary_body_without_new_custody_hold() {
         "protected members never acquire money custody holds"
     );
     assert_eq!(before, serde_json::to_vec(&page.snapshots).unwrap());
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn p2a_root_telemetry_does_not_move_an_inactive_child_past_the_account_cutoff() {
+    let (home, root, mut index) = claude_context_backfill_fixture("p2a-member-activity", 1);
+    let support = p2a_support(&home);
+    let _live = money::LiveForTest::new(&support);
+    let session = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
+    let child_path = root
+        .join(session)
+        .join("subagents/agent-0000000000000000.jsonl");
+    let old = fs::read_to_string(&child_path)
+        .unwrap()
+        .replace("2026-08-23T18:20:00Z", "2026-05-02T18:20:00Z");
+    fs::write(&child_path, old).unwrap();
+    let mut scan = p2a_scan(&root, &support, &mut index);
+    assert_eq!(scan.snapshots.len(), 2);
+    let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
+        capture_revision: "claude_api_request:v2".into(),
+        session_id: session.into(),
+        request_id: "request-0-root".into(),
+        observed_at: "2026-08-23T18:20:00Z".into(),
+        model: "claude-haiku-4-5".into(),
+        cost_usd_micros: Some(100),
+        input_tokens: 10,
+        output_tokens: 1,
+        request_count: 1,
+        ..Default::default()
+    };
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&row).unwrap())
+    );
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+        evidence: BTreeMap::from([(session.to_owned(), vec![row])]),
+        ..Default::default()
+    };
+    assert!(money::live_page(
+        &support,
+        &mut scan.snapshots,
+        &index,
+        &api,
+        &Default::default(),
+        true,
+        None,
+        &mut BTreeMap::new(),
+    )
+    .is_empty());
+    let child = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id != session)
+        .unwrap();
+    assert_eq!(
+        child.source_last_activity_at.as_deref(),
+        Some("2026-05-02T18:20:00Z")
+    );
+    let cutoff = crate::backfill::BackfillState {
+        backfill_cutoff_at: Some("2026-06-01T00:00:00Z".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::backfill::apply_backfill_cutoff(&mut scan.snapshots, &cutoff),
+        1
+    );
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(scan.snapshots[0].source_session_id, session);
+    money::store::flush();
     let _ = fs::remove_dir_all(home);
 }

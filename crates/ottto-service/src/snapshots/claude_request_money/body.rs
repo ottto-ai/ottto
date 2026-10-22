@@ -1174,7 +1174,13 @@ fn side_calls(
             return;
         }
         let hash = row.request_hash;
-        for entity in body.entities.values_mut() {
+        let named = family
+            .trace
+            .and_then(|trace| trace.get(&hash))
+            .filter(|member| family.indexed_members.contains(member.as_str()))
+            .map(String::as_str);
+        let target = named.unwrap_or(family.root);
+        if let Some(entity) = body.entities.get_mut(target) {
             entity.activity_unix = entity.activity_unix.max(row.clock);
             entity.activity_nanos = entity.activity_nanos.max(
                 row.observed_at()
@@ -1183,12 +1189,7 @@ fn side_calls(
                     .unwrap_or(i128::from(row.clock) * 1_000_000_000),
             );
         }
-        let named = family
-            .trace
-            .and_then(|trace| trace.get(&hash))
-            .filter(|member| family.indexed_members.contains(member.as_str()))
-            .map(String::as_str);
-        let target = named.unwrap_or(family.root);
+
         // A member's transcript and its matching API row are one evidence
         // unit. Root-only/trace-only API evidence is a separate removed unit
         // when the contribution belongs to a different member.

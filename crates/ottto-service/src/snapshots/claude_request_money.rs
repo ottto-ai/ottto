@@ -3754,10 +3754,10 @@ fn schedule_trace(
                     continue;
                 }
                 let owner: [u8; 32] = Sha256::digest(member.as_bytes()).into();
-                if member == family || old_owner == Some(&owner) || next_owner == Some(owner) {
-                    if !stage_money_dirty(ledger, key, revision, now) {
-                        return false;
-                    }
+                if (member == family || old_owner == Some(&owner) || next_owner == Some(owner))
+                    && !stage_money_dirty(ledger, key, revision, now)
+                {
+                    return false;
                 }
             }
             if !stage_money_watch(
@@ -3811,6 +3811,74 @@ pub(crate) fn pace_money_debt(
         }
     }
     let _ = store::checkpoint(support_dir, &mut ledger);
+}
+
+// Watch publication is phase two. A crash at any earlier data-shard boundary
+// leaves the old watch replayable. A later watch write can only follow durable
+// dependent invalidation; no cross-shard atomic rename is assumed.
+type MoneyWatchUpdates = Vec<(String, Option<ClaudeRequestCensusRecord>)>;
+
+fn stage_money_dirty(
+    ledger: &mut ClaudeLedger,
+    index_key: &str,
+    revision: [u8; 32],
+    now: u64,
+) -> bool {
+    let key = store::money_key("dirty:", index_key);
+    if ledger
+        .get(&key)
+        .is_some_and(|record| record.money_revision() == revision)
+    {
+        return true;
+    }
+    ledger.put_money(key, ClaudeRequestCensusRecord::money_debt(revision, now))
+}
+
+fn checkpoint_money_watches(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    updates: MoneyWatchUpdates,
+) -> bool {
+    if updates.is_empty() {
+        return true;
+    }
+    if !store::checkpoint(support_dir, ledger) {
+        return false;
+    }
+    for (key, record) in updates {
+        match record {
+            Some(record) => {
+                if !ledger.put_money(key, record) {
+                    return false;
+                }
+            }
+            None => ledger.remove(&key),
+        }
+    }
+    true
+}
+
+fn stage_money_watch(
+    updates: &mut MoneyWatchUpdates,
+    key: String,
+    record: Option<ClaudeRequestCensusRecord>,
+    budget: &mut ShadowBudget,
+) -> bool {
+    if !budget.charge(key.capacity()) {
+        return false;
+    }
+    if updates.len() == updates.capacity() {
+        let capacity = updates.capacity().max(4).saturating_mul(2);
+        if !budget.charge(capacity.saturating_mul(std::mem::size_of::<(
+            String,
+            Option<ClaudeRequestCensusRecord>,
+        )>())) {
+            return false;
+        }
+        updates.reserve_exact(capacity - updates.len());
+    }
+    updates.push((key, record));
+    true
 }
 
 #[cfg(test)]
@@ -3979,72 +4047,4 @@ mod scheduling_reconciliation_tests {
             0
         );
     }
-}
-
-// Watch publication is phase two. A crash at any earlier data-shard boundary
-// leaves the old watch replayable. A later watch write can only follow durable
-// dependent invalidation; no cross-shard atomic rename is assumed.
-type MoneyWatchUpdates = Vec<(String, Option<ClaudeRequestCensusRecord>)>;
-
-fn stage_money_dirty(
-    ledger: &mut ClaudeLedger,
-    index_key: &str,
-    revision: [u8; 32],
-    now: u64,
-) -> bool {
-    let key = store::money_key("dirty:", index_key);
-    if ledger
-        .get(&key)
-        .is_some_and(|record| record.money_revision() == revision)
-    {
-        return true;
-    }
-    ledger.put_money(key, ClaudeRequestCensusRecord::money_debt(revision, now))
-}
-
-fn checkpoint_money_watches(
-    support_dir: &Path,
-    ledger: &mut ClaudeLedger,
-    updates: MoneyWatchUpdates,
-) -> bool {
-    if updates.is_empty() {
-        return true;
-    }
-    if !store::checkpoint(support_dir, ledger) {
-        return false;
-    }
-    for (key, record) in updates {
-        match record {
-            Some(record) => {
-                if !ledger.put_money(key, record) {
-                    return false;
-                }
-            }
-            None => ledger.remove(&key),
-        }
-    }
-    true
-}
-
-fn stage_money_watch(
-    updates: &mut MoneyWatchUpdates,
-    key: String,
-    record: Option<ClaudeRequestCensusRecord>,
-    budget: &mut ShadowBudget,
-) -> bool {
-    if !budget.charge(key.capacity()) {
-        return false;
-    }
-    if updates.len() == updates.capacity() {
-        let capacity = updates.capacity().max(4).saturating_mul(2);
-        if !budget.charge(capacity.saturating_mul(std::mem::size_of::<(
-            String,
-            Option<ClaudeRequestCensusRecord>,
-        )>())) {
-            return false;
-        }
-        updates.reserve_exact(capacity - updates.len());
-    }
-    updates.push((key, record));
-    true
 }

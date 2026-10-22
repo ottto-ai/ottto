@@ -395,6 +395,13 @@ pub(crate) struct WriteResult {
     meta_unwritten: Option<bool>,
 }
 
+type CheckpointPayload = (
+    PathBuf,
+    ClaudeLedgerSave,
+    ShadowReservation,
+    SyncSender<(Vec<usize>, Option<bool>)>,
+);
+
 enum Job {
     Load(PathBuf),
     Write(Box<WriteJob>),
@@ -404,12 +411,7 @@ enum Job {
         entered: SyncSender<()>,
         release: Receiver<()>,
     },
-    Checkpoint(
-        PathBuf,
-        ClaudeLedgerSave,
-        ShadowReservation,
-        SyncSender<(Vec<usize>, Option<bool>)>,
-    ),
+    Checkpoint(Box<CheckpointPayload>, ShadowReservation),
 }
 
 enum Slot {
@@ -458,7 +460,7 @@ impl Job {
     fn queued_bytes(&self) -> usize {
         match self {
             Self::Write(job) => job.queued_bytes(),
-            Self::Checkpoint(_, _, reservation, _) => reservation.bytes(),
+            Self::Checkpoint(payload, allocation) => payload.2.bytes() + allocation.bytes(),
             _ => 0,
         }
     }
@@ -665,11 +667,13 @@ fn run_writer(receiver: Receiver<Job>) {
                     results.entry(support_dir).or_default().push(result);
                 }
             }
-            Job::Checkpoint(support_dir, save, reservation, done) => {
+            Job::Checkpoint(payload, allocation) => {
+                let (support_dir, save, reservation, done) = *payload;
                 let state = failed.entry(support_dir.clone()).or_default();
                 let result = write_save(&support_dir.join(LEDGER_DIR), &save, state);
-                QUEUED_BYTES.fetch_sub(reservation.bytes(), Ordering::AcqRel);
+                QUEUED_BYTES.fetch_sub(reservation.bytes() + allocation.bytes(), Ordering::AcqRel);
                 drop(reservation);
+                drop(allocation);
                 let _ = done.send(result);
             }
             #[cfg(test)]
@@ -893,6 +897,10 @@ pub(crate) fn flush() {
 }
 
 fn flush_acknowledged() -> bool {
+    flush_acknowledged_by(Instant::now() + flush_timeout())
+}
+
+fn flush_acknowledged_by(deadline: Instant) -> bool {
     let (done, wait) = sync_channel(1);
     let Some(sender) = WRITER
         .get()
@@ -902,7 +910,6 @@ fn flush_acknowledged() -> bool {
     else {
         return false;
     };
-    let deadline = Instant::now() + flush_timeout();
     let mut job = Job::Flush(done);
     loop {
         let attempt = sender.lock().ok().map(|sender| sender.try_send(job));
@@ -1059,25 +1066,28 @@ impl ClaudeLedger {
 /// retry debt. The guard stays exclusive; a timed-out save is dirtied again.
 /// This barrier deliberately has no network or credential side effects.
 pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
+    let deadline = Instant::now() + flush_timeout();
+    if writer().is_none() || !flush_acknowledged_by(deadline) {
+        return false;
+    }
     super::apply_results(
         support_dir,
         ledger,
         &mut super::ClaudeRequestMoneyShadowCounts::default(),
     );
     if ledger.dirty_shards() == 0 {
-        // No dirty buffers can also mean an earlier save is still in flight.
-        // A timeout is not proof that those shards reached disk.
-        if !flush_acknowledged() {
-            return false;
-        }
-        super::apply_results(
-            support_dir,
-            ledger,
-            &mut super::ClaudeRequestMoneyShadowCounts::default(),
-        );
-        return ledger.dirty_shards() == 0;
+        return true;
     }
-    let Some((save, reservation)) = ledger.take_save(Instant::now() + Duration::from_millis(100))
+    // Admit the boxed command and its directory before allocating either.
+    let Some(allocation) = ShadowReservation::admit(
+        std::mem::size_of::<CheckpointPayload>()
+            .saturating_add(support_dir.as_os_str().len())
+            .saturating_add(1024),
+    ) else {
+        return false;
+    };
+    let Some((save, reservation)) =
+        ledger.take_save(deadline.min(Instant::now() + Duration::from_millis(100)))
     else {
         return false;
     };
@@ -1089,17 +1099,15 @@ pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool 
     let meta = (save.meta_first.is_some() || save.meta_last.is_some()).then_some(save.meta_debt);
     let (done, wait) = sync_channel(1);
     if submit(Job::Checkpoint(
-        support_dir.to_path_buf(),
-        save,
-        reservation,
-        done,
+        Box::new((support_dir.to_path_buf(), save, reservation, done)),
+        allocation,
     ))
     .is_err()
     {
         ledger.restore(&shards, meta);
         return false;
     }
-    match wait.recv_timeout(Duration::from_secs(5)) {
+    match wait.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok((failed, meta)) => ledger.restore(&failed, meta),
         Err(_) => ledger.restore(&shards, meta),
     }
@@ -1385,5 +1393,56 @@ mod refused_intent_tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn checkpoint_persists_memos_returned_by_a_pending_writer_batch() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-checkpoint-pending-memo");
+        let support = scratch.join("support");
+        let mut ledger = ClaudeLedger::new_for_test();
+        let key = "fam:checkpoint-pending".to_owned();
+        let revision = [9; 32];
+        let memo = ClaudeFamilyMemo {
+            snapshot: 7,
+            ..Default::default()
+        };
+        let stalled = stall_writer_for_test();
+        let job = WriteJob {
+            support_dir: support.clone(),
+            pending_intent: None,
+            jsonl: super::super::JsonlBatch {
+                now: 1_790_000_000,
+                families: Vec::new(),
+                coverage: super::super::CoverageRow::owed(1_790_000_000),
+                buffer_bytes: 0,
+            },
+            memos: vec![PendingMemo {
+                key: key.clone(),
+                revision,
+                observed_unix: 1_790_000_000,
+                memo,
+            }],
+            save: None,
+            reservations: Vec::new(),
+        };
+        assert!(submit_batch(&mut ledger, job).is_ok());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(stalled);
+        });
+        assert!(checkpoint(&support, &mut ledger));
+        release.join().unwrap();
+        assert_eq!(ledger.dirty_shards(), 0);
+        assert_eq!(
+            ledger.get(&key).unwrap().family_memo(),
+            Some((&revision, memo))
+        );
+        let reloaded = load_for_test(&support);
+        assert_eq!(
+            reloaded.get(&key).unwrap().family_memo(),
+            Some((&revision, memo))
+        );
+        super::super::forget_owed_coverage_for_test(&support);
     }
 }

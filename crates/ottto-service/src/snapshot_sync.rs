@@ -19750,6 +19750,8 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
+    // Imported fixtures retain their independent body clones.
+    #[allow(clippy::cloned_ref_to_slice_refs)]
     mod claude_request_money_pipeline_tests {
         include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
     }
