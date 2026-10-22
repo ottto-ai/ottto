@@ -39,6 +39,7 @@ mod harvest;
 mod measure;
 mod payload;
 mod report;
+mod v2;
 
 pub use harvest::spawn_context_composition_sync;
 
