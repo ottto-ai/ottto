@@ -18658,13 +18658,12 @@ impl OwnedSourceScan {
                         });
                 // Slice D1: before `finish` consumes the parser. P1 ledger
                 // birth: `created()` and identity of the descriptor this parse
-                // opened (one read, never a path); unknown is None.
+                // opened, taken at open (never a path); unknown is None.
                 let claude_opened_birth = (source == SnapshotSource::ClaudeCode
                     && !comparison_target
                     && claude_index_path_family_member(&candidate.path).is_some())
-                .then(|| parser.reader.reader.get_ref().metadata().ok())
-                .flatten()
-                .and_then(|metadata| claude_opened_file_birth(&metadata));
+                .then_some(parser.claude_opened_birth)
+                .flatten();
                 let claude_itemless_request_hashes = if source == SnapshotSource::ClaudeCode
                     && !comparison_target
                     && !parser.positive_usage_evidence
@@ -21730,6 +21729,8 @@ struct OwnedJsonlParser {
     recognized_usage_drop_count: usize,
     positive_recognized_usage_count: usize,
     positive_usage_evidence: bool,
+    /// P1 ledger birth from the same open-time read as `claude_file_birth`.
+    claude_opened_birth: Option<claude_request_census::ClaudeRequestBirth>,
 }
 impl OwnedJsonlParser {
     #[allow(clippy::too_many_arguments)]
@@ -21793,11 +21794,14 @@ impl OwnedJsonlParser {
                 accumulator.seed_codex_sidecar_parent(path, &file_metadata, metadata);
             }
         }
+        let mut claude_opened_birth = None;
         if source == SnapshotSource::ClaudeCode {
             // Birth of the opened object itself; a later path lookup could
-            // describe a replacement file.
-            accumulator.claude_file_birth =
-                ClaudeFileBirth::observe(path, reader.get_ref().metadata().ok().as_ref());
+            // describe a replacement file. One read, shared by the birth rule
+            // (this open only) and the P1 ledger (first-seen birth).
+            let opened = reader.get_ref().metadata().ok();
+            accumulator.claude_file_birth = ClaudeFileBirth::observe(path, opened.as_ref());
+            claude_opened_birth = opened.as_ref().and_then(claude_opened_file_birth);
         }
 
         Ok(Self {
@@ -21812,6 +21816,7 @@ impl OwnedJsonlParser {
             recognized_usage_drop_count: 0,
             positive_recognized_usage_count: 0,
             positive_usage_evidence: false,
+            claude_opened_birth,
         })
     }
     fn step(&mut self) -> Result<bool> {
@@ -69383,7 +69388,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
