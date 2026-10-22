@@ -29,8 +29,8 @@
 //! taken, while any other process of this user runs an executable named
 //! `ottto-service`: the process table is read before the pass applies
 //! anything and again before every lock attempt, and once it shows such a
-//! process, or cannot be read, the rest of the pass applies nothing
-//! (`skipped.other_daemon`). The startup pass runs before this daemon
+//! process, or cannot be read before the time budget runs out, the rest of
+//! the pass applies nothing (`skipped.other_daemon`). The startup pass runs before this daemon
 //! starts any worker of its own. What remains is a daemon launched between
 //! the last process-table read and the unlink, a window of a few syscalls;
 //! launchd starts one instance per label, so that needs a second, manually
@@ -219,8 +219,13 @@ fn probe_pid(pid: i32) -> PidState {
 }
 
 /// Whether another `ottto-service` process of this user may be running.
-/// An error means the process table could not be read completely.
-type DaemonProbe = Box<dyn Fn() -> std::io::Result<bool>>;
+/// An error means the process table could not be read completely, also
+/// when the sweep's deadline (asked before every process) ran out.
+type DaemonProbe = Box<dyn Fn(&mut dyn FnMut() -> bool) -> std::io::Result<bool>>;
+
+fn timed_out() -> std::io::Error {
+    std::io::ErrorKind::TimedOut.into()
+}
 
 enum OtherDaemonCheck {
     /// Probe before applying anything and again before every lock attempt.
@@ -329,10 +334,15 @@ mod process_table {
         Err(std::io::Error::other("process table kept growing"))
     }
 
-    pub(super) fn other_daemon_running() -> std::io::Result<bool> {
+    pub(super) fn other_daemon_running(
+        out_of_time: &mut dyn FnMut() -> bool,
+    ) -> std::io::Result<bool> {
         let own = std::process::id();
         let uid = unsafe { libc::getuid() };
         for pid in all_pids()? {
+            if out_of_time() {
+                return Err(super::timed_out());
+            }
             if pid <= 0 || pid as u32 == own {
                 continue;
             }
@@ -393,10 +403,15 @@ mod process_table {
         error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
     }
 
-    pub(super) fn other_daemon_running() -> std::io::Result<bool> {
+    pub(super) fn other_daemon_running(
+        out_of_time: &mut dyn FnMut() -> bool,
+    ) -> std::io::Result<bool> {
         let own = std::process::id();
         let uid = unsafe { libc::getuid() };
         for entry in std::fs::read_dir("/proc")? {
+            if out_of_time() {
+                return Err(super::timed_out());
+            }
             let entry = entry?;
             let Some(pid) = entry
                 .file_name()
@@ -451,7 +466,9 @@ mod process_table {
     target_os = "android"
 )))]
 mod process_table {
-    pub(super) fn other_daemon_running() -> std::io::Result<bool> {
+    pub(super) fn other_daemon_running(
+        _out_of_time: &mut dyn FnMut() -> bool,
+    ) -> std::io::Result<bool> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 }
@@ -831,20 +848,29 @@ impl Sweep<'_> {
     }
 
     /// Reads the process table unless an earlier read already stopped the
-    /// pass from applying. Returns whether applying must stop.
+    /// pass from applying. Returns whether applying must stop. The read
+    /// asks the deadline before every process; a read cut short by it, or
+    /// a deadline that passed during it, counts as failed, so nothing is
+    /// locked after the budget is spent.
     fn other_daemon_may_run(&mut self) -> bool {
         if self.report.other_daemon_check.blocks_apply() {
             return true;
         }
-        self.report.other_daemon_check = match &self.policy.other_daemon {
+        let policy = self.policy;
+        let state = match &policy.other_daemon {
             OtherDaemonCheck::NotApplicable => OtherDaemonState::NotApplicableNonDefaultDir,
-            OtherDaemonCheck::Probe(probe) => match probe() {
-                Ok(false) => OtherDaemonState::Clear,
-                Ok(true) => OtherDaemonState::Present,
-                Err(_) => OtherDaemonState::ProbeFailed,
-            },
+            OtherDaemonCheck::Probe(probe) => {
+                let result = probe(&mut || self.out_of_time());
+                match result {
+                    _ if self.out_of_time() => OtherDaemonState::ProbeFailed,
+                    Ok(false) => OtherDaemonState::Clear,
+                    Ok(true) => OtherDaemonState::Present,
+                    Err(_) => OtherDaemonState::ProbeFailed,
+                }
+            }
         };
-        self.report.other_daemon_check.blocks_apply()
+        self.report.other_daemon_check = state;
+        state.blocks_apply()
     }
 
     fn record(&mut self, path: String, bytes: u64, verdict: &Verdict, lock: LockState) {

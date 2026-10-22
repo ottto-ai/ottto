@@ -69,8 +69,11 @@ fn plant_orphan(dest: &Path, base: &str) -> PathBuf {
     orphan
 }
 
+/// A process-table probe that answers without asking the deadline.
 fn daemon_probe(probe: impl Fn() -> std::io::Result<bool> + 'static) -> OtherDaemonCheck {
-    OtherDaemonCheck::Probe(Box::new(probe))
+    OtherDaemonCheck::Probe(Box::new(move |_out_of_time: &mut dyn FnMut() -> bool| {
+        probe()
+    }))
 }
 
 /// Production rules, except that no other daemon is running.
@@ -1225,7 +1228,15 @@ fn daemon_executable_names_match_exactly() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn process_table_shows_another_daemon_executable() {
-    assert!(other_daemon_running().is_ok(), "process table readable");
+    assert!(
+        other_daemon_running(&mut || false).is_ok(),
+        "process table readable"
+    );
+    assert_eq!(
+        other_daemon_running(&mut || true).map_err(|error| error.kind()),
+        Err(ErrorKind::TimedOut),
+        "the read asks the deadline"
+    );
     let scratch = ScratchDir::new("local-state-sweep-daemon");
     let stand_in = scratch.join(DAEMON_EXECUTABLE);
     let test_binary = std::env::current_exe().expect("test binary");
@@ -1246,7 +1257,7 @@ fn process_table_shows_another_daemon_executable() {
             .expect("spawn stand-in"),
     );
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !other_daemon_running().expect("process table readable") {
+    while !other_daemon_running(&mut || false).expect("process table readable") {
         assert!(Instant::now() < deadline, "stand-in never seen");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1258,4 +1269,61 @@ fn process_table_shows_another_daemon_executable() {
 #[ignore = "stand-in process for another test"]
 fn other_daemon_stand_in() {
     let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+}
+
+#[test]
+fn deadline_during_the_process_table_read_applies_nothing() {
+    let f = fixture();
+    let planted = plant_three_orphans(&f.dest);
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+    let probe_reads = reads.clone();
+    let policy = Policy {
+        // A table read that would say "clear" if it were not cut short.
+        other_daemon: OtherDaemonCheck::Probe(Box::new(
+            move |out_of_time: &mut dyn FnMut() -> bool| {
+                probe_reads.set(probe_reads.get() + 1);
+                for _ in 0..1_000 {
+                    if out_of_time() {
+                        return Err(timed_out());
+                    }
+                }
+                Ok(false)
+            },
+        )),
+        before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+        // The first read before applying runs out of time on its 2nd process.
+        expire_after_checks: Some(1),
+        ..names_and_locks_only()
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert!(report.time_budget_exhausted);
+    assert_eq!(report.other_daemon_check, OtherDaemonState::ProbeFailed);
+    assert_eq!(report.removed, 0);
+    assert_eq!(reads.get(), 1);
+    for (orphan, lock) in &planted {
+        assert!(orphan.exists());
+        assert!(lock_is_free(lock));
+    }
+
+    // A read that finishes in time but after which the budget is gone also
+    // stops the pass before any lock.
+    let f = fixture();
+    let planted = plant_three_orphans(&f.dest);
+    let policy = Policy {
+        other_daemon: daemon_probe(|| Ok(false)),
+        before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+        expire_after_checks: Some(0),
+        ..names_and_locks_only()
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.other_daemon_check, OtherDaemonState::ProbeFailed);
+    assert_eq!(report.removed, 0);
+    for (orphan, lock) in &planted {
+        assert!(orphan.exists());
+        assert!(lock_is_free(lock));
+    }
 }
