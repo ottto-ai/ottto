@@ -2,7 +2,7 @@
 //! No paths, identities, arbitrary strings, persisted fields or extra scans.
 use super::{
     disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
-    ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource,
+    ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
 };
 use serde::Serialize;
 
@@ -37,6 +37,9 @@ pub(super) struct Starting {
     context_matches: bool,
     retry_due: Option<bool>,
     prior_unsettled_upload: bool,
+    /// Fixed names of the paths that set `prior_unsettled_upload`. Empty when
+    /// it is false or was set by a daemon that did not record causes.
+    prior_unsettled_causes: Vec<&'static str>,
     previous: Option<Previous>,
     new_retry_attempt: u8,
     pub(super) stale_pending_families: usize,
@@ -80,6 +83,9 @@ impl Starting {
             context_matches: matches,
             retry_due: matches.then_some(true),
             prior_unsettled_upload: index.bounded_sweep_had_unsettled_upload,
+            prior_unsettled_causes: UnsettledUploadCause::names(
+                index.bounded_sweep_unsettled_causes,
+            ),
             previous,
             new_retry_attempt: attempt,
             stale_pending_families: 0,
@@ -108,6 +114,7 @@ pub(super) fn retiring(
     index_generation: u64,
     traversal: &ScanTraversalCheckpoint,
     raw_complete: bool,
+    unsettled_causes: u16,
     gates: CensusGates,
 ) {
     #[derive(Serialize)]
@@ -118,6 +125,8 @@ pub(super) fn retiring(
         window_unix_seconds: Option<u64>,
         raw_census_complete: bool,
         gates: CensusGates,
+        /// Fixed names of the paths that set the clean follow-up's flag.
+        unsettled_causes: Vec<&'static str>,
         counts: &'a ScanTraversalCounts,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
     }
@@ -141,6 +150,7 @@ pub(super) fn retiring(
             window_unix_seconds: rfc3339_unix_seconds(&traversal.census_window_end),
             raw_census_complete: raw_complete,
             gates,
+            unsettled_causes: UnsettledUploadCause::names(unsettled_causes),
             counts: &traversal.counts,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
         },
@@ -151,9 +161,7 @@ pub(super) fn retiring(
 mod tests {
     use super::*;
     use crate::local_resource_diagnostics::capture;
-    use crate::snapshots::{
-        ensure_bounded_traversal, scan_source_roots, UnsettledUploadCause, BACKFILL_WINDOW_DAYS,
-    };
+    use crate::snapshots::{ensure_bounded_traversal, scan_source_roots, BACKFILL_WINDOW_DAYS};
     use serde_json::{json, Value};
 
     const T0: &str = "2026-08-01T00:00:00Z";
@@ -685,6 +693,8 @@ mod tests {
             let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
             starting.context_matches = false; // longest boolean spelling
             starting.prior_unsettled_upload = false;
+            starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
+            assert_eq!(starting.prior_unsettled_causes.len(), 8);
             starting.retry_due = Some(false);
             starting.stale_pending_families = usize::MAX;
             starting.rearmed_index_files = usize::MAX;
@@ -710,6 +720,7 @@ mod tests {
                     u64::MAX,
                     index.traversal.as_ref().unwrap(),
                     true,
+                    u16::MAX,
                     CensusGates {
                         clean_followup: true,
                         ..Default::default()
@@ -718,6 +729,13 @@ mod tests {
             });
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0]["source"], source.api_slug());
+            assert_eq!(
+                rows[0]["counts"]["unsettled_causes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                8
+            );
             assert_complete_max_row(rows[0].clone());
         }
     }

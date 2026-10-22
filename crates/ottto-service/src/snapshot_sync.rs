@@ -301,7 +301,7 @@ fn commit_completed_with_local_holds(
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
     let mut index =
         index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
-    index.mark_bounded_sweep_unsettled();
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
     index
 }
 
@@ -430,7 +430,11 @@ fn settle_checkpointed_upload(
     };
     let settled = resolved_permanent_rejections && !holds.any();
     if !settled {
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
+            UnsettledUploadCause::RejectedWithHolds
+        } else {
+            UnsettledUploadCause::DeferredConflict
+        });
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled);
     UploadIndexSettlement {
@@ -1895,8 +1899,10 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     if let Some(fallback) = fallback {
         fallback.restore(&mut committable, committed_index)?;
     }
-    let _ = cause;
-    committable.mark_bounded_sweep_unsettled();
+    match cause {
+        Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
+        None => committable.mark_bounded_sweep_unsettled(),
+    }
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
@@ -5656,7 +5662,7 @@ fn finish_sync_source(
                 comparison_completion
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
-                None,
+                Some(UnsettledUploadCause::Shed),
             ) {
                 Ok(committable) => committable,
                 Err(error) => {
@@ -5772,7 +5778,7 @@ fn finish_sync_source(
                     comparison_completion
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
-                    None,
+                    Some(UnsettledUploadCause::UploadError),
                 ) {
                     Ok(committable) => index = committable,
                     Err(checkpoint_error) => eprintln!(
@@ -7044,7 +7050,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // until a complete family pass reconstructs the exact witness.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::AuthorityCensusWithheld);
     }
     Ok((disposition, census_withheld, stats))
 }
