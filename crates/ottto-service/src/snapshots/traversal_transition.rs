@@ -506,8 +506,10 @@ mod tests {
         );
 
         // A newer daemon's unknown bit stays beside later marks and a reload.
-        let mut flagged = ScanIndex::default();
-        flagged.bounded_sweep_had_unsettled_upload = true;
+        let flagged = ScanIndex {
+            bounded_sweep_had_unsettled_upload: true,
+            ..ScanIndex::default()
+        };
         let mut newer = with_unsettled_causes(&flagged, 1 << 15);
         assert_eq!(newer.bounded_sweep_unsettled_cause_names(), ["unknown"]);
         newer.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
