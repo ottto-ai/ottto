@@ -639,7 +639,7 @@ impl std::fmt::Display for UploadFailureDiagnostics {
 
 impl std::error::Error for UploadFailureDiagnostics {}
 
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Hash)]
 pub struct ActivityHintResponse {
     pub source: String,
     pub server_time: String,

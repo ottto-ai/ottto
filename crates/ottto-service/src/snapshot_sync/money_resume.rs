@@ -24,7 +24,7 @@ struct PendingFinish {
     exclusions_revision: Option<FileRevision>,
     account_witness: [u8; 32],
     destination: String,
-    policy: crate::snapshot_client::ActivityHintResponse,
+    policy: [u8; 32],
     client: SnapshotApiClient,
 }
 static PENDING: Mutex<Option<PendingFinish>> = Mutex::new(None);
@@ -54,15 +54,30 @@ fn refusal() -> anyhow::Error {
 
 // Observation clocks/counts are allowed to advance; every collection, privacy,
 // attribution and capability field must still match the authenticated hint.
-fn policy(
-    mut hint: crate::snapshot_client::ActivityHintResponse,
-) -> crate::snapshot_client::ActivityHintResponse {
+pub(super) fn policy(mut hint: crate::snapshot_client::ActivityHintResponse) -> [u8; 32] {
+    use std::hash::{Hash, Hasher};
+    struct PolicyHash(Sha256);
+    impl Hasher for PolicyHash {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.update(bytes);
+        }
+        fn finish(&self) -> u64 {
+            let digest = self.0.clone().finalize();
+            u64::from_be_bytes(digest[..8].try_into().expect("digest prefix"))
+        }
+    }
     hint.server_time.clear();
     hint.last_data_at = None;
     hint.record_count_15m = 0;
     hint.record_count_24h = 0;
     hint.recommended_scan_after.clear();
-    hint
+    let mut digest = PolicyHash(Sha256::new());
+    digest.write(b"claude_money_resume_policy:v1\0");
+    hint.hash(&mut digest);
+    if let Some(key) = hint.session_attribution_hmac_key.as_mut() {
+        key.zeroize();
+    }
+    digest.0.finalize().into()
 }
 
 // Saved indexes/list installs replace the file atomically. Check their
@@ -255,8 +270,8 @@ pub(super) fn start(
         .ok_or_else(refusal)?;
     // Pay only the metadata that is actually copied outside the moved input
     // graphs. In particular, never duplicate either entire index's charge.
-    let context_bytes = graph_bytes(&preparation.activity_hint)?
-        .saturating_add(graph_bytes(&preparation.receipt_client)?.saturating_mul(2))
+    let context_bytes = graph_bytes(&preparation.receipt_client)?
+        .saturating_mul(2)
         .saturating_add(preparation.index_path.as_os_str().len())
         .saturating_add(preparation.upload_destination_namespace.len())
         .saturating_add(device.device_id.len())
@@ -294,7 +309,7 @@ pub(super) fn start(
         index_revision(&support_dir.join("snapshots/claude_code-reemission-exclusions.txt"))?;
     let account_witness = preparation.account_witness;
     let destination = preparation.upload_destination_namespace.clone();
-    let hint = policy(preparation.activity_hint.clone());
+    let hint = preparation.money_policy.ok_or_else(refusal)?;
     let client = preparation.receipt_client.clone();
     let resume_client = client.clone();
     let owned_device = device.clone();
@@ -440,6 +455,48 @@ mod tests {
         drop(cap);
         drop(memory);
         assert_eq!(money::reserved_for_test(), before);
+    }
+
+    #[test]
+    fn policy_witness_survives_key_consumption_but_rejects_rotation_and_privacy_changes() {
+        let hint: crate::snapshot_client::ActivityHintResponse = serde_json::from_value(serde_json::json!({
+            "source":"claude_code", "server_time":"2026-10-22T10:00:00Z", "last_data_at":null,
+            "record_count_15m":0, "record_count_24h":0, "local_usage_reconciliation_enabled":true,
+            "backfill_window_days":183, "recommended_scan_after":"2026-10-22T10:05:00Z",
+            "session_attribution_enabled":true, "session_attribution_hmac_key":"synthetic-policy-key-a",
+            "session_attribution_hmac_key_version":"synthetic-v1"
+        })).unwrap();
+        // Preparation stores this witness BEFORE consuming its raw key.
+        let witness = policy(hint.clone());
+        let mut prepared = hint.clone();
+        let mut raw = prepared.session_attribution_hmac_key.take().unwrap();
+        raw.zeroize();
+        assert!(prepared.session_attribution_hmac_key.is_none());
+        assert_eq!(
+            witness,
+            policy(hint.clone()),
+            "unchanged authenticated hint resumes the consumed-key preparation"
+        );
+        assert_ne!(
+            witness,
+            policy(prepared),
+            "do not derive the saved witness from the stripped preparation"
+        );
+        let mut observations = hint.clone();
+        observations.record_count_24h = 100;
+        observations.server_time = "2026-10-22T12:00:00Z".into();
+        observations.recommended_scan_after.clear();
+        assert_eq!(witness, policy(observations));
+        let mut rotated = hint.clone();
+        rotated.session_attribution_hmac_key = Some("synthetic-policy-key-b".into());
+        assert_ne!(
+            witness,
+            policy(rotated),
+            "same-version key rotation must invalidate old work"
+        );
+        let mut privacy = hint;
+        privacy.session_titles_enabled = false;
+        assert_ne!(witness, policy(privacy));
     }
 
     fn test_progress() -> SnapshotUploadProgress {

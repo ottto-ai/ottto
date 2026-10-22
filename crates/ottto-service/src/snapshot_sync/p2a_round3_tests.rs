@@ -1786,3 +1786,62 @@ fn p2a_enabling_live_between_finish_entry_and_evidence_yields_without_panicking_
         "fresh admitted live finish must later make progress"
     );
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_synchronous_audit_mode_never_yields_or_mutates_live_money_custody() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let control = P2aControl::new(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let mut index = ScanIndex::default();
+    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        &[control
+            .fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")],
+        &mut index,
+        &current_rfc3339(),
+        183,
+        16,
+        true,
+    )
+    .unwrap();
+    assert!(!scan.snapshots.is_empty());
+    let before = money::store::with_ledger_for_test(&control.support, |ledger| {
+        serde_json::to_value(ledger.census()).unwrap()
+    })
+    .unwrap();
+    let result = money_resume::immediate(try_apply_claude_local_evidence_to_scan_resume(
+        &control.support,
+        &mut scan,
+        &mut index,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    ))
+    .expect("audit mode must stay synchronous even while live money is enabled");
+    assert!(result.is_ok());
+    assert!(scan.snapshots.iter().all(
+        |item| item.usage_accounting_contract.as_deref() != Some(money::REQUEST_OWNED_CONTRACT)
+    ));
+    let after = money::store::with_ledger_for_test(&control.support, |ledger| {
+        serde_json::to_value(ledger.census()).unwrap()
+    })
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "audit must not mint synthetic/dirty/watch/offer/adoption custody"
+    );
+    assert!(control.offers().is_empty());
+    money::capture::purge_before(&control.support, Instant::now());
+}

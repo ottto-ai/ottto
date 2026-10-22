@@ -1266,6 +1266,7 @@ pub(crate) fn shadow_page_at(
         trace_report,
         census_complete,
         now,
+        false,
         &mut output,
     );
     crate::snapshot_sync::money_resume::immediate(future).unwrap_or_default()
@@ -1287,8 +1288,10 @@ async fn build_page_at(
     trace_report: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
     now: u64,
+    live: bool,
     output: &mut PageBodies,
 ) -> ClaudeRequestMoneyShadowCounts {
+    let live = live && request_owned_live(support_dir);
     let started = Instant::now();
     let mut deadline = started + PAGE_MAX_ELAPSED;
     let mut counts = ClaudeRequestMoneyShadowCounts::default();
@@ -1528,7 +1531,7 @@ async fn build_page_at(
     let dropped = end.tail.certificate_dropped;
     end.tail = tail;
     end.tail.certificate_dropped += dropped;
-    if request_owned_live(support_dir) {
+    if live {
         let mut updates = MoneyWatchUpdates::new();
         let complete = schedule_evidence(ledger, index, now, deadline, &mut budget, &mut updates);
         // Even a partial bootstrap may publish completed invalidations, but
@@ -1689,7 +1692,7 @@ async fn build_page_at(
             }
         }
     }
-    if request_owned_live(support_dir) {
+    if live {
         let mut updates = MoneyWatchUpdates::new();
         let complete = schedule_trace(
             ledger,
@@ -1730,7 +1733,7 @@ async fn build_page_at(
     page_message_hashes.sort_unstable();
     page_message_hashes.dedup();
 
-    if request_owned_live(support_dir) {
+    if live {
         let Some(released) =
             update_unbuilt_lifecycle(index, ledger, &BTreeSet::new(), now, deadline)
         else {
@@ -1930,7 +1933,7 @@ async fn build_page_at(
     end.scope = scope.debt;
     drop(holders);
     drop(scope);
-    if request_owned_live(support_dir) {
+    if live {
         let Some(released) =
             update_unbuilt_lifecycle(index, ledger, &blocking_files, now, deadline)
         else {
@@ -2044,7 +2047,7 @@ async fn build_page_at(
             });
         }
     }
-    if request_owned_live(support_dir) {
+    if live {
         for (member, entity) in &built {
             let key = member_keys.iter().find_map(|((_, id), keys)| {
                 (id == member)
@@ -2140,6 +2143,7 @@ pub(crate) async fn live_page_resume(
         trace,
         census_complete,
         page_now(support_dir),
+        true,
         &mut output,
     ))
     .await;
@@ -2336,6 +2340,7 @@ pub(crate) fn live_page(
         trace,
         census_complete,
         page_now(support_dir),
+        true,
         &mut output,
     )));
     apply_live_page(snapshots, index, &output, identity, groupings)
