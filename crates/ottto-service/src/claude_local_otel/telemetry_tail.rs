@@ -267,8 +267,10 @@ impl ClaudeTelemetryTail {
                 break;
             }
             match read_file(&dir, stem, ledger, now_unix, work, &mut counts) {
-                FileRead::Done { .. } | FileRead::Absent => cursor.clone_from(stem),
-                FileRead::Debt => {
+                FileRead::Done { reached: true } | FileRead::Absent => cursor.clone_from(stem),
+                // A file left short of its extent (a partial last line, an
+                // oversized line being skipped) has rows not yet read.
+                FileRead::Done { reached: false } | FileRead::Debt => {
                     sweep.debt = 1;
                     cursor.clone_from(stem);
                 }
@@ -828,7 +830,19 @@ fn read_file(
     }
     let (mut file, opened) = match open_sidecar(&path) {
         Ok(Some(opened)) => opened,
-        Ok(None) => return FileRead::Absent,
+        Ok(None) => {
+            // Gone: its saved claims go now (with the certificate), not
+            // when the missing-file round reaches it.
+            if let Some(record) = ledger.get(&key) {
+                let had_claims = !record.request_hashes().is_empty();
+                ledger.remove(&key);
+                counts.retired_missing += 1;
+                if had_claims {
+                    lose_claims(ledger, now_unix, counts);
+                }
+            }
+            return FileRead::Absent;
+        }
         Err(()) => {
             counts.files_unreadable += 1;
             return FileRead::Debt;
