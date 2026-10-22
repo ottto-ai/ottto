@@ -15072,6 +15072,7 @@ mod tests {
             |item| item.clone(),
             |_| None,
             |item| reconcile_class.contains(item),
+            &mut InplaceRetryBudget::default(),
             |batch| {
                 let is_reconcile = batch
                     .iter()
