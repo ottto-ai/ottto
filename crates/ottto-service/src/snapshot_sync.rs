@@ -19264,6 +19264,7 @@ mod tests {
     include!("retry_integrated_driver.rs");
     include!("retry_owned_rotation.rs");
     include!("retry_bounded_native_tests.rs");
+    include!("retry_compact_index_band_tests.rs");
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");

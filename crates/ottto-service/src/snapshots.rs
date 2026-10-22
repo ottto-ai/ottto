@@ -31262,7 +31262,7 @@ impl ScanIndex {
         let result = (|| -> Result<()> {
             {
                 let mut writer = BufWriter::new(&mut file);
-                serde_json::to_writer_pretty(&mut writer, &self)
+                serde_json::to_writer(&mut writer, &self)
                     .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
                 writer
                     .flush()
@@ -34098,6 +34098,9 @@ mod tests {
     mod claude_request_money_tests {
         include!("snapshots/claude_request_money_tests.rs");
     }
+    mod compact_scan_index_tests {
+        include!("snapshots/compact_scan_index_tests.rs");
+    }
     use super::*;
     use base64::Engine as _;
 
@@ -36528,7 +36531,7 @@ mod tests {
         index.save(&path).expect("save large generation");
         assert_eq!(
             fs::read(&path).expect("read durable index"),
-            serde_json::to_vec_pretty(&index).expect("encode exact index bytes")
+            serde_json::to_vec(&index).expect("encode exact compact index bytes")
         );
         let mut stale = ScanIndex::load(&path).expect("load stale generation");
         let mut winner = ScanIndex::load(&path).expect("load winning generation");
@@ -36539,7 +36542,7 @@ mod tests {
             .expect_err("stale generation stays fenced");
         assert_eq!(
             fs::read(&path).expect("read winning bytes"),
-            serde_json::to_vec_pretty(&winner).expect("encode winning bytes")
+            serde_json::to_vec(&winner).expect("encode winning compact bytes")
         );
         let observed = ScanIndex::load(&path).expect("reload winning generation");
         assert_eq!(observed.generation, 2);
