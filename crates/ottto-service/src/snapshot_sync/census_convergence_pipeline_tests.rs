@@ -1425,6 +1425,9 @@ fn mixed_rejected_fixture(name: &str, account_hold: bool) -> (PipelineFixture, S
     }
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
     fixture.append(PIPELINE_REFUSED_SESSION, "req_1_2");
+    // An unchanged sibling can be a semantic no-op after finalization. Make
+    // this sibling genuinely revised so its acceptance reaches the uploader.
+    fixture.append(PIPELINE_SESSIONS[2], "req_2_2");
     fixture.durable_progress = true;
     (fixture, baseline)
 }
@@ -1476,6 +1479,17 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
     assert_eq!(last.index.claude_account_deferred_hold_count(), 1);
     assert!(!last.fully_settled);
     assert!(!last.backfill_succeeded);
+    assert!(matches!(
+        refused_entity_state(
+            true,
+            PermanentRefusalCounts::of(&last.progress),
+            last.fully_settled
+        ),
+        CollectorState::Error {
+            code: "backend_validation_error",
+            ..
+        }
+    ));
     assert!(last
         .index
         .context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
@@ -1620,11 +1634,35 @@ fn assert_real_rejected_hold(
     }
 
     // Independent accepted-fold oracle: A retains its accepted revision;
-    // refused B contributes nothing, while C and D retain baseline bodies.
+    // refused B contributes nothing, C contributes its newly ACKed body, and
+    // D keeps its baseline body. The held key never enters this update.
     let mut expected = baseline.clone();
     let refused_key = PipelineFixture::key(baseline, PIPELINE_REFUSED_SESSION);
     expected.files.remove(&refused_key);
     expected.file_snapshot_fingerprints.remove(&refused_key);
+    let accepted_key = PipelineFixture::key(baseline, PIPELINE_SESSIONS[2]);
+    let accepted_body = first.progress.accepted_fingerprints.iter().next().unwrap();
+    assert!(!baseline
+        .current_snapshot_fingerprints()
+        .contains(accepted_body));
+    assert!(first
+        .scan
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == PIPELINE_SESSIONS[2]
+            && &item.snapshot_fingerprint == accepted_body));
+    expected
+        .files
+        .get_mut(&accepted_key)
+        .unwrap()
+        .last_snapshot_fingerprint = Some(accepted_body.clone());
+    expected
+        .file_snapshot_fingerprints
+        .insert(accepted_key, BTreeSet::from([accepted_body.clone()]));
+    expected.snapshot_activity_at.insert(
+        accepted_body.clone(),
+        Some("2026-08-02T07:00:30Z".to_string()),
+    );
     let (start, end) = snapshot_manifest_window(&last.scan.census_window_end, 183).unwrap();
     let manifest = last
         .index
@@ -1699,7 +1737,10 @@ fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
         PipelineUpload::ServerRejected,
         |index| {
             let mut value = serde_json::to_value(&*index).unwrap();
-            value["claude_usage_family_witnesses"]
+            // A retained witness without a terminal quarantine is valid
+            // index state, but cannot bind this authority-only hold. Removing
+            // the witness alone would leave an invalid orphaned quarantine.
+            value["claude_usage_authority_quarantine"]
                 .as_object_mut()
                 .unwrap()
                 .remove(PIPELINE_HELD_SESSION);
@@ -1824,8 +1865,12 @@ fn no_hold_rejected_and_deferred_pages_never_increment_the_terminal_hold_counter
     ] {
         let fixture = PipelineFixture::new("h1-no-hold-counter-control");
         fixture.baseline();
+        let cycle = PipelineCycle {
+            proven_owner_session: Some(PIPELINE_HELD_SESSION),
+            ..PIPELINE_HOLD_CYCLE
+        };
         let before = terminal_hold_settlement_count();
-        let first = fixture.page("2026-08-02T09:00:00Z", &PIPELINE_HOLD_CYCLE, upload);
+        let first = fixture.page("2026-08-02T09:00:00Z", &cycle, upload);
         assert!(first.held.is_empty());
         assert_eq!(
             first.index.bounded_sweep_had_unsettled_upload(),
