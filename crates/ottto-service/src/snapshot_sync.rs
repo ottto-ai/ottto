@@ -5520,8 +5520,10 @@ fn prepare_sync_source(
         home,
         &scan_agent_status_collection.codex_scan_homes,
     )?;
-    let money_policy = source_money_resume(source, support_dir)
-        .then(|| money_resume::policy(activity_hint.clone()));
+    let money_policy = (source_money_resume(source, support_dir)
+        || source == SnapshotSource::ClaudeCode
+            && crate::snapshots::claude_request_money::store::live_refused(support_dir))
+    .then(|| money_resume::policy(activity_hint.clone()));
     let mut encoded_attribution_key = activity_hint.session_attribution_hmac_key.take();
     let attribution_context = SessionAttributionContext::from_activity_hint(
         source,
@@ -5628,6 +5630,20 @@ fn prepare_sync_source(
         );
     }
     index.activate_upload_context(upload_context);
+    if source == SnapshotSource::ClaudeCode {
+        use crate::snapshots::claude_request_money::{self as money, MoneyReceipt};
+        match money::reclaim_metadata(support_dir, &index) {
+            MoneyReceipt::Pending => {
+                return Err(crate::source_rotation::LocalRefusal(
+                    "request money scheduling checkpoint pending",
+                )
+                .into())
+            }
+            MoneyReceipt::Refused => money::store::refuse_live(support_dir),
+            MoneyReceipt::Ready => (),
+        }
+        money::note_collection_fallback(support_dir);
+    }
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
@@ -5990,7 +6006,9 @@ fn finish_sync_source(
     }
     #[cfg(test)]
     money_resume::before_immediate_for_test();
-    money_resume::immediate(finish_sync_source_resume(
+    let fallback = preparation.source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_money::store::live_refused(support_dir);
+    let result = money_resume::immediate(finish_sync_source_resume(
         preparation,
         index,
         scan_result,
@@ -6009,7 +6027,13 @@ fn finish_sync_source(
     .unwrap_or(Err(crate::source_rotation::LocalRefusal(
         "request money scheduling checkpoint pending",
     )
-    .into()))
+    .into()));
+    if fallback && result.is_ok() {
+        // One completed ordinary collection earns a fresh live admission
+        // attempt. No elapsed-time timeout, cap bypass, or custody deletion.
+        crate::snapshots::claude_request_money::store::allow_live(support_dir);
+    }
+    result
 }
 
 fn source_money_resume(source: SnapshotSource, support_dir: &Path) -> bool {
@@ -6470,16 +6494,16 @@ async fn finish_sync_source_resume(
     }
     if source_money_resume(source, support_dir) {
         money_resume::until(|| {
-            crate::snapshots::claude_request_money::prepare_money_offers(
+            crate::snapshots::claude_request_money::prepare_money_offers_receipt(
                 support_dir,
                 &index,
                 &scan_result.snapshots,
                 &claude_authority_disposition.quarantined_source_session_ids_for_money(),
             )
         })
-        .await;
+        .await?;
         money_resume::until(|| {
-            crate::snapshots::claude_request_money::note_adoption_outcomes(
+            crate::snapshots::claude_request_money::note_adoption_outcomes_receipt(
                 support_dir,
                 &index,
                 &scan_result.snapshots,
@@ -6488,7 +6512,7 @@ async fn finish_sync_source_resume(
                 },
             )
         })
-        .await;
+        .await?;
     }
     let local_holds = LocalHoldSettlement::classify(
         source,
@@ -6829,7 +6853,7 @@ async fn finish_sync_source_resume(
             memory.refresh(&index, &scan_result, Some(&upload_progress), 0)?;
         }
         money_resume::until(|| {
-            crate::snapshots::claude_request_money::note_adoption_outcomes(
+            crate::snapshots::claude_request_money::note_adoption_outcomes_receipt(
                 support_dir,
                 &index,
                 &scan_result.snapshots,
@@ -6855,7 +6879,7 @@ async fn finish_sync_source_resume(
                 },
             )
         })
-        .await;
+        .await?;
 
         let Some(settlement_funds) =
             crate::snapshots::claude_request_money::ShadowReservation::admit(

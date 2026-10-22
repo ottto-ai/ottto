@@ -37,13 +37,23 @@ pub(crate) fn immediate<T>(future: impl Future<Output = T>) -> Option<T> {
     }
 }
 
-pub(crate) async fn until(mut ready: impl FnMut() -> bool) {
-    std::future::poll_fn(|_| {
-        if ready() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
+#[derive(Debug)]
+struct AdmissionRefused;
+impl std::fmt::Display for AdmissionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request money admission refused; ordinary collection remains available")
+    }
+}
+impl std::error::Error for AdmissionRefused {}
+
+pub(crate) async fn until(
+    mut ready: impl FnMut() -> crate::snapshots::claude_request_money::MoneyReceipt,
+) -> Result<()> {
+    use crate::snapshots::claude_request_money::MoneyReceipt;
+    std::future::poll_fn(|_| match ready() {
+        MoneyReceipt::Ready => Poll::Ready(Ok(())),
+        MoneyReceipt::Pending => Poll::Pending,
+        MoneyReceipt::Refused => Poll::Ready(Err(AdmissionRefused.into())),
     })
     .await
 }
@@ -169,7 +179,17 @@ impl Memory {
 
 fn poll(mut pending: PendingFinish) -> Result<()> {
     match immediate(pending.future.as_mut()) {
-        Some(result) => result,
+        Some(result) => {
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<AdmissionRefused>())
+            {
+                crate::snapshots::claude_request_money::store::refuse_live(&pending.support_dir);
+                eprintln!("claude_request_money admission_refused=1 continuation_released=1");
+            }
+            result
+        }
         None => {
             let mut slot = PENDING.lock().map_err(|_| refusal())?;
             if slot.is_some() {
@@ -364,6 +384,15 @@ pub(super) fn start(
 }
 
 #[cfg(test)]
+pub(super) fn pending_for_test(support: &Path) -> bool {
+    PENDING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|pending| pending.support_dir == support)
+}
+
+#[cfg(test)]
 pub(super) fn forget_for_test(support_dir: &Path) {
     let mut slot = PENDING.lock().unwrap();
     if slot
@@ -404,6 +433,17 @@ pub(crate) fn drive_for_test<T>(future: impl Future<Output = T>) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_real_pending_receipts_park_and_terminal_refusal_releases_immediately() {
+        use crate::snapshots::claude_request_money::MoneyReceipt;
+        assert!(immediate(until(|| MoneyReceipt::Ready)).unwrap().is_ok());
+        assert!(immediate(until(|| MoneyReceipt::Refused))
+            .unwrap()
+            .unwrap_err()
+            .is::<AdmissionRefused>());
+        assert!(immediate(until(|| MoneyReceipt::Pending)).is_none());
+    }
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]

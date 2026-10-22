@@ -734,10 +734,11 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
                 .clone();
             // This control starts at a settled, matching policy boundary. A
             // mismatching context/revision is an ordinary reparse control.
-            saved.upload_context_fingerprint = Some(snapshot_upload_context_fingerprint(
-                SnapshotUploadPolicy::default(),
-                None,
+            let mut persisted = serde_json::to_value(&saved).unwrap();
+            persisted["upload_context_fingerprint"] = serde_json::json!(snapshot_upload_context_fingerprint(
+                SnapshotUploadPolicy::default(), None,
             ));
+            saved = serde_json::from_value(persisted).unwrap();
             if terminal {
                 saved.insert_unproven_terminal_claude_authority_for_test(
                     IDENTITY_PIPELINE_ROOT,
@@ -1844,4 +1845,194 @@ fn p2a_synchronous_audit_mode_never_yields_or_mutates_live_money_custody() {
     );
     assert!(control.offers().is_empty());
     money::capture::purge_before(&control.support, Instant::now());
+}
+
+
+// Real-cap controls use the production record limit, actual preparation/finish,
+// POST, durable ACK, selected save and restart. No test cap or timeout stands
+// in for the admission decision.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
+    };
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::new(FinishOutcome::Accept);
+    control.cycle();
+    let _live = money::LiveForTest::new(&control.support);
+    money::store::reload_for_test(&control.support).unwrap();
+    money::store::with_ledger_for_test(&control.support, |ledger| {
+        for n in 0..money::store::LEDGER_MAX_RECORDS {
+            assert_eq!(
+                ledger.insert(
+                    format!("dirty:{n:064x}"),
+                    ClaudeRequestCensusRecord::money_debt([7; 32], 0)
+                ),
+                ClaudeRequestCensusInsert::Stored
+            );
+        }
+        assert_eq!(
+            ledger.insert(
+                "dirty:over-cap".into(),
+                ClaudeRequestCensusRecord::money_debt([8; 32], 0)
+            ),
+            ClaudeRequestCensusInsert::Refused
+        );
+        assert!(money::store::checkpoint_for_test(&control.support, ledger));
+    })
+    .unwrap();
+    let _refused = control.cycle_changing(|attempt| {
+        assert!(
+            attempt < 12,
+            "terminal capacity refusal cannot remain parked"
+        )
+    });
+    assert!(!money_resume::pending_for_test(&control.support));
+    assert!(
+        !money::request_owned_live(&control.support),
+        "next collection uses ordinary path"
+    );
+    let sibling = "7c1bccdd-3ac4-4c78-a15d-1ed09f351405";
+    let text = std::fs::read_to_string(control.transcript())
+        .unwrap()
+        .replace(IDENTITY_PIPELINE_ROOT, sibling)
+        .replace("req_1", "capacity-new-1")
+        .replace("req_2", "capacity-new-2");
+    std::fs::write(
+        control
+            .transcript()
+            .with_file_name(format!("{sibling}.jsonl")),
+        text,
+    )
+    .unwrap();
+    let before = control.offers().len();
+    control.cycle();
+    let offers = control.offers();
+    let ordinary = offers[before..]
+        .iter()
+        .find(|item| item["source_session_id"] == sibling)
+        .expect("ordinary sibling actually POSTs through saturated money custody");
+    assert_ne!(
+        ordinary["usage_accounting_contract"],
+        money::REQUEST_OWNED_CONTRACT
+    );
+    assert!(control.saved().accepted_snapshot_fingerprint_recorded(
+        ordinary["snapshot_fingerprint"].as_str().unwrap()
+    ));
+    assert!(!money_resume::pending_for_test(&control.support));
+    money::store::with_ledger_for_test(&control.support, |ledger| {
+        assert_eq!(
+            ledger.census().record_count(),
+            money::store::LEDGER_MAX_RECORDS
+        );
+        assert_eq!(
+            ledger
+                .get(&format!("dirty:{:064x}", 0))
+                .unwrap()
+                .money_revision(),
+            [7; 32],
+            "ordinary progress never deletes existing debt"
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_actual_cap_metadata_recovery_finishes_literal_and_survives_restart() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
+    };
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut control = P2aControl::new(FinishOutcome::Accept);
+    control.cycle();
+    let _live = money::LiveForTest::new(&control.support);
+    money::store::reload_for_test(&control.support).unwrap();
+    money::store::with_ledger_for_test(&control.support, |ledger| {
+        assert_eq!(
+            ledger.insert(
+                "due:sentinel".into(),
+                ClaudeRequestCensusRecord::money_debt([9; 32], 0)
+            ),
+            ClaudeRequestCensusInsert::Stored
+        );
+        for n in 1..money::store::LEDGER_MAX_RECORDS {
+            assert_eq!(
+                ledger.insert(
+                    format!(
+                        "watch:trace:{:x}:{n:016x}",
+                        Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+                    ),
+                    ClaudeRequestCensusRecord::money_debt([7; 32], 0)
+                ),
+                ClaudeRequestCensusInsert::Stored
+            );
+        }
+        assert_eq!(
+            ledger.insert(
+                "dirty:over-cap".into(),
+                ClaudeRequestCensusRecord::money_debt([8; 32], 0)
+            ),
+            ClaudeRequestCensusInsert::Refused
+        );
+        assert!(money::store::checkpoint_for_test(&control.support, ledger));
+    })
+    .unwrap();
+    money::store::refuse_live(&control.support);
+    let before = control.offers().len();
+    control
+        .cycle_changing(|attempt| {
+            assert!(
+                attempt < 16,
+                "real reclaimed slots must admit and settle a literal"
+            )
+        })
+        .unwrap();
+    let offers = control.offers();
+    let literal = offers[before..]
+        .iter()
+        .find(|item| item["usage_accounting_contract"] == money::REQUEST_OWNED_CONTRACT)
+        .expect("actual literal POST after cap reclamation");
+    let fp = literal["snapshot_fingerprint"].as_str().unwrap();
+    assert!(control.saved().accepted_snapshot_fingerprint_recorded(fp));
+    assert!(control
+        .saved()
+        .files
+        .values()
+        .all(|entry| entry.effective_upload_body_witness_revision == 3));
+    money::store::with_ledger_for_test(&control.support, |ledger| {
+        assert!(ledger.census().record_count() < money::store::LEDGER_MAX_RECORDS);
+        assert_eq!(
+            ledger.get("due:sentinel").unwrap().money_revision(),
+            [9; 32]
+        );
+        assert!(money::store::checkpoint_for_test(&control.support, ledger));
+    })
+    .unwrap();
+    control.restart();
+    control.cycle();
+    assert!(control.saved().accepted_snapshot_fingerprint_recorded(fp));
+    money::store::with_ledger_for_test(&control.support, |ledger| {
+        assert_eq!(
+            ledger.get("due:sentinel").unwrap().money_revision(),
+            [9; 32]
+        )
+    })
+    .unwrap();
+    assert!(!money_resume::pending_for_test(&control.support));
 }
