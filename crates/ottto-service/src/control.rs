@@ -6689,6 +6689,7 @@ fn auth_reset(
     };
     let mut cloud_disconnect: Option<SetupRunDisconnectResponse> = None;
     let mut setup_run_already_ended = false;
+    let mut released_without_setup_run = false;
 
     if !local_only {
         let connection = daemon
@@ -6708,18 +6709,29 @@ fn auth_reset(
             release.as_ref(),
         ) {
             Ok(disconnect) => cloud_disconnect = Some(disconnect),
-            // Ottto already ended this run, so there is nothing left to
-            // disconnect or release. Fall through to the local-only cleanup
-            // (prior device proof kept for reconnecting) and report that Ottto
-            // was not changed. Forgetting the installation still needs the
+            // Ottto already ended this run, so it can never be disconnected.
+            // This Mac can still release its own registration with its device
+            // secret, which needs no setup run; once Ottto confirms, the reset
+            // continues exactly like a successful cloud logout. Otherwise a
+            // plain logout falls through to the local-only cleanup (prior
+            // device proof kept for reconnecting) and reports that Ottto was
+            // not changed; forgetting the installation still needs the
             // release, and every other failure still aborts with local state
             // intact.
             Err(error)
-                if !forget_installation
-                    && terminal_refresh_rejection(&error)
-                        == Some(TerminalRefreshRejection::SetupRunEnded) =>
+                if terminal_refresh_rejection(&error)
+                    == Some(TerminalRefreshRejection::SetupRunEnded) =>
             {
-                setup_run_already_ended = true;
+                if release
+                    .as_ref()
+                    .is_some_and(|release| release_device_without_setup_run(&api_base_url, release))
+                {
+                    released_without_setup_run = true;
+                } else if forget_installation {
+                    return Err(error);
+                } else {
+                    setup_run_already_ended = true;
+                }
             }
             Err(error) => return Err(error),
         }
@@ -6769,10 +6781,16 @@ fn auth_reset(
     reset.disconnected_at = cloud_disconnect
         .as_ref()
         .map(|disconnect| disconnect.disconnected_at.clone());
-    reset.device_released = cloud_disconnect
-        .as_ref()
-        .map(|disconnect| disconnect.device_released);
-    reset.message = if setup_run_already_ended {
+    reset.device_released = if released_without_setup_run {
+        Some(true)
+    } else {
+        cloud_disconnect
+            .as_ref()
+            .map(|disconnect| disconnect.device_released)
+    };
+    reset.message = if released_without_setup_run {
+        released_without_setup_run_message(forget_installation)
+    } else if setup_run_already_ended {
         StableMessage {
             code: "setup_run_already_ended".to_string(),
             text: "Ottto had already ended this Mac's setup run, so nothing changed in Ottto and this Mac's server registration was not released. Active local credentials were cleared; prior device proof was retained securely for reconnection."
@@ -6823,6 +6841,25 @@ fn auth_reset_message(forget_installation: bool, device_released: Option<bool>) 
     StableMessage {
         code: code.to_string(),
         text,
+    }
+}
+
+/// A cloud reset whose setup run had already ended, after this Mac released
+/// its own server registration directly.
+fn released_without_setup_run_message(forget_installation: bool) -> StableMessage {
+    const RELEASED: &str = "This Mac's Ottto connection had expired, so it released its server registration directly and was logged out.";
+    if forget_installation {
+        StableMessage {
+            code: "installation_forgotten".to_string(),
+            text: format!(
+                "{RELEASED} Installation identity, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing."
+            ),
+        }
+    } else {
+        StableMessage {
+            code: "device_released_after_run_ended".to_string(),
+            text: RELEASED.to_string(),
+        }
     }
 }
 
@@ -8685,6 +8722,50 @@ fn device_release_proof(device_id: String, device_secret: String) -> Option<Devi
         device_id,
         device_secret,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceSelfReleaseResponse {
+    device_released: bool,
+}
+
+/// Ask Ottto to release this Mac's registration with the device's own
+/// secret, for a cloud logout whose setup run has already ended. Needs no
+/// setup run. True only on a 200 that says `device_released: true`; any other
+/// status (older servers answer 404 or 405), an unparsable body, or a
+/// transport failure is not a release.
+fn release_device_without_setup_run(api_base_url: &str, release: &DeviceReleaseProof) -> bool {
+    // SECURITY: the request carries the long-lived device secret. Gate the
+    // base through the trusted-base validator, only put an id made of plain
+    // path characters into the URL, and never follow a redirect: ureq would
+    // forward the custom secret header to the redirect target, so a 3xx is
+    // an unconfirmed release.
+    let Ok(api_base_url) = validated_api_base_url(Some(api_base_url)) else {
+        return false;
+    };
+    if !release
+        .device_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return false;
+    }
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!("/api/v1/telemetry/devices/{}/release", release.device_id),
+    );
+    crate::retry_tls::agent_builder()
+        .redirects(0)
+        .build()
+        .post(&url)
+        .set("Accept", "application/json")
+        .set("X-Ottto-Device-Secret", &release.device_secret)
+        .timeout(BACKEND_REQUEST_TIMEOUT)
+        .send_bytes(&[])
+        .ok()
+        .filter(|response| response.status() == 200)
+        .and_then(|response| response.into_json::<DeviceSelfReleaseResponse>().ok())
+        .is_some_and(|response| response.device_released)
 }
 
 fn setup_run_disconnect_body(release: Option<&DeviceReleaseProof>) -> serde_json::Value {
@@ -23001,6 +23082,8 @@ for line in sys.stdin:
             (401, r#"{"detail":"Setup run not found for this device"}"#),
             (401, expired),
             (401, expired),
+            // An older server has no device release route.
+            (404, r#"{"detail":"Not Found"}"#),
         ]);
         let (root, _guards, daemon, device) =
             connected_binding_fixture("logout-ended-run", api_base_url);
@@ -23059,6 +23142,286 @@ for line in sys.stdin:
         assert!(requests[1].contains("/local-client/refresh"));
         assert!(requests[2].contains("/local-client/disconnect"));
         assert!(requests[3].contains("/local-client/refresh"));
+        assert!(requests[4].starts_with("POST /api/v1/telemetry/devices/device-connected/release "));
+        assert_eq!(requests.len(), 5);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn auth_reset_request(
+        request_id: &str,
+        local_only: bool,
+        forget_installation: bool,
+    ) -> LocalControlRequest {
+        LocalControlRequest {
+            request_id: request_id.to_string(),
+            protocol_version: if forget_installation {
+                ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION
+            } else {
+                PROTOCOL_VERSION
+            },
+            token: Some("token".to_string()),
+            client_kind: Some(LocalClientKind::Cli),
+            client_install_owner: None,
+            command: LocalControlCommand::AuthReset {
+                local_only,
+                forget_installation,
+            },
+        }
+    }
+
+    const ENDED_RUN_RELEASED: &str = r#"{"device_released":true}"#;
+
+    #[test]
+    #[serial]
+    fn logout_after_ottto_ended_the_run_releases_this_mac_with_its_device_secret() {
+        let _lock = lock_backend_test_env();
+        let expired = r#"{"detail":"Setup run expired"}"#;
+        let (api_base_url, server) = scripted_json_backend(vec![
+            (401, expired),
+            (401, expired),
+            (200, ENDED_RUN_RELEASED),
+        ]);
+        let (root, _guards, daemon, _device) =
+            connected_binding_fixture("logout-ended-run-release", api_base_url);
+
+        let response = handle_request(
+            &daemon,
+            auth_reset_request("req_logout_ended_run_release", false, false),
+        );
+        let requests = server.join().expect("scripted backend");
+
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["local_only"], false);
+        assert_eq!(payload["cloud_disconnected"], false);
+        assert_eq!(payload["device_released"], true);
+        assert!(payload["setup_run_id"].is_null());
+        assert_eq!(
+            payload["message"]["code"],
+            "device_released_after_run_ended"
+        );
+        assert!(payload["message"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("connection had expired")));
+        assert!(!payload.to_string().contains("connected-secret"));
+        assert_eq!(
+            daemon.status("token").unwrap().account.state,
+            LocalAccountState::NotConnected
+        );
+        // Same local cleanup as a successful cloud logout: no prior proof kept.
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert!(FileDeviceStore::new(default_prior_device_path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert!(KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .is_err());
+        assert!(
+            KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .is_err()
+        );
+
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains("/local-client/disconnect"));
+        assert!(requests[1].contains("/local-client/refresh"));
+        let release = &requests[2];
+        assert!(release.starts_with("POST /api/v1/telemetry/devices/device-connected/release "));
+        assert!(release
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("x-ottto-device-secret: connected-secret")));
+        assert!(!release
+            .to_ascii_lowercase()
+            .contains("x-ottto-setup-run-token"));
+        assert_eq!(http_request_body(release), "");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn forget_installation_after_ottto_ended_the_run_releases_then_forgets() {
+        let _lock = lock_backend_test_env();
+        let expired = r#"{"detail":"Setup run expired"}"#;
+        let (api_base_url, server) = scripted_json_backend(vec![
+            (401, expired),
+            (401, expired),
+            (200, ENDED_RUN_RELEASED),
+        ]);
+        let (root, _guards, daemon, _device) =
+            connected_binding_fixture("forget-ended-run-release", api_base_url);
+        FileMachineStore::default()
+            .save(&LocalMachineBinding {
+                machine_id: "machine_test".to_string(),
+                installation_id: "oti_ended_run".to_string(),
+                hardware_uuid: None,
+            })
+            .unwrap();
+
+        let response = handle_request(
+            &daemon,
+            auth_reset_request("req_forget_ended_run_release", false, true),
+        );
+        let requests = server.join().expect("scripted backend");
+
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["local_only"], false);
+        assert_eq!(payload["cloud_disconnected"], false);
+        assert_eq!(payload["device_released"], true);
+        assert_eq!(payload["message"]["code"], "installation_forgotten");
+        assert!(payload["message"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("connection had expired")));
+        assert!(FileMachineStore::default().load().unwrap().is_none());
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert!(requests[2].starts_with("POST /api/v1/telemetry/devices/device-connected/release "));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn ended_run_release_not_confirmed_keeps_todays_logout_outcomes() {
+        let _lock = lock_backend_test_env();
+        let expired = r#"{"detail":"Setup run expired"}"#;
+        for (name, release_status, release_body) in [
+            ("refused", 200, r#"{"device_released":false}"#),
+            ("old-server", 404, r#"{"detail":"Not Found"}"#),
+            ("unparsable", 200, r#"{"released":"yes"}"#),
+        ] {
+            // Forgetting the installation still fails with local state intact.
+            let (api_base_url, server) = scripted_json_backend(vec![
+                (401, expired),
+                (401, expired),
+                (release_status, release_body),
+            ]);
+            let (root, _guards, daemon, device) =
+                connected_binding_fixture(&format!("ended-run-no-release-{name}"), api_base_url);
+            let refused = handle_request(
+                &daemon,
+                auth_reset_request("req_forget_ended_run_unreleased", false, true),
+            );
+            let requests = server.join().expect("scripted backend");
+            assert!(!refused.ok, "{name}");
+            let error = refused.error.expect("error");
+            assert_eq!(error.code, CliErrorCode::BackendRejected, "{name}");
+            assert_eq!(error.code.exit_code(), 15, "{name}");
+            assert!(error.message.starts_with("Setup run expired."), "{name}");
+            assert_eq!(
+                daemon.status("token").unwrap().account.state,
+                LocalAccountState::Connected
+            );
+            assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
+            assert_eq!(
+                KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                    .load()
+                    .unwrap(),
+                "connected-secret"
+            );
+            assert!(requests[2].contains("/api/v1/telemetry/devices/device-connected/release"));
+
+            // A plain logout still falls back to the local-only cleanup.
+            let (api_base_url, server) = scripted_json_backend(vec![
+                (401, expired),
+                (401, expired),
+                (release_status, release_body),
+            ]);
+            let connection = LocalConnectionBinding {
+                api_base_url,
+                ..daemon
+                    .connection_for_authorized_client()
+                    .unwrap()
+                    .expect("connection")
+            };
+            FileConnectionStore::default().save(&connection).unwrap();
+            let daemon = daemon.with_connection(Some(connection));
+            let ended = handle_request(
+                &daemon,
+                auth_reset_request("req_logout_ended_run_unreleased", false, false),
+            );
+            server.join().expect("scripted backend");
+            assert!(ended.ok, "{name}: {ended:?}");
+            let payload = ended.payload.expect("payload");
+            assert_eq!(payload["local_only"], true);
+            assert!(payload["device_released"].is_null());
+            assert_eq!(payload["message"]["code"], "setup_run_already_ended");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn ended_run_release_never_follows_a_redirect() {
+        let _lock = lock_backend_test_env();
+        let target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        target.set_nonblocking(true).expect("nonblocking");
+        let location = format!("http://{}/released", target.local_addr().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirecting backend");
+        let api_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept release");
+            let request = read_complete_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{{\"device_released\":true}}"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write redirect");
+            request
+        });
+        let proof = device_release_proof(
+            "device-redirected".to_string(),
+            "secret-redirected".to_string(),
+        )
+        .expect("complete proof");
+
+        assert!(!release_device_without_setup_run(&api_base_url, &proof));
+        let request = server.join().expect("redirecting backend");
+        assert!(request.starts_with("POST /api/v1/telemetry/devices/device-redirected/release "));
+        assert!(matches!(
+            target.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn ended_run_release_refuses_a_device_id_that_is_not_a_plain_path_segment() {
+        let _lock = lock_backend_test_env();
+        let proof = device_release_proof("../setup-runs/x".to_string(), "secret".to_string())
+            .expect("complete proof");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let api_base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        assert!(!release_device_without_setup_run(&api_base_url, &proof));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn local_only_logout_never_contacts_ottto() {
+        let _lock = lock_backend_test_env();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let api_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (root, _guards, daemon, _device) =
+            connected_binding_fixture("local-only-no-request", api_base_url);
+
+        let response = handle_request(
+            &daemon,
+            auth_reset_request("req_local_only_no_request", true, false),
+        );
+
+        assert!(response.ok, "{response:?}");
+        assert!(response.payload.expect("payload")["device_released"].is_null());
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
