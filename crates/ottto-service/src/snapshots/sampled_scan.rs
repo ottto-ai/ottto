@@ -688,25 +688,59 @@ pub(super) fn retire_proof_beside_copy(
         .retire_proof_over_room(room.saturating_sub(budget.saturating_mul(2)));
     #[cfg(test)]
     COPY_RETIRE_PROBE.with(|probe| {
-        probe.set(Some((
-            crate::heap_layout_bound::bound(context, STATE_BYTES),
-            step.used.unwrap_or(0),
+        let whole = crate::heap_layout_bound::bound(context, STATE_BYTES);
+        let main = codex_cursor::bound_for_main(context, STATE_BYTES);
+        probe.set(Some(CopyRetireProbe {
+            proof: whole
+                .zip(main)
+                .and_then(|(whole, main)| whole.checked_sub(main)),
+            resident: step.resident,
+            used: step.used.unwrap_or(0),
             budget,
-        )))
+        }))
     });
+}
+
+/// Tests only: what `retire_proof_beside_copy` saw right after its retire.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CopyRetireProbe {
+    /// The suspended proof's charge left beside the copy (`bound(context)`
+    /// less main's view, measured together, so main's own growth since the
+    /// walk cancels).
+    pub(super) proof: Option<usize>,
+    /// The walk's main-view resident, its active charge and the budget.
+    pub(super) resident: Option<usize>,
+    pub(super) used: usize,
+    pub(super) budget: usize,
+}
+#[cfg(test)]
+impl CopyRetireProbe {
+    /// At the clone: the walk's resident + the proof + the active + both
+    /// shares fit `STATE_BYTES`.
+    pub(super) fn fits(&self) -> bool {
+        self.resident
+            .zip(self.proof)
+            .and_then(|(resident, proof)| {
+                resident
+                    .checked_add(proof)?
+                    .checked_add(self.used)?
+                    .checked_add(self.budget.checked_mul(2)?)
+            })
+            .is_some_and(|total| total <= STATE_BYTES)
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Tests only: after `retire_proof_beside_copy`'s retire, the whole
-    /// `bound(context)` (proof included), the active's charge and the budget.
-    static COPY_RETIRE_PROBE: std::cell::Cell<Option<(Option<usize>, usize, usize)>> =
+    /// Tests only: the last `retire_proof_beside_copy` on this thread.
+    static COPY_RETIRE_PROBE: std::cell::Cell<Option<CopyRetireProbe>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// Tests only: the last `COPY_RETIRE_PROBE` on this thread, taken.
 #[cfg(test)]
-pub(super) fn copy_retire_probe() -> Option<(Option<usize>, usize, usize)> {
+pub(super) fn copy_retire_probe() -> Option<CopyRetireProbe> {
     COPY_RETIRE_PROBE.with(std::cell::Cell::take)
 }
 

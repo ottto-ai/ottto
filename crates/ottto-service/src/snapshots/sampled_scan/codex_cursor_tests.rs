@@ -8945,9 +8945,9 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
         observe(|| super::super::retire_proof_beside_copy(Some(&context), with, step));
     assert_eq!(cache.proof_suspended_for_test(), None, "retired first");
     assert_eq!(proof_drops(counts), 1);
-    let (whole, used, funded) = super::super::copy_retire_probe().expect("probed");
-    assert_eq!((used, funded), (0, with));
-    assert!(whole.expect("measured") + used + 2 * funded <= STATE_BYTES);
+    let probe = super::super::copy_retire_probe().expect("probed");
+    assert_eq!((probe.proof, probe.used, probe.budget), (Some(0), 0, with));
+    assert!(probe.fits(), "{probe:?}");
     let scope = Scope("ns-a".to_owned());
     let index = std::path::Path::new("/idx/a.json");
     assert_eq!(cache.take_retired_proof_seqs(&scope, index, "inc-1"), [1]);
@@ -8960,8 +8960,9 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
 
 /// Fix round 2 DB1, the completion site: a cursor job's pages that allocate
 /// nothing keep a suspended proof of a third of the state budget; the page
-/// whose completion retains the certified copy retires it before the clone,
-/// and `bound(context)` + the active + both shares fit `STATE_BYTES` there.
+/// whose completion retains the certified copy retires it before the clone:
+/// the walk's resident + the proof left there (none) + the active + both
+/// shares fit `STATE_BYTES`.
 #[test]
 fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -8998,9 +8999,10 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
         }
         assert!(certified, "precondition: the job certified");
         assert!(cache.take(&key).is_some(), "the certified copy is retained");
-        let (whole, used, funded) = super::super::copy_retire_probe().expect("probed");
-        assert!(funded > 0);
-        assert!(whole.expect("measured") + used + 2 * funded <= STATE_BYTES);
+        let probe = super::super::copy_retire_probe().expect("probed");
+        assert!(probe.budget > 0);
+        assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
+        assert!(probe.fits(), "{probe:?}");
     });
 }
 

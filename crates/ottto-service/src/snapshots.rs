@@ -16879,14 +16879,17 @@ impl CodexProofReaders {
     /// CHARGE_REFRESH_BYTES`), the readers hold at most
     /// `W + (W - B) + 2s + ΔB` before the next line, on E3's premise
     /// (retained growth at most twice the bytes consumed) plus one doubling
-    /// of every walked non-buffer container and the measured buffer growth.
-    /// The next line (L ≤ `MAX_JSONL_LINE_BYTES`) adds at most `2L` retained
-    /// and `g ≤ MAX_JSONL_LINE_BYTES` of buffer, so charging
-    /// `2 × MAX_JSONL_LINE_BYTES` here keeps the step within
-    /// `room + MAX_JSONL_LINE_BYTES` on that premise. Like main's E3, the
-    /// transient `serde_json::Value` of a line being decoded is not
-    /// charged. Fresh walks use `s = 0`; a miss re-walks, then shrinks the
-    /// buffers and re-walks.
+    /// of every walked non-buffer container and the measured buffer growth;
+    /// one `MAX_JSONL_LINE_BYTES` is charged for the next line. On that
+    /// generic premise the next line (L ≤ `MAX_JSONL_LINE_BYTES`) can add
+    /// `2L` retained plus up to `MAX_JSONL_LINE_BYTES` of buffer, so the
+    /// step stays within `room + 2 × MAX_JSONL_LINE_BYTES`, not `room` plus
+    /// one line. Charging `2 × MAX_JSONL_LINE_BYTES` here would exceed the
+    /// whole proof room (`STATE_BYTES` = 31 MiB) and refuse every step; the
+    /// fix is an owner ruling (a pinned proof-reader premise, or the
+    /// stated bound). Like main's E3, the transient `serde_json::Value` of
+    /// a line being decoded is not charged. Fresh walks use `s = 0`; a miss
+    /// re-walks, then shrinks the buffers and re-walks.
     fn step_fits(&mut self, walk: &mut Option<ProofWalk>, room: usize) -> bool {
         let buffers = self.buffers();
         let worst = |walk: ProofWalk, since: usize, buffers: usize| {
@@ -16894,7 +16897,7 @@ impl CodexProofReaders {
                 .checked_add(walk.charge.saturating_sub(walk.buffers))?
                 .checked_add(since.checked_mul(2)?)?
                 .checked_add(buffers.saturating_sub(walk.buffers))?
-                .checked_add(MAX_JSONL_LINE_BYTES.checked_mul(2)?)
+                .checked_add(MAX_JSONL_LINE_BYTES)
         };
         let fits = |need: Option<usize>| need.is_some_and(|need| need <= room);
         let estimate = walk.and_then(|walk| {

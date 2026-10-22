@@ -1157,12 +1157,12 @@ fn a_run_steps_only_while_one_more_line_fits_its_room() {
     write_values(&parent, &parent_values());
     let child = rollout(&root, CHILD);
     write_values(&child, &child_values());
-    // Owner note 4 (r79), fix round 2 DM1: the charge of a fresh walk `W`
-    // with buffers `B` before one more line: `W + (W - B) + 2 * MAX`.
+    // Owner note 4 (r79): the charge of a fresh walk `W` with buffers `B`
+    // before one more line: `W + (W - B) + MAX_JSONL_LINE_BYTES`.
     let walk = |job: &mut CodexProofReaders| {
         job.shrink_buffers();
         let walked = crate::heap_layout_bound::bound(&*job, usize::MAX).unwrap();
-        walked + (walked - job.buffers()) + 2 * MAX_JSONL_LINE_BYTES
+        walked + (walked - job.buffers()) + MAX_JSONL_LINE_BYTES
     };
 
     let mut job = job_of(&parent, &[&child]);
