@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 764,
-  "content_sha256": "d90200dc98902bfff4c2a11527dbb93c39057594cc478a6e62fcdfe5e6e2bb29",
+  "candidate_file_count": 766,
+  "content_sha256": "672632b16606e174b40cfa8cdea6482de0e8e1623372e1d0c2b2be0db73add39",
   "files": [
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "a1c4df76816f26e06956ee83331b82cfe73d73f806d93919a48bb43931e06623",
-      "size_bytes": 3076617
+      "sha256": "f57f9edd04d4aa1e9bfc57fd35b31a3d97f13736f21197f54d9b38a649f11b29",
+      "size_bytes": 3078781
     },
     {
       "executable": false,
@@ -1471,6 +1471,13 @@
       "path": "crates/ottto-service/src/snapshots/cache_observations/tests.rs",
       "sha256": "620d46db86d32b35f3023fcaf950b79e3f9bf41d686b30cd8ecc3cf3d86b819e",
       "size_bytes": 6035
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/cache_overcap_tests.rs",
+      "sha256": "07a0411c82d63c693b6b7f69dc963ebf1aeae08b379e00bcb24c813427aa96df",
+      "size_bytes": 8556
     },
     {
       "executable": false,
@@ -1770,8 +1777,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "1c0f7dd75844227e338d6917bc6226970ed57fcf1045af5503c6b48619b544ec",
-      "size_bytes": 107051
+      "sha256": "1b0b29f06396da2d6266f1c480b28c1ed1f460c5024377f946032479f22525f0",
+      "size_bytes": 110068
     },
     {
       "executable": false,
@@ -1875,8 +1882,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/cache-observations-v1.md",
-      "sha256": "38283b9a3d2c8117b1920b9f63b95a953a4611017e2f36e60337241a0013346c",
-      "size_bytes": 3826
+      "sha256": "eb165613ecfda0e54aa3fd10e3b47bcd50f0ad671dc74ada0ca3c4060ddb803c",
+      "size_bytes": 4528
     },
     {
       "executable": false,
@@ -3578,6 +3585,13 @@
       "path": "docs/session-2026-10-21-tls-webpki-advisory-repair.md",
       "sha256": "ef62b022edc9e5a419dcd1e24d4509ae26d04a99355d05799cc8e87178ccd083",
       "size_bytes": 3566
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-22-cache-overcap-upload.md",
+      "sha256": "a96e15ff77b390a83606cb8f6696c2ce99d53d9a2627f26b76596f4ccbad03ca",
+      "size_bytes": 3785
     },
     {
       "executable": false,
@@ -5351,9 +5365,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T08:39:21+00:00",
+  "generated_at": "2026-10-22T09:16:37+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 765,
+  "output_file_count": 767,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5390,5 +5404,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d15f6f53298ee1ffdc47615c67019ed434c0b771"
+  "source_commit": "c262e00c65855c4e13562031bbfd95545f775ca3"
 }
