@@ -133,6 +133,27 @@ fn acquire_with(
     usize,
     Value,
 ) {
+    let (retained, mode, guards, items) =
+        acquire_items_with(fixture, source, metadata, scope, old, now, complete);
+    (retained, mode, guards, serde_json::to_value(items).unwrap())
+}
+/// `acquire_with`, returning the items themselves so local-only (`serde(skip)`)
+/// fields can be compared too.
+#[allow(clippy::too_many_arguments)]
+fn acquire_items_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+    scope: &Scope,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+    complete: bool,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    usize,
+    Vec<SnapshotItem>,
+) {
     let (mut parser, expected, _) = native_parser_with(fixture, source, metadata);
     let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
     let mode = parser.prepare_acquisition(old, scope, debt, now).unwrap();
@@ -177,7 +198,7 @@ fn acquire_with(
     assert_eq!(parsed.complete(), complete);
     let mut items = parsed.snapshots;
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
-    (retained, mode, guards, serde_json::to_value(items).unwrap())
+    (retained, mode, guards, items)
 }
 fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
     let mut items = match source {
@@ -2662,3 +2683,153 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
 }
 
 mod stage2pre_in_page_tail_tests;
+
+/// Codex rollout with two compaction shapes: a marker followed by an exact
+/// repeat of the last record (not counted) and a zero-size record (skipped)
+/// before the next counted request, then two markers with no request between.
+fn codex_compaction_lines() -> Vec<Value> {
+    let token = |at: &str, total: u64, last: u64| {
+        json!({"type":"event_msg", "timestamp":at,
+        "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+        "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":total/10},
+        "last_token_usage":{"input_tokens":last,"cached_input_tokens":last/2,"output_tokens":last/10}}}})
+    };
+    let compacted =
+        |at: &str| json!({"timestamp":at,"type":"compacted","payload":{"replacement_history":[]}});
+    let before = token("2026-10-07T11:05:00Z", 490_000, 250_000);
+    vec![
+        token("2026-10-07T11:00:00Z", 240_000, 240_000),
+        before.clone(),
+        compacted("2026-10-07T11:10:00Z"),
+        before,
+        token("2026-10-07T11:11:00Z", 490_000, 0),
+        token("2026-10-07T11:20:00Z", 549_000, 59_000),
+        token("2026-10-07T11:40:00Z", 619_000, 70_000),
+        compacted("2026-10-07T11:45:00Z"),
+        compacted("2026-10-07T11:46:00Z"),
+        token("2026-10-07T11:50:00Z", 649_000, 30_000),
+    ]
+}
+fn local_points(item: &SnapshotItem) -> Vec<(String, u32)> {
+    item.local_context_points
+        .iter()
+        .map(|point| {
+            let at = OffsetDateTime::from_unix_timestamp(i64::from(point.at_unix_seconds))
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap();
+            (at, point.prompt_tokens)
+        })
+        .collect()
+}
+#[test]
+fn codex_compaction_events_take_last_before_and_first_counted_after() {
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    for line in codex_compaction_lines() {
+        fixture.append(&line);
+    }
+    let items = parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
+    let item = &items[0];
+    let event = |at: &str, before: u64, after: u64| SnapshotCompactionEvent {
+        at: at.to_string(),
+        before: Some(before),
+        after: Some(after),
+        trigger: None,
+    };
+    assert_eq!(
+        item.compaction_events,
+        [
+            event("2026-10-07T11:10:00Z", 250_000, 59_000),
+            event("2026-10-07T11:45:00Z", 70_000, 30_000),
+            event("2026-10-07T11:46:00Z", 70_000, 30_000),
+        ]
+    );
+    assert_eq!(
+        item.compaction_events
+            .iter()
+            .map(|event| event.at.clone())
+            .collect::<Vec<_>>(),
+        item.compaction_timestamps
+    );
+    // Points come from the first/peak/last block: first == First,
+    // last == Last, none above Peak; one per 15-minute slot.
+    assert_eq!(
+        local_points(item),
+        [
+            ("2026-10-07T11:00:00Z".to_string(), 240_000),
+            ("2026-10-07T11:05:00Z".to_string(), 250_000),
+            ("2026-10-07T11:20:00Z".to_string(), 59_000),
+            ("2026-10-07T11:40:00Z".to_string(), 70_000),
+            ("2026-10-07T11:50:00Z".to_string(), 30_000),
+        ]
+    );
+    assert_eq!(item.first_turn_context_tokens, Some(240_000));
+    assert_eq!(item.last_turn_context_tokens, Some(30_000));
+    assert_eq!(item.peak_context_fill_tokens, Some(250_000));
+    let wire = serde_json::to_value(item).unwrap();
+    assert!(wire.get("local_context_points").is_none());
+    assert_eq!(wire["compaction_events"][0]["before"], json!(250_000));
+
+    // Output gate: two hours after the last activity the item carries no
+    // points; compaction sizes are unaffected.
+    let late = parse_codex_jsonl_file(&fixture.0, "2026-10-07T13:50:00Z", "native-fixture".into())
+        .unwrap();
+    assert!(late[0].local_context_points.is_empty());
+    assert_eq!(late[0].compaction_events, item.compaction_events);
+}
+#[test]
+fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let lines = codex_compaction_lines();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let metadata = CodexTitleMetadata::default();
+    let whole = Fixture::new(source);
+    for line in &lines {
+        whole.append(line);
+    }
+    let expected = parse_codex_jsonl_file(&whole.0, NOW, "native-fixture".into()).unwrap();
+    for split in 0..lines.len() {
+        let fixture = Fixture::new(source);
+        for line in &lines[..split] {
+            fixture.append(line);
+        }
+        let (mut retained, _, _, _) =
+            acquire_items_with(&fixture, source, &metadata, &scope, None, 100, true);
+        let mut items = Vec::new();
+        for (step, line) in lines[split..].iter().enumerate() {
+            fixture.append(line);
+            let reusable = retained.is_some();
+            let (next, mode, _, next_items) = acquire_items_with(
+                &fixture,
+                source,
+                &metadata,
+                &scope,
+                retained,
+                101 + step as u64,
+                true,
+            );
+            if reusable {
+                assert_eq!(mode, ReadMode::Tail, "split {split}, step {step}");
+            }
+            retained = next;
+            items = next_items;
+        }
+        assert_eq!(
+            serde_json::to_value(&items).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "split {split}"
+        );
+        assert_eq!(
+            items[0].compaction_events, expected[0].compaction_events,
+            "split {split}"
+        );
+        assert_eq!(
+            local_points(&items[0]),
+            local_points(&expected[0]),
+            "split {split}"
+        );
+    }
+}
