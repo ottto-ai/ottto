@@ -37,8 +37,8 @@ pub(super) struct Starting {
     context_matches: bool,
     retry_due: Option<bool>,
     prior_unsettled_upload: bool,
-    /// Fixed names of the paths that set `prior_unsettled_upload`. Empty when
-    /// it is false or was set by a daemon that did not record causes.
+    /// Fixed names of the paths that set `prior_unsettled_upload`. Empty
+    /// exactly when it is false.
     prior_unsettled_causes: Vec<&'static str>,
     previous: Option<Previous>,
     new_retry_attempt: u8,
@@ -83,9 +83,7 @@ impl Starting {
             context_matches: matches,
             retry_due: matches.then_some(true),
             prior_unsettled_upload: index.bounded_sweep_had_unsettled_upload,
-            prior_unsettled_causes: UnsettledUploadCause::names(
-                index.bounded_sweep_unsettled_causes,
-            ),
+            prior_unsettled_causes: UnsettledUploadCause::names(index.unsettled_cause_bits()),
             previous,
             new_retry_attempt: attempt,
             stale_pending_families: 0,

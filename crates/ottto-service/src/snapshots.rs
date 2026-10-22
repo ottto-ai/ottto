@@ -2362,7 +2362,13 @@ pub struct ScanIndex {
     /// Diagnostics only: the `UnsettledUploadCause` bits of the paths that
     /// set `bounded_sweep_had_unsettled_upload` in this sweep. The traversal
     /// transition lines name them; no gate reads them. Reset with the flag.
-    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    /// Read through `unsettled_cause_bits`, which reports none without the
+    /// flag and `Unattributed` for a flag with no recorded cause.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u16",
+        deserialize_with = "deserialize_unsettled_causes"
+    )]
     bounded_sweep_unsettled_causes: u16,
     /// Durable bounded filesystem census. It is intentionally destination-
     /// scoped with the rest of the scan index: missed watcher events, daemon
@@ -2465,10 +2471,13 @@ pub(crate) enum UnsettledUploadCause {
     LegacyReconcile,
     /// An admission-limit re-offer armed revisions.
     AdmissionReoffer,
+    /// A path that does not name itself, a flag saved before causes were
+    /// recorded, or a malformed recorded value.
+    Unattributed,
 }
 
 impl UnsettledUploadCause {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Shed,
         Self::UploadError,
         Self::DeferredConflict,
@@ -2477,6 +2486,7 @@ impl UnsettledUploadCause {
         Self::AuthorityCensusWithheld,
         Self::LegacyReconcile,
         Self::AdmissionReoffer,
+        Self::Unattributed,
     ];
 
     fn bit(self) -> u16 {
@@ -2493,18 +2503,89 @@ impl UnsettledUploadCause {
             Self::AuthorityCensusWithheld => "authority_census_withheld",
             Self::LegacyReconcile => "legacy_reconcile",
             Self::AdmissionReoffer => "admission_reoffer",
+            Self::Unattributed => "unattributed",
         }
     }
 
-    /// Fixed names of the set bits, in declaration order. Unknown bits from a
-    /// newer daemon are not named.
+    /// Fixed names of the set bits, in declaration order. Bits a newer daemon
+    /// set are kept and named `unknown` once, never read as a known set.
     fn names(causes: u16) -> Vec<&'static str> {
-        Self::ALL
+        let known = Self::ALL
+            .into_iter()
+            .fold(0, |bits, cause| bits | cause.bit());
+        let mut names: Vec<_> = Self::ALL
             .into_iter()
             .filter(|cause| causes & cause.bit() != 0)
             .map(Self::name)
-            .collect()
+            .collect();
+        if causes & !known != 0 {
+            names.push("unknown");
+        }
+        names
     }
+}
+
+/// The causes are a diagnostic leaf, so a malformed value must not fail the
+/// whole index. Any value that is not a `u16` decodes as `Unattributed`, which
+/// is reported only beside the authoritative flag.
+fn deserialize_unsettled_causes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u16, D::Error> {
+    struct Causes;
+    impl<'de> serde::de::Visitor<'de> for Causes {
+        type Value = u16;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("unsettled cause bits")
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> std::result::Result<u16, E> {
+            Ok(u16::try_from(value).unwrap_or(UnsettledUploadCause::Unattributed.bit()))
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> std::result::Result<u16, E> {
+            Ok(u16::try_from(value).unwrap_or(UnsettledUploadCause::Unattributed.bit()))
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<u16, E> {
+            Ok(UnsettledUploadCause::Unattributed.bit())
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<u16, E> {
+            Ok(UnsettledUploadCause::Unattributed.bit())
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<u16, E> {
+            Ok(UnsettledUploadCause::Unattributed.bit())
+        }
+        fn visit_bytes<E: serde::de::Error>(self, _: &[u8]) -> std::result::Result<u16, E> {
+            Ok(UnsettledUploadCause::Unattributed.bit())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<u16, E> {
+            Ok(UnsettledUploadCause::Unattributed.bit())
+        }
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<u16, E> {
+            Ok(UnsettledUploadCause::Unattributed.bit())
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<u16, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<u16, A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(UnsettledUploadCause::Unattributed.bit())
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<u16, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(UnsettledUploadCause::Unattributed.bit())
+        }
+    }
+    deserializer.deserialize_any(Causes)
 }
 
 impl Default for ScanIndex {
@@ -19879,7 +19960,7 @@ impl OwnedSourceScan {
                         index.generation,
                         &traversal_snapshot,
                         raw_census_complete,
-                        index.bounded_sweep_unsettled_causes,
+                        index.unsettled_cause_bits(),
                         CensusGates {
                             discovery_done: traversal_discovery_done,
                             traversal_healthy,
@@ -30048,15 +30129,30 @@ impl ScanIndex {
             .extend(source_files.iter().cloned());
     }
 
+    /// Mark the sweep unsettled by a path that does not name itself.
     pub fn mark_bounded_sweep_unsettled(&mut self) {
-        self.bounded_sweep_had_unsettled_upload = true;
+        self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Unattributed);
     }
 
     /// Mark the sweep unsettled and record which path did it, for the
-    /// transition lines only.
+    /// transition lines only. An earlier flag with no recorded cause stays
+    /// `Unattributed` beside this one.
     pub(crate) fn mark_bounded_sweep_unsettled_by(&mut self, cause: UnsettledUploadCause) {
-        self.bounded_sweep_unsettled_causes |= cause.bit();
-        self.mark_bounded_sweep_unsettled();
+        self.bounded_sweep_unsettled_causes = self.unsettled_cause_bits() | cause.bit();
+        self.bounded_sweep_had_unsettled_upload = true;
+    }
+
+    /// Diagnostics only. The flag is authoritative: no cause without it, and
+    /// `Unattributed` for a flag with no recorded cause.
+    fn unsettled_cause_bits(&self) -> u16 {
+        match (
+            self.bounded_sweep_had_unsettled_upload,
+            self.bounded_sweep_unsettled_causes,
+        ) {
+            (false, _) => 0,
+            (true, 0) => UnsettledUploadCause::Unattributed.bit(),
+            (true, causes) => causes,
+        }
     }
 
     /// Record the contract-5 contract a prepared Claude cycle builds bodies
@@ -30086,7 +30182,7 @@ impl ScanIndex {
 
     #[cfg(test)]
     pub(crate) fn bounded_sweep_unsettled_cause_names(&self) -> Vec<&'static str> {
-        UnsettledUploadCause::names(self.bounded_sweep_unsettled_causes)
+        UnsettledUploadCause::names(self.unsettled_cause_bits())
     }
 
     #[cfg(test)]
