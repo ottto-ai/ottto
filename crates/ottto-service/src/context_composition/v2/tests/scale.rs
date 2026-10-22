@@ -487,7 +487,7 @@ impl Layout {
 }
 
 /// An uploader that keeps only the payload sizes.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Counting {
     uploads: u64,
     bytes: u64,
@@ -513,7 +513,9 @@ fn max_rss_bytes() -> u64 {
     }
 }
 
-fn run_both(layout: &Layout, now: OffsetDateTime) -> Vec<(Source, SourceStats, Counting)> {
+type ScaleResults = Vec<(Source, SourceStats, Counting)>;
+
+fn run_both(layout: &Layout, now: OffsetDateTime) -> ScaleResults {
     let mut out = Vec::new();
     for (source, root) in [
         (Source::Claude, layout.claude()),
@@ -535,7 +537,21 @@ fn run_both(layout: &Layout, now: OffsetDateTime) -> Vec<(Source, SourceStats, C
             destination: "device|machine|api",
             labels_enabled: true,
         };
-        let stats = run_source(&mut run, source, std::slice::from_ref(&root), Some(target));
+        let scan = || run_source(&mut run, source, std::slice::from_ref(&root), Some(target));
+        let stats = if std::env::var_os("COMPOSITION_SCALE_HEAP").is_some() {
+            let (stats, heap) = crate::retry_allocation_probe::measure(scan);
+            println!(
+                "[heap] {}: requested_live={} usable_live={} requested_peak={} usable_peak={}",
+                source.label(),
+                heap.requested_live,
+                heap.usable_live,
+                heap.requested_peak,
+                heap.usable_peak
+            );
+            stats
+        } else {
+            scan()
+        };
         out.push((source, stats, counting));
     }
     out
@@ -564,7 +580,17 @@ fn report(
     baseline: u64,
     results: &[(Source, SourceStats, Counting)],
 ) {
-    let peak = max_rss_bytes();
+    // Conservative peak bound: count the worker as well as the parent,
+    // even if their individual high-water marks did not overlap.
+    let worker_peak = if phase == "scan" && std::env::var_os("COMPOSITION_SCALE_INLINE").is_none() {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: getrusage fills the provided record; the worker was reaped.
+        unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) };
+        usage.ru_maxrss as u64 * if cfg!(target_os = "macos") { 1 } else { 1024 }
+    } else {
+        0
+    };
+    let peak = max_rss_bytes() + worker_peak;
     let (state_read, written) = super::super::checkpoint::IO_BYTES.with(|io| io.get());
     println!(
         "[{phase}] bytes_read={} bytes_written={} bytes_fsynced={}",
@@ -649,7 +675,44 @@ fn real_scale_gate() {
         if phase == "v1" {
             run_v1(&layout, now, baseline);
         } else {
-            let results = run_both(&layout, now);
+            if std::env::var_os("COMPOSITION_SCALE_CHILD").is_some() {
+                serde_json::from_reader::<_, ()>(std::io::stdin().lock()).unwrap();
+                super::super::harvest::set_utility_qos();
+                let results = run_both(&layout, now);
+                let io = super::super::checkpoint::IO_BYTES.with(|io| io.get());
+                super::super::harvest::write_worker_reply(&(results, io)).unwrap();
+                return;
+            }
+            if std::env::var_os("COMPOSITION_SCALE_HEAP").is_some() {
+                report_allocator("before");
+            }
+            let cpu =
+                process_cpu_micros(libc::RUSAGE_SELF) + process_cpu_micros(libc::RUSAGE_CHILDREN);
+            let started = Instant::now();
+            let results = if std::env::var_os("COMPOSITION_SCALE_INLINE").is_some() {
+                run_both(&layout, now)
+            } else {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["real_scale_gate", "--ignored", "--nocapture"])
+                    .env("COMPOSITION_SCALE_CHILD", "1");
+                let (results, io): (ScaleResults, (u64, u64)) =
+                    super::super::harvest::run_worker_process(&mut command, &()).unwrap();
+                super::super::checkpoint::IO_BYTES.with(|counter| counter.set(io));
+                results
+            };
+            super::super::harvest::release_memory();
+            let cpu = process_cpu_micros(libc::RUSAGE_SELF)
+                + process_cpu_micros(libc::RUSAGE_CHILDREN)
+                - cpu;
+            println!(
+                "[scan] total_cpu_s={:.3} total_wall_s={:.3}",
+                cpu as f64 / 1e6,
+                started.elapsed().as_secs_f64()
+            );
+            if std::env::var_os("COMPOSITION_SCALE_HEAP").is_some() {
+                report_allocator("after");
+            }
             report("scan", &layout, baseline, &results);
         }
         return;
@@ -842,6 +905,42 @@ fn real_scale_gate() {
             println!("unknown COMPOSITION_SCALE_PHASE {other:?}: build, prepare, daily or load")
         }
     }
+}
+
+fn process_cpu_micros(who: i32) -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: getrusage fills the provided record.
+    assert_eq!(unsafe { libc::getrusage(who, &mut usage) }, 0);
+    (usage.ru_utime.tv_sec as u64 + usage.ru_stime.tv_sec as u64) * 1_000_000
+        + usage.ru_utime.tv_usec as u64
+        + usage.ru_stime.tv_usec as u64
+}
+
+/// Native live storage distinguishes allocator caches from Rust-owned state.
+fn report_allocator(phase: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct MallocStatistics {
+            blocks_in_use: u32,
+            size_in_use: usize,
+            max_size_in_use: usize,
+            size_allocated: usize,
+        }
+        extern "C" {
+            fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut MallocStatistics);
+        }
+        let mut stats = MallocStatistics::default();
+        // SAFETY: null sums all zones; stats has the public malloc_statistics_t layout.
+        unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut stats) };
+        println!(
+            "[allocator-{phase}] blocks_in_use={} native_live={} native_reserved={}",
+            stats.blocks_in_use, stats.size_in_use, stats.size_allocated
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = phase;
 }
 
 /// Current resident pages, independent of the process high-water mark.

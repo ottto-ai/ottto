@@ -44,10 +44,12 @@ use crate::composition_kinds::{GitRootCache, KindsVersion};
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -59,10 +61,7 @@ pub(super) fn state_dir(support_dir: &Path) -> PathBuf {
 // Loop and gate.
 // -------------------------------------------------------------------------
 
-pub(in crate::context_composition) fn spawn_v2_sync(
-    home: PathBuf,
-    support_dir: PathBuf,
-) -> Result<()> {
+pub(in crate::context_composition) fn spawn_v2_sync() -> Result<()> {
     std::thread::Builder::new()
         .name("ottto-context-composition-v2".to_string())
         .spawn(move || {
@@ -74,16 +73,15 @@ pub(in crate::context_composition) fn spawn_v2_sync(
                 if !wait.is_zero() {
                     std::thread::sleep(wait);
                 }
-                if !local_harvest_disabled(&support_dir) {
-                    let today = day_of(OffsetDateTime::now_utc().date());
-                    map_worktrees(&state_dir(&support_dir), today, &mut worktrees);
-                }
-                if let Err(error) = run_if_due(&home, &support_dir) {
+                if let Err(error) = run_wake(&mut worktrees) {
                     eprintln!(
                         "context composition run skipped: {}",
                         crate::snapshot_sync::safe_error(&error)
                     );
                 }
+                // All daily state, pipe buffers and superseded hourly
+                // metadata have dropped before this single relief call.
+                release_memory();
                 std::thread::sleep(WAKE_INTERVAL);
             }
         })
@@ -91,9 +89,93 @@ pub(in crate::context_composition) fn spawn_v2_sync(
     Ok(())
 }
 
+fn run_wake(worktrees: &mut WorktreeCache) -> Result<()> {
+    // Pin reloads can allocate as much as a scan. Keep both in the worker;
+    // only the hourly folder map returns to the scheduler.
+    let mut command = Command::new(std::env::current_exe()?);
+    command.arg("context-composition-worker");
+    *worktrees = run_worker_process(&mut command, worktrees)?;
+    Ok(())
+}
+
+// A marker lets the same runner be exercised by the Rust test harness,
+// whose own progress lines also go to stdout. The reply contains folder
+// metadata only; daily checkpoints and aggregates never cross this pipe.
+const WORKER_REPLY: &[u8] = b"composition-worker-v1 ";
+
+pub(super) fn write_worker_reply(reply: &impl Serialize) -> Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(b"\n")?;
+    out.write_all(WORKER_REPLY)?;
+    serde_json::to_writer(&mut out, reply)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Wait for process exit before returning any hourly metadata. System malloc
+/// can retain free pages even after thread exit and pressure relief; process
+/// teardown releases those pages without changing the daemon's allocator.
+pub(super) fn run_worker_process<I: Serialize, O: DeserializeOwned>(
+    command: &mut Command,
+    input: &I,
+) -> Result<O> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let write = (|| -> Result<()> {
+        use std::io::Write;
+        let mut pipe = std::io::BufWriter::new(child.stdin.take().expect("piped worker input"));
+        serde_json::to_writer(&mut pipe, input)?;
+        pipe.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = write {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(anyhow!("composition worker failed: {}", output.status));
+    }
+    let reply = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find_map(|line| line.strip_prefix(WORKER_REPLY))
+        .ok_or_else(|| anyhow!("composition worker reply is missing"))?;
+    Ok(serde_json::from_slice(reply)?)
+}
+
+/// Private service entry point. It starts neither the daemon nor any other
+/// collector. The existing release gate also applies to direct invocation.
+#[doc(hidden)]
+pub fn run_context_composition_worker() -> Result<()> {
+    if !super::changed_days_enabled() {
+        return Err(anyhow!("changed-days composition reader is disabled"));
+    }
+    set_utility_qos();
+    let mut worktrees: WorktreeCache = serde_json::from_reader(std::io::stdin().lock())?;
+    let home = crate::snapshot_sync::home_dir()?;
+    let support_dir = ottto_core::default_support_dir();
+    if !local_harvest_disabled(&support_dir) {
+        let today = day_of(OffsetDateTime::now_utc().date());
+        map_worktrees(&state_dir(&support_dir), today, &mut worktrees);
+    }
+    if let Err(error) = run_if_due(&home, &support_dir) {
+        eprintln!(
+            "context composition run skipped: {}",
+            crate::snapshot_sync::safe_error(&error)
+        );
+    }
+    write_worker_reply(&worktrees)
+}
+
 /// Background work: let the system run it on efficiency cores and behind
 /// interactive work.
-fn set_utility_qos() {
+pub(super) fn set_utility_qos() {
     #[cfg(target_os = "macos")]
     {
         extern "C" {
@@ -314,11 +396,12 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
 
 /// What the last wake saw of one agent's pins, so a wake with nothing new
 /// reads only the shared git folders, never the pins.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub(super) struct WorktreeCache {
     seen: BTreeMap<Source, SeenIndex>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct SeenIndex {
     /// Size and modification time of the pins file when read.
     witness: (u64, Stamp),
@@ -431,6 +514,7 @@ pub(super) struct Run<'a> {
 }
 
 #[derive(Debug, Default, Clone)]
+#[cfg_attr(test, derive(Serialize, Deserialize))]
 pub(super) struct SourceStats {
     pub(super) bytes_new: u64,
     pub(super) bytes_repair: u64,
@@ -710,8 +794,8 @@ fn rebuild_pins(
     rebuilt
 }
 
-/// Run in its own allocation scope, then release allocator caches after
-/// every index, shard and upload buffer has been dropped.
+/// Every index, shard, name cache and upload buffer belongs to this source
+/// invocation. Allocator relief runs once after the worker process has exited.
 pub(super) fn run_source(
     run: &mut Run,
     source: Source,
@@ -721,7 +805,6 @@ pub(super) fn run_source(
     let started = Instant::now();
     let cpu_started = thread_cpu_micros();
     let mut stats = run_source_inner(run, source, roots, target);
-    release_memory();
     finish(&mut stats, started, cpu_started);
     stats
 }

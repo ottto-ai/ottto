@@ -45,6 +45,7 @@ mod report;
 mod v2;
 
 pub use harvest::spawn_context_composition_sync;
+pub use v2::run_context_composition_worker;
 
 /// The kinds_version 1 name of a composition kind.
 use crate::composition_kinds::Kind as Category;

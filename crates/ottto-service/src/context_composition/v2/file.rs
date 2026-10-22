@@ -15,7 +15,9 @@ use std::fs::File;
 use std::path::Path;
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(super) enum Source {
     Claude,
     Codex,
@@ -32,6 +34,7 @@ impl Source {
 
 /// Line counters for one run.
 #[derive(Debug, Default, Clone, Copy)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub(super) struct LineStats {
     pub(super) lines: u64,
     pub(super) prefix_skipped: u64,

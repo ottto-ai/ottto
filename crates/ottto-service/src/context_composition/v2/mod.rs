@@ -38,6 +38,7 @@ mod reader;
 mod scope;
 mod upload;
 
+pub use harvest::run_context_composition_worker;
 pub(super) use harvest::spawn_v2_sync;
 
 use std::time::Duration;

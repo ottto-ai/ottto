@@ -2314,8 +2314,12 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
     let mut cache = harvest::WorktreeCache::default();
     let today = day_of(now.date());
     assert_eq!(harvest::map_worktrees(&state, today, &mut cache), 1);
+    // The subprocess round trip preserves witnesses and known folders.
+    cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
     // A second wake with nothing new reads no pins and adds nothing.
+    let io = super::checkpoint::IO_BYTES.with(|io| io.get());
     assert_eq!(harvest::map_worktrees(&state, today, &mut cache), 0);
+    assert_eq!(super::checkpoint::IO_BYTES.with(|io| io.get()), io);
     git_in(
         &main,
         &["worktree", "remove", "--force", worktree.to_str().unwrap()],
@@ -3577,4 +3581,43 @@ fn request_one_boundary_does_not_allocate_large_skipped_prelude_text() {
             stats.requested_peak
         );
     }
+}
+
+#[test]
+#[ignore = "private subprocess fixture"]
+fn composition_worker_process_fixture() {
+    if std::env::var_os("COMPOSITION_WORKER_FIXTURE").is_none() {
+        return;
+    }
+    let input: Vec<String> = serde_json::from_reader(std::io::stdin().lock()).unwrap();
+    if input.is_empty() {
+        std::process::exit(7);
+    }
+    let scratch = vec![42u8; 8 * 1024 * 1024];
+    std::hint::black_box(&scratch);
+    harvest::write_worker_reply(&(std::process::id(), input)).unwrap();
+}
+
+#[test]
+fn worker_process_waits_for_exit_and_preserves_hourly_metadata() {
+    let command = || {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "context_composition::v2::tests::composition_worker_process_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("COMPOSITION_WORKER_FIXTURE", "1");
+        cmd
+    };
+    let input = vec!["workspace-key".to_string()];
+    let (pid, output): (u32, Vec<String>) =
+        harvest::run_worker_process(&mut command(), &input).unwrap();
+    assert_ne!(pid, std::process::id());
+    assert_eq!(output, input);
+    // wait_with_output reaps the worker, including when it exits unsuccessfully.
+    let failed: anyhow::Result<(u32, Vec<String>)> =
+        harvest::run_worker_process(&mut command(), &Vec::<String>::new());
+    assert!(failed.is_err());
 }
