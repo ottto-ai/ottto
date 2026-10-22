@@ -38,7 +38,10 @@ use super::checkpoint::{
     prefix_matches, read_json, stamp, write_json, write_packed, Checkpoint, Index, InstallRecord,
     Pin, RunRecord, Stamp, Status, StoredParse, COLD_AFTER_SECS,
 };
-use super::file::{head_cwds, new_parse_state, read_lines, LineSink, LineStats, Names, Source};
+use super::file::{
+    head_cwds, new_parse_state, new_parse_state_before, read_lines, LineSink, LineStats, Names,
+    Source,
+};
 use super::scope::{
     checkpoint_members, highest_generation, linked_worktrees, load_scope, resolved_missing,
     save_scope, scope_file_stem, scope_files, scope_path, set_aside, shard_id, update_members,
@@ -1183,6 +1186,7 @@ fn run_source_inner(
         // Duplicate entries were counted while streaming the walk.
         present.insert(key, chosen);
     }
+    let mut pending_openings = false;
     for (key, file) in &present {
         let needs = match index.files.get_mut(key) {
             None => {
@@ -1195,18 +1199,24 @@ fn run_source_inner(
                     .zip(previous_scan)
                     .is_some_and(|(born, last)| born >= last);
                 let new = live || born_later;
-                if new && !agent_reset && opening_verdict_pending(run, source, file, &mut stats) {
-                    // No pin or checkpoint is created. Preserve new-byte
-                    // eligibility for the next daily run, even at install;
-                    // it will read Forward from zero without a repair grant.
-                    index.last_scan_started = Some(
-                        index
-                            .last_scan_started
-                            .unwrap_or(now_secs)
-                            .min(file.born.unwrap()),
-                    );
-                    stats.verdict_deferred += 1;
-                    continue;
+                if new && !agent_reset {
+                    let pending = opening_verdict_pending(run, source, file, &mut stats);
+                    if pending != Some(false) {
+                        // No pin or checkpoint is created. Preserve new-byte
+                        // eligibility for the next daily run, even at install;
+                        // it reads Forward from zero without a repair grant.
+                        index.last_scan_started = Some(
+                            index
+                                .last_scan_started
+                                .unwrap_or(now_secs)
+                                .min(file.born.unwrap()),
+                        );
+                        pending_openings = true;
+                        if pending == Some(true) {
+                            stats.verdict_deferred += 1;
+                        }
+                        continue;
+                    }
                 }
                 let start = if new { 0 } else { file.size };
                 let waiting = live;
@@ -1550,7 +1560,7 @@ fn run_source_inner(
         }
     }
     stats.name_lookups_skipped = names.skipped();
-    tidy_index(&mut index, today);
+    tidy_index(&mut index, today, pending_openings);
 
     if let Some(target) = target.as_mut() {
         upload_other_scopes(
@@ -1644,7 +1654,7 @@ fn known_scope(index: &Index, cwd: &str) -> Option<String> {
 /// End of a run: note the scopes pins still name, and drop folder entries
 /// nothing needs any more (their scope has no pins, or the folder is gone
 /// and no file waits to be scoped).
-fn tidy_index(index: &mut Index, today: Day) {
+fn tidy_index(index: &mut Index, today: Day, pending_openings: bool) {
     let Index {
         files,
         cwd_scopes,
@@ -1666,6 +1676,11 @@ fn tidy_index(index: &mut Index, today: Day) {
     }
     for scope in &pinned {
         scope_last_pinned.insert((*scope).to_string(), today);
+    }
+    // Deferred openings have no pins yet. Retain cached worktree mappings
+    // until they can be scoped, including worktrees deleted before reading.
+    if pending_openings {
+        return;
     }
     cwd_scopes.retain(|folder, scope| {
         pinned.contains(scope.as_str()) && (waiting_for_scope || Path::new(folder).is_dir())
@@ -1705,19 +1720,31 @@ fn opening_verdict_pending(
     source: Source,
     file: &Found,
     stats: &mut SourceStats,
-) -> bool {
+) -> Option<bool> {
     let now = run.now.unix_timestamp();
     if !file
         .born
         .is_some_and(|born| born <= now && now - born < 6 * 3600)
     {
-        return false;
+        return Some(false);
     }
-    let (state, bytes) = new_parse_state(source, &file.path, 0);
+    let (state, bytes) = match new_parse_state_before(source, &file.path, run.deadline) {
+        Ok(head) => head,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                stats.cut = true;
+            } else {
+                stats.scan_errors += 1;
+            }
+            return None;
+        }
+    };
     stats.bytes_head += bytes;
-    run.start_verdicts
-        .lookup(source.label(), &state.session, now)
-        .is_none()
+    Some(
+        run.start_verdicts
+            .lookup(source.label(), &state.session, now)
+            .is_none(),
+    )
 }
 
 /// Failed reads in a row that quarantine a file.

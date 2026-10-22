@@ -1209,6 +1209,96 @@ fn missing_verdict_does_not_defer_later_bytes_of_a_fresh_file() {
 }
 
 #[test]
+fn deferred_opening_preserves_a_cached_deleted_folder_scope() {
+    let env = Env::new("composition-verdict-gone-folder");
+    let source = Source::Claude;
+    write_records(
+        &env.root.join("p/older.jsonl"),
+        &claude_turn(&env.cwd(), base_now().date(), 1),
+    );
+    env.run(source, base_now(), None);
+    // Same map used for a linked worktree removed before its first read.
+    let old_index = read_index(&env.state, source);
+    let scope_id = old_index.files["older.jsonl"].scope.clone().unwrap();
+    assert_eq!(old_index.cwd_scopes.get(&env.cwd()), Some(&scope_id));
+    fs::remove_dir_all(&env.workspace).unwrap();
+    let (path, born, _) = opening_verdict_fixture(&env, source);
+    let stats = env.run(source, born, None);
+    assert_eq!(stats.verdict_deferred, 1);
+    let index = read_index(&env.state, source);
+    assert_eq!(index.cwd_scopes.get(&env.cwd()), Some(&scope_id));
+    assert!(!index.files.contains_key("s1.jsonl"));
+    let stats = env.run(source, born + time::Duration::days(1), None);
+    assert_eq!(
+        (stats.verdict_deferred, stats.unscoped, stats.files_read),
+        (0, 0, 1)
+    );
+    assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+    let index = read_index(&env.state, source);
+    assert_eq!(index.files["s1.jsonl"].scope.as_ref(), Some(&scope_id));
+    assert_eq!(index.scope_info.len(), 1);
+    assert!(
+        !index.cwd_scopes.contains_key(&env.cwd()),
+        "mapping pruned once no opening waits"
+    );
+    env.cleanup();
+}
+
+#[test]
+fn opening_verdict_probe_respects_expired_deadline_and_keeps_new_bytes() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-verdict-deadline-{source:?}"));
+        let (path, born, _) = opening_verdict_fixture(&env, source);
+        let deadline = Instant::now() - Duration::from_secs(1);
+        // Deadline check precedes opening even a nonexistent path.
+        assert_eq!(
+            super::file::new_parse_state_before(source, &path.with_extension("missing"), deadline)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        let mut resolver = FolderResolver::default();
+        let mut run = Run {
+            state_dir: env.state.clone(),
+            now: born,
+            deadline,
+            resolver: &mut resolver,
+            repair_left: 0,
+            start_verdicts: Default::default(),
+        };
+        let stats = run_source(&mut run, source, std::slice::from_ref(&env.root), None);
+        assert!(stats.cut);
+        assert_eq!(
+            (
+                stats.verdict_deferred,
+                stats.files_read,
+                stats.bytes_head,
+                stats.bytes_new,
+                stats.bytes_repair
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(resolver.calls, 0);
+        let index = read_index(&env.state, source);
+        assert!(index.files.is_empty());
+        assert_eq!(index.last_scan_started, Some(born.unix_timestamp()));
+        let stats = env.run_with(
+            source,
+            born + time::Duration::days(1),
+            None,
+            0,
+            &mut FolderResolver::default(),
+        );
+        assert_eq!(
+            (stats.verdict_deferred, stats.files_read, stats.bytes_repair),
+            (0, 1, 0)
+        );
+        assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+        env.cleanup();
+    }
+}
+
+#[test]
 fn later_opening_verdict_transitions_do_not_reread_counted_bytes() {
     let env = Env::new("composition-verdict-forward-only");
     let source = Source::Claude;
