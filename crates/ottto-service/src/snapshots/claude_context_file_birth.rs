@@ -234,7 +234,10 @@ impl ClaudeFileBirth {
 
 /// Replace the item's first/peak/last and compaction scalars with the own-only
 /// values. One source for every branch that ships parser scalars.
-pub(super) fn apply_own_context_scalars(item: &mut SnapshotItem) {
+pub(super) fn apply_own_context_scalars(
+    item: &mut SnapshotItem,
+    counts: &mut ClaudeContextFileBirthCounts,
+) {
     let birth = item.claude_file_birth;
     item.first_turn_context_tokens = birth.own_first_context;
     item.peak_context_fill_tokens = (birth.own_peak_context > 0).then_some(birth.own_peak_context);
@@ -249,7 +252,7 @@ pub(super) fn apply_own_context_scalars(item: &mut SnapshotItem) {
     // (an untimed one counts as own there too), minus id-less responses,
     // which carry no occurrence. Moved out for the call, never cloned.
     let occurrences = std::mem::take(&mut item.claude_usage_occurrences);
-    set_claude_compaction_scalars(
+    let id_less = set_claude_compaction_scalars(
         item,
         &owned,
         occurrences
@@ -257,6 +260,12 @@ pub(super) fn apply_own_context_scalars(item: &mut SnapshotItem) {
             .filter(|occurrence| birth.copied(occurrence.timestamp.as_deref()) != Some(true)),
     );
     item.claude_usage_occurrences = occurrences;
+    counts.id_less_response_before_compaction_count = counts
+        .id_less_response_before_compaction_count
+        .saturating_add(id_less.before);
+    counts.id_less_response_after_compaction_count = counts
+        .id_less_response_after_compaction_count
+        .saturating_add(id_less.after);
 }
 
 /// Why an item without a provider-proven start kept or lost its scalars.
@@ -703,6 +712,12 @@ pub struct ClaudeContextFileBirthCounts {
     /// The remembered-veto list was full when this fold judged a file-birth
     /// item: every later file-birth admission withholds until restart.
     pub remembered_veto_overflowed: bool,
+    /// Shipped compactions whose response just before had no request id, so
+    /// their `before` came from an earlier request or is absent. Local only.
+    pub id_less_response_before_compaction_count: u64,
+    /// Shipped compactions whose response just after had no request id, so
+    /// their `after` comes from a later request. Local only.
+    pub id_less_response_after_compaction_count: u64,
 }
 
 impl ClaudeContextFileBirthCounts {
@@ -921,7 +936,7 @@ pub(super) fn admit_claude_file_birth_posture(
     counts.remembered_veto_overflowed |= remembered.overflowed;
     match verdict {
         ClaudeFileBirthVerdict::Admitted => {
-            apply_own_context_scalars(item);
+            apply_own_context_scalars(item, counts);
             if birth.tagged_in_opening {
                 // A copied opening did not start fresh here: keep the
                 // version only. A second file for the id withholds above.

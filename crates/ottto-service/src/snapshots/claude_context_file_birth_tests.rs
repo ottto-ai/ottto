@@ -2600,8 +2600,12 @@ fn incomplete_identity_ships_sizes_from_the_own_set() {
     for fence_closed in [false, true] {
         let mut items = vec![parsed.clone()];
         let mut index = indexed(&[&path], fence_closed);
-        fold(&mut items, &evidence, &mut index, true);
+        let disposition = fold(&mut items, &evidence, &mut index, true);
         let item = &items[0];
+        // The id-less response is not next to the compaction.
+        let counts = &disposition.context_file_birth;
+        assert_eq!(counts.id_less_response_before_compaction_count, 0);
+        assert_eq!(counts.id_less_response_after_compaction_count, 0);
         // Strict with incomplete identity and file birth both ship the
         // own-only tuple, so both ship own-only sizes and points.
         assert_eq!(
@@ -2621,6 +2625,56 @@ fn incomplete_identity_ships_sizes_from_the_own_set() {
             vec![100, 200],
             "fence_closed={fence_closed}"
         );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn id_less_neighbours_of_a_compaction_are_counted_locally() {
+    let dir = temp_dir("claude-file-birth-sizes-id-less-neighbours");
+    let now = OffsetDateTime::now_utc();
+    let (path, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            // The responses just before and just after the compaction have no
+            // request id: never a size, so before and after skip them.
+            id_less_assistant(ROOT, &stamp(now, -29), 150),
+            boundary(ROOT, &stamp(now, -28), 160, 50),
+            id_less_assistant(ROOT, &stamp(now, -27), 60)
+                .replace("msg_id_less", "msg_id_less_after"),
+            assistant(ROOT, "req_a2", &stamp(now, -26), 200),
+        ],
+    );
+    assert!(!parsed.claude_context_curve_identity_complete);
+    let evidence = reports(&[(ROOT, "req_a1", 1, 100), (ROOT, "req_a2", 2, 200)], true);
+    for fence_closed in [false, true] {
+        let mut items = vec![parsed.clone()];
+        let mut index = indexed(&[&path], fence_closed);
+        let disposition = fold(&mut items, &evidence, &mut index, true);
+        assert_eq!(
+            items[0].compaction_events,
+            vec![SnapshotCompactionEvent {
+                at: stamp(now, -28),
+                before: Some(100),
+                after: Some(200),
+                trigger: Some("auto".to_string()),
+            }],
+            "fence_closed={fence_closed}"
+        );
+        // Counted on the local basis-counts line only; the wire is unchanged.
+        let counts = &disposition.context_file_birth;
+        assert_eq!(
+            (
+                counts.id_less_response_before_compaction_count,
+                counts.id_less_response_after_compaction_count
+            ),
+            (1, 1),
+            "fence_closed={fence_closed}"
+        );
+        let wire = serde_json::to_value(&items[0]).unwrap();
+        assert!(!wire.to_string().contains("id_less"));
     }
     let _ = fs::remove_dir_all(dir);
 }

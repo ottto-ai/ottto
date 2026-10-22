@@ -111,20 +111,26 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeCompactionTrigger {
 /// summary #676's pairing leaves unpaired, each with a timestamp, bounded like
 /// `bounded_compaction_timestamps`, so `at` matches `compaction_timestamps`
 /// entry for entry. `own_requests` are the owned requests behind the item's
-/// first/peak/last, in any order:
-/// - `before` = the owned non-zero request with the largest sequence below
-///   the boundary's `response_count_before`;
-/// - `after` = the owned non-zero request with the smallest sequence at or
-///   above it, absent until one is seen.
+/// first/peak/last, in any order; only requests with a request id have one.
+/// - `before`: prompt size of the last owned request with a request id before
+///   the compaction. Responses without a request id are skipped, so this can
+///   come from an earlier request than the true last one (usually smaller).
+///   NULL when there is none. Exactly: the owned non-zero request with the
+///   largest sequence below the boundary's `response_count_before`.
+/// - `after`: prompt size of the first owned request with a request id after
+///   the compaction. Responses without a request id are skipped, so this can
+///   come from a later request (usually larger). NULL until seen. Exactly:
+///   the owned non-zero request with the smallest sequence at or above it.
 ///
 /// One pass over the requests, memory bounded by the (at most 64) events, and
 /// no work at all for an item without an owned boundary. Called only by the
 /// fold's posture writers through `set_claude_compaction_scalars`, never by
-/// `finish()`.
+/// `finish()`. Also returns how many of these events sit next to an id-less
+/// response (local counters only).
 pub(super) fn claude_compaction_events<'a>(
     owned_observations: &[ClaudeCompactionObservation],
     own_requests: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
-) -> Vec<SnapshotCompactionEvent> {
+) -> (Vec<SnapshotCompactionEvent>, ClaudeIdLessNeighbours) {
     let paired = paired_claude_legacy_compactions(owned_observations);
     let candidates = owned_observations
         .iter()
@@ -135,9 +141,14 @@ pub(super) fn claude_compaction_events<'a>(
         .filter_map(|(_, observation)| Some((observation.timestamp.as_deref()?, observation)))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return Vec::new();
+        return (Vec::new(), ClaudeIdLessNeighbours::default());
     }
     let candidates = bounded_by_at(candidates, |(at, _)| at);
+    let mut id_less = ClaudeIdLessNeighbours::default();
+    for (_, observation) in &candidates {
+        id_less.before += u64::from(observation.id_less_before);
+        id_less.after += u64::from(observation.id_less_after);
+    }
 
     // Cut points between requests, ascending. Gap `g` holds the requests with
     // `cuts[g - 1] <= sequence < cuts[g]`; gap 0 is before the first cut.
@@ -179,7 +190,7 @@ pub(super) fn claude_compaction_events<'a>(
         after[index - 1] = earliest;
     }
 
-    candidates
+    let events = candidates
         .into_iter()
         .map(|(at, observation)| {
             let cut = cuts.partition_point(|cut| *cut < observation.response_count_before);
@@ -199,7 +210,17 @@ pub(super) fn claude_compaction_events<'a>(
                 trigger: trigger.map(|trigger| trigger.wire().to_string()),
             }
         })
-        .collect()
+        .collect();
+    (events, id_less)
+}
+
+/// Shipped Claude compactions whose response just before (or just after) had
+/// no request id. That response is never a size, so `before` came from an
+/// earlier request (or `after` from a later one). Local log counters only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ClaudeIdLessNeighbours {
+    pub(super) before: u64,
+    pub(super) after: u64,
 }
 
 /// The owned requests of one gap between compactions that the sizes need:

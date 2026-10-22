@@ -31,17 +31,32 @@ never judged carries none.
   (`paired_claude_legacy_compactions`) leaves unpaired, each with a timestamp;
   same sort, dedup and newest-64 bound, so `at` matches `compaction_timestamps`
   entry for entry.
-- `before`: the owned non-zero request with the largest sequence below the
-  boundary. `after`: the owned non-zero request with the smallest sequence at
-  or after it, absent until seen. Prompt size = input + cache read + cache
-  write, the first/peak/last measure.
+- `before`: prompt size of the last owned request with a request id before the
+  compaction. Responses without a request id are skipped, so this can come
+  from an earlier request than the true last one (usually smaller). NULL when
+  there is none.
+- `after`: prompt size of the first owned request with a request id after the
+  compaction. Responses without a request id are skipped, so this can come
+  from a later request (usually larger). NULL until seen.
+- Exactly: the owned non-zero request with the largest sequence below the
+  boundary, and the one with the smallest sequence at or after it. Prompt
+  size = input + cache read + cache write, the first/peak/last measure.
 - `trigger`: `compactMetadata.trigger` of the boundary (`auto` or `manual`;
   `idle` when Claude Code writes it). An automatic compaction whose last owned
   request is 50 minutes or more earlier is reported as `idle` (Claude Code
   compacts an idle session shortly before its one-hour prompt cache expires).
   A legacy summary has no trigger. Unknown values are omitted.
 - Id-less responses carry no occurrence, so they are never a size or a point,
-  although the file-birth first/peak/last may read them.
+  although the file-birth first/peak/last may read them. A size is therefore
+  only ever under-counted this way, never over-counted, and a copied request
+  is never a size.
+- Local diagnostic: when responses are resolved, a compaction whose response
+  just before (or just after) has no request id is marked (two flags in the
+  observation's existing padding). The fold counts the shipped events so
+  marked as `id_less_response_before_compaction_count` and
+  `id_less_response_after_compaction_count` on the existing local
+  `claude context basis counts` log line. Never uploaded. The strict path
+  always counts zero (its request ids are complete).
 
 ## Local points
 
@@ -58,7 +73,10 @@ collection; only then are the owned requests ordered. Local only (`serde(skip)`)
   memory bounded by the events (at most 65 gap slots). Items without one: no work.
 - Per fold, recent items only: one ordered list of owned request references
   (8 bytes each) for the points; at most 64 points of 8 bytes kept.
-- Retained state: the trigger byte sits in `ClaudeCompactionObservation`'s
-  existing padding (size pinned at 120 bytes); no new per-session vector.
+- Retained state: the trigger byte and the two id-less flags sit in
+  `ClaudeCompactionObservation`'s existing padding (at most 120 bytes, pinned);
+  no new per-session vector. Marking costs one scan of the compaction
+  observations per id-less response, the same shape as the existing
+  `compaction_before` check per response.
 - Upload: about 84 bytes per Claude event; outside the content hash, semantic
   fingerprint, envelope component hashes, revision v2 input and body witness.

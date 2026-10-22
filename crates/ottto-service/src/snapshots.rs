@@ -885,6 +885,11 @@ pub(crate) struct ClaudeCompactionObservation {
     /// `compactMetadata.trigger` of a current boundary; `None` for a legacy
     /// summary or an unknown value. Fits the struct's existing padding.
     trigger: Option<ClaudeCompactionTrigger>,
+    /// The response just before / just after this compaction had no request
+    /// id, so it is never its size. Set when responses are resolved; read only
+    /// by the fold's local id-less counters, never uploaded. Padding too.
+    id_less_before: bool,
+    id_less_after: bool,
 }
 
 // The time fallback consumes unlinked legacy summaries greedily in
@@ -1076,19 +1081,23 @@ fn clear_claude_context_posture(item: &mut SnapshotItem) {
 /// and `finish()` never builds Claude sizes or points.
 ///
 /// Points are built only when the item's last activity is within the
-/// 75-minute output gate; only then are the owned requests ordered.
+/// 75-minute output gate; only then are the owned requests ordered. Returns
+/// how many shipped events sit next to an id-less response, for the local
+/// counters (always zero on the strict path, whose request ids are complete).
 fn set_claude_compaction_scalars<'a, I>(
     item: &mut SnapshotItem,
     owned_observations: &[ClaudeCompactionObservation],
     own_requests: I,
-) where
+) -> compaction_events::ClaudeIdLessNeighbours
+where
     I: Iterator<Item = &'a ClaudeTranscriptUsageOccurrence> + Clone,
 {
     let (count, timestamps, metrics) = claude_compaction_summary(owned_observations);
     item.compaction_count = Some(count);
     item.compaction_timestamps = timestamps;
-    item.compaction_events =
+    let (events, id_less) =
         compaction_events::claude_compaction_events(owned_observations, own_requests.clone());
+    item.compaction_events = events;
     item.compaction_total_pre_tokens =
         (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
     item.compaction_total_post_tokens =
@@ -1111,6 +1120,7 @@ fn set_claude_compaction_scalars<'a, I>(
         } else {
             Vec::new()
         };
+    id_less
 }
 
 /// Replace Claude posture scalars from the same owned response suffix used by
@@ -6605,7 +6615,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             // Without a complete request index the occurrences cannot rebuild
             // the tuple; ship the parser's own-only values, never raw ones.
             if item.claude_file_birth.observed() {
-                claude_context_file_birth::apply_own_context_scalars(item);
+                claude_context_file_birth::apply_own_context_scalars(item, &mut context_file_birth);
             } else {
                 clear_claude_context_posture(item);
             }
@@ -14537,6 +14547,24 @@ impl SnapshotAccumulator {
                         response.terminal_timestamp.as_deref(),
                         response.model.as_deref(),
                     );
+                }
+                // An id-less response is never a compaction size. Mark the
+                // compaction it sits just before or just after for the fold's
+                // local counters; the sizes themselves are unchanged.
+                for index in 0..self.claude_compaction_observations.len() {
+                    let cut = self.claude_compaction_observations[index].response_count_before;
+                    if cut != response.sequence.saturating_add(1) && cut != response.sequence {
+                        continue;
+                    }
+                    if let Some(mut observation) =
+                        self.claude_compaction_observations.get_mut(index)
+                    {
+                        if cut == response.sequence {
+                            observation.id_less_after = true;
+                        } else {
+                            observation.id_less_before = true;
+                        }
+                    }
                 }
             }
             self.note_claude_turn_duration_between(
@@ -29405,6 +29433,8 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 pair_key,
                 has_parent_link: value.get("parentUuid").and_then(Value::as_str).is_some(),
                 trigger: None,
+                id_less_before: false,
+                id_less_after: false,
             });
     }
     if is_current_compaction {
@@ -29440,6 +29470,8 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                         .pointer("/compactMetadata/trigger")
                         .and_then(Value::as_str),
                 ),
+                id_less_before: false,
+                id_less_after: false,
             });
     }
     accumulator.note_time(timestamp.clone());
@@ -56889,6 +56921,8 @@ mod tests {
                 pair_key: None,
                 has_parent_link: false,
                 trigger: None,
+                id_less_before: false,
+                id_less_after: false,
             };
         let legacy = ClaudeCompactionKind::LegacySummary;
         let current = ClaudeCompactionKind::CurrentBoundary;
@@ -56945,6 +56979,8 @@ mod tests {
             pair_key: None,
             has_parent_link: false,
             trigger: None,
+            id_less_before: false,
+            id_less_after: false,
         };
         let legacy = ClaudeCompactionKind::LegacySummary;
         let current = ClaudeCompactionKind::CurrentBoundary;
@@ -57407,11 +57443,12 @@ mod tests {
         assert_eq!(item.compaction_count, Some(5));
 
         // The helper reads the owned requests in any order.
-        let reversed = super::compaction_events::claude_compaction_events(
+        let (reversed, id_less) = super::compaction_events::claude_compaction_events(
             &item.claude_context_curve_boundaries,
             item.claude_usage_occurrences.values().rev(),
         );
         assert_eq!(reversed, item.compaction_events);
+        assert_eq!(id_less, Default::default());
 
         // Local points: the same requests as first/peak/last, in order.
         let seconds = |at: &str| {
@@ -57472,11 +57509,27 @@ mod tests {
                 "auto",
             ));
         }
+        // Out of parse order, after every request: a duplicate of boundary 68
+        // (the first in parse order keeps its sizes and trigger), one between
+        // boundaries 40 and 41 (kept, sorted into place), and one older than
+        // everything (dropped by the cap).
+        lines.push(claude_sized_boundary(
+            &claude_line_at(start + time::Duration::seconds(68 * 120 + 30)),
+            "manual",
+        ));
+        lines.push(claude_sized_boundary(
+            &claude_line_at(start + time::Duration::seconds(40 * 120 + 60)),
+            "auto",
+        ));
+        lines.push(claude_sized_boundary(
+            &claude_line_at(start - time::Duration::hours(1)),
+            "auto",
+        ));
         let lines = lines.iter().map(String::as_str).collect::<Vec<_>>();
         let mut item = parse_claude_compaction_fixture("claude-compaction-sizes-cap", &lines);
         rebuild_all_owned(&mut item);
 
-        assert_eq!(item.compaction_count, Some(70));
+        assert_eq!(item.compaction_count, Some(73));
         assert_eq!(item.compaction_events.len(), MAX_COMPACTION_TIMESTAMPS);
         assert_eq!(
             item.compaction_events
@@ -57485,8 +57538,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             item.compaction_timestamps
         );
+        // 72 distinct times: the old one and boundaries 0..=6 fall off.
         let first = &item.compaction_events[0];
-        assert_eq!((first.before, first.after), (Some(1_006), Some(1_007)));
+        assert_eq!((first.before, first.after), (Some(1_007), Some(1_008)));
+        let late = &item.compaction_events[40 - 7 + 1];
+        assert_eq!(
+            late.at,
+            claude_line_at(start + time::Duration::seconds(40 * 120 + 60))
+        );
+        assert_eq!((late.before, late.after), (Some(1_069), None));
+        let duplicate = &item.compaction_events[MAX_COMPACTION_TIMESTAMPS - 2];
+        assert_eq!(
+            duplicate.at,
+            claude_line_at(start + time::Duration::seconds(68 * 120 + 30))
+        );
+        assert_eq!(
+            (duplicate.before, duplicate.after),
+            (Some(1_068), Some(1_069))
+        );
         let last = item.compaction_events.last().unwrap();
         assert_eq!((last.before, last.after), (Some(1_069), None));
         assert!(item
@@ -57499,9 +57568,9 @@ mod tests {
 
     #[test]
     fn claude_compaction_observation_keeps_its_size_with_the_trigger() {
-        // The trigger byte sits in existing padding: retained boundaries do
-        // not grow.
-        assert_eq!(std::mem::size_of::<ClaudeCompactionObservation>(), 120);
+        // The trigger and the two id-less flags sit in existing padding:
+        // retained boundaries do not grow (120 B on today's 64-bit targets).
+        assert!(std::mem::size_of::<ClaudeCompactionObservation>() <= 120);
         assert_eq!(
             std::mem::size_of::<Option<super::compaction_events::ClaudeCompactionTrigger>>(),
             1
@@ -75460,7 +75529,7 @@ crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, select
 crate::heap_layout_bound::fields!(CandidateFile; scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; census_window_end, account_identifier_hash, evidence_request_count, members, member_request_id_hashes, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier_hash, evidence_request_count, members, member_request_id_fingerprints);
-crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link, trigger);
+crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link, trigger, id_less_before, id_less_after);
 crate::heap_layout_bound::fields!(ClaudeDesktopIdentityEvidence; account_identifier_hash, provider_workspace_hash, source_created_at, imported);
 crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id);
 crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
