@@ -350,7 +350,19 @@ impl ToolTotals {
 pub(super) struct SessionTotals {
     /// Earliest line of the session's transcripts, unix seconds.
     pub(super) started: Option<i64>,
-    pub(super) days: BTreeMap<Day, BTreeMap<Kind, u64>>,
+    pub(super) days: Vec<(Day, Vec<(Kind, u64)>)>,
+}
+
+impl SessionTotals {
+    fn add(&mut self, day: Day, kind: Kind, tokens: u64) {
+        let at = self.days.binary_search_by_key(&day, |row| row.0)
+            .unwrap_or_else(|at| { self.days.insert(at, (day, Vec::new())); at });
+        let kinds = &mut self.days[at].1;
+        match kinds.binary_search_by_key(&kind, |row| row.0) {
+            Ok(at) => kinds[at].1 += tokens,
+            Err(at) => kinds.insert(at, (kind, tokens)),
+        }
+    }
 }
 
 /// One scope's totals. Days are UTC days; the 30-day maps keep only the
@@ -491,16 +503,8 @@ impl Sink<'_> {
                 .entry((item.day, item.slot.kind))
                 .or_default() += item.tokens;
         }
-        *self
-            .agg
-            .sessions
-            .entry(item.session.into())
-            .or_default()
-            .days
-            .entry(item.day)
-            .or_default()
-            .entry(item.slot.kind)
-            .or_default() += item.tokens;
+        self.agg.sessions.entry(item.session.into()).or_default()
+            .add(item.day, item.slot.kind, item.tokens);
         true
     }
 
@@ -643,10 +647,7 @@ impl Aggregate {
                 into.started = Some(into.started.map_or(ts, |started| started.min(ts)));
             }
             for (day, kinds) in totals.days {
-                let into_day = into.days.entry(day).or_default();
-                for (kind, tokens) in kinds {
-                    *into_day.entry(kind).or_default() += tokens;
-                }
+                for (kind, tokens) in kinds { into.add(day, kind, tokens); }
             }
         }
         for (day, generation) in delta.day_generation {
@@ -710,18 +711,15 @@ impl Aggregate {
             .and_then(|session| self.sessions.get_mut(session))
         {
             for ((day, kind), tokens) in &share.sessions {
-                if let Some(kinds) = totals.days.get_mut(day) {
-                    if let Some(value) = kinds.get_mut(kind) {
-                        *value = value.saturating_sub(*tokens);
-                        if *value == 0 {
-                            kinds.remove(kind);
-                        }
-                    }
-                    if kinds.is_empty() {
-                        totals.days.remove(day);
+                if let Ok(at) = totals.days.binary_search_by_key(day, |row| row.0) {
+                    let kinds = &mut totals.days[at].1;
+                    if let Ok(k) = kinds.binary_search_by_key(kind, |row| row.0) {
+                        kinds[k].1 = kinds[k].1.saturating_sub(*tokens);
+                        if kinds[k].1 == 0 { kinds.remove(k); }
                     }
                 }
             }
+            totals.days.retain(|(_, kinds)| !kinds.is_empty());
             if totals.days.is_empty() {
                 self.sessions
                     .remove(share.session.as_deref().unwrap_or_default());
@@ -740,7 +738,7 @@ impl Aggregate {
         self.day_tools.retain(|(day, _), _| *day >= period);
         self.tool_sessions.retain(|_, day| *day >= period);
         self.sessions.retain(|_, totals| {
-            totals.days.retain(|day, _| *day >= floor);
+            totals.days.retain(|(day, _)| *day >= floor);
             !totals.days.is_empty()
         });
         trim_per_day_files(&mut self.day_files, MAX_FILES_PER_DAY);
@@ -754,7 +752,7 @@ impl Aggregate {
         let sessions: usize = self
             .sessions
             .values()
-            .map(|totals| 48 + totals.days.len() * ROW)
+            .map(|totals| 48 + totals.days.iter().map(|(_, kinds)| 24 + kinds.capacity() * 16).sum::<usize>())
             .sum();
         (self.days.len()
             + self.day_parts.len()

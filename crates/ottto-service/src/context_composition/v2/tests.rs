@@ -245,7 +245,7 @@ fn v2_sessions(agg: &Aggregate) -> BTreeMap<String, u64> {
         .map(|(id, totals)| {
             (
                 id.to_string(),
-                totals.days.values().flat_map(|kinds| kinds.values()).sum(),
+                totals.days.iter().flat_map(|(_, kinds)| kinds.iter().map(|(_, tokens)| tokens)).sum(),
             )
         })
         .collect()
@@ -3107,7 +3107,7 @@ fn a_maximal_upload_meets_the_server_field_rules() {
             .entry(format!("session-{n}").into())
             .or_default();
         totals.started = Some(now.unix_timestamp());
-        totals.days.insert(today, BTreeMap::from([(kind, 10 + n)]));
+        totals.days.push((today, vec![(kind, 10 + n)]));
     }
     let mut capture = Capture::default();
     let target = UploadTarget {
