@@ -104,6 +104,10 @@ pub(super) fn codex_parent_proof_step(
 ) {
     let side = Some((&*context.cache, pass.ns));
     let census_valid = identities.census_valid();
+    // R2-M1: a pass the side gate closes (the outage after a failed save;
+    // with Stage 1, a continuation page) starts and finishes no proof. A
+    // held job only steps fd-only and suspends.
+    let side_allowed = pass.gate.side_allowed;
     // Step 1: prune first, metadata only, whatever the holder or budget.
     index.sweep_codex_parent_side(census_valid, side);
     // A job never binds to an unminted index (row 35). Only proof work
@@ -153,18 +157,16 @@ pub(super) fn codex_parent_proof_step(
                 lease
             }
             ProofTake::Free => {
-                // Visit and start wait for a valid page (rev 9 §6.2).
-                if !census_valid {
+                // Visit and start wait for a valid, side-allowed page (rev 9
+                // §6.2, R2-M1).
+                if !census_valid || !side_allowed {
                     context.cache.note_proof_hook(&context.namespace, false);
                     return;
                 }
-                let visit = index.visit_codex_parent_proofs(identities, now, side);
-                page.charge(
-                    false,
-                    visit
-                        .refenced
-                        .saturating_mul(sampled_scan::codex_cursor::SAMPLE_READ_BYTES),
-                );
+                let leftover = page.singleton_remaining(Limits::current());
+                let visit = index.visit_codex_parent_proofs(identities, now, side, leftover);
+                // R1-M1: each re-fence is P's side fence and the proof seal.
+                page.charge(false, visit.refenced.saturating_mul(PROOF_FENCE_READ_BYTES));
                 let Some((parent, entries)) = visit.batch else {
                     context.cache.note_proof_hook(&context.namespace, false);
                     return;
@@ -174,6 +176,26 @@ pub(super) fn codex_parent_proof_step(
                     // No leftover for one step: nothing starts (counted).
                     index.codex_parent_proof_cursor = visit.before_head;
                     count(Event::ProofDrop);
+                    return;
+                }
+                // R1-L4: P's side fence once (charged) before P is read; the
+                // finish fence stays authoritative.
+                page.charge(false, SIDE_FENCE_READ_BYTES);
+                if let Some((outcome, wake)) =
+                    codex_proof_parent_prefence(index, identities, &parent, now, side)
+                {
+                    for (key, seq) in entries {
+                        index.finish_codex_parent_proof_entry(
+                            &key,
+                            seq,
+                            &incarnation,
+                            ProofFinish::Attempt {
+                                outcome,
+                                wake: wake.clone(),
+                            },
+                            now,
+                        );
+                    }
                     return;
                 }
                 let (readers, started, refused) =
@@ -207,34 +229,99 @@ pub(super) fn codex_parent_proof_step(
                 )
             }
         };
-    // Memory: one step only with headroom over the job's own walk (cc row 4).
-    let walked = crate::heap_layout_bound::bound(&*lease.job(), usize::MAX);
-    if !walked.is_some_and(|walked| sampled_scan::codex_cursor::proof_step_room(context, walked)) {
-        // Counted; no outcome change while the job is live.
-        count(Event::ProofDrop);
-        lease.suspend();
-        return;
-    }
+    // Memory (R2-B1, rev 5/6 §5.1): every step must fit the proof's room
+    // less the rest of the job (`run` re-checks the readers before each).
+    let room = codex_proof_readers_room(context, lease.job());
     let mut budget = page.singleton_remaining(Limits::current());
     let before = budget;
     let run = match lease.job().readers.as_deref_mut() {
-        Some(readers) => readers.run(&mut budget),
+        Some(readers) => readers.run(&mut budget, room),
         None => CodexProofRun::Done,
     };
     page.charge(false, before.saturating_sub(budget));
+    // R2-B2: a job dropped for memory or the holder backs every entry off
+    // (`after_attempt` paces the restart).
+    let entries = lease.job().entries.clone();
+    let back_off = |index: &mut ScanIndex, outcome: ProofOutcome| {
+        for (key, seq) in &entries {
+            index.finish_codex_parent_proof_entry(
+                key,
+                *seq,
+                &incarnation,
+                ProofFinish::Attempt {
+                    outcome,
+                    wake: ProofWake::Backoff,
+                },
+                now,
+            );
+        }
+    };
     match run {
-        CodexProofRun::Budget => {
-            lease.suspend();
+        CodexProofRun::Memory => {
+            count(Event::ProofDrop);
+            lease.finish();
+            back_off(index, ProofOutcome::StepRefusedMemory);
         }
-        // Finish waits for a valid page; a RAM job keeps its FDs meanwhile.
-        CodexProofRun::Done if !census_valid => {
-            lease.suspend();
-        }
-        CodexProofRun::Done => {
+        CodexProofRun::Done if census_valid && side_allowed => {
+            // R2-L3: P's side fence and the commit's samples.
+            page.charge(false, PROOF_FENCE_READ_BYTES);
             finish_codex_proof_job(index, identities, lease.job(), now, side);
             lease.finish();
         }
+        // The budget ended the page, or finish waits for a valid,
+        // side-allowed page (a RAM job keeps its FDs meanwhile).
+        CodexProofRun::Budget | CodexProofRun::Done => {
+            if !lease.suspend() {
+                back_off(index, ProofOutcome::MemoryRefused);
+            }
+        }
     }
+}
+
+/// R2-B1: the room `run` checks the readers against: `proof_room` less the
+/// job's walk outside its readers. None fits: 0 (no step).
+fn codex_proof_readers_room(context: &sampled_scan::Context, job: &ProofJob) -> usize {
+    let walked = crate::heap_layout_bound::bound(job, usize::MAX);
+    let readers = job.readers.as_deref().map_or(Some(0), |readers| {
+        crate::heap_layout_bound::bound(readers, usize::MAX)
+    });
+    sampled_scan::codex_cursor::proof_room(context)
+        .zip(walked.zip(readers))
+        .and_then(|(room, (walked, readers))| room.checked_sub(walked.saturating_sub(readers)))
+        .unwrap_or(0)
+}
+
+/// The outcome a P side fence that did not admit gives every entry.
+fn codex_proof_held_outcome(fenced: SideFence) -> ProofOutcome {
+    match fenced {
+        SideFence::FileCapHeld => ProofOutcome::FileCapHeld,
+        SideFence::Unreadable => ProofOutcome::SideUnreadable,
+        SideFence::Stale => ProofOutcome::SideStale,
+        SideFence::Held { lineage: true, .. } => ProofOutcome::LineageHeld,
+        _ => ProofOutcome::ParentHeld,
+    }
+}
+
+/// R1-L4: P's side fence at P's current size, before P is read. `Some`:
+/// the outcome and wake every entry records with no read, when P's record
+/// neither admits nor is only behind P's growth (`Stale`, which a main
+/// parse may cure before the finish). A P that does not locate is left to
+/// the start (`Identity`).
+fn codex_proof_parent_prefence(
+    index: &mut ScanIndex,
+    identities: &CodexParentIdentities,
+    parent: &str,
+    now: u64,
+    side: Option<(&sampled_scan::SharedCache, u128)>,
+) -> Option<(ProofOutcome, ProofWake)> {
+    let (p_key, mut file) = codex_parent_locate(identities.census(index), parent).ok()?;
+    let size = file.metadata().ok()?.len();
+    let fenced = index.codex_parent_side_fence(&p_key, &mut file, size, now, side);
+    if matches!(fenced, SideFence::Admitted | SideFence::Stale) {
+        return None;
+    }
+    let wake = index.codex_parent_held_wake(&p_key, &file, fenced, size);
+    Some((codex_proof_held_outcome(fenced), wake))
 }
 
 /// A resumed job's held FDs are append-compatible with their open stamps
@@ -431,7 +518,9 @@ fn codex_proof_parent_checks(
 }
 
 /// The finish (rev 3 §2.6): P's checks decide the whole batch, then P's
-/// side record, the lineage owe, and each child's result.
+/// side record and each child's result. R2-M2 (owner choice (a)): a
+/// `Held{lineage}` P owes nothing in 2a; the lineage owe is a 2b row with
+/// the proof memo wake, since no 2a path consumes P's own proof.
 fn finish_codex_proof_job(
     index: &mut ScanIndex,
     identities: &CodexParentIdentities,
@@ -476,39 +565,7 @@ fn finish_codex_proof_job(
     let needed = seal.sealed_offset();
     let fenced = index.codex_parent_side_fence(&p_key, &mut file, needed, now, side);
     if fenced != SideFence::Admitted {
-        // Step 5: a lineage hold for want of G's evidence owes P's own proof.
-        if let SideFence::Held {
-            lineage: true,
-            cause,
-        } = fenced
-        {
-            let owed = cause == CAUSE_NO_EVIDENCE
-                || CodexParentUnresolvable::from_index(cause)
-                    .is_some_and(CodexParentUnresolvable::proof_owed);
-            if let Some(grandparent) = readers
-                .parent
-                .parser
-                .accumulator
-                .codex_parent_session_ref
-                .as_deref()
-                .filter(|_| owed)
-            {
-                index.owe_codex_parent_proof(
-                    &p_key,
-                    grandparent,
-                    cause,
-                    OwedOrigin::Lineage,
-                    false,
-                );
-            }
-        }
-        let outcome = match fenced {
-            SideFence::FileCapHeld => ProofOutcome::FileCapHeld,
-            SideFence::Unreadable => ProofOutcome::SideUnreadable,
-            SideFence::Stale => ProofOutcome::SideStale,
-            SideFence::Held { lineage: true, .. } => ProofOutcome::LineageHeld,
-            _ => ProofOutcome::ParentHeld,
-        };
+        let outcome = codex_proof_held_outcome(fenced);
         let wake = index.codex_parent_held_wake(&p_key, &file, fenced, needed);
         finish_all(index, outcome, &WakeOf::Held(Box::new(wake)), &job.entries);
         return;
@@ -568,7 +625,9 @@ impl ScanIndex {
     /// backed off (`Due` always fires). A due `Owed{kept}` is re-fenced
     /// first: admitted → `Proven` again (no job). The batch is the first
     /// due entry and ≤ 3 later due entries of the same parent; the head
-    /// becomes the cursor. A wrap over a non-empty map bumps
+    /// becomes the cursor. A re-fence runs only within `leftover`, the
+    /// page's singleton budget (R2-L3, `PROOF_FENCE_READ_BYTES` each): an
+    /// unaffordable due head stops the visit before it. A wrap over a non-empty map bumps
     /// `codex_parent_proof_wrap_epoch`; each visited entry's parent record
     /// takes the epoch.
     pub(super) fn visit_codex_parent_proofs(
@@ -576,6 +635,7 @@ impl ScanIndex {
         identities: &CodexParentIdentities,
         now: u64,
         side: Option<(&sampled_scan::SharedCache, u128)>,
+        leftover: u64,
     ) -> ProofVisit {
         use std::ops::Bound::{Excluded, Included, Unbounded};
         let cursor = self.codex_parent_proof_cursor.take();
@@ -633,6 +693,7 @@ impl ScanIndex {
             ..Default::default()
         };
         let mut previous = visit.before_head.clone();
+        let mut stopped = false;
         for (key, absent) in keys.iter().zip(absent) {
             let parent = match self.codex_parent_prefix_proofs.get(key) {
                 Some(CodexParentProofState::Owed(owed)) => owed.parent.clone(),
@@ -675,6 +736,13 @@ impl ScanIndex {
             }
             let (seq, kept) = (owed.seq, owed.kept.as_deref().cloned());
             if let Some(kept) = kept {
+                if leftover / PROOF_FENCE_READ_BYTES <= visit.refenced {
+                    if visit.batch.is_none() {
+                        stopped = true;
+                        break;
+                    }
+                    continue;
+                }
                 visit.refenced += 1;
                 if self.refence_kept_codex_parent_proof(identities, &kept, now, side) {
                     self.remove_codex_parent_proof(key);
@@ -696,6 +764,7 @@ impl ScanIndex {
         }
         self.codex_parent_proof_cursor = match &visit.batch {
             Some((_, entries)) => entries.first().map(|(head, _)| head.clone()),
+            None if stopped => previous,
             None => keys.last().cloned(),
         };
         visit

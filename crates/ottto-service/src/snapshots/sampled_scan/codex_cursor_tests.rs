@@ -8701,7 +8701,7 @@ fn the_proof_due_flag_is_per_namespace() {
 /// cc row 4: the step needs `PROOF_STEP_HEADROOM_BYTES` beside the context
 /// and the job's walked charge.
 #[test]
-fn proof_step_room_keeps_the_headroom() {
+fn proof_room_keeps_the_headroom() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -8725,9 +8725,7 @@ fn proof_step_room_keeps_the_headroom() {
     };
     let resident = crate::heap_layout_bound::bound(&context, STATE_BYTES).unwrap();
     let exact = STATE_BYTES - resident - PROOF_STEP_HEADROOM_BYTES;
-    assert!(proof_step_room(&context, exact));
-    assert!(!proof_step_room(&context, exact + 1));
-    assert!(!proof_step_room(&context, usize::MAX));
+    assert_eq!(proof_room(&context), Some(exact));
 }
 
 /// ss-6: the retained insert reserves main's cursor term, so its decision is
@@ -8802,6 +8800,91 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+fn main_context(cache: &Arc<SharedCache>) -> super::super::Context {
+    super::super::Context {
+        cache: Arc::clone(cache),
+        namespace: Scope("ns-main".to_owned()),
+        audit_metadata_supported: true,
+        audit_slots: 0,
+        full_files: 0,
+        tail_files: 0,
+        unchanged_files: 0,
+        native_bytes: 0,
+        sample_bytes: 0,
+        full_reasons: [0; 11],
+        priority_replays: 0,
+        audits_started: 0,
+        audits_completed: 0,
+        start_overdue_seconds: 0,
+        completion_overdue_seconds: 0,
+        admission: Default::default(),
+    }
+}
+
+/// R2-B3: main's copy budget is measured as if no proof existed. With and
+/// without a suspended proof that fits free room, main gets the same copy
+/// budget and resident measure (the proof keeps its slot: nothing was
+/// spent yet); the insert that needs the proof's room then retires it and
+/// keeps the copy (ss-6).
+#[test]
+fn a_suspended_proof_never_shrinks_mains_copy_budget() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let completed = |copy: crate::transcript_cache::Retained<_>| {
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: copy.checkpoint,
+                reduction: Some(copy.state),
+                unsealed: false,
+            }
+        };
+        let copy = cache.take(&key).expect("a certified copy");
+        cache.insert(key.clone(), completed(copy), 0);
+        let with_copy = admission_floor(&cache);
+        let state = cache.cursor_resident();
+        let copy = cache.take(&key).expect("retained");
+        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+        let proof = proof_charge(&job);
+        let context = main_context(&cache);
+        let budget = || super::super::copy_budget_step(Some(&context), None, false);
+        let (without, measured_without) = budget();
+        assert!(without > proof, "precondition: a visible difference");
+        assert!(suspend(&cache, job));
+        let (with, measured_with) = budget();
+        assert_eq!(with, without, "parity");
+        assert_eq!(measured_with.resident, measured_without.resident);
+        assert!(cache.proof_suspended_for_test().is_some());
+        // One byte short of room for both: the copy needs the proof's room.
+        let claim = STATE_BYTES - state - with_copy - proof + 1;
+        let credit = cache.cursor_reserve(claim).expect("fits beside the proof");
+        assert!(cache.proof_suspended_for_test().is_some());
+        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "the copy is kept"
+        );
+        assert_eq!(cache.proof_suspended_for_test(), None);
+        assert_eq!(proof_drops(counts), 1);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        credit.refund();
     });
 }
 

@@ -12,7 +12,7 @@
 use super::SharedCache;
 use crate::local_resource_diagnostics::codex_side_lifecycle::{record, Event};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::MutexGuard;
@@ -613,6 +613,22 @@ impl SideLedger {
     }
 }
 
+/// C14 (R2-L2): the index's file keys by parent digest, for `wanted` only.
+/// One SHA-256 per file key, so it runs with the ledger lock released
+/// (C14 is single-threaded under `SNAPSHOT_SYNC_LOCK`).
+pub(in crate::snapshots) fn index_parent_keys(
+    files: &BTreeMap<String, crate::snapshots::ScanIndexEntry>,
+    wanted: &BTreeSet<u128>,
+) -> BTreeMap<u128, String> {
+    files
+        .keys()
+        .filter_map(|key| {
+            let p = parent_of(key);
+            wanted.contains(&p).then(|| (p, key.clone()))
+        })
+        .collect()
+}
+
 /// A record of the entry's object whose seal covers what the entry's
 /// children need. (dev, ino) equality is the identity part only; coverage is
 /// the seal's sealed offset against `needed_extent`.
@@ -630,30 +646,50 @@ impl SideLedger {
     /// exactly as loaded: the gate slot, then prune and eager hydrate of this
     /// namespace's entries. Touches only side requests and a covering side
     /// record's `pace`. With no entry for
-    /// the namespace it builds nothing.
+    /// the namespace it builds nothing. Production runs the three parts with
+    /// the lock released around the hashing (`begin_codex_side_pass`, R2-L2).
+    #[cfg(test)]
     pub(in crate::snapshots) fn begin_index_pass(
         &mut self,
         ns: u128,
         now: u64,
         index: &mut crate::snapshots::ScanIndex,
     ) -> GateOpen {
+        let (gate, wanted) = self.open_index_pass(ns, now);
+        if let Some(wanted) = wanted {
+            let keys = index_parent_keys(&index.files, &wanted);
+            self.hydrate_index_pass(ns, &wanted, &keys, index);
+        }
+        gate
+    }
+
+    /// C14's first part, under the lock: the gate slot, and the parent
+    /// digests of this namespace's entries (None: it has none, and C14
+    /// builds nothing).
+    pub(in crate::snapshots) fn open_index_pass(
+        &mut self,
+        ns: u128,
+        now: u64,
+    ) -> (GateOpen, Option<BTreeSet<u128>>) {
         let gate = self.begin_pass(ns, now);
         if !self.has_namespace(ns) {
-            return gate;
+            return (gate, None);
         }
-        // The entries' parents, by digest: at most one H128 per file key.
-        let wanted = self
-            .namespace(ns)
-            .map(|(key, _)| key.p)
-            .collect::<std::collections::BTreeSet<_>>();
-        let keys = index
-            .files
-            .keys()
-            .filter_map(|key| {
-                let p = parent_of(key);
-                wanted.contains(&p).then(|| (p, key.clone()))
-            })
-            .collect::<BTreeMap<u128, String>>();
+        let wanted = self.namespace(ns).map(|(key, _)| key.p).collect();
+        (gate, Some(wanted))
+    }
+
+    /// C14's last part, under the lock again: prune and eager hydrate of
+    /// this namespace's entries against `keys` (`index_parent_keys` of the
+    /// index as loaded, for `wanted`). An entry whose parent is not in
+    /// `wanted` was written since the first part and is kept as it is.
+    pub(in crate::snapshots) fn hydrate_index_pass(
+        &mut self,
+        ns: u128,
+        wanted: &BTreeSet<u128>,
+        keys: &BTreeMap<u128, String>,
+        index: &mut crate::snapshots::ScanIndex,
+    ) {
         let requests = &index.codex_parent_side_requests;
         let records = &index.codex_parent_side;
         // D5′: the different-object terms prune only an entry a successful
@@ -667,7 +703,7 @@ impl SideLedger {
         self.prune(ns, |key, entry| {
             // (c) P left the index.
             let Some(p_key) = keys.get(&key.p) else {
-                return true;
+                return wanted.contains(&key.p);
             };
             let record = records.get(p_key);
             // (c) the saved record is for another object.

@@ -660,7 +660,10 @@ pub(super) fn copy_budget_step(
     let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
         return (0, StepMeasure::default());
     };
-    let resident = crate::heap_layout_bound::bound(context, STATE_BYTES);
+    // U1a-2a (R2-B3): main's view, any suspended proof charged as none, so
+    // optional proof work never shrinks a copy budget; the admission and
+    // the insert retire the proof where its room is needed.
+    let resident = codex_cursor::bound_for_main(context, STATE_BYTES);
     let remaining = resident.and_then(|resident| STATE_BYTES.checked_sub(resident));
     let Some(active) = active else {
         let budget = remaining.map_or(0, |remaining| remaining / 2);
@@ -738,6 +741,13 @@ pub(super) fn copy_budget_step(
             )
         }
     };
+    // R2-B3: a suspended proof never holds bytes this step spends.
+    if let Some(room) = remaining
+        .zip(used)
+        .map(|(remaining, used)| remaining.saturating_sub(used))
+    {
+        context.cache.retire_proof_over_room(room);
+    }
     let budget = remaining
         .zip(used)
         .and_then(|(remaining, used)| remaining.checked_sub(used))

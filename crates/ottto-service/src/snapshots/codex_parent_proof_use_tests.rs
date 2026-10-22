@@ -193,6 +193,17 @@ fn parse(
     ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
 ) -> ParsedJsonlFile {
+    parse_forged(path, ledgers, proof, |_| {})
+}
+
+/// `parse`, with `forge` applied to the accumulator after the last step
+/// and before the finish.
+fn parse_forged(
+    path: &Path,
+    ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
+    proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
+    forge: impl FnOnce(&mut SnapshotAccumulator),
+) -> ParsedJsonlFile {
     let metadata = CodexTitleMetadata::default();
     let mut file = File::open(path).unwrap();
     let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
@@ -210,6 +221,7 @@ fn parse(
     .unwrap();
     parser.accumulator.codex_parent_prefix_proof = proof;
     while !parser.step().unwrap() {}
+    forge(&mut parser.accumulator);
     parser
         .finish(
             &identity,
@@ -392,6 +404,26 @@ fn a_mismatched_or_undecided_proof_is_base_exactly() {
         let ignored = parse(&child, witness(cause), Some(installed(&good)));
         assert_eq!(view(&ignored), view(&base), "{cause:?}");
         assert_eq!(ignored.codex_parent_proof_used, None);
+    }
+    // R1-L3: an arm that decided, but not as the proof says (forged: it
+    // cannot occur), fails closed in every build: held under main's cause
+    // (`NoLedger` with none), never pending, ownership-incomplete.
+    for evidence in [witness(CodexParentUnresolvable::Oversize), BTreeMap::new()] {
+        let forged = parse_forged(&child, evidence, Some(installed(&good)), |accumulator| {
+            let (matched, digest, owned) = accumulator
+                .codex_parent_prefix_decided
+                .expect("the arm decided as proven");
+            assert_eq!((matched, owned), (good.matched, good.owned));
+            accumulator.codex_parent_prefix_decided = Some((matched - 1, digest, owned));
+        });
+        assert_eq!(
+            forged.codex_parent_proof_refusal,
+            Some(ProofRefusal::Decision)
+        );
+        assert_eq!(forged.codex_parent_prefix_decided, None);
+        assert_eq!(forged.ownership_incomplete_file_count, 1);
+        assert!(!forged.codex_parent_resolution_pending);
+        assert!(!forged.complete());
     }
     // A complete ledger wins over the proof.
     let base = parse(&child, complete_ledger(), None);
@@ -861,7 +893,7 @@ fn job_of(parent: &Path, children: &[&Path]) -> CodexProofReaders {
 
 fn run_to_end(job: &mut CodexProofReaders) -> Vec<ChildResult> {
     let mut budget = u64::MAX;
-    assert_eq!(job.run(&mut budget), CodexProofRun::Done);
+    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Done);
     job.children
         .iter()
         .map(|child| child.result.expect("every child has a result"))
@@ -1090,15 +1122,15 @@ fn a_job_reads_nothing_past_its_budget() {
 
     let mut job = job_of(&parent, &[&child]);
     let mut budget = reserve - 1;
-    assert_eq!(job.run(&mut budget), CodexProofRun::Budget);
+    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
     assert_eq!((budget, job.consumed), (reserve - 1, 0));
 
     let mut budget = reserve;
-    assert_eq!(job.run(&mut budget), CodexProofRun::Budget);
+    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
     assert!(job.consumed > 0 && budget == reserve - job.consumed);
 
     let mut budget = u64::MAX;
-    assert_eq!(job.run(&mut budget), CodexProofRun::Done);
+    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Done);
     assert!(matches!(
         job.children[0].result,
         Some(ChildResult::Decided {
@@ -1107,6 +1139,113 @@ fn a_job_reads_nothing_past_its_budget() {
             ..
         })
     ));
+    let _ = fs::remove_dir_all(root);
+}
+
+/// R2-B1 (rev 5/6 §5.1): before every step the readers' charge and one
+/// more line must fit the room. A run whose next line would not fit stops
+/// with `Memory` before reading it (at the start and mid-run, buffers
+/// already shrunk), and a run's walked peak after any step never passes the
+/// room it checked.
+#[test]
+fn a_run_steps_only_while_one_more_line_fits_its_room() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("job-room");
+    let parent = rollout(&root, PARENT);
+    write_values(&parent, &parent_values());
+    let child = rollout(&root, CHILD);
+    write_values(&child, &child_values());
+    let walk = |job: &mut CodexProofReaders| {
+        job.shrink_buffers();
+        crate::heap_layout_bound::bound(&*job, usize::MAX).unwrap()
+    };
+
+    let mut job = job_of(&parent, &[&child]);
+    let walked = walk(&mut job);
+    let mut budget = u64::MAX;
+    assert_eq!(
+        job.run(&mut budget, walked + MAX_JSONL_LINE_BYTES - 1),
+        CodexProofRun::Memory
+    );
+    assert_eq!((budget, job.consumed), (u64::MAX, 0), "nothing read");
+    // One step, then a room one byte short of the next line.
+    let mut budget = codex_proof_step_reserve();
+    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
+    let consumed = job.consumed;
+    assert!(consumed > 0);
+    let walked = walk(&mut job);
+    let mut budget = u64::MAX;
+    assert_eq!(
+        job.run(&mut budget, walked + MAX_JSONL_LINE_BYTES - 1),
+        CodexProofRun::Memory
+    );
+    assert_eq!((budget, job.consumed), (u64::MAX, consumed));
+
+    // The in-run peak stays within the checked room.
+    let mut job = job_of(&parent, &[&child]);
+    let room = walk(&mut job) + MAX_JSONL_LINE_BYTES + (1 << 20);
+    proof_run_peak();
+    let mut budget = u64::MAX;
+    assert_eq!(job.run(&mut budget, room), CodexProofRun::Done);
+    let (peak, checked) = proof_run_peak();
+    assert_eq!(checked, room);
+    assert!(peak > 0 && peak <= room, "{peak} > {room}");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// R2-B1: a suspend shrinks every reader buffer first, so a long line read
+/// earlier is not charged while the job waits: the suspended charge is the
+/// job's walk with each reader buffer at most 64 KiB.
+#[test]
+fn a_suspended_job_does_not_keep_a_long_lines_buffer() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("job-long-line");
+    let parent = rollout(&root, PARENT);
+    let mut values = parent_values();
+    let long = values.len();
+    values.push(json!({
+        "timestamp": "2026-08-02T08:40:00Z",
+        "type": "response_item",
+        "payload": {"type": "message", "role": "user", "content": "x".repeat(MAX_JSONL_LINE_BYTES - 4096)},
+    }));
+    for at in 0..400 {
+        values.push(unsigned(&format!("2026-08-02T08:50:{:02}Z", at % 60)));
+    }
+    write_values(&parent, &values);
+    let child = rollout(&root, CHILD);
+    write_values(&child, &child_values());
+    let mut job = job_of(&parent, &[&child]);
+    // Past the long line, well short of P's end.
+    let mut budget = codex_proof_step_reserve() + row_end(&values, long) + 4096;
+    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
+    assert!(job.consumed > row_end(&values, long) && !job.parent.done);
+    assert!(
+        job.parent.parser.reader.buf.capacity() >= MAX_JSONL_LINE_BYTES - 4096,
+        "the long line grew P's buffer"
+    );
+    let buffers = job.buffers();
+    let readers = 1 + job.children.len();
+    let job = Box::new(sampled_scan::codex_cursor::ProofJob {
+        namespace: "proof-hook".into(),
+        index_path: PathBuf::from(HOOK_INDEX),
+        incarnation: "u1a2a-hook-incarnation".into(),
+        entries: Vec::new(),
+        next_row_end: 0,
+        touched_page: 0,
+        readers: Some(Box::new(job)),
+    });
+    let walked = crate::heap_layout_bound::bound(&*job, usize::MAX).unwrap();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    assert!(sampled_scan::codex_cursor::ProofLease::new(&cache, job).suspend());
+    let (_, charge) = cache.proof_suspended_for_test().unwrap();
+    assert!(
+        charge <= walked - buffers + readers * 64 * 1024,
+        "{charge} {walked} {buffers}"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1202,15 +1341,26 @@ impl Scene {
 
     /// One page's proof hook on `page`.
     fn hook(&mut self, cache: &Arc<sampled_scan::SharedCache>, page: &mut PageBudget) {
+        self.hook_in(cache, &hook_pass(), page, sampled_scan::now_seconds());
+    }
+
+    /// One page's proof hook on `page`, in `pass`, at `now`.
+    fn hook_in(
+        &mut self,
+        cache: &Arc<sampled_scan::SharedCache>,
+        pass: &CodexSidePass,
+        page: &mut PageBudget,
+        now: u64,
+    ) {
         let identities =
             CodexParentIdentities::new(SnapshotSource::Codex, self.index.traversal.as_ref());
         codex_parent_proof_hook::codex_parent_proof_step(
             &mut self.index,
             &hook_context(cache),
-            &hook_pass(),
+            pass,
             &identities,
             page,
-            sampled_scan::now_seconds(),
+            now,
         );
     }
 
@@ -1277,8 +1427,12 @@ fn a_budget_short_page_suspends_and_the_next_page_finishes() {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let limits = Limits::current();
     let mut page = PageBudget::default();
-    // Exactly one step's reserve left: P's first row, then `Budget`.
-    page.charge(false, limits.singleton() - codex_proof_step_reserve());
+    // Exactly one step's reserve left after P's fence: P's first row, then
+    // `Budget`.
+    page.charge(
+        false,
+        limits.singleton() - codex_proof_step_reserve() - SIDE_FENCE_READ_BYTES,
+    );
     scene.hook(&cache, &mut page);
     assert_eq!(scene.owed_entry().outcome, 0, "no finished attempt yet");
     assert!(
@@ -1327,4 +1481,186 @@ fn an_identity_refusal_waits_for_its_census_wake() {
     }
     scene.hook(&cache, &mut PageBudget::default());
     assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
+}
+
+/// The singleton bytes `page` spent.
+fn spent(page: &PageBudget) -> u64 {
+    let limits = Limits::current();
+    limits.singleton() - page.singleton_remaining(limits)
+}
+
+/// A page with `leftover` singleton bytes.
+fn page_with(leftover: u64) -> PageBudget {
+    let mut page = PageBudget::default();
+    page.charge(false, Limits::current().singleton() - leftover);
+    page
+}
+
+/// R2-B2: a job dropped for memory backs every entry off (`after_attempt`
+/// paces the restart). With no room to suspend (state budget 0), a page
+/// that cannot finish P records `MemoryRefused` + `Backoff`, and further
+/// passes inside the backoff read nothing: P's bytes are bounded by one
+/// leftover per backoff, not one per pass. With no room to step (a full
+/// cache), `StepRefusedMemory`, and P is never read. Nothing is proven.
+#[test]
+fn a_memory_dropped_job_backs_off_and_rereads_nothing_inside_the_backoff() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let now = sampled_scan::now_seconds();
+    // P's fence, then one step: P is not done.
+    let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
+    let mut scene = Scene::owed("hook-refused-suspend");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut read = Vec::new();
+    for _ in 0..5 {
+        let mut page = page_with(leftover);
+        sampled_scan::codex_cursor::with_test_state_budget(0, || {
+            scene.hook_in(&cache, &hook_pass(), &mut page, now);
+        });
+        read.push(leftover - page.singleton_remaining(Limits::current()));
+    }
+    assert!(read[0] > SIDE_FENCE_READ_BYTES, "the first pass read P");
+    assert_eq!(read[1..], [0; 4], "inside the backoff: nothing");
+    let owed = scene.owed_entry();
+    assert_eq!(owed.outcome, ProofOutcome::MemoryRefused as u8);
+    assert_eq!((owed.attempts, &owed.wake), (1, &ProofWake::Backoff));
+    assert!(owed.not_before_unix_seconds > now);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    // Past the backoff: one more paced attempt.
+    let later = owed.not_before_unix_seconds + 1;
+    let mut page = page_with(leftover);
+    sampled_scan::codex_cursor::with_test_state_budget(0, || {
+        scene.hook_in(&cache, &hook_pass(), &mut page, later);
+    });
+    let owed = scene.owed_entry();
+    assert_eq!(
+        (owed.attempts, owed.outcome),
+        (2, ProofOutcome::MemoryRefused as u8)
+    );
+    assert!(owed.not_before_unix_seconds > later);
+
+    // A full cache: no room for one step.
+    let mut scene = Scene::owed("hook-refused-step");
+    let (full, _) = crate::snapshots::cache_policy_tests::filled_cache();
+    let mut page = PageBudget::default();
+    scene.hook_in(&full, &hook_pass(), &mut page, now);
+    assert_eq!(spent(&page), SIDE_FENCE_READ_BYTES, "P is never read");
+    let owed = scene.owed_entry();
+    assert_eq!(owed.outcome, ProofOutcome::StepRefusedMemory as u8);
+    assert_eq!((owed.attempts, &owed.wake), (1, &ProofWake::Backoff));
+    let mut page = PageBudget::default();
+    scene.hook_in(&full, &hook_pass(), &mut page, now);
+    assert_eq!(spent(&page), 0);
+    assert_eq!(full.proof_suspended_for_test(), None);
+}
+
+/// R2-M1: after a failed save the side gate is closed. The next pass starts
+/// no proof (nothing read, the entry untouched) and finishes none: a held
+/// job steps fd-only and suspends again. A saved pass finishes it.
+#[test]
+fn a_closed_side_gate_starts_and_finishes_no_proof() {
+    let limits = Limits::current();
+    let index_path = Path::new(HOOK_INDEX);
+    // Free: a closed gate starts nothing.
+    let mut scene = Scene::owed("hook-gate-free");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    assert!(
+        begin_codex_side_pass(&cache, index_path, &mut scene.index)
+            .gate
+            .side_allowed
+    );
+    // The pass's save failed: no `note_codex_side_pass_saved`.
+    let closed = begin_codex_side_pass(&cache, index_path, &mut scene.index);
+    assert!(!closed.gate.side_allowed);
+    let owed = scene.owed_entry();
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &closed, &mut page, sampled_scan::now_seconds());
+    assert_eq!(spent(&page), 0);
+    assert_eq!(scene.owed_entry(), owed);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+
+    // Mine: a job suspended in an open pass resumes in a closed one, steps
+    // to its end and suspends unfinished.
+    let mut scene = Scene::owed("hook-gate-mine");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let open = begin_codex_side_pass(&cache, index_path, &mut scene.index);
+    let mut page = page_with(codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES);
+    scene.hook_in(&cache, &open, &mut page, sampled_scan::now_seconds());
+    assert!(cache.proof_suspended_for_test().is_some());
+    let closed = begin_codex_side_pass(&cache, index_path, &mut scene.index);
+    assert!(!closed.gate.side_allowed);
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &closed, &mut page, sampled_scan::now_seconds());
+    assert!(spent(&page) > 0 && spent(&page) < limits.singleton());
+    assert!(cache.proof_suspended_for_test().is_some(), "not finished");
+    assert_eq!(scene.owed_entry().outcome, 0);
+    // The pass's save succeeds: the next pass finishes it.
+    let mark = codex_side_save_mark(&cache, index_path);
+    note_codex_side_pass_saved(&cache, index_path, false, mark);
+    let reopened = begin_codex_side_pass(&cache, index_path, &mut scene.index);
+    assert!(reopened.gate.side_allowed);
+    scene.hook_in(
+        &cache,
+        &reopened,
+        &mut PageBudget::default(),
+        sampled_scan::now_seconds(),
+    );
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
+}
+
+/// R1-L4 / R2-M2: P's side record held for P's own lineage refuses the
+/// batch at the start's fence (charged; P is never read) as `LineageHeld`
+/// and owes P nothing in 2a. Held only by the finish (the record turned
+/// held while the job was suspended), the finish records the same and owes
+/// nothing either.
+#[test]
+fn a_lineage_held_parent_is_refused_before_its_read_and_owes_nothing() {
+    let held = SideVerdict::Held {
+        lineage: true,
+        cause: CAUSE_NO_EVIDENCE,
+    };
+    let mut scene = Scene::owed("hook-lineage-start");
+    let p_key = local_index_key(&scene.parent);
+    scene
+        .index
+        .codex_parent_side
+        .get_mut(&p_key)
+        .unwrap()
+        .verdict = held;
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut page = PageBudget::default();
+    scene.hook(&cache, &mut page);
+    assert_eq!(spent(&page), SIDE_FENCE_READ_BYTES, "P is not read");
+    let owed = scene.owed_entry();
+    assert_eq!(owed.outcome, ProofOutcome::LineageHeld as u8);
+    assert!(matches!(
+        owed.wake,
+        ProofWake::ParentHeld { lineage: true, .. }
+    ));
+    assert!(
+        !scene.index.codex_parent_prefix_proofs.contains_key(&p_key),
+        "no lineage owe"
+    );
+
+    let mut scene = Scene::owed("hook-lineage-finish");
+    let p_key = local_index_key(&scene.parent);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut page = page_with(codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES);
+    scene.hook(&cache, &mut page);
+    assert!(cache.proof_suspended_for_test().is_some());
+    scene
+        .index
+        .codex_parent_side
+        .get_mut(&p_key)
+        .unwrap()
+        .verdict = held;
+    scene.hook(&cache, &mut PageBudget::default());
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!(scene.owed_entry().outcome, ProofOutcome::LineageHeld as u8);
+    assert!(
+        !scene.index.codex_parent_prefix_proofs.contains_key(&p_key),
+        "no lineage owe"
+    );
 }

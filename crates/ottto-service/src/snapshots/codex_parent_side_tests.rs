@@ -844,6 +844,30 @@ fn epoch_request(state: SideRequestState, referenced_epoch: u64) -> SideRequest 
     }
 }
 
+/// A `Live` request no read was charged to (R2-M3: the epoch prune's
+/// unconditional case).
+fn uncharged_request(referenced_epoch: u64) -> SideRequest {
+    SideRequest {
+        attempts: 0,
+        ..epoch_request(SideRequestState::Live, referenced_epoch)
+    }
+}
+
+/// A settled record of `side_request`'s object (R2-M3: it can carry a
+/// pruned request's pacing).
+fn same_object_record(referenced_epoch: u64) -> CodexParentSide {
+    CodexParentSide {
+        referenced_epoch,
+        ..record(open_stamp(serde_json::json!({
+            "dev": 16_777_232,
+            "ino": 123_456_789,
+            "extent": 4096,
+            "modified": [1_792_540_800, 5],
+            "changed": [1_792_540_800, 5],
+        })))
+    }
+}
+
 /// D6(b): an unset epoch keeps a request's bytes exactly (legacy identity);
 /// a set one adds only its own member, and the request owns no heap.
 #[test]
@@ -884,7 +908,9 @@ fn a_zero_request_epoch_keeps_the_legacy_bytes() {
 /// request is pruned only more than 2 completed wraps behind (checked:
 /// an epoch ahead of the clock, or `u64::MAX` arithmetic, never prunes);
 /// an unknown epoch only starts the clock; tombstones are never
-/// epoch-pruned; a stale record goes once nothing keeps it live.
+/// epoch-pruned; a stale record goes once nothing keeps it live. R2-M3: a
+/// charged `Live` request is pruned only onto P's same-object record, its
+/// pacing merged into the record's `pace` first; otherwise it is kept.
 #[test]
 fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_requests() {
     let live = SideRequestState::Live;
@@ -926,7 +952,7 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
         let mut index = swept_index(wrap);
         index
             .codex_parent_side_requests
-            .insert(SWEPT.into(), epoch_request(live, epoch));
+            .insert(SWEPT.into(), uncharged_request(epoch));
         let before = serde_json::to_vec(&index).unwrap().len();
         let sweep = index.sweep_codex_parent_side(true, None);
         assert_eq!(sweep.requests_pruned, usize::from(pruned), "{epoch} {wrap}");
@@ -945,13 +971,52 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
     let mut index = swept_index(10);
     index
         .codex_parent_side_requests
-        .insert(SWEPT.into(), epoch_request(live, 0));
+        .insert(SWEPT.into(), uncharged_request(0));
     assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 0);
     assert_eq!(index.codex_parent_side_requests[SWEPT].referenced_epoch, 10);
     index.codex_parent_proof_wrap_epoch = 12;
     assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 0);
     index.codex_parent_proof_wrap_epoch = 13;
     assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 1);
+    // R2-M3: a charged stale request with no record to carry its pacing is
+    // kept, as is a worn one; with P's same-object record it is pruned and
+    // the record takes `{not_before, attempts_floor: 6}` (max-merged).
+    let charged = epoch_request(live, 1);
+    assert!(charged.attempts > 0);
+    for (with_record, attempts, pruned) in [
+        (false, charged.attempts, false),
+        (true, SIDE_REQUEST_EVICT_ATTEMPTS, false),
+        (true, charged.attempts, true),
+    ] {
+        let mut index = swept_index(10);
+        let request = SideRequest {
+            attempts,
+            ..charged
+        };
+        index
+            .codex_parent_side_requests
+            .insert(SWEPT.into(), request);
+        if with_record {
+            index
+                .codex_parent_side
+                .insert(SWEPT.into(), same_object_record(10));
+        }
+        let sweep = index.sweep_codex_parent_side(true, None);
+        assert_eq!(sweep.requests_pruned, usize::from(pruned), "{attempts}");
+        assert_eq!(
+            index.codex_parent_side_requests.get(SWEPT).copied(),
+            (!pruned).then_some(request)
+        );
+        if pruned {
+            assert_eq!(
+                index.codex_parent_side[SWEPT].pace,
+                Some(SidePace {
+                    not_before_unix_seconds: request.not_before_unix_seconds,
+                    attempts_floor: SIDE_REQUEST_EVICT_ATTEMPTS - 1,
+                })
+            );
+        }
+    }
     // Tombstones keep their pacing: never epoch-pruned.
     for state in [
         SideRequestState::Evicted,
@@ -995,7 +1060,30 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
     assert!(index.codex_parent_side.is_empty());
 }
 
-/// Row 32: orphans (key ∉ `files`) go only under a valid census; the
+/// A census holding `key` only.
+fn census_of(key: &str) -> ScanTraversalCheckpoint {
+    ScanTraversalCheckpoint {
+        context_fingerprint: "side-sweep".to_string(),
+        census_window_end: "2026-10-22T00:00:00Z".to_string(),
+        scan_roots: vec![PathBuf::from("/s")],
+        pending_directories: VecDeque::new(),
+        pending_candidates: VecDeque::new(),
+        observed_index_keys: BTreeSet::new(),
+        codex_rollout_paths: BTreeSet::from([key.to_owned()]),
+        codex_join_directory_census: None,
+        reconciliation_upper_bound: None,
+        reconciliation_after: None,
+        reconciliation_started: false,
+        watcher_hint_seen: false,
+        codex_parent_resolution_retry_required: false,
+        unhealthy_retry_attempt: 0,
+        unhealthy_retry_not_before_unix_seconds: None,
+        counts: ScanTraversalCounts::default(),
+        residue: ScanTraversalResidue::default(),
+    }
+}
+
+/// Row 32: orphans (key ∉ `files` ∪ the census, R2-L1) go only under a valid census; the
 /// sweep visits at most `CODEX_SIDE_SWEEP_KEYS` keys of records ∪
 /// requests and wraps its cursor after a short visit.
 #[test]
@@ -1010,6 +1098,11 @@ fn the_side_sweep_drops_orphans_under_a_valid_census_and_wraps_its_cursor() {
         .insert(orphan.into(), extreme_record());
     assert_eq!(index.sweep_codex_parent_side(false, None).orphans, 0);
     assert!(index.codex_parent_side_requests.contains_key(orphan));
+    // R2-L1: a key the valid census holds is not an orphan (as the visit).
+    index.traversal = Some(census_of(orphan));
+    assert_eq!(index.sweep_codex_parent_side(true, None).orphans, 0);
+    assert!(index.codex_parent_side_requests.contains_key(orphan));
+    index.traversal = None;
     assert_eq!(index.sweep_codex_parent_side(true, None).orphans, 1);
     assert!(index.codex_parent_side_requests.is_empty());
     assert!(index.codex_parent_side.is_empty());
@@ -1051,6 +1144,10 @@ fn the_request_epoch_prune_keeps_unsaved_charges_and_never_resurrects_budget() {
     let saved = epoch_request(SideRequestState::Live, 1);
     let mut index = swept_index(4);
     index.codex_parent_side_requests.insert(SWEPT.into(), saved);
+    // R2-M3: P's same-object record carries the pruned pacing.
+    index
+        .codex_parent_side
+        .insert(SWEPT.into(), same_object_record(4));
     index.save(&path).unwrap();
     let mut index = ScanIndex::load(&path).unwrap();
     let pass = begin_codex_side_pass(&cache, &path, &mut index);

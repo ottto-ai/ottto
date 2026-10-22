@@ -2426,10 +2426,12 @@ pub(in crate::snapshots) struct SideSweep {
 /// (the destination index file), its outage gate, and that index file's
 /// path (the proof holder's binding, s row 31).
 ///
-/// TODO(U1a-2a G7 / side due; `stage1/c14c15-answer.md` §2): the side due
-/// and G7 must exclude Stage 1 continuation pages (due only when
-/// `gate.side_allowed` and the page is not a continuation). The
-/// continuation hook is the Stage 1 lease's, not added here.
+/// TODO(U1a-2a G7 / side due / rows 31–32; `stage1/c14c15-answer.md` §2):
+/// Stage 1 continuation pages are exclusions for the side due and G7 (due
+/// only when `gate.side_allowed` and the page is not a continuation), the
+/// row 31 proof hook (no visit, start or finish; R2-M1 already gates them on
+/// `gate.side_allowed`) and the row 32 sweep. The continuation hook is the
+/// Stage 1 lease's, not added here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CodexSidePass {
     pub(in crate::snapshots) ns: u128,
@@ -2451,8 +2453,18 @@ pub(crate) fn begin_codex_side_pass(
     index: &mut ScanIndex,
 ) -> CodexSidePass {
     let ns = sampled_scan::side_ledger::namespace_of(index_path);
+    let (gate, wanted) = cache
+        .side_ledger()
+        .open_index_pass(ns, sampled_scan::now_seconds());
+    // R2-L2: one SHA-256 per file key, with the leaf lock released (C14 is
+    // single-threaded under `SNAPSHOT_SYNC_LOCK`).
+    let keys = wanted
+        .as_ref()
+        .map(|wanted| sampled_scan::side_ledger::index_parent_keys(&index.files, wanted));
     let mut ledger = cache.side_ledger();
-    let gate = ledger.begin_index_pass(ns, sampled_scan::now_seconds(), index);
+    if let Some((wanted, keys)) = wanted.as_ref().zip(keys.as_ref()) {
+        ledger.hydrate_index_pass(ns, wanted, keys, index);
+    }
     let ledger_entries = ledger.len();
     drop(ledger);
     note_codex_side_gauges(index, ledger_entries);
@@ -13926,6 +13938,13 @@ impl SnapshotAccumulator {
     /// the proven prefix) is refused: the child ends as main reads it, under
     /// the evidence main had (`Ledger([])` + witness, or none: pending).
     /// Every record so far was inherited, as in main's `AmbiguousFork`.
+    ///
+    /// R1-L3: an arm that decided, but not as the proof says, cannot occur
+    /// (`Proof::at` differs only at `matched`, and `installable` forces
+    /// `owned == (matched > 0)`). Should it, records may already have been
+    /// applied as owned, so the parse fails closed in every build: held
+    /// under main's cause (`NoLedger` when main had none), never pending,
+    /// and ownership-incomplete, so nothing it counted can publish.
     fn settle_codex_parent_proof_arm(&mut self) {
         let Some((proof, base)) = self.codex_parent_proof_used.as_ref() else {
             return;
@@ -13936,11 +13955,13 @@ impl SnapshotAccumulator {
         if decided {
             return;
         }
-        debug_assert!(
-            self.codex_parent_prefix_decided.is_none(),
-            "the proof arm decides only on its own digest"
-        );
-        let base = *base;
+        let mismatched = self.codex_parent_prefix_decided.is_some();
+        let base = if mismatched {
+            self.codex_legacy_bootstrap_valid = false;
+            Some(base.unwrap_or(CodexParentUnresolvable::NoLedger))
+        } else {
+            *base
+        };
         self.codex_parent_prefix_decided = None;
         self.codex_parent_signatures = base.map(|_| CodexParentPrefix::Ledger(Vec::new()));
         self.codex_parent_unresolvable = base;
@@ -16341,6 +16362,15 @@ fn codex_parent_locate(
     Ok((key.to_owned(), file))
 }
 
+/// R1-M1: the most one side fence of P reads: its admission's two sample
+/// windows and at most one `samples_match` (each `SAMPLE_READ_BYTES`).
+pub(in crate::snapshots) const SIDE_FENCE_READ_BYTES: u64 =
+    2 * sampled_scan::codex_cursor::SAMPLE_READ_BYTES;
+/// R1-M1: a proof's install or re-fence: P's side fence, then the proof
+/// seal's `admits` on the same FD.
+pub(in crate::snapshots) const PROOF_FENCE_READ_BYTES: u64 =
+    SIDE_FENCE_READ_BYTES + sampled_scan::codex_cursor::SAMPLE_READ_BYTES;
+
 /// U1a-2a (D6(a); rev 3 §1.4, §5.3): install `candidate`'s `Proven` proof
 /// into its Codex parser at construction, every mode, only on a
 /// frozen-valid census page and only from this pass's own index (its
@@ -16351,7 +16381,7 @@ fn codex_parent_locate(
 /// FD, never as a publication. A refusal installs nothing, so the parse is
 /// main's exactly; it rides to the record site, which settles the entry.
 /// The decision check is at the parser's finish. Returns whether P's FD was
-/// opened (the caller charges the two samples).
+/// opened (the caller charges `PROOF_FENCE_READ_BYTES`).
 fn install_codex_parent_proof(
     parser: &mut OwnedJsonlParser,
     candidate: &CandidateFile,
@@ -16628,6 +16658,34 @@ pub(in crate::snapshots) enum CodexProofRun {
     Done,
     /// The budget cannot cover one more step: suspend, or end the page.
     Budget,
+    /// R2-B1 (rev 5/6 §5.1): the job's state plus one more step would not
+    /// fit the room checked before it, even with every reader buffer shrunk:
+    /// no step this page (`StepRefusedMemory`).
+    Memory,
+}
+
+/// R2-B1: the readers' walked charge, with the input position and reader
+/// buffer capacities it was taken at (the E3 base of `run`'s check).
+#[derive(Clone, Copy)]
+struct ProofWalk {
+    charge: usize,
+    consumed: u64,
+    buffers: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the largest walked readers' bound after any step of a
+    /// `run`, beside the room that run checked (`proof_run_peak`).
+    static PROOF_RUN_PEAK: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Tests only: `(peak walked bound after a step, room checked)` since the
+/// last call, which resets it.
+#[cfg(test)]
+pub(in crate::snapshots) fn proof_run_peak() -> (usize, usize) {
+    PROOF_RUN_PEAK.with(|peak| peak.replace((0, 0)))
 }
 
 /// U1a-2a (rev 11 §6.1, D6(d)): the most one reader step consumes (a capped
@@ -16683,8 +16741,17 @@ impl CodexProofReaders {
     /// is past the ring, P steps one row. Entries leave only below the
     /// trailing child. Once every child has a result, P alone continues to
     /// its frozen end. Children stop at their decision.
-    pub(in crate::snapshots) fn run(&mut self, budget: &mut u64) -> CodexProofRun {
+    ///
+    /// R2-B1 (rev 5/6 §5.1): before every step the readers' charge must fit
+    /// `room` (`proof_room` less the rest of the job) with one more line:
+    /// an E3 estimate (the last walk, plus every byte consumed since, plus
+    /// the buffers' capacity growth since), walked again every
+    /// `CHARGE_REFRESH_BYTES`, plus `MAX_JSONL_LINE_BYTES`. When it does
+    /// not fit, every reader buffer is shrunk and the readers walked once
+    /// more; still too large: `Memory`, before reading the line.
+    pub(in crate::snapshots) fn run(&mut self, budget: &mut u64, room: usize) -> CodexProofRun {
         let reserve = codex_proof_step_reserve();
+        let mut walk = None;
         loop {
             self.settle_children();
             if self.parent.failed {
@@ -16701,13 +16768,99 @@ impl CodexProofReaders {
             if *budget < reserve {
                 return CodexProofRun::Budget;
             }
+            if !self.step_fits(&mut walk, room) {
+                return CodexProofRun::Memory;
+            }
             match trailing {
                 Some((at, next)) if self.parent.done || self.ring.get(next).is_some() => {
                     self.step_child(at, next, budget);
                 }
                 trailing => self.step_parent(trailing.map(|(at, _)| at), budget),
             }
+            self.note_peak(room);
         }
+    }
+
+    /// Tests only: the walked readers' bound after a step (`proof_run_peak`).
+    #[cfg(test)]
+    fn note_peak(&self, room: usize) {
+        if let Some(walked) = crate::heap_layout_bound::bound(self, usize::MAX) {
+            PROOF_RUN_PEAK.with(|peak| {
+                let (max, _) = peak.get();
+                peak.set((max.max(walked), room));
+            });
+        }
+    }
+    #[cfg(not(test))]
+    fn note_peak(&self, _room: usize) {}
+
+    /// Every reader buffer's capacity.
+    fn buffers(&self) -> usize {
+        self.children
+            .iter()
+            .map(|child| &child.reader)
+            .chain(std::iter::once(&self.parent))
+            .fold(0usize, |sum, reader| {
+                sum.saturating_add(reader.parser.reader.buf.capacity())
+            })
+    }
+
+    /// R2-B1: shrink every reader buffer to `max(len, 64 KiB)` capacity
+    /// (`shrink_paused_buffer`): before a suspend's walk, and when a step
+    /// would not fit. Every live byte is kept.
+    pub(in crate::snapshots) fn shrink_buffers(&mut self) {
+        for reader in self
+            .children
+            .iter_mut()
+            .map(|child| &mut child.reader)
+            .chain(std::iter::once(&mut self.parent))
+        {
+            sampled_scan::codex_cursor::shrink_paused_buffer(&mut reader.parser.reader.buf);
+        }
+    }
+
+    /// The walked base, taken now.
+    fn walk(&self) -> Option<ProofWalk> {
+        Some(ProofWalk {
+            charge: crate::heap_layout_bound::bound(self, usize::MAX)?,
+            consumed: self.consumed,
+            buffers: self.buffers(),
+        })
+    }
+
+    /// R2-B1: whether the readers' charge and one more line fit `room`
+    /// (`run`). The estimate is not a strict bound: an accumulator that
+    /// regrows can add more than the bytes that caused it, for at most
+    /// `CHARGE_REFRESH_BYTES` of input (as main's E3), and a buffer's
+    /// doubling growth inside one line is covered by the line's own
+    /// `MAX_JSONL_LINE_BYTES` and the headroom `proof_room` keeps.
+    fn step_fits(&mut self, walk: &mut Option<ProofWalk>, room: usize) -> bool {
+        let fits = |charge: usize| {
+            charge
+                .checked_add(MAX_JSONL_LINE_BYTES)
+                .is_some_and(|need| need <= room)
+        };
+        let estimate = walk.and_then(|walk| {
+            let since = self.consumed.checked_sub(walk.consumed)?;
+            if since >= sampled_scan::codex_cursor::CHARGE_REFRESH_BYTES {
+                return None;
+            }
+            Some(
+                walk.charge
+                    .saturating_add(usize::try_from(since).ok()?)
+                    .saturating_add(self.buffers().saturating_sub(walk.buffers)),
+            )
+        });
+        if estimate.is_some_and(fits) {
+            return true;
+        }
+        *walk = self.walk();
+        if walk.is_some_and(|walk| fits(walk.charge)) {
+            return true;
+        }
+        self.shrink_buffers();
+        *walk = self.walk();
+        walk.is_some_and(|walk| fits(walk.charge))
     }
 
     fn step_child(&mut self, at: usize, next: u64, budget: &mut u64) {
@@ -17174,12 +17327,16 @@ pub(in crate::snapshots) enum ProofOutcome {
     LineageHeld,
     Identity,
     Invalidated,
+    /// R2-B2: the job's suspend was refused (no free room beside the cache,
+    /// or the holder taken), or a finished job on an invalid page could not
+    /// wait: dropped, every entry backed off.
     MemoryRefused,
     /// P's record covers less than the children need; the wake keeps the
     /// needed offset (`ProofWake::ParentHeld::needed_extent`).
     SideStale,
     FileCapHeld,
-    /// Counted; no outcome change while the job is live.
+    /// R2-B1/B2: no step fit the room checked before it (rev 5/6 §5.1):
+    /// the job is dropped, every entry backed off.
     StepRefusedMemory,
     SideUnreadable,
 }
@@ -17486,16 +17643,22 @@ impl ScanIndex {
     /// side sweep, metadata-only. It visits the next
     /// `CODEX_SIDE_SWEEP_KEYS` keys of records ∪ requests after
     /// `codex_parent_side_cursor` (key order, wrapping) and, per key:
-    /// - **Orphan** (`census_valid` ∧ key ∉ `files`): every U1a item of the
+    /// - **Orphan** (`census_valid` ∧ key ∉ `files` ∧ key ∉ the census
+    ///   paths, as the proof visit decides, R2-L1): every U1a item of the
     ///   key goes, ledger `Gone` (`drop_codex_proof_items`).
     /// - **Request:** referenced by a child (path ids, as cc 7) → takes the
     ///   wrap epoch; epoch 0 (unknown) → takes it too, which starts its
     ///   clock and never prunes. A `Live` request that is unreferenced,
     ///   more than 2 wraps stale and holds no unproven ledger charge
     ///   (`prunable`: active and in-flight charges stay) is removed, its
-    ///   key ledger `Gone`. Tombstones are not epoch-pruned (rev 15 §5;
-    ///   they leave by a cure, the orphan sweep or replay), so no pacing
-    ///   of an unchanged object is reset.
+    ///   key ledger `Gone`, only where no pacing is lost (R2-M3): it never
+    ///   charged an attempt, or a same-object record takes its pacing as
+    ///   the stub first (`pace = max(existing, {not_before, 6})`, as a cure
+    ///   keeps it), so a re-reference re-arms at 6 attempts, never fewer.
+    ///   Otherwise it is kept. Tombstones are not epoch-pruned (rev 15 §5;
+    ///   saved ones leave the ledger by C14 (a), and they leave the index by
+    ///   a cure, the orphan sweep or replay), so no pacing of an unchanged
+    ///   object is reset.
     /// - **Record:** live (`codex_parent_side_live`) → takes the wrap epoch;
     ///   else removed when more than 2 wraps stale, P's ledger generation
     ///   ended.
@@ -17537,8 +17700,21 @@ impl ScanIndex {
             None
         };
         let wrap = self.codex_parent_proof_wrap_epoch;
-        for key in keys {
-            if census_valid && !self.files.contains_key(&key) {
+        let census = self
+            .traversal
+            .as_ref()
+            .filter(|_| census_valid)
+            .map(|traversal| &traversal.codex_rollout_paths);
+        let orphans = keys
+            .iter()
+            .map(|key| {
+                census_valid
+                    && !self.files.contains_key(key)
+                    && !census.is_some_and(|paths| paths.contains(key))
+            })
+            .collect::<Vec<_>>();
+        for (key, orphan) in keys.into_iter().zip(orphans) {
+            if orphan {
                 self.drop_codex_proof_items(&key, side);
                 sweep.orphans += 1;
                 continue;
@@ -17554,11 +17730,27 @@ impl ScanIndex {
                     if request.state == SideRequestState::Live
                         && codex_side_epoch_stale(request.referenced_epoch, wrap) =>
                 {
-                    Some(request.dev_ino)
+                    Some(*request)
                 }
                 _ => None,
             };
-            if let Some(dev_ino) = prune_request {
+            // R2-M3: no pacing is lost (an attempt was charged and no
+            // same-object record can carry it): keep the request.
+            let prune_request = prune_request.filter(|request| {
+                let record_keeps_pacing = self
+                    .codex_parent_side
+                    .get(&key)
+                    .is_some_and(|record| record.parsed.dev_ino() == request.dev_ino);
+                request.attempts == 0
+                    || (record_keeps_pacing && request.attempts < SIDE_REQUEST_EVICT_ATTEMPTS)
+            });
+            if let Some(SideRequest {
+                dev_ino,
+                attempts,
+                not_before_unix_seconds,
+                ..
+            }) = prune_request
+            {
                 let ledger_key = side.map(|(_, ns)| side_ledger_key(ns, &key, dev_ino));
                 let prunable = side
                     .zip(ledger_key)
@@ -17566,6 +17758,17 @@ impl ScanIndex {
                         cache.side_ledger().prunable(&ledger_key)
                     });
                 if prunable {
+                    if attempts > 0 {
+                        if let Some(record) = self.codex_parent_side.get_mut(&key) {
+                            record.pace = Some(SidePace::merged(
+                                record.pace,
+                                SidePace {
+                                    not_before_unix_seconds,
+                                    attempts_floor: SIDE_REQUEST_EVICT_ATTEMPTS - 1,
+                                },
+                            ));
+                        }
+                    }
                     self.codex_parent_side_requests.remove(&key);
                     if let Some(((cache, _), ledger_key)) = side.zip(ledger_key) {
                         cache.side_ledger().end_key(&ledger_key);
@@ -18387,6 +18590,9 @@ impl ScanIndex {
         let ledger_stub = entry
             .filter(|entry| entry.tag == LedgerTag::Removed)
             .map(|entry| entry.stub_not_before);
+        // R1-M1: the record's sealed windows are read at most once per
+        // fence; every later use reuses the answer.
+        let mut samples: Option<bool> = None;
 
         // The object test, request side (the current-key entry's own extents
         // when it is the view).
@@ -18399,12 +18605,13 @@ impl ScanIndex {
             } else if at.size == request.state_extent && at.ctime != request.state_ctime {
                 // Q-U28: a same-size ctime change is a rewrite iff the record's
                 // sealed windows no longer hash to its seal.
-                let samples = self
+                let matched = self
                     .codex_parent_side
                     .get(p_key)
                     .filter(|record| record.parsed.dev_ino() == at.dev_ino)
                     .map(|record| record.seal.samples_match(file));
-                match samples {
+                samples = matched;
+                match matched {
                     Some(false) => new_object = Some(SideNewObject::Rewrite),
                     Some(true) => {
                         request.state_ctime = at.ctime;
@@ -18470,11 +18677,14 @@ impl ScanIndex {
             Ok(()) => return SideFence::Admitted,
             Err(reason) => reason,
         };
+        let mut samples_match = |index: &Self, file: &mut File| {
+            *samples.get_or_insert_with(|| index.side_record_samples_match(p_key, file))
+        };
         match reason {
             FullReason::AuditDue | FullReason::ClockChanged | FullReason::ScopeChanged => {}
-            FullReason::SameSizeEdit if self.side_record_samples_match(p_key, file) => {}
+            FullReason::SameSizeEdit if samples_match(self, file) => {}
             _ => {
-                if self.side_record_samples_match(p_key, file) {
+                if samples_match(self, file) {
                     return SideFence::Stale;
                 }
                 self.side_new_object(
@@ -18889,8 +19099,9 @@ impl ScanIndex {
     /// when P has a `Live` view.
     ///
     /// TODO(U1a-2a; `stage1/c14c15-answer.md` §2): a Stage 1 continuation
-    /// page must not be a side due. That hook is the Stage 1 lease's and is
-    /// not added here.
+    /// page must not be a side due, run the row 31 proof hook's visit, start
+    /// or finish, or the row 32 sweep (`CodexSidePass`). That hook is the
+    /// Stage 1 lease's and is not added here.
     pub(in crate::snapshots) fn codex_parent_side_request_due(
         &mut self,
         p_key: &str,
@@ -21420,7 +21631,8 @@ impl OwnedSourceScan {
                             side,
                             sampled_scan::now_seconds(),
                         ) {
-                            codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                            // R1-M1: P's side fence and the proof seal.
+                            codex_page.charge(false, PROOF_FENCE_READ_BYTES);
                         }
                     }
                     let acquisition = active.sampling.as_mut().expect("sampled acquisition");
@@ -24254,8 +24466,9 @@ impl OwnedSourceScan {
                     side,
                     sampled_scan::now_seconds(),
                 ) {
-                    // The fence re-read two samples of P.
-                    codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                    // R1-M1: P's side fence (its admission and at most one
+                    // `samples_match`) and the proof seal's `admits`.
+                    codex_page.charge(false, PROOF_FENCE_READ_BYTES);
                 }
             }
             let mut file_sampling = None;

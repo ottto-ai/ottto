@@ -37,7 +37,7 @@ const SKIP_CHUNK_BYTES: usize = 1024 * 1024;
 /// A live cursor job's copy-budget charge is walked again after this many
 /// consumed bytes (E3): at most 16 walks per page (B / 4 MiB), plus the
 /// pause and completion walks, against one per line before.
-const CHARGE_REFRESH_BYTES: u64 = 4 * 1024 * 1024;
+pub(in crate::snapshots) const CHARGE_REFRESH_BYTES: u64 = 4 * 1024 * 1024;
 /// Consecutive invalidated attempts of one file after which its attempt ends
 /// as strict `MemberChanged` debt (D2). Growth never invalidates: appended
 /// bytes belong to the next tail; unavailable evidence never counts (K9).
@@ -317,20 +317,18 @@ impl PageBudget {
     }
 }
 
-/// U1a-2a (cc row 4, rev 6 §5.1): room for one proof step:
-/// `STATE_BYTES − bound(context) − walked_charge ≥ PROOF_STEP_HEADROOM_BYTES`,
-/// the copy-budget computation (`copy_budget_parts`) with the running job's
-/// last walk in place of the active file. `bound(context)` includes the
-/// shared cache (cursor state, retained copies, side ledger). Cycles are
-/// serialized under `SNAPSHOT_SYNC_LOCK`, so it sees every live main state.
-pub(in crate::snapshots) fn proof_step_room(
-    context: &super::Context,
-    walked_charge: usize,
-) -> bool {
+/// U1a-2a (cc row 4, rev 5/6 §5.1, R2-B1): the most a running proof job
+/// may hold before a step: `STATE_BYTES − bound(context) −
+/// PROOF_STEP_HEADROOM_BYTES`, the copy-budget computation
+/// (`copy_budget_parts`) with the running job in place of the active file.
+/// `bound(context)` includes the shared cache (cursor state, retained
+/// copies, side ledger) but not the running job (out of the holder). Cycles
+/// are serialized under `SNAPSHOT_SYNC_LOCK`, so it sees every live main
+/// state. None: the context is unbounded or leaves no headroom.
+pub(in crate::snapshots) fn proof_room(context: &super::Context) -> Option<usize> {
     crate::heap_layout_bound::bound(context, STATE_BYTES)
         .and_then(|resident| STATE_BYTES.checked_sub(resident))
-        .and_then(|room| room.checked_sub(walked_charge))
-        .is_some_and(|room| room >= PROOF_STEP_HEADROOM_BYTES)
+        .and_then(|room| room.checked_sub(PROOF_STEP_HEADROOM_BYTES))
 }
 
 /// Opened-object facts of the held descriptor, captured at job open.
@@ -752,9 +750,39 @@ impl ProofHolder {
 impl HeapLayoutBound for ProofHolder {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         // The suspended box was walked once at suspend; nothing mutates it
-        // while it sits here.
+        // while it sits here. Main's view (`bound_for_main`) charges the
+        // holder as `None` (no heap), as `state_for_main` does.
+        if MAIN_VIEW.with(std::cell::Cell::get) {
+            return c.add(0);
+        }
         c.add(self.charge())
     }
+}
+
+thread_local! {
+    /// Set only for the duration of one `bound_for_main` walk.
+    static MAIN_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// U1a-2a (R2-B3): `bound(value, limit)` as main measures it, with any
+/// suspended proof charged as `ProofHolder::None`, mirroring
+/// `state_for_main`. One walk under the same `try_lock` discipline as
+/// `bound` (a busy lock still reads as unbounded). Main's copy budget
+/// measures this, so optional proof work never shrinks it; main's
+/// admission and insert retire the proof where its room is needed
+/// (`admit_locked`, ss-6).
+pub(in crate::snapshots) fn bound_for_main<T: HeapLayoutBound>(
+    value: &T,
+    limit: usize,
+) -> Option<usize> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MAIN_VIEW.with(|view| view.set(self.0));
+        }
+    }
+    let _restore = Restore(MAIN_VIEW.with(|view| view.replace(true)));
+    crate::heap_layout_bound::bound(value, limit)
 }
 
 /// U1a-2a (cc row 1): what the proof hook may do with the holder.
@@ -770,8 +798,8 @@ pub(in crate::snapshots) enum ProofTake {
 }
 
 /// U1a-2a (cc row 1, rev 6 §5.1): a proof job taken out of the holder for
-/// one step, charged 0 in the cursor state while it runs (the step checks
-/// `proof_step_room` first). It goes back only through `suspend` (free room
+/// one step, charged 0 in the cursor state while it runs (each reader step
+/// checks `proof_room` first, R2-B1). It goes back only through `suspend` (free room
 /// only); `finish` ends it; a lease dropped holding its job loses it,
 /// counted, and its entries stay `Owed`.
 pub(in crate::snapshots) struct ProofLease {
@@ -792,12 +820,18 @@ impl ProofLease {
 
     /// Back into the holder as `Suspended`, measured now and admitted as
     /// `Admitter::Proof` (free room only: no retained copy, provenance or
-    /// witness is released for it). Refused, or the holder already taken:
-    /// the job is dropped (counted `side_proof_drops`). True when suspended.
+    /// witness is released for it). Every reader buffer is shrunk first
+    /// (`shrink_paused_buffer`, R2-B1), so one long line read this page is
+    /// not charged while the job waits. Refused, or the holder already
+    /// taken: the job is dropped (counted `side_proof_drops`; the hook
+    /// records `MemoryRefused` on its entries). True when suspended.
     pub(in crate::snapshots) fn suspend(mut self) -> bool {
         let Some(mut job) = self.job.take() else {
             return false;
         };
+        if let Some(readers) = job.readers.as_deref_mut() {
+            readers.shrink_buffers();
+        }
         let Some(charge) = crate::heap_layout_bound::bound(&*job, STATE_BYTES) else {
             record_proof_drop();
             return false;
@@ -2861,6 +2895,30 @@ impl SharedCache {
             .checked_sub(live_bytes_in)
             .and_then(|room| room.checked_sub(super::side_ledger::SIDE_LEDGER_BYTES));
         self.with_cursor(|cursor| drop_suspended_proof_over(retained, cursor, 0, budget));
+    }
+
+    /// U1a-2a (R2-B3): main's copy-budget step left `room` bytes free in
+    /// main's view (`bound_for_main`). A suspended proof larger than that is
+    /// spending bytes main now uses, so it is retired here (retained, then
+    /// cursor; the box is freed under them), counted `side_proof_drops`.
+    /// Otherwise nothing is locked beyond one `try_lock` read.
+    pub(super) fn retire_proof_over_room(&self, room: usize) {
+        let over = self
+            .cursor
+            .try_lock()
+            .is_ok_and(|cursor| cursor.proof.charge() > room);
+        if !over {
+            return;
+        }
+        let Ok(_retained) = self.retained() else {
+            return;
+        };
+        self.with_cursor(|cursor| {
+            if cursor.proof.charge() > room {
+                cursor.proof = ProofHolder::None;
+                record_proof_drop();
+            }
+        });
     }
 
     /// U1a-2a D6(e): M1's release room, under the caller's retained lock, in

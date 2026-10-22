@@ -399,6 +399,67 @@ fn a_ctime_only_change_is_the_same_object_and_a_rewrite_consumes_the_record() {
     assert_eq!(restarted.state_ctime, parent.ctime());
 }
 
+/// R1-M1: one fence reads the record's sealed windows at most once. On the
+/// `SameSizeEdit` path with changed samples, the guard and the `_` arm
+/// share one `samples_match`.
+#[test]
+fn a_same_size_edit_with_changed_samples_reads_them_once() {
+    let mut parent = Parent::new("samples-once", 9_000);
+    let now = now();
+    let len = parent.len();
+    let mut index = with_record(parent.record(SideVerdict::Settled, now));
+    parent.rewrite_head();
+    crate::transcript_acquisition::samples_match_calls();
+    let (fenced, _) = parent.fence(&mut index, len, now);
+    assert_eq!(fenced, SideFence::Unknown, "a rewrite consumes the record");
+    assert!(!index.codex_parent_side.contains_key(KEY));
+    assert_eq!(crate::transcript_acquisition::samples_match_calls(), 1);
+}
+
+/// R2-M3: the epoch prune moves a charged `Live` request's pacing onto P's
+/// same-object record first, so the next reference re-arms with attempts
+/// ≥ the pruned ones (never a fresh ladder); with no such record the
+/// request is kept.
+#[test]
+fn an_epoch_pruned_request_rearms_with_at_least_its_attempts() {
+    let mut parent = Parent::new("epoch-prune", 9_000);
+    let now = now();
+    // The fence refuses this record (`ClockChanged`): the request path decides.
+    let mut record = parent.record(SideVerdict::Settled, now + 600);
+    record.referenced_epoch = 10;
+    let charged = SideRequest {
+        referenced_epoch: 1,
+        ..parent.request(SideRequestState::Live, 3)
+    };
+    let mut index = with_record(record);
+    index.codex_parent_proof_wrap_epoch = 10;
+    index.codex_parent_side_requests.insert(KEY.into(), charged);
+    assert_eq!(
+        index.sweep_codex_parent_side(false, None).requests_pruned,
+        1
+    );
+    assert!(index.codex_parent_side_requests.is_empty());
+    let (fenced, _) = parent.fence(&mut index, 1, now);
+    assert_eq!(fenced, SideFence::Refused(FullReason::ClockChanged));
+    let rearmed = index.codex_parent_side_requests[KEY];
+    assert!(rearmed.attempts >= charged.attempts, "{rearmed:?}");
+    assert_eq!(
+        rearmed.not_before_unix_seconds,
+        charged.not_before_unix_seconds
+    );
+
+    let mut index = ScanIndex {
+        codex_parent_proof_wrap_epoch: 10,
+        ..ScanIndex::default()
+    };
+    index.codex_parent_side_requests.insert(KEY.into(), charged);
+    assert_eq!(
+        index.sweep_codex_parent_side(false, None).requests_pruned,
+        0
+    );
+    assert_eq!(index.codex_parent_side_requests[KEY], charged);
+}
+
 /// The request-side object test: a shrink below `state_extent`, or a record
 /// for another object, is a new object (record consumed, request
 /// restarted); a same-size ctime change with matching record samples only

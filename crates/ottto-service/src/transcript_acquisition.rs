@@ -397,6 +397,8 @@ impl PrefixSeal {
     /// admission. The caller keeps its object, extent, scope and freshness
     /// fences, and `admits` / `append_compatible` still decide admission.
     pub(crate) fn samples_match(&self, file: &mut File) -> bool {
+        #[cfg(test)]
+        SAMPLES_MATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
         let sealed = self.stamp.length;
         let len = self.sample_len as usize;
         if u64::from(self.sample_len) != sealed.min(SAMPLE_BYTES as u64)
@@ -1244,6 +1246,18 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests only (R1-M1): `PrefixSeal::samples_match` calls on this thread
+/// since the last call, which resets the count.
+#[cfg(test)]
+pub(crate) fn samples_match_calls() -> u64 {
+    SAMPLES_MATCH_CALLS.with(|calls| calls.replace(0))
 }
 
 #[cfg(all(test, unix))]
