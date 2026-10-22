@@ -22,16 +22,16 @@ The body holds exactly the server's fields: `agent_source`, `machine_id`,
 `checkpoint_restarts`, `worker_timeouts` and `worker_failures`. Each count is
 held within the server's bounds. CPU is the reading thread's own CPU time;
 memory is the reader's accounted bytes. The full-read waiting files and bytes
-come from the pins still waiting at the end of the run, at their current sizes, and the backlog growth
-days count consecutive daily runs in which those bytes grew (kept in
-`run.json`).
+come from the pins still waiting at the end of the run, at their current
+sizes, and the backlog growth days count consecutive daily runs in which those
+bytes grew (kept in `run.json`).
 
 The record names the device, machine and server the run uploaded to; if they
 changed before the post, the record is dropped unsent. The record is marked
-sent before the first request. A refused or failed post is
-logged once and counted in the daemon's metrics line, and is never retried
-within the day; the next daily run reports again. A record older than yesterday
-is dropped rather than sent late.
+sent before the first request. A refused or failed post is logged once and
+counted in the daemon's metrics line, and is never retried within the day; the
+next daily run reports again. A record older than yesterday is dropped rather
+than sent late.
 
 ## Audit sample
 
@@ -50,8 +50,8 @@ meets any, the comparison is per kind over all days. A match changes nothing
 and commits nothing. A re-read stopped by the run's wall cap proves nothing and
 also changes nothing (counted as an audit failure). A re-read that ends at a
 different offset is counted as a difference but cannot replace bytes it did not
-cover. A difference replaces the file's share and checkpoint with
-the re-read's result, as a budgeted full read would, and counts it in
+cover. Any other difference replaces the file's share and checkpoint with the
+re-read's result, as a budgeted full read would, and counts it in
 `audit_differences`. No other file is read because of it. Picks rotate through
 the pins in key order from where the previous audit stopped, kept in
 `run.json`, so every eligible file is sampled in turn. Audit bytes are counted
