@@ -1163,10 +1163,19 @@ fn terminal_bound_hold_traversal(
 #[serial(source_manifests)]
 fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
     let _source_manifests = SourceManifestTestGuard::new();
+    let settled_pages = || {
+        CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let settled_before = settled_pages();
     let (_fixture, baseline, first, last) = terminal_bound_hold_traversal(
         "claude-census-rejected-terminal-bound-hold",
         PipelineUpload::ServerRejected,
         false,
+    );
+    assert!(
+        settled_pages() > settled_before,
+        "the local counter records the settled page"
     );
     let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
     assert!(

@@ -408,10 +408,18 @@ fn settle_completed_upload(
     }
 }
 
+/// Process-local, content-free count of `Rejected` pages whose local holds
+/// were all terminal-bound and settled through the `Completed` restore path.
+static CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
 /// entities keep replay pending and owe a clean follow-up. A validated
 /// permanent refusal settles transport and traversal; its separate health
-/// still discloses the rejected usage.
+/// still discloses the rejected usage. Its holds settle exactly as on a
+/// `Completed` page: when every hold is non-progressing (no RetryPending
+/// family anywhere) and restorable, held keys keep their committed revision
+/// and the traversal may settle; backfill and replay stay pending.
 fn settle_checkpointed_upload(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -419,7 +427,23 @@ fn settle_checkpointed_upload(
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
 ) -> UploadIndexSettlement {
-    let mut index = if holds.any() {
+    let terminal_bound_holds = resolved_permanent_rejections
+        && holds.any()
+        && !holds.progress_blocking
+        && index.locally_held_keys_restorable(
+            committed_index,
+            &holds.held_fingerprints,
+            &holds.account_deferred_fingerprints,
+        );
+    let mut index = if terminal_bound_holds {
+        CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        index.into_locally_held_keys_reverted(
+            committed_index,
+            &holds.held_fingerprints,
+            &holds.account_deferred_fingerprints,
+        )
+    } else if holds.any() {
         let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
@@ -428,11 +452,11 @@ fn settle_checkpointed_upload(
     } else {
         index
     };
-    let settled = resolved_permanent_rejections && !holds.any();
+    let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
     if !settled {
         index.mark_bounded_sweep_unsettled();
     }
-    let fully_settled = upload_settled_without_account_holds(&index, settled);
+    let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
     UploadIndexSettlement {
         index,
         fully_settled,
@@ -5626,8 +5650,11 @@ fn finish_sync_source(
             deferred_entity_count = Some(count);
             eprintln!(
                 "local snapshot upload checkpointed accepted siblings but left {count} \
-                 unsettled entity(ies) pending for {}; a clean follow-up scan is required",
-                source.api_slug()
+                 unsettled entity(ies) pending for {}; a clean follow-up scan is required \
+                 ({} page(s) settled with terminal-bound holds)",
+                source.api_slug(),
+                CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+                    .load(std::sync::atomic::Ordering::Relaxed)
             );
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
