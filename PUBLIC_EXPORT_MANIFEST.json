@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 779,
-  "content_sha256": "3d23a022fd667fabac12b59b5a391b412d1dba5d563c77755c6dfe24b668f63f",
+  "candidate_file_count": 781,
+  "content_sha256": "d16af78444a9a78072217434614c2abdf9fd028920566404e85450d96e31754e",
   "files": [
     {
       "executable": false,
@@ -1112,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "d205b7b955860cf5cb327e4b76956090b6bf99b9c99df09858b9bc50e79844ac",
-      "size_bytes": 372422
+      "sha256": "da81c3440d4a241f32e61584a5ae48043a99e51e053832a7ab074a8817ad3545",
+      "size_bytes": 372562
     },
     {
       "executable": false,
@@ -1146,6 +1146,20 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/local_state_sweep.rs",
+      "sha256": "a0dff82ae7e0a304e80faed2b2f144b9365abf5d0cac44fe173987996a25ad46",
+      "size_bytes": 56689
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/local_state_sweep/tests.rs",
+      "sha256": "1b053be38a87544274d017e7e4ffb2f56f1dccf15f9dc665e60bc011577a8070",
+      "size_bytes": 57027
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/macos_service.rs",
       "sha256": "b9eda978a47c393f524fc455c524f2a6dd2303ed405ba6553e65ad4afdee082a",
       "size_bytes": 23642
@@ -1154,8 +1168,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "1694312c2afe20fe60aa8db4699dfa5176c14cb13cca919dae9c7c4fcf7aac69",
-      "size_bytes": 39360
+      "sha256": "58c200201c1f5c5b9bc8b70bf89bb796f9db71fa54a91c31ba865b0b33a2799d",
+      "size_bytes": 44702
     },
     {
       "executable": false,
@@ -5456,9 +5470,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T16:10:19+00:00",
+  "generated_at": "2026-10-22T17:37:45+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 780,
+  "output_file_count": 782,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5495,5 +5509,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0c2b6838c0c4ae4b542aa6182e7c6f0037582def"
+  "source_commit": "ef66ecd3f7d68917b8fbb24a324e461d443f48f4"
 }
