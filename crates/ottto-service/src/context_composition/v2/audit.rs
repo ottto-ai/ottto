@@ -17,7 +17,7 @@
 //! and the budgeted rewrite repair; its bytes are counted on their own.
 
 use super::aggregate::{Bucket, Contribution, Day};
-use super::checkpoint::{file_identity, stamp, Checkpoint, Index, Pin, Status};
+use super::checkpoint::{file_identity, stamp, Checkpoint, Index, Pin, Status, COLD_AFTER_SECS};
 use super::{AUDIT_BYTES_PER_DAY, AUDIT_FILES_PER_DAY, PARSER_VERSION};
 use crate::composition_kinds::Kind;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,20 +28,29 @@ use std::path::Path;
 pub(super) struct AuditRun {
     /// Audit bytes left today (shared by the agents).
     pub(super) left: u64,
+    /// Files picked in this run (shared by the agents).
+    pub(super) files: usize,
     /// Per agent: the copy key audited (or passed over) last.
     pub(super) after: BTreeMap<String, String>,
 }
 
 impl AuditRun {
     pub(super) fn with_budget(left: u64, after: BTreeMap<String, String>) -> Self {
-        Self { left, after }
+        Self {
+            left,
+            files: 0,
+            after,
+        }
     }
 }
 
 /// A pin that may be sampled: pinned to a scope, counted from its start,
-/// read to its end at its last commit and not waiting for any other work.
-fn pin_eligible(pin: &Pin) -> bool {
+/// read to its end at its last commit, not waiting for any other work and
+/// changed recently enough that its checkpoint is not cold (a cold share
+/// cannot be replaced).
+fn pin_eligible(pin: &Pin, now_secs: i64) -> bool {
     pin.scope.is_some()
+        && pin.mtime.0 >= now_secs - COLD_AFTER_SECS
         && pin.origin == Some(0)
         && pin.start > 0
         && pin.start == pin.size
@@ -60,6 +69,7 @@ pub(super) fn pick(
     agent: &str,
     index: &Index,
     busy: &BTreeSet<&str>,
+    now_secs: i64,
 ) -> Vec<(String, std::path::PathBuf, std::fs::Metadata)> {
     let mut picks = Vec::new();
     let after = audit.after.get(agent).cloned();
@@ -72,10 +82,10 @@ pub(super) fn pick(
         .chain(index.files.iter().filter(|(key, _)| !later(key)));
     let mut cursor = after.clone();
     for (key, pin) in ordered {
-        if audit.left == 0 || picks.len() >= AUDIT_FILES_PER_DAY {
+        if audit.left == 0 || audit.files >= AUDIT_FILES_PER_DAY {
             break;
         }
-        if !pin_eligible(pin) || busy.contains(key.as_str()) {
+        if !pin_eligible(pin, now_secs) || busy.contains(key.as_str()) {
             continue;
         }
         if pin.start > AUDIT_BYTES_PER_DAY {
@@ -99,6 +109,7 @@ pub(super) fn pick(
             continue;
         }
         audit.left -= pin.start;
+        audit.files += 1;
         picks.push((key.clone(), std::path::PathBuf::from(&pin.path), metadata));
     }
     if let Some(cursor) = cursor {

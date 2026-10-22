@@ -798,3 +798,44 @@ fn backlog_counts_a_waiting_file_at_its_current_size() {
     assert_eq!(second.full_read_backlog_bytes, grown);
     env.cleanup();
 }
+
+#[test]
+fn audit_leaves_files_idle_long_enough_to_go_cold() {
+    let env = Env::new("composition-a2-audit-cold-age");
+    let now = base_now();
+    let path = whole_file(&env, "a", now);
+    env.run(Source::Claude, now, None);
+    // Last written three days before the next run: its share is (or is
+    // about to be) dropped, so it could not be replaced.
+    let idle = std::time::SystemTime::UNIX_EPOCH
+        + Duration::from_secs((now.unix_timestamp() - 3 * 86_400) as u64);
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(idle)
+        .unwrap();
+    env.run(Source::Claude, now + time::Duration::hours(1), None);
+    let mut audit = full_budget();
+    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
+    assert_eq!((stats.audit_files, stats.audit_skipped), (0, 0));
+    assert_eq!(audit.left, AUDIT_BYTES_PER_DAY);
+    env.cleanup();
+}
+
+#[test]
+fn audit_file_cap_is_shared_by_the_agents() {
+    let env = Env::new("composition-a2-audit-file-cap");
+    let now = base_now();
+    for name in ["a", "b", "c"] {
+        whole_file(&env, name, now);
+    }
+    env.run(Source::Claude, now, None);
+    // The other agent already used all but one of today's picks.
+    let mut audit = full_budget();
+    audit.files = AUDIT_FILES_PER_DAY - 1;
+    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(1), &mut audit);
+    assert_eq!(stats.audit_files, 1);
+    assert_eq!(audit.files, AUDIT_FILES_PER_DAY);
+    env.cleanup();
+}

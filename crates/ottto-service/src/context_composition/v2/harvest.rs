@@ -1101,6 +1101,7 @@ fn reconcile_pins(
                 pin.mtime = checkpoint.mtime;
                 pin.head = checkpoint.head;
                 pin.tail = checkpoint.tail;
+                pin.origin = checkpoint.origin;
                 pin.waiting = false;
                 rebuilt += 1;
             }
@@ -1556,7 +1557,7 @@ fn run_source_inner(
     });
 
     let busy: BTreeSet<&str> = work.iter().map(|item| item.key.as_str()).collect();
-    let picks = super::audit::pick(&mut run.audit, source.label(), &index, &busy);
+    let picks = super::audit::pick(&mut run.audit, source.label(), &index, &busy, now_secs);
     drop(busy);
     for (key, path, metadata) in picks {
         let mut item = Work::new(key, Found::new(path, &metadata), Mode::Audit);
@@ -1999,6 +2000,8 @@ fn process_scope(
                 pin.path = checkpoint.path.clone();
                 pin.head = checkpoint.head;
                 pin.tail = checkpoint.tail;
+                // Where counting started: a restart at the end moves it.
+                pin.origin = checkpoint.origin;
                 pin.waiting = false;
                 pin.restart_at_end = false;
                 pin.failures = 0;

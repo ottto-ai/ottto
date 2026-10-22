@@ -35,10 +35,13 @@ than sent late.
 
 ## Audit sample
 
-Each daily run may re-read up to 100 MB (and at most 32 files) of transcripts
-that were already counted. A file is eligible only when it was counted from its
-first byte under the current parser, is not cold, holds only known ids, is not
-otherwise read in this run and has not changed since its last commit. Request 1
+Each daily run may re-read up to 100 MB (and at most 32 files, both shared by
+the agents) of transcripts that were already counted. A file is eligible only
+when it was counted from its first byte under the current parser, changed
+within the last two days (an older file's share is dropped, so it could not be
+replaced), holds only known ids, is not otherwise read in this run and has not
+changed since its last commit. A pin follows its checkpoint's starting offset,
+so a file restarted at its end is never taken for one counted whole. Request 1
 records the session-start verdict its reads ran under, so a later verdict change
 is not mistaken for a counting fault; a request 1 read under two different
 verdicts is never sampled.
