@@ -575,7 +575,7 @@ impl std::fmt::Display for UploadFailureDiagnostics {
 
 impl std::error::Error for UploadFailureDiagnostics {}
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub struct ActivityHintResponse {
     pub source: String,
     pub server_time: String,

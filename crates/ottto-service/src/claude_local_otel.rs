@@ -3742,6 +3742,7 @@ mod tests {
     }
 }
 
+crate::heap_layout_bound::fields!(ClaudeLocalOtelLoadReport; evidence, health);
 crate::heap_layout_bound::fields!(ClaudeApiEvidenceRead; evidence, reads);
 crate::heap_layout_bound::fields!(ApiReadWitness; health, generation);
 crate::heap_layout_bound::fields!(ApiFileGeneration; device, inode, bytes, modified, changed);

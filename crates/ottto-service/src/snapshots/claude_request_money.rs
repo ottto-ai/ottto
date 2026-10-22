@@ -1171,6 +1171,17 @@ pub(crate) fn guarded_for_test(run: impl FnOnce()) -> (bool, u64) {
     (panicked, SHADOW_PANICS.load(Ordering::Acquire))
 }
 
+// Catch a panic on every resumed poll, preserving the shadow panic latch.
+async fn guarded_resume<T: Default>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let mut result = None;
+        guarded(|| result = Some(future.as_mut().poll(cx)));
+        result.unwrap_or(std::task::Poll::Ready(T::default()))
+    })
+    .await
+}
+
 /// Index keys of each page (root, member) and the indexed members of each
 /// page root.
 type FamilyMembers = (
@@ -1230,7 +1241,8 @@ pub(crate) fn shadow_page_at(
     census_complete: bool,
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
-    build_page_at(
+    let mut output = PageBodies::default();
+    let future = build_page_at(
         support_dir,
         snapshots,
         index,
@@ -1238,8 +1250,9 @@ pub(crate) fn shadow_page_at(
         trace_report,
         census_complete,
         now,
-        &mut PageBodies::default(),
-    )
+        &mut output,
+    );
+    crate::snapshot_sync::money_resume::immediate(future).unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -1250,7 +1263,7 @@ struct PageBodies {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_page_at(
+async fn build_page_at(
     support_dir: &Path,
     snapshots: &[SnapshotItem],
     index: &ScanIndex,
@@ -1261,7 +1274,7 @@ fn build_page_at(
     output: &mut PageBodies,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
-    let deadline = started + PAGE_MAX_ELAPSED;
+    let mut deadline = started + PAGE_MAX_ELAPSED;
     let mut counts = ClaudeRequestMoneyShadowCounts::default();
     let scope_key = shadow_scope(support_dir);
     let snapshot = next_snapshot();
@@ -1504,7 +1517,12 @@ fn build_page_at(
         let complete = schedule_evidence(ledger, index, now, deadline, &mut budget, &mut updates);
         // Even a partial bootstrap may publish completed invalidations, but
         // its watches cannot advance until that debt is durably on disk.
-        let durable = checkpoint_money_watches_at(support_dir, ledger, updates, deadline);
+        let waiting = Instant::now();
+        let durable = checkpoint_money_watches_resume(support_dir, ledger, updates).await;
+        let paused = waiting.elapsed();
+        deadline += paused;
+        end.deadline = deadline;
+        end.started += paused;
         if !complete || !durable {
             counts.refused_deadline = u64::from(Instant::now() >= deadline);
             counts.refused_budget = u64::from(counts.refused_deadline == 0);
@@ -1666,7 +1684,12 @@ fn build_page_at(
             &mut budget,
             &mut updates,
         );
-        let durable = checkpoint_money_watches_at(support_dir, ledger, updates, deadline);
+        let waiting = Instant::now();
+        let durable = checkpoint_money_watches_resume(support_dir, ledger, updates).await;
+        let paused = waiting.elapsed();
+        deadline += paused;
+        end.deadline = deadline;
+        end.started += paused;
         if !complete || !durable {
             counts.refused_deadline = u64::from(Instant::now() >= deadline);
             counts.refused_budget = u64::from(counts.refused_deadline == 0);
@@ -2082,29 +2105,38 @@ fn build_page_at(
 /// Build once, publish the P1 comparison, then apply only certified members.
 /// Protected entities keep the existing body; failed builds become local holds.
 #[allow(clippy::too_many_arguments)] // Shared evidence and identity remain separately owned.
-pub(crate) fn live_page(
+pub(crate) async fn live_page_resume(
     support_dir: &Path,
     snapshots: &mut Vec<SnapshotItem>,
     index: &ScanIndex,
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
-    identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
+    identity: Option<&mut super::claude_request_identity::ScanEvidence<'_>>,
     groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
 ) -> BTreeSet<String> {
     let mut output = PageBodies::default();
-    guarded(|| {
-        build_page_at(
-            support_dir,
-            snapshots,
-            index,
-            api,
-            trace,
-            census_complete,
-            page_now(support_dir),
-            &mut output,
-        );
-    });
+    guarded_resume(build_page_at(
+        support_dir,
+        snapshots,
+        index,
+        api,
+        trace,
+        census_complete,
+        page_now(support_dir),
+        &mut output,
+    ))
+    .await;
+    apply_live_page(snapshots, index, &output, identity.as_deref(), groupings)
+}
+
+fn apply_live_page(
+    snapshots: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    output: &PageBodies,
+    identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
+    groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
+) -> BTreeSet<String> {
     let mut held = BTreeSet::new();
     let present = snapshots
         .iter()
@@ -2265,6 +2297,32 @@ pub(crate) fn live_page(
         }
     }
     held
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn live_page(
+    support_dir: &Path,
+    snapshots: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    census_complete: bool,
+    identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
+    groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
+) -> BTreeSet<String> {
+    let mut output = PageBodies::default();
+    let _ = crate::snapshot_sync::money_resume::immediate(guarded_resume(build_page_at(
+        support_dir,
+        snapshots,
+        index,
+        api,
+        trace,
+        census_complete,
+        page_now(support_dir),
+        &mut output,
+    )));
+    apply_live_page(snapshots, index, &output, identity, groupings)
 }
 
 #[cfg(test)]
@@ -3064,6 +3122,7 @@ pub(crate) fn family_root(item: &SnapshotItem) -> &str {
     claude_snapshot_family_root_ref(item)
 }
 
+#[cfg(test)]
 pub(crate) fn checkpoint_pending(support: &Path) -> bool {
     store::checkpoint_pending(support)
 }
@@ -4336,6 +4395,7 @@ fn checkpoint_money_watches(
     )
 }
 
+#[cfg(test)]
 fn checkpoint_money_watches_at(
     support_dir: &Path,
     ledger: &mut ClaudeLedger,
@@ -4348,6 +4408,10 @@ fn checkpoint_money_watches_at(
     if !store::checkpoint_until(support_dir, ledger, deadline) {
         return false;
     }
+    publish_money_watches(ledger, updates)
+}
+
+fn publish_money_watches(ledger: &mut ClaudeLedger, updates: MoneyWatchUpdates) -> bool {
     for (key, record) in updates {
         match record {
             Some(record) => {
@@ -4359,6 +4423,25 @@ fn checkpoint_money_watches_at(
         }
     }
     true
+}
+
+async fn checkpoint_money_watches_resume(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    updates: MoneyWatchUpdates,
+) -> bool {
+    if updates.is_empty() {
+        return true;
+    }
+    std::future::poll_fn(|_| {
+        if store::checkpoint(support_dir, ledger) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    publish_money_watches(ledger, updates)
 }
 
 fn stage_money_watch(

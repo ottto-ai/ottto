@@ -1300,6 +1300,7 @@ pub(super) fn has_offer(support: &Path, key: &str) -> bool {
     found
 }
 
+#[cfg(test)]
 pub(super) fn checkpoint_pending(support_dir: &Path) -> bool {
     let Ok(ledgers) = LEDGERS.lock() else {
         return true;

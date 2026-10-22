@@ -46,6 +46,7 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 use zeroize::Zeroize;
 
 mod continuation;
+pub(crate) mod money_resume;
 mod rejection_log;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
@@ -4633,6 +4634,11 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    if source == SnapshotSource::ClaudeCode
+        && money_resume::resume(device, device_secret, home, support_dir, daemon)?
+    {
+        return Ok(None);
+    }
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
         // would scan, re-derive and re-POST the same pages it just shed, which is
@@ -5147,6 +5153,58 @@ fn capture_codex_recovery_evidence(
 #[allow(clippy::too_many_arguments)]
 fn finish_sync_source(
     preparation: SourcePreparation,
+    index: ScanIndex,
+    scan_result: SourceScanResult,
+    _client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    _source: SnapshotSource,
+    machine_id: &str,
+    _home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
+    retry: &mut live_snapshot_retry::LiveRetryOwner,
+) -> Result<()> {
+    if source_money_resume(preparation.source, support_dir) {
+        return money_resume::start(
+            preparation,
+            index,
+            scan_result,
+            device,
+            device_secret,
+            machine_id,
+            _home,
+            support_dir,
+            daemon,
+        );
+    }
+    money_resume::immediate(finish_sync_source_resume(
+        preparation,
+        index,
+        scan_result,
+        _client,
+        device,
+        device_secret,
+        _source,
+        machine_id,
+        _home,
+        support_dir,
+        daemon,
+        _transport_cycle,
+        retry,
+    ))
+    .expect("gate-off finish has no asynchronous custody barrier")
+}
+
+fn source_money_resume(source: SnapshotSource, support_dir: &Path) -> bool {
+    source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_money::request_owned_live(support_dir)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_sync_source_resume(
+    preparation: SourcePreparation,
     mut index: ScanIndex,
     mut scan_result: SourceScanResult,
     _client: &SnapshotApiClient,
@@ -5292,15 +5350,16 @@ fn finish_sync_source(
     let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
-        let applied = try_apply_claude_local_evidence_to_scan_with_comparison(
+        let applied = try_apply_claude_local_evidence_to_scan_resume(
             support_dir,
             &mut scan_result,
             &mut index,
             cycle_request_identity_permit(source, &activity_hint),
             prepared_claude_evidence,
             comparison_completion.as_mut(),
-            native_comparison_lease.as_ref(),
-        );
+            native_comparison_lease.as_mut(),
+        )
+        .await;
         let (disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
             Err(reason) => {
@@ -5584,25 +5643,38 @@ fn finish_sync_source(
             &scan_result.snapshots,
         );
     }
-    if source == SnapshotSource::ClaudeCode
-        && !crate::snapshots::claude_request_money::prepare_money_offers(
-            support_dir,
-            &index,
-            &scan_result.snapshots,
-            &claude_authority_disposition.quarantined_source_session_ids_for_money(),
-        )
-    {
-        return Err(anyhow!("request money scheduling checkpoint pending"));
-    }
-    if source == SnapshotSource::ClaudeCode
-        && !crate::snapshots::claude_request_money::note_adoption_outcomes(
-            support_dir,
-            &index,
-            &scan_result.snapshots,
-            |item| u64::from(claude_authority_disposition.was_quarantined(&item.source_session_id)),
-        )
-    {
-        return Err(anyhow!("request money scheduling checkpoint pending"));
+    // Re-measure the transformed page before retaining it over offer/outcome
+    // receipts. This charge lasts through POST, exact ACK and selected save.
+    let _money_finish_funds = if source_money_resume(source, support_dir) {
+        Some((
+            money_resume::retain(&index)?,
+            money_resume::retain(&scan_result)?,
+            money_resume::retain(&upload_progress)?,
+        ))
+    } else {
+        None
+    };
+    if source_money_resume(source, support_dir) {
+        money_resume::until(|| {
+            crate::snapshots::claude_request_money::prepare_money_offers(
+                support_dir,
+                &index,
+                &scan_result.snapshots,
+                &claude_authority_disposition.quarantined_source_session_ids_for_money(),
+            )
+        })
+        .await;
+        money_resume::until(|| {
+            crate::snapshots::claude_request_money::note_adoption_outcomes(
+                support_dir,
+                &index,
+                &scan_result.snapshots,
+                |item| {
+                    u64::from(claude_authority_disposition.was_quarantined(&item.source_session_id))
+                },
+            )
+        })
+        .await;
     }
     let local_holds = LocalHoldSettlement::classify(
         source,
@@ -5903,33 +5975,34 @@ fn finish_sync_source(
                     .map(|record| record.retry_after_unix_seconds)
             },
         );
-        if !crate::snapshots::claude_request_money::note_adoption_outcomes(
-            support_dir,
-            &index,
-            &scan_result.snapshots,
-            |item| {
-                let fp = &item.snapshot_fingerprint;
-                if upload_progress.accepted_fingerprints.contains(fp) {
-                    4
-                } else if let Some(rejection) = upload_progress.permanent_rejections.get(fp) {
-                    if rejection.reason.is_dominated() {
-                        6
+        money_resume::until(|| {
+            crate::snapshots::claude_request_money::note_adoption_outcomes(
+                support_dir,
+                &index,
+                &scan_result.snapshots,
+                |item| {
+                    let fp = &item.snapshot_fingerprint;
+                    if upload_progress.accepted_fingerprints.contains(fp) {
+                        4
+                    } else if let Some(rejection) = upload_progress.permanent_rejections.get(fp) {
+                        if rejection.reason.is_dominated() {
+                            6
+                        } else {
+                            3
+                        }
+                    } else if upload_progress
+                        .quarantined_fingerprints
+                        .get(fp)
+                        .is_some_and(|record| record.hold.is_some())
+                    {
+                        2
                     } else {
-                        3
+                        0
                     }
-                } else if upload_progress
-                    .quarantined_fingerprints
-                    .get(fp)
-                    .is_some_and(|record| record.hold.is_some())
-                {
-                    2
-                } else {
-                    0
-                }
-            },
-        ) {
-            return Err(anyhow!("request money scheduling checkpoint pending"));
-        }
+                },
+            )
+        })
+        .await;
 
         let Some(settlement_funds) =
             crate::snapshots::claude_request_money::ShadowReservation::admit(
@@ -7209,7 +7282,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     prepared: Option<PreparedClaudeLocalEvidence>,
     comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
-    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    lease: Option<&mut crate::snapshots::claude_native_comparison::lifecycle::Lease>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
     bool,
@@ -7232,9 +7305,39 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
     permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+    prepared: Option<PreparedClaudeLocalEvidence>,
+    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
+    lease: Option<&mut crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+) -> std::result::Result<
+    (
+        crate::snapshots::ClaudeUsageAuthorityDisposition,
+        bool,
+        ClaudeLocalEvidenceStats,
+    ),
+    crate::source_rotation::LocalRefusal,
+> {
+    money_resume::immediate(try_apply_claude_local_evidence_to_scan_resume(
+        support_dir,
+        scan_result,
+        index,
+        permit,
+        prepared,
+        comparison,
+        lease,
+    ))
+    .unwrap_or(Err(crate::source_rotation::LocalRefusal(
+        "request money scheduling checkpoint pending",
+    )))
+}
+
+async fn try_apply_claude_local_evidence_to_scan_resume(
+    support_dir: &Path,
+    scan_result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     mut prepared: Option<PreparedClaudeLocalEvidence>,
     mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
-    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    lease: Option<&mut crate::snapshots::claude_native_comparison::lifecycle::Lease>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -7425,7 +7528,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
-    let identity_evidence = emission_permitted.then(|| {
+    let mut identity_evidence = emission_permitted.then(|| {
         crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
@@ -7443,9 +7546,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         observations,
         comparison
             .as_deref()
-            .map(|comparison| comparison.fold_view(lease))
+            .map(|comparison| comparison.fold_view(lease.as_deref()))
             .or_else(|| {
-                lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
+                lease
+                    .as_deref()
+                    .map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
             }),
         &veto_api_rows,
     );
@@ -7461,23 +7566,39 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         comparison.retire_native_fold_owner();
     }
 
+    // These baseline-loader graphs now survive a yield as well as the
+    // builder's independently admitted scratch. Do not park uncharged rows.
+    let _money_evidence_funds = if request_owned_live {
+        Some((
+            money_resume::retain(&api_report),
+            money_resume::retain(&trace_report),
+            money_resume::retain(&scan_result.snapshots),
+        ))
+    } else {
+        None
+    };
+    let _money_evidence_funds = match _money_evidence_funds {
+        Some((Ok(api), Ok(trace), Ok(snapshots))) => Some((api, trace, snapshots)),
+        Some(_) => {
+            return Err(crate::source_rotation::LocalRefusal(
+                "request money evidence retention refused",
+            ))
+        }
+        None => None,
+    };
     if request_owned_live {
         let mut groupings = BTreeMap::new();
-        let holds = crate::snapshots::claude_request_money::live_page(
+        let holds = crate::snapshots::claude_request_money::live_page_resume(
             support_dir,
             &mut scan_result.snapshots,
             index,
             &api_report,
             &trace_report,
             census_complete,
-            identity_evidence.as_ref(),
+            identity_evidence.as_mut(),
             &mut groupings,
-        );
-        if crate::snapshots::claude_request_money::checkpoint_pending(support_dir) {
-            return Err(crate::source_rotation::LocalRefusal(
-                "request money scheduling checkpoint pending",
-            ));
-        }
+        )
+        .await;
         let mut holds = holds;
         if !crate::snapshots::claude_request_money::stage_selection_fingerprints(
             support_dir,
@@ -9807,7 +9928,7 @@ mod tests {
                 None,
                 None,
                 completion.as_mut(),
-                Some(&lease),
+                Some(&mut lease),
             )
             .unwrap()
         });
