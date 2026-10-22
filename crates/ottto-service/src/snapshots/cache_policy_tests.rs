@@ -473,7 +473,21 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
     if older_tail {
         tailed.set_modified(unix_now() - OLD_SECONDS + 1);
     }
+    sampled_scan::test_hooks::clear();
     let (tail, counts) = observe(|| observed_scan(&tailed, source, index, &cache));
+    // M1 (ii) historical-baseline diagnostic (parent grant, 2026-10-22):
+    // printed before any assertion of the calling row. Content-free sizes and
+    // counters only.
+    eprintln!(
+        "CACHE_POLICY_BASELINE test={} resident_before={resident_before} resident_after={} filler_charge={filler_charge} fillers_after={} tail_retained_after={} tail_zero_budget_steps={} modes={:?} finalizations={:?} counts={counts:?}",
+        std::thread::current().name().unwrap_or("unnamed"),
+        optional_resident(&cache),
+        fillers_resident(&cache),
+        cache.retained_checkpoint(&tailed.key()).is_some(),
+        tail.tail_zero_budget_steps,
+        tail.modes,
+        sampled_scan::test_hooks::finalizations(),
+    );
     assert_eq!(
         tail.modes,
         (0, 1, 0),

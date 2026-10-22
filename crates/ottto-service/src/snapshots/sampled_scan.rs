@@ -886,3 +886,40 @@ mod cache_lifecycle_tests {
         assert_eq!(counts.clear_entries_released, 0);
     }
 }
+
+/// M1 (ii) historical-baseline diagnostic (parent grant, 2026-10-22): the
+/// finalization recorder from #665's diagnostic round, adapted to this
+/// base's call site. Tests only; not compiled in production.
+#[cfg(test)]
+pub(super) mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FINALIZATIONS: RefCell<Vec<Finalization>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(in crate::snapshots) fn clear() {
+        FINALIZATIONS.with(|records| records.borrow_mut().clear());
+    }
+
+    /// One completion's finalization check (diagnostic receipts): the budget
+    /// it was checked against, the finished bound (at that budget when it
+    /// fit; otherwise re-walked at `usize::MAX`, `None` when even that walk
+    /// fails: a failed measurement, not a bound above budget), whether it
+    /// fit, and whether a retained copy was pending.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::snapshots) struct Finalization {
+        pub(in crate::snapshots) budget: usize,
+        pub(in crate::snapshots) charge: Option<usize>,
+        pub(in crate::snapshots) within_budget: bool,
+        pub(in crate::snapshots) copy_pending: Option<bool>,
+    }
+
+    pub(in crate::snapshots) fn record_finalization(record: Finalization) {
+        FINALIZATIONS.with(|records| records.borrow_mut().push(record));
+    }
+
+    pub(in crate::snapshots) fn finalizations() -> Vec<Finalization> {
+        FINALIZATIONS.with(|records| records.borrow().clone())
+    }
+}

@@ -16904,6 +16904,22 @@ impl OwnedSourceScan {
                 };
                 let finalization_charge =
                     crate::heap_layout_bound::completed_bound(&parsed_file, copy_budget);
+                // Tests only (diagnostic receipt): a refused check is re-walked
+                // unbounded, so a failed measurement and a bound above the
+                // budget are told apart. Not compiled in production.
+                #[cfg(test)]
+                sampled_scan::test_hooks::record_finalization(
+                    sampled_scan::test_hooks::Finalization {
+                        budget: copy_budget,
+                        charge: finalization_charge.or_else(|| {
+                            crate::heap_layout_bound::completed_bound(&parsed_file, usize::MAX)
+                        }),
+                        within_budget: finalization_charge.is_some(),
+                        copy_pending: completed_acquisition
+                            .as_ref()
+                            .map(|completed| completed.reduction.is_some()),
+                    },
+                );
                 if finalization_charge.is_none() {
                     if let Some(completed) = completed_acquisition.as_mut() {
                         if completed.reduction.is_some() {
