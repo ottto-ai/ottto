@@ -44,6 +44,10 @@ pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
+mod compaction_events;
+pub(crate) use compaction_events::bounded_compaction_events;
+use compaction_events::CodexCompactionSizes;
+pub use compaction_events::SnapshotCompactionEvent;
 #[cfg(test)]
 mod codex_counting_v2_tests;
 mod codex_counting_version;
@@ -68,6 +72,9 @@ mod disappearance_diagnostics;
 mod launch_demand_tests;
 #[cfg(test)]
 mod launcher_recognition_tests;
+mod local_context_points;
+pub(crate) use local_context_points::LocalContextPoint;
+use local_context_points::LocalContextPoints;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod sampled_audit;
@@ -1531,6 +1538,16 @@ pub struct SnapshotItem {
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_timestamps: Vec<String>,
+    /// Context sizes around each compaction, one per `compaction_timestamps`
+    /// entry with a byte-identical `at`. Additive evidence: deliberately
+    /// outside the `context_posture` component, the content hash and the body
+    /// witness. Codex only for now; Claude Code leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_events: Vec<SnapshotCompactionEvent>,
+    /// Local-only context points for the Mac app's Sessions graph (Codex, last
+    /// activity within 75 minutes). Never serialized or uploaded.
+    #[serde(skip)]
+    pub(crate) local_context_points: Vec<LocalContextPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_total_pre_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10271,6 +10288,11 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
             "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_timestamps"
         ));
     }
+    if item.compaction_events.len() > MAX_COMPACTION_TIMESTAMPS {
+        return Err(format!(
+            "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_events"
+        ));
+    }
     if let Some(curve) = item.context_curve.as_ref() {
         validate_context_curve(index, curve)?;
         if item.provenance.collector == "codex_state_sqlite"
@@ -12400,6 +12422,10 @@ struct SnapshotAccumulator {
     last_turn_context_tokens: Option<u64>,
     compaction_count: u64,
     compaction_timestamps: crate::owned_heap::OwnedVec<String>,
+    // Codex only: sizes index-aligned with `compaction_timestamps`.
+    codex_compaction_sizes: CodexCompactionSizes,
+    // Codex only: bounded points for the local Sessions graph.
+    local_context_points: LocalContextPoints,
     claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
     // Pair key of the latest boundary still waiting for its legacy summary and
     // the uuid at the tip of its `attachment` chain. One slot suffices: the
@@ -12542,6 +12568,8 @@ impl SnapshotAccumulator {
             last_turn_context_tokens: None,
             compaction_count: 0,
             compaction_timestamps: crate::owned_heap::OwnedVec::new(),
+            codex_compaction_sizes: CodexCompactionSizes::default(),
+            local_context_points: LocalContextPoints::default(),
             claude_compaction_observations: crate::owned_heap::OwnedVec::new(),
             claude_compaction_link_tip: None,
             session_start: Box::default(),
@@ -14535,16 +14563,32 @@ impl SnapshotAccumulator {
                 row.account_identifier_hash = self.account_identifier_hash.clone();
             }
         }
-        let (compaction_count, compaction_timestamps, compaction_metrics) =
+        // Claude Code events are built by the ownership fold, never here.
+        let (compaction_count, compaction_timestamps, compaction_events, compaction_metrics) =
             if self.source == SnapshotSource::ClaudeCode {
-                claude_compaction_summary(&self.claude_compaction_observations)
+                let (count, timestamps, metrics) =
+                    claude_compaction_summary(&self.claude_compaction_observations);
+                (count, timestamps, Vec::new(), metrics)
             } else {
+                let timestamps = self.compaction_timestamps.into_vec();
+                let events = if self.source == SnapshotSource::Codex {
+                    self.codex_compaction_sizes.into_events()
+                } else {
+                    Vec::new()
+                };
                 (
                     self.compaction_count,
-                    bounded_compaction_timestamps(self.compaction_timestamps.into_vec()),
+                    bounded_compaction_timestamps(timestamps),
+                    events,
                     CompactionMetrics::default(),
                 )
             };
+        let local_context_points = if self.source == SnapshotSource::Codex {
+            self.local_context_points
+                .into_recent(self.last_activity_at.as_deref(), collected_at)
+        } else {
+            Vec::new()
+        };
         let context_curve = if !self.context_curve_enabled {
             None
         } else {
@@ -14668,6 +14712,12 @@ impl SnapshotAccumulator {
             } else {
                 Vec::new()
             },
+            compaction_events: if self.source.derives_context_posture() {
+                compaction_events
+            } else {
+                Vec::new()
+            },
+            local_context_points,
             compaction_total_pre_tokens: if self.source.derives_context_posture()
                 && compaction_metrics.metrics_count > 0
             {
@@ -21441,6 +21491,8 @@ fn codex_state_only_snapshot(
         last_turn_context_tokens: None,
         compaction_count: None,
         compaction_timestamps: Vec::new(),
+        compaction_events: Vec::new(),
+        local_context_points: Vec::new(),
         compaction_total_pre_tokens: None,
         compaction_total_post_tokens: None,
         compaction_total_cumulative_dropped_tokens: None,
@@ -24397,6 +24449,11 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 });
         }
         if let Some(timestamp) = timestamp.clone() {
+            // `before` is the session's current "last" value: the last owned
+            // non-zero request before this marker, in the posture measure.
+            accumulator
+                .codex_compaction_sizes
+                .note_marker(&timestamp, accumulator.last_turn_context_tokens);
             accumulator.compaction_timestamps.push(timestamp);
         }
     }
@@ -24427,6 +24484,9 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.peak_context_fill_tokens =
                 accumulator.peak_context_fill_tokens.max(context_tokens);
             accumulator.last_turn_context_tokens = Some(context_tokens);
+            accumulator
+                .local_context_points
+                .push(timestamp.as_deref(), context_tokens);
         }
     }
     // Usage-counting V2 (configured parsers only): version decision on the
@@ -24518,6 +24578,16 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         }
         if let (Some(_), Some(last_usage)) = (admitted.as_ref(), last_usage.as_ref()) {
             accumulator.session_start.note_codex_request(last_usage);
+        }
+        // A compaction's "after" is the first COUNTED request after it: exact
+        // duplicates and re-emissions are not admitted. Same measure as
+        // `before` (the posture read of `last_token_usage`).
+        if admitted.is_some() {
+            if let Some(context_tokens) = codex_last_turn_input_context(value) {
+                accumulator
+                    .codex_compaction_sizes
+                    .note_counted_request(context_tokens);
+            }
         }
         if admitted.is_some() && accumulator.context_curve_enabled {
             match (last_usage, usage_event_identity) {
@@ -44191,6 +44261,8 @@ mod tests {
             last_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
+            compaction_events: Vec::new(),
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
@@ -54216,6 +54288,66 @@ mod tests {
         );
     }
 
+    /// Compaction sizes and local context points are additive evidence: they
+    /// must never move semantic identity, the content hash or the body
+    /// witness, and the points must never reach the wire.
+    #[test]
+    fn compaction_events_and_local_context_points_are_identity_neutral() {
+        let mut request = valid_v6_batch_request();
+        let policy = request.upload_policy;
+        let mut item = request.snapshots.remove(0);
+        item.peak_context_fill_tokens = Some(250_000);
+        item.first_turn_context_tokens = Some(40_000);
+        item.compaction_count = Some(1);
+        item.compaction_timestamps = vec!["2026-08-14T09:00:00Z".to_string()];
+        let mut with = item.clone();
+        with.compaction_events = vec![SnapshotCompactionEvent {
+            at: "2026-08-14T09:00:00Z".to_string(),
+            before: Some(250_000),
+            after: Some(59_000),
+            trigger: Some("manual".to_string()),
+        }];
+        with.local_context_points = vec![LocalContextPoint {
+            at_unix_seconds: 1_786_000_000,
+            prompt_tokens: 250_000,
+        }];
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+            assert_eq!(
+                snapshot_semantic_component_hashes(source, &with),
+                snapshot_semantic_component_hashes(source, &item),
+                "{source:?}"
+            );
+            assert_eq!(
+                snapshot_fingerprint(source, &with),
+                snapshot_fingerprint(source, &item),
+                "{source:?}"
+            );
+            // The whole envelope, so the lists can never slip into the
+            // revision or revision v2 input either.
+            assert_eq!(
+                snapshot_semantic_envelope(source, &with, policy),
+                snapshot_semantic_envelope(source, &item, policy),
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            snapshot_upload_body_witness(&with),
+            snapshot_upload_body_witness(&item)
+        );
+        assert_eq!(
+            snapshot_upload_body_witness_version(&with),
+            snapshot_upload_body_witness_version(&item)
+        );
+        let wire = serde_json::to_value(&with).expect("serialize");
+        assert_eq!(
+            wire["compaction_events"],
+            json!([{"at": "2026-08-14T09:00:00Z", "before": 250_000, "after": 59_000, "trigger": "manual"}])
+        );
+        assert!(wire.get("local_context_points").is_none());
+        let wire = serde_json::to_value(&item).expect("serialize");
+        assert!(wire.get("compaction_events").is_none());
+    }
+
     #[test]
     fn context_curve_is_hash_neutral_and_deterministically_bounded() {
         let first = max_fractional_context_curve_fixture();
@@ -54282,6 +54414,16 @@ mod tests {
             item.context_curve = Some(first.clone());
             item.compaction_timestamps = (0..MAX_COMPACTION_TIMESTAMPS)
                 .map(|second| format!("2026-08-20T12:00:{:02}Z", second % 60))
+                .collect();
+            item.compaction_events = item
+                .compaction_timestamps
+                .iter()
+                .map(|at| SnapshotCompactionEvent {
+                    at: at.clone(),
+                    before: Some(u64::MAX),
+                    after: Some(u64::MAX),
+                    trigger: Some("manual".to_string()),
+                })
                 .collect();
             item.tool_usage = Some(
                 (0..MAX_TOOL_USAGE_NAMES)
@@ -61991,6 +62133,17 @@ mod tests {
         assert_eq!(item.first_turn_context_tokens, Some(100));
         assert_eq!(item.peak_context_fill_tokens, Some(100));
         assert_eq!(item.compaction_count, Some(1));
+        // The inherited-prefix marker is no event, and the owned marker's
+        // `before` is the owned request, never the inherited 1,000.
+        assert_eq!(
+            item.compaction_events,
+            [SnapshotCompactionEvent {
+                at: "2026-08-02T06:01:03Z".to_string(),
+                before: Some(100),
+                after: None,
+                trigger: None,
+            }]
+        );
         assert_eq!(
             item.model_usage[0].reasoning_effort.as_deref(),
             Some("high")
@@ -66912,6 +67065,7 @@ mod tests {
             "last_turn_context_tokens",
             "compaction_count",
             "compaction_timestamps",
+            "compaction_events",
             "compaction_total_pre_tokens",
             "compaction_total_post_tokens",
             "compaction_total_cumulative_dropped_tokens",
@@ -67093,8 +67247,15 @@ mod tests {
             peak_context_fill_tokens: Some(115),
             first_turn_context_tokens: Some(105),
             last_turn_context_tokens: None,
-            compaction_count: Some(0),
-            compaction_timestamps: Vec::new(),
+            compaction_count: Some(1),
+            compaction_timestamps: vec!["2026-07-20T11:30:00Z".to_string()],
+            compaction_events: vec![SnapshotCompactionEvent {
+                at: "2026-07-20T11:30:00Z".to_string(),
+                before: Some(115),
+                after: Some(105),
+                trigger: None,
+            }],
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
@@ -67211,6 +67372,10 @@ mod tests {
             snapshot["context_curve"]["points"][0]["model_window_index"],
             json!(0)
         );
+        assert_eq!(
+            snapshot["compaction_events"],
+            json!([{"at": "2026-07-20T11:30:00Z", "before": 115, "after": 105}])
+        );
 
         // (2) every snapshot-item key is within the backend's allowed item set.
         for key in snapshot.keys() {
@@ -67315,6 +67480,24 @@ mod tests {
             error.contains("more than 64 compaction_timestamps"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn v6_snapshot_preflight_rejects_oversized_compaction_events() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].compaction_events = vec![
+            SnapshotCompactionEvent {
+                at: "2026-07-20T12:00:00Z".to_string(),
+                before: Some(1),
+                after: None,
+                trigger: None,
+            };
+            MAX_COMPACTION_TIMESTAMPS + 1
+        ];
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+
+        assert!(error.contains("more than 64 compaction_events"), "{error}");
     }
 
     #[test]
@@ -68538,6 +68721,8 @@ mod tests {
                 last_turn_context_tokens: None,
                 compaction_count: None,
                 compaction_timestamps: Vec::new(),
+                compaction_events: Vec::new(),
+                local_context_points: Vec::new(),
                 compaction_total_pre_tokens: None,
                 compaction_total_post_tokens: None,
                 compaction_total_cumulative_dropped_tokens: None,
@@ -70698,13 +70883,13 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, claude_compaction_link_tip, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
+crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_events, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
 crate::heap_layout_bound::fields!(SnapshotModelUsage; model, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, reasoning_effort, unattributed_total_tokens, request_count, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
