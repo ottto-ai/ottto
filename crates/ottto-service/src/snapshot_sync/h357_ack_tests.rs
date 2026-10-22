@@ -1895,6 +1895,7 @@ fn a_non_dominated_permanent_refusal_keeps_backend_validation_error() {
 /// T3: dominated refusals plus a local hold stay unsettled, and the reported
 /// code is unchanged.
 #[test]
+#[serial_test::serial(source_manifests)]
 fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
     let mut ledger = progress();
     refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
