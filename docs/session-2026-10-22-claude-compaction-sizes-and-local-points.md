@@ -63,16 +63,32 @@ never judged carries none.
 The same rule as Codex (pinned first point, 15-minute slots, big-change rule,
 64-point cap with halving, unique seconds) over the owned requests in sequence
 order. Built only when the session's last activity is within 75 minutes of
-collection; only then are the owned requests ordered. Local only (`serde(skip)`).
+collection. Local only (`serde(skip)`). The requests are fed in sequence order
+without being collected: the strict path's slice is already in order (one
+pass); the file-birth path's request-id map is not, so
+`LocalContextPoints::from_requests_by_sequence` replays it in windows of 256
+`(sequence, position)` keys, one cheap pass per window. The result equals a
+stable sort by sequence.
 
 ## Weight
 
 - Reads: none added.
 - Per line: one JSON pointer read on `compact_boundary` lines only.
-- Per fold, items with an owned boundary: one pass over the owned requests,
-  memory bounded by the events (at most 65 gap slots). Items without one: no work.
-- Per fold, recent items only: one ordered list of owned request references
-  (8 bytes each) for the points; at most 64 points of 8 bytes kept.
+- Per fold, items with an owned boundary: one pass over the owned compaction
+  observations that keeps only the newest 64 distinct `at` values (sorted,
+  evict before insert; length and capacity at most 64), then one pass over the
+  owned requests with at most 65 gap slots, 64 cuts and 64 before/after
+  entries. The legacy pairing set is built once and shared with the existing
+  summary. Nothing 5b builds grows with the marker or request count. Items
+  without an owned boundary: no request work.
+- Per fold, recent items only: points from a fixed window of 256 request
+  references (about 6 KB), `ceil(n / 256)` passes over the request map (one
+  pass when already in order); at most 64 points of 8 bytes kept.
+- Existing debt, not changed here: the Claude parser keeps one
+  `ClaudeCompactionObservation` (at most 120 bytes) per marker for the whole
+  parse, and the fold's existing summary and owned-boundary copies are as
+  long. That vector is owned by the Claude parser / StateMissing work; 5b does
+  not grow its entries or copy it again.
 - Retained state: the trigger byte and the two id-less flags sit in
   `ClaudeCompactionObservation`'s existing padding (at most 120 bytes, pinned);
   no new per-session vector. Marking costs one scan of the compaction

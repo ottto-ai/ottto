@@ -979,7 +979,18 @@ fn paired_claude_legacy_compactions(
 fn claude_compaction_summary(
     observations: &[ClaudeCompactionObservation],
 ) -> (u64, Vec<String>, CompactionMetrics) {
-    let matched_legacy = paired_claude_legacy_compactions(observations);
+    claude_compaction_summary_paired(
+        observations,
+        &paired_claude_legacy_compactions(observations),
+    )
+}
+
+/// `claude_compaction_summary` with the pairing already computed, so the fold
+/// can share one pairing between the summary and the compaction sizes.
+fn claude_compaction_summary_paired(
+    observations: &[ClaudeCompactionObservation],
+    matched_legacy: &BTreeSet<usize>,
+) -> (u64, Vec<String>, CompactionMetrics) {
     let mut metrics = CompactionMetrics::default();
 
     for current in observations
@@ -1075,28 +1086,36 @@ fn clear_claude_context_posture(item: &mut SnapshotItem) {
 
 /// The compaction tuple (count, timestamps, four totals), the compaction
 /// sizes and the Mac-local context points of a Claude Code item, all from one
-/// owned set: `owned_observations` and `own_requests` (the requests behind
-/// first/peak/last, any order). Both posture writers call this, so the two
-/// paths cannot drift; `clear_claude_context_posture` clears the same fields
-/// and `finish()` never builds Claude sizes or points.
+/// owned set: `owned_observations` and the requests of `occurrences` that
+/// `is_own` accepts (the requests behind first/peak/last, any order). Both
+/// posture writers call this, so the two paths cannot drift;
+/// `clear_claude_context_posture` clears the same fields and `finish()` never
+/// builds Claude sizes or points.
 ///
-/// Points are built only when the item's last activity is within the
-/// 75-minute output gate; only then are the owned requests ordered. Returns
-/// how many shipped events sit next to an id-less response, for the local
-/// counters (always zero on the strict path, whose request ids are complete).
+/// Legacy pairing runs once for the summary and the sizes. Points are built
+/// only when the item's last activity is within the 75-minute output gate,
+/// in request order without collecting the requests. Returns how many
+/// shipped events sit next to an id-less response, for the local counters
+/// (always zero on the strict path, whose request ids are complete).
 fn set_claude_compaction_scalars<'a, I>(
     item: &mut SnapshotItem,
     owned_observations: &[ClaudeCompactionObservation],
-    own_requests: I,
+    occurrences: I,
+    is_own: impl Fn(&ClaudeTranscriptUsageOccurrence) -> bool,
 ) -> compaction_events::ClaudeIdLessNeighbours
 where
     I: Iterator<Item = &'a ClaudeTranscriptUsageOccurrence> + Clone,
 {
-    let (count, timestamps, metrics) = claude_compaction_summary(owned_observations);
+    let paired = paired_claude_legacy_compactions(owned_observations);
+    let (count, timestamps, metrics) =
+        claude_compaction_summary_paired(owned_observations, &paired);
     item.compaction_count = Some(count);
     item.compaction_timestamps = timestamps;
-    let (events, id_less) =
-        compaction_events::claude_compaction_events(owned_observations, own_requests.clone());
+    let (events, id_less) = compaction_events::claude_compaction_events(
+        owned_observations,
+        &paired,
+        occurrences.clone().filter(|occurrence| is_own(occurrence)),
+    );
     item.compaction_events = events;
     item.compaction_total_pre_tokens =
         (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
@@ -1109,14 +1128,16 @@ where
     item.local_context_points =
         if local_context_points_recent(item.source_last_activity_at.as_deref(), &item.collected_at)
         {
-            let mut ordered = own_requests.collect::<Vec<_>>();
-            ordered.sort_by_key(|occurrence| occurrence.sequence);
-            LocalContextPoints::from_ordered_requests(ordered.into_iter().map(|occurrence| {
-                (
-                    occurrence.timestamp.as_deref(),
-                    occurrence.effective_input_context,
-                )
-            }))
+            LocalContextPoints::from_requests_by_sequence(
+                occurrences,
+                |occurrence| occurrence.sequence,
+                |occurrence| {
+                    is_own(occurrence).then_some((
+                        occurrence.timestamp.as_deref(),
+                        occurrence.effective_input_context,
+                    ))
+                },
+            )
         } else {
             Vec::new()
         };
@@ -1152,7 +1173,9 @@ fn rebuild_claude_context_posture(
         })
         .cloned()
         .collect::<Vec<_>>();
-    set_claude_compaction_scalars(item, &owned_observations, owned_occurrences.iter());
+    set_claude_compaction_scalars(item, &owned_observations, owned_occurrences.iter(), |_| {
+        true
+    });
 }
 
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the
@@ -57445,6 +57468,7 @@ mod tests {
         // The helper reads the owned requests in any order.
         let (reversed, id_less) = super::compaction_events::claude_compaction_events(
             &item.claude_context_curve_boundaries,
+            &paired_claude_legacy_compactions(&item.claude_context_curve_boundaries),
             item.claude_usage_occurrences.values().rev(),
         );
         assert_eq!(reversed, item.compaction_events);

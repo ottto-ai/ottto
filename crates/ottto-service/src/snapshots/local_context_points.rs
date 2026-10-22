@@ -29,6 +29,9 @@ const LOCAL_CONTEXT_POINT_BIG_CHANGE_TOKENS: u32 = 20_000;
 /// Only items whose last activity is this recent carry points, so a long
 /// first pass over old transcripts holds no point lists.
 const LOCAL_CONTEXT_POINT_RECENT_SECONDS: i64 = 75 * 60;
+/// Requests ordered per pass when the fold's owned requests are not already
+/// in sequence order (Claude Code's request-id map): about 6 KB of scratch.
+pub(super) const LOCAL_CONTEXT_POINT_ORDER_WINDOW: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalContextPoint {
@@ -130,17 +133,68 @@ impl LocalContextPoints {
         }
     }
 
-    /// Points over owned requests already in transcript order, `(timestamp,
-    /// prompt size)` each. Claude Code builds its list this way in the
-    /// ownership fold from the requests behind first/peak/last.
-    pub(super) fn from_ordered_requests<'a>(
-        requests: impl Iterator<Item = (Option<&'a str>, u64)>,
-    ) -> Vec<LocalContextPoint> {
+    /// Points over owned requests given in any order, fed to `push` in
+    /// `(sequence, input position)` order: exactly a stable sort by sequence,
+    /// so the result equals collecting and sorting the requests, but nothing
+    /// grows with the request count. Input already in sequence order (the
+    /// strict fold's sorted slice) is fed in one pass. Otherwise each pass
+    /// over `requests` selects the next `LOCAL_CONTEXT_POINT_ORDER_WINDOW`
+    /// keys after the last one fed, so scratch is that window whatever the
+    /// count, for `ceil(n / window)` cheap passes. Claude Code builds its list
+    /// this way in the ownership fold from the requests behind
+    /// first/peak/last. `point` returns `None` for a request that is not
+    /// owned, and is called once per request.
+    pub(super) fn from_requests_by_sequence<'a, T, I>(
+        requests: I,
+        sequence: impl Fn(T) -> u64,
+        point: impl Fn(T) -> Option<(Option<&'a str>, u64)>,
+    ) -> Vec<LocalContextPoint>
+    where
+        T: Copy,
+        I: Iterator<Item = T> + Clone,
+    {
         let mut points = Self::default();
-        for (at, prompt_tokens) in requests {
-            points.push(at, prompt_tokens);
+        let mut feed = |request: T| {
+            if let Some((at, prompt_tokens)) = point(request) {
+                points.push(at, prompt_tokens);
+            }
+        };
+        let mut previous = None;
+        let in_order = requests.clone().all(|request| {
+            let sequence = sequence(request);
+            let in_order = !matches!(previous, Some(previous) if previous > sequence);
+            previous = Some(sequence);
+            in_order
+        });
+        if in_order {
+            requests.for_each(feed);
+            return points.points;
         }
-        points.points
+        let mut window = Vec::with_capacity(LOCAL_CONTEXT_POINT_ORDER_WINDOW);
+        let mut fed: Option<(u64, usize)> = None;
+        loop {
+            for (position, request) in requests.clone().enumerate() {
+                let key = (sequence(request), position);
+                if fed.is_some_and(|fed| key <= fed) {
+                    continue;
+                }
+                if window.len() == LOCAL_CONTEXT_POINT_ORDER_WINDOW {
+                    if window.last().is_some_and(|(last, _)| key > *last) {
+                        continue;
+                    }
+                    window.pop();
+                }
+                let index = window.partition_point(|(kept, _)| *kept < key);
+                window.insert(index, (key, request));
+                debug_assert!(window.len() <= LOCAL_CONTEXT_POINT_ORDER_WINDOW);
+            }
+            let full = window.len() == LOCAL_CONTEXT_POINT_ORDER_WINDOW;
+            fed = window.last().map(|(key, _)| *key);
+            window.drain(..).for_each(|(_, request)| feed(request));
+            if !full {
+                return points.points;
+            }
+        }
     }
 }
 
@@ -371,28 +425,69 @@ mod tests {
     }
 
     #[test]
-    fn ordered_requests_follow_the_same_rule_and_cap() {
-        // One request per minute for five hours, big steps every 7 minutes.
+    fn requests_by_sequence_follow_the_same_rule_and_cap() {
+        // One request per minute for five hours, big steps every 7 minutes;
+        // every third is not owned, and two share a sequence (input order
+        // breaks the tie, like the stable sort).
         let requests = (0..300_u32)
             .map(|minute| {
                 let tokens: u64 = if minute % 7 == 0 { 400_000 } else { 50_000 };
-                (at(BASE + minute * 60), tokens)
+                (
+                    u64::from(minute),
+                    at(BASE + minute * 60),
+                    tokens,
+                    minute % 3 != 1,
+                )
             })
-            .chain([(String::from("not a time"), 9), (at(BASE + 300 * 60), 0)])
+            .chain([
+                (300, String::from("not a time"), 9, true),
+                (301, at(BASE + 300 * 60), 0, true),
+                (299, at(BASE + 299 * 60 + 5), 70_000, true),
+            ])
             .collect::<Vec<_>>();
-        let mut pushed = LocalContextPoints::default();
-        for (at, tokens) in &requests {
-            pushed.push(Some(at), *tokens);
-        }
-        let built = LocalContextPoints::from_ordered_requests(
-            requests
-                .iter()
-                .map(|(at, tokens)| (Some(at.as_str()), *tokens)),
+        // Oracle: collect, stable-sort by sequence, push the owned ones.
+        let oracle = |requests: &[&(u64, String, u64, bool)]| {
+            let mut sorted = requests.to_vec();
+            sorted.sort_by_key(|(sequence, ..)| *sequence);
+            let mut pushed = LocalContextPoints::default();
+            for (_, at, tokens, _) in sorted.iter().filter(|(.., own)| *own) {
+                pushed.push(Some(at), *tokens);
+            }
+            pushed.points
+        };
+        let build = |requests: &[&(u64, String, u64, bool)]| {
+            LocalContextPoints::from_requests_by_sequence(
+                requests.iter().copied(),
+                |(sequence, ..)| *sequence,
+                |(_, at, tokens, own)| own.then_some((Some(at.as_str()), *tokens)),
+            )
+        };
+        // In order (one pass), and shuffled (two windows of 256).
+        let mut sorted = requests.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|(sequence, ..)| *sequence);
+        let in_order = build(&sorted);
+        assert_eq!(in_order, oracle(&sorted));
+        assert_eq!(
+            in_order.last().unwrap().at_unix_seconds,
+            BASE + 299 * 60 + 5
         );
-        assert_eq!(built, pushed.points);
-        assert!(built.len() <= LOCAL_CONTEXT_POINT_CAP);
-        assert!(built.capacity() <= LOCAL_CONTEXT_POINT_CAP);
-        assert_eq!(built.first().unwrap().at_unix_seconds, BASE);
-        assert_eq!(built.last().unwrap().at_unix_seconds, BASE + 299 * 60);
+        assert_eq!(in_order.last().unwrap().prompt_tokens, 70_000);
+        let mut shuffled = requests.iter().collect::<Vec<_>>();
+        shuffled.reverse();
+        shuffled.rotate_left(97);
+        let shuffled = build(&shuffled);
+        assert_ne!(shuffled, in_order, "the tie follows input order");
+        assert_eq!(
+            shuffled,
+            oracle(&{
+                let mut input = requests.iter().collect::<Vec<_>>();
+                input.reverse();
+                input.rotate_left(97);
+                input
+            })
+        );
+        assert!(shuffled.len() <= LOCAL_CONTEXT_POINT_CAP);
+        assert!(shuffled.capacity() <= LOCAL_CONTEXT_POINT_CAP);
+        assert_eq!(shuffled.first().unwrap().at_unix_seconds, BASE);
     }
 }

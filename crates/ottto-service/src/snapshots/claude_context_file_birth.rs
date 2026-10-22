@@ -252,13 +252,9 @@ pub(super) fn apply_own_context_scalars(
     // (an untimed one counts as own there too), minus id-less responses,
     // which carry no occurrence. Moved out for the call, never cloned.
     let occurrences = std::mem::take(&mut item.claude_usage_occurrences);
-    let id_less = set_claude_compaction_scalars(
-        item,
-        &owned,
-        occurrences
-            .values()
-            .filter(|occurrence| birth.copied(occurrence.timestamp.as_deref()) != Some(true)),
-    );
+    let id_less = set_claude_compaction_scalars(item, &owned, occurrences.values(), |occurrence| {
+        birth.copied(occurrence.timestamp.as_deref()) != Some(true)
+    });
     item.claude_usage_occurrences = occurrences;
     counts.id_less_response_before_compaction_count = counts
         .id_less_response_before_compaction_count

@@ -24,8 +24,8 @@ use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
-    paired_claude_legacy_compactions, ClaudeCompactionKind, ClaudeCompactionObservation,
-    ClaudeTranscriptUsageOccurrence, MAX_COMPACTION_TIMESTAMPS,
+    ClaudeCompactionKind, ClaudeCompactionObservation, ClaudeTranscriptUsageOccurrence,
+    MAX_COMPACTION_TIMESTAMPS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -47,19 +47,15 @@ crate::heap_layout_bound::fields!(SnapshotCompactionEvent; at, before, after, tr
 /// events' `at` values: sorted by `at`, one event per distinct `at` (the first
 /// in parse order wins), newest `MAX_COMPACTION_TIMESTAMPS` kept.
 pub(crate) fn bounded_compaction_events(
-    events: Vec<SnapshotCompactionEvent>,
+    mut events: Vec<SnapshotCompactionEvent>,
 ) -> Vec<SnapshotCompactionEvent> {
-    bounded_by_at(events, |event| &event.at)
-}
-
-fn bounded_by_at<T>(mut entries: Vec<T>, at: impl Fn(&T) -> &str) -> Vec<T> {
     // Stable sort, so equal timestamps keep parse order for the dedup below.
-    entries.sort_by(|left, right| at(left).cmp(at(right)));
-    entries.dedup_by(|later, earlier| at(later) == at(earlier));
-    if entries.len() > MAX_COMPACTION_TIMESTAMPS {
-        entries.split_off(entries.len() - MAX_COMPACTION_TIMESTAMPS)
+    events.sort_by(|left, right| left.at.cmp(&right.at));
+    events.dedup_by(|later, earlier| later.at == earlier.at);
+    if events.len() > MAX_COMPACTION_TIMESTAMPS {
+        events.split_off(events.len() - MAX_COMPACTION_TIMESTAMPS)
     } else {
-        entries
+        events
     }
 }
 
@@ -122,28 +118,31 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeCompactionTrigger {
 ///   come from a later request (usually larger). NULL until seen. Exactly:
 ///   the owned non-zero request with the smallest sequence at or above it.
 ///
-/// One pass over the requests, memory bounded by the (at most 64) events, and
-/// no work at all for an item without an owned boundary. Called only by the
+/// `paired` is `paired_claude_legacy_compactions(owned_observations)`, the
+/// set the summary already built, so the fold pairs once. One pass over the
+/// observations and one over the requests; everything this builds is bounded
+/// by the (at most 64) events, never by the marker or request count, and an
+/// item without an owned boundary does no request work. Called only by the
 /// fold's posture writers through `set_claude_compaction_scalars`, never by
 /// `finish()`. Also returns how many of these events sit next to an id-less
 /// response (local counters only).
 pub(super) fn claude_compaction_events<'a>(
     owned_observations: &[ClaudeCompactionObservation],
+    paired: &BTreeSet<usize>,
     own_requests: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
 ) -> (Vec<SnapshotCompactionEvent>, ClaudeIdLessNeighbours) {
-    let paired = paired_claude_legacy_compactions(owned_observations);
-    let candidates = owned_observations
-        .iter()
-        .enumerate()
-        .filter(|(index, observation)| {
-            observation.kind == ClaudeCompactionKind::CurrentBoundary || !paired.contains(index)
-        })
-        .filter_map(|(_, observation)| Some((observation.timestamp.as_deref()?, observation)))
-        .collect::<Vec<_>>();
+    let mut candidates = NewestDistinctAt::default();
+    for (index, observation) in owned_observations.iter().enumerate() {
+        if observation.kind == ClaudeCompactionKind::CurrentBoundary || !paired.contains(&index) {
+            if let Some(at) = observation.timestamp.as_deref() {
+                candidates.note(at, observation);
+            }
+        }
+    }
+    let candidates = candidates.entries;
     if candidates.is_empty() {
         return (Vec::new(), ClaudeIdLessNeighbours::default());
     }
-    let candidates = bounded_by_at(candidates, |(at, _)| at);
     let mut id_less = ClaudeIdLessNeighbours::default();
     for (_, observation) in &candidates {
         id_less.before += u64::from(observation.id_less_before);
@@ -152,12 +151,14 @@ pub(super) fn claude_compaction_events<'a>(
 
     // Cut points between requests, ascending. Gap `g` holds the requests with
     // `cuts[g - 1] <= sequence < cuts[g]`; gap 0 is before the first cut.
-    let cuts = candidates
+    let mut cuts = candidates
         .iter()
         .map(|(_, observation)| observation.response_count_before)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect::<Vec<_>>();
+    cuts.sort_unstable();
+    cuts.dedup();
+    debug_assert!(candidates.len() <= MAX_COMPACTION_TIMESTAMPS);
+    debug_assert!(cuts.len() <= MAX_COMPACTION_TIMESTAMPS);
     let mut gaps = vec![ClaudeRequestGap::default(); cuts.len() + 1];
     for request in own_requests {
         if request.effective_input_context == 0 {
@@ -221,6 +222,47 @@ pub(super) fn claude_compaction_events<'a>(
 pub(super) struct ClaudeIdLessNeighbours {
     pub(super) before: u64,
     pub(super) after: u64,
+}
+
+/// The newest `MAX_COMPACTION_TIMESTAMPS` distinct `at` values seen so far,
+/// sorted by the string order of `bounded_compaction_timestamps`, each with
+/// the first entry in input order that carried it. Equal to collecting every
+/// entry, stable-sorting by `at`, deduplicating and keeping the newest 64,
+/// but length and capacity never pass 64: once full, the cutoff (the oldest
+/// kept `at`) only rises, so a rejected or evicted `at` can never come back
+/// and a kept one has been kept since its first entry. The 5a Codex sizes use
+/// the same rule.
+#[derive(Debug)]
+struct NewestDistinctAt<'a, T> {
+    entries: Vec<(&'a str, T)>,
+}
+
+impl<T> Default for NewestDistinctAt<'_, T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<'a, T> NewestDistinctAt<'a, T> {
+    fn note(&mut self, at: &'a str, value: T) {
+        let Err(mut index) = self.entries.binary_search_by(|(kept, _)| (*kept).cmp(at)) else {
+            return;
+        };
+        if self.entries.len() == MAX_COMPACTION_TIMESTAMPS {
+            if index == 0 {
+                return;
+            }
+            self.entries.remove(0);
+            index -= 1;
+        }
+        if self.entries.len() == self.entries.capacity() {
+            let target = (self.entries.capacity() * 2).clamp(4, MAX_COMPACTION_TIMESTAMPS);
+            self.entries.reserve_exact(target - self.entries.len());
+        }
+        self.entries.insert(index, (at, value));
+    }
 }
 
 /// The owned requests of one gap between compactions that the sizes need:
@@ -342,10 +384,272 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexCompactionSizes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshots::bounded_compaction_timestamps;
+    use crate::snapshots::{
+        bounded_compaction_timestamps, claude_compaction_summary,
+        local_context_points::{LocalContextPoints, LOCAL_CONTEXT_POINT_ORDER_WINDOW},
+        paired_claude_legacy_compactions,
+    };
+    use std::collections::BTreeMap;
 
     fn at(index: usize) -> String {
         format!("2026-10-21T10:{:02}:{:02}Z", index / 60, index % 60)
+    }
+
+    /// Round 2's `claude_compaction_events`, kept as the oracle: collect every
+    /// candidate, stable-sort by `at`, dedup (first in parse order wins), keep
+    /// the newest 64, then the same gap walk.
+    fn round_two_claude_compaction_events<'a>(
+        owned_observations: &[ClaudeCompactionObservation],
+        own_requests: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
+    ) -> (Vec<SnapshotCompactionEvent>, ClaudeIdLessNeighbours) {
+        let paired = paired_claude_legacy_compactions(owned_observations);
+        let mut candidates = owned_observations
+            .iter()
+            .enumerate()
+            .filter(|(index, observation)| {
+                observation.kind == ClaudeCompactionKind::CurrentBoundary || !paired.contains(index)
+            })
+            .filter_map(|(_, observation)| Some((observation.timestamp.as_deref()?, observation)))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return (Vec::new(), ClaudeIdLessNeighbours::default());
+        }
+        candidates.sort_by(|left, right| left.0.cmp(right.0));
+        candidates.dedup_by(|later, earlier| later.0 == earlier.0);
+        if candidates.len() > MAX_COMPACTION_TIMESTAMPS {
+            candidates = candidates.split_off(candidates.len() - MAX_COMPACTION_TIMESTAMPS);
+        }
+        let mut id_less = ClaudeIdLessNeighbours::default();
+        for (_, observation) in &candidates {
+            id_less.before += u64::from(observation.id_less_before);
+            id_less.after += u64::from(observation.id_less_after);
+        }
+        let cuts = candidates
+            .iter()
+            .map(|(_, observation)| observation.response_count_before)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut gaps = vec![ClaudeRequestGap::default(); cuts.len() + 1];
+        for request in own_requests {
+            if request.effective_input_context == 0 {
+                continue;
+            }
+            let gap = &mut gaps[cuts.partition_point(|cut| *cut <= request.sequence)];
+            if !matches!(gap.last, Some((sequence, ..)) if sequence >= request.sequence) {
+                gap.last = Some((
+                    request.sequence,
+                    request.effective_input_context,
+                    request.timestamp.as_deref(),
+                ));
+            }
+            if !matches!(gap.first, Some((sequence, _)) if sequence <= request.sequence) {
+                gap.first = Some((request.sequence, request.effective_input_context));
+            }
+        }
+        let mut before = Vec::new();
+        let mut latest = None;
+        for gap in &gaps[..cuts.len()] {
+            latest = gap.last.or(latest);
+            before.push(latest);
+        }
+        let mut after = vec![None; cuts.len()];
+        let mut earliest = None;
+        for (index, gap) in gaps.iter().enumerate().skip(1).rev() {
+            earliest = gap.first.or(earliest);
+            after[index - 1] = earliest;
+        }
+        let events = candidates
+            .into_iter()
+            .map(|(at, observation)| {
+                let cut = cuts.partition_point(|cut| *cut < observation.response_count_before);
+                let before = before[cut];
+                let trigger = match observation.trigger {
+                    Some(ClaudeCompactionTrigger::Auto)
+                        if idle_gap(before.and_then(|(_, _, timestamp)| timestamp), at) =>
+                    {
+                        Some(ClaudeCompactionTrigger::Idle)
+                    }
+                    trigger => trigger,
+                };
+                SnapshotCompactionEvent {
+                    at: at.to_string(),
+                    before: before.map(|(_, context, _)| context),
+                    after: after[cut].map(|(_, context)| context),
+                    trigger: trigger.map(|trigger| trigger.wire().to_string()),
+                }
+            })
+            .collect();
+        (events, id_less)
+    }
+
+    fn claude_at(seconds: i64) -> String {
+        OffsetDateTime::from_unix_timestamp(1_792_576_800 + seconds)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap()
+    }
+
+    #[test]
+    fn claude_streaming_selection_matches_round_two_on_a_long_stream() {
+        // 5,000 owned markers in parse order: boundaries at out-of-order
+        // times with many duplicates (2,003 distinct values), legacy
+        // summaries paired by link, by time, or left as their own event, and
+        // some without a timestamp. 20,000 requests in a request-id map, so
+        // map order is not request order: every 5th is copied (not own),
+        // every 11th has size zero, every 13th is id-less (absent), and a
+        // few have no usable timestamp.
+        let mut observations = Vec::new();
+        for index in 0..5_000_u64 {
+            let at = (index % 97 != 0).then(|| claude_at((index * 7_919 % 2_003) as i64 * 15));
+            let boundary = ClaudeCompactionObservation {
+                kind: ClaudeCompactionKind::CurrentBoundary,
+                timestamp: at.clone(),
+                pre_tokens: Some(100_000 + index),
+                post_tokens: None,
+                cumulative_dropped_tokens: None,
+                duration_ms: None,
+                response_count_before: index * 4,
+                pair_key: Some(index),
+                has_parent_link: true,
+                trigger: [
+                    Some(ClaudeCompactionTrigger::Auto),
+                    Some(ClaudeCompactionTrigger::Manual),
+                    Some(ClaudeCompactionTrigger::Idle),
+                    None,
+                ][(index % 4) as usize],
+                id_less_before: index % 6 == 0,
+                id_less_after: index % 10 == 0,
+            };
+            observations.push(boundary.clone());
+            if index % 9 == 0 {
+                // Linked legacy summary (paired away), or every 27th an
+                // unlinked one 1 s later (paired by time), or every 45th one
+                // with a foreign parent (its own event).
+                let mut legacy = boundary;
+                legacy.kind = ClaudeCompactionKind::LegacySummary;
+                legacy.trigger = None;
+                if index % 45 == 0 {
+                    legacy.pair_key = None;
+                    legacy.timestamp = Some(claude_at(40_000 + index as i64));
+                } else if index % 27 == 0 {
+                    legacy.pair_key = None;
+                    legacy.has_parent_link = false;
+                    legacy.timestamp =
+                        at.map(|_| claude_at((index * 7_919 % 2_003) as i64 * 15 + 1));
+                }
+                observations.push(legacy);
+            }
+        }
+        let observations = observations.into_iter().take(5_000).collect::<Vec<_>>();
+        let mut occurrences = BTreeMap::new();
+        for sequence in 0..20_000_u64 {
+            if sequence % 13 == 0 {
+                continue;
+            }
+            let timestamp = (sequence % 1_009 != 0).then(|| claude_at(sequence as i64 * 3 / 2));
+            occurrences.insert(
+                format!(
+                    "req_{:08x}",
+                    sequence.wrapping_mul(2_654_435_761) % (1 << 32)
+                ),
+                ClaudeTranscriptUsageOccurrence {
+                    sequence,
+                    usage: Default::default(),
+                    model: None,
+                    selector: Default::default(),
+                    reasoning_effort: None,
+                    timestamp,
+                    event_clock_complete: true,
+                    effective_input_context: if sequence % 11 == 0 {
+                        0
+                    } else {
+                        10_000 + sequence * 7 % 190_000
+                    },
+                },
+            );
+        }
+        fn is_own(occurrence: &ClaudeTranscriptUsageOccurrence) -> bool {
+            occurrence.sequence % 5 != 0
+        }
+        assert!(occurrences
+            .values()
+            .zip(occurrences.values().skip(1))
+            .any(|(left, right)| left.sequence > right.sequence));
+
+        // The streaming selection never holds more than 64 entries.
+        let paired = paired_claude_legacy_compactions(&observations);
+        let mut selection = NewestDistinctAt::default();
+        for (index, observation) in observations.iter().enumerate() {
+            if observation.kind == ClaudeCompactionKind::CurrentBoundary || !paired.contains(&index)
+            {
+                if let Some(at) = observation.timestamp.as_deref() {
+                    selection.note(at, index);
+                    assert!(selection.entries.len() <= MAX_COMPACTION_TIMESTAMPS);
+                    assert!(selection.entries.capacity() <= MAX_COMPACTION_TIMESTAMPS);
+                }
+            }
+        }
+        assert_eq!(selection.entries.len(), MAX_COMPACTION_TIMESTAMPS);
+
+        let own = || occurrences.values().filter(|occurrence| is_own(occurrence));
+        let streamed = claude_compaction_events(&observations, &paired, own());
+        let oracle = round_two_claude_compaction_events(&observations, own());
+        assert_eq!(streamed, oracle);
+        let (events, _) = &streamed;
+        assert_eq!(events.len(), MAX_COMPACTION_TIMESTAMPS);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.at.clone())
+                .collect::<Vec<_>>(),
+            claude_compaction_summary(&observations).1
+        );
+        assert!(events.iter().any(|event| event.before.is_some()));
+        assert!(events.iter().any(|event| event.after.is_some()));
+        assert!(events.iter().any(|event| event.trigger.is_none()));
+
+        // Points: round 2 collected the own requests, sorted them by
+        // sequence and pushed them in that order, which is exactly the
+        // in-order path (a plain push loop, checked against `push` in
+        // `local_context_points`). The map is not in request order, so the
+        // bounded path runs several windows.
+        assert!(occurrences.len() > 4 * LOCAL_CONTEXT_POINT_ORDER_WINDOW);
+        let mut ordered = own().collect::<Vec<_>>();
+        ordered.sort_by_key(|occurrence| occurrence.sequence);
+        let round_two = LocalContextPoints::from_requests_by_sequence(
+            ordered.iter().copied(),
+            |occurrence| occurrence.sequence,
+            |occurrence| {
+                Some((
+                    occurrence.timestamp.as_deref(),
+                    occurrence.effective_input_context,
+                ))
+            },
+        );
+        fn point(occurrence: &ClaudeTranscriptUsageOccurrence) -> Option<(Option<&str>, u64)> {
+            is_own(occurrence).then_some((
+                occurrence.timestamp.as_deref(),
+                occurrence.effective_input_context,
+            ))
+        }
+        let from_map = LocalContextPoints::from_requests_by_sequence(
+            occurrences.values(),
+            |occurrence| occurrence.sequence,
+            point,
+        );
+        assert!(!from_map.is_empty());
+        assert!(from_map.len() <= 64);
+        assert_eq!(from_map, round_two);
+        // The strict fold passes a slice already in sequence order.
+        let mut sorted = occurrences.values().cloned().collect::<Vec<_>>();
+        sorted.sort_by_key(|occurrence| occurrence.sequence);
+        let from_slice = LocalContextPoints::from_requests_by_sequence(
+            sorted.iter(),
+            |occurrence| occurrence.sequence,
+            point,
+        );
+        assert_eq!(from_slice, round_two);
     }
 
     #[test]
