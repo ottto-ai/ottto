@@ -157,12 +157,12 @@ pub(super) struct ClaudeLine<'a> {
     pub(super) ts: Raw<'a>,
     #[serde(borrow)]
     pub(super) uuid: Raw<'a>,
+    #[serde(rename = "parentUuid", borrow)]
+    pub(super) parent_uuid: Raw<'a>,
     #[serde(rename = "sessionId", borrow)]
     pub(super) session_id: Raw<'a>,
     #[serde(rename = "isSidechain", borrow)]
     pub(super) is_sidechain: Raw<'a>,
-    #[serde(rename = "agentId", borrow)]
-    pub(super) agent_id: Raw<'a>,
     #[serde(rename = "isCompactSummary", borrow)]
     pub(super) is_compact_summary: Raw<'a>,
     #[serde(borrow)]

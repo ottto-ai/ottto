@@ -262,8 +262,11 @@ impl LiveRetryOwner {
             // Fresh local credentials are scoped to this one turn. The page
             // owns only the hashed destination and account fence.
             let (device, secret) = load_snapshot_device_credentials()?;
-            let client =
-                SnapshotApiClient::new(snapshot_api_base_url()).with_receipt_state_dir(support);
+            let client = SnapshotApiClient::new(snapshot_api_base_url())
+                .with_receipt_state_dir(support)
+                .with_receipt_destination_namespace(snapshot_upload_destination_namespace(
+                    &device, &secret,
+                ));
             let source = page.source();
             let authority = page.authority();
             let live = page.take_live_authority()?;
