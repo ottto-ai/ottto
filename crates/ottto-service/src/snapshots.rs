@@ -56,6 +56,9 @@ mod codex_usage_occurrence;
 mod context_curve;
 mod session_start;
 pub(crate) use session_start::OpeningFileCandidate;
+// For the composition reader, which is wired separately.
+#[allow(unused_imports)]
+pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
 #[cfg(test)]
