@@ -14162,7 +14162,7 @@ impl SnapshotAccumulator {
             return Vec::new();
         };
         let source_session_id = if self.source == SnapshotSource::Codex {
-            resolve_codex_identity(source_session_id.as_str())
+            snapshot_source_session_id(self.source, path, source_session_id)
         } else {
             source_session_id
         };
@@ -14236,9 +14236,10 @@ impl SnapshotAccumulator {
         let claude_subagent = (self.source == SnapshotSource::ClaudeCode)
             .then(|| claude_subagent_identity(path))
             .flatten();
-        let source_session_id = match claude_subagent.as_ref() {
-            Some(identity) => identity.source_session_id(),
-            None => source_session_id,
+        let source_session_id = if self.source == SnapshotSource::ClaudeCode {
+            snapshot_source_session_id(self.source, path, source_session_id)
+        } else {
+            source_session_id
         };
         // Subagent tree position, read from the provider's own sidecar. Absent
         // or malformed metadata simply leaves the derived facts absent.
@@ -33088,6 +33089,28 @@ pub(crate) fn claude_subagent_identity(path: &Path) -> Option<ClaudeSubagentIden
         workflow_ref,
     })
 }
+
+/// Resolve the source session id used on the snapshot wire from the first
+/// in-file id. Claude subagents take their parent from the path; Codex UUIDs
+/// use the same case normalization as snapshot identity comparisons.
+/// Callers must exclude Claude workflow journals before resolving an id.
+pub(crate) fn snapshot_source_session_id(
+    source: SnapshotSource,
+    path: &Path,
+    first_id: String,
+) -> String {
+    match source {
+        SnapshotSource::ClaudeCode => claude_subagent_identity(path)
+            .map(|identity| identity.source_session_id())
+            .unwrap_or(first_id),
+        SnapshotSource::Codex => resolve_codex_identity(&first_id),
+        _ => first_id,
+    }
+}
+
+#[cfg(test)]
+#[path = "snapshots/source_session_id_tests.rs"]
+mod source_session_id_tests;
 
 /// Convenience wrapper: the re-keyed `source_session_id` for a subagent
 /// transcript, or `None` for an ordinary top-level transcript. The production
