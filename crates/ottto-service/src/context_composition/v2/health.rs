@@ -38,6 +38,9 @@ fn health_path(state_dir: &Path) -> PathBuf {
 pub(super) struct HealthRecord {
     pub(super) schema: u32,
     pub(super) run_day: Day,
+    /// Device, machine and server the run uploaded to: the record is sent
+    /// only there.
+    pub(super) destination: String,
     /// Set before the first post: a run's health is sent at most once.
     pub(super) posted: bool,
     pub(super) entries: Vec<HealthEntry>,
@@ -117,12 +120,13 @@ pub(super) struct HealthLog {
 
 impl HealthLog {
     /// Start today's record (replacing the previous run's).
-    pub(super) fn begin(state_dir: &Path, run_day: Day) -> Self {
+    pub(super) fn begin(state_dir: &Path, run_day: Day, destination: &str) -> Self {
         let log = Self {
             path: health_path(state_dir),
             record: HealthRecord {
                 schema: STATE_SCHEMA,
                 run_day,
+                destination: destination.to_string(),
                 posted: false,
                 entries: Vec::new(),
             },
@@ -224,14 +228,24 @@ pub(super) struct PostCounts {
     pub(super) failed: u64,
 }
 
-/// Post each agent's entry once. A failure is logged once and counted.
+/// Post each agent's entry once, to the destination its run uploaded to
+/// (`destination`, `machine_id`: the current device's). A failure is logged
+/// once and counted.
 pub(super) fn send(
     record: &HealthRecord,
+    destination: &str,
     machine_id: &str,
     worker: WorkerCounts,
     poster: &mut dyn HealthPoster,
 ) -> PostCounts {
     let mut counts = PostCounts::default();
+    if record.destination != destination {
+        // The device, machine or server changed since the run: its counts
+        // belong to the old one and are dropped.
+        eprintln!("context composition run health not sent: destination changed since the run");
+        counts.failed = record.entries.len() as u64;
+        return counts;
+    }
     for entry in &record.entries {
         let result = body(entry, record.run_day, machine_id, worker)
             .ok_or_else(|| anyhow::anyhow!("run health out of range"))

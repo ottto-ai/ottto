@@ -149,8 +149,8 @@ fn post_run_health(worker: WorkerCounts) -> PostCounts {
             };
         }
     };
-    let machine_id = poster.machine_id.clone();
-    super::health::send(&record, &machine_id, worker, &mut poster)
+    let (destination, machine_id) = (poster.destination.clone(), poster.machine_id.clone());
+    super::health::send(&record, &destination, &machine_id, worker, &mut poster)
 }
 
 /// Posts with the composition upload's credentials: a relay token per agent.
@@ -159,6 +159,7 @@ struct ClientHealthPoster {
     device: ottto_core::LocalDeviceBinding,
     device_secret: String,
     machine_id: String,
+    destination: String,
 }
 
 impl ClientHealthPoster {
@@ -167,8 +168,10 @@ impl ClientHealthPoster {
         let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
             return Err(anyhow!("machine identity is missing"));
         };
+        let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
         Ok(Self {
-            client: SnapshotApiClient::new(crate::snapshot_sync::snapshot_api_base_url()),
+            client: SnapshotApiClient::new(api_base_url.clone()),
+            destination: destination_identity(&device, &machine_id, &api_base_url),
             device,
             device_secret,
             machine_id,
@@ -469,7 +472,7 @@ fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
         ),
     };
     let today = day_of(now.date());
-    let mut health = HealthLog::begin(&dir, today);
+    let mut health = HealthLog::begin(&dir, today, &destination);
     for (snapshot_source, source) in source_order(today) {
         if !enabled.contains(&snapshot_source) || Instant::now() >= run.deadline {
             continue;
@@ -1610,13 +1613,15 @@ fn run_source_inner(
     }
     stats.name_lookups_skipped = names.skipped();
     tidy_index(&mut index, today);
-    for pin in index
+    for (key, pin) in index
         .files
-        .values()
-        .filter(|pin| pin.waiting && !pin.done && !pin.quarantined)
+        .iter()
+        .filter(|(_, pin)| pin.waiting && !pin.done && !pin.quarantined)
     {
+        // Its size now (a waiting file is always found by the walk); the
+        // pin keeps the size of its last commit.
         stats.full_read_waiting_files += 1;
-        stats.full_read_backlog_bytes += pin.size;
+        stats.full_read_backlog_bytes += present.get(key).map_or(pin.size, |file| file.size);
     }
 
     if let Some(target) = target.as_mut() {
@@ -2356,8 +2361,8 @@ fn read_file(
         }
     };
     out.sink.session_start(&state.session, state.min_ts);
-    if request1_open && end.offset > checkpoint.offset && state.request1_start_measured.is_none() {
-        state.request1_start_measured = Some(state.start_measured);
+    if request1_open && end.offset > checkpoint.offset {
+        state.note_request1_verdict(state.start_measured);
     }
     #[cfg(test)]
     if tests::fail_read(&item.found.path) {
@@ -2377,18 +2382,31 @@ fn read_file(
     if mode == Mode::Forward {
         tests::skew(&item.found.path, &mut contribution, &mut delta);
     }
+    #[cfg(test)]
+    let end = tests::cut_audit(&item.found.path, end);
     if let Some((_, audited_end)) = audit {
         stats.bytes_audit += end.bytes;
         stats.audit_files += 1;
+        if end.cut {
+            // Stopped by the wall cap: an incomplete re-read proves nothing,
+            // and the stored checkpoint stays as it was.
+            stats.cut = true;
+            stats.audit_failed += 1;
+            return Ok(None);
+        }
         let undated = stats.lines.undated > undated_before;
-        if end.offset == audited_end
-            && !super::audit::differs(old_share.as_ref(), &contribution, undated)
-        {
+        let same_end = end.offset == audited_end;
+        if same_end && !super::audit::differs(old_share.as_ref(), &contribution, undated) {
             // Same numbers: the stored checkpoint stays as it was.
             return Ok(None);
         }
-        // Use the re-read's result for this file (as a full read would).
         stats.audit_differences += 1;
+        if !same_end {
+            // The re-read did not end where the checkpoint did, so it does
+            // not cover the same bytes: counted, but it cannot replace them.
+            return Ok(None);
+        }
+        // Use the re-read's result for this file (as a full read would).
     }
     // The read succeeded: only now does it change the scope's totals.
     if let Some(old) = old_share {
@@ -2525,6 +2543,22 @@ pub(super) mod tests {
         static CRASH_AFTER: Cell<Option<u64>> = const { Cell::new(None) };
         static GROW: RefCell<Option<(PathBuf, Vec<u8>)>> = const { RefCell::new(None) };
         static SKEW: RefCell<Option<(PathBuf, u64)>> = const { RefCell::new(None) };
+        static CUT_AUDIT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Simulate the wall cap stopping a read of `path` (meant for audits).
+    pub(in super::super) fn set_cut_audit(path: Option<&Path>) {
+        CUT_AUDIT.with(|cell| *cell.borrow_mut() = path.map(Path::to_path_buf));
+    }
+
+    pub(super) fn cut_audit(
+        path: &Path,
+        mut end: super::super::file::ReadEnd,
+    ) -> super::super::file::ReadEnd {
+        if CUT_AUDIT.with(|cell| cell.borrow().as_deref() == Some(path)) {
+            end.cut = true;
+        }
+        end
     }
 
     /// Simulate a reader fault: a forward read of `path` counts `tokens`

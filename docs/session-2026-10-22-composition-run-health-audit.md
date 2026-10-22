@@ -22,11 +22,13 @@ The body holds exactly the server's fields: `agent_source`, `machine_id`,
 `checkpoint_restarts`, `worker_timeouts` and `worker_failures`. Each count is
 held within the server's bounds. CPU is the reading thread's own CPU time;
 memory is the reader's accounted bytes. The full-read waiting files and bytes
-come from the pins still waiting at the end of the run, and the backlog growth
+come from the pins still waiting at the end of the run, at their current sizes, and the backlog growth
 days count consecutive daily runs in which those bytes grew (kept in
 `run.json`).
 
-The record is marked sent before the first request. A refused or failed post is
+The record names the device, machine and server the run uploaded to; if they
+changed before the post, the record is dropped unsent. The record is marked
+sent before the first request. A refused or failed post is
 logged once and counted in the daemon's metrics line, and is never retried
 within the day; the next daily run reports again. A record older than yesterday
 is dropped rather than sent late.
@@ -37,14 +39,18 @@ Each daily run may re-read up to 100 MB (and at most 32 files) of transcripts
 that were already counted. A file is eligible only when it was counted from its
 first byte under the current parser, is not cold, holds only known ids, is not
 otherwise read in this run and has not changed since its last commit. Request 1
-records the session-start verdict its lines were counted under, so a later
-verdict change is not mistaken for a counting fault.
+records the session-start verdict its reads ran under, so a later verdict change
+is not mistaken for a counting fault; a request 1 read under two different
+verdicts is never sampled.
 
 The re-read covers exactly the bytes the checkpoint counted and compares events,
 tokens, residency and images per (day, kind) with the file's stored share.
 Lines without a timestamp count on the day they are read, so when the re-read
 meets any, the comparison is per kind over all days. A match changes nothing
-and commits nothing. A difference replaces the file's share and checkpoint with
+and commits nothing. A re-read stopped by the run's wall cap proves nothing and
+also changes nothing (counted as an audit failure). A re-read that ends at a
+different offset is counted as a difference but cannot replace bytes it did not
+cover. A difference replaces the file's share and checkpoint with
 the re-read's result, as a budgeted full read would, and counts it in
 `audit_differences`. No other file is read because of it. Picks rotate through
 the pins in key order from where the previous audit stopped, kept in

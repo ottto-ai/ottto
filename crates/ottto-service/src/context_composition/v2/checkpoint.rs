@@ -568,14 +568,26 @@ pub(super) struct ParseState {
     pub(super) request1_closed: bool,
     /// Latest final snapshot verdict, refreshed without reading transcripts.
     pub(super) start_measured: bool,
-    /// The verdict request 1's lines were first counted under, so an audit
-    /// re-read counts them the same way after the verdict changed.
+    /// The verdict reads while request 1 was open ran under, so an audit
+    /// re-read counts its lines the same way after the verdict changed.
     pub(super) request1_start_measured: Option<bool>,
+    /// Those reads ran under different verdicts: no re-read can match.
+    pub(super) request1_verdict_mixed: bool,
     pub(super) compactions: crate::snapshots::CompositionCompactions,
     pub(super) cwd: Option<Box<str>>,
 }
 
 impl ParseState {
+    /// Note the verdict a read that advanced while request 1 was open ran
+    /// under.
+    pub(super) fn note_request1_verdict(&mut self, measured: bool) {
+        match self.request1_start_measured {
+            None => self.request1_start_measured = Some(measured),
+            Some(earlier) if earlier != measured => self.request1_verdict_mixed = true,
+            Some(_) => {}
+        }
+    }
+
     pub(super) fn add_open(&mut self, day: Day, slot: &Slot, tokens: u64) {
         if tokens == 0 {
             return;
@@ -671,6 +683,8 @@ pub(super) struct StoredParse {
     request1_closed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     request1_start_measured: Option<bool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    request1_verdict_mixed: bool,
     #[serde(skip_serializing_if = "crate::snapshots::CompositionCompactions::is_empty")]
     compactions: crate::snapshots::CompositionCompactions,
     cwd: Option<String>,
@@ -691,10 +705,12 @@ impl StoredParse {
     }
 
     /// The start verdict request 1 was counted under, once request 1 has
-    /// closed (`None` while it is open or when unknown).
+    /// closed (`None` while it is open, when unknown or when its reads ran
+    /// under different verdicts).
     pub(super) fn request1_verdict(&self) -> Option<bool> {
         let closed = self.request1_closed || self.last_assistant.is_some() || self.call_seq > 0;
-        self.request1_start_measured.filter(|_| closed)
+        self.request1_start_measured
+            .filter(|_| closed && !self.request1_verdict_mixed)
     }
 
     fn ids_known(&self) -> bool {
@@ -803,6 +819,7 @@ impl StoredParse {
             has_rendered: state.has_rendered,
             request1_closed: state.request1_closed,
             request1_start_measured: state.request1_start_measured,
+            request1_verdict_mixed: state.request1_verdict_mixed,
             compactions: state.compactions.clone(),
             cwd: state.cwd.as_deref().map(str::to_string),
         }
@@ -875,6 +892,7 @@ impl StoredParse {
             request1_closed,
             start_measured: false,
             request1_start_measured: self.request1_start_measured,
+            request1_verdict_mixed: self.request1_verdict_mixed,
             compactions: self.compactions,
             cwd: self.cwd.map(Into::into),
         })

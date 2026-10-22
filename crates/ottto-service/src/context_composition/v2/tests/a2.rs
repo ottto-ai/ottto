@@ -2,7 +2,7 @@
 
 use super::super::audit::{self, AuditRun};
 use super::super::checkpoint::Backlog;
-use super::super::harvest::tests::set_skew_forward;
+use super::super::harvest::tests::{set_cut_audit, set_skew_forward};
 use super::super::health::{self, HealthEntry, HealthLog, HealthPoster, PostCounts, WorkerCounts};
 use super::*;
 use crate::composition_kinds::Part;
@@ -447,7 +447,7 @@ fn health_posts_once_per_agent_and_never_retries_within_the_day() {
     let dir = scratch("composition-a2-health-once");
     let day = day_of(base_now().date());
     let completed = base_now();
-    let mut log = HealthLog::begin(&dir, day);
+    let mut log = HealthLog::begin(&dir, day, "device|machine|api");
     log.set(HealthEntry::started("claude-code", completed));
     log.set(HealthEntry::finished(
         "claude-code",
@@ -470,6 +470,7 @@ fn health_posts_once_per_agent_and_never_retries_within_the_day() {
     let record = health::take_pending(&dir, day).unwrap();
     let counts = health::send(
         &record,
+        "device|machine|api",
         "machine-test",
         WorkerCounts::default(),
         &mut poster,
@@ -481,7 +482,7 @@ fn health_posts_once_per_agent_and_never_retries_within_the_day() {
     assert!(health::take_pending(&dir, day + 1).is_none());
 
     // The next daily run reports again.
-    let mut log = HealthLog::begin(&dir, day + 1);
+    let mut log = HealthLog::begin(&dir, day + 1, "device|machine|api");
     log.set(HealthEntry::finished(
         "codex",
         &SourceStats::default(),
@@ -500,7 +501,7 @@ fn health_carries_worker_counters_even_for_a_killed_run() {
     let dir = scratch("composition-a2-health-killed");
     let day = day_of(base_now().date());
     let started = base_now();
-    let mut log = HealthLog::begin(&dir, day);
+    let mut log = HealthLog::begin(&dir, day, "device|machine|api");
     log.set(HealthEntry::finished(
         "claude-code",
         &sample_stats(),
@@ -515,7 +516,13 @@ fn health_carries_worker_counters_even_for_a_killed_run() {
         timeouts: 1,
         failures: 0,
     };
-    let counts = health::send(&record, "machine-test", worker, &mut poster);
+    let counts = health::send(
+        &record,
+        "device|machine|api",
+        "machine-test",
+        worker,
+        &mut poster,
+    );
     assert_eq!(counts.sent, 2);
     for (agent, body) in &poster.calls {
         assert_eq!(body["worker_timeouts"], 1, "{agent}");
@@ -666,4 +673,128 @@ fn run_health_client_sends_one_request_for_a_refusal() {
         assert!(error.to_string().contains(&status.to_string()), "{error}");
         assert_eq!(server.join().unwrap(), 1, "HTTP {status}: no retry");
     }
+}
+
+#[test]
+fn an_audit_cut_by_the_wall_cap_keeps_the_stored_share() {
+    let env = Env::new("composition-a2-audit-cut");
+    let now = base_now();
+    let path = whole_file(&env, "a", now);
+    env.run(Source::Claude, now, None);
+    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
+    set_skew_forward(Some(&path), 1000);
+    env.run(Source::Claude, now + time::Duration::hours(1), None);
+    set_skew_forward(None, 0);
+    let before = env.scope(Source::Claude);
+
+    // The re-read would differ, but it was cut: nothing is replaced.
+    set_cut_audit(Some(&path));
+    let mut audit = full_budget();
+    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
+    set_cut_audit(None);
+    assert_eq!((stats.audit_files, stats.audit_failed), (1, 1));
+    assert_eq!(stats.audit_differences, 0);
+    assert!(stats.cut);
+    assert_eq!(stats.scopes_committed, 0);
+    let after = env.scope(Source::Claude);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.agg.days, before.agg.days);
+    let checkpoint = |scope: &super::super::scope::Scope| {
+        let checkpoint = scope.files.values().next().unwrap();
+        (checkpoint.offset, total_share(checkpoint))
+    };
+    assert_eq!(checkpoint(&after), checkpoint(&before));
+    env.cleanup();
+}
+
+fn total_share(checkpoint: &Checkpoint) -> u64 {
+    checkpoint
+        .contribution
+        .clone()
+        .into_share()
+        .unwrap()
+        .parts
+        .values()
+        .map(|bucket| bucket.tokens)
+        .sum()
+}
+
+#[test]
+fn request_one_read_under_two_verdicts_is_never_audited() {
+    let mut state = ParseState {
+        session: "s".into(),
+        ..Default::default()
+    };
+    // A first read saw only the session header under one verdict; a later
+    // read counted request 1 under another.
+    state.note_request1_verdict(false);
+    state.note_request1_verdict(false);
+    state.request1_closed = true;
+    assert_eq!(
+        StoredParse::from_state(&state).request1_verdict(),
+        Some(false)
+    );
+    state.note_request1_verdict(true);
+    let stored = StoredParse::from_state(&state);
+    assert_eq!(stored.request1_verdict(), None);
+    // Kept across checkpoints.
+    let round = StoredParse::from_state(&stored.into_state().unwrap());
+    assert_eq!(round.request1_verdict(), None);
+    let mut checkpoint = eligible_checkpoint();
+    checkpoint.parse = round;
+    assert_eq!(audit::eligible(&checkpoint, 100), None);
+}
+
+#[test]
+fn health_for_another_destination_is_dropped_unsent() {
+    let dir = scratch("composition-a2-health-destination");
+    let day = day_of(base_now().date());
+    let mut log = HealthLog::begin(&dir, day, "old-device|machine|api");
+    log.set(HealthEntry::finished(
+        "claude-code",
+        &sample_stats(),
+        0,
+        base_now(),
+    ));
+    let record = health::take_pending(&dir, day).unwrap();
+    let mut poster = Poster::default();
+    let counts = health::send(
+        &record,
+        "new-device|machine|api",
+        "machine-test",
+        WorkerCounts::default(),
+        &mut poster,
+    );
+    assert!(poster.calls.is_empty());
+    assert_eq!(counts, PostCounts { sent: 0, failed: 1 });
+    assert!(health::take_pending(&dir, day).is_none());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn backlog_counts_a_waiting_file_at_its_current_size() {
+    let env = Env::new("composition-a2-backlog-growth");
+    let now = base_now();
+    let path = whole_file(&env, "a", now);
+    let run = |hours: i64| {
+        env.run_with(
+            Source::Claude,
+            now + time::Duration::hours(hours),
+            None,
+            0,
+            &mut FolderResolver::default(),
+        )
+    };
+    let first = run(0);
+    assert_eq!(
+        first.full_read_backlog_bytes,
+        fs::metadata(&path).unwrap().len()
+    );
+    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
+    let second = run(1);
+    let grown = fs::metadata(&path).unwrap().len();
+    assert!(grown > first.full_read_backlog_bytes);
+    assert_eq!(second.full_read_waiting_files, 1);
+    assert_eq!(second.full_read_backlog_bytes, grown);
+    env.cleanup();
 }
