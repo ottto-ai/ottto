@@ -28,6 +28,11 @@ use toml_edit::{DocumentMut, Item};
 pub(crate) mod cache_observations;
 #[cfg(test)]
 mod cache_policy_tests;
+mod claude_context_file_birth;
+#[cfg(test)]
+pub(crate) use claude_context_file_birth::ClaudeFileBirthVerdict;
+pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
+pub(crate) use claude_context_file_birth::{ClaudeFileBirth, ClaudeVetoApiRows};
 pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
@@ -51,6 +56,9 @@ mod codex_usage_occurrence;
 mod context_curve;
 mod session_start;
 pub(crate) use session_start::OpeningFileCandidate;
+// For the composition reader, which is wired separately.
+#[allow(unused_imports)]
+pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
 #[cfg(test)]
@@ -1077,222 +1085,6 @@ fn rebuild_claude_context_posture(
         (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
 }
 
-/// Visible negative evidence against the Claude posture member waiver, built
-/// only while the global census fence is closed. It is local to one fold and
-/// read only: never persisted, never merged into the duplicate witness, and
-/// bounded by the requests of this page's waiver candidates (one entry per
-/// candidate request, never one per matching owner or row).
-#[derive(Default)]
-struct ClaudePostureWaiverEvidence<'r> {
-    /// Candidate request hashes that retained, non-invalid family pending of
-    /// any window assigns to more than one (root, member) owner.
-    visible_dupes: BTreeSet<String>,
-    /// Candidate request ids reported by loaded local API or trace evidence,
-    /// with the one reporting root or a marker that several roots report it.
-    /// Keys and roots borrow the loaded reports.
-    foreign_otel: BTreeMap<&'r str, ClaudeReportedRequestRoot<'r>>,
-}
-
-enum ClaudeReportedRequestRoot<'r> {
-    One(&'r str),
-    Several,
-}
-
-/// Build the waiver evidence, or refuse before allocating anything when the
-/// candidates carry more requests than `max_candidate_requests`. Candidates
-/// are members of current, valid family pending, which the Mac-wide pending
-/// occurrence cap already bounds, so the refusal is a guard on that
-/// invariant; a refused fold keeps the strict rule for every candidate.
-fn claude_posture_waiver_evidence<'s, 'r>(
-    candidates: impl Iterator<Item = &'s SnapshotItem> + Clone,
-    max_candidate_requests: usize,
-    index: &ScanIndex,
-    api_report: &'r crate::claude_local_otel::ClaudeLocalOtelLoadReport,
-    trace_report: &'r crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-) -> Option<ClaudePostureWaiverEvidence<'r>> {
-    let candidate_request_count = candidates
-        .clone()
-        .map(|item| item.claude_usage_request_ids.len())
-        .fold(0_usize, usize::saturating_add);
-    if candidate_request_count > max_candidate_requests {
-        return None;
-    }
-    if candidate_request_count == 0 {
-        return Some(ClaudePostureWaiverEvidence::default());
-    }
-    let candidate_request_ids = candidates
-        .flat_map(|item| item.claude_usage_request_ids.iter().map(String::as_str))
-        .collect::<BTreeSet<_>>();
-    let candidate_request_hashes = candidate_request_ids
-        .iter()
-        .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
-        .collect::<BTreeSet<_>>();
-    // An invalid family has erased its evidence; it stays unknown, never
-    // unique. Any family that still shows a candidate request under another
-    // owner keeps every peer that shares it fail closed.
-    // `None` once a second owner is seen: the request is shared, and no more
-    // owners need to be retained.
-    let mut owners = BTreeMap::<&str, Option<(&str, &str)>>::new();
-    for (root_session_id, pending) in &index.claude_usage_family_pending {
-        if pending.invalid {
-            continue;
-        }
-        let member_hashes = pending
-            .member_request_id_hashes
-            .iter()
-            .flat_map(|(member, hashes)| hashes.iter().map(move |hash| (member, hash)))
-            .chain(
-                pending
-                    .member_occurrences
-                    .iter()
-                    .flat_map(|(member, occurrences)| {
-                        occurrences.keys().map(move |hash| (member, hash))
-                    }),
-            );
-        for (member, request_hash) in member_hashes {
-            if !candidate_request_hashes.contains(request_hash) {
-                continue;
-            }
-            let owner = (root_session_id.as_str(), member.as_str());
-            let first = owners.entry(request_hash.as_str()).or_insert(Some(owner));
-            if first.is_some_and(|first| first != owner) {
-                *first = None;
-            }
-        }
-    }
-    let visible_dupes = owners
-        .into_iter()
-        .filter(|(_, owner)| owner.is_none())
-        .map(|(request_hash, _)| request_hash.to_string())
-        .collect();
-    let api_rows = api_report.evidence.iter().flat_map(|(root, rows)| {
-        rows.iter().map(move |row| {
-            (
-                root.as_str(),
-                row.session_id.as_str(),
-                row.request_id.as_str(),
-            )
-        })
-    });
-    let trace_rows = trace_report.evidence.iter().flat_map(|(root, rows)| {
-        rows.iter().map(move |row| {
-            (
-                root.as_str(),
-                row.session_id.as_str(),
-                row.request_id.as_str(),
-            )
-        })
-    });
-    let mut foreign_otel = BTreeMap::<&'r str, ClaudeReportedRequestRoot<'r>>::new();
-    for (root, session_id, request_id) in api_rows.chain(trace_rows) {
-        if !candidate_request_ids.contains(request_id) {
-            continue;
-        }
-        let reported = foreign_otel
-            .entry(request_id)
-            .or_insert(ClaudeReportedRequestRoot::One(root));
-        if matches!(reported, ClaudeReportedRequestRoot::One(first) if *first != root || *first != session_id)
-        {
-            *reported = ClaudeReportedRequestRoot::Several;
-        }
-    }
-    Some(ClaudePostureWaiverEvidence {
-        visible_dupes,
-        foreign_otel,
-    })
-}
-
-/// Inputs shared by every withheld item's posture admission in one fold.
-struct ClaudePostureFence<'a> {
-    closed: bool,
-    reports_healthy: bool,
-    census_window_end: &'a str,
-    own_pending: Option<&'a ClaudeUsageFamilyPending>,
-    duplicated_request_hashes: &'a BTreeSet<String>,
-    /// `None` when the evidence was refused at its allocation bound.
-    evidence: Option<&'a ClaudePostureWaiverEvidence<'a>>,
-}
-
-/// Classify an item the strict posture rule withheld, and admit the member
-/// waiver only for exact per-member provider ownership. Uniqueness is never
-/// proof here: the waiver needs this call's session-exclusive contract with no
-/// legacy exclusion, complete request identity, this item's own family valid
-/// in the current window, and no known, visible or reported duplicate.
-fn claude_withheld_posture_admission(
-    item: &SnapshotItem,
-    root_session_id: &str,
-    excluded_request_hashes: &BTreeSet<String>,
-    fence: ClaudePostureFence<'_>,
-) -> ClaudePostureAdmission {
-    let exclusive_contract =
-        item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1");
-    if !(item.claude_context_curve_owned_start_proven
-        || !excluded_request_hashes.is_empty()
-        || exclusive_contract)
-    {
-        return ClaudePostureAdmission::WithheldNoContract;
-    }
-    if !fence.closed {
-        // With an open fence the strict rule withholds a proven start only for
-        // a known duplicate.
-        return ClaudePostureAdmission::WithheldDuplicate;
-    }
-    if !fence.reports_healthy || !exclusive_contract || !excluded_request_hashes.is_empty() {
-        return ClaudePostureAdmission::WithheldGlobalCensus;
-    }
-    if !item.claude_context_curve_identity_complete
-        || item.claude_usage_occurrences.is_empty()
-        || item.claude_usage_occurrences.len() != item.claude_usage_request_ids.len()
-    {
-        return ClaudePostureAdmission::WithheldIdentity;
-    }
-    let request_hashes = item
-        .claude_usage_request_ids
-        .iter()
-        .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
-        .collect::<BTreeSet<_>>();
-    if request_hashes
-        .iter()
-        .any(|request_hash| fence.duplicated_request_hashes.contains(request_hash))
-    {
-        return ClaudePostureAdmission::WithheldDuplicate;
-    }
-    // Defense in depth: this fold accumulated the item into its own pending,
-    // which resets a stale window to the current one and invalidates the
-    // family on a changed request set. These checks also hold when the
-    // pending came from earlier native observations.
-    let own_family_current_valid = fence.own_pending.is_some_and(|pending| {
-        !pending.invalid
-            && pending.census_window_end == fence.census_window_end
-            && pending
-                .member_request_id_hashes
-                .get(&item.source_session_id)
-                == Some(&request_hashes)
-    });
-    if !own_family_current_valid {
-        return ClaudePostureAdmission::WithheldOwnFamily;
-    }
-    let Some(evidence) = fence.evidence else {
-        return ClaudePostureAdmission::WithheldEvidenceBound;
-    };
-    let visibly_shared = request_hashes
-        .iter()
-        .any(|request_hash| evidence.visible_dupes.contains(request_hash));
-    let reported_elsewhere = item.claude_usage_request_ids.iter().any(|request_id| {
-        evidence
-            .foreign_otel
-            .get(request_id.as_str())
-            .is_some_and(|reported| match reported {
-                ClaudeReportedRequestRoot::One(root) => *root != root_session_id,
-                ClaudeReportedRequestRoot::Several => true,
-            })
-    });
-    if visibly_shared || reported_elsewhere {
-        return ClaudePostureAdmission::WithheldDuplicate;
-    }
-    ClaudePostureAdmission::MemberWaiver
-}
-
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the
 // file COUNT and an mtime window, but the per-file/-line byte lengths were
 // previously unbounded: a transcript whose monitored tool output embeds a huge
@@ -1761,6 +1553,10 @@ pub struct SnapshotItem {
     pub(crate) claude_context_curve_request_index_complete: bool,
     #[serde(skip)]
     pub(crate) claude_context_curve_owned_start_proven: bool,
+    /// Local-only birth evidence and own-only context tally of the Claude
+    /// transcript this item was parsed from. Never serialized.
+    #[serde(skip)]
+    pub(crate) claude_file_birth: ClaudeFileBirth,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_summary: Option<SnapshotActivitySummary>,
     /// Names of tools actually invoked by counted Claude assistant responses.
@@ -3049,6 +2845,8 @@ pub(crate) struct ClaudeAuthorityRecordForTest {
 pub struct ClaudeUsageAuthorityDisposition {
     pub(crate) duplicate_census: ClaudeDuplicateCensusCounts,
     pub(crate) first_proof_hold: ClaudeFirstProofHoldCounts,
+    /// Local counters for how this fold's Claude scalars were decided.
+    pub(crate) context_file_birth: ClaudeContextFileBirthCounts,
     quarantined_source_session_ids: BTreeSet<String>,
     /// The account-deferred subset of `quarantined_source_session_ids`. Upload
     /// retention still uses the union; this only classifies settlement.
@@ -3070,29 +2868,14 @@ pub struct ClaudeUsageAuthorityDisposition {
 }
 
 /// The rule that admitted or withheld one Claude item's first/peak/last
-/// context and compaction scalars in the ownership fold.
+/// context and compaction scalars in the ownership fold. Recorded by tests.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudePostureAdmission {
     /// Owned start proven and no unresolved duplicate (the unchanged rule).
     Strict,
-    /// The global census fence is closed, but this member's own Claude Code
-    /// telemetry assigns it every counted request (scalars only).
-    MemberWaiver,
-    /// No explicit fork boundary, exact copied prefix or provider ledger.
-    WithheldNoContract,
-    /// The global census fence is closed and the member waiver does not apply
-    /// to this ownership proof (explicit or legacy-prefix start only).
-    WithheldGlobalCensus,
-    /// The member's own family pending is invalid, stale or not this item's.
-    WithheldOwnFamily,
-    /// A request is visibly shared with another owner or reported under
-    /// another root.
-    WithheldDuplicate,
-    /// A response lacks one unique request id, or no response was counted.
-    WithheldIdentity,
-    /// The fold's waiver candidates exceeded the evidence allocation bound,
-    /// so the strict rule applies.
-    WithheldEvidenceBound,
+    /// No provider-proven start: the file birth rule decided (design E).
+    FileBirth(ClaudeFileBirthVerdict),
 }
 
 #[cfg(test)]
@@ -3100,13 +2883,13 @@ impl ClaudePostureAdmission {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Strict => "strict",
-            Self::MemberWaiver => "member_waiver",
-            Self::WithheldNoContract => "withheld_no_contract",
-            Self::WithheldGlobalCensus => "withheld_global_census",
-            Self::WithheldOwnFamily => "withheld_own_family",
-            Self::WithheldDuplicate => "withheld_duplicate",
-            Self::WithheldIdentity => "withheld_identity",
-            Self::WithheldEvidenceBound => "withheld_evidence_bound",
+            Self::FileBirth(ClaudeFileBirthVerdict::Admitted) => "file_birth_rule",
+            Self::FileBirth(ClaudeFileBirthVerdict::UnknownBirth) => "withheld_unknown_birth",
+            Self::FileBirth(ClaudeFileBirthVerdict::UntimedRecord) => "withheld_untimed_record",
+            Self::FileBirth(ClaudeFileBirthVerdict::AllCopied) => "withheld_all_copied",
+            Self::FileBirth(ClaudeFileBirthVerdict::MultiFile) => "withheld_multi_file",
+            Self::FileBirth(ClaudeFileBirthVerdict::Tripwire) => "withheld_tripwire",
+            Self::FileBirth(ClaudeFileBirthVerdict::EvidenceBound) => "withheld_evidence_bound",
         }
     }
 }
@@ -5608,6 +5391,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         &BTreeSet::new(),
         None,
         None,
+        &BTreeMap::new(),
     )
 }
 
@@ -5675,9 +5459,11 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
         identity,
         observations,
         None,
+        &BTreeMap::new(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     scan: &mut SourceScanResult,
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -5686,6 +5472,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
+    veto_api_rows: &ClaudeVetoApiRows,
 ) -> ClaudeUsageAuthorityDisposition {
     // A previous unsettled upload requires a clean followup before manifest /
     // replay settlement, but cannot erase the actual healthy terminal native
@@ -5715,6 +5502,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         &current_files,
         observations,
         comparison,
+        veto_api_rows,
     );
     // Slice D1: report only. The shadow was measured by the scan; no fold
     // input above read it.
@@ -5736,6 +5524,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     current_files: &BTreeSet<String>,
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
+    veto_api_rows: &ClaudeVetoApiRows,
 ) -> ClaudeUsageAuthorityDisposition {
     let (negatives, diagnostic) = comparison.map_or((None, None), |view| {
         (view.negatives, view.lease.map(|lease| &lease.diagnostic))
@@ -6074,51 +5863,18 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             }
         }
     }
-    // An invalid or stale family can hide a copied request, so the global
-    // fence below withholds posture from every session it cannot clear. That
-    // hidden evidence can only be negative. A member whose own Claude Code
-    // telemetry assigns it every counted request does not rely on uniqueness,
-    // so it may keep its scalar tuple while no visible evidence contradicts it.
-    let global_posture_fence =
-        duplicate_census_invalid || index.claude_duplicate_request_witness_overflowed;
-    // `usage_accounting_contract` was reset and set by the rebuild above, in
-    // this call, so the waiver never reads a persisted contract flag.
-    let posture_waiver_evidence = if global_posture_fence {
-        claude_posture_waiver_evidence(
-            snapshots.iter().filter(|item| {
-                let root_session_id = claude_snapshot_family_root_ref(item);
-                item.usage_accounting_contract.as_deref()
-                    == Some("session_exclusive_reported_usage:v1")
-                    && item.claude_context_curve_identity_complete
-                    && index
-                        .claude_usage_family_pending
-                        .get(root_session_id)
-                        .is_some_and(|pending| {
-                            !pending.invalid
-                                && pending.census_window_end == census_window_end
-                                && pending
-                                    .member_request_id_hashes
-                                    .contains_key(&item.source_session_id)
-                        })
-                    && !proven
-                        .get(root_session_id)
-                        .or_else(|| reconstructed.get(root_session_id))
-                        .and_then(|family| {
-                            family
-                                .witness
-                                .legacy_excluded_request_id_hashes
-                                .get(&item.source_session_id)
-                        })
-                        .is_some_and(|excluded| !excluded.is_empty())
-            }),
-            max_pending_occurrences,
-            index,
-            api_report,
-            trace_report,
-        )
-    } else {
-        Some(ClaudePostureWaiverEvidence::default())
-    };
+    // Design E: an item without a provider-proven start keeps its own-only
+    // scalars by the file birth rule. Loaded telemetry only vetoes them; the
+    // census fence and family pending are no longer consulted for scalars.
+    let file_birth_tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
+        snapshots,
+        max_pending_occurrences,
+        api_report,
+        trace_report,
+        veto_api_rows,
+    );
+    let multi_file_members = claude_context_file_birth::claude_multi_file_members(snapshots, index);
+    let mut context_file_birth = ClaudeContextFileBirthCounts::default();
     #[cfg(test)]
     let mut posture_admissions = BTreeMap::new();
     for item in snapshots.iter_mut() {
@@ -6147,53 +5903,34 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 == Some("session_exclusive_reported_usage:v1");
         let explicit_owned_start = item.claude_context_curve_owned_start_proven;
         let posture_owned = (explicit_owned_start || provider_owned_start) && !unresolved_duplicate;
-        let posture_admission = if posture_owned {
-            ClaudePostureAdmission::Strict
+        if posture_owned {
+            context_file_birth.record_proof(item);
+            #[cfg(test)]
+            posture_admissions.insert(
+                item.source_session_id.clone(),
+                ClaudePostureAdmission::Strict,
+            );
         } else {
-            claude_withheld_posture_admission(
+            // Cache observations and the curve below still read the strict
+            // `posture_owned`: only the scalar tuple and session start move.
+            let multi_file = multi_file_members.contains(&item.source_session_id);
+            let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
                 item,
                 &root_session_id,
-                &excluded_request_hashes,
-                ClaudePostureFence {
-                    closed: global_posture_fence,
-                    reports_healthy,
-                    census_window_end,
-                    own_pending: index.claude_usage_family_pending.get(&root_session_id),
-                    duplicated_request_hashes: &duplicated_request_hashes,
-                    evidence: posture_waiver_evidence.as_ref(),
-                },
-            )
-        };
-        #[cfg(test)]
-        posture_admissions.insert(item.source_session_id.clone(), posture_admission);
-
-        if posture_admission == ClaudePostureAdmission::MemberWaiver {
-            // Scalars only: cache observations and the curve below still read
-            // the strict `posture_owned`. Every occurrence is assigned to this
-            // member, but a compaction counts only after its first owned
-            // response, so a boundary copied at the head stays excluded.
-            let mut owned_occurrences = item
-                .claude_usage_occurrences
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            owned_occurrences.sort_by_key(|occurrence| occurrence.sequence);
-            let first_owned_sequence = owned_occurrences
-                .first()
-                .map(|occurrence| occurrence.sequence);
-            item.session_start = item
-                .session_start
-                .take()
-                .and_then(|start| (*start).inherited())
-                .map(Box::new);
-            rebuild_claude_context_posture(item, &owned_occurrences, first_owned_sequence);
-        } else if !posture_owned {
-            // A raw top-level transcript can be a Fable/takeover successor
-            // with a copied, unmarked prefix. Until the predecessor or an
-            // exclusive provider ledger proves where ownership starts, no
-            // first/peak/last context or compaction scalar is truthful.
-            clear_claude_context_posture(item);
-        } else if item.claude_context_curve_identity_complete {
+                &file_birth_tripwire,
+                &mut claude_context_file_birth::remembered_tripwire(),
+                multi_file,
+                &mut context_file_birth,
+            );
+            #[cfg(test)]
+            posture_admissions.insert(
+                item.source_session_id.clone(),
+                ClaudePostureAdmission::FileBirth(verdict),
+            );
+            #[cfg(not(test))]
+            let _ = verdict;
+        }
+        if posture_owned && item.claude_context_curve_identity_complete {
             let mut owned_occurrences = item
                 .claude_usage_occurrences
                 .iter()
@@ -6220,6 +5957,14 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                         .map(Box::new);
                 }
                 rebuild_claude_context_posture(item, &owned_occurrences, copied_prefix_end);
+            } else {
+                clear_claude_context_posture(item);
+            }
+        } else if posture_owned {
+            // Without a complete request index the occurrences cannot rebuild
+            // the tuple; ship the parser's own-only values, never raw ones.
+            if item.claude_file_birth.observed() {
+                claude_context_file_birth::apply_own_context_scalars(item);
             } else {
                 clear_claude_context_posture(item);
             }
@@ -6390,6 +6135,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             }
         }
     }
+    claude_context_file_birth::alarm_first_resource_withhold(&context_file_birth);
 
     let owned_start_reparse_ids = index
         .claude_owned_start_census
@@ -6418,22 +6164,34 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         request_groupings,
         #[cfg(test)]
         posture_admissions,
+        context_file_birth,
         ..ClaudeUsageAuthorityDisposition::default()
     };
     let mut demoting_members_by_root = BTreeMap::<String, BTreeSet<String>>::new();
     for item in snapshots.iter() {
         let root_session_id = claude_snapshot_family_root(item);
-        if witness_roots_before.contains(&root_session_id)
-            && item.usage_accounting_contract.as_deref()
-                != Some("session_exclusive_reported_usage:v1")
-        {
+        let contractless = item.usage_accounting_contract.as_deref()
+            != Some("session_exclusive_reported_usage:v1");
+        if contractless {
+            disposition
+                .context_file_birth
+                .record_contractless(item, witness_roots_before.contains(&root_session_id));
+        }
+        if witness_roots_before.contains(&root_session_id) && contractless {
             demoting_members_by_root
                 .entry(root_session_id)
                 .or_default()
                 .insert(item.source_session_id.clone());
-            disposition
+            if disposition
                 .quarantined_source_session_ids
-                .insert(item.source_session_id.clone());
+                .insert(item.source_session_id.clone())
+            {
+                // R7: the demotion hold stays; its sessions upload no
+                // scalars this pass whatever their basis. Counted locally.
+                disposition
+                    .context_file_birth
+                    .demotion_quarantined_session_count += 1;
+            }
         }
     }
 
@@ -12571,6 +12329,7 @@ struct SnapshotAccumulator {
     claude_context_curve_identity_complete: bool,
     claude_context_curve_request_index_complete: bool,
     claude_context_curve_owned_start_proven: bool,
+    claude_file_birth: ClaudeFileBirth,
     tool_usage_counts: BTreeMap<String, u64>,
     tool_usage_truncated: bool,
     // Current Pi transcripts carry usage on `type=message` assistant records;
@@ -12737,6 +12496,7 @@ impl SnapshotAccumulator {
             claude_context_curve_identity_complete: true,
             claude_context_curve_request_index_complete: true,
             claude_context_curve_owned_start_proven: false,
+            claude_file_birth: ClaudeFileBirth::default(),
             tool_usage_counts: BTreeMap::new(),
             tool_usage_truncated: false,
             seen_pi_usage_keys: BTreeMap::new(),
@@ -13861,6 +13621,11 @@ impl SnapshotAccumulator {
             let effective_input_context = response
                 .computed_effective_input_context
                 .unwrap_or_else(|| response.usage.effective_input_context());
+            self.claude_file_birth.observe_response(
+                response.sequence,
+                response.terminal_timestamp.as_deref(),
+                effective_input_context,
+            );
             if !response.selector.context.contains_key("context_bucket") {
                 // Stamped only against the model's catalog line: Haiku 5.5's
                 // 100K price line or the 200K analysis line of flat 1M-window
@@ -14840,6 +14605,7 @@ impl SnapshotAccumulator {
             claude_context_curve_request_index_complete: self
                 .claude_context_curve_request_index_complete,
             claude_context_curve_owned_start_proven: self.claude_context_curve_owned_start_proven,
+            claude_file_birth: self.claude_file_birth,
             activity_summary,
             tool_usage,
             tool_usage_truncated,
@@ -21484,6 +21250,7 @@ fn codex_state_only_snapshot(
         claude_context_curve_identity_complete: false,
         claude_context_curve_request_index_complete: false,
         claude_context_curve_owned_start_proven: false,
+        claude_file_birth: Default::default(),
         activity_summary: None,
         tool_usage: None,
         tool_usage_truncated: false,
@@ -21932,6 +21699,12 @@ impl OwnedJsonlParser {
                     .with_context(|| format!("read opened JSONL metadata {}", path.display()))?;
                 accumulator.seed_codex_sidecar_parent(path, &file_metadata, metadata);
             }
+        }
+        if source == SnapshotSource::ClaudeCode {
+            // Birth of the opened object itself; a later path lookup could
+            // describe a replacement file.
+            accumulator.claude_file_birth =
+                ClaudeFileBirth::observe(path, reader.get_ref().metadata().ok().as_ref());
         }
 
         Ok(Self {
@@ -24983,6 +24756,9 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     let timestamp = string_at(value, &["timestamp"])
         .or_else(|| string_at(value, &["created_at"]))
         .or_else(|| string_at(value, &["message", "created_at"]));
+    accumulator
+        .claude_file_birth
+        .observe_line(timestamp.as_deref(), accumulator.claude_response_sequence);
     note_claude_capability_calls(value, timestamp.as_deref(), accumulator);
     // Current Claude transcripts write both of these shapes for one compaction.
     // Keep the raw observations here; `claude_compaction_summary` pairs a
@@ -33794,8 +33570,8 @@ mod tests {
     mod authority_proof_correction_tests {
         include!("snapshots/authority_proof_correction_tests.rs");
     }
-    mod claude_posture_member_waiver_tests {
-        include!("snapshots/claude_posture_member_waiver_tests.rs");
+    mod claude_context_file_birth_tests {
+        include!("snapshots/claude_context_file_birth_tests.rs");
     }
     mod claude_request_census_tests {
         include!("snapshots/claude_request_census_tests.rs");
@@ -43719,6 +43495,7 @@ mod tests {
             claude_context_curve_identity_complete: false,
             claude_context_curve_request_index_complete: false,
             claude_context_curve_owned_start_proven: false,
+            claude_file_birth: Default::default(),
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
@@ -47372,12 +47149,42 @@ mod tests {
         assert!(rejected_hashes
             .iter()
             .all(|fingerprint| sha256_hex_is_well_formed(fingerprint)));
-        assert!(weaker_revision.iter().all(|item| {
-            item.first_turn_context_tokens.is_none()
-                && item.peak_context_fill_tokens.is_none()
-                && item.last_turn_context_tokens.is_none()
-                && item.compaction_count.is_none()
-        }));
+        // Design E: the root's only record predates its file, so its scalars
+        // stay cleared; subagent files keep their own. The demotion hold
+        // below still keeps every body from uploading (R7).
+        for item in &weaker_revision {
+            let tuple = (
+                item.first_turn_context_tokens,
+                item.peak_context_fill_tokens,
+                item.last_turn_context_tokens,
+                item.compaction_count,
+            );
+            if item.source_session_id == root_session_id {
+                assert_eq!(tuple, (None, None, None, None));
+            } else {
+                assert_eq!(tuple, (Some(10), Some(10), Some(10), Some(0)));
+            }
+        }
+        assert_eq!(
+            disposition
+                .context_file_birth
+                .demotion_quarantined_session_count,
+            7
+        );
+        // SOURCE condition 6 with a local witness: the six contract-less
+        // bodies carrying scalars are counted and held below, never sent.
+        assert_eq!(
+            disposition
+                .context_file_birth
+                .contractless_scalars_witness_present_session_count,
+            6
+        );
+        assert_eq!(
+            disposition
+                .context_file_birth
+                .contractless_scalars_witness_missing_session_count,
+            0
+        );
         let mut uploadable = weaker_revision.clone();
         disposition.retain_uploadable(&mut uploadable);
         assert!(uploadable.is_empty(), "all seven demoting bodies are held");
@@ -47563,10 +47370,9 @@ mod tests {
             local_index_key(&hidden_copy_path),
             manifest_index_entry(None),
         );
-        let expected_child_start = items[1]
-            .session_start
-            .clone()
-            .and_then(|start| (*start).inherited());
+        // A subagent file is exempt from the birth rule and keeps its own
+        // full session-start split.
+        let expected_child_start = items[1].session_start.clone();
 
         let disposition = apply_claude_reported_usage_with_index(
             &mut items,
@@ -47592,10 +47398,10 @@ mod tests {
             "an invalid peer family can hide a copied request, so the curve stays closed"
         );
         // The hidden family is the copier: telemetry assigns req_5 to the
-        // child, so the child keeps its member-owned scalars (only).
+        // child's own root, so the file birth rule keeps the child's scalars.
         assert_eq!(
             disposition.posture_admission(&child.source_session_id),
-            Some("member_waiver")
+            Some("file_birth_rule")
         );
         assert_eq!(
             (
@@ -47606,16 +47412,14 @@ mod tests {
             ),
             (Some(10), Some(10), Some(10), Some(0))
         );
-        assert_eq!(
-            child.session_start.as_deref(),
-            expected_child_start.as_ref()
-        );
+        assert_eq!(child.session_start, expected_child_start);
         assert!(child.cache_observations.is_none());
         let hidden_copy = &items[2];
         assert_eq!(hidden_copy.usage_accounting_contract, None);
+        // Every record predates the copy's file birth: nothing is its own.
         assert_eq!(
             disposition.posture_admission(hidden_copy_id),
-            Some("withheld_no_contract")
+            Some("withheld_all_copied")
         );
         assert_eq!(
             (
@@ -47666,6 +47470,8 @@ mod tests {
         disposition.duplicate_census = ClaudeDuplicateCensusCounts::default();
         disposition.transcript_ownership_complete = false;
         disposition.posture_admissions.clear();
+        // Local-only context basis counters, logged and never persisted.
+        disposition.context_file_birth = Default::default();
         assert_eq!(disposition, ClaudeUsageAuthorityDisposition::default());
         let index_json = serde_json::to_string(&index).expect("serialize index");
         let items_json = serde_json::to_string(&items).expect("serialize items");
@@ -54339,6 +54145,7 @@ mod tests {
                     body_witness_digest: digest,
                     head_etag: None,
                     head_challenge: None,
+                    unchanged_basis: None,
                 }],
                 unchanged_entities: Vec::new(),
                 rejected_entities: Vec::new(),
@@ -54409,6 +54216,7 @@ mod tests {
                 body_witness_digest: Some(snapshot_upload_body_witness(&exclusive_item)),
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),
@@ -54846,6 +54654,7 @@ mod tests {
                                 body_witness_digest: proof,
                                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                                 head_challenge: None,
+                                unchanged_basis: None,
                             };
                             crate::snapshot_client::SnapshotBatchResponse {
                                 accepted: 1,
@@ -56575,6 +56384,7 @@ mod tests {
                                 body_witness_digest: proof,
                                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                                 head_challenge: None,
+                                unchanged_basis: None,
                             };
                             crate::snapshot_client::SnapshotBatchResponse {
                                 accepted: 1,
@@ -65838,6 +65648,7 @@ mod tests {
             claude_context_curve_identity_complete: false,
             claude_context_curve_request_index_complete: false,
             claude_context_curve_owned_start_proven: false,
+            claude_file_birth: Default::default(),
             activity_summary: Some(SnapshotActivitySummary {
                 capability_collection_version: Some("agent_capability_usage:v1".to_string()),
                 tool_calls: 3,
@@ -67120,6 +66931,7 @@ mod tests {
                 body_witness_digest: digest,
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             }],
             unchanged_entities: vec![],
             rejected_entities: vec![],
@@ -67267,6 +67079,7 @@ mod tests {
                 claude_context_curve_identity_complete: false,
                 claude_context_curve_request_index_complete: false,
                 claude_context_curve_owned_start_proven: false,
+                claude_file_birth: Default::default(),
                 activity_summary: None,
                 tool_usage: None,
                 tool_usage_truncated: false,
@@ -69417,13 +69230,13 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, claude_compaction_link_tip, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, claude_compaction_link_tip, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
+crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
 crate::heap_layout_bound::fields!(SnapshotModelUsage; model, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, reasoning_effort, unattributed_total_tokens, request_count, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);

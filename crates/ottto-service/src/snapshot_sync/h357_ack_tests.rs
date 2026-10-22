@@ -62,6 +62,7 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         body_witness_digest: version.map(|_| snapshot_upload_body_witness(item)),
         head_etag: None,
         head_challenge: None,
+        unchanged_basis: None,
     }
 }
 
