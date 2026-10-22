@@ -241,7 +241,16 @@ fn with_bootstrap_deferred(
 }
 
 // Local index projection producer revision; independent of semantic/wire identity.
-const EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION: u64 = 1;
+// Each indexed file whose stored revision differs is re-read once; the stamp is
+// written only when its upload settles, so an interrupted pass resumes. Claude
+// Code 2 re-reads its history once so the newer context numbers fill in. Bump a
+// source at most once per release; Codex and Pi stay unchanged.
+pub(crate) fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
+    match source {
+        SnapshotSource::ClaudeCode => 2,
+        SnapshotSource::Codex | SnapshotSource::Pi => 1,
+    }
+}
 
 fn exclude_held_effective_body_witness_revision(
     index: &mut ScanIndex,
@@ -3169,6 +3178,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The money shadow's kill switch, seen before this process's first parse.
+    crate::snapshots::claude_request_money::seed_shadow_off(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -4107,6 +4118,11 @@ impl SourcePreparation {
             let occupied = initialize
                 .then(|| self.native_incremental_owned_bytes(&state))
                 .flatten();
+            #[cfg(test)]
+            let remaining = self
+                .native_comparison_reservation
+                .as_ref()
+                .and_then(crate::source_rotation::PaidReservation::remaining_for_test);
             let paid = self
                 .native_comparison_reservation
                 .as_mut()
@@ -4117,6 +4133,12 @@ impl SourcePreparation {
                     occupied
                         .is_some_and(|bytes| paid.grow_for(bytes) && paid.record_allocated(bytes))
                 });
+            #[cfg(test)]
+            if initialize {
+                tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::note_native_allowance(
+                    remaining, occupied, paid,
+                );
+            }
             if !paid {
                 state.disable_native_comparison();
             }
@@ -4422,7 +4444,9 @@ fn try_collect_native_preparation_with_rotation(
     };
     // The original rotation calculates queue/parked/retained deductions. No
     // independently fabricated full-budget argument reaches the native caller.
-    crate::source_rotation::run(&mut owner, &[source], crate::source_rotation::PARKED_BUDGET);
+    let budget =
+        tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::rotation_budget();
+    crate::source_rotation::run(&mut owner, &[source], budget);
     if let Some(error) = owner.failure {
         return Err(error);
     }
@@ -4801,7 +4825,13 @@ fn prepare_sync_source(
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
-    index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        source,
+    ));
+    if source == SnapshotSource::ClaudeCode {
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(support_dir);
+    }
     let committed_index = index.clone();
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
@@ -7086,6 +7116,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
+    // P1 per-request money, shadow only: reads this page's final items, the
+    // index and the rows loaded above; writes only its own ledger, through
+    // its writer thread after this page. Never fails or changes the page.
+    crate::snapshots::claude_request_money::shadow_page(
+        support_dir,
+        &scan_result.snapshots,
+        index,
+        &api_report,
+        &trace_report,
+        scan_result.census_complete,
+    );
     Ok((disposition, census_withheld, stats))
 }
 
@@ -9830,7 +9871,7 @@ mod tests {
             let mut index = ScanIndex::load(&index_path).unwrap();
             index.activate_upload_context("cache-on".into());
             index.activate_effective_upload_body_witness_revision(
-                EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+                effective_upload_body_witness_revision(SnapshotSource::Codex),
             );
             index
         };
@@ -10179,7 +10220,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let mut baseline = ScanIndex::default();
         baseline.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let raw = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10297,7 +10338,7 @@ mod tests {
                 if held {
                     0
                 } else {
-                    EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION
+                    effective_upload_body_witness_revision(SnapshotSource::Codex)
                 },
                 "caller excludes raw held file from effective adoption"
             );
@@ -10405,7 +10446,7 @@ mod tests {
         };
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-off".into());
         let mut progress = test_upload_progress();
@@ -10549,7 +10590,7 @@ mod tests {
         let mut loaded = ScanIndex::load(&index_path).unwrap();
         loaded.activate_upload_context("cache-on-mandatory".into());
         loaded.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let mut progress = SnapshotUploadProgress::load(
             &progress_path,
@@ -10637,7 +10678,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let (mut index, _) = cache_effective_wire_released143_index(&root);
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let next = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10671,7 +10712,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let (mut index, mut progress) = cache_effective_wire_released143_index(&root);
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-on-new-context-same-effective-body".into());
         let previous = index.clone();
@@ -10751,7 +10792,7 @@ mod tests {
         let mut retry_index = ScanIndex::load(&path).unwrap();
         retry_index.activate_upload_context("cache-on-new-context-same-effective-body".into());
         retry_index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let mut retry = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10835,10 +10876,10 @@ mod tests {
             .files
             .values()
             .all(|entry| entry.effective_upload_body_witness_revision
-                == EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION));
+                == effective_upload_body_witness_revision(SnapshotSource::Codex)));
         loaded.activate_upload_context("cache-on-new-context-same-effective-body".into());
         loaded.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         let stable = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Codex,
@@ -10862,7 +10903,7 @@ mod tests {
         let root = cache_effective_wire_fixture_root();
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::Codex),
         );
         index.activate_upload_context("cache-off".into());
         let scan = |index: &mut ScanIndex| {
@@ -19226,6 +19267,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
+    mod claude_request_money_pipeline_tests {
+        include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
+    }
     mod p12_base_exit_tests {
         include!("snapshot_sync/p12_base_exit_tests.rs");
     }
