@@ -2961,3 +2961,5 @@ fn a_maximal_upload_meets_the_server_field_rules() {
     // Servers (otel and long, per period) and tools (four per period).
     assert_eq!(dropped.unsafe_text, 2 * 2 + 4 * 2);
 }
+
+mod scale;
