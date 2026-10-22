@@ -48,6 +48,22 @@ impl ClaudeResponseBook {
         self.responses.iter()
     }
 
+    /// (response sequence, message id) of every response whose key carries a
+    /// message id (`claude_code_usage_dedup_key`'s `m` and `p` keys). Read
+    /// only by the P1 money shadow's armed capture; allocates nothing.
+    pub(super) fn message_keys(&self) -> impl Iterator<Item = (u64, &str)> + Clone + '_ {
+        self.index.iter().filter_map(|(key, slot)| {
+            let mut parts = key.split('\u{1f}');
+            match (parts.next(), parts.next()) {
+                (Some("m" | "p"), Some(message_id)) if !message_id.is_empty() => self
+                    .responses
+                    .get(*slot as usize)
+                    .map(|response| (response.sequence, message_id)),
+                _ => None,
+            }
+        })
+    }
+
     pub(super) fn get_mut(
         &mut self,
         key: &str,

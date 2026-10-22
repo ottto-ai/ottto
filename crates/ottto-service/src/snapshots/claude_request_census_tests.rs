@@ -6,7 +6,7 @@ use crate::snapshots::claude_request_census::{
     claude_census_disjointness_complete, claude_census_member_status, claude_request_hash,
     ClaudeCensusMemberStatus, ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
     CLAUDE_REQUEST_CENSUS_CANARY, CLAUDE_REQUEST_CENSUS_DERIVATION,
-    MAX_CLAUDE_REQUEST_CENSUS_HASHES,
+    MAX_CLAUDE_REQUEST_CENSUS_HASHES, MAX_RAW_BYTES, MAX_RECORD_BYTES,
 };
 use sha2::Sha256 as CanarySha256;
 
@@ -790,6 +790,8 @@ fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
     let mut index = ScanIndex::default();
     let mut entry = manifest_index_entry(Some("body"));
     entry.source_file_fingerprint = hex_fingerprint('a');
+    // Modified in this window: not due for transcript retirement.
+    entry.modified_unix_seconds = rfc3339_unix_seconds(FIRST_WINDOW).expect("window");
     index.files.insert(indexed.clone(), entry);
     index
         .file_snapshot_fingerprints
@@ -844,6 +846,8 @@ fn census_member_status_names_disjoint_shared_unknown_and_unobserved() {
     let mut add = |name: &str, seed: char, record: Option<ClaudeRequestCensusRecord>| {
         let mut entry = manifest_index_entry(Some(name));
         entry.source_file_fingerprint = hex_fingerprint(seed);
+        // Modified in this window: not due for transcript retirement.
+        entry.modified_unix_seconds = window;
         index.files.insert(key(name), entry);
         index
             .file_snapshot_fingerprints
@@ -1150,6 +1154,65 @@ fn census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
     );
 }
 
+/// StateMissing M1: an unchanged re-parse of a record retired at 35 days
+/// (a backfill re-reading every file, a resume miss) is no derivation drift
+/// and leaves the record retired: neither the hashes nor the index bytes
+/// bounce back.
+#[test]
+fn census_retired_record_survives_an_unchanged_reparse() {
+    let scratch = crate::test_scratch::ScratchDir::new("census-retired-reparse");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "census-retired.jsonl",
+        &[census_response(
+            "census-retired",
+            Some("req_retired_1"),
+            "msg_retired_1",
+            1,
+            10,
+        )],
+    );
+    // Windows far enough past the file's mtime (now) to retire it.
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, "2027-03-01T09:00:00Z");
+    let key = census_key(&index, &root, "census-retired.jsonl");
+    let retired = index
+        .claude_request_census_for_test()
+        .record_for_test(&key)
+        .expect("record")
+        .clone();
+    assert_eq!(retired.retired_for_test(), Some(1), "retired at the terminal");
+    let hashes = index.claude_request_census_for_test().totals_for_test().0;
+    index
+        .files
+        .get_mut(&key)
+        .expect("entry")
+        .source_file_fingerprint
+        .clear();
+    census_scan(&root, &mut index, "2027-03-02T09:00:00Z");
+    let reparsed = index
+        .claude_request_census_for_test()
+        .record_for_test(&key)
+        .expect("reparsed record");
+    assert_eq!(
+        reparsed.fingerprint_hex_for_test(),
+        retired.fingerprint_hex_for_test()
+    );
+    assert_eq!(reparsed.retired_for_test(), Some(1), "still retired");
+    assert!(reparsed.request_hashes_for_test().is_empty());
+    assert_eq!(
+        index
+            .claude_request_census_shadow_for_test()
+            .derivation_drift_for_test(),
+        0
+    );
+    assert_eq!(
+        index.claude_request_census_for_test().totals_for_test().0,
+        hashes
+    );
+}
+
 /// A transcript of zero-usage responses only (API errors) yields no item, yet
 /// its request ids still reach the census and meet a peer's copy.
 #[test]
@@ -1270,12 +1333,24 @@ fn census_record_json(seed: char, shape: &str, hashes: &[u64]) -> serde_json::Va
         "s": shape,
     });
     if !hashes.is_empty() {
-        value["h"] = serde_json::json!(hashes
-            .iter()
-            .map(|hash| format!("{hash:016x}"))
-            .collect::<String>());
+        value["b"] = serde_json::json!(base64_hashes(hashes));
     }
     value
+}
+
+/// The `b` wire form: base64 of the big-endian hashes.
+fn base64_hashes(hashes: &[u64]) -> String {
+    use base64::Engine as _;
+    let bytes = hashes
+        .iter()
+        .flat_map(|hash| hash.to_be_bytes())
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The legacy `h` wire form (#664): concatenated 16-digit lowercase hex.
+fn legacy_hex_hashes(hashes: &[u64]) -> String {
+    hashes.iter().map(|hash| format!("{hash:016x}")).collect()
 }
 
 /// TD1c: the decoder is per entry, tolerant and bounded. An old index has no
@@ -1349,12 +1424,12 @@ fn census_decoder_drops_bad_entries_and_never_quarantines_the_index() {
     bad_fp["fp"] = serde_json::json!("A".repeat(64));
     let mut short_fp = census_record_json('a', "exact", &[1]);
     short_fp["fp"] = serde_json::json!("a".repeat(63));
-    let mut ragged = census_record_json('a', "lossy", &[1]);
+    let mut ragged = census_record_json('a', "lossy", &[]);
     ragged["h"] = serde_json::json!("0123");
     let mut descending = census_record_json('a', "lossy", &[]);
-    descending["h"] = serde_json::json!(format!("{:016x}{:016x}", 2, 1));
+    descending["h"] = serde_json::json!(legacy_hex_hashes(&[2, 1]));
     let mut repeated = census_record_json('a', "lossy", &[]);
-    repeated["h"] = serde_json::json!(format!("{:016x}{:016x}", 1, 1));
+    repeated["h"] = serde_json::json!(legacy_hex_hashes(&[1, 1]));
     let unknown_shape = census_record_json('a', "multi_item", &[1]);
     let exact_without_ids = census_record_json('a', "exact", &[]);
     let empty_with_ids = census_record_json('a', "empty", &[1]);
@@ -1364,7 +1439,7 @@ fn census_decoder_drops_bad_entries_and_never_quarantines_the_index() {
     wide_derivation["v"] = serde_json::json!(70_000);
     let mut wrong_flag = census_record_json('a', "exact", &[1]);
     wrong_flag["tw"] = serde_json::json!("yes");
-    let mut nested = census_record_json('a', "exact", &[1]);
+    let mut nested = census_record_json('a', "exact", &[]);
     nested["h"] = serde_json::json!({"a": [1, 2]});
     let mut missing_fp = census_record_json('a', "exact", &[1]);
     missing_fp.as_object_mut().expect("record").remove("fp");
@@ -1688,7 +1763,7 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
     let (before, after) = json.split_once(marker).expect("census field");
     write!(file, "{before}\"claude_request_census\":\"").unwrap();
     let block = [b'x'; 8192];
-    for _ in 0..4097 {
+    for _ in 0..=MAX_RAW_BYTES / block.len() {
         file.write_all(&block).unwrap();
     }
     write!(file, "\"{after}").unwrap();
@@ -1703,7 +1778,9 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
 
 #[test]
 fn census_hash_budget_warning_starts_at_eighty_percent() {
-    for hashes in [838_860, 838_861] {
+    // 80% of the hash cap, rounded up: the first count that warns.
+    let threshold = (MAX_CLAUDE_REQUEST_CENSUS_HASHES * 4).div_ceil(5) as u64;
+    for hashes in [threshold - 1, threshold] {
         let mut index = ScanIndex::default();
         index.claude_request_census_mut_for_test().insert_for_test(
             "key",
@@ -1720,10 +1797,10 @@ fn census_hash_budget_warning_starts_at_eighty_percent() {
             &BTreeSet::new(),
             FIRST_WINDOW,
         );
-        assert_eq!(counts.hash_budget_warning, hashes == 838_861);
+        assert_eq!(counts.hash_budget_warning, hashes == threshold);
         assert_eq!(
             counts.hash_budget_usage_percent,
-            if hashes == 838_861 { 80 } else { 79 }
+            if hashes == threshold { 80 } else { 79 }
         );
     }
 }
@@ -1993,7 +2070,7 @@ fn census_decoder_stops_after_an_oversized_record() {
     )
     .unwrap();
     let block = [b'x'; 8192];
-    for _ in 0..2049 {
+    for _ in 0..=MAX_RECORD_BYTES / block.len() {
         file.write_all(&block).unwrap();
     }
     write!(
@@ -2072,7 +2149,7 @@ fn census_escaped_shadow_field_name_cannot_bypass_the_reader_bound() {
     let mut file = File::create(&path).unwrap();
     write!(file, "{},\"{escaped}\":\"", base.strip_suffix('}').unwrap()).unwrap();
     let block = [b'x'; 8192];
-    for _ in 0..4097 {
+    for _ in 0..=MAX_RAW_BYTES / block.len() {
         file.write_all(&block).unwrap();
     }
     write!(file, "\"}}").unwrap();

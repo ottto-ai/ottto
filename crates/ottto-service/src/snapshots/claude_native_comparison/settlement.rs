@@ -1280,8 +1280,10 @@ impl SelectedFallback {
                     index.terminal_jsonl_dispositions.remove(key);
                 }
             }
-            // Slice D1: fail closed, never a record of either revision.
-            index.claude_request_census.remove(key);
+            // Slice D1: fail closed, never a record of either revision. The
+            // first-seen birth of the same physical object stays (an in-place
+            // stub every reader treats as no record; nothing is allocated).
+            index.claude_request_census.invalidate_keeping_birth(key);
             if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
                 match previous.claude_owned_start_census.get(&member) {
                     Some(value) => {
