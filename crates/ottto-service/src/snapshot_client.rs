@@ -300,16 +300,12 @@ fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
     }
 }
 
-/// The recognized top-level `code` of a backend error envelope. Any other
-/// code, a malformed or truncated body, or a non-string code is `None`; no
-/// body text outlives this call.
+/// The recognized top-level `code` of a backend error envelope, which must be
+/// a JSON object. Any other code, a malformed or truncated body, a non-object
+/// body or a non-string code is `None`; no body text outlives this call.
 fn shed_code(excerpt: &[u8]) -> Option<UploadShedCode> {
-    #[derive(Deserialize)]
-    struct ErrorEnvelope {
-        code: Option<String>,
-    }
-    let envelope = serde_json::from_slice::<ErrorEnvelope>(excerpt).ok()?;
-    UploadShedCode::recognize(envelope.code.as_deref()?)
+    let envelope = serde_json::from_slice::<Value>(excerpt).ok()?;
+    UploadShedCode::recognize(envelope.as_object()?.get("code")?.as_str()?)
 }
 
 /// The backend refused a snapshot batch before payload validation because the
