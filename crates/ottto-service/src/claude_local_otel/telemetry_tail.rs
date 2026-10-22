@@ -1,40 +1,106 @@
 //! `ClaudeTelemetryTail`: the P1 money ledger's incremental reader of the
 //! Claude API sidecars (`local-otel/claude-code-effort/<sha256>.jsonl`).
 //!
-//! Shadow only. Each page reads a bounded, resumable slice: one directory
-//! listing (entry cap), the next files after a process cursor (file and stat
-//! caps), and only the bytes appended since the saved offset (byte and time
-//! caps). It advances only past complete lines of an extent frozen at open,
-//! and commits a file's hashes, offset, anchor and checksum in one census
-//! insert. A file whose identity, size or anchor does not match the saved
-//! state is rebuilt from offset 0. A resumable checksum (wrapping sum of
-//! keyed per-line digests) lets a bounded audit reread `[0, offset)` and
-//! catch a rewrite that kept identity and length (Sol N12).
+//! Shadow only. Each page does a bounded slice of a resumable sweep: one
+//! directory listing (entry cap), the next files after the persisted sweep
+//! cursor, and only the bytes appended since each file's saved offset. All
+//! of it draws on one shared work budget (physical bytes, stats and a
+//! deadline checked inside every read loop), shared with the shadow's other
+//! readers. It advances only past complete lines of an extent frozen at
+//! open, and commits a file's hashes, offset, anchor and checksum in one
+//! census insert. A file whose identity, size or anchor does not match the
+//! saved state is rebuilt from offset 0. A resumable checksum (wrapping sum
+//! of keyed per-line digests) lets an audit reread `[0, offset)` across pages
+//! and catch a rewrite that kept identity and length (Sol N12); no file is
+//! too long to audit. An oversized line is skipped across pages too, its
+//! progress saved, so it never pins the sweep.
+//!
+//! The sweep position (`sweep:tail`) and the missing-sidecar check position
+//! (`sweep:missing`) are census records, saved with the index: a restart
+//! resumes the sweep. `complete_through` is the start time of the last sweep
+//! that read every sidecar without debt; the classifier trusts "no telemetry
+//! owner" only for units older than it.
+//!
+//! Memory: a file's old hashes are moved out of its record (never copied),
+//! merged with the new ones and moved back; the old and new capacities are
+//! admitted before the read. An unchanged file is skipped before anything is
+//! taken.
 
 use super::{ClaudeLocalOtelEvidence, STORE_DIR};
 use crate::snapshots::claude_request_census::{
-    claude_request_hash, ClaudeRequestBirth, ClaudeRequestCensus, ClaudeRequestCensusInsert,
-    ClaudeRequestCensusRecord, ClaudeTelemetryTailState, TELEMETRY_KEY_PREFIX,
+    claude_request_hash, ClaudeLedgerSweep, ClaudeRequestCensus, ClaudeRequestCensusInsert,
+    ClaudeRequestCensusRecord, ClaudeTelemetryAudit, ClaudeTelemetryTailState, SWEEP_KEY_PREFIX,
+    TELEMETRY_KEY_PREFIX,
 };
+use crate::snapshots::claude_request_money::ShadowReservation;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Per-page bounds. Nothing here runs unbounded under the sync lock.
+/// The shadow's shared per-page work budget: physical bytes read, metadata
+/// calls (stat/open) and a deadline. Every reader of the shadow (tail, audit,
+/// missing check, row reconstruction) draws on the same one and checks it
+/// inside its loops.
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeLedgerWork {
+    bytes_left: u64,
+    stats_left: u64,
+    deadline: Instant,
+    /// Some work stopped on the budget (the page leaves debt behind).
+    pub(crate) stopped: bool,
+}
+
+impl ClaudeLedgerWork {
+    pub(crate) fn new(max_bytes: u64, max_stats: u64, max_elapsed: Duration) -> Self {
+        Self {
+            bytes_left: max_bytes,
+            stats_left: max_stats,
+            deadline: Instant::now() + max_elapsed,
+            stopped: false,
+        }
+    }
+
+    pub(crate) fn bytes_left(&self) -> u64 {
+        self.bytes_left
+    }
+
+    /// Debit bytes actually read.
+    pub(crate) fn debit(&mut self, bytes: u64) {
+        self.bytes_left = self.bytes_left.saturating_sub(bytes);
+    }
+
+    /// One metadata call (stat or open); false when none is left or the
+    /// deadline passed.
+    pub(crate) fn stat(&mut self) -> bool {
+        if self.stats_left == 0 || Instant::now() >= self.deadline {
+            self.stopped = true;
+            return false;
+        }
+        self.stats_left -= 1;
+        true
+    }
+
+    /// Bytes or time are out: stop this loop.
+    pub(crate) fn exhausted(&mut self) -> bool {
+        if self.bytes_left == 0 || Instant::now() >= self.deadline {
+            self.stopped = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Per-page bounds of the tail's own selection (the shared work budget
+/// bounds its I/O and time).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClaudeTelemetryTailBudget {
     pub(crate) max_dir_entries: usize,
     pub(crate) max_files: usize,
-    pub(crate) max_stats: usize,
-    pub(crate) max_bytes: u64,
-    pub(crate) max_audit_bytes: u64,
     pub(crate) max_missing_checks: usize,
-    pub(crate) max_elapsed: Duration,
 }
 
 impl Default for ClaudeTelemetryTailBudget {
@@ -42,27 +108,37 @@ impl Default for ClaudeTelemetryTailBudget {
         Self {
             max_dir_entries: 65_536,
             max_files: 256,
-            max_stats: 512,
-            max_bytes: 8 * 1024 * 1024,
-            max_audit_bytes: 4 * 1024 * 1024,
             max_missing_checks: 64,
-            max_elapsed: Duration::from_millis(250),
         }
     }
 }
 
 /// One API row is far below this; a longer line is skipped, never buffered.
-const MAX_LINE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_LINE_BYTES: usize = 256 * 1024;
+const READ_BUFFER_BYTES: usize = 64 * 1024;
 const ANCHOR_BYTES: u64 = 64;
 /// A verified record is audited again after a day (Sol N12).
 const AUDIT_INTERVAL_SECONDS: u64 = 86_400;
+/// The shortest line the reader can keep as a row: the session id (36), a
+/// request id and the JSON keys around them.
+pub(crate) const MIN_ROW_LINE_BYTES: u64 = 48;
 
-/// Fixed memory the reader may hold at once (line buffer, read buffer, the
-/// selection heap and one file's new hashes), charged by the shadow's
-/// admission before it runs.
-pub(crate) fn tail_memory_bound(budget: &ClaudeTelemetryTailBudget) -> usize {
-    let hashes = (budget.max_bytes / 64) as usize * 8;
-    MAX_LINE_BYTES * 2 + 64 * 1024 + budget.max_files * 96 + hashes * 2
+const SWEEP_TAIL_KEY: &str = "sweep:tail";
+const SWEEP_MISSING_KEY: &str = "sweep:missing";
+
+/// Fixed memory the reader holds at once besides one file's hashes (line
+/// buffer, read buffer, the selection heap, the anchor buffer).
+pub(crate) fn tail_fixed_memory(budget: &ClaudeTelemetryTailBudget) -> usize {
+    MAX_LINE_BYTES * 2 + READ_BUFFER_BYTES + budget.max_files * 96 + ANCHOR_BYTES as usize
+}
+
+/// What one file's read may allocate besides the fixed memory: the hashes it
+/// collects (at most one per minimal line), their sort, and the merged vector
+/// beside the old one (old hashes are moved, never copied).
+pub(crate) fn tail_file_memory(old_hashes: usize, read_bytes: u64) -> usize {
+    let new = (read_bytes / MIN_ROW_LINE_BYTES) as usize;
+    new.saturating_mul(16)
+        .saturating_add(old_hashes.saturating_add(new).saturating_mul(8))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -70,82 +146,139 @@ pub(crate) struct ClaudeTelemetryTailCounts {
     pub(crate) dir_entries: u64,
     pub(crate) dir_entry_cap_hit: bool,
     pub(crate) files_selected: u64,
-    pub(crate) stats: u64,
     pub(crate) files_unchanged: u64,
     pub(crate) files_appended: u64,
     pub(crate) files_rebuilt: u64,
     pub(crate) files_raced: u64,
     pub(crate) files_unreadable: u64,
+    pub(crate) files_refused_memory: u64,
     pub(crate) bytes_read: u64,
     pub(crate) rows_valid: u64,
     pub(crate) rows_refused: u64,
     pub(crate) lines_oversized: u64,
     pub(crate) records_tombstoned: u64,
     pub(crate) records_refused: u64,
-    pub(crate) audits: u64,
+    pub(crate) audits_started: u64,
+    pub(crate) audits_completed: u64,
     pub(crate) audit_bytes: u64,
     pub(crate) audit_mismatches: u64,
     pub(crate) retired_missing: u64,
     pub(crate) budget_stopped: bool,
     pub(crate) sweep_wrapped: bool,
+    /// The sweep that just wrapped had debt (it does not advance
+    /// `complete_through`).
+    pub(crate) sweep_debt: bool,
+    pub(crate) sweep_complete_through: u64,
 }
-
-/// Process cursors per support directory: the last sidecar stem read and the
-/// last telemetry key checked for a missing sidecar. Memory only; a restart
-/// starts a fresh fair sweep.
-static CURSORS: Mutex<BTreeMap<PathBuf, (String, String)>> = Mutex::new(BTreeMap::new());
 
 pub(crate) struct ClaudeTelemetryTail;
 
 impl ClaudeTelemetryTail {
-    /// Read one bounded slice of the sidecars into `census`'s `otel:` records.
+    /// Read one bounded slice of the sweep into `census`'s `otel:` records.
     pub(crate) fn advance(
         support_dir: &Path,
         census: &mut ClaudeRequestCensus,
         now_unix: u64,
         budget: &ClaudeTelemetryTailBudget,
+        work: &mut ClaudeLedgerWork,
     ) -> ClaudeTelemetryTailCounts {
-        let started = Instant::now();
         let mut counts = ClaudeTelemetryTailCounts::default();
         let dir = support_dir.join(STORE_DIR);
-        let (mut cursor, mut missing_cursor) = CURSORS
-            .lock()
-            .map(|cursors| cursors.get(support_dir).cloned().unwrap_or_default())
-            .unwrap_or_default();
+        let (mut cursor, mut sweep_start, mut sweep) = sweep_state(census, SWEEP_TAIL_KEY);
+        if cursor.is_empty() && sweep_start == 0 {
+            sweep_start = now_unix;
+        }
         let selected = select_after(&dir, &cursor, budget, &mut counts);
-        let mut bytes_left = budget.max_bytes;
-        let mut exhausted = selected.len() < budget.max_files && !counts.dir_entry_cap_hit;
+        if counts.dir_entry_cap_hit {
+            // Enumeration saw a subset: this sweep cannot certify every file.
+            sweep.debt = 1;
+        }
+        let mut finished = selected.len() < budget.max_files;
         for stem in &selected {
-            if started.elapsed() >= budget.max_elapsed
-                || bytes_left == 0
-                || counts.stats as usize >= budget.max_stats
-            {
-                counts.budget_stopped = true;
-                exhausted = false;
+            if work.exhausted() {
+                finished = false;
                 break;
             }
-            let complete = read_file(&dir, stem, census, now_unix, &mut bytes_left, &mut counts);
-            if !complete {
-                // Byte budget ran out inside the file: continue it next page.
-                counts.budget_stopped = true;
-                exhausted = false;
-                break;
+            match read_file(&dir, stem, census, now_unix, work, &mut counts) {
+                FileRead::Done => cursor.clone_from(stem),
+                FileRead::Debt => {
+                    sweep.debt = 1;
+                    cursor.clone_from(stem);
+                }
+                FileRead::Stopped => {
+                    work.stopped = true;
+                    finished = false;
+                    break;
+                }
             }
-            cursor.clone_from(stem);
         }
-        if exhausted {
-            cursor.clear();
+        if finished {
             counts.sweep_wrapped = true;
+            counts.sweep_debt = sweep.debt != 0;
+            if sweep.debt == 0 {
+                sweep.complete_through = sweep_start;
+            }
+            cursor.clear();
+            sweep.debt = 0;
+            sweep_start = now_unix;
         }
-        if started.elapsed() < budget.max_elapsed {
-            audit_one(&dir, census, now_unix, budget, &mut counts);
-            retire_missing(&dir, census, &mut missing_cursor, budget, &mut counts);
+        counts.sweep_complete_through = sweep.complete_through;
+        save_sweep(census, SWEEP_TAIL_KEY, &cursor, sweep_start, sweep);
+        // An audit slice needs room for one longest line (a shorter slice
+        // could not pass it); with less left it waits for the next page.
+        if !work.exhausted() && work.bytes_left() > MAX_LINE_BYTES as u64 + ANCHOR_BYTES {
+            audit_step(&dir, census, now_unix, work, &mut counts);
         }
-        if let Ok(mut cursors) = CURSORS.lock() {
-            cursors.insert(support_dir.to_path_buf(), (cursor, missing_cursor));
+        if !work.exhausted() {
+            retire_missing(&dir, census, budget, work, &mut counts);
         }
+        counts.budget_stopped = work.stopped;
         counts
     }
+}
+
+/// The telemetry sweep's `complete_through` (0: never completed).
+pub(crate) fn telemetry_complete_through(census: &ClaudeRequestCensus) -> u64 {
+    sweep_state(census, SWEEP_TAIL_KEY).2.complete_through
+}
+
+/// A sweep record's (cursor stem, sweep start, state). The cursor is the
+/// record's fingerprint bytes as hex (all zero: the start).
+fn sweep_state(census: &ClaudeRequestCensus, key: &str) -> (String, u64, ClaudeLedgerSweep) {
+    match census.get(key).and_then(ClaudeRequestCensusRecord::sweep) {
+        Some((cursor, start, sweep)) => {
+            let stem = if cursor.iter().all(|byte| *byte == 0) {
+                String::new()
+            } else {
+                cursor.iter().map(|byte| format!("{byte:02x}")).collect()
+            };
+            (stem, start, sweep)
+        }
+        None => (String::new(), 0, ClaudeLedgerSweep::default()),
+    }
+}
+
+fn save_sweep(
+    census: &mut ClaudeRequestCensus,
+    key: &str,
+    cursor: &str,
+    start: u64,
+    sweep: ClaudeLedgerSweep,
+) {
+    let mut bytes = [0_u8; 32];
+    if cursor.len() == 64 {
+        for (slot, pair) in bytes.iter_mut().zip(cursor.as_bytes().chunks_exact(2)) {
+            *slot = std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .unwrap_or(0);
+        }
+    }
+    debug_assert!(key.starts_with(SWEEP_KEY_PREFIX));
+    let _ = census.insert(
+        key.to_owned(),
+        ClaudeRequestCensusRecord::sweep_record(bytes, start, sweep),
+    );
 }
 
 /// `<64 lowercase hex>.jsonl`, the only names the API sidecar writer makes.
@@ -158,7 +291,9 @@ fn sidecar_stem(name: &str) -> Option<&str> {
     .then_some(stem)
 }
 
-/// The smallest `max_files` sidecar stems after `cursor`, in order.
+/// The smallest `max_files` sidecar stems after `cursor`, in order. When the
+/// listing was capped and nothing after the cursor was seen, it wraps to the
+/// smallest stems seen (the sweep never pins on an unlucky listing).
 fn select_after(
     dir: &Path,
     cursor: &str,
@@ -168,7 +303,19 @@ fn select_after(
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut heap = BinaryHeap::new();
+    let mut after = BinaryHeap::new();
+    let mut smallest = BinaryHeap::new();
+    let keep = |heap: &mut BinaryHeap<String>, stem: &str| {
+        if heap.len() < budget.max_files {
+            heap.push(stem.to_owned());
+        } else if heap
+            .peek()
+            .is_some_and(|largest: &String| stem < largest.as_str())
+        {
+            heap.pop();
+            heap.push(stem.to_owned());
+        }
+    };
     for entry in entries {
         if counts.dir_entries as usize >= budget.max_dir_entries {
             counts.dir_entry_cap_hit = true;
@@ -180,19 +327,17 @@ fn select_after(
         let Some(stem) = name.to_str().and_then(sidecar_stem) else {
             continue;
         };
-        if stem <= cursor {
-            continue;
-        }
-        if heap.len() < budget.max_files {
-            heap.push(stem.to_owned());
-        } else if heap
-            .peek()
-            .is_some_and(|largest: &String| stem < largest.as_str())
-        {
-            heap.pop();
-            heap.push(stem.to_owned());
+        if stem > cursor {
+            keep(&mut after, stem);
+        } else if counts.dir_entry_cap_hit || after.is_empty() {
+            keep(&mut smallest, stem);
         }
     }
+    let heap = if after.is_empty() && counts.dir_entry_cap_hit {
+        smallest
+    } else {
+        after
+    };
     let mut selected = heap.into_vec();
     selected.sort_unstable();
     counts.files_selected = selected.len() as u64;
@@ -213,29 +358,33 @@ fn first_u64(bytes: &[u8]) -> u64 {
 }
 
 /// Digest of the (up to) 64 bytes before `offset`, read from the open file.
-fn anchor_at(file: &mut File, offset: u64) -> Option<u64> {
+fn anchor_at(file: &mut File, offset: u64, work: &mut ClaudeLedgerWork) -> Option<u64> {
     let start = offset.saturating_sub(ANCHOR_BYTES);
-    let mut bytes = vec![0_u8; (offset - start) as usize];
+    let mut bytes = [0_u8; ANCHOR_BYTES as usize];
+    let bytes = &mut bytes[..(offset - start) as usize];
     file.seek(SeekFrom::Start(start)).ok()?;
-    file.read_exact(&mut bytes).ok()?;
+    file.read_exact(bytes).ok()?;
+    work.debit(bytes.len() as u64);
     let mut digest = Sha256::new();
     digest.update(b"claude_telemetry_anchor:v1\0");
-    digest.update(&bytes);
+    digest.update(&*bytes);
     Some(first_u64(&digest.finalize()))
 }
 
 #[cfg(unix)]
-fn identity(metadata: &fs::Metadata) -> (u64, u64) {
+pub(crate) fn identity(metadata: &fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (metadata.dev(), metadata.ino())
 }
 
 #[cfg(not(unix))]
-fn identity(_: &fs::Metadata) -> (u64, u64) {
+pub(crate) fn identity(_: &fs::Metadata) -> (u64, u64) {
     (0, 0)
 }
 
-fn open_sidecar(path: &Path) -> Option<(File, fs::Metadata)> {
+/// Open a sidecar for reading; a missing file is `Ok(None)`, anything else
+/// that is not a readable regular file is `Err(())`.
+pub(crate) fn open_sidecar(path: &Path) -> Result<Option<(File, fs::Metadata)>, ()> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -244,9 +393,17 @@ fn open_sidecar(path: &Path) -> Option<(File, fs::Metadata)> {
         // A stat/open race to a FIFO must refuse without blocking at open.
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options.open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    metadata.is_file().then_some((file, metadata))
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let metadata = file.metadata().map_err(|_| ())?;
+    if metadata.is_file() {
+        Ok(Some((file, metadata)))
+    } else {
+        Err(())
+    }
 }
 
 fn modified_unix(metadata: &fs::Metadata) -> u64 {
@@ -257,229 +414,350 @@ fn modified_unix(metadata: &fs::Metadata) -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// What a run of complete lines contributed.
-struct Consumed {
-    bytes: u64,
-    line_sum: u64,
-    hashes: Vec<u64>,
-    /// Stopped before the extent end on a partial line or the byte budget.
-    stopped_early: bool,
+/// A reader that counts the physical bytes it returns (read-ahead included).
+pub(crate) struct CountingRead<R> {
+    inner: R,
+    pub(crate) read: u64,
 }
 
-/// Read complete lines of `[start, end)` from `reader`, at most `limit` bytes.
-fn consume_lines(
+impl<R> CountingRead<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self { inner, read: 0 }
+    }
+}
+
+impl<R: Read> Read for CountingRead<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.read += read as u64;
+        Ok(read)
+    }
+}
+
+/// Where a line scan stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineStop {
+    /// The whole range was consumed.
+    End,
+    /// A partial last line (no newline yet): not consumed.
+    Partial,
+    /// Inside an oversized line: `skip` bytes of it were passed.
+    Skipping { skip: u64 },
+    /// The work budget ran out between lines.
+    Budget,
+    /// A read error.
+    Failed,
+}
+
+/// Complete lines of `[start, start + range)` read from `reader` (already
+/// positioned at `start + skip`). `skip` > 0 resumes an oversized line. Each
+/// complete line (and each finished oversized line, by a marker of its
+/// length) adds to `line_sum`; `on_line` sees each complete line.
+pub(crate) struct LineScan {
+    pub(crate) consumed: u64,
+    pub(crate) line_sum: u64,
+    pub(crate) stop: LineStop,
+}
+
+pub(crate) fn scan_lines(
     reader: &mut impl BufRead,
-    stem: &str,
+    range: u64,
     start_sum: u64,
-    extent: u64,
-    limit: u64,
-    counts: &mut ClaudeTelemetryTailCounts,
-    collect: bool,
-) -> Consumed {
-    let mut consumed = Consumed {
-        bytes: 0,
+    skip: u64,
+    work: &mut ClaudeLedgerWork,
+    counts_oversized: &mut u64,
+    mut on_line: impl FnMut(&[u8]),
+) -> LineScan {
+    let mut scan = LineScan {
+        consumed: 0,
         line_sum: start_sum,
-        hashes: Vec::new(),
-        stopped_early: false,
+        stop: LineStop::End,
     };
+    let mut skipping = (skip > 0).then_some(skip);
     let mut line = Vec::new();
-    let readable = extent.min(limit);
-    while consumed.bytes < readable {
+    loop {
+        let position = scan.consumed + skipping.unwrap_or(0);
+        if position >= range {
+            scan.stop = match skipping {
+                Some(skip) => LineStop::Skipping { skip },
+                None => LineStop::End,
+            };
+            return scan;
+        }
+        if work.exhausted() {
+            scan.stop = match skipping {
+                Some(skip) => LineStop::Skipping { skip },
+                None => LineStop::Budget,
+            };
+            return scan;
+        }
+        if let Some(skip) = skipping {
+            // Pass an oversized line chunk by chunk up to its newline.
+            let buffer = match reader.fill_buf() {
+                Ok(buffer) if !buffer.is_empty() => buffer,
+                Ok(_) => {
+                    scan.stop = LineStop::Skipping { skip };
+                    return scan;
+                }
+                Err(_) => {
+                    scan.stop = LineStop::Failed;
+                    return scan;
+                }
+            };
+            let room = (range - position) as usize;
+            let buffer = &buffer[..buffer.len().min(room)];
+            let (take, hit) = match buffer.iter().position(|byte| *byte == b'\n') {
+                Some(at) => (at + 1, true),
+                None => (buffer.len(), false),
+            };
+            reader.consume(take);
+            let skip = skip + take as u64;
+            if hit {
+                scan.line_sum = scan.line_sum.wrapping_add(line_digest(&skip.to_be_bytes()));
+                scan.consumed += skip;
+                skipping = None;
+            } else {
+                skipping = Some(skip);
+            }
+            continue;
+        }
         line.clear();
-        let window = (readable - consumed.bytes).min(MAX_LINE_BYTES as u64 + 1);
+        let window = (range - position).min(MAX_LINE_BYTES as u64 + 1);
         match reader.by_ref().take(window).read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => {
-                consumed.stopped_early = true;
-                break;
+            Ok(0) => {
+                scan.stop = LineStop::Partial;
+                return scan;
+            }
+            Err(_) => {
+                scan.stop = LineStop::Failed;
+                return scan;
             }
             Ok(_) => {}
         }
         if line.last() != Some(&b'\n') {
             if line.len() > MAX_LINE_BYTES {
-                // Skip an oversized line up to its newline, never buffer it.
-                counts.lines_oversized += 1;
-                let mut skipped = line.len() as u64;
-                let mut found = false;
-                while consumed.bytes + skipped < readable {
-                    let buffer = match reader.fill_buf() {
-                        Ok(buffer) if !buffer.is_empty() => buffer,
-                        _ => break,
-                    };
-                    let room = (readable - consumed.bytes - skipped) as usize;
-                    let buffer = &buffer[..buffer.len().min(room)];
-                    let (take, hit) = match buffer.iter().position(|byte| *byte == b'\n') {
-                        Some(position) => (position + 1, true),
-                        None => (buffer.len(), false),
-                    };
-                    reader.consume(take);
-                    skipped += take as u64;
-                    if hit {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    consumed.stopped_early = true;
-                    break;
-                }
-                // The skipped line's bytes are part of the checksum too,
-                // but are not retained: digest a marker of its length.
-                consumed.line_sum = consumed
-                    .line_sum
-                    .wrapping_add(line_digest(&skipped.to_be_bytes()));
-                consumed.bytes += skipped;
+                *counts_oversized += 1;
+                skipping = Some(line.len() as u64);
                 continue;
             }
             // A partial last line: not consumed until its newline arrives.
-            consumed.stopped_early = true;
-            break;
+            scan.stop = LineStop::Partial;
+            return scan;
         }
-        consumed.bytes += line.len() as u64;
-        consumed.line_sum = consumed.line_sum.wrapping_add(line_digest(&line));
-        if !collect {
-            continue;
-        }
-        let row = serde_json::from_slice::<ClaudeLocalOtelEvidence>(&line).ok();
-        match row.filter(|row| {
-            format!("{:x}", Sha256::digest(row.session_id.as_bytes())) == stem
-                && crate::snapshots::validate_claude_api_row(row, &row.session_id)
-        }) {
-            Some(row) => {
-                counts.rows_valid += 1;
-                consumed.hashes.push(claude_request_hash(&row.request_id));
-            }
-            None => counts.rows_refused += 1,
-        }
+        scan.consumed += line.len() as u64;
+        scan.line_sum = scan.line_sum.wrapping_add(line_digest(&line));
+        on_line(&line);
     }
-    consumed
 }
 
-/// Returns false when the byte budget stopped the read inside this file.
+/// A valid API row's request hash and event clock, or None (refused).
+fn row_hash(line: &[u8], stem: &str) -> Option<(u64, u64)> {
+    let row = serde_json::from_slice::<ClaudeLocalOtelEvidence>(line).ok()?;
+    (format!("{:x}", Sha256::digest(row.session_id.as_bytes())) == stem
+        && crate::snapshots::validate_claude_api_row(&row, &row.session_id))
+    .then(|| {
+        (
+            claude_request_hash(&row.request_id),
+            event_unix(&row.observed_at),
+        )
+    })
+}
+
+/// An RFC 3339 clock in unix seconds; 0 when unknown.
+pub(crate) fn event_unix(value: &str) -> u64 {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .and_then(|clock| u64::try_from(clock.unix_timestamp()).ok())
+        .unwrap_or(0)
+}
+
+enum FileRead {
+    /// Read to its frozen extent (or unchanged, or gone).
+    Done,
+    /// Cannot be certified this sweep (unreadable, raced, refused).
+    Debt,
+    /// The work budget stopped it: resume here next page.
+    Stopped,
+}
+
 fn read_file(
     dir: &Path,
     stem: &str,
     census: &mut ClaudeRequestCensus,
     now_unix: u64,
-    bytes_left: &mut u64,
+    work: &mut ClaudeLedgerWork,
     counts: &mut ClaudeTelemetryTailCounts,
-) -> bool {
+) -> FileRead {
     let key = format!("{TELEMETRY_KEY_PREFIX}{stem}");
     let path = dir.join(format!("{stem}.jsonl"));
-    counts.stats += 1;
-    let Some((mut file, opened)) = open_sidecar(&path) else {
-        counts.files_unreadable += 1;
-        return true;
+    // Two metadata calls: the open and the check after the read.
+    if !work.stat() || !work.stat() {
+        return FileRead::Stopped;
+    }
+    let (mut file, opened) = match open_sidecar(&path) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return FileRead::Done,
+        Err(()) => {
+            counts.files_unreadable += 1;
+            return FileRead::Debt;
+        }
     };
     let (device, inode) = identity(&opened);
     // The extent is frozen at open: rows appended later wait for a page.
     let extent = opened.len();
-    let previous = census.get(&key).cloned();
-    let saved = previous.as_ref().and_then(|record| record.tail().copied());
-    let resume = saved.filter(|state| {
-        state.device == device
-            && state.inode == inode
-            && extent >= state.offset
-            && anchor_at(&mut file, state.offset) == Some(state.anchor)
-    });
-    let (start, start_sum, mut hashes) = match (resume, previous.as_ref()) {
-        (Some(state), Some(record)) => (
-            state.offset,
-            state.line_sum,
-            record.request_hashes().to_vec(),
-        ),
-        _ => {
-            if previous.is_some() {
-                counts.files_rebuilt += 1;
+    let saved = census.get(&key).and_then(|record| record.tail().copied());
+    let resume = match saved {
+        Some(state)
+            if state.device == device
+                && state.inode == inode
+                && extent >= state.offset + state.skip_bytes =>
+        {
+            match anchor_at(&mut file, state.offset, work) {
+                Some(anchor) if anchor == state.anchor => Some(state),
+                _ => None,
             }
-            (0, 0, Vec::new())
         }
+        _ => None,
     };
-    if resume.is_some() && start == extent {
+    let start = resume.map_or(0, |state| state.offset);
+    let skip = resume.map_or(0, |state| state.skip_bytes);
+    if resume.is_some() && start + skip == extent {
         counts.files_unchanged += 1;
-        return true;
+        return FileRead::Done;
     }
-    if file.seek(SeekFrom::Start(start)).is_err() {
+    if saved.is_some() && resume.is_none() {
+        counts.files_rebuilt += 1;
+    }
+    // Admit this file's hashes before reading: its old hashes (moved, not
+    // copied), the new ones it can collect and their merge.
+    let old_hashes = if resume.is_some() {
+        census
+            .get(&key)
+            .map_or(0, |record| record.request_hashes().len())
+    } else {
+        0
+    };
+    let read_bytes = (extent - start - skip).min(work.bytes_left());
+    let Some(_admitted) = ShadowReservation::admit(tail_file_memory(old_hashes, read_bytes)) else {
+        counts.files_refused_memory += 1;
+        return FileRead::Debt;
+    };
+    if file.seek(SeekFrom::Start(start + skip)).is_err() {
         counts.files_unreadable += 1;
-        return true;
+        return FileRead::Debt;
     }
-    // The byte budget, not the file, ends this read: resume here next page.
-    let budget_cut = extent - start > *bytes_left;
-    let mut reader = BufReader::with_capacity(64 * 1024, &mut file);
-    let consumed = consume_lines(
-        &mut reader,
-        stem,
-        start_sum,
-        extent - start,
-        *bytes_left,
-        counts,
-        true,
-    );
-    drop(reader);
-    *bytes_left = bytes_left.saturating_sub(consumed.bytes);
-    counts.bytes_read += consumed.bytes;
-    let offset = start + consumed.bytes;
+    let mut collected = Vec::new();
+    let mut first_event = resume.map_or(0, |state| state.first_event_unix);
+    let (rows_valid, rows_refused) = (&mut counts.rows_valid, &mut counts.rows_refused);
+    let mut counting = CountingRead::new((&mut file).take(read_bytes));
+    let scan = {
+        let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, &mut counting);
+        scan_lines(
+            &mut reader,
+            extent - start,
+            resume.map_or(0, |state| state.line_sum),
+            skip,
+            work,
+            &mut counts.lines_oversized,
+            |line| match row_hash(line, stem) {
+                Some((hash, clock)) => {
+                    *rows_valid += 1;
+                    collected.push(hash);
+                    if clock > 0 && (first_event == 0 || clock < first_event) {
+                        first_event = clock;
+                    }
+                }
+                None => *rows_refused += 1,
+            },
+        )
+    };
+    work.debit(counting.read);
+    counts.bytes_read += counting.read;
+    if scan.stop == LineStop::Failed {
+        counts.files_unreadable += 1;
+        return FileRead::Debt;
+    }
+    let offset = start + scan.consumed;
+    let skip_bytes = match scan.stop {
+        LineStop::Skipping { skip } => skip,
+        _ => 0,
+    };
     // The object we read must still be the one at the path, and must not
     // have shrunk under the consumed extent.
-    counts.stats += 1;
-    let still = fs::symlink_metadata(&path)
-        .ok()
-        .filter(|metadata| identity(metadata) == (device, inode) && metadata.len() >= offset);
+    let still = fs::symlink_metadata(&path).ok().filter(|metadata| {
+        identity(metadata) == (device, inode) && metadata.len() >= offset + skip_bytes
+    });
     let Some(after) = still else {
         counts.files_raced += 1;
-        return true;
+        return FileRead::Debt;
     };
-    let Some(anchor) = anchor_at(&mut file, offset) else {
+    let Some(anchor) = anchor_at(&mut file, offset, work) else {
         counts.files_unreadable += 1;
-        return true;
+        return FileRead::Debt;
     };
-    let mut added = consumed.hashes;
-    added.sort_unstable();
-    added.dedup();
-    hashes = merge_sorted(&hashes, &added);
+    collected.sort_unstable();
+    collected.dedup();
+    // Move the old record's hashes out (no copy), merge, move back. A
+    // rebuild drops them; the first-seen time stays with the same object.
+    let previous = census.take(&key);
     let first_seen = previous
         .as_ref()
         .and_then(ClaudeRequestCensusRecord::birth)
         .filter(|birth| birth.device == device && birth.inode == inode)
         .map_or(now_unix, |birth| birth.unix_seconds);
+    let (old, retired) = match previous {
+        Some(mut record) if resume.is_some() => (record.take_request_hashes(), record.retired()),
+        _ => (Vec::new(), None),
+    };
+    let hashes = merge_sorted(old, collected);
     let tail = ClaudeTelemetryTailState {
         device,
         inode,
         offset,
         anchor,
-        line_sum: consumed.line_sum,
+        line_sum: scan.line_sum,
         last_append_unix: modified_unix(&after),
         audited_offset: resume.map_or(0, |state| state.audited_offset),
         audited_unix: resume.map_or(0, |state| state.audited_unix),
         missing_sweeps: 0,
+        first_event_unix: first_event,
+        skip_bytes,
+        audit: resume.and_then(|state| state.audit),
     };
     let mut record = ClaudeRequestCensusRecord::telemetry(hashes, tail, first_seen);
-    debug_assert_eq!(
-        record.birth(),
-        Some(ClaudeRequestBirth {
-            unix_seconds: first_seen,
-            device,
-            inode
-        })
-    );
-    if resume.is_some() {
-        record.carry_retired(
-            previous
-                .as_ref()
-                .and_then(ClaudeRequestCensusRecord::retired),
-        );
-    }
+    record.carry_retired(retired);
     match census.insert(key, record) {
         ClaudeRequestCensusInsert::Stored => {}
-        ClaudeRequestCensusInsert::Tombstone => counts.records_tombstoned += 1,
-        ClaudeRequestCensusInsert::Refused => counts.records_refused += 1,
+        ClaudeRequestCensusInsert::Tombstone => {
+            counts.records_tombstoned += 1;
+            return FileRead::Debt;
+        }
+        ClaudeRequestCensusInsert::Refused => {
+            counts.records_refused += 1;
+            return FileRead::Debt;
+        }
     }
     if resume.is_some() {
         counts.files_appended += 1;
     }
-    !(budget_cut && offset < extent)
+    let budget_cut = read_bytes < extent - start - skip;
+    if scan.stop == LineStop::Budget || (budget_cut && offset + skip_bytes < extent) {
+        // The budget ended this read: continue it next page. (A partial last
+        // line the writer has not finished waits for the next sweep.)
+        return FileRead::Stopped;
+    }
+    FileRead::Done
 }
 
-fn merge_sorted(left: &[u64], right: &[u64]) -> Vec<u64> {
+/// Merge two sorted unique vectors into one, reusing `left`'s allocation
+/// when it has room (no third buffer beyond the admitted merge).
+fn merge_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+    if right.is_empty() {
+        return left;
+    }
+    if left.is_empty() {
+        return right;
+    }
     let mut merged = Vec::with_capacity(left.len() + right.len());
     let (mut i, mut j) = (0, 0);
     while i < left.len() && j < right.len() {
@@ -504,96 +782,167 @@ fn merge_sorted(left: &[u64], right: &[u64]) -> Vec<u64> {
     merged
 }
 
-/// Reread `[0, offset)` of the least recently audited record that fits the
-/// audit budget and compare the resumable checksum. A mismatch drops the
-/// record (rebuilt from 0 next page) and is counted, never trusted.
-fn audit_one(
+/// One bounded step of the audit: continue the audit in progress, else start
+/// one on the least recently audited due record. An audit rereads
+/// `[0, target)` across pages and compares the resumable checksum; a mismatch
+/// drops the record (rebuilt from 0 next sweep) and is counted.
+fn audit_step(
     dir: &Path,
     census: &mut ClaudeRequestCensus,
     now_unix: u64,
-    budget: &ClaudeTelemetryTailBudget,
+    work: &mut ClaudeLedgerWork,
     counts: &mut ClaudeTelemetryTailCounts,
 ) {
-    let Some((key, state)) = census
+    let chosen = census
         .records()
         .filter_map(|(key, record)| {
             let state = record.tail()?;
-            // Due: unverified bytes, or a full day since the last audit.
-            (key.starts_with(TELEMETRY_KEY_PREFIX)
-                && state.offset > 0
-                && state.offset <= budget.max_audit_bytes
-                && (state.audited_offset < state.offset
-                    || now_unix.saturating_sub(state.audited_unix) >= AUDIT_INTERVAL_SECONDS))
-                .then_some((key, *state))
+            if !key.starts_with(TELEMETRY_KEY_PREFIX) || state.offset == 0 {
+                return None;
+            }
+            let in_progress = state.audit.is_some();
+            let due = state.audited_offset < state.offset
+                || now_unix.saturating_sub(state.audited_unix) >= AUDIT_INTERVAL_SECONDS;
+            (in_progress || due).then_some((!in_progress, state.audited_unix, key))
         })
-        .min_by_key(|(key, state)| (state.audited_unix, (*key).clone()))
-        .map(|(key, state)| (key.clone(), state))
-    else {
+        .min()
+        .map(|(_, _, key)| key.clone());
+    let Some(key) = chosen else {
         return;
+    };
+    let Some(state) = census.get(&key).and_then(|record| record.tail().copied()) else {
+        return;
+    };
+    let audit = match state.audit {
+        Some(audit) => audit,
+        None => {
+            counts.audits_started += 1;
+            ClaudeTelemetryAudit {
+                target_offset: state.offset,
+                target_sum: state.line_sum,
+                position: 0,
+                partial_sum: 0,
+                skip_bytes: 0,
+            }
+        }
     };
     let stem = &key[TELEMETRY_KEY_PREFIX.len()..];
-    counts.stats += 1;
-    let Some((mut file, opened)) = open_sidecar(&dir.join(format!("{stem}.jsonl"))) else {
+    if !work.stat() {
         return;
+    }
+    let (mut file, opened) = match open_sidecar(&dir.join(format!("{stem}.jsonl"))) {
+        Ok(Some(opened)) => opened,
+        // Gone or not a file: the tail or the missing check handles it.
+        _ => {
+            update_tail(census, &key, |tail| tail.audit = None);
+            return;
+        }
     };
-    if identity(&opened) != (state.device, state.inode) || opened.len() < state.offset {
+    if identity(&opened) != (state.device, state.inode) || opened.len() < audit.target_offset {
         // The next read sees the replacement and rebuilds.
+        update_tail(census, &key, |tail| tail.audit = None);
         return;
     }
-    if file.seek(SeekFrom::Start(0)).is_err() {
+    if file
+        .seek(SeekFrom::Start(audit.position + audit.skip_bytes))
+        .is_err()
+    {
         return;
     }
-    counts.audits += 1;
-    let mut reader = BufReader::with_capacity(64 * 1024, &mut file);
-    let consumed = consume_lines(
-        &mut reader,
-        stem,
-        0,
-        state.offset,
-        state.offset,
-        counts,
-        false,
-    );
-    counts.audit_bytes += consumed.bytes;
-    if consumed.bytes != state.offset || consumed.line_sum != state.line_sum {
-        counts.audit_mismatches += 1;
-        census.remove(&key);
-        return;
-    }
-    if let Some(mut record) = census.get(&key).cloned() {
-        let mut tail = state;
-        tail.audited_offset = state.offset;
-        tail.audited_unix = now_unix;
-        let first_seen = record.birth().map_or(now_unix, |birth| birth.unix_seconds);
-        let retired = record.retired();
-        let hashes = record.request_hashes().to_vec();
-        record = ClaudeRequestCensusRecord::telemetry(hashes, tail, first_seen);
-        record.carry_retired(retired);
-        let _ = census.insert(key, record);
+    let range = audit.target_offset - audit.position;
+    let limit = (range - audit.skip_bytes).min(work.bytes_left());
+    let mut counting = CountingRead::new((&mut file).take(limit));
+    let scan = {
+        let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, &mut counting);
+        let mut oversized = 0;
+        scan_lines(
+            &mut reader,
+            range,
+            audit.partial_sum,
+            audit.skip_bytes,
+            work,
+            &mut oversized,
+            |_| {},
+        )
+    };
+    work.debit(counting.read);
+    counts.audit_bytes += counting.read;
+    let next = ClaudeTelemetryAudit {
+        position: audit.position + scan.consumed,
+        partial_sum: scan.line_sum,
+        skip_bytes: match scan.stop {
+            LineStop::Skipping { skip } => skip,
+            _ => 0,
+        },
+        ..audit
+    };
+    let reached = next.position == audit.target_offset && next.skip_bytes == 0;
+    let budget_cut = limit < range - audit.skip_bytes;
+    match scan.stop {
+        LineStop::End if reached && next.partial_sum == audit.target_sum => {
+            counts.audits_completed += 1;
+            update_tail(census, &key, |tail| {
+                tail.audit = None;
+                tail.audited_offset = audit.target_offset;
+                tail.audited_unix = now_unix;
+            });
+        }
+        // Budget or time: resume next page from here.
+        LineStop::Budget | LineStop::Skipping { .. } => {
+            update_tail(census, &key, |tail| tail.audit = Some(next));
+        }
+        LineStop::Partial if !reached && budget_cut => {
+            update_tail(census, &key, |tail| tail.audit = Some(next));
+        }
+        // A checksum mismatch, or the target no longer ending on a line
+        // boundary: a rewrite. Rebuilt from 0 by the next sweep.
+        _ => {
+            counts.audit_mismatches += 1;
+            census.remove(&key);
+        }
     }
 }
 
-/// Round-robin over telemetry records: a record whose sidecar no longer
-/// exists is removed (the ledger loses that root's claims; a later copy then
-/// falls back to policy).
+/// Replace a telemetry record's tail state in place (the hashes move).
+fn update_tail(
+    census: &mut ClaudeRequestCensus,
+    key: &str,
+    change: impl FnOnce(&mut ClaudeTelemetryTailState),
+) {
+    if let Some(record) = census.take(key) {
+        let mut tail = record.tail().copied().unwrap_or_default();
+        change(&mut tail);
+        let _ = census.insert(key.to_owned(), record.with_tail(tail));
+    }
+}
+
+/// Round-robin over telemetry records from the persisted `sweep:missing`
+/// cursor: a record whose sidecar no longer exists is removed (the ledger
+/// loses that root's claims; a later copy then falls back to policy).
 fn retire_missing(
     dir: &Path,
     census: &mut ClaudeRequestCensus,
-    cursor: &mut String,
     budget: &ClaudeTelemetryTailBudget,
+    work: &mut ClaudeLedgerWork,
     counts: &mut ClaudeTelemetryTailCounts,
 ) {
+    let (cursor, start, sweep) = sweep_state(census, SWEEP_MISSING_KEY);
+    let cursor_key = format!("{TELEMETRY_KEY_PREFIX}{cursor}");
     let due = census
         .records()
         .map(|(key, _)| key)
-        .filter(|key| key.starts_with(TELEMETRY_KEY_PREFIX) && key.as_str() > cursor.as_str())
+        .filter(|key| key.starts_with(TELEMETRY_KEY_PREFIX) && key.as_str() > cursor_key.as_str())
         .take(budget.max_missing_checks)
         .cloned()
         .collect::<Vec<_>>();
-    let wrapped = due.len() < budget.max_missing_checks;
+    let mut wrapped = due.len() < budget.max_missing_checks;
+    let mut last = cursor;
     for key in due {
+        if !work.stat() {
+            wrapped = false;
+            break;
+        }
         let stem = &key[TELEMETRY_KEY_PREFIX.len()..];
-        counts.stats += 1;
         match fs::symlink_metadata(dir.join(format!("{stem}.jsonl"))) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 census.remove(&key);
@@ -601,16 +950,10 @@ fn retire_missing(
             }
             _ => {}
         }
-        cursor.clone_from(&key);
+        last = stem.to_owned();
     }
     if wrapped {
-        cursor.clear();
+        last.clear();
     }
-}
-
-#[cfg(test)]
-pub(crate) fn reset_cursors_for_test(support_dir: &Path) {
-    if let Ok(mut cursors) = CURSORS.lock() {
-        cursors.remove(support_dir);
-    }
+    save_sweep(census, SWEEP_MISSING_KEY, &last, start, sweep);
 }
