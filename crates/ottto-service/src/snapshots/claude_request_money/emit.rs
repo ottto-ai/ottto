@@ -190,6 +190,15 @@ mod tests {
     #[test]
     fn literal_emission_preserves_attribution_and_costs_only_own_priced_grains() {
         let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        item.attribution_facts = crate::session_attribution::claude_desktop_spawn_facts(
+            "94bd328b-f2a9-4c31-bbfe-e174d41b4310",
+            "da1dc804-1c50-4401-8c3c-0898b126772f",
+            "2026-10-18T10:20:00Z",
+        );
+        assert!(
+            !item.attribution_facts.is_empty(),
+            "spawn conservation must be nonvacuous"
+        );
         let facts = serde_json::to_value(&item.attribution_facts).unwrap();
         let mut entity = ClaudeEntityBody::default();
         for (model, origin, cost, tokens) in [

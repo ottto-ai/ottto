@@ -818,6 +818,38 @@ fn money_gate_off_saved_fixture_receipt() {
     std::fs::create_dir_all(&support).unwrap();
     std::fs::create_dir_all(&secrets).unwrap();
     if !support.join("local-otel").exists() {
+        // Keep the two checked logins in the SAME hour and row grain, so
+        // C1 requires real identity_parts rather than two single-login rows.
+        let transcript = fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+        let hour = (OffsetDateTime::now_utc() - TimeDuration::hours(3))
+            .replace_minute(0)
+            .unwrap()
+            .replace_second(0)
+            .unwrap()
+            .replace_nanosecond(0)
+            .unwrap();
+        let mut lines = std::fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for (n, line) in lines.iter_mut().enumerate() {
+            line["timestamp"] = (hour + TimeDuration::seconds(n as i64))
+                .format(&Rfc3339)
+                .unwrap()
+                .into();
+        }
+        std::fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(|line| line.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
         write_native_bootstrap_sidecars(&fixture, &support);
         let path = support.join("local-otel/claude-code-effort").join(format!(
             "{:x}.jsonl",
@@ -845,9 +877,41 @@ fn money_gate_off_saved_fixture_receipt() {
         let mut missing = rows[0].clone();
         missing.request_id = "req_missing_trace".into();
         missing.client_request_id = "client-missing".into();
+        missing.event_sequence = Some(3);
         let mut side = rows[0].clone();
         side.request_id = "req_side_call".into();
         side.client_request_id = "client-side".into();
+        side.event_sequence = Some(4);
+        // A paired auxiliary row is counted, but its observer clock cannot
+        // qualify identity: this must reach BadClock, not missing-trace.
+        let trace_path = support
+            .join("local-otel/claude-code-trace-ownership")
+            .join(format!(
+                "{:x}.jsonl",
+                Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+            ));
+        let mut trace: crate::claude_local_otel::ClaudeTraceOwnershipEvidence =
+            serde_json::from_str(
+                std::fs::read_to_string(&trace_path)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+        trace.request_id = side.request_id.clone();
+        trace.client_request_id = side.client_request_id.clone();
+        trace.fingerprint.clear();
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).unwrap())
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(trace_path)
+            .unwrap()
+            .write_all((serde_json::to_string(&trace).unwrap() + "\n").as_bytes())
+            .unwrap();
         rows.extend([missing.clone(), side]);
         let transcript = fixture
             .home
@@ -910,11 +974,15 @@ fn money_gate_off_saved_fixture_receipt() {
         std::fs::write(&index_path, serde_json::to_vec(&seed).unwrap()).unwrap();
         let mut transport = crate::net_resilience::TransportCycleOutcome::default();
         let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
-        let collection = || AgentStatusCollection {
-            snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
-            source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
-            codex_scan_homes: Vec::new(),
-            codex_home_bindings: Vec::new(),
+        let collection = || {
+            let mut status = test_agent_status(SourceKind::ClaudeCode);
+            status.account = Some(test_agent_account(&"a".repeat(64), &"c".repeat(64)));
+            AgentStatusCollection {
+                snapshots: vec![status.clone()],
+                source_health_snapshot: status,
+                codex_scan_homes: Vec::new(),
+                codex_home_bindings: Vec::new(),
+            }
         };
         let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
             prepare_sync_source(
@@ -933,6 +1001,7 @@ fn money_gate_off_saved_fixture_receipt() {
         });
         let mut decision = "refused";
         let mut accepted = 0;
+        let mut local_markers = Vec::new();
         if let Ok(Some(mut frame)) = frame {
             for n in 0..history {
                 frame
@@ -949,6 +1018,13 @@ fn money_gate_off_saved_fixture_receipt() {
                 .save(&frame.upload_progress_path)
                 .unwrap();
             let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+            for item in &scan.snapshots {
+                assert!(
+                    item.claude_org_markers.is_some(),
+                    "C1 marker must be captured locally"
+                );
+                local_markers.push(format!("{:?}", item.claude_org_markers));
+            }
             let progress_path = preparation.upload_progress_path.clone();
             let result = crate::agent_status_refresh::with_test_collection(collection(), || {
                 finish_sync_source(
@@ -983,8 +1059,49 @@ fn money_gate_off_saved_fixture_receipt() {
         if history == 0 {
             assert!(!offers.is_empty(), "baseline must exercise real upload");
             assert!(accepted > 0);
+            let item = offers
+                .iter()
+                .find(|item| item["source_session_id"] == IDENTITY_PIPELINE_ROOT)
+                .unwrap();
+            assert!(
+                item["session_account_evidence"].is_object(),
+                "C1 populated creator evidence: {item}"
+            );
+            assert!(
+                !item["request_evidence"].as_array().unwrap().is_empty(),
+                "C1 real C5 evidence"
+            );
+            assert_eq!(
+                item["request_identity_refusals"], 2,
+                "missing trace + paired BadClock side call: {item}"
+            );
+            for rows in [
+                item["model_usage"].as_array().unwrap().clone(),
+                item["usage_buckets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|bucket| bucket["model_usage"].as_array().unwrap().iter().cloned())
+                    .collect(),
+            ] {
+                assert!(
+                    rows.iter()
+                        .any(
+                            |row| row["identity_parts"].as_array().is_some_and(|parts| parts
+                                .iter()
+                                .filter(|part| part["account_identifier_hash"].is_string())
+                                .count()
+                                >= 2)
+                        ),
+                    "C1 requires a populated split at row AND bucket grain: {rows:?}"
+                );
+            }
         }
-        receipts.push(serde_json::json!({"history":history,"decision":decision,"accepted":accepted,"offers":offers,"saved_fingerprints":ScanIndex::load(&index_path).unwrap().current_snapshot_fingerprints()}));
+        // Keep the local-only marker comparison separate from the upload
+        // identity bytes. The workflow diffs both receipts against main.
+        receipts.push(serde_json::json!({"history":history,"decision":decision,"accepted":accepted,
+            "local_claude_org_markers":local_markers,"offers":offers,
+            "saved_fingerprints":ScanIndex::load(&index_path).unwrap().current_snapshot_fingerprints()}));
     }
     std::fs::write(output, serde_json::to_vec_pretty(&receipts).unwrap()).unwrap();
 }
