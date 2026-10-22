@@ -30463,6 +30463,53 @@ impl ScanIndex {
         );
     }
 
+    /// A well-formed RetryPending family quarantine bound to a retained
+    /// synthetic witness whose only member is the root itself, recording
+    /// `revision` as that member's held source revision.
+    #[cfg(test)]
+    pub(crate) fn insert_retry_pending_claude_authority_at_revision_for_test(
+        &mut self,
+        root_session_id: &str,
+        revision: &str,
+    ) {
+        self.insert_claude_authority_for_test(
+            root_session_id,
+            revision,
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+        );
+    }
+
+    /// A well-formed RetryPending family quarantine bound to the family's
+    /// already retained witness, recording `members` (member session id to
+    /// source revision).
+    #[cfg(test)]
+    pub(crate) fn bind_retry_pending_claude_authority_for_test(
+        &mut self,
+        root_session_id: &str,
+        members: BTreeMap<String, String>,
+    ) {
+        let witness = self
+            .claude_usage_family_witnesses
+            .get(root_session_id)
+            .expect("the family retains a witness");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let record = ClaudeUsageAuthorityQuarantineRecord {
+            proof_correction: None,
+            contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+            proven_witness_fingerprint: claude_usage_family_witness_fingerprint(witness),
+            member_source_file_fingerprints: members,
+            failed_reconstruction_count: 1,
+            disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+            retry_after_unix_seconds: now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS),
+        };
+        assert!(claude_usage_authority_preserves_pending(&record, witness));
+        self.claude_usage_authority_quarantine
+            .insert(root_session_id.to_string(), record);
+    }
+
     /// A well-formed UnprovenTerminal family quarantine bound to a retained
     /// synthetic witness whose only member is the root itself, recording
     /// `revision` as that member's held source revision.
