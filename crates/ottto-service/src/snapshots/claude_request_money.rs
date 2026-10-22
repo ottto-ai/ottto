@@ -961,17 +961,23 @@ pub(crate) fn shadow_page_at(
         .map(|bucket| bucket.model_usage.len())
         .sum::<usize>();
     let key_bytes = index.files.keys().map(String::len).sum::<usize>();
+    // Census records of members the index no longer lists: the scope walks
+    // them too.
+    let (residue_records, residue_key_bytes) = index
+        .claude_request_census
+        .records()
+        .filter(|(key, _)| !index.files.contains_key(*key))
+        .fold((0_usize, 0_usize), |(records, bytes), (key, _)| {
+            (records + 1, bytes.saturating_add(key.len()))
+        });
     let admission = occurrences
         .saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES)
         .saturating_add(row_charge(live_rows))
         .saturating_add(trace_rows.saturating_mul(TRACE_ROW_BYTES))
         .saturating_add(bucket_rows.saturating_mul(LIVE_ROW_BYTES))
         .saturating_add(claude_request_ledger::scope_bound(
-            index
-                .files
-                .len()
-                .saturating_add(index.claude_request_census.record_count()),
-            key_bytes.saturating_mul(2),
+            index.files.len().saturating_add(residue_records),
+            key_bytes.saturating_add(residue_key_bytes),
         ))
         .saturating_add(roots.len().saturating_mul(FAMILY_BYTES))
         .saturating_add(index.files.len().saturating_mul(64))
