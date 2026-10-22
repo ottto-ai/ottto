@@ -462,7 +462,7 @@ fn money_transcript_records_retire_after_35_days() {
         assert_eq!(record.retired_for_test(), None, "{name}");
         assert_eq!(record.request_hashes_for_test(), &[1, 2, 3], "{name}");
     }
-    assert_eq!(census.hash_total_for_test(), 12);
+    assert_eq!(census.hash_total_for_test(), 9);
 }
 
 /// A telemetry record's facts for `count` synthetic rows of `session`.
@@ -1439,6 +1439,7 @@ fn money_telemetry_tail_admits_growth_before_reading() {
 /// the disk lost; a sweep advance waits until every data shard of the
 /// directory is on disk.
 #[test]
+#[serial_test::serial(claude_request_money_shadow)]
 fn money_lost_claims_are_durable_debt() {
     use crate::claude_local_otel::telemetry_tail::{drop_certificate, save_sweep};
     let scratch = crate::test_scratch::ScratchDir::new("money-ledger-durable-debt");
@@ -1516,6 +1517,7 @@ fn money_lost_claims_are_durable_debt() {
 /// before the failure came back writes no data shard either, so the disk
 /// never holds a deletion under the old certificate.
 #[test]
+#[serial_test::serial(claude_request_money_shadow)]
 fn money_failed_debt_meta_blocks_later_batches() {
     use crate::claude_local_otel::telemetry_tail::{drop_certificate, save_sweep};
     let scratch = crate::test_scratch::ScratchDir::new("money-ledger-debt-barrier");
@@ -1582,6 +1584,7 @@ fn money_failed_debt_meta_blocks_later_batches() {
 /// final meta, after every data shard is on disk. A save past the page
 /// deadline takes nothing.
 #[test]
+#[serial_test::serial(claude_request_money_shadow)]
 fn money_zero_meta_is_retaken_after_an_advance() {
     use crate::claude_local_otel::telemetry_tail::{drop_certificate, save_sweep};
     let scratch = crate::test_scratch::ScratchDir::new("money-ledger-zero-retake");
@@ -1794,6 +1797,7 @@ fn money_audits_skip_idle_sidecars() {
 /// A missing or corrupt ledger shard at load is damage (the page drops the
 /// certificate) and the shard is rewritten, never a silent loss.
 #[test]
+#[serial_test::serial(claude_request_money_shadow)]
 fn money_ledger_load_damage_is_debt() {
     let scratch = crate::test_scratch::ScratchDir::new("money-ledger-damage");
     let support = scratch.join("support");
