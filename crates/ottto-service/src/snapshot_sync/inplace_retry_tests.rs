@@ -373,6 +373,7 @@ fn bootstrap_probe_resent_after_server_error_settles_as_conflict() {
                         source_session_id: items[0].source_session_id.clone(),
                         snapshot_fingerprint: items[0].snapshot_fingerprint.clone(),
                         occurrence_count: 1,
+                        unchanged_basis: None,
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: None,
