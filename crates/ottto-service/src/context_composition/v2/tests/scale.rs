@@ -524,6 +524,7 @@ fn run_both(layout: &Layout, now: OffsetDateTime) -> ScaleResults {
         fs::create_dir_all(&root).unwrap();
         let mut resolver = FolderResolver::default();
         let mut run = Run {
+            start_verdicts: Default::default(),
             state_dir: layout.state(),
             now,
             deadline: Instant::now() + RUN_WALL_CAP,

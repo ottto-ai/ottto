@@ -1943,6 +1943,11 @@ impl SnapshotApiClient {
                             enforce_head_cas,
                             retry.is_some(),
                         );
+                        self.record_composition_start_verdicts(
+                            request,
+                            &response,
+                            enforce_head_cas,
+                        );
                         Ok(response)
                     }
                     Err(_) => {
@@ -2037,6 +2042,57 @@ impl SnapshotApiClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn record_composition_start_verdicts(
+        &self,
+        request: &SnapshotBatchRequest,
+        response: &SnapshotBatchResponse,
+        enforce_head_cas: bool,
+    ) {
+        let Some(support) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        if response.disabled
+            || response
+                .validate_entity_ack_with_head_cas(request, enforce_head_cas)
+                .is_err()
+        {
+            return;
+        }
+        // This is the final folded, budget-trimmed wire item. A well-formed
+        // ACK can still reject or conflict individual items: record only the
+        // accepted/unchanged bodies, never those other outcomes.
+        let acknowledged: std::collections::BTreeSet<_> = response
+            .accepted_entities
+            .iter()
+            .chain(&response.unchanged_entities)
+            .map(|r| {
+                (
+                    r.source_session_id.as_str(),
+                    r.snapshot_fingerprint.as_str(),
+                )
+            })
+            .collect();
+        let items = request.snapshots.iter().filter(|item| {
+            response.entity_ack_contract.is_none()
+                || acknowledged.contains(&(
+                    item.source_session_id.as_str(),
+                    item.snapshot_fingerprint.as_str(),
+                ))
+        });
+        match crate::snapshots::start_verdict_store::record(
+            support,
+            &request.source,
+            items,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        ) {
+            Ok(bytes) if bytes > 0 => {
+                eprintln!("ottto-service: composition_start_verdict bytes_appended={bytes}")
+            }
+            Ok(_) => {}
+            Err(_) => eprintln!("ottto-service: composition start verdict persistence failed"),
+        }
+    }
+
     fn record_batch_success(
         &self,
         request: &SnapshotBatchRequest,
@@ -4025,6 +4081,59 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn composition_start_verdict_records_only_final_acknowledged_items() {
+        use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
+        let support = crate::test_scratch::private_dir("composition-ack-verdict");
+        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        item.context_curve = None;
+        item.cache_observations = None;
+        item.session_account_evidence = None;
+        item.session_start = Some(Box::new(SnapshotSessionStart {
+            user_turn_count: Some(1),
+            ..Default::default()
+        }));
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: vec![item],
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let client =
+            SnapshotApiClient::new("https://example.invalid").with_receipt_state_dir(&support);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let id = &request.snapshots[0].source_session_id;
+        let get = || start_verdict_store::load(&support, now).get("codex", id, now);
+        let mut conflict = entity_ack(0, vec![]);
+        conflict.conflict_entities.push(entity_ref(
+            id,
+            &request.snapshots[0].snapshot_fingerprint,
+            1,
+        ));
+        conflict.validate_entity_ack(&request).unwrap();
+        client.record_composition_start_verdicts(&request, &conflict, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        let mut disabled = entity_ack(0, vec![]);
+        disabled.disabled = true;
+        client.record_composition_start_verdicts(&request, &disabled, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        // Legacy all-accepted ACK; the final wire body measures this start.
+        let mut accepted = entity_ack(1, vec![]);
+        accepted.entity_ack_contract = None;
+        client.record_composition_start_verdicts(&request, &accepted, false);
+        assert_eq!(get(), StartVerdict::Measured);
+        // A later final-body clear (including a payload-budget clear) must
+        // replace the verdict, not retain the earlier folded start.
+        let mut cleared = request.clone();
+        cleared.snapshots[0].session_start = None;
+        client.record_composition_start_verdicts(&cleared, &accepted, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        std::fs::remove_dir_all(support).unwrap();
     }
 
     #[test]

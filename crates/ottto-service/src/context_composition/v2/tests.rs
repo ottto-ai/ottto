@@ -904,6 +904,10 @@ impl Env {
         resolver: &mut dyn ScopeResolver,
     ) -> SourceStats {
         let mut run = Run {
+            start_verdicts: crate::snapshots::start_verdict_store::load(
+                &self.root,
+                now.unix_timestamp(),
+            ),
             state_dir: self.state.clone(),
             now,
             deadline: Instant::now() + Duration::from_secs(120),
@@ -1803,6 +1807,7 @@ fn scope_key_is_stable_across_worktrees() {
     );
     let run = |now: OffsetDateTime, resolver: &mut dyn ScopeResolver| {
         let mut run = Run {
+            start_verdicts: Default::default(),
             state_dir: state.clone(),
             now,
             deadline: Instant::now() + Duration::from_secs(120),
@@ -2488,6 +2493,7 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
     let run = |now: OffsetDateTime| {
         let mut resolver = super::scope::GitScopeResolver;
         let mut run = Run {
+            start_verdicts: Default::default(),
             state_dir: state.clone(),
             now,
             deadline: Instant::now() + Duration::from_secs(120),
@@ -4629,3 +4635,6 @@ fn uncommitted_first_scope_shards_remain_pending() {
     assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
     env.cleanup();
 }
+
+#[path = "tests/a34.rs"]
+mod a34;

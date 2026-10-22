@@ -109,12 +109,12 @@ impl LineSink<'_> {
     ) -> LineCtx<'p> {
         match self.kinds {
             KindsVersion::V1 => LineCtx::v1(agent),
-            // No saved daemon verdict is exposed here yet. Until one is,
-            // unmeasured input is labelled explicitly and never an ordinary kind.
             KindsVersion::V2 => LineCtx::v2(
                 agent,
                 if state.request1_closed {
                     Request1::No
+                } else if state.start_measured {
+                    Request1::StartMeasured
                 } else {
                     Request1::StartNotMeasured
                 },

@@ -704,6 +704,7 @@ pub(super) fn checkpoint_members(checkpoint: &Checkpoint) -> Vec<FileSession> {
         return Vec::new();
     };
     let session = session.split(" (subagent:").next().unwrap_or(session);
+    let session = session.split("_agent-").next().unwrap_or(session);
     let session = stable_hash(session.as_bytes());
     let mut names = BTreeMap::new();
     for (hash, day) in checkpoint.cold.iter().flat_map(|c| c.files()).chain(

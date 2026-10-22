@@ -239,6 +239,8 @@ pub(super) struct FileRow {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(super) struct SessionRow {
     pub(super) session_id_hash: String,
+    pub(super) source_session_id: String,
+    pub(super) top_kind_tokens_entered_est: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) started_at: Option<String>,
     pub(super) total_tokens_entered_est: u64,
@@ -839,9 +841,21 @@ fn build_sessions(
         total: u64,
         recent: u64,
         top: Kind,
+        top_tokens: u64,
     }
     let mut rows: Vec<Row> = Vec::new();
     for (id, totals) in &scope.agg.sessions {
+        // Keep plain ids verbatim, never truncate or turn a path into an id.
+        if id.len() > 255
+            || !id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._:-".contains(&c))
+            || id.contains("..")
+        {
+            dropped.unsafe_text += 1;
+            continue;
+        }
         let mut per_kind: BTreeMap<Kind, u64> = BTreeMap::new();
         let mut total = 0u64;
         let mut recent = 0u64;
@@ -866,12 +880,13 @@ fn build_sessions(
             }
         }
         match top.filter(|_| total > 0) {
-            Some((top, _)) => rows.push(Row {
+            Some((top, top_tokens)) => rows.push(Row {
                 id,
                 started: totals.started,
                 total,
                 recent,
                 top,
+                top_tokens,
             }),
             None if other > 0 => dropped.non_v2 += 1,
             None => {}
@@ -895,6 +910,8 @@ fn build_sessions(
         }
         out.push(SessionRow {
             session_id_hash: format!("sha256:{}", sha256_hex(&[row.id])),
+            source_session_id: row.id.to_string(),
+            top_kind_tokens_entered_est: row.top_tokens,
             started_at: row.started.and_then(iso),
             total_tokens_entered_est: row.total,
             top_kind: row.top.as_str().to_string(),

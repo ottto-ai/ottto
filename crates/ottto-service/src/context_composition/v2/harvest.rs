@@ -247,6 +247,10 @@ fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
     let destination = destination_identity(&device, &machine_id, &api_base_url);
     let mut resolver = GitScopeResolver;
     let mut run = Run {
+        start_verdicts: crate::snapshots::start_verdict_store::load(
+            support_dir,
+            now.unix_timestamp(),
+        ),
         state_dir: dir.clone(),
         now,
         deadline: Instant::now() + RUN_WALL_CAP,
@@ -525,6 +529,7 @@ pub(super) struct Run<'a> {
     pub(super) resolver: &'a mut dyn ScopeResolver,
     /// Full-read bytes left today (shared by the sources).
     pub(super) repair_left: u64,
+    pub(super) start_verdicts: crate::snapshots::start_verdict_store::Verdicts,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -669,6 +674,7 @@ fn copy_key_text(path: &Path) -> String {
 /// Stream directory entries. Unchanged files update their pin in place;
 /// only files needing work retain a path/metadata row after the visit.
 fn walk(
+    source: Source,
     roots: &[PathBuf],
     index: &mut Index,
     today: Day,
@@ -711,6 +717,11 @@ fn walk(
     let mut archived = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut callback = |path: PathBuf, metadata: Metadata, compressed: bool| {
+        if source == Source::Claude
+            && crate::snapshots::claude_transcript_excluded_from_snapshots(&path)
+        {
+            return;
+        }
         let key = copy_key_text(&path);
         if compressed {
             archived.insert(key);
@@ -971,7 +982,7 @@ fn run_source_inner(
     index.last_scan_started = Some(now_secs);
 
     // Discovery: pick one copy per key and decide what needs reading.
-    let (found, archived, seen) = walk(roots, &mut index, today, &mut stats);
+    let (found, archived, seen) = walk(source, roots, &mut index, today, &mut stats);
     let mut work: Vec<Work> = Vec::new();
     let mut present: BTreeMap<String, Found> = BTreeMap::new();
     for (key, mut copies) in found {
@@ -2134,6 +2145,10 @@ fn read_file(
             )
         }
     };
+    state.start_measured =
+        run.start_verdicts
+            .get(source.label(), &state.session, run.now.unix_timestamp())
+            == crate::snapshots::StartVerdict::Measured;
     let mut contribution = std::mem::take(&mut checkpoint.contribution)
         .into_share()
         .unwrap_or_default();
