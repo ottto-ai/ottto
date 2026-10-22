@@ -5819,11 +5819,10 @@ fn finish_sync_source(
         );
     }
 
-    if source == SnapshotSource::ClaudeCode
+    let money_settlement = if source == SnapshotSource::ClaudeCode
         && !upload_result.as_ref().err().is_some_and(|error| {
             snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
-        })
-    {
+        }) {
         crate::snapshots::claude_request_money::pace_money_debt(
             support_dir,
             &index,
@@ -5839,13 +5838,6 @@ fn finish_sync_source(
                     })
                     .map(|record| record.retry_after_unix_seconds)
             },
-        );
-        crate::snapshots::claude_request_money::settle_money_acks(
-            support_dir,
-            &index,
-            &scan_result.snapshots,
-            &upload_progress.accepted_fingerprints,
-            &upload_progress.accepted_body_witnesses,
         );
         crate::snapshots::claude_request_money::note_adoption_outcomes(
             support_dir,
@@ -5896,15 +5888,25 @@ fn finish_sync_source(
                 }
             }
         }
-        crate::snapshots::claude_request_money::settle_money_acks(
-            support_dir,
-            &index,
-            &scan_result.snapshots,
-            &settled,
-            &settled_bodies,
-        );
         index.stamp_request_money_acks(&scan_result.snapshots, &settled, &settled_bodies);
-    }
+        Some((settled, settled_bodies))
+    } else {
+        None
+    };
+    // A durable ACK does not prove the selected index committed. Retain the
+    // due/dirty selection obligation through every failed CAS or save, even
+    // for unchanged, already-adopted files. Each caller below has saved first.
+    let settle_saved_money = |saved: &ScanIndex| {
+        if let Some((settled, bodies)) = &money_settlement {
+            crate::snapshots::claude_request_money::settle_money_acks(
+                support_dir,
+                saved,
+                &scan_result.snapshots,
+                settled,
+                bodies,
+            );
+        }
+    };
     index.log_claude_proof_correction_debt();
 
     // The server may have accepted new entities even when the final result is a
@@ -5993,6 +5995,9 @@ fn finish_sync_source(
                     committed_index.clone()
                 }
             };
+            if checkpoint_succeeded {
+                settle_saved_money(&committable);
+            }
             if retry.enabled()
                 && checkpoint_succeeded
                 && locally_held_fingerprints.is_empty()
@@ -6097,7 +6102,10 @@ fn finish_sync_source(
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
                 ) {
-                    Ok(committable) => index = committable,
+                    Ok(committable) => {
+                        settle_saved_money(&committable);
+                        index = committable;
+                    }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
@@ -6346,6 +6354,7 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    settle_saved_money(&index);
     if upload_fully_settled
         && native_comparison_lease
             .as_ref()

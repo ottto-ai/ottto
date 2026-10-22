@@ -812,3 +812,70 @@ fn p2a_root_telemetry_does_not_move_an_inactive_child_past_the_account_cutoff() 
     money::store::flush();
     let _ = fs::remove_dir_all(home);
 }
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn p2a_shadow_duplicate_files_complete_one_logical_family_and_publish_its_memo() {
+    let (home, root, mut index) = claude_context_backfill_fixture("p2a-shadow-logical-coverage", 1);
+    let support = p2a_support(&home);
+    money::enable_shadow_for_test(&support);
+    let session = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
+    fs::copy(
+        root.join(format!("{session}.jsonl")),
+        root.join("99999999-bbbb-4ccc-8ddd-000000000000.jsonl"),
+    )
+    .unwrap();
+    let scan = p2a_scan(&root, &support, &mut index);
+    assert_eq!(
+        scan.snapshots.len(),
+        3,
+        "root, physical copy and logical child"
+    );
+    let counts = money::shadow_page_at(
+        &support,
+        &scan.snapshots,
+        &index,
+        &Default::default(),
+        &Default::default(),
+        true,
+        rfc3339_unix_seconds("2026-08-23T18:40:00Z").unwrap(),
+    );
+    assert_eq!(counts.families, 1);
+    assert_eq!(counts.families_union_partial, 0);
+    assert_eq!(counts.families_coverage_complete, 1);
+    money::store::flush();
+    let lines = fs::read_dir(support.join("diagnostics"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .map(|entry| fs::read_to_string(entry.path()).unwrap())
+        .collect::<String>();
+    let family = lines
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row["row"] == "family")
+        .unwrap();
+    assert_eq!(family["members_built"], 2);
+    assert_eq!(family["members_total"], 2);
+    assert_eq!(family["coverage_complete"], true);
+    // An ordinary later shadow page applies the completed writer's memo;
+    // no live gate or upload is needed for the shadow's removal-delta basis.
+    assert!(!money::request_owned_live(&support));
+    money::shadow_page_at(
+        &support,
+        &[],
+        &index,
+        &Default::default(),
+        &Default::default(),
+        true,
+        rfc3339_unix_seconds("2026-08-23T18:40:01Z").unwrap(),
+    );
+    let key = crate::snapshots::claude_request_census::family_key(session);
+    assert!(money::store::with_ledger_for_test(&support, |ledger| ledger
+        .get(&key)
+        .and_then(|record| record.family_memo())
+        .is_some())
+    .unwrap());
+    money::disable_shadow_for_test(&support);
+    let _ = fs::remove_dir_all(home);
+}

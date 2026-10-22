@@ -1791,7 +1791,6 @@ fn build_page_at(
             .collect();
         let empty = BTreeSet::new();
         let members = indexed_members.get(root).unwrap_or(&empty);
-        let total = members.len().max(items.len());
         let mut family_captures = BTreeMap::new();
         for item in items {
             if let Some(capture) = captures.remove(&(
@@ -1813,6 +1812,13 @@ fn build_page_at(
             .iter()
             .map(|item| item.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
+        // Coverage counts logical members, while every physical capture is
+        // still required and certified by the union builder.
+        let total = members.len()
+            + present
+                .iter()
+                .filter(|member| !members.contains(**member))
+                .count();
         let mut absent_old = ClaudeMoneyTotals::default();
         let mut absent_old_unknown = 0_u64;
         for member in members {
@@ -3392,7 +3398,8 @@ pub(crate) fn money_hold_bound(index: &ScanIndex, item: &SnapshotItem) -> bool {
     store::hold_revision_bound(support_dir, revision)
 }
 
-/// Only a covering durable literal ACK clears a dirty/due record. An older
+/// After the selected index is durable, a covering literal ACK clears its
+/// dirty/due record. Callers must save the selected index first. An older
 /// ACK cannot clear a transfer discovered after its offer; a partial body's
 /// ACK leaves a future maturity deadline in place.
 pub(crate) fn settle_money_acks(
@@ -3431,6 +3438,13 @@ pub(crate) fn settle_money_acks(
         let Some(item) = by_source.get(entry.source_file_fingerprint.as_str()) else {
             continue;
         };
+        // A selected-state rollback may retain the old body of this same
+        // physical file. Its ACK does not settle the newly offered body.
+        if entry.last_snapshot_fingerprint.as_deref() != Some(&item.snapshot_fingerprint)
+            || entry.last_upload_body_witness.as_ref() != bodies.get(&item.snapshot_fingerprint)
+        {
+            continue;
+        }
         let offer_key = format!(
             "{}:{}",
             store::money_key("offer:", key),

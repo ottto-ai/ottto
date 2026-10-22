@@ -117,13 +117,31 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
         };
-        let cycles = if conflict || ledger_fault || ack_save_fault {
+        let cycles = if conflict {
+            3 // First adopt, then fail a due-only save, then retry unchanged bytes.
+        } else if ledger_fault || ack_save_fault {
             2
         } else {
             1
         };
         let _reset = P2aConflictReset;
         for cycle in 0..cycles {
+            if conflict && cycle == 1 {
+                let saved = ScanIndex::load(&index_path).unwrap();
+                assert!(saved
+                    .files
+                    .values()
+                    .all(|entry| entry.effective_upload_body_witness_revision == 3));
+                // No physical change or adoption remains: only this durable
+                // external-evidence obligation can select the file again.
+                money::store::with_ledger_for_test(&support, |ledger| {
+                    ledger.insert(dirty.clone(), crate::snapshots::claude_request_census::ClaudeRequestCensusRecord::money_debt([9; 32], 0));
+                    let mut writer = money::store::WriterState::default();
+                    while ledger.dirty_shards() > 0 {
+                        money::store::save_page_for_test(&support, ledger, &mut writer).unwrap();
+                    }
+                }).unwrap();
+            }
             cadence.next_due_cycle();
             let mut transport = crate::net_resilience::TransportCycleOutcome::default();
             let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
@@ -155,7 +173,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 P2A_ACK_SAVE_FAILURE
                     .with(|state| *state.borrow_mut() = Some(progress_path.clone()));
             }
-            if conflict && cycle == 0 {
+            if conflict && cycle == 1 {
                 P2A_INDEX_CONFLICT
                     .with(|state| *state.borrow_mut() = Some(preparation.index_path.clone()));
             }
@@ -178,12 +196,12 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             });
             money::store::flush();
             let saved = ScanIndex::load(&index_path).unwrap();
-            if conflict && cycle == 0 {
+            if conflict && cycle == 1 {
                 assert!(result.is_err(), "competing selected save must reject CAS");
                 assert!(saved
                     .files
                     .values()
-                    .all(|entry| entry.effective_upload_body_witness_revision != 3));
+                    .all(|entry| entry.effective_upload_body_witness_revision == 3));
                 let progress = SnapshotUploadProgress::load(
                     &progress_path,
                     &namespace,
@@ -193,6 +211,10 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 assert!(
                     !progress.accepted_fingerprints.is_empty(),
                     "covering ACK was durable before failed CAS"
+                );
+                assert!(
+                    money::money_due(&support, &transcript.to_string_lossy(), u64::MAX),
+                    "failed selected-index CAS must retain due-only debt on an adopted file"
                 );
             } else if ack_save_fault && cycle == 0 {
                 assert!(result.is_err());
@@ -239,6 +261,10 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                         .iter()
                         .all(|item| item["usage_accounting_contract"]
                             == money::REQUEST_OWNED_CONTRACT)
+                );
+                assert!(
+                    !money::money_due(&support, &transcript.to_string_lossy(), u64::MAX),
+                    "saved covering body retires its selection obligation"
                 );
                 if matches!(outcome, FinishOutcome::Dominated { .. }) {
                     let fp = offered[0]["snapshot_fingerprint"].as_str().unwrap();

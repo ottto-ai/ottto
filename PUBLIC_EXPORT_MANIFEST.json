@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 783,
-  "content_sha256": "900d284dfa1096ba045061684c0da4f2f19e2e6d9ac27bd5c97ae87205e02f30",
+  "content_sha256": "8b66c5b25a3723564b6e8c9de524041b3847680a193c12ddd395ded67380d6c6",
   "files": [
     {
       "executable": false,
@@ -1322,8 +1322,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "971c7171cb42fefc323741b6318b4ff99790f96282e8982aac3bd6fcf1aa8e8d",
-      "size_bytes": 895506
+      "sha256": "01fe84c3ebb502c75eec7608889259b215f3fd37c54aec15bb3b6d8314ace9e6",
+      "size_bytes": 895947
     },
     {
       "executable": false,
@@ -1392,8 +1392,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p2a_round3_tests.rs",
-      "sha256": "9adbfe25984f74badbded8914ce7c69decdea8518eeade6b6ce32d32957c5933",
-      "size_bytes": 14278
+      "sha256": "637e3c83ef24f07b71c0bd4070904a5a7ecc96e1a6a4ffb8fb6fbeff2d7d990d",
+      "size_bytes": 15753
     },
     {
       "executable": false,
@@ -1609,8 +1609,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money.rs",
-      "sha256": "3a71511f255116ca1ff481f265ae58e6128c9a59034bb04db6920911402b7017",
-      "size_bytes": 149255
+      "sha256": "36693cb9a9ceabda0549606d5223b77591cc3bd6918e013b160e28d924b9a810",
+      "size_bytes": 149960
     },
     {
       "executable": false,
@@ -1665,8 +1665,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money_tests.rs",
-      "sha256": "1322a45028a5fc7c8a3e392a0aafb17a503bf09489e7e6fdb0cbd7f1db69c7cd",
-      "size_bytes": 157264
+      "sha256": "a38a07081030e7a52fde735b96db5d52b197fc95c2329558b782a28a949850f3",
+      "size_bytes": 157265
     },
     {
       "executable": false,
@@ -1819,8 +1819,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/p2a_adoption_tests.rs",
-      "sha256": "b1943c24baca52ab89b4b870bea388274990435084194f87a7fc51c0067a23ac",
-      "size_bytes": 29329
+      "sha256": "52c89b75b72578e5d9352a5db4c6266e3beb8d24416705267c0051fec6af8f91",
+      "size_bytes": 31790
     },
     {
       "executable": false,
