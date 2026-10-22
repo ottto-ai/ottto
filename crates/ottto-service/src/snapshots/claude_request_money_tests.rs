@@ -3857,7 +3857,7 @@ fn p2a_backend_ownership_wire_golden_zero_and_every_counter() {
     let owned = components(&item);
     assert_eq!(
         owned["usage_accounting"],
-        "NONc9d1e2ccd1092d6570b90137e916ec273e2725ab360c5d7060f7fb43724d0c85"
+        "b687536300c6bff44e9d6ae83e63eb6531490758c1189704c7144f031a4c28cf"
     );
     assert_eq!(
         old.iter()
