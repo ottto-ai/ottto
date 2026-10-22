@@ -46,6 +46,21 @@ impl std::fmt::Display for AdmissionRefused {
 }
 impl std::error::Error for AdmissionRefused {}
 
+pub(super) fn admission_refused() -> anyhow::Error {
+    AdmissionRefused.into()
+}
+fn record_refusal(support: &Path, result: &Result<()>) {
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<AdmissionRefused>())
+        && !crate::snapshots::claude_request_money::store::live_refused(support)
+    {
+        crate::snapshots::claude_request_money::store::refuse_live(support);
+        eprintln!("claude_request_money admission_refused=1 continuation_released=1");
+    }
+}
+
 pub(crate) async fn until(
     mut ready: impl FnMut() -> crate::snapshots::claude_request_money::MoneyReceipt,
 ) -> Result<()> {
@@ -127,7 +142,7 @@ fn graph_bytes<T: crate::heap_layout_bound::HeapLayoutBound>(graph: &T) -> Resul
         graph,
         crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES,
     )
-    .ok_or_else(refusal)
+    .ok_or_else(admission_refused)
 }
 
 /// One moving charge for the actual retained inputs. Refreshing replaces its
@@ -156,7 +171,7 @@ impl Memory {
             .saturating_add(progress)
             .saturating_add(evidence);
         if !self.funds.resize(bytes) {
-            return Err(refusal());
+            return Err(admission_refused());
         }
         self.progress = progress;
         Ok(())
@@ -180,14 +195,7 @@ impl Memory {
 fn poll(mut pending: PendingFinish) -> Result<()> {
     match immediate(pending.future.as_mut()) {
         Some(result) => {
-            if result
-                .as_ref()
-                .err()
-                .is_some_and(|error| error.is::<AdmissionRefused>())
-            {
-                crate::snapshots::claude_request_money::store::refuse_live(&pending.support_dir);
-                eprintln!("claude_request_money admission_refused=1 continuation_released=1");
-            }
+            record_refusal(&pending.support_dir, &result);
             result
         }
         None => {
@@ -269,6 +277,37 @@ pub(super) fn start(
     support_dir: &Path,
     daemon: &LocalDaemon,
 ) -> Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_START.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    let result = start_admitted(
+        preparation,
+        index,
+        scan,
+        device,
+        device_secret,
+        machine_id,
+        home,
+        support_dir,
+        daemon,
+    );
+    record_refusal(support_dir, &result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_admitted(
+    preparation: SourcePreparation,
+    index: ScanIndex,
+    scan: SourceScanResult,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    machine_id: &str,
+    home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+) -> Result<()> {
     if resume(device, device_secret, home, support_dir, daemon)? {
         return Ok(());
     }
@@ -287,7 +326,7 @@ pub(super) fn start(
         .and_then(|bytes| {
             crate::heap_layout_bound::completed_bound(&scan, limit - bytes).map(|next| bytes + next)
         })
-        .ok_or_else(refusal)?;
+        .ok_or_else(admission_refused)?;
     // Pay only the metadata that is actually copied outside the moved input
     // graphs. In particular, never duplicate either entire index's charge.
     let context_bytes = graph_bytes(&preparation.receipt_client)?
@@ -317,7 +356,7 @@ pub(super) fn start(
     let funds = crate::snapshots::claude_request_money::ShadowReservation::admit(
         retained.saturating_add(context_bytes),
     )
-    .ok_or_else(refusal)?;
+    .ok_or_else(admission_refused)?;
     let mut memory = Memory {
         funds,
         fixed,
@@ -329,7 +368,7 @@ pub(super) fn start(
         index_revision(&support_dir.join("snapshots/claude_code-reemission-exclusions.txt"))?;
     let account_witness = preparation.account_witness;
     let destination = preparation.upload_destination_namespace.clone();
-    let hint = preparation.money_policy.ok_or_else(refusal)?;
+    let hint = preparation.money_policy.ok_or_else(admission_refused)?;
     let client = preparation.receipt_client.clone();
     let resume_client = client.clone();
     let owned_device = device.clone();
@@ -364,7 +403,7 @@ pub(super) fn start(
     let allocation = crate::snapshots::claude_request_money::ShadowReservation::admit(
         inline.saturating_add(16384),
     )
-    .ok_or_else(refusal)?;
+    .ok_or_else(admission_refused)?;
     // Both charges live for exactly the continuation lifetime.
     let future = async move {
         let _allocation = allocation;
@@ -406,7 +445,13 @@ pub(super) fn forget_for_test(support_dir: &Path) {
 #[cfg(test)]
 thread_local! {
     static BEFORE_IMMEDIATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_START: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
+#[cfg(test)]
+pub(super) fn set_before_start_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_START.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
 #[cfg(test)]
 pub(super) fn set_before_immediate_for_test(hook: impl FnOnce() + 'static) {
     BEFORE_IMMEDIATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
@@ -486,7 +531,10 @@ mod tests {
             money::SHADOW_MEMORY_CEILING_BYTES - money::reserved_for_test(),
         )
         .unwrap();
-        assert!(memory.refresh(&index, &scan, Some(&progress), 1).is_err());
+        assert!(memory
+            .refresh(&index, &scan, Some(&progress), 1)
+            .unwrap_err()
+            .is::<AdmissionRefused>());
         assert_eq!(
             memory.funds.bytes(),
             charge,

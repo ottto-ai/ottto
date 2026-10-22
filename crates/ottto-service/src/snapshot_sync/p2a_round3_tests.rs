@@ -2036,3 +2036,67 @@ fn p2a_actual_cap_metadata_recovery_finishes_literal_and_survives_restart() {
     .unwrap();
     assert!(!money_resume::pending_for_test(&control.support));
 }
+
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_preboxing_memory_refusal_releases_finish_then_collects_ordinary() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::new(FinishOutcome::Accept);
+    control.cycle();
+    let _live = money::LiveForTest::new(&control.support);
+    let held = Arc::new(Mutex::new(None));
+    let injected = held.clone();
+    money_resume::set_before_start_for_test(move || {
+        *injected.lock().unwrap() = Some(
+            money::ShadowReservation::admit(
+                money::SHADOW_MEMORY_CEILING_BYTES - money::reserved_for_test(),
+            )
+            .unwrap(),
+        );
+    });
+    let before = control.offers().len();
+    let error = control.cycle_result().unwrap_err();
+    assert!(error.to_string().contains("admission refused"));
+    assert!(!money_resume::pending_for_test(&control.support));
+    assert!(!money::request_owned_live(&control.support));
+    assert_eq!(
+        control.offers().len(),
+        before,
+        "unadmitted graph cannot POST"
+    );
+    drop(held.lock().unwrap().take());
+    let sibling = "d515a780-afae-4857-8325-b5e900af638c";
+    let text = std::fs::read_to_string(control.transcript())
+        .unwrap()
+        .replace(IDENTITY_PIPELINE_ROOT, sibling)
+        .replace("req_1", "memory-new-1")
+        .replace("req_2", "memory-new-2");
+    std::fs::write(
+        control
+            .transcript()
+            .with_file_name(format!("{sibling}.jsonl")),
+        text,
+    )
+    .unwrap();
+    control.cycle();
+    let offers = control.offers();
+    let ordinary = offers[before..]
+        .iter()
+        .find(|item| item["source_session_id"] == sibling)
+        .expect("ordinary POST after pre-boxing admission refusal");
+    assert_ne!(
+        ordinary["usage_accounting_contract"],
+        money::REQUEST_OWNED_CONTRACT
+    );
+    assert!(control.saved().accepted_snapshot_fingerprint_recorded(
+        ordinary["snapshot_fingerprint"].as_str().unwrap()
+    ));
+}

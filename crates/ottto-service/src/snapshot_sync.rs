@@ -6053,7 +6053,7 @@ async fn finish_sync_source_resume(
                     .sum(),
             )
         else {
-            return Err(anyhow!("request money settlement admission pending"));
+            return Err(money_resume::admission_refused());
         };
         // A dominated/stale exact literal is settled-refused, never accepted.
         // Use the same covering body check for adoption and debt retirement.
@@ -7617,6 +7617,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
         memory
             .evidence(index, scan_result, &api_report, &trace_report)
             .map_err(|_| {
+                crate::snapshots::claude_request_money::store::refuse_live(support_dir);
                 crate::source_rotation::LocalRefusal("request money evidence retention refused")
             })?;
     }
@@ -7937,20 +7938,50 @@ fn snapshot_upload_error_class(error: &anyhow::Error) -> Option<SnapshotUploadEr
 }
 
 fn is_literal_version_skew(error: &anyhow::Error) -> bool {
-    error
+    let Some(body) = error
         .downcast_ref::<BatchRejected>()
         .filter(|error| error.status == 422)
         .and_then(|error| error.body_excerpt.as_deref())
-        .is_some_and(|body| {
-            [
-                "usage_accounting_contract",
-                "removed_request_count",
-                "removed_usage",
-                "telemetry_owned_complete",
-                "request_usage_origin",
-            ]
-            .iter()
-            .any(|field| body.contains(field))
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+    else {
+        return false;
+    };
+    // Explicit unknown-field/contract-enum errors indicate an older schema.
+    // A field name alone also occurs in genuine per-item validation failures;
+    // those must keep the existing singleton isolation and poison handling.
+    body.get("detail")
+        .or_else(|| body.get("errors"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                let kind = error.get("type").and_then(serde_json::Value::as_str);
+                let Some(location) = error.get("loc").and_then(serde_json::Value::as_array) else {
+                    return false;
+                };
+                let literal_field =
+                    location
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(|field| {
+                            matches!(
+                                field,
+                                "usage_accounting_contract"
+                                    | "removed_request_count"
+                                    | "removed_usage"
+                                    | "telemetry_owned_complete"
+                                    | "request_usage_origin"
+                            )
+                        });
+                let enum_field = location
+                    .last()
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|field| {
+                        matches!(field, "usage_accounting_contract" | "request_usage_origin")
+                    });
+                literal_field
+                    && (kind == Some("extra_forbidden")
+                        || kind == Some("literal_error") && enum_field)
+            })
         })
 }
 
@@ -8463,6 +8494,7 @@ where
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
+    let mut literal_retry_after = None::<u64>;
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -8518,7 +8550,21 @@ where
                     }) =>
             {
                 let mut retry_after = 1_800;
+                let mut ordinary = Vec::new();
                 for index in &indices {
+                    let literal = serde_json::to_value(&items[*index])
+                        .ok()
+                        .is_some_and(|body| {
+                            body.get("usage_accounting_contract")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(
+                                    crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT,
+                                )
+                        });
+                    if !literal {
+                        ordinary.push(*index);
+                        continue;
+                    }
                     let fp = fingerprint(&items[*index]);
                     let attempts = progress
                         .quarantined_fingerprints
@@ -8544,9 +8590,10 @@ where
                     "local snapshot sync: literal_version_skew={}",
                     indices.len()
                 );
-                return Ok(ResumableUploadResult::Shed {
-                    retry_after: Some(Duration::from_secs(retry_after)),
-                });
+                literal_retry_after = Some(literal_retry_after.unwrap_or(0).max(retry_after));
+                if !ordinary.is_empty() {
+                    batches.push_front((ordinary, false));
+                }
             }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
                 // The daemon validator names the exact request-local item. It
@@ -8707,6 +8754,10 @@ where
         .count();
     if let Some(error) = deferred_validation_error {
         Err(error)
+    } else if let Some(delay) = literal_retry_after {
+        Ok(ResumableUploadResult::Shed {
+            retry_after: Some(Duration::from_secs(delay)),
+        })
     } else if conflicted_entities > 0 {
         Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities,
@@ -21705,7 +21756,7 @@ mod request_owned_retry_tests {
     fn request_owned_skew_is_classified_before_item_validation() {
         let error = anyhow::Error::new(BatchRejected {
             status: 422,
-            body_excerpt: Some("{\"loc\":[\"body\",\"snapshots\",0,\"removed_usage\"]}".into()),
+            body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0,"removed_usage"],"type":"extra_forbidden"}]}"#.into()),
         });
         assert!(is_literal_version_skew(&error));
         assert!(is_item_specific_validation_failure(&error));
@@ -21714,5 +21765,9 @@ mod request_owned_retry_tests {
             body_excerpt: Some("invalid tool_usage".into()),
         });
         assert!(!is_literal_version_skew(&unrelated));
+        let invalid = anyhow::Error::new(BatchRejected { status: 422,
+            body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0,"removed_usage"],"type":"greater_than_equal"}]}"#.into()) });
+        assert!(!is_literal_version_skew(&invalid));
+        assert!(is_item_specific_validation_failure(&invalid));
     }
 }
