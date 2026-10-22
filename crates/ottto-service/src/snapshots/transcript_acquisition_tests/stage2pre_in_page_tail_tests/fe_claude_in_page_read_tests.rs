@@ -1170,30 +1170,21 @@ fn fe_claude_census_proof_fails_closed_while_api_rows_exceed_prefix() {
     );
 }
 
-/// Explicit SOURCE exclusion: unequal request sets alone are insufficient.
-/// This isolates the proof guard from the grown-reader failure: the body is
-/// present, the terminal healthy, and the D1 source certificate unverified.
+/// SOURCE (B): real FE prefix provenance, rather than ordinary D1 debt,
+/// excludes API rows beyond the published native prefix.
 #[test]
 fn fe_claude_unverified_source_api_rows_beyond_prefix_cannot_mint_v1() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let (fixture, mut index, result) = quiescent();
-    let key = local_index_key(&fixture.file.0);
-    let record = index
-        .claude_request_census_for_test()
-        .get(&key)
-        .unwrap()
-        .clone()
-        .with_unverified_for_test(true);
-    index
-        .claude_request_census_mut_for_test()
-        .insert_for_test(&key, record);
-    assert!(
-        !mints_v1(&mut index, &result, 0..9),
-        "SOURCE explicit guard: API rows beyond an unverified prefix cannot mint v1"
-    );
-    assert!(!index.claude_usage_family_witnesses.contains_key(SESSION));
+    let mut grown = grown_full();
+    assert_eq!(grown.seen.unreadable, 0);
+    assert!(!grown.result.snapshots.is_empty());
+    assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
+    assert!(!grown
+        .index
+        .claude_usage_family_witnesses
+        .contains_key(SESSION));
 }
 
 /// Restart/record-budget fallback: the durable prepared audit marker fences
@@ -1217,32 +1208,24 @@ fn fe_claude_prefix_without_d1_record_still_cannot_mint_v1() {
         .contains_key(SESSION));
 }
 
-/// A previously proven family cannot reconstruct v1 from an unverified
-/// prefix on an incomplete page, even with unchanged API/trace evidence.
+/// A saved family cannot reconstruct v1 from an actual FE prefix on an
+/// incomplete page, even with unchanged API/trace evidence.
 #[test]
 fn fe_claude_unverified_source_cannot_reconstruct_a_saved_family_witness() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let (fixture, mut index, mut result) = quiescent();
-    assert!(mints_v1(&mut index, &result, 0..9));
-    let previous_witness = index.claude_usage_family_witnesses[SESSION].clone();
-    let key = local_index_key(&fixture.file.0);
-    let record = index
-        .claude_request_census_for_test()
-        .get(&key)
-        .unwrap()
-        .clone()
-        .with_unverified_for_test(true);
-    index
-        .claude_request_census_mut_for_test()
-        .insert_for_test(&key, record);
-    result.census_complete = false;
-    assert!(!mints_v1(&mut index, &result, 0..9));
+    let (_fixture, mut verified, result) = quiescent();
+    assert!(mints_v1(&mut verified, &result, 0..9));
+    let previous_witness = verified.claude_usage_family_witnesses[SESSION].clone();
+    let mut grown = grown_full();
+    grown.index.claude_usage_family_witnesses = verified.claude_usage_family_witnesses;
+    grown.result.census_complete = false;
+    assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
     assert_eq!(
-        index.claude_usage_family_witnesses.get(SESSION),
+        grown.index.claude_usage_family_witnesses.get(SESSION),
         Some(&previous_witness),
-        "the historical witness stays for demotion/hold accounting, never backs this prefix"
+        "historical witness remains for hold accounting, never prefix authority"
     );
 }
 
@@ -1444,4 +1427,116 @@ fn fe_claude_prefix_with_different_physical_key_cannot_reconstruct_v1() {
         !mints_v1(&mut grown.index, &grown.result, 0..9),
         "SOURCE: physical-key drift cannot bypass prefix exclusion"
     );
+}
+
+/// Ordinary EOF-recomposed Tail retains positive behavior despite unverified D1.
+#[test]
+fn fe_claude_ordinary_tail_d1_debt_does_not_exclude_recomposed_body() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    let (mut index, result, seen) = plain(&base.fixture, CLAUDE, base.index, &base.cache);
+    assert_eq!(seen.modes, (0, 1, 0));
+    assert_eq!(seen.unreadable, 0);
+    assert!(index
+        .claude_request_census_for_test()
+        .get(&base.key)
+        .unwrap()
+        .unverified_or_twin());
+    assert!(
+        index.files[&base.key].has_unverified_source(),
+        "audit debt remains"
+    );
+    assert!(mints_v1(&mut index, &result, 0..9));
+}
+
+/// Old, unknown and malformed tags cannot assert a complete native reduction.
+#[test]
+fn fe_claude_old_unknown_and_malformed_provenance_exclude() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for tag in [
+        "semantic_sync:v2+sampled_unverified:v1:9999999999",
+        "semantic_sync:v2+sampled_unverified:v99:9999999999:c",
+        "semantic_sync:v2+sampled_unverified:v2:9999999999:unknown",
+        "semantic_sync:v2+sampled_unverified:v2:bad:c",
+        "unknown-provenance",
+    ] {
+        let (fixture, mut index, result) = quiescent();
+        let key = local_index_key(&fixture.file.0);
+        index.files.get_mut(&key).unwrap().scan_identity_version = Some(tag.into());
+        assert!(!mints_v1(&mut index, &result, 0..9), "tag {tag}");
+    }
+}
+
+/// Persistence must preserve the exclusion even without D1 and after key drift.
+#[test]
+fn fe_claude_prefix_provenance_round_trips_without_d1() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut grown = grown_full();
+    let tag = grown.index.files[&grown.base.key]
+        .scan_identity_version
+        .clone();
+    grown
+        .index
+        .claude_request_census_mut_for_test()
+        .invalidate_keeping_birth_for_test(&grown.base.key);
+    let moved = local_index_key(&grown.base.path.with_file_name("physical-other.jsonl"));
+    let entry = grown.index.files.remove(&grown.base.key).unwrap();
+    grown.index.files.insert(moved.clone(), entry);
+    let path = grown.base.fixture.root.join("prefix-index.json");
+    grown.index.save(&path).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(loaded.files[&moved].scan_identity_version, tag);
+    assert!(!mints_v1(&mut loaded, &grown.result, 0..9));
+}
+
+/// The recovery Tail starts from a retained COMPLETE pre-prefix reduction,
+/// replays all later rows and revalidates EOF. No FE prefix is cached.
+#[test]
+fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut base = baseline(CLAUDE, 4, 2);
+    let complete = base.cache.take(&base.key).unwrap();
+    let path = base.path.clone();
+    let (index, result, seen, _) = page_injecting(
+        &base.fixture,
+        CLAUDE,
+        std::mem::take(&mut base.index),
+        &base.cache,
+        is_full,
+        |_| append_raw(&path, &row_bytes(CLAUDE, 6..9)),
+    );
+    assert_eq!(seen.unreadable, 0);
+    base.index = index;
+    assert!(!mints_v1(&mut base.index, &result, 0..9));
+    assert!(base.cache.retained_checkpoint(&base.key).is_none());
+    assert!(base
+        .cache
+        .retained()
+        .unwrap()
+        .insert(base.key.clone(), complete));
+    let (mut index, result, seen) = plain(&base.fixture, CLAUDE, base.index, &base.cache);
+    assert_eq!(
+        seen.modes,
+        (0, 1, 0),
+        "complete baseline reduction is replayed"
+    );
+    assert_eq!(seen.unreadable, 0);
+    assert!(
+        index.files[&base.key].has_unverified_source(),
+        "Tail still owes audit"
+    );
+    assert!(index
+        .claude_request_census_for_test()
+        .get(&base.key)
+        .unwrap()
+        .unverified_or_twin());
+    assert!(mints_v1(&mut index, &result, 0..9));
 }
