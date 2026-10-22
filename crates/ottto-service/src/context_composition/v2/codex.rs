@@ -108,19 +108,64 @@ pub(super) fn head_identity(lines: &[&str], path: &Path) -> HeadIdentity {
     }
 }
 
+/// Ask the shared prelude parser only about rows that can close input.
+/// Developer/world-state text can be large; borrowed views avoid building
+/// a Value tree for content the prefix path will intentionally skip.
+pub(super) fn request1_input_closed(line: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let owned: Option<String>;
+    let Some(view) = decode_view!(text, owned, CodexLine) else {
+        return false;
+    };
+    let kind = view.kind.str();
+    let kind = kind.as_deref().unwrap_or("");
+    let minimal = match kind {
+        "response_item" => {
+            let Some(text) = view.payload.text() else {
+                return false;
+            };
+            let payload_owned: Option<String>;
+            let Some(payload) = decode_view!(text, payload_owned, CodexPayload) else {
+                return false;
+            };
+            let payload_type = payload.kind.str();
+            let payload_type = payload_type.as_deref().unwrap_or("");
+            if payload_type == "agent_message" {
+                return true;
+            }
+            serde_json::json!({"type":kind,"payload":{"type":payload_type,"role":payload.role.str()}})
+        }
+        "token_usage_record" | "event_msg" => {
+            // Usage records are small. Other event messages can contain
+            // large outputs and never close the prelude.
+            let Some(text) = view.payload.text() else {
+                return false;
+            };
+            let payload_owned: Option<String>;
+            let Some(payload) = decode_view!(text, payload_owned, CodexPayload) else {
+                return false;
+            };
+            if kind == "event_msg" && payload.kind.str().as_deref() != Some("token_count") {
+                return false;
+            }
+            let Ok(row) = serde_json::from_slice::<Value>(line) else {
+                return false;
+            };
+            row
+        }
+        _ => return false,
+    };
+    let mut parser = crate::codex_prelude_footprint::CodexPreludeParser::matching_only(0);
+    parser.observe(&minimal);
+    parser.prelude().input_closed
+}
+
 /// Handle one Codex line.
 pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8]) {
     if !state.request1_closed && out.kinds == KindsVersion::V2 {
-        // The shared parser determines exactly when the input closes. Its
-        // closure decision depends on this row, so no prior text is retained.
-        if let Ok(row) = serde_json::from_slice::<Value>(line) {
-            let mut parser = crate::codex_prelude_footprint::CodexPreludeParser::matching_only(0);
-            parser.observe(&row);
-            state.request1_closed = parser.prelude().input_closed
-                // Older rollouts use this response form, also supported by
-                // the composition request/residency handler below.
-                || (row["type"] == "response_item" && row["payload"]["type"] == "agent_message");
-        }
+        state.request1_closed = request1_input_closed(line);
     }
     if codex_never_counted(line) {
         out.stats.prefix_skipped += 1;

@@ -3559,3 +3559,22 @@ fn identity_and_scope_probes_do_not_prefetch_large_tool_output() {
     assert!(read <= 2 * 8192, "head probes read {read} bytes");
     env.cleanup();
 }
+
+#[test]
+fn request_one_boundary_does_not_allocate_large_skipped_prelude_text() {
+    let large = "x".repeat(8 * 1024 * 1024);
+    for row in [
+        json!({"type":"world_state","payload":{"text":large}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":large}]}}),
+    ] {
+        let bytes = serde_json::to_vec(&row).unwrap();
+        let (closed, stats) =
+            crate::retry_allocation_probe::measure(|| super::codex::request1_input_closed(&bytes));
+        assert!(!closed);
+        assert!(
+            stats.requested_peak < 128 * 1024,
+            "prelude boundary allocated {} bytes",
+            stats.requested_peak
+        );
+    }
+}
