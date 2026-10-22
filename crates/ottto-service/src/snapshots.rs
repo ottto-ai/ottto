@@ -35676,8 +35676,8 @@ mod tests {
         for flag in [true, false] {
             for (case, value) in malformed.iter().enumerate() {
                 let path = root.join(format!("claude-scan-index-{flag}-{case}.json"));
+                // A fresh path takes generation 0; the save makes it 1.
                 let mut index = ScanIndex {
-                    generation: 41,
                     resume_after_path: Some("content-free-cursor".to_string()),
                     ..ScanIndex::default()
                 };
@@ -35706,7 +35706,7 @@ mod tests {
                         .remove("bounded_sweep_unsettled_causes");
                 }
                 assert_eq!(reloaded, saved, "{value}: the rest of the index survives");
-                assert_eq!(loaded.generation, 41);
+                assert_eq!(loaded.generation, 1);
                 assert_eq!(
                     loaded.resume_after_path.as_deref(),
                     Some("content-free-cursor")
