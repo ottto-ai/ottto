@@ -51,7 +51,12 @@ pub(super) fn write_atomic<T>(
         .file_name()
         .ok_or_else(|| std::io::Error::other("state path has no name"))?
         .to_os_string();
-    temp_name.push(".tmp");
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    temp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let temp = dir.join(temp_name);
     let written = {
         let mut file = File::create(&temp)?;
@@ -239,22 +244,18 @@ pub(super) struct Pin {
     /// takes its place.
     #[serde(default)]
     pub(super) quarantined: bool,
+    /// A reset remains pending until this file commits a current-end checkpoint.
+    #[serde(default)]
+    pub(super) restart_at_end: bool,
     /// Fingerprints of the bytes before `start` (as the checkpoint's), so a
     /// larger copy of the same transcript can take over.
     #[serde(default)]
     pub(super) head: Fingerprint,
     #[serde(default)]
     pub(super) tail: Fingerprint,
-    /// Where the file's first read started (`start` moves on with each
-    /// commit). A scope falling back to an older committed generation reads
-    /// a file that generation never held from here.
+    /// Where the file's first read started (`start` moves on with each commit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) origin: Option<u64>,
-    /// Bytes before this offset were counted by a generation that could not
-    /// be used: reading them again is charged to the repair budget, and
-    /// waits for budget rather than being skipped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) repair_to: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -279,9 +280,7 @@ pub(super) struct Index {
     /// The last day a pin named each scope. A scope no pin named for
     /// `KEEP_DAYS` is no longer refreshed.
     pub(super) scope_last_pinned: BTreeMap<String, Day>,
-    /// Scopes whose state could not be used and had no good earlier
-    /// generation, with the day they were set aside: never read, rebuilt or
-    /// uploaded again.
+    /// Scopes awaiting a forward-only reset, with the date history was reset.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) quarantined_scopes: BTreeMap<String, Day>,
 }

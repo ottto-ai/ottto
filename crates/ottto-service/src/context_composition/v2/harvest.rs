@@ -14,14 +14,11 @@
 //! `LIVE_AT_INSTALL` are read once from their start within the repair
 //! budget; every other file starts at its current size. That discovery is
 //! saved before any scope commits, so a crashed first run resumes it. Later,
-//! a file born after the previous run started is new and read from its
-//! start; a file first seen but older starts at its current size.
+//! a file with no pin starts at its current size; missing pins never
+//! authorize another initial read.
 //!
-//! State that cannot be used is never rebuilt from transcripts. A scope
-//! goes back to its previous committed generation and reads only what that
-//! generation is behind on (repair budget); without one, the scope (or the
-//! files of a damaged checkpoint shard) is set aside. Each case is counted
-//! for the daily run-health alert.
+//! Bad state is quarantined and counted. On a later run its files restart
+//! at their current ends; no prior generation or transcript history is replayed.
 //!
 //! Every wake (even when no run is due) records the linked worktrees of each
 //! repository scope, read from the shared git folder without starting git,
@@ -40,10 +37,9 @@ use super::checkpoint::{
 };
 use super::file::{head_cwds, new_parse_state, read_lines, LineSink, LineStats, Names, Source};
 use super::scope::{
-    checkpoint_members, highest_generation, keep_previous, linked_worktrees, load_previous,
-    load_scope, prev_path, resolved_missing, save_scope, scope_file_stem, scope_files, scope_path,
-    set_aside, shard_id, update_members, verify_commit, GitScopeResolver, Scope, ScopeInfo,
-    ScopeResolver,
+    checkpoint_members, highest_generation, linked_worktrees, load_scope, resolved_missing,
+    save_scope, scope_file_stem, scope_files, scope_path, set_aside, shard_id, update_members,
+    verify_commit, GitScopeResolver, Scope, ScopeInfo, ScopeResolver,
 };
 use super::upload::{upload_scope, UploadOutcome, UploadResult, UploadTarget, Uploader};
 use super::{
@@ -104,7 +100,19 @@ fn run_wake(worktrees: &mut WorktreeCache) -> Result<()> {
     // only the hourly folder map returns to the scheduler.
     let mut command = Command::new(std::env::current_exe()?);
     command.arg("context-composition-worker");
-    *worktrees = run_worker_process(&mut command, worktrees)?;
+    let result = run_worker_process(&mut command, worktrees);
+    let (timeouts, failures, locked) = match result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<WorkerError>())
+    {
+        Some(WorkerError::Timeout) => (1, 0, 0),
+        Some(WorkerError::Locked) => (0, 0, 1),
+        _ if result.is_err() => (0, 1, 0),
+        _ => (0, 0, 0),
+    };
+    eprintln!("context_composition_v2_metrics source=parent worker_timeouts={timeouts} worker_failures={failures} worker_lock_busy={locked}");
+    *worktrees = result?;
     Ok(())
 }
 
@@ -130,33 +138,147 @@ pub(super) fn run_worker_process<I: Serialize, O: DeserializeOwned>(
     command: &mut Command,
     input: &I,
 ) -> Result<O> {
+    run_worker_process_timeout(
+        command,
+        input,
+        RUN_WALL_CAP + std::time::Duration::from_secs(5 * 60),
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WorkerError {
+    Timeout,
+    Failed,
+    Locked,
+}
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "composition worker {self:?}")
+    }
+}
+impl std::error::Error for WorkerError {}
+
+pub(super) fn run_worker_process_timeout<I: Serialize, O: DeserializeOwned>(
+    command: &mut Command,
+    input: &I,
+    timeout: std::time::Duration,
+) -> Result<O> {
+    use std::io::{Read, Write};
+    let deadline = Instant::now() + timeout;
+    let bytes = serde_json::to_vec(input)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-    let write = (|| -> Result<()> {
-        use std::io::Write;
-        let mut pipe = std::io::BufWriter::new(child.stdin.take().expect("piped worker input"));
-        serde_json::to_writer(&mut pipe, input)?;
-        pipe.flush()?;
-        Ok(())
+    let mut stdin = child.stdin.take().expect("piped worker input");
+    let stdout = child.stdout.take().expect("piped worker output");
+    let (send, recv) = std::sync::mpsc::channel();
+    let send_input = send.clone();
+    let writer = std::thread::spawn(move || {
+        let result = stdin.write_all(&bytes);
+        drop(stdin);
+        let _ = send_input.send(result.map(|()| None));
+    });
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes);
+        let result = result.and_then(|_| {
+            if bytes.len() > 16 * 1024 * 1024 {
+                Err(std::io::Error::other("worker reply too large"))
+            } else {
+                Ok(Some(bytes))
+            }
+        });
+        let _ = send.send(result);
+    });
+    let exchange = (|| -> Result<O> {
+        let mut status = None;
+        let mut output = None;
+        let mut wrote = false;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(WorkerError::Timeout.into());
+            }
+            while let Ok(result) = recv.try_recv() {
+                match result.map_err(|_| WorkerError::Failed)? {
+                    Some(bytes) => output = Some(bytes),
+                    None => wrote = true,
+                }
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if let Some(status) = status {
+                if status.code() == Some(75) {
+                    return Err(WorkerError::Locked.into());
+                }
+                if !status.success() {
+                    return Err(WorkerError::Failed.into());
+                }
+                if wrote {
+                    if let Some(bytes) = &output {
+                        let reply = bytes
+                            .split(|b| *b == b'\n')
+                            .rev()
+                            .find_map(|line| line.strip_prefix(WORKER_REPLY))
+                            .ok_or(WorkerError::Failed)?;
+                        return serde_json::from_slice(reply)
+                            .map_err(|_| WorkerError::Failed.into());
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     })();
-    if let Err(error) = write {
+    // Kill the private process group as well: a child holding a pipe must
+    // not keep either I/O thread alive after timeout or protocol failure.
+    #[cfg(unix)]
+    if exchange.is_err() {
+        // SAFETY: this child was started in its own process group.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    if exchange.is_err() {
         let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
     }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(anyhow!("composition worker failed: {}", output.status));
+    let _ = child.wait();
+    let _ = writer.join();
+    let _ = reader.join();
+    exchange
+}
+
+/// The OS releases this exclusive lease even if the parent or worker dies.
+/// It covers hourly mapping and the saved-day check as well as the scan.
+pub(super) fn lock_state(dir: &Path) -> std::io::Result<Option<File>> {
+    super::checkpoint::create_dir_durable(dir)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("worker.lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock operates on this live file descriptor.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
     }
-    let reply = output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .rev()
-        .find_map(|line| line.strip_prefix(WORKER_REPLY))
-        .ok_or_else(|| anyhow!("composition worker reply is missing"))?;
-    Ok(serde_json::from_slice(reply)?)
+    #[cfg(not(unix))]
+    return Err(std::io::Error::other("worker locking is unsupported"));
+    #[cfg(unix)]
+    Ok(Some(lock))
 }
 
 /// Private service entry point. It starts neither the daemon nor any other
@@ -167,9 +289,13 @@ pub fn run_context_composition_worker() -> Result<()> {
         return Err(anyhow!("changed-days composition reader is disabled"));
     }
     set_utility_qos();
+    let support_dir = ottto_core::default_support_dir();
+    let Some(_lease) = lock_state(&state_dir(&support_dir))? else {
+        eprintln!("context_composition_v2_metrics source=worker worker_lock_busy=1");
+        std::process::exit(75);
+    };
     let mut worktrees: WorktreeCache = serde_json::from_reader(std::io::stdin().lock())?;
     let home = crate::snapshot_sync::home_dir()?;
-    let support_dir = ottto_core::default_support_dir();
     if !local_harvest_disabled(&support_dir) {
         let today = day_of(OffsetDateTime::now_utc().date());
         map_worktrees(&state_dir(&support_dir), today, &mut worktrees);
@@ -355,7 +481,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} state_fallbacks={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -383,7 +509,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.cold_compacted,
         stats.cold_restarted,
         stats.bad_state,
-        stats.state_fallbacks,
+        stats.agent_resets,
         stats.scopes_quarantined,
         stats.files_quarantined,
         stats.checkpoint_restarts,
@@ -562,13 +688,10 @@ pub(super) struct SourceStats {
     /// Cold files rewritten: restarted at their end, not read again.
     pub(super) cold_restarted: u64,
     pub(super) bad_state: u64,
-    /// Scopes whose newest state could not be used and that went back to
-    /// their previous committed generation.
-    pub(super) state_fallbacks: u64,
-    /// Scopes set aside: unusable state and no good earlier generation.
+    pub(super) agent_resets: u64,
+    /// Scopes set aside because their state cannot be used.
     pub(super) scopes_quarantined: u64,
-    /// Files set aside because the checkpoint shard holding them was
-    /// damaged in every kept generation.
+    /// Files in scopes set aside because their state cannot be used.
     pub(super) files_quarantined: u64,
     /// Checkpoints naming ids this build does not know: restarted at their
     /// end, their counted history kept.
@@ -636,13 +759,6 @@ struct Work {
     /// A full read's granted end: bytes appended after the grant wait for
     /// the next run, so the repair budget is never exceeded.
     reserved: Option<u64>,
-    /// Bytes of a forward read already counted by a failed generation and
-    /// read again after a fallback (charged to the repair budget).
-    catch_up: u64,
-    /// Scoped in this run (no committed checkpoint can exist).
-    fresh: bool,
-    /// Added by a fallback only to catch up; dropped when nothing is behind.
-    catch_up_only: bool,
 }
 
 impl Work {
@@ -652,9 +768,6 @@ impl Work {
             found,
             mode,
             reserved: None,
-            catch_up: 0,
-            fresh: false,
-            catch_up_only: false,
         }
     }
 }
@@ -742,6 +855,7 @@ fn walk(
                 && metadata.len() == pin.size
                 && stamp(&metadata) == pin.mtime
                 && !pin.waiting
+                && !pin.restart_at_end
                 && (pin.start >= metadata.len() || pin.unscoped || pin.done || pin.quarantined)
             {
                 return;
@@ -772,109 +886,75 @@ fn walk(
     (found, archived, seen)
 }
 
-/// Bad pins: rebuild them from the scope states, whose checkpoints hold each
-/// file's path, identity, offset, size and scope. Files no scope holds start
-/// over as found-but-old.
-fn rebuild_pins(
-    state_dir: &Path,
+/// Recover manifest-last commits after a crash with an otherwise valid index.
+/// A missing index is never reconstructed: it resets the whole agent instead.
+fn reconcile_pins(
+    run: &Run,
     source: Source,
     index: &mut Index,
     today: Day,
-    only_uncommitted: bool,
+    stats: &mut SourceStats,
 ) -> u64 {
-    let Ok(entries) = fs::read_dir(state_dir.join("scopes")) else {
-        return 0;
-    };
-    let prefix = format!("{}-", source.label());
+    let state_dir = &run.state_dir;
     let mut rebuilt = 0;
-    // A scope whose newest manifest is gone still has its previous one.
-    let scope_ids: BTreeSet<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_str()?.strip_prefix(&prefix)?;
-            name.strip_suffix(".prev.json")
-                .or_else(|| name.strip_suffix(".json"))
-                .filter(|id| !id.contains('.'))
-                .map(str::to_string)
-        })
-        .collect();
-    for scope_id in scope_ids {
+    for scope_id in disk_scopes(state_dir, source) {
         let path = scope_path(state_dir, source, &scope_id);
-        if only_uncommitted {
-            #[derive(serde::Deserialize)]
-            struct Generation {
-                generation: u64,
-            }
-            let Ok(Some(saved)) = read_json::<Generation>(&path) else {
-                continue;
-            };
+        #[derive(Deserialize)]
+        struct Generation {
+            generation: u64,
+        }
+        let saved = read_json::<Generation>(&path);
+        if matches!(&saved, Ok(None))
+            && !index.scope_generations.contains_key(&scope_id)
+            && !path.with_extension("committed").exists()
+        {
+            // Shard writes can precede the first manifest. The intact
+            // installation pins still authorize their unfinished first read.
+            continue;
+        }
+        if let Ok(Some(saved)) = saved {
             if index.scope_generations.get(&scope_id) == Some(&saved.generation) {
                 continue;
             }
+        } else {
+            // A pending reset deliberately has no active manifest.
+            if index.quarantined_scopes.contains_key(&scope_id) {
+                continue;
+            }
+            stats.bad_state += 1;
+            quarantine_scope(run, source, &scope_id, &path, index, today, stats);
+            continue;
         }
-        let hydrate = |mut scope: Scope| scope.load_all_shards(&path).ok().map(|()| scope);
-        // Lost pins with unusable newest state: the previous generation's
-        // checkpoints, whose older offsets make the scope's fallback catch up.
-        let Some((scope, recovered_previous)) = load_scope(&path, source, &scope_id)
-            .ok()
-            .flatten()
-            .and_then(hydrate)
-            .map(|scope| (scope, false))
-            .or_else(|| {
-                (!only_uncommitted)
-                    .then(|| load_previous(&path, source, &scope_id))
-                    .flatten()
-                    .and_then(hydrate)
-                    .map(|scope| (scope, true))
-            })
-        else {
+        let loaded = load_scope(&path, source, &scope_id).ok().flatten();
+        let Some(mut scope) = loaded else {
+            stats.bad_state += 1;
+            quarantine_scope(run, source, &scope_id, &path, index, today, stats);
             continue;
         };
-        for (key, checkpoint) in &scope.files {
-            index.files.insert(
-                key.clone(),
-                Pin {
-                    path: checkpoint.path.clone(),
-                    dev: checkpoint.dev,
-                    ino: checkpoint.ino,
-                    scope: Some(scope_id.clone()),
-                    start: checkpoint.offset,
-                    size: checkpoint.size,
-                    mtime: checkpoint.mtime,
-                    waiting: false,
-                    done: checkpoint.status == Status::Done,
-                    last_seen: checkpoint.last_seen,
-                    first_seen: checkpoint.created,
-                    unscoped: false,
-                    failures: 0,
-                    quarantined: false,
-                    head: checkpoint.head,
-                    tail: checkpoint.tail,
-                    origin: checkpoint.origin,
-                    repair_to: None,
-                },
-            );
-            rebuilt += 1;
+        if scope.load_all_shards(&path).is_err() {
+            stats.bad_state += 1;
+            quarantine_scope(run, source, &scope_id, &path, index, today, stats);
+            continue;
         }
-        // Only explicit committed recovery metadata identifies rollback
-        // debt. A shorter checkpoint can also be a successful rewrite.
-        // Quarantined files may deliberately have no checkpoint at all.
-        index.files.extend(scope.recovery_pins);
-        if recovered_previous {
-            // With both the index and newest generation unavailable, the
-            // old counted boundary cannot be trusted. Conservatively charge
-            // the entire outstanding tail at recovery to repair, never to
-            // uncapped new bytes. Later appends remain new.
-            for pin in index.files.values_mut() {
-                if pin.scope.as_deref() != Some(scope_id.as_str()) || pin.quarantined {
+        for (key, checkpoint) in scope.files {
+            if let Some(pin) = index.files.get_mut(&key) {
+                pin.scope = Some(scope_id.clone());
+                // Even an equal offset can be an old checkpoint retained
+                // after a failed reset. Only a successful reset read and
+                // its final index write clear this conservative decision.
+                if pin.restart_at_end {
                     continue;
                 }
-                let Ok(metadata) = fs::metadata(&pin.path) else {
-                    continue;
-                };
-                let end = metadata.len().max(pin.repair_to.unwrap_or(0));
-                pin.repair_to = (end > pin.start).then_some(end);
+                pin.dev = checkpoint.dev;
+                pin.ino = checkpoint.ino;
+                pin.path = checkpoint.path.clone();
+                pin.start = checkpoint.offset;
+                pin.size = checkpoint.size;
+                pin.mtime = checkpoint.mtime;
+                pin.head = checkpoint.head;
+                pin.tail = checkpoint.tail;
+                pin.waiting = false;
+                rebuilt += 1;
             }
         }
         if !scope.info.workspace_path.is_empty() {
@@ -883,12 +963,28 @@ fn rebuild_pins(
                 .insert(scope.info.workspace_path.clone(), scope_id.clone());
         }
         index.scope_info.insert(scope_id.clone(), scope.info);
-        index
-            .scope_generations
-            .insert(scope_id.clone(), scope.generation);
-        index.scope_last_pinned.insert(scope_id, today);
+        index.scope_last_pinned.insert(scope_id.clone(), today);
+        index.scope_generations.insert(scope_id, scope.generation);
     }
     rebuilt
+}
+
+fn disk_scopes(state_dir: &Path, source: Source) -> BTreeSet<String> {
+    let prefix = format!("{}-", source.label());
+    fs::read_dir(state_dir.join("scopes"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix(&prefix)?
+                .split('.')
+                .next()
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Every index, shard, name cache and upload buffer belongs to this source
@@ -940,45 +1036,37 @@ fn run_source_inner(
     let now_secs = run.now.unix_timestamp();
     let path = index_path(&run.state_dir, source);
     let install_file = install_path(&run.state_dir, source.label());
-    let (mut index, mut first_run) = match read_json::<Index>(&path) {
-        Ok(Some(index)) if index.schema == STATE_SCHEMA => (index, false),
-        Ok(None) => (Index::new(now_secs), true),
-        _ => {
-            stats.bad_state += 1;
-            let mut index = Index::new(now_secs);
-            index.last_scan_started = Some(now_secs);
-            stats.pins_rebuilt = rebuild_pins(&run.state_dir, source, &mut index, today, false);
-            (index, false)
-        }
+    let saved = read_json::<Index>(&path);
+    let scopes_on_disk = disk_scopes(&run.state_dir, source);
+    let prior_install = install_file.exists();
+    let valid = matches!(&saved, Ok(Some(index)) if index.schema == STATE_SCHEMA);
+    let first_run = matches!(&saved, Ok(None)) && !prior_install && scopes_on_disk.is_empty();
+    let agent_reset = !valid && !first_run;
+    let mut index = match saved {
+        Ok(Some(index)) if valid => index,
+        _ => Index::new(now_secs),
     };
-    // A first run can commit a scope before its only pins write. Recover
-    // those manifests even when the pins file has never existed, and resume
-    // the first run's discovery from its install record: its cutoff and
-    // starting offsets, never the restart time.
-    let mut install = None;
-    if first_run {
-        install = read_json::<InstallRecord>(&install_file)
-            .ok()
-            .flatten()
-            .filter(|record| record.schema == STATE_SCHEMA);
-        let recovered = rebuild_pins(&run.state_dir, source, &mut index, today, false);
-        stats.pins_rebuilt += recovered;
-        if let Some(record) = &install {
-            first_run = false;
-            index.created = record.cutoff;
-            index.last_scan_started = Some(record.cutoff);
-        } else if recovered > 0 {
-            // Committed scopes without pins or an install record: pins lost
-            // after a completed first run, as with bad pins.
-            first_run = false;
-            index.last_scan_started = Some(now_secs);
+    if agent_reset {
+        stats.bad_state += 1;
+        stats.agent_resets += 1;
+        // Persist the reset before any state moves. A crash cannot turn a
+        // missing index into an installation with permission to read history.
+        if write_json(
+            &install_file,
+            &InstallRecord {
+                schema: STATE_SCHEMA,
+                cutoff: now_secs,
+                ..Default::default()
+            },
+        )
+        .is_err()
+        {
+            stats.scopes_failed += 1;
+            return stats;
         }
-    } else {
-        // Generation comparison also works on filesystems whose timestamps
-        // cannot distinguish the manifest commit from the previous pins write.
-        stats.pins_rebuilt += rebuild_pins(&run.state_dir, source, &mut index, today, true);
+    } else if valid {
+        stats.pins_rebuilt = reconcile_pins(run, source, &mut index, today, &mut stats);
     }
-    let previous_scan = index.last_scan_started;
     index.last_scan_started = Some(now_secs);
 
     // Discovery: pick one copy per key and decide what needs reading.
@@ -1020,28 +1108,14 @@ fn run_source_inner(
     for (key, file) in &present {
         let needs = match index.files.get_mut(key) {
             None => {
-                let recorded = install
-                    .as_ref()
-                    .and_then(|record| Some((record.starts.get(key)?, record)));
-                let (new, start, waiting) = match recorded {
-                    // Found by the interrupted first run.
-                    Some((start, record)) => {
-                        let live = record.live.contains(key);
-                        (live, (*start).min(file.size), live)
-                    }
-                    None => {
-                        let new = if first_run {
-                            now_secs - file.stamp.0 <= LIVE_AT_INSTALL.as_secs() as i64
-                        } else {
-                            previous_scan.is_some_and(|last| file.birth >= last)
-                        };
-                        // Files live at install read from their start
-                        // within the repair budget.
-                        (new, if new { 0 } else { file.size }, new && first_run)
-                    }
-                };
+                let new = first_run && now_secs - file.stamp.0 <= LIVE_AT_INSTALL.as_secs() as i64;
+                let start = if new { 0 } else { file.size };
+                let waiting = new;
                 if !new {
                     stats.dormant_found += 1;
+                    if !first_run && !agent_reset {
+                        stats.checkpoint_restarts += 1;
+                    }
                 }
                 index.files.insert(
                     key.clone(),
@@ -1057,17 +1131,17 @@ fn run_source_inner(
                         done: false,
                         last_seen: today,
                         // First seen by the install run when it found it.
-                        first_seen: recorded.map_or(now_secs, |(_, record)| record.cutoff),
+                        first_seen: now_secs,
                         unscoped: false,
                         failures: 0,
                         quarantined: false,
+                        restart_at_end: !first_run,
                         head: Default::default(),
                         tail: Default::default(),
                         origin: Some(start),
-                        repair_to: None,
                     },
                 );
-                start < file.size
+                start < file.size || agent_reset
             }
             Some(pin) => {
                 pin.last_seen = today;
@@ -1099,6 +1173,7 @@ fn run_source_inner(
                 // whose scoping failed is retried (one that named no folder
                 // waits until it changes).
                 pin.waiting
+                    || pin.restart_at_end
                     || !same
                     || file.size != pin.size
                     || file.stamp != pin.mtime
@@ -1106,7 +1181,12 @@ fn run_source_inner(
             }
         };
         if needs {
-            work.push(Work::new(key.clone(), file.clone(), Mode::Forward));
+            let mode = if index.files[key].restart_at_end {
+                Mode::RestartAtEnd
+            } else {
+                Mode::Forward
+            };
+            work.push(Work::new(key.clone(), file.clone(), mode));
         }
     }
     if first_run {
@@ -1153,7 +1233,7 @@ fn run_source_inner(
 
     // Scope every file that will be read.
     let mut scoped = Vec::with_capacity(work.len());
-    for mut item in work {
+    for item in work {
         let Some(pin) = index.files.get(&item.key) else {
             continue;
         };
@@ -1179,7 +1259,6 @@ fn run_source_inner(
             Scoping::Found(scope) => {
                 pin.scope = Some(scope);
                 pin.unscoped = false;
-                item.fresh = true;
                 scoped.push(item);
             }
             Scoping::Unscoped => {
@@ -1193,6 +1272,122 @@ fn run_source_inner(
         }
     }
     let mut work = scoped;
+
+    if agent_reset {
+        let mut scopes = scopes_on_disk;
+        scopes.extend(index.files.values().filter_map(|pin| pin.scope.clone()));
+        for scope in scopes {
+            let path = scope_path(&run.state_dir, source, &scope);
+            quarantine_scope(run, source, &scope, &path, &mut index, today, &mut stats);
+        }
+    }
+    // Pending resets include unchanged files: every current file is pinned
+    // at its current end on the first later run, before any new tail is read.
+    let mut pending = index.quarantined_scopes.clone();
+    let marker_dir = run.state_dir.join("quarantined-scopes");
+    for entry in fs::read_dir(marker_dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        if let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(&format!("{}-", source.label())))
+            .and_then(|n| n.strip_suffix(".json"))
+        {
+            match read_json::<Day>(&entry.path()) {
+                Ok(Some(day)) => {
+                    pending.insert(id.to_string(), day);
+                }
+                _ => {
+                    stats.bad_state += 1;
+                    quarantine_scope(
+                        run,
+                        source,
+                        id,
+                        &scope_path(&run.state_dir, source, id),
+                        &mut index,
+                        today,
+                        &mut stats,
+                    );
+                    pending.insert(id.to_string(), today);
+                }
+            }
+        }
+    }
+    let mut reset_prepared = false;
+    for (scope_id, day) in pending {
+        let path = scope_path(&run.state_dir, source, &scope_id);
+        #[derive(Deserialize)]
+        struct ResetDate {
+            history_reset_at: Option<Day>,
+        }
+        let applied = read_json::<ResetDate>(&path)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.history_reset_at == Some(day));
+        if applied {
+            index.quarantined_scopes.remove(&scope_id);
+            continue;
+        }
+        if index
+            .quarantined_scopes
+            .insert(scope_id.clone(), day)
+            .is_none()
+        {
+            stats.scopes_quarantined += 1;
+            for pin in index
+                .files
+                .values_mut()
+                .filter(|pin| pin.scope.as_deref() == Some(scope_id.as_str()))
+            {
+                pin.restart_at_end = true;
+                pin.waiting = false;
+            }
+            stats.files_quarantined += index
+                .files
+                .values()
+                .filter(|pin| pin.scope.as_deref() == Some(&scope_id))
+                .count() as u64;
+        }
+        if day >= today {
+            work.retain(|item| {
+                index.files.get(&item.key).and_then(|p| p.scope.as_deref()) != Some(&scope_id)
+            });
+            continue;
+        }
+        work.retain(|item| {
+            index.files.get(&item.key).and_then(|p| p.scope.as_deref()) != Some(&scope_id)
+        });
+        reset_prepared = true;
+        for (key, pin) in &mut index.files {
+            if pin.scope.as_deref() != Some(&scope_id) {
+                continue;
+            }
+            pin.restart_at_end = true;
+            pin.waiting = false;
+            pin.quarantined = false;
+            pin.failures = 0;
+            if let Some(file) = present.get(key) {
+                work.push(Work::new(key.clone(), file.clone(), Mode::RestartAtEnd));
+            } else if let Ok(metadata) = fs::metadata(&pin.path) {
+                work.push(Work::new(
+                    key.clone(),
+                    Found::new(PathBuf::from(&pin.path), &metadata),
+                    Mode::RestartAtEnd,
+                ));
+            }
+        }
+    }
+
+    if reset_prepared {
+        // Before any reset manifest can commit, every unfinished file's
+        // restart decision must survive a crash or a partial scope commit.
+        match write_json(&path, &index) {
+            Ok(bytes) => stats.state_bytes += bytes,
+            Err(_) => {
+                stats.scopes_failed += 1;
+                return stats;
+            }
+        }
+    }
 
     // Full reads waiting for budget, newest first.
     let mut waiting: Vec<&mut Work> = work
@@ -1243,7 +1438,7 @@ fn run_source_inner(
         }
         let items = by_scope.remove(&scope_id).unwrap_or_default();
         let Some(scope) = process_scope(
-            run, source, &scope_id, items, &mut index, &present, window, &mut names, &mut stats,
+            run, source, &scope_id, items, &mut index, window, &mut names, &mut stats,
         ) else {
             continue;
         };
@@ -1260,15 +1455,17 @@ fn run_source_inner(
     }
     stats.name_lookups_skipped = names.skipped();
     tidy_index(&mut index, today);
-    if let Ok(bytes) = write_json(&path, &index) {
-        stats.state_bytes += bytes;
-        // The pins now hold the first run's discovery.
-        let _ = fs::remove_file(&install_file);
-    }
 
     if let Some(target) = target.as_mut() {
-        upload_other_scopes(run, source, &index, &uploaded, target, window, &mut stats);
+        upload_other_scopes(
+            run, source, &mut index, &uploaded, target, window, &mut stats,
+        );
     }
+    if let Ok(bytes) = write_json(&path, &index) {
+        stats.state_bytes += bytes;
+        // Keep the durable installation witness: a missing index is a reset.
+    }
+
     finish(&mut stats, started, cpu_started);
     stats
 }
@@ -1406,17 +1603,6 @@ fn grant(run: &mut Run, stats: &mut SourceStats, size: u64) -> Mode {
 /// Failed reads in a row that quarantine a file.
 const QUARANTINE_AFTER: u8 = 2;
 
-/// Where a scope's state came from this run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Base {
-    /// Never committed.
-    Fresh,
-    /// The newest committed generation.
-    Current,
-    /// The previous generation: the newest could not be used.
-    Fallback,
-}
-
 #[allow(clippy::too_many_arguments)]
 fn process_scope(
     run: &mut Run,
@@ -1424,23 +1610,10 @@ fn process_scope(
     scope_id: &str,
     mut items: Vec<Work>,
     index: &mut Index,
-    present: &BTreeMap<String, Found>,
     window: Window,
     names: &mut GitRootCache,
     stats: &mut SourceStats,
 ) -> Option<Scope> {
-    if scope_quarantine_marker(&run.state_dir, source, scope_id).is_file()
-        && index
-            .quarantined_scopes
-            .insert(scope_id.to_string(), window.today)
-            .is_none()
-    {
-        stats.scopes_quarantined += 1;
-    }
-    if index.quarantined_scopes.contains_key(scope_id) {
-        // Set aside: never read, rebuilt or uploaded again.
-        return None;
-    }
     let today = window.today;
     let path = scope_path(&run.state_dir, source, scope_id);
     let info = index
@@ -1453,100 +1626,56 @@ fn process_scope(
             identity: Default::default(),
             common_dir: None,
         });
-    let known = index.scope_generations.contains_key(scope_id)
-        || prev_path(&path).is_file()
-        || path.with_extension("committed").is_file();
-    let loaded = match load_scope(&path, source, scope_id) {
-        // A scope the pins know but whose state is gone is bad state too.
-        Ok(None) if known => Err(()),
-        loaded => loaded,
-    };
-    let previous = || load_previous(&path, source, scope_id);
-    // Shards are checked before any transcript byte is read, so a damaged
-    // one can still send the whole scope back to its previous generation.
-    let mut damaged = BTreeSet::new();
-    let (mut scope, base) = match loaded {
-        Ok(None) => {
-            forget_upload(&run.state_dir, source, scope_id);
-            (Scope::new(scope_id, info), Base::Fresh)
+    let reset = index.quarantined_scopes.get(scope_id).copied();
+    if reset.is_some_and(|day| day >= today) {
+        return None;
+    }
+    let mut scope = if let Some(day) = reset {
+        // Finish moving any files left by a crash after the reset marker.
+        if set_aside(
+            &run.state_dir,
+            &format!("{}-{day}", scope_file_stem(source, scope_id)),
+            &scope_files(&path),
+        )
+        .is_err()
+        {
+            stats.scopes_failed += 1;
+            return None;
         }
-        Ok(Some(mut scope)) => {
-            damaged = scope.verify_shards(&path, items.iter().map(|item| shard_id(&item.key)));
-            if damaged.is_empty() {
-                (scope, Base::Current)
-            } else {
-                stats.bad_state += 1;
-                match previous() {
-                    Some(previous) => (previous, Base::Fallback),
-                    None => (scope, Base::Current),
-                }
-            }
-        }
-        Err(()) => {
-            // Never rebuilt from transcripts: the previous generation, or
-            // the scope is set aside.
-            stats.bad_state += 1;
-            match previous() {
-                Some(previous) => (previous, Base::Fallback),
-                None => {
+        let mut scope = Scope::new(scope_id, info);
+        scope.history_reset_at = Some(day);
+        scope
+    } else {
+        let known = index.scope_generations.contains_key(scope_id)
+            || path.with_extension("committed").exists();
+        match load_scope(&path, source, scope_id) {
+            Ok(Some(mut scope)) => {
+                if !scope
+                    .verify_shards(&path, scope.shards.keys().copied().collect::<Vec<_>>())
+                    .is_empty()
+                {
+                    stats.bad_state += 1;
                     quarantine_scope(run, source, scope_id, &path, index, today, stats);
                     return None;
                 }
+                scope
+            }
+            Ok(None) if !known => {
+                forget_upload(&run.state_dir, source, scope_id);
+                Scope::new(scope_id, info)
+            }
+            _ => {
+                stats.bad_state += 1;
+                quarantine_scope(run, source, scope_id, &path, index, today, stats);
+                return None;
             }
         }
     };
-    let generation = if base == Base::Fallback {
-        // The previous generation's offsets are older than the pins': every
-        // pinned file that generation is behind on reads the difference.
-        stats.state_fallbacks += 1;
-        let listed: BTreeSet<String> = items.iter().map(|item| item.key.clone()).collect();
-        for (key, pin) in &index.files {
-            if pin.scope.as_deref() != Some(scope_id)
-                || pin.done
-                || pin.quarantined
-                || listed.contains(key)
-            {
-                continue;
-            }
-            let Some(found) = present.get(key).cloned().or_else(|| {
-                let path = PathBuf::from(&pin.path);
-                let metadata = fs::metadata(&path).ok()?;
-                Some(Found::new(path, &metadata))
-            }) else {
-                continue;
-            };
-            let mut item = Work::new(key.clone(), found, Mode::Forward);
-            item.catch_up_only = true;
-            items.push(item);
-        }
-        damaged = scope.verify_shards(&path, items.iter().map(|item| shard_id(&item.key)));
-        // Every day is sent again: the acknowledged upload may hold the
-        // failed generation's rows.
-        forget_upload(&run.state_dir, source, scope_id);
-        // Names the failed generation wrote are never reused.
-        scope
-            .generation
-            .max(index.scope_generations.get(scope_id).copied().unwrap_or(0))
-            .max(highest_generation(&path))
-            + 1
-    } else {
-        scope.generation + 1
-    };
-    // Kept by this commit's cleanup next to the new generation.
-    let kept = scope.refs();
+    let generation = scope.generation.max(highest_generation(&path)) + 1;
     let legacy = std::mem::take(&mut scope.files);
     let mut groups: BTreeMap<u16, Vec<Work>> = BTreeMap::new();
     for item in items.drain(..) {
         groups.entry(shard_id(&item.key)).or_default().push(item);
-    }
-    if base == Base::Fallback {
-        // A temporarily absent file still needs a durable rollback pin.
-        // Its shard may have no discovery work items this run.
-        for (key, pin) in &index.files {
-            if pin.scope.as_deref() == Some(scope_id) && !pin.done && !pin.quarantined {
-                groups.entry(shard_id(key)).or_default();
-            }
-        }
     }
     // Migration reads state only, never transcript history. The switch has
     // not shipped, but preserve existing local checkpoints when upgrading.
@@ -1564,61 +1693,16 @@ fn process_scope(
     for (id, mut items) in groups.by_ref() {
         if stats.cut || Instant::now() >= run.deadline {
             stats.cut = true;
-            if base == Base::Fallback {
-                follow_kept_shard(
-                    run, source, scope_id, &mut scope, &path, id, &damaged, index, stats,
-                );
-            }
             break;
         }
         let legacy = legacy_groups.remove(&id);
         let migrating = legacy.is_some();
         scope.files = legacy.unwrap_or_default();
-        if damaged.contains(&id) || scope.load_shard(&path, id).is_err() {
-            items = quarantine_shard(
-                run, source, scope_id, &mut scope, &path, id, items, index, stats,
-            );
+        if scope.load_shard(&path, id).is_err() {
+            stats.bad_state += 1;
+            quarantine_scope(run, source, scope_id, &path, index, today, stats);
+            return None;
         }
-        if base == Base::Fallback {
-            // Whatever happens to the reads, the pins now follow the kept
-            // generation, so nothing it is behind on is ever skipped.
-            follow_kept_pins(index, scope_id, id, &scope);
-        }
-        // Bytes a failed generation had counted are read again within the
-        // repair budget, or wait for a later day's.
-        items.retain_mut(|item| {
-            if item.mode != Mode::Forward {
-                return true;
-            }
-            let Some(pin) = index.files.get(&item.key) else {
-                return !item.catch_up_only;
-            };
-            let from = scope
-                .files
-                .get(&item.key)
-                .map_or(pin.start, |checkpoint| checkpoint.offset);
-            let behind = pin
-                .repair_to
-                .map_or(0, |to| to.min(item.found.size).saturating_sub(from));
-            if behind == 0 {
-                return !item.catch_up_only;
-            }
-            if behind > REPAIR_BYTES_PER_DAY {
-                // More than a whole day's budget: counted, and its earlier
-                // totals stay as committed.
-                stats.repair_restarted += 1;
-                item.mode = Mode::RestartAtEnd;
-                return true;
-            }
-            if behind <= run.repair_left {
-                run.repair_left -= behind;
-                item.catch_up = behind;
-                return true;
-            }
-            stats.repair_waiting += 1;
-            stats.repair_waiting_bytes += behind;
-            false
-        });
         if items.is_empty() && !migrating {
             // Nothing to read or move: the shard keeps its reference.
             scope.files.clear();
@@ -1735,8 +1819,8 @@ fn process_scope(
                 pin.head = checkpoint.head;
                 pin.tail = checkpoint.tail;
                 pin.waiting = false;
+                pin.restart_at_end = false;
                 pin.failures = 0;
-                pin.repair_to = pin.repair_to.filter(|to| *to > checkpoint.offset);
                 updates.push((key, pin));
             }
         }
@@ -1749,16 +1833,6 @@ fn process_scope(
         }
         scope.files.clear();
     }
-    // A cut fallback commits the kept generation for shards it did not
-    // reach: their pins follow it too, so the next run reads what it is
-    // behind on.
-    if base == Base::Fallback {
-        for (id, _) in groups {
-            follow_kept_shard(
-                run, source, scope_id, &mut scope, &path, id, &damaged, index, stats,
-            );
-        }
-    }
     update_members(&mut scope.file_sessions, removed, added, window.floor);
     scope.agg.prune(window);
     // Every checkpoint commit advances generation, even when all new lines
@@ -1769,28 +1843,6 @@ fn process_scope(
     if tests::fail_scope_commit() {
         stats.scopes_failed += 1;
         return None;
-    }
-    // The generation now committed stays, as the fallback, until the new
-    // one is verified. After a fallback the previous one already is.
-    if base == Base::Current && keep_previous(&path).is_err() {
-        stats.scopes_failed += 1;
-        return None;
-    }
-    // Save exceptional pin decisions in the same transaction as totals.
-    // Apply successful read updates first, so discharged debt is removed.
-    scope.recovery_pins = index
-        .files
-        .iter()
-        .filter(|(_, pin)| pin.scope.as_deref() == Some(scope_id))
-        .filter(|(_, pin)| pin.quarantined || pin.repair_to.is_some())
-        .map(|(key, pin)| (key.clone(), pin.clone()))
-        .collect();
-    for (key, pin) in &updates {
-        if pin.quarantined || pin.repair_to.is_some() {
-            scope.recovery_pins.insert(key.clone(), pin.clone());
-        } else {
-            scope.recovery_pins.remove(key);
-        }
     }
     match save_scope(&path, source, &scope) {
         Ok(bytes) => {
@@ -1804,8 +1856,7 @@ fn process_scope(
         }
     }
     if !verify_commit(&path, source, &scope) {
-        // Nothing is cleaned and the pins keep their offsets: the next run
-        // falls back to the kept generation.
+        // Leave failed state for counted quarantine on the next run.
         stats.scopes_failed += 1;
         return None;
     }
@@ -1823,7 +1874,8 @@ fn process_scope(
         }
     }
     stats.scopes_committed += 1;
-    scope.clean_shards(&path, &kept);
+    scope.clean_shards(&path);
+    index.quarantined_scopes.remove(scope_id);
     for (key, pin) in updates {
         index.files.insert(key, pin);
     }
@@ -1833,113 +1885,7 @@ fn process_scope(
     Some(scope)
 }
 
-/// After a fallback: point a pin at what the kept generation holds for it
-/// (its checkpoint, else where its first read started), remembering how far
-/// the failed generation had counted.
-fn follow_kept(pin: &mut Pin, kept: Option<&Checkpoint>) {
-    let from = kept.map_or_else(|| pin.origin.unwrap_or(pin.start), |kept| kept.offset);
-    if pin.start <= from {
-        return;
-    }
-    pin.repair_to = Some(pin.repair_to.unwrap_or(0).max(pin.start));
-    pin.start = from;
-    (pin.head, pin.tail) = kept.map_or_else(Default::default, |kept| (kept.head, kept.tail));
-}
-
-/// Roll back every active pin of a shard, including temporarily absent files.
-fn follow_kept_pins(index: &mut Index, scope_id: &str, id: u16, scope: &Scope) {
-    for (key, pin) in &mut index.files {
-        if pin.scope.as_deref() == Some(scope_id)
-            && shard_id(key) == id
-            && !pin.done
-            && !pin.quarantined
-        {
-            follow_kept(pin, scope.files.get(key));
-        }
-    }
-}
-
-/// `follow_kept` for the files of a shard a cut fallback did not process.
-#[allow(clippy::too_many_arguments)]
-fn follow_kept_shard(
-    run: &Run,
-    source: Source,
-    scope_id: &str,
-    scope: &mut Scope,
-    path: &Path,
-    id: u16,
-    damaged: &BTreeSet<u16>,
-    index: &mut Index,
-    stats: &mut SourceStats,
-) {
-    scope.files.clear();
-    if damaged.contains(&id) || scope.load_shard(path, id).is_err() {
-        quarantine_shard(
-            run,
-            source,
-            scope_id,
-            scope,
-            path,
-            id,
-            Vec::new(),
-            index,
-            stats,
-        );
-        return;
-    }
-    follow_kept_pins(index, scope_id, id, scope);
-    scope.files.clear();
-}
-
-/// No kept generation holds this shard: stop referencing it and set its
-/// file aside. The files it held are set aside too (counted per file): never
-/// re-read, never moved on from an empty checkpoint, their pins kept. Returns
-/// the items still to read: files first scoped in this run.
-#[allow(clippy::too_many_arguments)]
-fn quarantine_shard(
-    run: &Run,
-    source: Source,
-    scope_id: &str,
-    scope: &mut Scope,
-    path: &Path,
-    id: u16,
-    mut items: Vec<Work>,
-    index: &mut Index,
-    stats: &mut SourceStats,
-) -> Vec<Work> {
-    stats.bad_state += 1;
-    scope.files.clear();
-    if let Some(file) = scope.drop_shard(path, id) {
-        let label = format!(
-            "{}-s{id:03}-{}",
-            scope_file_stem(source, scope_id),
-            run.now.unix_timestamp()
-        );
-        let _ = set_aside(&run.state_dir, &label, &[file]);
-    }
-    let fresh: BTreeSet<String> = items
-        .iter()
-        .filter(|item| item.fresh)
-        .map(|item| item.key.clone())
-        .collect();
-    for (key, pin) in index.files.iter_mut() {
-        if pin.scope.as_deref() == Some(scope_id)
-            && shard_id(key) == id
-            && !pin.done
-            && !pin.quarantined
-            && !fresh.contains(key)
-        {
-            pin.quarantined = true;
-            stats.files_quarantined += 1;
-        }
-    }
-    items.retain(|item| fresh.contains(&item.key));
-    items
-}
-
-/// Unusable state and no good earlier generation: move the scope's files
-/// aside and stop reading, updating and uploading it (counted). Its
-/// transcripts are never read again to rebuild it.
+/// Persist a reset decision before moving state; never read quarantined history.
 fn quarantine_scope(
     run: &Run,
     source: Source,
@@ -1963,6 +1909,19 @@ fn quarantine_scope(
     if marked.is_err() || set_aside(&run.state_dir, &label, &scope_files(path)).is_err() {
         stats.scopes_failed += 1;
     }
+    for pin in index
+        .files
+        .values_mut()
+        .filter(|pin| pin.scope.as_deref() == Some(scope_id))
+    {
+        pin.restart_at_end = true;
+        pin.waiting = false;
+    }
+    stats.files_quarantined += index
+        .files
+        .values()
+        .filter(|pin| pin.scope.as_deref() == Some(scope_id))
+        .count() as u64;
     index.quarantined_scopes.insert(scope_id.to_string(), today);
     index.scope_generations.remove(scope_id);
     stats.scopes_quarantined += 1;
@@ -2021,6 +1980,9 @@ fn read_file(
     // The scope keeps this checkpoint until the read succeeds.
     let mut existing = scope.files.get(&item.key).cloned();
     let mut mode = item.mode;
+    if mode == Mode::RestartAtEnd {
+        stats.checkpoint_restarts += 1;
+    }
     let mut reserved = item.reserved;
     if let Some(checkpoint) = existing
         .as_mut()
@@ -2030,7 +1992,9 @@ fn read_file(
         // checkpoint restarts at its end. What it counted stays in the totals
         // and, like a cold file's share, can never be replaced, so a later
         // rewrite never adds it twice.
-        stats.checkpoint_restarts += 1;
+        if mode != Mode::RestartAtEnd {
+            stats.checkpoint_restarts += 1;
+        }
         checkpoint.compact();
         if mode == Mode::Full {
             run.repair_left += reserved.take().unwrap_or(0);
@@ -2212,9 +2176,7 @@ fn read_file(
     if mode == Mode::Full {
         stats.bytes_repair += end.bytes;
     } else {
-        let repair = item.catch_up.min(end.bytes);
-        stats.bytes_repair += repair;
-        stats.bytes_new += end.bytes - repair;
+        stats.bytes_new += end.bytes;
     }
     stats.cut |= end.cut;
     state.open.retain(|(day, _, _)| *day >= window.floor);
@@ -2230,6 +2192,9 @@ fn read_file(
     checkpoint.last_seen = window.today;
     checkpoint.parse = StoredParse::from_state(&state);
     checkpoint.contribution = StoredContribution::from_share(&contribution);
+    if mode == Mode::RestartAtEnd {
+        checkpoint.compact();
+    }
     Ok(Some(Outcome::Read(Box::new(checkpoint))))
 }
 
@@ -2254,17 +2219,17 @@ fn count_upload(result: UploadResult, stats: &mut SourceStats) {
 fn upload_other_scopes(
     run: &Run,
     source: Source,
-    index: &Index,
+    index: &mut Index,
     done: &BTreeSet<String>,
     target: &mut UploadTarget,
     window: Window,
     stats: &mut SourceStats,
 ) {
-    for (scope_id, generation) in &index.scope_generations {
+    for (scope_id, generation) in index.scope_generations.clone() {
+        let scope_id = &scope_id;
         if done.contains(scope_id)
             || scope_retired(index, scope_id, window.today)
             || index.quarantined_scopes.contains_key(scope_id)
-            || scope_quarantine_marker(&run.state_dir, source, scope_id).is_file()
         {
             continue;
         }
@@ -2274,15 +2239,31 @@ fn upload_other_scopes(
             .flatten()
             .filter(|ack| ack.destination == target.destination);
         let due = ack.as_ref().map_or(true, |ack| {
-            ack.generation < *generation
+            ack.generation < generation
                 || run.now.unix_timestamp() - ack.posted_at >= super::UPLOAD_STALENESS_SECS
         });
         if !due {
             continue;
         }
         let path = scope_path(&run.state_dir, source, scope_id);
-        let Ok(Some(mut scope)) = load_scope(&path, source, scope_id) else {
-            continue;
+        let loaded = load_scope(&path, source, scope_id);
+        let mut scope = match loaded {
+            Ok(Some(mut scope)) => {
+                if !scope
+                    .verify_shards(&path, scope.shards.keys().copied().collect::<Vec<_>>())
+                    .is_empty()
+                {
+                    stats.bad_state += 1;
+                    quarantine_scope(run, source, scope_id, &path, index, window.today, stats);
+                    continue;
+                }
+                scope
+            }
+            _ => {
+                stats.bad_state += 1;
+                quarantine_scope(run, source, scope_id, &path, index, window.today, stats);
+                continue;
+            }
         };
         scope.agg.prune(window);
         let result = upload_scope(&run.state_dir, source, &scope, target, run.now, window);

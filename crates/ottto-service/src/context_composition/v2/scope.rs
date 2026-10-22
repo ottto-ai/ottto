@@ -9,8 +9,7 @@
 use super::aggregate::{stable_hash, Day};
 use super::aggregate::{Aggregate, AggregateRef, StoredAggregate};
 use super::checkpoint::{
-    create_dir_durable, read_json, sync_dir, write_atomic, write_json, write_packed, Checkpoint,
-    Pin,
+    create_dir_durable, read_json, sync_dir, write_json, write_packed, Checkpoint,
 };
 use super::file::Source;
 use super::STATE_SCHEMA;
@@ -162,7 +161,7 @@ pub(super) struct StoredScope {
     #[serde(default)]
     totals: Option<ShardRef>,
     #[serde(default)]
-    recovery_pins: BTreeMap<String, Pin>,
+    history_reset_at: Option<Day>,
 }
 
 /// The same layout, borrowed for writing.
@@ -175,7 +174,7 @@ struct StoredScopeRef<'a> {
     generation: u64,
     shards: &'a BTreeMap<u16, ShardRef>,
     totals: ShardRef,
-    recovery_pins: &'a BTreeMap<String, Pin>,
+    history_reset_at: Option<Day>,
 }
 
 #[derive(Deserialize)]
@@ -197,10 +196,8 @@ pub(super) struct Scope {
     pub(super) file_sessions: Vec<FileSession>,
     /// Shards whose file was checked against its reference in this run.
     verified: BTreeSet<u16>,
-    /// Exceptional pins commit with the totals: unfinished fallback reads
-    /// and quarantine decisions must survive a lost index write. Healthy
-    /// checkpoints need no duplicate pin.
-    pub(super) recovery_pins: BTreeMap<String, Pin>,
+    /// Date from which local history resumes after a forward-only reset.
+    pub(super) history_reset_at: Option<Day>,
 }
 
 /// The files one committed generation references: its totals and shards.
@@ -215,16 +212,6 @@ impl Scope {
     pub(super) fn accounted_bytes(&self) -> usize {
         self.agg.accounted_bytes()
             + self.file_sessions.capacity() * std::mem::size_of::<FileSession>()
-            + self
-                .recovery_pins
-                .iter()
-                .map(|(key, pin)| {
-                    std::mem::size_of::<Pin>()
-                        + key.len()
-                        + pin.path.len()
-                        + pin.scope.as_ref().map_or(0, String::len)
-                })
-                .sum::<usize>()
             + self.shards.len() * 128
             + self
                 .files
@@ -243,7 +230,7 @@ impl Scope {
             shards: BTreeMap::new(),
             file_sessions: Vec::new(),
             verified: BTreeSet::new(),
-            recovery_pins: BTreeMap::new(),
+            history_reset_at: None,
         }
     }
 
@@ -340,33 +327,9 @@ pub(super) fn scope_path(state_dir: &Path, source: Source, scope_id: &str) -> Pa
         .join(format!("{}.json", scope_file_stem(source, scope_id)))
 }
 
-/// The previous committed manifest, kept until a newer commit is verified.
-/// A commit keeps it as the fallback; its files stay until the next
-/// verified commit replaces it.
-pub(super) fn prev_path(path: &Path) -> PathBuf {
-    path.with_extension("prev.json")
-}
-
-/// Keep the manifest now committed as the previous generation, before a new
-/// one replaces it.
-pub(super) fn keep_previous(path: &Path) -> std::io::Result<()> {
-    let mut current = std::fs::File::open(path)?;
-    write_atomic(&prev_path(path), |file| {
-        std::io::copy(&mut current, file).map(|_| ())
-    })
-}
-
-/// Load a scope. `Err` = the file exists but cannot be used (bad state).
+/// Load only the current committed generation. Bad state is never replayed.
 pub(super) fn load_scope(path: &Path, source: Source, scope_id: &str) -> Result<Option<Scope>, ()> {
     load_manifest(path, path, source, scope_id)
-}
-
-/// Load the previous generation (`None` when there is none or it cannot
-/// be used either). Its files are named after the scope's manifest.
-pub(super) fn load_previous(path: &Path, source: Source, scope_id: &str) -> Option<Scope> {
-    load_manifest(&prev_path(path), path, source, scope_id)
-        .ok()
-        .flatten()
 }
 
 fn load_manifest(
@@ -403,13 +366,12 @@ fn load_manifest(
         shards: stored.shards,
         file_sessions,
         verified: BTreeSet::new(),
-        recovery_pins: stored.recovery_pins,
+        history_reset_at: stored.history_reset_at,
     }))
 }
 
 /// Read a just-written manifest back and check the totals and the shards it
-/// wrote against their hashes. Only a verified commit lets the cleanup drop
-/// the previous generation.
+/// wrote against their hashes before removing unreferenced generation files.
 pub(super) fn verify_commit(path: &Path, source: Source, scope: &Scope) -> bool {
     let Ok(Some(stored)) = read_json::<StoredScope>(path) else {
         return false;
@@ -461,7 +423,7 @@ pub(super) fn save_scope(path: &Path, source: Source, scope: &Scope) -> std::io:
         info: &scope.info,
         generation: scope.generation,
         shards: &scope.shards,
-        recovery_pins: &scope.recovery_pins,
+        history_reset_at: scope.history_reset_at,
         totals: ShardRef {
             generation: scope.generation,
             sha,
@@ -548,13 +510,6 @@ impl Scope {
         damaged
     }
 
-    /// Stop referencing a damaged shard; returns its file (to set aside).
-    pub(super) fn drop_shard(&mut self, path: &Path, id: u16) -> Option<PathBuf> {
-        self.verified.remove(&id);
-        let reference = self.shards.remove(&id)?;
-        Some(shard_path(path, id, reference.generation))
-    }
-
     /// Recovery and test inspection only. The daily path never hydrates all
     /// checkpoints; it holds one changed shard at a time.
     pub(super) fn load_all_shards(&mut self, path: &Path) -> Result<(), ()> {
@@ -567,20 +522,20 @@ impl Scope {
         Ok(())
     }
 
-    /// Remove generations neither this state nor `previous` references, only
-    /// after the new manifest is verified.
-    pub(super) fn clean_shards(&self, path: &Path, previous: &Refs) {
+    /// Keep only files referenced by the current verified manifest.
+    pub(super) fn clean_shards(&self, path: &Path) {
         let Some(dir) = path.parent() else { return };
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             return;
         };
         let current = self.refs();
+        let _ = std::fs::remove_file(path.with_extension("prev.json"));
         let kept = |refs: &Refs, id: Option<u16>, generation: u64| match id {
             None => refs.totals == Some(generation),
             Some(id) => refs.shards.get(&id) == Some(&generation),
         };
         for (file, id, generation) in generation_files(dir, stem) {
-            if !kept(&current, id, generation) && !kept(previous, id, generation) {
+            if !kept(&current, id, generation) {
                 let _ = std::fs::remove_file(file);
             }
         }
@@ -620,8 +575,7 @@ fn generation_files(dir: &Path, stem: &str) -> Vec<(PathBuf, Option<u16>, u64)> 
     out
 }
 
-/// The highest generation any file of the scope carries: a commit after a
-/// fallback must never reuse a name the failed generation wrote.
+/// Avoid reusing names from a write interrupted before its manifest commit.
 pub(super) fn highest_generation(path: &Path) -> u64 {
     let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
         return 0;
