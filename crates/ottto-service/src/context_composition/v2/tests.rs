@@ -1740,6 +1740,43 @@ fn parse_state_round_trips() {
 }
 
 #[test]
+fn totals_are_written_as_stored_without_a_copy() {
+    let dir = scratch("composition-v2-aggregate-ref");
+    let (claude, codex) = every_family("/w", fallback_date());
+    for (source, records) in [(Source::Claude, claude), (Source::Codex, codex)] {
+        let path = dir.join(format!("{}.jsonl", source.label()));
+        write_records(&path, &records);
+        let mut agg = read_whole(source, &[&path]).agg;
+        agg.day_generation.insert(day_of(fallback_date()), 3);
+        let copied = super::aggregate::StoredAggregate::from_aggregate(&agg);
+        let written = |generations| {
+            serde_json::to_string(&super::aggregate::AggregateRef {
+                agg: &agg,
+                generations,
+            })
+            .unwrap()
+        };
+        assert_eq!(written(true), serde_json::to_string(&copied).unwrap());
+        // Without generations: the same rows, no generations.
+        let mut copied = copied;
+        let mut value = serde_json::to_value(&copied).unwrap();
+        value["day_generation"] = json!([]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&written(false)).unwrap(),
+            value
+        );
+        // And it loads back as the same totals.
+        copied = serde_json::from_str(&written(true)).unwrap();
+        let back = copied.into_aggregate();
+        assert_eq!(v2_rows(&back), v2_rows(&agg));
+    }
+    // A stored kind or part id this build does not know is bad state.
+    assert!(serde_json::from_str::<super::aggregate::Id<Kind>>("\"files_read\"").is_ok());
+    assert!(serde_json::from_str::<super::aggregate::Id<Kind>>("\"no_such_kind\"").is_err());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn v2_splits_match_one_read_with_calls_open_across_a_checkpoint() {
     let dir = scratch("composition-v2-share-parity");
     let (claude, codex) = every_family("/w", fallback_date());

@@ -1101,11 +1101,10 @@ fn process_scope(
             Scope::new(scope_id, info)
         }
     };
-    // The loaded checkpoints and totals stay in memory for the whole scope;
-    // loading held the file's bytes next to them.
+    // The loaded checkpoints and totals stay in memory for the whole scope
+    // (loading streams the file).
     let held = scope.accounted_bytes();
-    let loaded_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
-    stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(held + loaded_bytes);
+    stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(held);
     let generation = scope.generation + 1;
     // Oldest transcript first (a stable order).
     items.sort_by(|a, b| {
@@ -1203,10 +1202,8 @@ fn process_scope(
     match save_scope(&path, source, &scope) {
         Ok(bytes) => {
             stats.state_bytes += bytes;
-            // Writing serializes the whole scope into one buffer.
-            stats.peak_accounted_bytes = stats
-                .peak_accounted_bytes
-                .max(scope.accounted_bytes() + bytes as usize);
+            // Writing streams the scope to the file.
+            stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(scope.accounted_bytes());
         }
         Err(_) => {
             stats.scopes_failed += 1;

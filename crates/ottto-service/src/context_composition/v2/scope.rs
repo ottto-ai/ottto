@@ -6,7 +6,7 @@
 //! recomputed, so worktrees coming and going never change it. Each file is
 //! pinned to the scope it was first read in, even after its folder is gone.
 
-use super::aggregate::{Aggregate, StoredAggregate};
+use super::aggregate::{Aggregate, AggregateRef, StoredAggregate};
 use super::checkpoint::{read_json, write_json, Checkpoint};
 use super::file::Source;
 use super::STATE_SCHEMA;
@@ -137,7 +137,7 @@ struct StoredScopeRef<'a> {
     info: &'a ScopeInfo,
     generation: u64,
     files: &'a BTreeMap<String, Checkpoint>,
-    aggregate: StoredAggregate,
+    aggregate: AggregateRef<'a>,
 }
 
 /// One scope's state in memory.
@@ -264,7 +264,7 @@ pub(super) fn load_scope(path: &Path, source: Source, scope_id: &str) -> Result<
     {
         return Err(());
     }
-    let agg = stored.aggregate.into_aggregate().ok_or(())?;
+    let agg = stored.aggregate.into_aggregate();
     Ok(Some(Scope {
         scope_id: stored.scope_id,
         info: stored.info,
@@ -285,7 +285,10 @@ pub(super) fn save_scope(path: &Path, source: Source, scope: &Scope) -> std::io:
             info: &scope.info,
             generation: scope.generation,
             files: &scope.files,
-            aggregate: StoredAggregate::from_aggregate(&scope.agg),
+            aggregate: AggregateRef {
+                agg: &scope.agg,
+                generations: true,
+            },
         },
     )
 }

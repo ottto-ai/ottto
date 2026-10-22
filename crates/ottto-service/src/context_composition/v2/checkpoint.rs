@@ -12,22 +12,26 @@
 //! never lets one file count in two scopes; the scope state stays the truth
 //! for offsets.
 
-use super::aggregate::{Day, Slot, StoredContribution};
+use super::aggregate::{Day, Id, Slot, StoredContribution};
 use super::scope::ScopeInfo;
 use super::{MAX_OPEN_CALLS, STATE_SCHEMA};
 use crate::composition_kinds::{CallClass, CallShare, Kind, Part, ToolKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 // -------------------------------------------------------------------------
 // Atomic writes.
 // -------------------------------------------------------------------------
 
-/// Write `bytes` to `path`: temp file, fsync, rename, directory fsync.
-pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write a file atomically: `write` fills a temp file, then fsync, rename,
+/// directory fsync.
+fn write_atomic<T>(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("state path has no folder"))?;
@@ -38,26 +42,56 @@ pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .to_os_string();
     temp_name.push(".tmp");
     let temp = dir.join(temp_name);
-    {
+    let written = {
         let mut file = File::create(&temp)?;
-        file.write_all(bytes)?;
+        let written = write(&mut file)?;
         file.sync_all()?;
-    }
+        written
+    };
     fs::rename(&temp, path)?;
-    File::open(dir)?.sync_all()
+    File::open(dir)?.sync_all()?;
+    Ok(written)
 }
 
+/// Write `value` as JSON, streamed to the file (never one buffer of the
+/// whole state); returns the bytes written.
 pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<u64> {
-    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-    write_atomic(path, &bytes)?;
-    Ok(bytes.len() as u64)
+    write_atomic(path, |file| {
+        let mut out = Counting {
+            inner: BufWriter::new(file),
+            bytes: 0,
+        };
+        serde_json::to_writer(&mut out, value).map_err(std::io::Error::other)?;
+        out.inner.flush()?;
+        Ok(out.bytes)
+    })
 }
 
-/// Read a state file. `Err` means the file exists but cannot be used (bad
+struct Counting<W> {
+    inner: W,
+    bytes: u64,
+}
+
+impl<W: Write> Write for Counting<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Read a state file, streamed (the whole file is never held next to what
+/// it decodes to). `Err` means the file exists but cannot be used (bad
 /// state); `Ok(None)` means there is none.
 pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, ()> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|_| ()),
+    match File::open(path) {
+        Ok(file) => serde_json::from_reader(std::io::BufReader::new(file))
+            .map(Some)
+            .map_err(|_| ()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(()),
     }
@@ -352,6 +386,9 @@ impl ParseState {
     }
 }
 
+/// Open tokens of one day and slot: day, kind, part, add-on server, tokens.
+type OpenRow = (Day, Id<Kind>, Id<Part>, Option<Box<str>>, u64);
+
 /// A call share as stored: kind, part, weight, file and add-on tool.
 type StoredShare = (String, String, u32, Option<String>, Option<String>);
 
@@ -381,7 +418,8 @@ pub(super) struct StoredParse {
     open_calls: Vec<StoredCall>,
     call_seq: u64,
     last_call: Option<String>,
-    open: Vec<(Day, String, String, Option<String>, u64)>,
+    /// Open tokens per day and slot (kind, part, add-on server).
+    open: Vec<OpenRow>,
     copied: CopiedMode,
     copied_lines: u64,
     own_lines: u64,
@@ -395,7 +433,7 @@ impl StoredParse {
     pub(super) fn accounted_bytes(&self) -> usize {
         160 + self.session.len()
             + self.cwd.as_ref().map_or(0, String::len)
-            + self.open.len() * 96
+            + self.open.len() * 40
             + self
                 .open_calls
                 .iter()
@@ -446,9 +484,9 @@ impl StoredParse {
                 .map(|(day, slot, tokens)| {
                     (
                         *day,
-                        slot.kind.as_str().to_string(),
-                        slot.part.as_str().to_string(),
-                        slot.server.as_deref().map(str::to_string),
+                        Id(slot.kind),
+                        Id(slot.part),
+                        slot.server.clone(),
                         *tokens,
                     )
                 })
@@ -493,20 +531,13 @@ impl StoredParse {
                 },
             );
         }
-        let mut open = Vec::new();
-        for (day, kind, part, server, tokens) in self.open {
-            let kind: Kind = kind_from_str(&kind)?;
-            let part: Part = part_from_str(&part)?;
-            open.push((
-                day,
-                Slot {
-                    kind,
-                    part,
-                    server: server.map(Into::into),
-                },
-                tokens,
-            ));
-        }
+        let open = self
+            .open
+            .into_iter()
+            .map(|(day, Id(kind), Id(part), server, tokens)| {
+                (day, Slot { kind, part, server }, tokens)
+            })
+            .collect();
         Some(ParseState {
             session: self.session.into(),
             agent_author: self.agent_author,

@@ -19,7 +19,7 @@
 use super::super::measure::date_ymd;
 use super::super::{BUCKET_TIMEZONE, CHARS_PER_TOKEN, COUNTER_SOURCE, IMAGE_NOMINAL_TOKENS};
 use super::aggregate::{
-    date_of, merge_file_totals, Bucket, Day, FileTotals, Slot, StoredAggregate, Window,
+    date_of, merge_file_totals, AggregateRef, Bucket, Day, FileTotals, Slot, Window,
 };
 use super::checkpoint::{read_json, write_json};
 use super::file::Source;
@@ -170,18 +170,38 @@ pub(super) fn upload_scope(
     uploaded
 }
 
-/// Hash of everything an upload is built from (not the commit generations).
+/// Hash of everything an upload is built from (not the commit generations),
+/// written straight into the hash. The same value as `sha256_hex` over the
+/// stored totals, the scope info and the labels setting.
 fn state_sha(scope: &Scope, labels_enabled: bool) -> String {
-    let stored =
-        serde_json::to_string(&StoredAggregate::from_aggregate(&scope.agg).without_generations())
-            .unwrap_or_default();
-    let info = serde_json::to_string(&scope.info).unwrap_or_default();
+    use sha2::{Digest, Sha256};
+    struct Hashing(Sha256);
+    impl std::io::Write for Hashing {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut hashing = Hashing(Sha256::new());
+    let totals = AggregateRef {
+        agg: &scope.agg,
+        generations: false,
+    };
+    let _ = serde_json::to_writer(&mut hashing, &totals);
+    hashing.0.update([0]);
+    let _ = serde_json::to_writer(&mut hashing, &scope.info);
+    hashing.0.update([0]);
     let labels = if labels_enabled {
         "labels"
     } else {
         "no-labels"
     };
-    sha256_hex(&[&stored, &info, labels])
+    hashing.0.update(labels.as_bytes());
+    hashing.0.update([0]);
+    format!("{:x}", hashing.0.finalize())
 }
 
 // -------------------------------------------------------------------------

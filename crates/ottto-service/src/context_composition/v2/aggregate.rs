@@ -10,7 +10,7 @@
 
 use super::{KEEP_DAYS, MAX_ALL_FILES, MAX_ALL_TOOLS, MAX_FILES_PER_DAY, PERIOD_DAYS};
 use crate::composition_kinds::{Kind, Part};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use time::Date;
 
@@ -157,6 +157,54 @@ pub(super) fn kind_from_str(text: &str) -> Option<Kind> {
 
 pub(super) fn part_from_str(text: &str) -> Option<Part> {
     ALL_PARTS.iter().copied().find(|part| part.as_str() == text)
+}
+
+/// A kind or part held as itself and stored as its wire id, so stored rows
+/// keep no text of their own. An unknown id fails the whole state file
+/// (state from an incompatible build is bad state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Id<T>(pub(super) T);
+
+impl Serialize for Id<Kind> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl Serialize for Id<Part> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Id<Kind> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_str(IdVisitor(kind_from_str))
+            .map(Id)
+    }
+}
+
+impl<'de> Deserialize<'de> for Id<Part> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_str(IdVisitor(part_from_str))
+            .map(Id)
+    }
+}
+
+struct IdVisitor<T>(fn(&str) -> Option<T>);
+
+impl<T> serde::de::Visitor<'_> for IdVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a kind or part id")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<T, E> {
+        (self.0)(text).ok_or_else(|| E::custom("unknown kind or part id"))
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -759,60 +807,214 @@ fn trim_by_tokens<K: Ord + Clone, V>(
 // Stored form (JSON rows with wire ids).
 // -------------------------------------------------------------------------
 
-type DayPartRow = (Day, String, String, Option<String>, [u64; 4]);
-type DayFileRow = (Day, String, String, String, u64, u64, Option<i64>);
-type SessionRow = (String, Option<i64>, Vec<(Day, Vec<(String, u64)>)>);
+/// A sequence written straight from an iterator (nothing collected).
+struct Rows<F>(F);
 
+impl<F, I> Serialize for Rows<F>
+where
+    F: Fn() -> I,
+    I: Iterator,
+    I::Item: Serialize,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq((self.0)())
+    }
+}
+
+fn slot_ids(slot: &Slot) -> (&'static str, &'static str, Option<&str>) {
+    (
+        slot.kind.as_str(),
+        slot.part.as_str(),
+        slot.server.as_deref(),
+    )
+}
+
+/// The totals written in the `StoredAggregate` layout straight from memory,
+/// so a save or a content hash never holds a second copy of them.
+pub(super) struct AggregateRef<'a> {
+    pub(super) agg: &'a Aggregate,
+    /// Without the commit generations: for comparing two states by content.
+    pub(super) generations: bool,
+}
+
+impl Serialize for AggregateRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let agg = self.agg;
+        let mut out = serializer.serialize_struct("StoredAggregate", 10)?;
+        out.serialize_field(
+            "days",
+            &Rows(|| {
+                agg.days
+                    .iter()
+                    .map(|((day, kind), bucket)| (*day, kind.as_str(), bucket.as_array()))
+            }),
+        )?;
+        out.serialize_field(
+            "day_parts",
+            &Rows(|| {
+                agg.day_parts.iter().map(|((day, slot), bucket)| {
+                    let (kind, part, server) = slot_ids(slot);
+                    (*day, kind, part, server, bucket.as_array())
+                })
+            }),
+        )?;
+        out.serialize_field(
+            "all_parts",
+            &Rows(|| {
+                agg.all_parts.iter().map(|(slot, bucket)| {
+                    let (kind, part, server) = slot_ids(slot);
+                    (kind, part, server, bucket.as_array())
+                })
+            }),
+        )?;
+        out.serialize_field(
+            "day_files",
+            &Rows(|| {
+                agg.day_files.iter().map(|((day, key), totals)| {
+                    (
+                        *day,
+                        &*key.path,
+                        key.kind.as_str(),
+                        key.part.as_str(),
+                        totals.events,
+                        totals.tokens,
+                        totals.last,
+                    )
+                })
+            }),
+        )?;
+        out.serialize_field(
+            "all_files",
+            &Rows(|| {
+                agg.all_files.iter().map(|(key, totals)| {
+                    (
+                        &*key.path,
+                        key.kind.as_str(),
+                        key.part.as_str(),
+                        totals.events,
+                        totals.tokens,
+                        totals.last,
+                    )
+                })
+            }),
+        )?;
+        out.serialize_field(
+            "day_tools",
+            &Rows(|| {
+                agg.day_tools.iter().map(|((day, tool), totals)| {
+                    (
+                        *day,
+                        &**tool,
+                        totals.kind.map(Kind::as_str),
+                        totals.calls,
+                        totals.tokens,
+                    )
+                })
+            }),
+        )?;
+        out.serialize_field(
+            "all_tools",
+            &Rows(|| {
+                agg.all_tools.iter().map(|(tool, totals)| {
+                    (
+                        &**tool,
+                        totals.kind.map(Kind::as_str),
+                        totals.calls,
+                        totals.tokens,
+                        totals.sessions,
+                    )
+                })
+            }),
+        )?;
+        out.serialize_field(
+            "tool_sessions",
+            &Rows(|| {
+                agg.tool_sessions
+                    .iter()
+                    .map(|((tool, session), day)| (&**tool, *session, *day))
+            }),
+        )?;
+        out.serialize_field(
+            "sessions",
+            &Rows(|| {
+                agg.sessions.iter().map(|(session, totals)| {
+                    let days = Rows(move || {
+                        totals.days.iter().map(|(day, kinds)| {
+                            let kinds = Rows(move || {
+                                kinds.iter().map(|(kind, tokens)| (kind.as_str(), *tokens))
+                            });
+                            (*day, kinds)
+                        })
+                    });
+                    (&**session, totals.started, days)
+                })
+            }),
+        )?;
+        let generations = self.generations.then_some(&agg.day_generation);
+        out.serialize_field(
+            "day_generation",
+            &Rows(|| {
+                generations
+                    .into_iter()
+                    .flatten()
+                    .map(|(day, generation)| (*day, *generation))
+            }),
+        )?;
+        out.end()
+    }
+}
+
+type DayPartRow = (Day, Id<Kind>, Id<Part>, Option<Box<str>>, [u64; 4]);
+type DayFileRow = (Day, Box<str>, Id<Kind>, Id<Part>, u64, u64, Option<i64>);
+type FileRow = (Box<str>, Id<Kind>, Id<Part>, u64, u64, Option<i64>);
+type PartRow = (Id<Kind>, Id<Part>, Option<Box<str>>, [u64; 4]);
+type DayToolRow = (Day, Box<str>, Option<Id<Kind>>, u64, u64);
+type ToolRow = (Box<str>, Option<Id<Kind>>, u64, u64, u64);
+type SessionRow = (Box<str>, Option<i64>, Vec<(Day, Vec<(Id<Kind>, u64)>)>);
+
+/// The totals as loaded: wire ids decode to kinds and parts as they are
+/// read, so loading holds no text but names, tools and sessions (written by
+/// `AggregateRef`, in the same layout).
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct StoredAggregate {
-    days: Vec<(Day, String, [u64; 4])>,
+    days: Vec<(Day, Id<Kind>, [u64; 4])>,
     day_parts: Vec<DayPartRow>,
-    all_parts: Vec<(String, String, Option<String>, [u64; 4])>,
+    all_parts: Vec<PartRow>,
     day_files: Vec<DayFileRow>,
-    all_files: Vec<(String, String, String, u64, u64, Option<i64>)>,
-    day_tools: Vec<(Day, String, Option<String>, u64, u64)>,
-    all_tools: Vec<(String, Option<String>, u64, u64, u64)>,
-    tool_sessions: Vec<(String, u64, Day)>,
+    all_files: Vec<FileRow>,
+    day_tools: Vec<DayToolRow>,
+    all_tools: Vec<ToolRow>,
+    tool_sessions: Vec<(Box<str>, u64, Day)>,
     sessions: Vec<SessionRow>,
     day_generation: Vec<(Day, u64)>,
 }
 
 impl StoredAggregate {
-    /// The same totals without the commit generations (for comparing two
-    /// states by content).
-    pub(super) fn without_generations(mut self) -> Self {
-        self.day_generation.clear();
-        self
-    }
-
+    /// The copying form of `AggregateRef` (its reference in tests).
+    #[cfg(test)]
     pub(super) fn from_aggregate(agg: &Aggregate) -> Self {
-        let slot_parts = |slot: &Slot| {
-            (
-                slot.kind.as_str().to_string(),
-                slot.part.as_str().to_string(),
-                slot.server.as_deref().map(str::to_string),
-            )
-        };
+        let slot = |slot: &Slot| (Id(slot.kind), Id(slot.part), slot.server.clone());
         Self {
             days: agg
                 .days
                 .iter()
-                .map(|((day, kind), bucket)| (*day, kind.as_str().to_string(), bucket.as_array()))
+                .map(|((day, kind), bucket)| (*day, Id(*kind), bucket.as_array()))
                 .collect(),
             day_parts: agg
                 .day_parts
                 .iter()
-                .map(|((day, slot), bucket)| {
-                    let (kind, part, server) = slot_parts(slot);
+                .map(|((day, key), bucket)| {
+                    let (kind, part, server) = slot(key);
                     (*day, kind, part, server, bucket.as_array())
                 })
                 .collect(),
             all_parts: agg
                 .all_parts
                 .iter()
-                .map(|(slot, bucket)| {
-                    let (kind, part, server) = slot_parts(slot);
+                .map(|(key, bucket)| {
+                    let (kind, part, server) = slot(key);
                     (kind, part, server, bucket.as_array())
                 })
                 .collect(),
@@ -822,9 +1024,9 @@ impl StoredAggregate {
                 .map(|((day, key), totals)| {
                     (
                         *day,
-                        key.path.to_string(),
-                        key.kind.as_str().to_string(),
-                        key.part.as_str().to_string(),
+                        key.path.clone(),
+                        Id(key.kind),
+                        Id(key.part),
                         totals.events,
                         totals.tokens,
                         totals.last,
@@ -836,9 +1038,9 @@ impl StoredAggregate {
                 .iter()
                 .map(|(key, totals)| {
                     (
-                        key.path.to_string(),
-                        key.kind.as_str().to_string(),
-                        key.part.as_str().to_string(),
+                        key.path.clone(),
+                        Id(key.kind),
+                        Id(key.part),
                         totals.events,
                         totals.tokens,
                         totals.last,
@@ -851,8 +1053,8 @@ impl StoredAggregate {
                 .map(|((day, tool), totals)| {
                     (
                         *day,
-                        tool.to_string(),
-                        totals.kind.map(|kind| kind.as_str().to_string()),
+                        tool.clone(),
+                        totals.kind.map(Id),
                         totals.calls,
                         totals.tokens,
                     )
@@ -863,8 +1065,8 @@ impl StoredAggregate {
                 .iter()
                 .map(|(tool, totals)| {
                     (
-                        tool.to_string(),
-                        totals.kind.map(|kind| kind.as_str().to_string()),
+                        tool.clone(),
+                        totals.kind.map(Id),
                         totals.calls,
                         totals.tokens,
                         totals.sessions,
@@ -874,14 +1076,14 @@ impl StoredAggregate {
             tool_sessions: agg
                 .tool_sessions
                 .iter()
-                .map(|((tool, session), day)| (tool.to_string(), *session, *day))
+                .map(|((tool, session), day)| (tool.clone(), *session, *day))
                 .collect(),
             sessions: agg
                 .sessions
                 .iter()
                 .map(|(session, totals)| {
                     (
-                        session.to_string(),
+                        session.clone(),
                         totals.started,
                         totals
                             .days
@@ -891,7 +1093,7 @@ impl StoredAggregate {
                                     *day,
                                     kinds
                                         .iter()
-                                        .map(|(kind, tokens)| (kind.as_str().to_string(), *tokens))
+                                        .map(|(kind, tokens)| (Id(*kind), *tokens))
                                         .collect(),
                                 )
                             })
@@ -907,41 +1109,25 @@ impl StoredAggregate {
         }
     }
 
-    /// Rebuild the totals. `None` when a row names an unknown kind or part
-    /// (state from an incompatible build): the caller treats it as bad state.
-    pub(super) fn into_aggregate(self) -> Option<Aggregate> {
-        let slot = |kind: &str, part: &str, server: Option<String>| -> Option<Slot> {
-            Some(Slot {
-                kind: kind_from_str(kind)?,
-                part: part_from_str(part)?,
-                server: server.map(Into::into),
-            })
-        };
-        let file_key = |path: String, kind: &str, part: &str| -> Option<FileKey> {
-            Some(FileKey {
-                path: path.into(),
-                kind: kind_from_str(kind)?,
-                part: part_from_str(part)?,
-            })
-        };
+    /// Rebuild the totals (unknown ids already failed the load).
+    pub(super) fn into_aggregate(self) -> Aggregate {
+        let slot = |Id(kind), Id(part), server| Slot { kind, part, server };
+        let file_key = |path, Id(kind), Id(part)| FileKey { path, kind, part };
         let mut agg = Aggregate::default();
-        for (day, kind, values) in self.days {
-            agg.days
-                .insert((day, kind_from_str(&kind)?), Bucket::from_array(values));
+        for (day, Id(kind), values) in self.days {
+            agg.days.insert((day, kind), Bucket::from_array(values));
         }
         for (day, kind, part, server, values) in self.day_parts {
-            agg.day_parts.insert(
-                (day, slot(&kind, &part, server)?),
-                Bucket::from_array(values),
-            );
+            agg.day_parts
+                .insert((day, slot(kind, part, server)), Bucket::from_array(values));
         }
         for (kind, part, server, values) in self.all_parts {
             agg.all_parts
-                .insert(slot(&kind, &part, server)?, Bucket::from_array(values));
+                .insert(slot(kind, part, server), Bucket::from_array(values));
         }
         for (day, path, kind, part, events, tokens, last) in self.day_files {
             agg.day_files.insert(
-                (day, file_key(path, &kind, &part)?),
+                (day, file_key(path, kind, part)),
                 FileTotals {
                     events,
                     tokens,
@@ -951,7 +1137,7 @@ impl StoredAggregate {
         }
         for (path, kind, part, events, tokens, last) in self.all_files {
             agg.all_files.insert(
-                file_key(path, &kind, &part)?,
+                file_key(path, kind, part),
                 FileTotals {
                     events,
                     tokens,
@@ -959,61 +1145,54 @@ impl StoredAggregate {
                 },
             );
         }
-        let tool_kind = |kind: Option<String>| -> Option<Option<Kind>> {
-            match kind {
-                None => Some(None),
-                Some(kind) => kind_from_str(&kind).map(Some),
-            }
-        };
         for (day, tool, kind, calls, tokens) in self.day_tools {
             agg.day_tools.insert(
-                (day, tool.into()),
+                (day, tool),
                 ToolTotals {
                     calls,
                     tokens,
                     sessions: 0,
-                    kind: tool_kind(kind)?,
+                    kind: kind.map(|Id(kind)| kind),
                 },
             );
         }
         for (tool, kind, calls, tokens, sessions) in self.all_tools {
             agg.all_tools.insert(
-                tool.into(),
+                tool,
                 ToolTotals {
                     calls,
                     tokens,
                     sessions,
-                    kind: tool_kind(kind)?,
+                    kind: kind.map(|Id(kind)| kind),
                 },
             );
         }
         for (tool, session, day) in self.tool_sessions {
-            agg.tool_sessions.insert((tool.into(), session), day);
+            agg.tool_sessions.insert((tool, session), day);
         }
         for (session, started, days) in self.sessions {
-            let mut totals = SessionTotals {
-                started,
-                days: BTreeMap::new(),
-            };
-            for (day, kinds) in days {
-                let mut per_kind = BTreeMap::new();
-                for (kind, tokens) in kinds {
-                    per_kind.insert(kind_from_str(&kind)?, tokens);
-                }
-                totals.days.insert(day, per_kind);
-            }
-            agg.sessions.insert(session.into(), totals);
+            let days = days
+                .into_iter()
+                .map(|(day, kinds)| {
+                    let kinds = kinds.into_iter().map(|(Id(kind), tokens)| (kind, tokens));
+                    (day, kinds.collect())
+                })
+                .collect();
+            agg.sessions
+                .insert(session, SessionTotals { started, days });
         }
         agg.day_generation = self.day_generation.into_iter().collect();
-        Some(agg)
+        agg
     }
 }
+
+type StoredPartRow = (Day, String, String, Option<String>, [u64; 4]);
 
 /// Stored form of a file's contribution (wire ids).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct StoredContribution {
-    parts: Vec<DayPartRow>,
+    parts: Vec<StoredPartRow>,
     files: Vec<(Day, String, String, String, u64, u64)>,
     tools: Vec<(Day, String, u64, u64)>,
     session: Option<String>,
