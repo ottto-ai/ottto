@@ -46,7 +46,7 @@ const MAX_CODEX_AGENTS_MD_BYTES: usize = MAX_HELD_INSTRUCTION_BYTES - 8 * 1024;
 /// Tool call ids are short; a longer one is not tracked.
 const MAX_CALL_ID_BYTES: usize = 256;
 const MAX_TOOL_LABEL_CHARS: usize = 64;
-const WINDOW_REQUESTS: usize = 3;
+pub(super) const WINDOW_REQUESTS: usize = 3;
 /// Claude Code appends this line to the request-1 auto-memory entry when it
 /// loaded only part of MEMORY.md.
 const MEMORY_CUT_MARKER: &str = "> WARNING: MEMORY.md is";
