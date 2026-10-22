@@ -186,8 +186,9 @@ the server are unchanged.
   and the exclusion list still does not gate them (pre-existing behaviour).
   A restart clears the latch; loading a still-empty index with the marker
   present sets it again. The manual full-stop brake below remains available.
-- Release coupling: this guard must ship in the same release as #677;
-  #677 must not ship without #694's index-load containment.
+- Release coupling: this guard must ship in the same release as #677
+  (`72a63255`) and #694's index-load containment. Containing one unbound
+  authority record keeps the index and does not trigger this rebuild latch.
 
 ## Manual brakes (runbook)
 
@@ -207,6 +208,9 @@ The latch does not replace the runbook's brakes:
   corrupt loads before activation do not latch.
 - `claude_backfill_index_load_preserves_other_sources_and_existing_indexes`:
   Codex/Pi unchanged; populated or nonzero-generation indexes do not latch.
+- `contained_unbound_authority_record_does_not_latch_claude_reemission_stop`:
+  #694's per-record containment keeps the index and does not latch, even with
+  the `.seen` marker present.
 - `claude_context_backfill_selects_every_root_and_subagent_once`
 - `claude_context_backfill_resumes_after_restart_without_rereading_settled_files`
 - `claude_context_backfill_leaves_codex_and_pi_unselected` (Codex adoption is

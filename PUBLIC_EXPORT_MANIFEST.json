@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 779,
-  "content_sha256": "3d23a022fd667fabac12b59b5a391b412d1dba5d563c77755c6dfe24b668f63f",
+  "content_sha256": "f530c4e2deb9764bd2102e4e65ccb0c1b60bc660b0ab14ab6a9175bef878d69d",
   "files": [
     {
       "executable": false,
@@ -1322,8 +1322,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "8b8bc773ade32cc02fa4bd22d2751abeec4a54c5ec4bda2078b4c1a2c484353f",
-      "size_bytes": 872123
+      "sha256": "ad86e77231ebd06bb869143e8427829bc9ec866aea11a784e670cb8e71695862",
+      "size_bytes": 872164
     },
     {
       "executable": false,
@@ -1448,8 +1448,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c89f2e42e5df32c6476951d3d94c5644cce2164867542035c2487585377ab571",
-      "size_bytes": 3125586
+      "sha256": "9802beb73ba0279e6028fce70576bcf0ba1598c9a00d4a07f21a91ce6a48a249",
+      "size_bytes": 3128003
     },
     {
       "executable": false,
@@ -1469,8 +1469,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/authority_proof_correction_tests.rs",
-      "sha256": "620ffb2b3361ec432847b1cb4a825b541df9bc60055f775c489f43abf6f638ae",
-      "size_bytes": 108468
+      "sha256": "b7b4c38df42876cd3440d9594ebe31ccbdc79f1f39d3723e9be13ea57faf44c3",
+      "size_bytes": 109401
     },
     {
       "executable": false,
@@ -1511,8 +1511,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_context_file_birth_tests.rs",
-      "sha256": "ab14bb3c315d8a00de829382dc8832d409f9301393e7d52d1b769d3e30b40fab",
-      "size_bytes": 88681
+      "sha256": "a2ec2d4eb9d16dce890f9b7fc4321157f680450ce54747f43746f8ee98f3ef29",
+      "size_bytes": 95450
     },
     {
       "executable": false,
@@ -3625,8 +3625,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-claude-context-backfill-adoption.md",
-      "sha256": "f0376b0a7c01304fe622a1d5773494e076e46a4fc83d783eb95c09f9683658a9",
-      "size_bytes": 14019
+      "sha256": "8957d03e87a29cb28ee1ff162f8e393a653c4d5d84bea5f8429382889f3e1ced",
+      "size_bytes": 15753
     },
     {
       "executable": false,
@@ -5456,7 +5456,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T16:10:19+00:00",
+  "generated_at": "2026-10-22T17:22:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 780,
   "public_roots": [
@@ -5495,5 +5495,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0c2b6838c0c4ae4b542aa6182e7c6f0037582def"
+  "source_commit": "9a75bbaf22215a53372b6e3823bcb42b52ddae8a"
 }
