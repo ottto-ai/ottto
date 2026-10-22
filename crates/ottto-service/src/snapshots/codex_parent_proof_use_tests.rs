@@ -123,8 +123,9 @@ fn installed(proof: &CodexParentPrefixProof) -> (CodexParentPrefixProof, PrefixD
     (proof.clone(), digest)
 }
 
-/// P's seal as it is now, the way `Checkpoint::seal_as` mints it.
-fn seal_of(file: &File, verified: u64, scope: &str) -> PrefixSeal {
+/// P's seal as it is now, the way `Checkpoint::seal_as` mints it (also the
+/// cursor tests' proof fixtures).
+pub(in crate::snapshots) fn seal_of(file: &File, verified: u64, scope: &str) -> PrefixSeal {
     let metadata = file.metadata().unwrap();
     let len = metadata.len();
     let window = len.min(SAMPLE_BYTES as u64);
@@ -2680,6 +2681,7 @@ fn a_hold_built_before_its_proof_is_not_memoized() {
             ids.census(&scene.index),
             &scene.key(),
             parsed,
+            false,
         )
     };
     let held = |scene: &Scene, cause: CodexParentUnresolvable| {

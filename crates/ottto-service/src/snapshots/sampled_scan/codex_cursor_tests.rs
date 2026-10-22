@@ -4519,18 +4519,19 @@ fn session_usage(scan: &SourceScanResult, session: &str) -> Vec<(u64, u64)> {
 }
 
 /// One page stepped to completion, with `between` run before every step
-/// call: a deterministic point between two records of the active file.
+/// call: a deterministic point between two records of the active file. It
+/// may change the scan's own index there (fix round 6's proof transition).
 fn page_between(
     fixture: &ScanRoot,
     index: ScanIndex,
     cache: &Arc<SharedCache>,
     collected_at: &str,
-    mut between: impl FnMut(&OwnedSourceScan),
+    mut between: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult) {
     let mut scan = codex_scan(fixture, index, collected_at)
         .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
     for _ in 0..100_000 {
-        between(&scan);
+        between(&mut scan);
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete {
@@ -7343,6 +7344,163 @@ fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
     assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
+/// Fix round 6 (R1-F1): the proof hook's `Proven` transition for C over P,
+/// on the page's own index (census keys): C's proof as the job mints it (m
+/// = the leading signatures C shares with P's `parent_records`, the chain
+/// over C's s_0..s_m, P at `parent` sealed now under the proof scope), P's
+/// settled side record covering it, and C's hold memo forgotten
+/// (`forget_proven_hold_memos`). Returns C's key.
+fn prove_child(
+    scan: &mut OwnedSourceScan,
+    cache: &SharedCache,
+    parent: &Path,
+    parent_records: &[Value],
+    child: &Path,
+    child_records: &[Value],
+) -> String {
+    use crate::snapshots::codex_parent_proof_use_tests::seal_of;
+    use crate::snapshots::{
+        codex_digest_hex, codex_ownership_signature, codex_parent_prefix_chain,
+        codex_parent_prefix_seed, codex_parent_proof_scope, codex_parent_side_scope,
+        CodexParentPrefixProof, CodexParentProofState, CodexParentSide, SideVerdict,
+    };
+    let census_key = |path: &Path| {
+        let name = file_name(path);
+        scan.index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| {
+                traversal
+                    .codex_rollout_paths
+                    .iter()
+                    .find(|key| key.ends_with(name.as_str()))
+                    .cloned()
+            })
+            .expect("in the census")
+    };
+    let (p_key, c_key) = (census_key(parent), census_key(child));
+    let signatures = |records: &[Value]| {
+        records
+            .iter()
+            .filter_map(codex_ownership_signature)
+            .collect::<Vec<_>>()
+    };
+    let (theirs, ours) = (signatures(parent_records), signatures(child_records));
+    let matched = theirs
+        .iter()
+        .zip(&ours)
+        .take_while(|(parent, child)| parent == child)
+        .count();
+    let mut digest = codex_parent_prefix_seed();
+    for signature in &ours[..=matched] {
+        digest = codex_parent_prefix_chain(&digest, signature);
+    }
+    let file = File::open(parent).unwrap();
+    let now = crate::snapshots::sampled_scan::now_seconds();
+    scan.index.codex_parent_prefix_proofs.insert(
+        c_key.clone(),
+        CodexParentProofState::Proven(CodexParentPrefixProof {
+            parent: PARENT.into(),
+            parent_seal: seal_of(&file, now, &codex_parent_proof_scope().0),
+            matched: matched as u64,
+            child_digest: codex_digest_hex(&digest),
+            owned: matched > 0,
+            published: false,
+        }),
+    );
+    scan.index.codex_parent_side.insert(
+        p_key,
+        CodexParentSide {
+            verdict: SideVerdict::Settled,
+            seal: seal_of(&file, now, &codex_parent_side_scope().0),
+            parsed: OpenStamp::capture(&file).unwrap(),
+            pace: None,
+            generation: 1,
+            referenced_epoch: 0,
+        },
+    );
+    cache.memo_forget(&memo_key(&Scope("cursor-fixture".into()), &c_key));
+    c_key
+}
+
+/// Fix round 6 (R1-F1, control A): with the ref set full, C's parser is
+/// built while C is owed (no install), and C's proof turns `Proven` before
+/// C's parse completes (production: a cursor job paused across the hook's
+/// page; here: between two step calls of C's parse, so the record site sees
+/// the same state). C completes pending, is deferred `DeferredRef` with no
+/// step-map witness and held, and that hold is not memoized; the next page
+/// parses C, installs the proof and C resolves. Before fix round 6 the hold
+/// was memoized and replayed on every later page.
+#[test]
+fn a_deferred_ref_hold_built_before_its_proof_is_not_memoized() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::CodexParentProofState;
+    use CodexParentUnresolvable::DeferredRef;
+    let home = ForkHome::new(&ForkHome::matching_child());
+    let mut index = ScanIndex::default();
+    for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS {
+        index
+            .codex_parent_ownership_refs
+            .insert(format!("prefilled-{n:03}"));
+    }
+    let (mut index, owed) = home.generation(index, &Arc::new(SharedCache::default()), 0);
+    assert!(session_usage(&owed, CHILD).is_empty());
+    assert_eq!(parent_causes(&owed), only(DeferredRef, 1));
+
+    // A fresh cache, so C is parsed (no hold memo).
+    let cache = Arc::new(SharedCache::default());
+    let (parent, child) = (home.fixture.file(PARENT), home.fixture.file(CHILD));
+    let mut key = None;
+    index.traversal = None;
+    let ((index, held), parsed) = parses(|| {
+        page_between(&home.fixture, index, &cache, &collected_at(1), |scan| {
+            if key.is_none() && active_is(scan, &child) {
+                key = Some(prove_child(
+                    scan,
+                    &cache,
+                    &parent,
+                    &ForkHome::parent(),
+                    &child,
+                    &ForkHome::matching_child(),
+                ));
+            }
+        })
+    });
+    let key = key.expect("C's parse spans step calls");
+    assert!(parsed.contains(&file_name(&child)), "{parsed:?}");
+    assert!(session_usage(&held, CHILD).is_empty());
+    assert_eq!(
+        parent_causes(&held),
+        only(DeferredRef, 1),
+        "{}",
+        counters(&cache)
+    );
+    assert!(matches!(
+        index.codex_parent_prefix_proofs.get(&key),
+        Some(CodexParentProofState::Proven(_))
+    ));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        0,
+        "the hold is not memoized: {}",
+        counters(&cache)
+    );
+    assert!(home.child_entry(&cache).is_none());
+
+    // The next page parses C, installs the proof, and C resolves.
+    let ((_, resolved), parsed) = parses(|| home.generation(index, &cache, 2));
+    assert!(parsed.contains(&file_name(&child)), "{parsed:?}");
+    assert_eq!(
+        session_usage(&resolved, CHILD),
+        vec![(30, 1)],
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(parent_causes(&resolved), only(DeferredRef, 0));
+}
+
 /// P-T14 (M1): the step-start match runs once per traversal: one census
 /// pass per generation here (each generation is one traversal and one
 /// page), and the namespace is marked matched for exactly that traversal,
@@ -8111,6 +8269,72 @@ fn deferred_intermediate_parent_is_not_reread_every_generation() {
             "c_first {c_first}: {witness:?}"
         );
     }
+}
+
+/// Fix round 6 (control B): C -> P -> X with X's ref never fitting, so C is
+/// held `DeferredRef` under P's step-map witness. C's proof turns `Proven`
+/// (its hold memo ends), C's next parse installs it, the witness arm holds C
+/// anyway, and that hold is memoized: from the page after, C is not parsed.
+#[test]
+fn a_witnessed_deferred_ref_hold_stays_memoized_beside_its_proven_entry() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::CodexParentProofState;
+    use CodexParentUnresolvable::DeferredRef;
+    let fixture = ScanRoot::with_sessions(&[]);
+    let parent_records = ForkHome::parent()[1..].to_vec();
+    let child_records = ForkHome::diverging_child(2);
+    write_rollout(&fixture, PARENT, Some(ABSENT_GRANDPARENT), &parent_records);
+    write_rollout(&fixture, CHILD, Some(PARENT), &child_records);
+    let mut index = ScanIndex::default();
+    for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS - 1 {
+        index
+            .codex_parent_ownership_refs
+            .insert(format!("prefilled-{n:03}"));
+    }
+    index.codex_parent_ownership_refs.insert(PARENT.to_owned());
+    let cache = Arc::new(SharedCache::default());
+    for n in 0..3 {
+        index = fixture_generation(&fixture, &cache, index, n).0;
+    }
+    let (parent, child) = (fixture.file(PARENT), fixture.file(CHILD));
+    let mut key = None;
+    index.traversal = None;
+    let ((index, held), parsed) = parses(|| {
+        page_between(&fixture, index, &cache, &collected_at(3), |scan| {
+            if key.is_none() {
+                key = Some(prove_child(
+                    scan,
+                    &cache,
+                    &parent,
+                    &parent_records,
+                    &child,
+                    &child_records,
+                ));
+            }
+        })
+    });
+    let key = key.unwrap();
+    assert_eq!(parsed, vec![file_name(&child)], "{}", counters(&cache));
+    assert_eq!(parent_causes(&held), only(DeferredRef, 2));
+    assert!(
+        matches!(
+            index.codex_parent_prefix_proofs.get(&key),
+            Some(CodexParentProofState::Proven(_))
+        ),
+        "installed, not refused"
+    );
+    assert!(stored_key(&cache, &child).is_some(), "{}", counters(&cache));
+    let hits = counter(&cache, |c| c.memo_hits);
+    let ((_, again), parsed) = parses(|| fixture_generation(&fixture, &cache, index, 4));
+    assert!(parsed.is_empty(), "{parsed:?}: {}", counters(&cache));
+    assert_eq!(parent_causes(&again), only(DeferredRef, 2));
+    assert!(
+        counter(&cache, |c| c.memo_hits) > hits,
+        "{}",
+        counters(&cache)
+    );
 }
 
 const GREAT_GRANDPARENT: &str = "019fa111-2222-7333-8444-222222222222";

@@ -16522,22 +16522,28 @@ fn codex_parent_proof_refenced(parsed: &ParsedJsonlFile) -> bool {
 /// parent and `installable`, the census is available, the parse attempted no
 /// install (no proof used, no refusal: its parser was built before the entry
 /// turned `Proven`, e.g. a cursor job paused across the transition), and it
-/// is held for a cap cause, the only witness the proof arm consumes. Any
-/// install outcome (an `Identity` refusal included), a mislabelled or
-/// mis-scoped proof, an unavailable census or another cause keeps today's
-/// memo, so a persistent skip never reparses every page.
+/// is held for a cap cause, the only witness the proof arm consumes, or
+/// (fix round 6) `DeferredRef` from the record site's deferral of a parse
+/// that used no ledger and read no step-map witness
+/// (`deferred_ref_unwitnessed`: the parser's pending arm, which an installed
+/// proof answers). Any install outcome (an `Identity` refusal included), a
+/// mislabelled or mis-scoped proof, an unavailable census or another cause
+/// (a step-map witness `DeferredRef` included) keeps today's memo, so a
+/// persistent skip never reparses every page.
 fn codex_held_memo_awaits_proof_install(
     index: &ScanIndex,
     census: CodexParentCensus<'_>,
     key: &str,
     parsed: &ParsedJsonlFile,
+    deferred_ref_unwitnessed: bool,
 ) -> bool {
     parsed.codex_parent_proof_used.is_none()
         && parsed.codex_parent_proof_refusal.is_none()
         && census.available
-        && parsed
-            .codex_parent_unresolvable
-            .is_some_and(CodexParentUnresolvable::cap)
+        && parsed.codex_parent_unresolvable.is_some_and(|cause| {
+            cause.cap()
+                || (deferred_ref_unwitnessed && cause == CodexParentUnresolvable::DeferredRef)
+        })
         && parsed
             .codex_parent_session_ref
             .as_deref()
@@ -22620,12 +22626,19 @@ impl OwnedSourceScan {
                 // restart. Once the scope's restart budget is spent, a pending
                 // child holds `DeferredRestart` instead of restarting again.
                 // Both are non-progressing held disclosure: nothing is admitted.
+                // U1a-2a (fix round 6): whether this parse is `DeferredRef` here
+                // with no ledger used and no step-map witness read (its parser's
+                // pending arm), the one deferral a later install's proof arm
+                // answers. In-memory, this completion only.
+                let mut deferred_ref_unwitnessed = false;
                 if source == SnapshotSource::Codex && parsed_file.codex_parent_resolution_pending {
                     if parsed_file
                         .codex_parent_session_ref
                         .as_deref()
                         .is_some_and(|parent| !index.codex_parent_ref_fits(parent))
                     {
+                        deferred_ref_unwitnessed =
+                            parsed_file.codex_parent_ledger_identity_used.is_none();
                         parsed_file.defer_parent_resolution(CodexParentUnresolvable::DeferredRef);
                     } else if codex_parent_identities.restart_budget_spent {
                         parsed_file
@@ -22987,15 +23000,16 @@ impl OwnedSourceScan {
                     let held = !parse_complete
                         && non_progressing_residue
                         && ownership_incomplete_file_count > 0;
-                    // U1a-2a (fix round 5, N1): a hold built before its proof
-                    // turned `Proven` is not memoized, so the next page parses
-                    // and reaches the install.
+                    // U1a-2a (fix round 5, N1; fix round 6): a hold built before
+                    // its proof turned `Proven` is not memoized, so the next page
+                    // parses and reaches the install.
                     let awaits_proof = held
                         && codex_held_memo_awaits_proof_install(
                             index,
                             codex_parent_identities.census(index),
                             &index_key,
                             &parsed_file,
+                            deferred_ref_unwitnessed,
                         );
                     match memo_candidate.filter(|_| held && !awaits_proof) {
                         Some((digest, live, stamp, sidecar)) => {
