@@ -108,6 +108,13 @@ const TRACE_ROW_BYTES: usize = 160;
 /// One page hash in the page's hash list, claim map and collision map.
 const PAGE_HASH_BYTES: usize = 160;
 
+/// What `rows` API rows may grow into downstream: the rows themselves, and
+/// for each a page hash, a unit and a grain (a side call is all three).
+fn row_charge(rows: usize) -> usize {
+    rows::rows_bound(rows)
+        .saturating_add(rows.saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES))
+}
+
 // ---------------------------------------------------------------- normalizer
 
 /// One reading of a Claude cache-creation write: the flat total and its
@@ -955,13 +962,8 @@ pub(crate) fn shadow_page_at(
         .sum::<usize>();
     let key_bytes = index.files.keys().map(String::len).sum::<usize>();
     let admission = occurrences
-        .saturating_mul(UNIT_BYTES + GRAIN_BYTES)
-        .saturating_add(rows::rows_bound(live_rows))
-        .saturating_add(
-            occurrences
-                .saturating_add(live_rows)
-                .saturating_mul(PAGE_HASH_BYTES),
-        )
+        .saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES)
+        .saturating_add(row_charge(live_rows))
         .saturating_add(trace_rows.saturating_mul(TRACE_ROW_BYTES))
         .saturating_add(bucket_rows.saturating_mul(LIVE_ROW_BYTES))
         .saturating_add(claude_request_ledger::scope_bound(
@@ -1098,9 +1100,7 @@ pub(crate) fn shadow_page_at(
                     Some(ClaudeRootRows::default())
                 }
                 Some(ClaudeRootTelemetry::Current) => match ledger.get(&telemetry_key(root)) {
-                    Some(record)
-                        if budget.charge(rows::rows_bound(record.request_hashes().len())) =>
-                    {
+                    Some(record) if budget.charge(row_charge(record.request_hashes().len())) => {
                         match ClaudeRootRows::from_record(record) {
                             Some(rows) => {
                                 end.rows.roots_from_facts += 1;

@@ -296,8 +296,8 @@ fn money_birth_is_carried_only_for_the_same_object() {
     assert!(census.record_for_test(key).is_none());
 }
 
-/// The `otel:` namespace cannot collide with a file key, and D1's join,
-/// counts and member statuses ignore every ledger record.
+/// The `otel:` namespace cannot collide with a file key, and no ledger
+/// record ever reaches D1's join, counts or member statuses.
 #[test]
 fn money_ledger_records_are_invisible_to_d1() {
     let root = "a1111111-1111-4111-8111-111111111111";
@@ -344,15 +344,25 @@ fn money_ledger_records_are_invisible_to_d1() {
     index
         .claude_request_census_mut_for_test()
         .invalidate_keeping_birth_for_test(stub_key);
+    // Ledger records live in the ledger's own store: an index holding one
+    // (a pre-release build) drops it on load, so D1 never sees it.
+    let scratch = crate::test_scratch::ScratchDir::new("money-d1-ledger-key");
+    let path = scratch.join("index.json");
+    index.save(&path).expect("save index");
+    let mut loaded = ScanIndex::load(&path).expect("load index");
+    assert!(loaded
+        .claude_request_census_for_test()
+        .record_for_test(&otel)
+        .is_none());
     assert_eq!(
         (
-            claude_census_disjointness_complete(&index, MONEY_WINDOW, true),
-            claude_census_member_status(&index, &key, MONEY_WINDOW, true),
+            claude_census_disjointness_complete(&loaded, MONEY_WINDOW, true),
+            claude_census_member_status(&loaded, &key, MONEY_WINDOW, true),
         ),
         before
     );
     let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-        &mut index,
+        &mut loaded,
         &BTreeSet::from([key.clone()]),
         &BTreeSet::new(),
         MONEY_WINDOW,
@@ -360,14 +370,24 @@ fn money_ledger_records_are_invisible_to_d1() {
     assert_eq!(counts.records, 1);
     assert_eq!(counts.hashes, 2);
     assert_eq!(counts.duplicate_hashes, 0);
-    // The terminal prune drops ledger records (they live in the ledger's
-    // own store, never the index) and the unindexed stub.
-    let census = index.claude_request_census_for_test();
-    assert!(census.record_for_test(&otel).is_none());
     assert!(
-        census.record_for_test(stub_key).is_none(),
+        loaded
+            .claude_request_census_for_test()
+            .record_for_test(stub_key)
+            .is_none(),
         "an unindexed stub is pruned"
     );
+    // The terminal prune drops one held in memory too.
+    crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &BTreeSet::from([key.clone()]),
+        &BTreeSet::new(),
+        MONEY_WINDOW,
+    );
+    assert!(index
+        .claude_request_census_for_test()
+        .record_for_test(&otel)
+        .is_none());
 }
 
 /// Transcript retirement (finding 10): 35 days after the modification time
@@ -1293,6 +1313,53 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
         .unwrap()
         .request_hashes()
         .contains(&claude_request_hash("req_9")));
+}
+
+/// Sol N2: the tail admits a record's growth against the ledger's budgets
+/// before it reads: near the hash ceiling it reads only what fits, never
+/// crosses the ceiling, stores no tombstone, and the cut read is debt (the
+/// sweep moves on; nothing is certified while the file is behind).
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn money_telemetry_tail_admits_growth_before_reading() {
+    let tail = MoneyTail::new("money-tail-ceiling");
+    let budget = ClaudeTelemetryTailBudget::default();
+    let session = "a7777777-7777-4777-8777-777777777777";
+    for number in 0..40 {
+        tail.append(
+            session,
+            &money_api_line(session, &format!("req_{number}"), "2026-08-02T07:00:00Z"),
+        );
+    }
+    let mut ledger = ClaudeLedger::new_for_test();
+    let room = 8_usize;
+    let _ = ledger.insert(
+        message_key("/money/projects/full.jsonl"),
+        ClaudeRequestCensusRecord::message_record(
+            &money_record('a', vec![]),
+            (0..(MAX_CLAUDE_REQUEST_CENSUS_HASHES - room) as u64).collect(),
+        ),
+    );
+    let mut refused = 0;
+    for _ in 0..6 {
+        let counts = tail.advance(&mut ledger, &budget);
+        assert_eq!(
+            counts.records_tombstoned + counts.records_refused,
+            0,
+            "{counts:?}"
+        );
+        assert!(ledger.census().hash_total() <= MAX_CLAUDE_REQUEST_CENSUS_HASHES);
+        assert!(!counts.sweep_wrapped || counts.sweep_debt, "{counts:?}");
+        refused += counts.files_refused_budget;
+    }
+    assert!(refused >= 1, "the cut read is debt");
+    let record = ledger.get(&telemetry_key(session)).expect("what fit");
+    assert!(
+        (1..=room).contains(&record.request_hashes().len()),
+        "{}",
+        record.request_hashes().len()
+    );
+    assert_eq!(telemetry_complete_through(&ledger), 0);
 }
 
 /// Sol N1: lost claims are durable debt. The meta that drops the

@@ -896,6 +896,8 @@ fn read_file(
         return FileRead::Debt;
     }
     let read_bytes = remaining.min(work.bytes_left()).min(room_bytes);
+    // The ledger's room, not the work budget, cut this read.
+    let room_cut = room_bytes < remaining.min(work.bytes_left());
     let Some(_admitted) =
         ShadowReservation::admit(tail_file_memory(old_hashes, old_facts, read_bytes))
     else {
@@ -1048,6 +1050,12 @@ fn read_file(
     }
     if resume.is_some() {
         counts.files_appended += 1;
+    }
+    if scan.stop != LineStop::Budget && room_cut && offset + skip_bytes < extent {
+        // What fit is kept; the rest waits for room as debt, and the sweep
+        // moves on rather than stalling on this file.
+        counts.files_refused_budget += 1;
+        return FileRead::Debt;
     }
     if scan.stop == LineStop::Budget || (read_bytes < remaining && offset + skip_bytes < extent) {
         // The budget (or the ledger's room) ended this read: continue it

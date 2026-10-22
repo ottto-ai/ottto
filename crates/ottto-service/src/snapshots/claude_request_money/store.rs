@@ -163,8 +163,9 @@ impl ClaudeLedger {
         let mut selected = vec![false; SHARDS];
         let mut bytes = 0_usize;
         let mut count = 0_usize;
+        let start = self.next_save;
         for step in 0..DATA_SHARDS {
-            let shard = (self.next_save + step) % DATA_SHARDS;
+            let shard = (start + step) % DATA_SHARDS;
             if !self.dirty[shard] {
                 continue;
             }
