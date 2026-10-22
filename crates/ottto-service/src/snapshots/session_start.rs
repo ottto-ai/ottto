@@ -1550,6 +1550,120 @@ impl SnapshotSessionStart {
     }
 }
 
+/// Whether session-start measured a session's opening, so another reader can
+/// leave request 1 to it instead of counting the same content twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartVerdict {
+    Measured,
+    NotMeasured,
+}
+
+/// The start verdict of one transcript file's snapshot item, read after the
+/// cycle's ownership fold (copied openings, forks and withheld files keep the
+/// client version only). Measured when the item carries any start value the
+/// server stores besides the client version and the config fingerprint; the
+/// server calls the same start "measured". Reads only the item: no file IO.
+// The composition reader is the first caller; it is wired separately.
+#[allow(dead_code)]
+pub(crate) fn session_start_verdict(item: &super::SnapshotItem) -> StartVerdict {
+    let Some(start) = item.session_start.as_deref() else {
+        return StartVerdict::NotMeasured;
+    };
+    // Exhaustive, so a new wire field must pick a side here.
+    let SnapshotSessionStart {
+        client_version: _,
+        start_config_fingerprint: _,
+        opening_files: _,
+        file_candidates: _,
+        files_over_guard: _,
+        policy_applied: _,
+        opening_files_unknown: _,
+        user_turn_count,
+        first_request_uncached_input_tokens,
+        first_request_cache_read_tokens,
+        first_request_cache_write_5m_tokens,
+        first_request_cache_write_1h_tokens,
+        opening_request_count,
+        request_2_context_tokens,
+        request_3_context_tokens,
+        opening_output_tokens,
+        opening_tool_calls,
+        opening_truncated_outputs,
+        opening_file_overflow,
+        instruction_load_cut,
+        start_parts_method,
+        start_chars_tools,
+        start_chars_system,
+        start_chars_instructions,
+        start_chars_memory,
+        start_chars_skills,
+        start_chars_agents,
+        start_chars_mcp_names,
+        start_chars_mcp_instructions,
+        start_chars_hooks_env,
+        start_chars_prompt,
+        start_chars_other,
+    } = start;
+    let measured = instruction_load_cut.is_some()
+        || start_parts_method.is_some()
+        || [
+            user_turn_count,
+            first_request_uncached_input_tokens,
+            first_request_cache_read_tokens,
+            first_request_cache_write_5m_tokens,
+            first_request_cache_write_1h_tokens,
+            opening_request_count,
+            request_2_context_tokens,
+            request_3_context_tokens,
+            opening_output_tokens,
+            opening_tool_calls,
+            opening_truncated_outputs,
+            opening_file_overflow,
+            start_chars_tools,
+            start_chars_system,
+            start_chars_instructions,
+            start_chars_memory,
+            start_chars_skills,
+            start_chars_agents,
+            start_chars_mcp_names,
+            start_chars_mcp_instructions,
+            start_chars_hooks_env,
+            start_chars_prompt,
+            start_chars_other,
+        ]
+        .iter()
+        .any(|value| value.is_some());
+    if measured {
+        StartVerdict::Measured
+    } else {
+        StartVerdict::NotMeasured
+    }
+}
+
+/// Test oracle from the uploaded bytes: the item's `session_start` object
+/// holds a non-null value outside the client version, the config fingerprint
+/// and the opening-file rows (those go to their own table).
+#[cfg(test)]
+pub(crate) fn uploaded_start_verdict(item: &super::SnapshotItem) -> StartVerdict {
+    let body = serde_json::to_value(item).expect("serialize item");
+    let measured = body
+        .get("session_start")
+        .and_then(Value::as_object)
+        .is_some_and(|start| {
+            start.iter().any(|(key, value)| {
+                !matches!(
+                    key.as_str(),
+                    "client_version" | "start_config_fingerprint" | "opening_files"
+                ) && !value.is_null()
+            })
+        });
+    if measured {
+        StartVerdict::Measured
+    } else {
+        StartVerdict::NotMeasured
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -1595,6 +1709,12 @@ mod tests {
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
         fingerprint
+    }
+
+    /// The accessor agrees with the uploaded body, and both with `expected`.
+    fn assert_start_verdict(item: &SnapshotItem, expected: StartVerdict) {
+        assert_eq!(uploaded_start_verdict(item), expected, "uploaded body");
+        assert_eq!(session_start_verdict(item), expected, "accessor");
     }
 
     fn attribution_context(dir: &Path) -> SessionAttributionContext {
@@ -1677,6 +1797,7 @@ mod tests {
         );
         let context = attribution_context(&dir);
         let items = parse_claude(&path, Some(&context));
+        assert_start_verdict(&items[0], StartVerdict::Measured);
         let parsed = items[0].session_start.clone().expect("session_start");
         // Nothing identifies a file until the upload policy is applied.
         assert!(parsed.opening_files.is_empty());
@@ -1945,6 +2066,7 @@ mod tests {
         let items =
             parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
                 .expect("parse");
+        assert_start_verdict(&items[0], StartVerdict::Measured);
         let mut start = items[0].session_start.clone().expect("session_start");
         start.apply_upload_policy(true, false);
         let mut actual = serde_json::to_value(&start).expect("serialize");
@@ -2165,6 +2287,7 @@ mod tests {
                 ..SnapshotSessionStart::default()
             })
         );
+        assert_start_verdict(&items[0], StartVerdict::NotMeasured);
         // Codex: a subagent fork with its parent's copied prefix (the shape
         // of `codex_legacy_full_fork_excludes_inherited_usage_activity_and_posture`).
         let token = |at: &str, total: (u64, u64, u64), last: (u64, u64, u64)| {
@@ -2208,6 +2331,55 @@ mod tests {
                     ..SnapshotSessionStart::default()
                 })
             );
+            assert_start_verdict(&item, StartVerdict::NotMeasured);
+        }
+    }
+
+    /// Version and config fingerprint alone are not a measured start; any
+    /// other stored value is.
+    #[test]
+    fn start_verdict_needs_a_value_beyond_version_and_fingerprint() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-verdict");
+        let path = dir.join("ss-claude-verdict.jsonl");
+        write_lines(
+            &path,
+            serde_json::from_str(CLAUDE_COMMON).unwrap(),
+            claude_fixture_lines(),
+        );
+        let mut item = parse_claude(&path, None).remove(0);
+        let version_only = SnapshotSessionStart {
+            client_version: Some("2.1.300".to_string()),
+            start_config_fingerprint: Some("0123456789abcdef".to_string()),
+            ..SnapshotSessionStart::default()
+        };
+        let cases = [
+            (None, StartVerdict::NotMeasured),
+            (Some(version_only.clone()), StartVerdict::NotMeasured),
+            (
+                Some(SnapshotSessionStart {
+                    user_turn_count: Some(1),
+                    ..version_only.clone()
+                }),
+                StartVerdict::Measured,
+            ),
+            (
+                Some(SnapshotSessionStart {
+                    instruction_load_cut: Some(false),
+                    ..version_only.clone()
+                }),
+                StartVerdict::Measured,
+            ),
+            (
+                Some(SnapshotSessionStart {
+                    start_chars_other: Some(0),
+                    ..version_only
+                }),
+                StartVerdict::Measured,
+            ),
+        ];
+        for (start, expected) in cases {
+            item.session_start = start.map(Box::new);
+            assert_start_verdict(&item, expected);
         }
     }
 
@@ -2243,6 +2415,7 @@ mod tests {
                     ..SnapshotSessionStart::default()
                 })
             );
+            assert_start_verdict(&item, StartVerdict::NotMeasured);
         }
     }
 
