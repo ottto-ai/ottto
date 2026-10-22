@@ -46,6 +46,7 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
             ownership_incomplete_file_count: 0,
             zero_snapshot_usage_evidence: false,
             dropped_usage_record_count: 0,
+            claude_compaction_unlinked_parent_count: 0,
             terminal_line_loss_count: 0,
             state_only_blocked_session_ids: BTreeSet::new(),
             codex_parent_session_ref: None,
@@ -3768,6 +3769,41 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
         .iter()
         .all(|item| item.source_session_id == FALLBACK_HEALTHY));
     writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
+}
+
+/// Slice D1 (TD1b, SOURCE #588): a selected restore reverts the withheld key
+/// to `previous` and REMOVES its request-census record. No record of the
+/// withheld revision, and none restored from `previous`, survives.
+#[test]
+fn native_comparison_selected_restore_removes_the_withheld_census_record() {
+    if !native_positive_layout_for_test(
+        "native_comparison_selected_restore_removes_the_withheld_census_record",
+    ) {
+        return;
+    }
+    let (fixture, mut index, _scan, mut fallback, mut previous, _path) =
+        native_comparison_selected_fallback_fixture();
+    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+    let record = |seed: char| {
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &seed.to_string().repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![1],
+        )
+    };
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record('a'));
+    previous
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record('b'));
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&index.files[&key]).unwrap(),
+        serde_json::to_vec(&previous.files[&key]).unwrap()
+    );
+    assert!(index.claude_request_census_for_test().get(&key).is_none());
 }
 
 #[test]

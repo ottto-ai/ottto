@@ -41,6 +41,8 @@ pub(super) struct Starting {
     new_retry_attempt: u8,
     pub(super) stale_pending_families: usize,
     pub(super) rearmed_index_files: usize,
+    pub(super) carried_pending_families: usize,
+    pub(super) carried_index_files: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
@@ -82,6 +84,8 @@ impl Starting {
             new_retry_attempt: attempt,
             stale_pending_families: 0,
             rearmed_index_files: 0,
+            carried_pending_families: 0,
+            carried_index_files: 0,
         }
     }
 
@@ -460,6 +464,8 @@ mod tests {
             starting.retry_due = Some(false);
             starting.stale_pending_families = usize::MAX;
             starting.rearmed_index_files = usize::MAX;
+            starting.carried_pending_families = usize::MAX;
+            starting.carried_index_files = usize::MAX;
             starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
             let previous = starting.previous.as_mut().unwrap();
             previous.window_unix_seconds = Some(u64::MAX);
