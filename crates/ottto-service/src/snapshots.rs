@@ -815,7 +815,10 @@ pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<
     }
 }
 
-const CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS: i128 = 100;
+// Fallback only: a legacy summary normally pairs through its `parentUuid`
+// chain. Since mid-October 2026 the two records land up to ~1.2 s apart, so an
+// unlinked pair still needs a window wider than that spread.
+const CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS: i128 = 2_000;
 #[derive(Debug, Clone, Default)]
 struct CompactionMetrics {
     total_pre_tokens: u64,
@@ -843,11 +846,20 @@ pub(crate) struct ClaudeCompactionObservation {
     /// stays local and lets the post-census ownership pass attach the boundary
     /// to exact owned request ordinals without uploading provider identities.
     response_count_before: u64,
+    /// Local parse-order key of a current boundary. A legacy summary carries
+    /// its boundary's key when its `parentUuid` chain (through `attachment`
+    /// records) leads to that boundary, and `None` otherwise.
+    pair_key: Option<u64>,
+    /// Whether the record named a `parentUuid`. Read only for a legacy summary:
+    /// one that names a parent outside its boundary's chain is its own event,
+    /// so only a summary without any link may pair by time.
+    has_parent_link: bool,
 }
 
-// Both projections consume legacy summaries greedily in current-boundary input
-// order. Equal distances prefer the original legacy index; keep millisecond
-// truncation and the inclusive tolerance identical for both callers.
+// The time fallback consumes unlinked legacy summaries greedily in
+// current-boundary input order. Equal distances prefer the original legacy
+// index; keep millisecond truncation and the inclusive tolerance identical for
+// both callers.
 fn matching_claude_legacy_compaction(
     observations: &[ClaudeCompactionObservation],
     current_millis: i128,
@@ -858,6 +870,7 @@ fn matching_claude_legacy_compaction(
         .enumerate()
         .filter(|(index, observation)| {
             observation.kind == ClaudeCompactionKind::LegacySummary
+                && !observation.has_parent_link
                 && !matched_legacy.contains(index)
         })
         .filter_map(|(index, observation)| {
@@ -873,17 +886,43 @@ fn matching_claude_legacy_compaction(
         .map(|(_, index)| index)
 }
 
-fn claude_compaction_summary(
+/// Legacy summaries folded into a current boundary, shared by the count and
+/// the curve so both see one event list. A summary pairs with the boundary it
+/// structurally descends from first; only boundaries left unlinked then fall
+/// back to the nearest summary inside the time tolerance that names no parent.
+fn paired_claude_legacy_compactions(
     observations: &[ClaudeCompactionObservation],
-) -> (u64, Vec<String>, CompactionMetrics) {
+) -> BTreeSet<usize> {
+    let mut boundary_by_key = BTreeMap::new();
+    for (index, observation) in observations.iter().enumerate() {
+        if observation.kind == ClaudeCompactionKind::CurrentBoundary {
+            if let Some(key) = observation.pair_key {
+                boundary_by_key.entry(key).or_insert(index);
+            }
+        }
+    }
     let mut matched_legacy = BTreeSet::new();
-    let mut pair_count = 0_u64;
-    let mut metrics = CompactionMetrics::default();
-
-    for current in observations
-        .iter()
-        .filter(|observation| observation.kind == ClaudeCompactionKind::CurrentBoundary)
-    {
+    let mut linked_boundaries = BTreeSet::new();
+    for (index, observation) in observations.iter().enumerate() {
+        if observation.kind != ClaudeCompactionKind::LegacySummary {
+            continue;
+        }
+        let Some(&boundary) = observation
+            .pair_key
+            .and_then(|key| boundary_by_key.get(&key))
+        else {
+            continue;
+        };
+        if linked_boundaries.insert(boundary) {
+            matched_legacy.insert(index);
+        }
+    }
+    for (index, current) in observations.iter().enumerate() {
+        if current.kind != ClaudeCompactionKind::CurrentBoundary
+            || linked_boundaries.contains(&index)
+        {
+            continue;
+        }
         let Some(current_timestamp) = current
             .timestamp
             .as_deref()
@@ -896,7 +935,28 @@ fn claude_compaction_summary(
             matching_claude_legacy_compaction(observations, current_millis, &matched_legacy)
         {
             matched_legacy.insert(legacy_index);
-            pair_count += 1;
+        }
+    }
+    matched_legacy
+}
+
+fn claude_compaction_summary(
+    observations: &[ClaudeCompactionObservation],
+) -> (u64, Vec<String>, CompactionMetrics) {
+    let matched_legacy = paired_claude_legacy_compactions(observations);
+    let mut metrics = CompactionMetrics::default();
+
+    for current in observations
+        .iter()
+        .filter(|observation| observation.kind == ClaudeCompactionKind::CurrentBoundary)
+    {
+        if current
+            .timestamp
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .is_none()
+        {
+            continue;
         }
         if let Some(pre_tokens) = current.pre_tokens {
             metrics.total_pre_tokens = metrics.total_pre_tokens.saturating_add(pre_tokens);
@@ -931,7 +991,7 @@ fn claude_compaction_summary(
         .filter_map(|(_, observation)| observation.timestamp.clone())
         .collect();
     (
-        observations.len() as u64 - pair_count,
+        observations.len() as u64 - matched_legacy.len() as u64,
         bounded_compaction_timestamps(timestamps),
         metrics,
     )
@@ -940,25 +1000,7 @@ fn claude_compaction_summary(
 fn canonical_claude_curve_boundaries(
     observations: &[ClaudeCompactionObservation],
 ) -> Vec<ClaudeCompactionObservation> {
-    let mut matched_legacy = BTreeSet::new();
-    for current in observations
-        .iter()
-        .filter(|observation| observation.kind == ClaudeCompactionKind::CurrentBoundary)
-    {
-        let Some(current_timestamp) = current
-            .timestamp
-            .as_deref()
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-        else {
-            continue;
-        };
-        let current_millis = current_timestamp.unix_timestamp_nanos() / 1_000_000;
-        if let Some(legacy_index) =
-            matching_claude_legacy_compaction(observations, current_millis, &matched_legacy)
-        {
-            matched_legacy.insert(legacy_index);
-        }
-    }
+    let matched_legacy = paired_claude_legacy_compactions(observations);
     let mut boundaries = observations
         .iter()
         .enumerate()
@@ -12337,6 +12379,10 @@ struct SnapshotAccumulator {
     compaction_count: u64,
     compaction_timestamps: crate::owned_heap::OwnedVec<String>,
     claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
+    // Pair key of the latest boundary still waiting for its legacy summary and
+    // the uuid at the tip of its `attachment` chain. One slot suffices: the
+    // provider writes boundary, attachments, then summary as a linear chain.
+    claude_compaction_link_tip: Option<(u64, String)>,
     session_start: Box<session_start::SessionStartState>,
 }
 
@@ -12474,6 +12520,7 @@ impl SnapshotAccumulator {
             compaction_count: 0,
             compaction_timestamps: crate::owned_heap::OwnedVec::new(),
             claude_compaction_observations: crate::owned_heap::OwnedVec::new(),
+            claude_compaction_link_tip: None,
             session_start: Box::default(),
         }
     }
@@ -18931,6 +18978,8 @@ impl OwnedSourceScan {
                 let ownership_incomplete_file_count = parsed_file.ownership_incomplete_file_count;
                 let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
                 let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
+                let claude_compaction_unlinked_parent_count =
+                    parsed_file.claude_compaction_unlinked_parent_count;
                 if let Some(context) = sampling
                     .as_ref()
                     .filter(|_| source == SnapshotSource::Codex && aliases.is_empty())
@@ -19368,6 +19417,9 @@ impl OwnedSourceScan {
                 census.dropped_usage_record_count = census
                     .dropped_usage_record_count
                     .saturating_add(dropped_usage_record_count);
+                census.claude_compaction_unlinked_parent_count = census
+                    .claude_compaction_unlinked_parent_count
+                    .saturating_add(claude_compaction_unlinked_parent_count);
                 if let Some(loss) = terminal_loss {
                     census.terminal_over_line_cap_count = census
                         .terminal_over_line_cap_count
@@ -19482,19 +19534,21 @@ impl OwnedSourceScan {
                         .saturating_add(census.terminal_dropped_usage_record_count);
                 }
                 if source == SnapshotSource::ClaudeCode
-                    && census.claude_parse_reasons.iter().any(|count| *count > 0)
+                    && (census.claude_parse_reasons.iter().any(|count| *count > 0)
+                        || census.claude_compaction_unlinked_parent_count > 0)
                 {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         CANDIDATE_PARSE_REASON_NAMES
                             .iter()
                             .zip(census.claude_parse_reasons)
                             .map(|(name, count)| format!("{name}={count}"))
                             .collect::<Vec<_>>()
-                            .join(" ")
+                            .join(" "),
+                        census.claude_compaction_unlinked_parent_count
                     );
                 }
                 // A remove/rename hint can arrive after bounded reconciliation has already
@@ -21516,6 +21570,10 @@ struct ParsedJsonlFile {
     ownership_incomplete_file_count: usize,
     zero_snapshot_usage_evidence: bool,
     dropped_usage_record_count: u64,
+    /// Local diagnostic only: Claude compaction summaries that name a
+    /// `parentUuid` whose chain never reached a boundary (each counts as its
+    /// own event). Counted before ownership filtering.
+    claude_compaction_unlinked_parent_count: usize,
     terminal_line_loss_count: usize,
     /// A rollout whose exclusive ownership could not be proven must not fall
     /// through to the inclusive state_5.sqlite tokens_used snapshot.
@@ -21943,6 +22001,17 @@ impl OwnedJsonlParser {
                 }
             }
         }
+        // A new Claude Code record type inside the boundary-to-summary chain
+        // would surface here first, before counts double on the page.
+        let claude_compaction_unlinked_parent_count = accumulator
+            .claude_compaction_observations
+            .iter()
+            .filter(|observation| {
+                observation.kind == ClaudeCompactionKind::LegacySummary
+                    && observation.has_parent_link
+                    && observation.pair_key.is_none()
+            })
+            .count();
         let snapshots = accumulator.into_items(
             path,
             collected_at,
@@ -21971,6 +22040,7 @@ impl OwnedJsonlParser {
             ownership_incomplete_file_count,
             zero_snapshot_usage_evidence,
             dropped_usage_record_count: recognized_usage_drop_count as u64,
+            claude_compaction_unlinked_parent_count,
             terminal_line_loss_count: report.over_line_cap_count,
             state_only_blocked_session_ids,
             codex_parent_session_ref,
@@ -24708,14 +24778,36 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         .or_else(|| string_at(value, &["message", "created_at"]));
     note_claude_capability_calls(value, timestamp.as_deref(), accumulator);
     // Current Claude transcripts write both of these shapes for one compaction.
-    // Keep the raw observations here; `claude_compaction_summary` pairs records
-    // within the provider's millisecond-scale emission window while preserving
-    // either shape when it appears alone in an older transcript.
+    // Keep the raw observations here; `claude_compaction_summary` pairs a
+    // summary with the boundary its `parentUuid` chain leads to, falls back to
+    // a short time window only for a summary with no `parentUuid`, and
+    // preserves either shape when it appears alone.
     let is_legacy_compaction = string_eq_at(value, &["type"], "user")
         && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
     let is_current_compaction = string_eq_at(value, &["type"], "system")
         && string_eq_at(value, &["subtype"], "compact_boundary");
+    let extends_compaction_link =
+        accumulator
+            .claude_compaction_link_tip
+            .as_ref()
+            .is_some_and(|(_, tip)| {
+                value.get("parentUuid").and_then(Value::as_str) == Some(tip.as_str())
+            });
+    if extends_compaction_link && string_eq_at(value, &["type"], "attachment") {
+        accumulator.claude_compaction_link_tip = accumulator
+            .claude_compaction_link_tip
+            .take()
+            .and_then(|(key, _)| Some((key, string_at(value, &["uuid"])?)));
+    }
     if is_legacy_compaction {
+        let pair_key = if extends_compaction_link {
+            accumulator
+                .claude_compaction_link_tip
+                .take()
+                .map(|(key, _)| key)
+        } else {
+            None
+        };
         accumulator
             .claude_compaction_observations
             .push(ClaudeCompactionObservation {
@@ -24726,6 +24818,8 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 cumulative_dropped_tokens: None,
                 duration_ms: None,
                 response_count_before: accumulator.claude_response_sequence,
+                pair_key,
+                has_parent_link: value.get("parentUuid").and_then(Value::as_str).is_some(),
             });
     }
     if is_current_compaction {
@@ -24741,6 +24835,9 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         let duration_ms = value
             .pointer("/compactMetadata/durationMs")
             .and_then(Value::as_u64);
+        let pair_key = accumulator.claude_compaction_observations.len() as u64;
+        accumulator.claude_compaction_link_tip =
+            string_at(value, &["uuid"]).map(|uuid| (pair_key, uuid));
         accumulator
             .claude_compaction_observations
             .push(ClaudeCompactionObservation {
@@ -24751,6 +24848,8 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 cumulative_dropped_tokens,
                 duration_ms,
                 response_count_before: accumulator.claude_response_sequence,
+                pair_key: Some(pair_key),
+                has_parent_link: value.get("parentUuid").and_then(Value::as_str).is_some(),
             });
     }
     accumulator.note_time(timestamp.clone());
@@ -26094,6 +26193,9 @@ struct ScanCensus {
     /// so the census moved through every scan step stays small; allocated
     /// only once a configured counting parse finishes.
     codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
+    /// Count-only: parsed Claude compaction summaries on this page whose
+    /// `parentUuid` chain never reached a boundary. Logged, never a decision.
+    claude_compaction_unlinked_parent_count: usize,
 }
 
 /// Preserve the old scope/open/object short-circuit and its one existing open.
@@ -51692,6 +51794,8 @@ mod tests {
                 cumulative_dropped_tokens: None,
                 duration_ms: None,
                 response_count_before,
+                pair_key: None,
+                has_parent_link: false,
             };
         let legacy = ClaudeCompactionKind::LegacySummary;
         let current = ClaudeCompactionKind::CurrentBoundary;
@@ -51700,10 +51804,10 @@ mod tests {
             observation(legacy, "2026-07-01T11:00:00.100Z", 4),
             // Equal distance consumes index 0, even though its ordinal is later.
             observation(current, "2026-07-01T11:00:00.050Z", 3),
-            // The remaining legacy is exactly 100 ms away and still matches.
+            // The nearer remaining legacy (100 ms) wins over the farther one.
             observation(current, "2026-07-01T11:00:00Z", 2),
-            observation(legacy, "2026-07-01T11:00:00.151Z", 1),
-            // Repeated currents are retained; 101 ms is outside tolerance.
+            observation(legacy, "2026-07-01T11:00:02.051Z", 1),
+            // Repeated currents are retained; 2,001 ms is outside tolerance.
             observation(current, "2026-07-01T11:00:00.050Z", 3),
         ];
         let (count, timestamps, metrics) = claude_compaction_summary(&observations);
@@ -51713,8 +51817,8 @@ mod tests {
             timestamps,
             vec![
                 "2026-07-01T11:00:00.050Z",
-                "2026-07-01T11:00:00.151Z",
                 "2026-07-01T11:00:00Z",
+                "2026-07-01T11:00:02.051Z",
             ]
         );
         let boundaries = canonical_claude_curve_boundaries(&observations);
@@ -51745,6 +51849,8 @@ mod tests {
             cumulative_dropped_tokens: Some(3),
             duration_ms: Some(4),
             response_count_before: 0,
+            pair_key: None,
+            has_parent_link: false,
         };
         let legacy = ClaudeCompactionKind::LegacySummary;
         let current = ClaudeCompactionKind::CurrentBoundary;
@@ -51829,6 +51935,245 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    fn parse_claude_compaction_fixture(name: &str, lines: &[&str]) -> SnapshotItem {
+        let path = temp_file(name);
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .expect("write fixture");
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-10-20T12:00:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        let _ = fs::remove_file(path);
+        item
+    }
+
+    #[test]
+    fn claude_code_parser_pairs_compaction_summary_through_its_parent_chain() {
+        let item = parse_claude_compaction_fixture(
+            "claude-compaction-structural-pair",
+            &[
+                "{\"timestamp\":\"2026-10-20T09:00:00Z\",\"sessionId\":\"claude-pair\",\"requestId\":\"req_pair_1\",\"message\":{\"id\":\"msg_pair_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // Current provider shape: boundary, attachment chain, then the
+                // summary 600 ms earlier than the boundary it descends from.
+                "{\"timestamp\":\"2026-10-20T09:01:00.600Z\",\"uuid\":\"boundary-1\",\"parentUuid\":null,\"logicalParentUuid\":\"msg-1\",\"sessionId\":\"claude-pair\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":900000,\"postTokens\":100000,\"durationMs\":20}}",
+                "{\"timestamp\":\"2026-10-20T09:01:00.601Z\",\"uuid\":\"attachment-1\",\"parentUuid\":\"boundary-1\",\"sessionId\":\"claude-pair\",\"type\":\"attachment\"}",
+                "{\"timestamp\":\"2026-10-20T09:01:00.602Z\",\"uuid\":\"attachment-2\",\"parentUuid\":\"attachment-1\",\"sessionId\":\"claude-pair\",\"type\":\"attachment\"}",
+                "{\"timestamp\":\"2026-10-20T09:01:00Z\",\"uuid\":\"summary-1\",\"parentUuid\":\"attachment-2\",\"sessionId\":\"claude-pair\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // Ten minutes later: a second compaction whose summary links
+                // directly and sits 5 s away, outside the time fallback.
+                "{\"timestamp\":\"2026-10-20T09:11:05Z\",\"uuid\":\"boundary-2\",\"parentUuid\":null,\"logicalParentUuid\":\"msg-2\",\"sessionId\":\"claude-pair\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":800000,\"postTokens\":90000,\"durationMs\":30}}",
+                "{\"timestamp\":\"2026-10-20T09:11:00Z\",\"uuid\":\"summary-2\",\"parentUuid\":\"boundary-2\",\"sessionId\":\"claude-pair\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ],
+        );
+
+        assert_eq!(item.compaction_count, Some(2));
+        // Time and sizes come from each boundary, never its summary.
+        assert_eq!(
+            item.compaction_timestamps,
+            vec![
+                "2026-10-20T09:01:00.600Z".to_string(),
+                "2026-10-20T09:11:05Z".to_string(),
+            ]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(1_700_000));
+        assert_eq!(item.compaction_total_post_tokens, Some(190_000));
+        assert_eq!(item.compaction_total_duration_ms, Some(50));
+        // The curve sees the same events: one boundary per pair, including the
+        // pair linked 5 s apart that the time window alone would split.
+        let curve = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries);
+        assert_eq!(
+            curve
+                .iter()
+                .map(|boundary| (boundary.kind, boundary.timestamp.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ClaudeCompactionKind::CurrentBoundary,
+                    Some("2026-10-20T09:01:00.600Z")
+                ),
+                (
+                    ClaudeCompactionKind::CurrentBoundary,
+                    Some("2026-10-20T09:11:05Z")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_code_parser_pairs_only_parentless_compaction_summary_by_time() {
+        let item = parse_claude_compaction_fixture(
+            "claude-compaction-fallback-pair",
+            &[
+                "{\"timestamp\":\"2026-10-20T10:00:00Z\",\"sessionId\":\"claude-fallback\",\"requestId\":\"req_fallback_1\",\"message\":{\"id\":\"msg_fallback_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // No link field at all: the pair rests on the 1.5 s time fallback.
+                "{\"timestamp\":\"2026-10-20T10:01:01.500Z\",\"uuid\":\"boundary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
+                "{\"timestamp\":\"2026-10-20T10:01:00Z\",\"uuid\":\"summary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // A summary whose parent lies outside the boundary's chain is
+                // not paired by time, even 1.5 s away: two events.
+                "{\"timestamp\":\"2026-10-20T10:05:01.500Z\",\"uuid\":\"boundary-elsewhere\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
+                "{\"timestamp\":\"2026-10-20T10:05:00Z\",\"uuid\":\"summary-elsewhere\",\"parentUuid\":\"unrelated\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // A boundary alone still counts once.
+                "{\"timestamp\":\"2026-10-20T10:11:00Z\",\"uuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\",\"preTokens\":600000}}",
+                "{\"timestamp\":\"2026-10-20T10:12:00Z\",\"uuid\":\"prompt-1\",\"parentUuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}",
+                // A legacy summary alone still counts once.
+                "{\"timestamp\":\"2026-10-20T10:21:00Z\",\"uuid\":\"summary-alone\",\"parentUuid\":\"prompt-1\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ],
+        );
+
+        assert_eq!(item.compaction_count, Some(5));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec![
+                "2026-10-20T10:01:01.500Z".to_string(),
+                "2026-10-20T10:05:00Z".to_string(),
+                "2026-10-20T10:05:01.500Z".to_string(),
+                "2026-10-20T10:11:00Z".to_string(),
+                "2026-10-20T10:21:00Z".to_string(),
+            ]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(1_800_000));
+    }
+
+    #[test]
+    fn claude_code_parser_counts_a_summary_whose_parent_chain_misses_its_boundary() {
+        let path = temp_file("claude-compaction-unlinked-parent");
+        let lines = [
+            "{\"timestamp\":\"2026-10-20T13:00:00Z\",\"sessionId\":\"claude-unlinked\",\"requestId\":\"req_unlinked_1\",\"message\":{\"id\":\"msg_unlinked_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+            // Linked through an attachment: one event, not counted.
+            "{\"timestamp\":\"2026-10-20T13:01:01Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
+            "{\"timestamp\":\"2026-10-20T13:01:01.001Z\",\"uuid\":\"attachment-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"attachment\"}",
+            "{\"timestamp\":\"2026-10-20T13:01:00Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"attachment-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            // An unknown record type inside the chain breaks the link: the
+            // summary names a parent, stays its own event and is counted.
+            "{\"timestamp\":\"2026-10-20T13:05:01Z\",\"uuid\":\"boundary-broken\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
+            "{\"timestamp\":\"2026-10-20T13:05:01.001Z\",\"uuid\":\"future-record\",\"parentUuid\":\"boundary-broken\",\"sessionId\":\"claude-unlinked\",\"type\":\"future_record_type\"}",
+            "{\"timestamp\":\"2026-10-20T13:05:00.500Z\",\"uuid\":\"summary-broken\",\"parentUuid\":\"future-record\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            // A summary with no parent at all is not this counter's case.
+            "{\"timestamp\":\"2026-10-20T13:21:00Z\",\"uuid\":\"summary-parentless\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .expect("write fixture");
+        let mut file = File::open(&path).expect("open fixture");
+        let identity =
+            opened_object_identity(SnapshotSource::ClaudeCode, &mut file).expect("identify");
+        let parsed = parse_opened_jsonl_file(
+            file,
+            &identity,
+            &path,
+            "2026-10-20T13:30:00Z",
+            "file-fingerprint".to_string(),
+            SnapshotSource::ClaudeCode,
+            apply_claude_code_line,
+            None,
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+            None,
+            true,
+            None,
+            true,
+        )
+        .expect("parse");
+        let _ = fs::remove_file(path);
+
+        assert_eq!(parsed.claude_compaction_unlinked_parent_count, 1);
+        let item = parsed.snapshots.first().expect("snapshot");
+        assert_eq!(item.compaction_count, Some(4));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec![
+                "2026-10-20T13:01:01Z".to_string(),
+                "2026-10-20T13:05:00.500Z".to_string(),
+                "2026-10-20T13:05:01Z".to_string(),
+                "2026-10-20T13:21:00Z".to_string(),
+            ]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(1_200_000));
+    }
+
+    #[test]
+    fn claude_code_parser_time_fallback_never_claims_a_linked_summary() {
+        let item = parse_claude_compaction_fixture(
+            "claude-compaction-unlinked-beside-linked",
+            &[
+                "{\"timestamp\":\"2026-10-20T11:00:00Z\",\"sessionId\":\"claude-beside\",\"requestId\":\"req_beside_1\",\"message\":{\"id\":\"msg_beside_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // A boundary without a uuid cannot be linked to.
+                "{\"timestamp\":\"2026-10-20T11:01:00.500Z\",\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":400000}}",
+                "{\"timestamp\":\"2026-10-20T11:01:03Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":300000}}",
+                // Linked to the second boundary, yet 10 ms from the first: the
+                // first boundary's fallback must skip it.
+                "{\"timestamp\":\"2026-10-20T11:01:00.490Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // The first boundary's own unlinked summary, 1 s away.
+                "{\"timestamp\":\"2026-10-20T11:01:01.500Z\",\"uuid\":\"summary-unlinked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ],
+        );
+
+        assert_eq!(item.compaction_count, Some(2));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec![
+                "2026-10-20T11:01:00.500Z".to_string(),
+                "2026-10-20T11:01:03Z".to_string(),
+            ]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(700_000));
+        assert_eq!(
+            canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn claude_copied_prefix_filter_drops_a_linked_compaction_pair_together() {
+        let mut item = parse_claude_compaction_fixture(
+            "claude-compaction-copied-prefix-pair",
+            &[
+                "{\"timestamp\":\"2026-10-20T12:00:00Z\",\"sessionId\":\"claude-prefix\",\"requestId\":\"req_prefix_1\",\"message\":{\"id\":\"msg_prefix_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // Copied-prefix compaction, linked 5 s apart: only the link
+                // pairs it, so a split filter would leave a stray summary.
+                "{\"timestamp\":\"2026-10-20T12:01:05Z\",\"uuid\":\"boundary-copied\",\"parentUuid\":null,\"sessionId\":\"claude-prefix\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":900000}}",
+                "{\"timestamp\":\"2026-10-20T12:01:05.001Z\",\"uuid\":\"attachment-copied\",\"parentUuid\":\"boundary-copied\",\"sessionId\":\"claude-prefix\",\"type\":\"attachment\"}",
+                "{\"timestamp\":\"2026-10-20T12:01:00Z\",\"uuid\":\"summary-copied\",\"parentUuid\":\"attachment-copied\",\"sessionId\":\"claude-prefix\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                "{\"timestamp\":\"2026-10-20T12:02:00Z\",\"sessionId\":\"claude-prefix\",\"requestId\":\"req_prefix_2\",\"message\":{\"id\":\"msg_prefix_2\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":60,\"output_tokens\":6}}}",
+                "{\"timestamp\":\"2026-10-20T12:03:05Z\",\"uuid\":\"boundary-owned\",\"parentUuid\":null,\"sessionId\":\"claude-prefix\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":800000}}",
+                "{\"timestamp\":\"2026-10-20T12:03:00Z\",\"uuid\":\"summary-owned\",\"parentUuid\":\"boundary-owned\",\"sessionId\":\"claude-prefix\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ],
+        );
+        assert_eq!(item.compaction_count, Some(2));
+
+        // The first owned response is sequence 1, so the copied pair (one
+        // response before it) leaves the count and the curve as a whole.
+        rebuild_claude_context_posture(&mut item, &[], Some(1));
+        assert_eq!(item.compaction_count, Some(1));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec!["2026-10-20T12:03:05Z".to_string()]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(800_000));
+        let curve = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries)
+            .into_iter()
+            .filter(|boundary| boundary.response_count_before > 1)
+            .map(|boundary| boundary.timestamp)
+            .collect::<Vec<_>>();
+        assert_eq!(curve, vec![Some("2026-10-20T12:03:05Z".to_string())]);
     }
 
     #[test]
@@ -68572,7 +68917,7 @@ crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, select
 crate::heap_layout_bound::fields!(CandidateFile; scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; census_window_end, account_identifier_hash, evidence_request_count, members, member_request_id_hashes, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier_hash, evidence_request_count, members, member_request_id_fingerprints);
-crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before);
+crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link);
 crate::heap_layout_bound::fields!(ClaudeDesktopIdentityEvidence; account_identifier_hash, provider_workspace_hash, source_created_at, imported);
 crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id);
 crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
@@ -68598,7 +68943,7 @@ crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
-crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count,
+crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
@@ -68609,7 +68954,7 @@ crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_p
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
-crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2);
+crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
@@ -68623,7 +68968,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, claude_compaction_link_tip, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
