@@ -310,3 +310,64 @@ fn workflow_journals_are_excluded_before_resolving_composition_ids() {
     assert!(capture.payloads.is_empty());
     env.cleanup();
 }
+
+#[test]
+fn measured_start_does_not_suppress_prompts_after_a_dormant_prefix() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new("composition-dormant-measured-start");
+        let now = base_now();
+        let path = env.root.join(match source {
+            Source::Claude => "p/s.jsonl",
+            Source::Codex => "p/rollout.jsonl",
+        });
+        let records = match source {
+            Source::Claude => vec![
+                json!({"type":"user","sessionId":"s","cwd":env.cwd(),"timestamp":ts(now.date(),1),"message":{"content":"old opening"}}),
+                json!({"type":"assistant","sessionId":"s","timestamp":ts(now.date(),2),"message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":2}}}),
+            ],
+            Source::Codex => vec![
+                json!({"type":"session_meta","timestamp":ts(now.date(),0),"payload":{"id":"s","cwd":env.cwd()}}),
+                json!({"type":"response_item","timestamp":ts(now.date(),1),"payload":{"type":"agent_message","content":[]}}),
+                json!({"type":"event_msg","timestamp":ts(now.date(),2),"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}),
+            ],
+        };
+        write_records(&path, &records);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600))
+            .unwrap();
+        let request = verdict_request(source, &path, true);
+        record_request(&env.root, &request, now.unix_timestamp()).unwrap();
+        let first = env.run(source, now, None);
+        assert_eq!(first.files_read, 0);
+        let later = "later prompt must count";
+        let row = match source {
+            Source::Claude => {
+                json!({"type":"user","sessionId":"s","cwd":env.cwd(),"timestamp":ts(now.date(),3),"message":{"content":later}})
+            }
+            Source::Codex => {
+                json!({"type":"response_item","timestamp":ts(now.date(),3),"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":later}]}})
+            }
+        };
+        append_records(&path, &[row]);
+        let second = env.run(source, now + time::Duration::hours(1), None);
+        assert!(second.bytes_new > 0);
+        let scope = env.scope(source);
+        let prompts: u64 = scope
+            .agg
+            .all_parts
+            .iter()
+            .filter(|(slot, _)| slot.part == Part::ByYou)
+            .map(|(_, bucket)| bucket.tokens)
+            .sum();
+        assert_eq!(prompts, tokens_for(later), "{source:?}");
+        assert!(scope
+            .agg
+            .all_parts
+            .keys()
+            .all(|slot| slot.part != Part::StartNotMeasured));
+        env.cleanup();
+    }
+}

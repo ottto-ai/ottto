@@ -872,3 +872,153 @@ fn audit_file_cap_is_shared_by_the_agents() {
     assert_eq!(audit.files, AUDIT_FILES_PER_DAY);
     env.cleanup();
 }
+
+#[test]
+fn health_mark_releases_the_worker_lease_before_posting() {
+    let dir = scratch("composition-health-release-lease");
+    let now = base_now();
+    let day = day_of(now.date());
+    let mut log = HealthLog::begin(&dir, day, "device|machine|api");
+    log.set(HealthEntry::started("claude-code", now));
+    let record = harvest::take_run_health(&dir, day).unwrap();
+    let lease = harvest::lock_state(&dir).unwrap();
+    assert!(
+        lease.is_some(),
+        "network work must not hold the worker lease"
+    );
+    assert!(health::take_pending(&dir, day).is_none());
+    assert_eq!(record.entries.len(), 1);
+    drop(lease);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn run_health_client_bounds_a_stalled_response() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client = crate::snapshot_client::SnapshotApiClient::new(format!(
+        "http://{}",
+        listener.local_addr().unwrap()
+    ));
+    let server = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(400));
+                return;
+            }
+            assert!(Instant::now() < until, "health client never connected");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let start = Instant::now();
+    assert!(client
+        .post_context_composition_run_health_with_timeout(
+            "synthetic-relay",
+            &json!({}),
+            Duration::from_millis(150)
+        )
+        .is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    server.join().unwrap();
+}
+
+#[test]
+fn an_unrecorded_opening_prefix_stays_ineligible_after_a_forward_read() {
+    let env = Env::new("composition-audit-old-verdict");
+    let now = base_now();
+    let path = env.root.join("p/a.jsonl");
+    write_records(
+        &path,
+        &[
+            json!({"type":"user","sessionId":"s1","cwd":env.cwd(),"timestamp":ts(now.date(),1),"message":{"content":"opening instructions"}}),
+        ],
+    );
+    env.run(Source::Claude, now, None);
+    let mut scope = env.scope(Source::Claude);
+    let (key, checkpoint) = scope.files.iter_mut().next().unwrap();
+    let shard = super::super::scope::shard_id(key);
+    let mut old = serde_json::to_value(&checkpoint.parse).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("request1_start_measured");
+    old.as_object_mut()
+        .unwrap()
+        .remove("request1_verdict_mixed");
+    checkpoint.parse = serde_json::from_value(old).unwrap();
+    assert_eq!(checkpoint.parse.request1_verdict(), None);
+    let manifest = scope_path(&env.state, Source::Claude, &scope.scope_id);
+    scope
+        .save_shard(&manifest, shard, scope.generation)
+        .unwrap();
+    super::super::scope::save_scope(&manifest, Source::Claude, &scope).unwrap();
+    append_records(
+        &path,
+        &[
+            json!({"type":"assistant","sessionId":"s1","timestamp":ts(now.date(),2),"message":{"id":"m"}}),
+        ],
+    );
+    env.run(Source::Claude, now + time::Duration::hours(1), None);
+    let resumed = env.scope(Source::Claude);
+    let checkpoint = resumed.files.values().next().unwrap();
+    assert!(
+        checkpoint
+            .parse
+            .clone()
+            .into_state()
+            .unwrap()
+            .request1_closed
+    );
+    assert_eq!(checkpoint.parse.request1_verdict(), None);
+    let mut audit = full_budget();
+    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
+    assert_eq!(
+        (stats.audit_files, stats.bytes_audit, stats.audit_skipped),
+        (0, 0, 1)
+    );
+    assert_eq!(env.scope(Source::Claude).agg, resumed.agg);
+    env.cleanup();
+}
+
+#[test]
+fn audit_does_not_restore_expired_undated_records() {
+    let env = Env::new("composition-audit-expired-undated");
+    let now = base_now();
+    let path = env.root.join("p/a.jsonl");
+    write_records(
+        &path,
+        &[
+            json!({"type":"user","sessionId":"s1","cwd":env.cwd(),"message":{"content":"undated opening"}}),
+            json!({"type":"assistant","sessionId":"s1","timestamp":ts(now.date(),1),"message":{"id":"m"}}),
+        ],
+    );
+    env.run(Source::Claude, now, None);
+    let later = now + time::Duration::days(93);
+    append_records(&path, &claude_turn(&env.cwd(), later.date(), 2));
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(later.unix_timestamp() as u64),
+        )
+        .unwrap();
+    env.run(Source::Claude, later, None);
+    let before = env.scope(Source::Claude);
+    let mut audit = full_budget();
+    let stats = env.run_audited(Source::Claude, later + time::Duration::hours(1), &mut audit);
+    assert_eq!(
+        (
+            stats.audit_files,
+            stats.audit_skipped,
+            stats.audit_differences
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(stats.scopes_committed, 0);
+    let after = env.scope(Source::Claude);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.agg, before.agg);
+    assert_eq!(stats.bytes_audit, fs::metadata(&path).unwrap().len());
+    env.cleanup();
+}

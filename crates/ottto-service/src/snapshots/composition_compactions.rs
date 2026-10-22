@@ -2,6 +2,21 @@
 
 use super::{paired_claude_legacy_compactions, ClaudeCompactionKind, ClaudeCompactionObservation};
 use serde::{Deserialize, Serialize};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+// Provider identifiers are short. Malformed fields must not turn a bounded
+// marker count into unbounded checkpoint or pairing allocations.
+const MAX_FIELD_BYTES: usize = 128;
+
+fn bounded_id(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| value.len() <= MAX_FIELD_BYTES)
+}
+
+fn bounded_timestamp(value: Option<&str>) -> Option<String> {
+    bounded_id(value)
+        .filter(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok())
+        .map(str::to_string)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Marker {
@@ -56,10 +71,12 @@ impl CompositionCompactions {
         parent: Option<&str>,
         timestamp: Option<&str>,
     ) -> bool {
+        let uuid = bounded_id(uuid);
+        let parent_id = bounded_id(parent);
         let extends = self
             .tip
             .as_ref()
-            .is_some_and(|(_, tip)| parent == Some(tip));
+            .is_some_and(|(_, tip)| parent_id == Some(tip));
         if extends && kind == "attachment" {
             self.tip = self
                 .tip
@@ -96,7 +113,7 @@ impl CompositionCompactions {
         let prior_pairs = paired_claude_legacy_compactions(&before);
         self.markers.push(Marker {
             boundary,
-            timestamp: timestamp.map(str::to_string),
+            timestamp: bounded_timestamp(timestamp),
             key,
             parent: parent.is_some(),
         });
@@ -123,5 +140,56 @@ impl CompositionCompactions {
                 .map(String::capacity)
                 .sum::<usize>()
             + self.tip.as_ref().map_or(0, |(_, tip)| tip.capacity())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composition_compaction_marker_fields_stay_bounded() {
+        let large = "x".repeat(1024 * 1024);
+        let mut history = CompositionCompactions::default();
+        for _ in 0..70 {
+            assert!(history.observe(
+                "system",
+                Some("compact_boundary"),
+                false,
+                Some(&large),
+                None,
+                Some(&large),
+            ));
+        }
+        assert_eq!(history.markers.len(), 64);
+        assert!(history
+            .markers
+            .iter()
+            .all(|marker| marker.timestamp.is_none()));
+        assert!(history.tip.is_none());
+        assert!(history.accounted_bytes() < 16 * 1024);
+        assert!(serde_json::to_vec(&history).unwrap().len() < 16 * 1024);
+
+        let valid = "2026-07-19T10:00:00.123Z";
+        assert!(history.observe(
+            "system",
+            Some("compact_boundary"),
+            false,
+            Some("boundary"),
+            None,
+            Some(valid)
+        ));
+        assert_eq!(
+            history.markers.last().unwrap().timestamp.as_deref(),
+            Some(valid)
+        );
+        assert!(!history.observe(
+            "user",
+            None,
+            true,
+            Some("summary"),
+            Some("boundary"),
+            Some(&large)
+        ));
     }
 }

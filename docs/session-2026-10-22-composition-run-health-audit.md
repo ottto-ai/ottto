@@ -28,8 +28,10 @@ bytes grew (kept in `run.json`).
 
 The record names the device, machine and server the run uploaded to; if they
 changed before the post, the record is dropped unsent. The record is marked
-sent before the first request. A refused or failed post is logged once and
-counted in the daemon's metrics line, and is never retried within the day; the
+sent before the first request, then the state lease is released before credential
+or network work. Relay-token and health requests each use a bounded DNS/request
+budget of ten seconds; successful health responses have a 64 KiB byte cap.
+A refused or failed post is logged once and counted in the daemon's metrics line, and is never retried within the day; the
 next daily run reports again. A record older than yesterday is dropped rather
 than sent late.
 
@@ -44,7 +46,9 @@ changed since its last commit. A pin follows its checkpoint's starting offset,
 so a file restarted at its end is never taken for one counted whole. Request 1
 records the session-start verdict its reads ran under, so a later verdict change
 is not mistaken for a counting fault; a request 1 read under two different
-verdicts is never sampled.
+verdicts is never sampled. An older checkpoint that did not record the opening
+prefix's verdict remains ineligible after later appends; a new read cannot prove
+the skipped prefix's provenance.
 
 The re-read covers exactly the bytes the checkpoint counted and compares events,
 tokens, residency and images per (day, kind) with the file's stored share.
@@ -58,7 +62,10 @@ re-read's result, as a budgeted full read would, and counts it in
 `audit_differences`. No other file is read because of it. Picks rotate through
 the pins in key order from where the previous audit stopped, kept in
 `run.json`, so every eligible file is sampled in turn. Audit bytes are counted
-separately from new and repair bytes.
+separately from new and repair bytes. A sample with undated records is not
+compared or used for replacement when the file's counting may have begun before
+the retention floor: its original read-day attribution is no longer available,
+and assigning those old records to today would count them again.
 
 ## Metrics
 

@@ -2626,15 +2626,28 @@ impl SnapshotApiClient {
         relay_token: &str,
         body: &Value,
     ) -> Result<Value> {
-        match self
-            .agent
+        self.post_context_composition_run_health_with_timeout(
+            relay_token,
+            body,
+            Duration::from_secs(10),
+        )
+    }
+
+    pub(crate) fn post_context_composition_run_health_with_timeout(
+        &self,
+        relay_token: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        match agent
             .post(&self.api_url("/api/v1/context-composition/run-health"))
+            .timeout(request_timeout)
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(body)
         {
-            Ok(response) => response
-                .into_json()
+            Ok(response) => bounded_response_json(response, 64 * 1024)
                 .map_err(|error| anyhow!("parse composition run health response failed: {error}")),
             Err(ureq::Error::Status(code, _response)) => Err(anyhow!(
                 "backend refused composition run health: HTTP {code}"

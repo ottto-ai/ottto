@@ -130,13 +130,8 @@ fn run_wake(worktrees: &mut WorktreeCache) -> Result<()> {
 /// loaded only when a run left an unsent record.
 fn post_run_health(worker: WorkerCounts) -> PostCounts {
     let dir = state_dir(&ottto_core::default_support_dir());
-    // The worker has exited; the lease keeps another daemon's worker out
-    // while the record is marked sent.
-    let Ok(Some(_lease)) = lock_state(&dir) else {
-        return PostCounts::default();
-    };
     let today = day_of(OffsetDateTime::now_utc().date());
-    let Some(record) = super::health::take_pending(&dir, today) else {
+    let Some(record) = take_run_health(&dir, today) else {
         return PostCounts::default();
     };
     let mut poster = match ClientHealthPoster::load() {
@@ -154,6 +149,13 @@ fn post_run_health(worker: WorkerCounts) -> PostCounts {
     };
     let (destination, machine_id) = (poster.destination.clone(), poster.machine_id.clone());
     super::health::send(&record, &destination, &machine_id, worker, &mut poster)
+}
+
+/// Mark the daily record while holding the state lease, then release it
+/// before credentials, DNS or network work can block another worker.
+pub(super) fn take_run_health(dir: &Path, today: Day) -> Option<super::health::HealthRecord> {
+    let _lease = lock_state(dir).ok()??;
+    super::health::take_pending(dir, today)
 }
 
 /// Posts with the composition upload's credentials: a relay token per agent.
@@ -188,9 +190,12 @@ impl HealthPoster for ClientHealthPoster {
             .into_iter()
             .find(|source| agent_source_label(*source) == agent_source)
             .ok_or_else(|| anyhow!("unknown agent source"))?;
-        let token = self
-            .client
-            .issue_relay_token(&self.device, &self.device_secret, source)?;
+        let token = self.client.issue_relay_token_with_timeout(
+            &self.device,
+            &self.device_secret,
+            source,
+            std::time::Duration::from_secs(10),
+        )?;
         self.client
             .post_context_composition_run_health(&token, body)
             .map(|_| ())
@@ -838,7 +843,7 @@ pub(super) struct SourceStats {
     pub(super) audit_files: u64,
     /// Audited files whose re-read differed (the re-read replaced them).
     pub(super) audit_differences: u64,
-    /// Picks that turned out not eligible (no read).
+    /// Ineligible picks or samples whose retained history cannot be compared.
     pub(super) audit_skipped: u64,
     pub(super) audit_failed: u64,
     /// Transcripts the walk found (one per copy key and copy).
@@ -2445,6 +2450,11 @@ fn read_file(
     };
     out.sink.session_start(&state.session, state.min_ts);
     if request1_open && end.offset > checkpoint.offset {
+        if checkpoint.offset > 0 && state.request1_start_measured.is_none() {
+            // An older checkpoint did not record the prefix's verdict.
+            // The current read cannot establish that prefix's provenance.
+            state.request1_verdict_mixed = true;
+        }
         state.note_request1_verdict(state.start_measured);
     }
     #[cfg(test)]
@@ -2478,6 +2488,17 @@ fn read_file(
             return Ok(None);
         }
         let undated = stats.lines.undated > undated_before;
+        if undated
+            && OffsetDateTime::from_unix_timestamp(checkpoint.created)
+                .ok()
+                .is_none_or(|created| day_of(created.date()) < window.floor)
+        {
+            // Undated records were attributed when first read. Once that
+            // day may have expired, a reread cannot safely restore them on
+            // today's date or add them to all-history totals a second time.
+            stats.audit_skipped += 1;
+            return Ok(None);
+        }
         let same_end = end.offset == audited_end;
         if same_end && !super::audit::differs(old_share.as_ref(), &contribution, undated) {
             // Same numbers: the stored checkpoint stays as it was.

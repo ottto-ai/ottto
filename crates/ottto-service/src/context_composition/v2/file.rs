@@ -408,7 +408,12 @@ pub(super) fn head_cwds(path: &Path, deadline: Instant) -> std::io::Result<(Vec<
 pub(super) fn new_parse_state(source: Source, path: &Path, offset: u64) -> (ParseState, u64) {
     let (lines, bytes) = head_lines(source, path).unwrap_or_default();
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    let mut state = ParseState::default();
+    // The skipped prefix may already contain the first response. Treat new
+    // bytes as later work rather than suppressing them under a start verdict.
+    let mut state = ParseState {
+        request1_closed: offset > 0,
+        ..Default::default()
+    };
     match source {
         Source::Claude => {
             let (session, sidechain) = claude::head_identity(&refs, path);
