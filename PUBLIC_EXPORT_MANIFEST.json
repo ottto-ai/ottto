@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 760,
-  "content_sha256": "3b681bb3f25ef110cbb32b7402dd310c7af7818e35f1a2078cee42d1ba9090dd",
+  "candidate_file_count": 764,
+  "content_sha256": "7713825aa791c04f89cbcb188f398b0a73b7a684bb67ef8bb3a656bb612d218c",
   "files": [
     {
       "executable": false,
@@ -902,15 +902,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/mod.rs",
-      "sha256": "701a89fb9ed3cb5d854ff5513580c1723f558be739c814a9bfebf3cbf532c1c8",
-      "size_bytes": 24254
+      "sha256": "e7313945695b76eed8e9eb230cc34bab587103937b50aaeb4278d92b067928cd",
+      "size_bytes": 37264
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/shell.rs",
-      "sha256": "b7a561744c41521b3e8fbf3ffbf4756b4895efeba13f1a8da9af37f76bf6d74d",
-      "size_bytes": 5439
+      "sha256": "f21059d1c61dbea67b7e6c54c7af65692196e2f1fbeb6a9cb14ec08731e0cf21",
+      "size_bytes": 46002
     },
     {
       "executable": false,
@@ -918,6 +918,20 @@
       "path": "crates/ottto-service/src/composition_kinds/tests.rs",
       "sha256": "25fb3eeb81131bf3bc67a083dc622b4b065bf4e08586c0580a8262c306f7992d",
       "size_bytes": 14260
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/composition_kinds/tests_v2.rs",
+      "sha256": "6c9b1b20337c4485fe5fa33368bd1d1e8464979380f64758ea01e5c8d34bb632",
+      "size_bytes": 53505
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/composition_kinds/v2.rs",
+      "sha256": "5bd2e1d7e0728cd86c8ce21477dccf03e77bb4f370ce1ecb9d06c82723f5d681",
+      "size_bytes": 26261
     },
     {
       "executable": false,
@@ -965,8 +979,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/mod.rs",
-      "sha256": "3ba531e088b5648f33812afed506bd8732139409dd88ac49c8860f690d45ce78",
-      "size_bytes": 5512
+      "sha256": "fb79d6f277b92af50f61097cc04b1b4632cf4decc7799aa8be951c7d91c8533a",
+      "size_bytes": 5622
     },
     {
       "executable": false,
@@ -3568,6 +3582,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-22-composition-kinds-v2.md",
+      "sha256": "20ad6e9819150701be84052dbd717464c59f90cfb41b42d2991edc20891345c8",
+      "size_bytes": 3434
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -4145,6 +4166,13 @@
       "path": "fixtures/collector-status/census-residue-scan-status-v1.json",
       "sha256": "5aab5897fad814215baac096c80acb6bc29d838eb6fc8c7007ba8d7e8a2cdbaa",
       "size_bytes": 2381
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/context-composition/kinds-v2.json",
+      "sha256": "7cc13f496cd8e274e6595b2d27749f90a11330d11e61090c03b7baf9bc71efa4",
+      "size_bytes": 1884
     },
     {
       "executable": false,
@@ -5325,7 +5353,7 @@
   ],
   "generated_at": "2026-10-22T01:27:09+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 761,
+  "output_file_count": 765,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
