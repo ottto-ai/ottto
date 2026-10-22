@@ -35852,6 +35852,10 @@ mod tests {
         let path = root.join("index.json");
         index.save(&path).unwrap();
         index = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            index.bounded_sweep_unsettled_cause_names(),
+            ["admission_reoffer"]
+        );
         let replay = scan_source_roots(
             source,
             std::slice::from_ref(&root),
@@ -68591,6 +68595,10 @@ mod tests {
         assert!(
             index.bounded_sweep_had_unsettled_upload,
             "arming is what forces the re-parse that recovers a dropped revision"
+        );
+        assert_eq!(
+            index.bounded_sweep_unsettled_cause_names(),
+            ["legacy_reconcile"]
         );
     }
 
