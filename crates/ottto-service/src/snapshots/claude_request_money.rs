@@ -104,7 +104,7 @@ pub(crate) fn request_owned_live(support_dir: &Path) -> bool {
 static LIVE_TEST_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Flush already queued ledger/output work on an orderly service exit.
-/// Abrupt termination is recovered by persisted debt; no signal handler does I/O.
+/// Abrupt exits still rely on the persisted checkpoints; no signal handler does I/O.
 pub fn flush_on_shutdown() {
     store::flush();
 }

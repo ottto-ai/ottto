@@ -2487,37 +2487,13 @@ impl SyncCounts {
     }
 
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
-        if index
-            .active_quarantine_witness
-            .as_ref()
-            .is_some_and(|witness| {
-                witness.parser_version == SnapshotSource::ClaudeCode.parser_version()
-            })
-        {
-            let mut held = 0;
-            let mut refused = 0;
-            for record in index
-                .quarantined_snapshot_fingerprints
-                .values()
-                .filter(|record| record.disposition == SnapshotQuarantineDisposition::RetryPending)
-            {
-                match record.hold.as_ref().map(|hold| hold.kind) {
-                    Some(SnapshotHoldKind::Held) => held += 1,
-                    Some(SnapshotHoldKind::Refused) => refused += 1,
-                    None => (),
-                }
-            }
+        if let Some((held, refused, live, protected)) = index.request_owned_menu_projection() {
             if let Ok(mut status) = REQUEST_MONEY_MENU.lock() {
                 *status = Some(RequestMoneyMenuStatus {
                     held,
                     refused,
-                    adoption: if index.active_effective_upload_body_witness_revision == 3 {
-                        "running"
-                    } else {
-                        "off"
-                    }
-                    .into(),
-                    protected: index.claude_reemission_exclusions.state().as_str().into(),
+                    adoption: if live { "running" } else { "off" }.into(),
+                    protected: protected.into(),
                 });
             }
         }
@@ -7149,9 +7125,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         for item in &scan_result.snapshots {
             if item.usage_accounting_contract.as_deref()
                 != Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-                && disposition
-                    .quarantined_source_session_ids
-                    .contains(&item.source_session_id)
+                && disposition.was_quarantined(&item.source_session_id)
             {
                 holds.insert(item.source_session_id.clone());
             }
@@ -7982,7 +7956,20 @@ where
             Ok(SnapshotPageOutcome::Settled { conflicted }) => {
                 conflicted_entities = conflicted_entities.saturating_add(conflicted);
             }
-            Err(error) if is_literal_version_skew(&error) => {
+            Err(error)
+                if is_literal_version_skew(&error)
+                    && indices.iter().any(|index| {
+                        serde_json::to_value(&items[*index])
+                            .ok()
+                            .and_then(|body| {
+                                body.get("usage_accounting_contract")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .as_deref()
+                            == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                    }) =>
+            {
                 let mut retry_after = 1_800;
                 for index in &indices {
                     let fp = fingerprint(&items[*index]);

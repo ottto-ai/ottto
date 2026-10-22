@@ -3021,6 +3021,10 @@ impl ClaudeUsageAuthorityDisposition {
 }
 
 impl ClaudeUsageAuthorityDisposition {
+    pub(crate) fn was_quarantined(&self, session: &str) -> bool {
+        self.quarantined_source_session_ids.contains(session)
+    }
+
     pub(crate) fn request_owned(&mut self, holds: BTreeSet<String>) {
         self.quarantined_source_session_ids = holds;
         self.quarantined_source_session_ids
@@ -31007,6 +31011,38 @@ impl ScanIndex {
             self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
             self.legacy_settlement_reconcile_after_fingerprint = None;
         }
+    }
+
+    pub(crate) fn request_owned_menu_projection(&self) -> Option<(u64, u64, bool, &'static str)> {
+        if !self
+            .active_quarantine_witness
+            .as_ref()
+            .is_some_and(|witness| {
+                witness.parser_version == SnapshotSource::ClaudeCode.parser_version()
+            })
+        {
+            return None;
+        }
+        let mut held = 0;
+        let mut refused = 0;
+        for record in self
+            .quarantined_snapshot_fingerprints
+            .values()
+            .filter(|record| record.disposition == SnapshotQuarantineDisposition::RetryPending)
+        {
+            match record.hold.as_ref().map(|hold| hold.kind) {
+                Some(SnapshotHoldKind::Held) => held += 1,
+                Some(SnapshotHoldKind::Refused) => refused += 1,
+                None => (),
+            }
+        }
+        let live = self.active_effective_upload_body_witness_revision == 3;
+        (live || held > 0 || refused > 0).then_some((
+            held,
+            refused,
+            live,
+            self.claude_reemission_exclusions.state().as_str(),
+        ))
     }
 
     pub(crate) fn snapshot_unproven_terminal_count(&self) -> usize {

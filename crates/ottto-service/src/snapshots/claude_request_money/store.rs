@@ -841,6 +841,9 @@ pub(crate) fn flush() {
         .ok()
         .is_some_and(|sender| sender.send(Job::Flush(done)).is_ok());
     if sent {
+        #[cfg(test)]
+        let _ = wait.recv();
+        #[cfg(not(test))]
         let _ = wait.recv_timeout(Duration::from_secs(5));
     }
 }
