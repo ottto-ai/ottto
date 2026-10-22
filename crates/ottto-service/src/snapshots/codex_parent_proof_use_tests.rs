@@ -2378,3 +2378,279 @@ fn an_overlong_row_is_charged_its_salvaged_timestamp_at_the_real_room() {
     scene.hook_in(&cache, &hook_pass(), &mut page, now);
     assert_eq!(spent(&page), 0, "inside the backoff: nothing");
 }
+
+// Fix round 4: the AutoReview findings at 396b1f32.
+
+/// Fix round 4 (AutoReview #1): a consumed proof is re-fenced against P at
+/// completion, in main's completion fence
+/// (`invalidate_stale_codex_parent_resolution`), by the install's own P
+/// checks. P unchanged: the parse is untouched and the record site admits.
+/// P rewritten in place or replaced after the install: child usage and its
+/// ledger are refused, the parse is pending (a later page retries), the
+/// proof is refused `Seal` and the entry is removed (the owe re-proves),
+/// never `Admitted`. P gone: refused `Identity`, the entry kept (PR-P holds
+/// the child). Function level: the same fence ends every completion,
+/// ordinary or a cursor job's.
+#[test]
+fn a_consumed_proof_is_refenced_against_p_at_completion() {
+    let consumed = |name: &str| {
+        let scene = Scene::new(name);
+        let proof = scene.proof();
+        let parsed = parse(
+            &scene.child.path,
+            witness(CodexParentUnresolvable::Oversize),
+            Some(installed(&proof)),
+        );
+        assert!(parsed.complete() && parsed.codex_parent_prefix_decided.is_some());
+        assert!(!parsed.snapshots.is_empty());
+        (scene, proof, parsed)
+    };
+    let fence = |scene: &Scene, parsed: &mut ParsedJsonlFile| {
+        let mut ids =
+            CodexParentIdentities::new(SnapshotSource::Codex, scene.index.traversal.as_ref());
+        let census = ids.census(&scene.index);
+        invalidate_stale_codex_parent_resolution(parsed, &mut ids, census)
+    };
+    let refused = |parsed: &ParsedJsonlFile| {
+        assert!(parsed.snapshots.is_empty());
+        assert!(parsed.codex_parent_resolution_pending);
+        assert!(!parsed.complete());
+        assert!(parsed
+            .codex_parent_ownership_ledger
+            .as_ref()
+            .map_or(true, |(_, ledger)| !ledger.scan_complete
+                && ledger.signatures.is_empty()));
+    };
+
+    // Unchanged: nothing changes; admitted (kept) as before.
+    let (mut scene, proof, mut parsed) = consumed("refence-unchanged");
+    let before = view(&parsed);
+    assert!(!fence(&scene, &mut parsed));
+    assert_eq!(view(&parsed), before);
+    assert_eq!(parsed.codex_parent_proof_refusal, None);
+    let key = scene.key();
+    scene.index.settle_codex_parent_proof_use(&key, &parsed);
+    assert_eq!(scene.proof(), proof);
+
+    // Rewritten in place (same inode, new head): `Seal`, removed.
+    let (mut scene, _, mut parsed) = consumed("refence-rewritten");
+    let mut values = parent_values();
+    values[1] = turn("2026-08-02T08:00:01Z", "parent-turn-rewritten");
+    write_values(&scene.parent, &values);
+    assert!(fence(&scene, &mut parsed));
+    refused(&parsed);
+    assert!(
+        matches!(
+            parsed.codex_parent_proof_refusal,
+            Some(ProofRefusal::Seal(_))
+        ),
+        "{:?}",
+        parsed.codex_parent_proof_refusal
+    );
+    let key = scene.key();
+    scene.index.settle_codex_parent_proof_use(&key, &parsed);
+    assert_eq!(scene.index.codex_parent_prefix_proofs.get(&key), None);
+
+    // Replaced (a new object at P's path): `Seal`, removed.
+    let (mut scene, _, mut parsed) = consumed("refence-replaced");
+    let staged = scene.parent.with_extension("staged");
+    write_values(&staged, &parent_values());
+    fs::rename(&staged, &scene.parent).unwrap();
+    assert!(fence(&scene, &mut parsed));
+    refused(&parsed);
+    assert!(
+        matches!(
+            parsed.codex_parent_proof_refusal,
+            Some(ProofRefusal::Seal(_))
+        ),
+        "{:?}",
+        parsed.codex_parent_proof_refusal
+    );
+    let key = scene.key();
+    scene.index.settle_codex_parent_proof_use(&key, &parsed);
+    assert_eq!(scene.index.codex_parent_prefix_proofs.get(&key), None);
+
+    // Gone: `Identity`, the entry kept for PR-P.
+    let (mut scene, proof, mut parsed) = consumed("refence-gone");
+    fs::remove_file(&scene.parent).unwrap();
+    assert!(fence(&scene, &mut parsed));
+    refused(&parsed);
+    assert!(matches!(
+        parsed.codex_parent_proof_refusal,
+        Some(ProofRefusal::Identity(_))
+    ));
+    let key = scene.key();
+    scene.index.settle_codex_parent_proof_use(&key, &parsed);
+    assert_eq!(scene.proof(), proof);
+}
+
+/// A singleton hold memo for `key` in the hook's namespace; its memo key.
+fn held_memo(cache: &sampled_scan::SharedCache, key: &str, file: &Path) -> String {
+    use sampled_scan::codex_cursor::{DebtReason, Disclosure, HeldCounts, LiveWitness, MemoEntry};
+    let file = File::open(file).unwrap();
+    let entry = MemoEntry::new(
+        "digest".into(),
+        LiveWitness::read(&file, 8).unwrap(),
+        OpenStamp::capture(&file).unwrap(),
+        None,
+        None,
+        Disclosure {
+            reason: DebtReason::HeldTerminal,
+            ownership_incomplete_file_count: 1,
+            zero_snapshot_usage_evidence: false,
+            state_only_blocked_session_ids: vec![CHILD.into()],
+            diagnostic_reason: crate::codex_scan_diagnostics::FileReason::OwnershipIncomplete,
+            parsed_snapshot_count: 0,
+            held: HeldCounts::default(),
+            parent_ref: Some(PARENT.into()),
+            parent_unresolvable: Some(CodexParentUnresolvable::LedgerCapped),
+        },
+    );
+    let memo_key = sampled_scan::codex_cursor::memo_key(
+        &crate::transcript_acquisition::Scope("proof-hook".into()),
+        key,
+    );
+    cache.memo_record(memo_key.clone(), entry);
+    assert!(cache.memo_lookup(&memo_key).is_some());
+    memo_key
+}
+
+/// Fix round 4 (AutoReview #2): a child's singleton hold memo ends when its
+/// entry becomes `Proven`, at the job's finish and at a kept proof's
+/// re-fence, so the child's next page parses and reaches the install
+/// instead of replaying the hold recorded before the proof. A job that
+/// proves nothing keeps the memo; other memos are untouched.
+#[test]
+fn a_proven_entry_ends_its_childs_hold_memo() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // The job's finish proves C.
+    let mut scene = Scene::owed("hook-memo-proven");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let child = held_memo(&cache, &scene.key(), &scene.child.path);
+    let other = held_memo(&cache, "/other/rollout.jsonl", &scene.parent);
+    let mut page = PageBudget::default();
+    scene.hook(&cache, &mut page);
+    assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
+    assert!(cache.memo_lookup(&child).is_none(), "the hold memo ended");
+    assert!(cache.memo_lookup(&other).is_some());
+
+    // A kept proof re-fenced to `Proven` (no job).
+    let mut scene = Scene::owed("hook-memo-refenced");
+    let key = scene.key();
+    let now = sampled_scan::now_seconds();
+    let proof = proof_of(
+        &child_values(),
+        &parent_values(),
+        seal_of(
+            &File::open(&scene.parent).unwrap(),
+            now,
+            &codex_parent_proof_scope().0,
+        ),
+    );
+    scene.index.remove_codex_parent_proof(&key);
+    scene
+        .index
+        .codex_parent_prefix_proofs
+        .insert(key.clone(), CodexParentProofState::Proven(proof.clone()));
+    scene.index.settle_codex_parent_proof_use(
+        &key,
+        &ParsedJsonlFile {
+            codex_parent_proof_refusal: Some(ProofRefusal::Side(ProofWake::Due)),
+            ..held(CodexParentUnresolvable::Oversize)
+        },
+    );
+    assert!(scene.owed_entry().kept.is_some());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let child = held_memo(&cache, &key, &scene.child.path);
+    let mut page = PageBudget::default();
+    scene.hook(&cache, &mut page);
+    assert_eq!(scene.proof(), proof);
+    assert!(cache.memo_lookup(&child).is_none(), "the hold memo ended");
+
+    // No proof (P's record held: the batch is refused, C stays owed): the
+    // memo replays as before.
+    let mut scene = Scene::owed("hook-memo-kept");
+    let p_key = local_index_key(&scene.parent);
+    scene
+        .index
+        .codex_parent_side
+        .get_mut(&p_key)
+        .unwrap()
+        .verdict = SideVerdict::Held {
+        lineage: true,
+        cause: CAUSE_NO_EVIDENCE,
+    };
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let child = held_memo(&cache, &scene.key(), &scene.child.path);
+    let mut page = PageBudget::default();
+    scene.hook(&cache, &mut page);
+    assert_eq!(scene.owed_entry().outcome, ProofOutcome::LineageHeld as u8);
+    assert!(cache.memo_lookup(&child).is_some(), "no proof: kept");
+}
+
+/// Fix round 4 (AutoReview #3): a `ParentHeld` wake fires when P's settled
+/// record is refreshed with a seal inside its horizon under the same
+/// verdict and generation; an unchanged expired seal does not wake it, and
+/// the backoff still governs.
+#[test]
+fn a_parent_held_wake_fires_on_a_refreshed_seal_only() {
+    let now = sampled_scan::now_seconds();
+    let mut scene = Scene::owed("hook-seal-refresh");
+    let key = scene.key();
+    let p_key = local_index_key(&scene.parent);
+    let parent = scene.parent.clone();
+    let side_seal = |verified: u64| {
+        seal_of(
+            &File::open(&parent).unwrap(),
+            verified,
+            &codex_parent_side_scope().0,
+        )
+    };
+    // P's record expired (verified two audit intervals ago), same generation.
+    let expired = side_seal(now - 2 * crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS);
+    scene.index.codex_parent_side.get_mut(&p_key).unwrap().seal = expired;
+    let generation = scene.index.codex_parent_side[&p_key].generation;
+    let wake = ProofWake::ParentHeld {
+        parent_key: p_key.clone(),
+        generation,
+        parent_entry: scene.index.codex_parent_entry_fingerprint(&p_key),
+        parent: OpenStamp::of_path(&scene.parent).unwrap(),
+        lineage: false,
+        needed_extent: 0,
+    };
+    let set_owed = |scene: &mut Scene, not_before: u64| {
+        let Some(CodexParentProofState::Owed(owed)) =
+            scene.index.codex_parent_prefix_proofs.get_mut(&key)
+        else {
+            panic!("not owed");
+        };
+        owed.wake = wake.clone();
+        owed.not_before_unix_seconds = not_before;
+    };
+    set_owed(&mut scene, 0);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let before = scene.owed_entry();
+
+    // Unchanged expired seal: no wake, nothing read.
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    assert_eq!(spent(&page), 0);
+    assert_eq!(scene.owed_entry(), before);
+
+    // Refreshed by a side read (same verdict and generation), but backed off:
+    // still nothing.
+    scene.index.codex_parent_side.get_mut(&p_key).unwrap().seal = side_seal(now);
+    assert_eq!(scene.index.codex_parent_side[&p_key].generation, generation);
+    set_owed(&mut scene, now + 600);
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    assert_eq!(spent(&page), 0, "the backoff governs");
+
+    // After the backoff: the wake fires and C is proven again.
+    set_owed(&mut scene, 0);
+    let mut page = PageBudget::default();
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
+}

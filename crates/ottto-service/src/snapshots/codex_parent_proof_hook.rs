@@ -25,6 +25,9 @@ pub(super) struct ProofVisit {
     pub(super) before_head: Option<String>,
     /// Kept proofs re-fenced (each re-read P's two samples).
     pub(super) refenced: u64,
+    /// Fix round 4 (AutoReview #2): entries a re-fence made `Proven` again
+    /// (at most the visit's keys), whose hold memos the hook ends.
+    pub(super) reproven: Vec<String>,
 }
 
 /// The change that can cure an outcome (rev 3 §1.6), before its stamps.
@@ -213,6 +216,7 @@ pub(super) fn codex_parent_proof_step(
                 let visit = index.visit_codex_parent_proofs(identities, now, side, leftover);
                 // R1-M1: each re-fence is P's side fence and the proof seal.
                 page.charge(false, visit.refenced.saturating_mul(PROOF_FENCE_READ_BYTES));
+                forget_proven_hold_memos(index, context, &visit.reproven);
                 let Some((parent, entries)) = visit.batch else {
                     context.cache.note_proof_hook(&context.namespace, false);
                     return;
@@ -312,6 +316,7 @@ pub(super) fn codex_parent_proof_step(
             // R2-L3: P's side fence and the commit's samples.
             page.charge(false, PROOF_FENCE_READ_BYTES);
             finish_codex_proof_job(index, identities, lease.job(), now, side);
+            forget_proven_hold_memos(index, context, entries.iter().map(|(key, _)| key));
             lease.finish();
         }
         // The budget ended the page, or finish waits for a valid,
@@ -320,6 +325,31 @@ pub(super) fn codex_parent_proof_step(
             if !lease.suspend() {
                 back_off(index, ProofOutcome::MemoryRefused);
             }
+        }
+    }
+}
+
+/// U1a-2a (fix round 4, AutoReview #2): each of `keys` whose entry is now
+/// `Proven` ends its child's singleton hold memo in this namespace
+/// (`memo_forget`, the memo's own custody), so the child's next page parses
+/// and reaches `install_codex_parent_proof` instead of replaying the hold
+/// the memo recorded before the proof existed. Other memos are untouched.
+fn forget_proven_hold_memos<'a>(
+    index: &ScanIndex,
+    context: &sampled_scan::Context,
+    keys: impl IntoIterator<Item = &'a String>,
+) {
+    for key in keys {
+        if matches!(
+            index.codex_parent_prefix_proofs.get(key),
+            Some(CodexParentProofState::Proven(_))
+        ) {
+            context
+                .cache
+                .memo_forget(&sampled_scan::codex_cursor::memo_key(
+                    &context.namespace,
+                    key,
+                ));
         }
     }
 }
@@ -770,7 +800,13 @@ impl ScanIndex {
             };
             let due = owed.wake == ProofWake::Due
                 || (!owed.backed_off(now)
-                    && self.codex_proof_wake_fires(&owed.wake, key, &matches, p_key.as_deref()));
+                    && self.codex_proof_wake_fires(
+                        &owed.wake,
+                        key,
+                        &matches,
+                        p_key.as_deref(),
+                        now,
+                    ));
             let excluded = visit.batch.as_ref().is_some_and(|(head_parent, entries)| {
                 *head_parent != parent || entries.len() >= CODEX_PROOF_BATCH
             });
@@ -794,6 +830,7 @@ impl ScanIndex {
                     self.remove_codex_parent_proof(key);
                     self.codex_parent_prefix_proofs
                         .insert(key.clone(), CodexParentProofState::Proven(kept));
+                    visit.reproven.push(key.clone());
                     if visit.batch.is_none() {
                         previous = Some(key.clone());
                     }
@@ -818,13 +855,19 @@ impl ScanIndex {
 
     /// Whether `wake` fires now (rev 3 §1.6): `child_key`'s and P's path
     /// stamps (no-follow stats; no byte is read), P's census fingerprint,
-    /// P's side generation and P's own proof entry.
+    /// P's side generation and P's own proof entry. Fix round 4 (AutoReview
+    /// #3): a `ParentHeld` wake also fires when P's settled record now
+    /// covers `needed_extent` with a seal inside its horizon
+    /// (`admits_in_time`), so a side read that refreshes the seal under the
+    /// same verdict and generation wakes it; an unchanged expired or short
+    /// seal does not. Backoff is checked before (`backed_off`).
     fn codex_proof_wake_fires(
         &self,
         wake: &ProofWake,
         child_key: &str,
         census: &str,
         p_key: Option<&str>,
+        now: u64,
     ) -> bool {
         let child_now = OpenStamp::of_path(Path::new(child_key));
         let parent_now = || p_key.and_then(|p_key| OpenStamp::of_path(Path::new(p_key)));
@@ -853,14 +896,18 @@ impl ScanIndex {
                 generation,
                 parent_entry,
                 parent,
+                needed_extent,
                 ..
             } => {
-                self.codex_parent_side
-                    .get(parent_key)
-                    .map_or(0, |record| record.generation)
-                    != *generation
+                let record = self.codex_parent_side.get(parent_key);
+                record.map_or(0, |record| record.generation) != *generation
                     || self.codex_parent_entry_fingerprint(parent_key) != *parent_entry
                     || OpenStamp::of_path(Path::new(parent_key)).as_ref() != Some(parent)
+                    || record.is_some_and(|record| {
+                        record.verdict == SideVerdict::Settled
+                            && record.seal.sealed_offset() >= *needed_extent
+                            && record.seal.admits_in_time(&codex_parent_side_scope(), now)
+                    })
             }
         }
     }

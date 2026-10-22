@@ -308,6 +308,27 @@ impl PrefixSeal {
             .is_some_and(|due| due <= self.sealed_unix_seconds)
     }
 
+    /// U1a-2a (fix round 4, AutoReview #3), metadata only: whether this seal
+    /// is in `scope` and inside its horizon at `now` for `admits` (no clock
+    /// regression, no due or out-of-range staged debt, verified less than
+    /// `AUDIT_INTERVAL_SECONDS` ago). It reads no byte and admits nothing:
+    /// `admits` still decides on the FD.
+    pub(crate) fn admits_in_time(&self, scope: &Scope, now: u64) -> bool {
+        let debt_ok = self.audit_debt_unix_seconds.map_or(true, |due| {
+            now < due
+                && now
+                    .checked_add(AUDIT_INTERVAL_SECONDS)
+                    .is_some_and(|latest| due <= latest)
+        });
+        self.scope == scope.0
+            && now >= self.verified_unix_seconds
+            && debt_ok
+            && self
+                .verified_unix_seconds
+                .checked_add(AUDIT_INTERVAL_SECONDS)
+                .is_some_and(|due| now < due)
+    }
+
     /// `prepare`'s decision (`select_mode`) with this seal as the checkpoint
     /// and no durable debt, on the held FD, followed by `prepare`'s stamp
     /// re-capture. `Ok(sample bytes read)` iff the decision is `Tail` or

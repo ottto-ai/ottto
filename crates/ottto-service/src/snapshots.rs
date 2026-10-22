@@ -16481,6 +16481,30 @@ fn install_codex_parent_proof(
     opened
 }
 
+/// U1a-2a (fix round 4, AutoReview #1): the install's P checks on `proof`
+/// now, for its completion fence: P's unique cap-free locate
+/// (`Identity`), then the proof seal's `admits` on that FD (`Seal`). It
+/// reads at most the seal's two sample windows. `None`: P is the object
+/// the proof was sealed against.
+fn codex_parent_proof_refusal_now(
+    census: CodexParentCensus<'_>,
+    proof: &CodexParentPrefixProof,
+) -> Option<ProofRefusal> {
+    match codex_parent_locate(census, &proof.parent) {
+        Err(cause) => Some(ProofRefusal::Identity(cause)),
+        Ok((_, mut file)) => proof
+            .parent_seal
+            .admits(
+                &mut file,
+                &codex_parent_proof_scope(),
+                sampled_scan::now_seconds(),
+                false,
+            )
+            .err()
+            .map(ProofRefusal::Seal),
+    }
+}
+
 /// U1a-2a (row 33, D6(c)): slots of a proof job's signature window.
 const CODEX_PROOF_RING_ENTRIES: usize = 64;
 /// `codex_ownership_signature` is SHA-256 hex, so every ring string has this
@@ -19471,19 +19495,40 @@ fn invalidate_stale_codex_parent_resolution(
     identities: &mut CodexParentIdentities,
     census: CodexParentCensus<'_>,
 ) -> bool {
-    let Some(used_identity) = parsed.codex_parent_ledger_identity_used.as_deref() else {
-        return false;
+    // U1a-2a (fix round 4, AutoReview #1): a consumed proof is bound to P
+    // here too, by its install's own checks on a fresh locate (P's unique
+    // cap-free locate, then the proof seal's `admits`; P may be over main's
+    // cap, so main's reprobe cannot stand for it), when the parse decided as
+    // the proof says (the only case the record site admits). P changed
+    // since the install: the proof is refused as the install would refuse it
+    // (`Identity` or `Seal`, so the record site never settles `Admitted`)
+    // and the parse is invalidated as below. A proof arm leaves no ledger
+    // identity, so a passing proof falls through to `false`.
+    let proof_refusal = match (
+        parsed.codex_parent_proof_used.as_ref(),
+        parsed.codex_parent_prefix_decided.as_ref(),
+        parsed.codex_parent_proof_refusal.as_ref(),
+    ) {
+        (Some(proof), Some(_), None) => codex_parent_proof_refusal_now(census, proof),
+        _ => None,
     };
-    // L-5: always a fresh open. This fence exists because the parent can
-    // change after the page-start pre-validation.
-    let parent_is_still_current = parsed
-        .codex_parent_session_ref
-        .as_deref()
-        .and_then(|parent_id| identities.reprobe(census, parent_id).ok())
-        .as_deref()
-        == Some(used_identity);
-    if parent_is_still_current {
-        return false;
+    if let Some(refusal) = proof_refusal {
+        parsed.codex_parent_proof_refusal = Some(refusal);
+    } else {
+        let Some(used_identity) = parsed.codex_parent_ledger_identity_used.as_deref() else {
+            return false;
+        };
+        // L-5: always a fresh open. This fence exists because the parent can
+        // change after the page-start pre-validation.
+        let parent_is_still_current = parsed
+            .codex_parent_session_ref
+            .as_deref()
+            .and_then(|parent_id| identities.reprobe(census, parent_id).ok())
+            .as_deref()
+            == Some(used_identity);
+        if parent_is_still_current {
+            return false;
+        }
     }
     // The parent changed after the scan-time prevalidation but before/during
     // this child parse. Refuse both the child usage and its transitive ledger
