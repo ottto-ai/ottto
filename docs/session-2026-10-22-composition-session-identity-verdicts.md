@@ -30,8 +30,9 @@ At six hours or older, a missing verdict is `NotMeasured`; the wait is bounded
 by birth time and cannot renew indefinitely. Unknown or future birth times do
 not authorize this wait. Explicit measured and unmeasured verdicts do not wait.
 Late days are resent by changed-days uploads when that path is enabled.
-Cached folder mappings survive while openings wait, including worktrees removed
-before their first read. Identity probes obey the run deadline; an interrupted
+Before deferring, a bounded folder probe caches a previously unseen workspace
+while it still exists. Cached folder mappings survive while openings wait,
+including worktrees removed before their first read. Identity probes obey the run deadline; an interrupted
 probe preserves new-byte eligibility without claiming a missing verdict.
 
 Verdict transitions do not reconcile previously classified contributions.

@@ -1214,6 +1214,27 @@ fn run_source_inner(
                         pending_openings = true;
                         if pending == Some(true) {
                             stats.verdict_deferred += 1;
+                            // A previously unseen workspace can disappear
+                            // before tomorrow. Cache its scope while it still
+                            // exists, without creating a file pin/checkpoint.
+                            match head_cwds(&file.path, run.deadline) {
+                                Ok((cwds, bytes)) => {
+                                    stats.bytes_head += bytes;
+                                    if matches!(
+                                        find_scope(run.resolver, &mut index, &cwds, today),
+                                        Scoping::Failed
+                                    ) {
+                                        stats.scan_errors += 1;
+                                    }
+                                }
+                                Err(error) => {
+                                    if error.kind() == std::io::ErrorKind::TimedOut {
+                                        stats.cut = true;
+                                    } else {
+                                        stats.scan_errors += 1;
+                                    }
+                                }
+                            }
                         }
                         continue;
                     }
