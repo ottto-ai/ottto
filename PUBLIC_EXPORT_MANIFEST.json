@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 776,
-  "content_sha256": "985ee85688d24040699628342cc2727039e5132541f02266589e1dfa471b102f",
+  "content_sha256": "e12c79c9cf9aedba5b64b932b02f8a3233fc9bfb044d0d27b7a9a5f92b1098fd",
   "files": [
     {
       "executable": false,
@@ -804,8 +804,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel/telemetry_tail.rs",
-      "sha256": "d53c14a7288a68597cd7318161ecbfe89aadfa255441f5eb4271d3a6a8f56d63",
-      "size_bytes": 46175
+      "sha256": "ef18d484cdbddd9fa9303a50684099335055b71440518b32697fff3dcf1dd979",
+      "size_bytes": 46596
     },
     {
       "executable": false,
@@ -1350,8 +1350,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/claude_request_money_pipeline_tests.rs",
-      "sha256": "5f1c5056bed868b608a0f47d1c68cdd894a5fc25d34cbcfc4ec7ed7086ed6e08",
-      "size_bytes": 35349
+      "sha256": "0aa7cf2f45e8dd4492abb97433d021680cac3c5800193f5f11ab6b6804016862",
+      "size_bytes": 35454
     },
     {
       "executable": false,
@@ -1595,8 +1595,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money.rs",
-      "sha256": "578a26c820d7f127398475c2d0a5bdcf11ca7eecd8e833263b31a434a1439f4c",
-      "size_bytes": 73644
+      "sha256": "e178c090d639ac9f147342351edd83fc1d1605b81d60eed1695ac9fd6fdc627a",
+      "size_bytes": 73760
     },
     {
       "executable": false,
@@ -1630,15 +1630,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/store.rs",
-      "sha256": "f842e3c516574ac220fb7cefc44c9bb85984c1a1f059f84624f83a27e87818f1",
-      "size_bytes": 23933
+      "sha256": "f72e1ff76396c461c0cf2e621b3ef40ca75ccaf0f1562738eedd679050353e61",
+      "size_bytes": 23960
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money_tests.rs",
-      "sha256": "3f43cb8ed29046d0cd86f6d15e0134ff7c2c439ba0861a1e324b0aa5c0505c9e",
-      "size_bytes": 85228
+      "sha256": "f9707d4a1bbcfea7a259c8863ee8ddad142318cdc718acf24a1f97208dfd556b",
+      "size_bytes": 87771
     },
     {
       "executable": false,

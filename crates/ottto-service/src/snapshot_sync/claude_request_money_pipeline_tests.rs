@@ -462,6 +462,8 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
         armed.census_complete,
         response + 3600,
     );
+    // The page's batch is released by its writer.
+    money::store::flush();
     // Every page item's capture was taken (freed); drop any parse of this
     // scope no item carried, then the capture budget is back to baseline.
     money::capture::purge_scope_for_test(&fixture.support);
@@ -614,6 +616,7 @@ fn money_shadow_holds_immature_units_until_they_mature() {
     assert_eq!(mature.units_undecided, 0, "{mature:?}");
     assert_eq!(mature.tokens_new, mature.tokens_old, "{mature:?}");
     assert_eq!(mature.families_equal, mature.families, "{mature:?}");
+    money::store::flush();
     assert_eq!(money::reserved_for_test(), 0);
 }
 
