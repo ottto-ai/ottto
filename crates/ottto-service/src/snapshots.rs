@@ -11439,6 +11439,14 @@ impl ClaudeTitleMetadata {
                             || previous.spawned_from_desktop_session_id
                                 != entry.spawned_from_desktop_session_id
                             || previous.spawned_from_unresolved != entry.spawned_from_unresolved
+                            || previous
+                                .original_identity
+                                .as_ref()
+                                .and_then(|identity| identity.source_created_at.as_ref())
+                                != entry
+                                    .original_identity
+                                    .as_ref()
+                                    .and_then(|identity| identity.source_created_at.as_ref())
                     });
                     index
                         .claude_desktop_title_files
@@ -11555,8 +11563,18 @@ impl ClaudeTitleMetadata {
             }
         }
         if index.claude_desktop_lineage_census_complete {
-            metadata.spawn_lineage =
-                claude_desktop_spawn_lineage(index.claude_desktop_title_files.values());
+            metadata.spawn_lineage = claude_desktop_spawn_lineage(
+                index.claude_desktop_title_files.values(),
+                |cli_session_id| {
+                    let file_name = format!("{cli_session_id}.jsonl");
+                    claude_transcript_live_window(index.files.keys().map(Path::new).filter(
+                        |path| {
+                            path.file_name().and_then(|name| name.to_str())
+                                == Some(file_name.as_str())
+                        },
+                    ))
+                },
+            );
         }
         let sidecar_parts = metadata
             .titles
@@ -11568,22 +11586,44 @@ impl ClaudeTitleMetadata {
     }
 }
 
+/// When the earliest and latest event of one transcript were written, as far
+/// as a bounded read of its head and tail shows. Both ends lean wide: copied
+/// history pulls the start earlier and a later record only moves the end out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeTranscriptLiveWindow {
+    first_unix_nanos: i128,
+    last_unix_nanos: i128,
+}
+
+/// A transcript counts as live this long before its first and after its last
+/// event, so a boundary case refuses instead of picking.
+const CLAUDE_DESKTOP_SPAWN_LIVE_MARGIN_NANOS: i128 = 60 * 1_000_000_000;
+const CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES: u64 = 256 * 1024;
+const CLAUDE_TRANSCRIPT_WINDOW_CACHE_ENTRIES: usize = 256;
+
 /// Resolve each desktop `spawnedFrom` link to the parent's transcript id.
 ///
 /// The edge is kept only when every store file for the child agrees on one
-/// parent desktop id, that desktop id belongs to exactly one other transcript,
+/// parent desktop id, that desktop id leads to exactly one other transcript,
 /// both transcript ids are canonical UUIDs (the only form a fact may carry, so
 /// a path or malformed `cliSessionId` never leaves the device), and the child
 /// is not on a cycle. The chain above the parent is walked only to refuse
 /// cycles; no root or depth is derived from it.
+///
+/// A desktop session that switched transcripts keeps one `cliSessionId` per
+/// store copy. Only then is `transcript_window` consulted: the parent is the
+/// one candidate whose live window holds the child's single store `createdAt`.
+/// A missing time or window, or more than one live candidate, refuses.
 fn claude_desktop_spawn_lineage<'a>(
     entries: impl Iterator<Item = &'a ClaudeDesktopTitleIndexEntry>,
+    mut transcript_window: impl FnMut(&str) -> Option<ClaudeTranscriptLiveWindow>,
 ) -> BTreeMap<String, ClaudeDesktopSpawnLineage> {
     let exportable = |session: &str| {
         crate::claude_local_otel::canonical_uuid(session).as_deref() == Some(session)
     };
     let mut cli_by_desktop: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut parent_desktop_by_cli: BTreeMap<&str, BTreeSet<Option<&str>>> = BTreeMap::new();
+    let mut created_at_by_cli: BTreeMap<&str, BTreeSet<Option<&str>>> = BTreeMap::new();
     let mut unresolved_parent: BTreeSet<&str> = BTreeSet::new();
     for entry in entries {
         if let Some(desktop_id) = entry.desktop_session_id.as_deref() {
@@ -11596,13 +11636,24 @@ fn claude_desktop_spawn_lineage<'a>(
             .entry(entry.cli_session_id.as_str())
             .or_default()
             .insert(entry.spawned_from_desktop_session_id.as_deref());
+        created_at_by_cli
+            .entry(entry.cli_session_id.as_str())
+            .or_default()
+            .insert(
+                entry
+                    .original_identity
+                    .as_ref()
+                    .and_then(|identity| identity.source_created_at.as_deref()),
+            );
         if entry.spawned_from_unresolved {
             unresolved_parent.insert(entry.cli_session_id.as_str());
         }
     }
+    let mut windows: BTreeMap<&str, Option<ClaudeTranscriptLiveWindow>> = BTreeMap::new();
     // The one transcript that started `session`, or None when nobody did or
-    // the store is missing, conflicting, self-referential or not exportable.
-    let resolve = |session: &str| -> Option<&str> {
+    // the store is missing, conflicting, self-referential, undatable or not
+    // exportable.
+    let mut resolve = |session: &str| -> Option<&str> {
         if unresolved_parent.contains(session) {
             return None;
         }
@@ -11611,10 +11662,40 @@ fn claude_desktop_spawn_lineage<'a>(
             return None;
         };
         let clis = cli_by_desktop.get(parent_desktop_id)?;
-        match clis.iter().copied().collect::<Vec<_>>()[..] {
-            [parent] if parent != session && exportable(parent) => Some(parent),
-            _ => None,
+        if clis.contains(session) {
+            return None;
         }
+        let parent = match clis.iter().copied().collect::<Vec<_>>()[..] {
+            [parent] => parent,
+            _ => {
+                let [Some(created_at)] = created_at_by_cli
+                    .get(session)?
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()[..]
+                else {
+                    return None;
+                };
+                let created_at = rfc3339_unix_nanos(created_at)?;
+                let mut live = None;
+                for &candidate in clis {
+                    let window = *windows
+                        .entry(candidate)
+                        .or_insert_with(|| transcript_window(candidate));
+                    let window = window?;
+                    if window.first_unix_nanos - CLAUDE_DESKTOP_SPAWN_LIVE_MARGIN_NANOS
+                        <= created_at
+                        && created_at
+                            <= window.last_unix_nanos + CLAUDE_DESKTOP_SPAWN_LIVE_MARGIN_NANOS
+                        && live.replace(candidate).is_some()
+                    {
+                        return None;
+                    }
+                }
+                live?
+            }
+        };
+        exportable(parent).then_some(parent)
     };
     let mut lineage = BTreeMap::new();
     'children: for &child in parent_desktop_by_cli.keys() {
@@ -11645,6 +11726,153 @@ fn claude_desktop_spawn_lineage<'a>(
         );
     }
     lineage
+}
+
+/// The live window across every indexed transcript file of one session, or
+/// None when there is none or any of them cannot be dated.
+fn claude_transcript_live_window<'p>(
+    paths: impl Iterator<Item = &'p Path>,
+) -> Option<ClaudeTranscriptLiveWindow> {
+    let mut union: Option<ClaudeTranscriptLiveWindow> = None;
+    for path in paths {
+        let window = claude_transcript_file_live_window(path)?;
+        union = Some(match union {
+            None => window,
+            Some(union) => ClaudeTranscriptLiveWindow {
+                first_unix_nanos: union.first_unix_nanos.min(window.first_unix_nanos),
+                last_unix_nanos: union.last_unix_nanos.max(window.last_unix_nanos),
+            },
+        });
+    }
+    union
+}
+
+/// Cached per path on size, mtime and birth time, so an idle transcript costs
+/// one stat per scan and only a written one is read again.
+fn claude_transcript_file_live_window(path: &Path) -> Option<ClaudeTranscriptLiveWindow> {
+    type StatKey = (u64, Option<SystemTime>, Option<SystemTime>);
+    type Cached = (StatKey, Option<ClaudeTranscriptLiveWindow>);
+    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, Cached>>> = OnceLock::new();
+    let stat_key = |metadata: &fs::Metadata| -> StatKey {
+        (
+            metadata.len(),
+            metadata.modified().ok(),
+            metadata.created().ok(),
+        )
+    };
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let cache = CACHE.get_or_init(Mutex::default);
+    let key = stat_key(&metadata);
+    if let Some((cached_key, window)) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+    {
+        if *cached_key == key {
+            return *window;
+        }
+    }
+    let (key, window) = match read_claude_transcript_live_window(path) {
+        Ok((metadata, window)) => (stat_key(&metadata), window),
+        Err(_) => (key, None),
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= CLAUDE_TRANSCRIPT_WINDOW_CACHE_ENTRIES && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), (key, window));
+    window
+}
+
+/// Reads at most the first and last `CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES` and
+/// takes the top-level `timestamp` of each whole line there; each read must
+/// yield one. The start is also capped by the file's birth time where the
+/// platform has one.
+fn read_claude_transcript_live_window(
+    path: &Path,
+) -> Result<(fs::Metadata, Option<ClaudeTranscriptLiveWindow>)> {
+    #[derive(Deserialize)]
+    struct Stamp {
+        timestamp: Option<String>,
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut file = options.open(path).context("open Claude transcript")?;
+    let metadata = file.metadata().context("stat Claude transcript")?;
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!("Claude transcript was not a file"));
+    }
+    let len = metadata.len();
+    let bound = CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES;
+    // (bytes, starts at a line start, ends at a line end)
+    let mut regions = Vec::new();
+    let mut head = Vec::new();
+    (&mut file)
+        .take(bound.min(len))
+        .read_to_end(&mut head)
+        .context("read Claude transcript head")?;
+    let head_is_whole = len <= bound.saturating_mul(2);
+    if head_is_whole {
+        file.take(len.saturating_sub(head.len() as u64))
+            .read_to_end(&mut head)
+            .context("read Claude transcript")?;
+        regions.push((head, true, true));
+    } else {
+        regions.push((head, true, false));
+        let mut tail = Vec::new();
+        file.seek(SeekFrom::Start(len - bound))
+            .context("seek Claude transcript tail")?;
+        file.take(bound)
+            .read_to_end(&mut tail)
+            .context("read Claude transcript tail")?;
+        regions.push((tail, false, true));
+    }
+    let mut first: Option<i128> = None;
+    let mut last: Option<i128> = None;
+    for (bytes, starts_whole, ends_whole) in &regions {
+        let mut lines = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+        if !ends_whole {
+            lines.pop();
+        }
+        let skip = usize::from(!starts_whole);
+        let mut region_dated = false;
+        for line in lines.into_iter().skip(skip) {
+            let Some(stamp) = serde_json::from_slice::<Stamp>(line)
+                .ok()
+                .and_then(|stamp| stamp.timestamp)
+                .and_then(|stamp| rfc3339_unix_nanos(&stamp))
+            else {
+                continue;
+            };
+            region_dated = true;
+            first = Some(first.map_or(stamp, |first| first.min(stamp)));
+            last = Some(last.map_or(stamp, |last| last.max(stamp)));
+        }
+        // A head or tail filled by one oversized record cannot place that
+        // end; the other region's stamps would understate the window.
+        if !region_dated {
+            return Ok((metadata, None));
+        }
+    }
+    let born = metadata
+        .created()
+        .ok()
+        .and_then(|born| born.duration_since(UNIX_EPOCH).ok())
+        .map(|born| born.as_nanos() as i128);
+    let window = first
+        .zip(last)
+        .map(|(first, last)| ClaudeTranscriptLiveWindow {
+            first_unix_nanos: born.map_or(first, |born| born.min(first)),
+            last_unix_nanos: last,
+        });
+    Ok((metadata, window))
 }
 
 #[derive(Debug, Default)]
@@ -56738,7 +56966,7 @@ mod tests {
             // The parent's store file is gone: nothing to resolve the link to.
             desktop_spawn_entry("orphan", "local_orphan", Some("local_missing")),
         ];
-        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
 
         assert_eq!(spawn_parent(&lineage, "mid"), Some(spawn_cli("root")));
         // Each child names only its direct starting session, never the top.
@@ -56765,7 +56993,7 @@ mod tests {
             desktop_spawn_entry("cycle-2", "local_c2", Some("local_c1")),
             desktop_spawn_entry("self", "local_self", Some("local_self")),
         ];
-        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
         assert!(lineage.is_empty(), "{lineage:?}");
     }
 
@@ -56787,7 +57015,7 @@ mod tests {
             desktop_spawn_entry("x2", "local_x2", Some("local_x1")),
             desktop_spawn_entry("c-cycle", "local_c_cycle", Some("local_x1")),
         ];
-        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
         for (child, parent) in [
             ("c-missing", "p-missing"),
             ("c-self", "p-self"),
@@ -56813,7 +57041,7 @@ mod tests {
             malformed,
             desktop_spawn_entry("c-bad", "local_c_bad", Some("local_p_bad")),
         ];
-        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
         assert_eq!(spawn_parent(&lineage, "c-bad"), Some(spawn_cli("p-bad")));
         assert_eq!(spawn_parent(&lineage, "p-bad"), None);
     }
@@ -56831,7 +57059,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
         assert!(lineage.is_empty(), "{lineage:?}");
 
         // A long acyclic chain keeps every direct edge.
@@ -56845,7 +57073,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let lineage = claude_desktop_spawn_lineage(chain.iter());
+        let lineage = claude_desktop_spawn_lineage(chain.iter(), |_| None);
         assert_eq!(lineage.len(), length - 1);
         assert_eq!(spawn_parent(&lineage, "b10"), Some(spawn_cli("b9")));
     }
@@ -56873,7 +57101,7 @@ mod tests {
             "local_escape",
             Some("local_valid"),
         ));
-        let lineage = claude_desktop_spawn_lineage(entries.iter());
+        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
         assert!(lineage.is_empty(), "{lineage:?}");
 
         // The same shapes with a canonical parent id keep the edge.
@@ -56883,6 +57111,7 @@ mod tests {
                 desktop_spawn_entry_raw(&child, "local_child", Some("local_valid")),
             ]
             .iter(),
+            |_| None,
         );
         assert_eq!(
             lineage
@@ -56923,6 +57152,333 @@ mod tests {
                 .map(|lineage| lineage.parent_session_id.as_str()),
             Some(parent.as_str())
         );
+    }
+
+    fn desktop_spawn_entry_created(
+        label: &str,
+        desktop: &str,
+        spawned_from: Option<&str>,
+        created_at: Option<&str>,
+    ) -> ClaudeDesktopTitleIndexEntry {
+        let mut entry = desktop_spawn_entry(label, desktop, spawned_from);
+        entry.original_identity = Some(ClaudeDesktopIdentityEvidence {
+            account_identifier_hash: None,
+            provider_workspace_hash: None,
+            source_created_at: created_at.map(str::to_string),
+            imported: false,
+        });
+        entry
+    }
+
+    fn live_window(first: &str, last: &str) -> ClaudeTranscriptLiveWindow {
+        ClaudeTranscriptLiveWindow {
+            first_unix_nanos: rfc3339_unix_nanos(first).expect("first"),
+            last_unix_nanos: rfc3339_unix_nanos(last).expect("last"),
+        }
+    }
+
+    /// Resolve with fixed windows per label, recording which transcripts
+    /// were asked for.
+    fn spawn_lineage_with_windows(
+        entries: &[ClaudeDesktopTitleIndexEntry],
+        windows: &[(&str, ClaudeTranscriptLiveWindow)],
+    ) -> (
+        BTreeMap<String, ClaudeDesktopSpawnLineage>,
+        BTreeSet<String>,
+    ) {
+        let windows = windows
+            .iter()
+            .map(|(label, window)| (spawn_cli(label), *window))
+            .collect::<BTreeMap<_, _>>();
+        let mut asked = BTreeSet::new();
+        let lineage = claude_desktop_spawn_lineage(entries.iter(), |cli| {
+            asked.insert(cli.to_string());
+            windows.get(cli).copied()
+        });
+        (lineage, asked)
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_picks_the_transcript_live_when_the_child_was_created() {
+        // One desktop session switched transcripts: old ran 09-09..09-26, new
+        // 09-27..09-28. Each store copy names a different `cliSessionId`.
+        let entries = [
+            desktop_spawn_entry_created("old", "local_owner", None, Some("2026-09-09T18:31:51Z")),
+            desktop_spawn_entry_created("new", "local_owner", None, Some("2026-09-09T18:31:51Z")),
+            // Created while the old transcript was live, before the switch.
+            desktop_spawn_entry_created(
+                "before-switch",
+                "local_before_1",
+                Some("local_owner"),
+                Some("2026-09-18T11:29:54.915Z"),
+            ),
+            desktop_spawn_entry_created(
+                "before-switch",
+                "local_before_2",
+                Some("local_owner"),
+                Some("2026-09-18T11:29:54.915Z"),
+            ),
+            // Created after the switch.
+            desktop_spawn_entry_created(
+                "after-switch",
+                "local_after",
+                Some("local_owner"),
+                Some("2026-09-28T10:00:00Z"),
+            ),
+            // Created in the gap between the two: neither was live.
+            desktop_spawn_entry_created(
+                "in-gap",
+                "local_gap",
+                Some("local_owner"),
+                Some("2026-09-27T02:00:00Z"),
+            ),
+            // An ordinary single-transcript parent never needs a window.
+            desktop_spawn_entry_created("solo", "local_solo", None, None),
+            desktop_spawn_entry_created("solo-child", "local_solo_child", Some("local_solo"), None),
+        ];
+        let (lineage, asked) = spawn_lineage_with_windows(
+            &entries,
+            &[
+                (
+                    "old",
+                    live_window("2026-09-09T18:31:55.158Z", "2026-09-26T14:31:52.136Z"),
+                ),
+                (
+                    "new",
+                    live_window("2026-09-27T18:26:48.551Z", "2026-09-28T15:10:20.064Z"),
+                ),
+            ],
+        );
+        assert_eq!(
+            spawn_parent(&lineage, "before-switch"),
+            Some(spawn_cli("old"))
+        );
+        assert_eq!(
+            spawn_parent(&lineage, "after-switch"),
+            Some(spawn_cli("new"))
+        );
+        assert_eq!(spawn_parent(&lineage, "in-gap"), None);
+        assert_eq!(
+            spawn_parent(&lineage, "solo-child"),
+            Some(spawn_cli("solo"))
+        );
+        assert_eq!(lineage.len(), 3, "{lineage:?}");
+        assert_eq!(asked, BTreeSet::from([spawn_cli("old"), spawn_cli("new")]));
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_refuses_overlapping_copied_history() {
+        // The later transcript copied the earlier one's history, so both start
+        // with the same stamps; only the earlier one's last event separates them.
+        let windows = [
+            (
+                "earlier",
+                live_window("2026-10-09T14:33:34.213Z", "2026-10-09T20:26:26.825Z"),
+            ),
+            (
+                "forked",
+                live_window("2026-10-09T14:33:34.213Z", "2026-10-20T20:09:43.795Z"),
+            ),
+        ];
+        let entries = [
+            desktop_spawn_entry_created(
+                "earlier",
+                "local_fork",
+                None,
+                Some("2026-10-09T14:33:31Z"),
+            ),
+            desktop_spawn_entry_created("forked", "local_fork", None, Some("2026-10-09T14:33:31Z")),
+            // After the earlier transcript's last event: only the fork was live.
+            desktop_spawn_entry_created(
+                "after-last",
+                "local_after_last",
+                Some("local_fork"),
+                Some("2026-10-11T12:37:29.831Z"),
+            ),
+            // Inside the copied span: both windows hold it.
+            desktop_spawn_entry_created(
+                "inside-copy",
+                "local_inside_copy",
+                Some("local_fork"),
+                Some("2026-10-09T18:00:00Z"),
+            ),
+            // Within the margin of the earlier transcript's last event.
+            desktop_spawn_entry_created(
+                "at-boundary",
+                "local_at_boundary",
+                Some("local_fork"),
+                Some("2026-10-09T20:27:00Z"),
+            ),
+        ];
+        let (lineage, _) = spawn_lineage_with_windows(&entries, &windows);
+        assert_eq!(
+            spawn_parent(&lineage, "after-last"),
+            Some(spawn_cli("forked"))
+        );
+        assert_eq!(spawn_parent(&lineage, "inside-copy"), None);
+        assert_eq!(spawn_parent(&lineage, "at-boundary"), None);
+        assert_eq!(lineage.len(), 1, "{lineage:?}");
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_refuses_a_switched_parent_without_evidence() {
+        let windows = [
+            (
+                "old",
+                live_window("2026-09-09T18:31:55Z", "2026-09-26T14:31:52Z"),
+            ),
+            (
+                "new",
+                live_window("2026-09-27T18:26:48Z", "2026-09-28T15:10:20Z"),
+            ),
+        ];
+        let owner = [
+            desktop_spawn_entry_created("old", "local_owner", None, None),
+            desktop_spawn_entry_created("new", "local_owner", None, None),
+        ];
+        let child = |created: &[Option<&str>]| {
+            created
+                .iter()
+                .enumerate()
+                .map(|(copy, created_at)| {
+                    desktop_spawn_entry_created(
+                        "child",
+                        &format!("local_child_{copy}"),
+                        Some("local_owner"),
+                        *created_at,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for created in [
+            // No creation time at all.
+            vec![None],
+            // One store copy lacks it.
+            vec![Some("2026-09-18T11:29:54Z"), None],
+            // Copies disagree.
+            vec![Some("2026-09-18T11:29:54Z"), Some("2026-09-28T10:00:00Z")],
+            // Unparseable.
+            vec![Some("yesterday")],
+        ] {
+            let entries = owner
+                .iter()
+                .cloned()
+                .chain(child(&created[..]))
+                .collect::<Vec<_>>();
+            let (lineage, _) = spawn_lineage_with_windows(&entries, &windows);
+            assert!(lineage.is_empty(), "{created:?}: {lineage:?}");
+        }
+
+        // A dated child still refuses when one candidate transcript is
+        // missing, even though the other one is live.
+        let entries = owner
+            .iter()
+            .cloned()
+            .chain(child(&[Some("2026-09-18T11:29:54Z")][..]))
+            .collect::<Vec<_>>();
+        let (lineage, _) = spawn_lineage_with_windows(&entries, &windows[..1]);
+        assert!(lineage.is_empty(), "{lineage:?}");
+        let (lineage, _) = spawn_lineage_with_windows(&entries, &windows);
+        assert_eq!(spawn_parent(&lineage, "child"), Some(spawn_cli("old")));
+    }
+
+    #[test]
+    fn claude_desktop_spawn_lineage_dates_switched_transcripts_from_the_index() {
+        let root = temp_dir("claude-desktop-spawn-by-time");
+        let project = root.join("-Users-dev-repo");
+        fs::create_dir_all(&project).expect("project dir");
+        let line = |stamp: &str| {
+            format!("{{\"type\":\"user\",\"timestamp\":\"{stamp}\",\"message\":{{\"timestamp\":\"2001-01-01T00:00:00Z\"}}}}\n")
+        };
+        // The old transcript is larger than both bounded reads together, and
+        // its last line is still being written; nested stamps never count.
+        let mut old = String::from("{\"type\":\"custom-title\"}\n");
+        old.push_str(&line("2026-09-09T18:31:55Z"));
+        let filler = format!(
+            "{{\"type\":\"attachment\",\"timestamp\":\"2026-09-12T00:00:00Z\",\"pad\":\"{}\"}}\n",
+            "x".repeat(4096)
+        );
+        while (old.len() as u64) < CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES * 3 {
+            old.push_str(&filler);
+        }
+        old.push_str(&line("2026-09-26T14:31:52Z"));
+        old.push_str("{\"type\":\"custom-title\"}\n{\"type\":\"user\",\"timesta");
+        let new = format!(
+            "{}{}{}",
+            line("2026-09-27T19:19:35Z"),
+            line("2026-09-27T18:26:48Z"),
+            line("2026-09-28T15:10:20Z")
+        );
+        let mut index = ScanIndex::default();
+        for (label, body) in [("old", old), ("new", new)] {
+            let path = project.join(format!("{}.jsonl", spawn_cli(label)));
+            fs::write(&path, body).expect("write transcript");
+            index
+                .files
+                .insert(local_index_key(&path), manifest_index_entry(None));
+        }
+        for (key, entry) in [
+            (
+                "old",
+                desktop_spawn_entry_created("old", "local_owner", None, None),
+            ),
+            (
+                "new",
+                desktop_spawn_entry_created("new", "local_owner", None, None),
+            ),
+            (
+                "child",
+                desktop_spawn_entry_created(
+                    "child",
+                    "local_child",
+                    Some("local_owner"),
+                    Some("2026-09-18T11:29:54.915Z"),
+                ),
+            ),
+        ] {
+            index
+                .claude_desktop_title_files
+                .insert(key.to_string(), entry);
+        }
+        index.claude_desktop_lineage_census_complete = true;
+
+        let old_path = project.join(format!("{}.jsonl", spawn_cli("old")));
+        let window = claude_transcript_file_live_window(&old_path).expect("old window");
+        assert_eq!(
+            window.first_unix_nanos,
+            rfc3339_unix_nanos("2026-09-09T18:31:55Z").unwrap()
+        );
+        assert_eq!(
+            window.last_unix_nanos,
+            rfc3339_unix_nanos("2026-09-26T14:31:52Z").unwrap()
+        );
+        let metadata = ClaudeTitleMetadata::from_durable_index(&index, false);
+        assert_eq!(
+            metadata
+                .spawn_lineage(&spawn_cli("child"))
+                .map(|lineage| lineage.parent_session_id.clone()),
+            Some(spawn_cli("old"))
+        );
+
+        // A final record larger than the tail read leaves the end unknown.
+        let oversized_tail = project.join("oversized-tail.jsonl");
+        fs::write(
+            &oversized_tail,
+            format!(
+                "{}{}{{\"type\":\"user\",\"timestamp\":\"2026-09-30T00:00:00Z\",\"pad\":\"{}\"}}\n",
+                line("2026-09-09T18:31:55Z"),
+                filler.repeat(64),
+                "x".repeat(CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES as usize * 2)
+            ),
+        )
+        .expect("write oversized tail");
+        assert_eq!(claude_transcript_file_live_window(&oversized_tail), None);
+
+        // Without the old transcript on disk the child is undatable.
+        fs::remove_file(&old_path).expect("remove old transcript");
+        let metadata = ClaudeTitleMetadata::from_durable_index(&index, false);
+        assert!(metadata.spawn_lineage(&spawn_cli("child")).is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn claude_desktop_spawn_test_transcript(session_id: &str) -> String {
