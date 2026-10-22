@@ -1376,3 +1376,128 @@ fn p2a_accepted_a_restored_older_b_message_only_real_reoffers_settle_loser() {
         );
     }
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_protected_terminal_quiet_root_keeps_real_literal_sibling_and_loss_receipt() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("protected sibling: UNEXECUTED unsupported layout");
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::new(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    const PROTECTED: &str = "2448a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    std::fs::write(
+        control
+            .support
+            .join("snapshots/claude_code-reemission-exclusions.txt"),
+        format!("{:x}\n", Sha256::digest(PROTECTED.as_bytes())),
+    )
+    .unwrap();
+    let mut saved = control.saved();
+    saved.insert_unproven_terminal_claude_authority_for_test(PROTECTED, &"a".repeat(64));
+    saved.save(&control.index_path).unwrap();
+    control.cycle();
+    let offers = control.offers();
+    assert!(
+        offers
+            .iter()
+            .all(|item| item["source_session_id"] != PROTECTED),
+        "protected root has no physical candidate on this page"
+    );
+    let literal = offers
+        .iter()
+        .find(|item| item["source_session_id"] == IDENTITY_PIPELINE_ROOT)
+        .expect("healthy unprotected sibling reaches real POST");
+    assert_eq!(
+        literal["usage_accounting_contract"],
+        money::REQUEST_OWNED_CONTRACT
+    );
+    let saved = control.saved();
+    assert!(saved.claude_authority_record_for_test(PROTECTED).is_some());
+    let statuses = control.server.terminal.lock().unwrap();
+    let status = statuses.last().unwrap();
+    assert_eq!(status["last_census_complete"], true);
+    assert_eq!(status["last_ownership_incomplete_file_count"], 1);
+    assert_eq!(status["last_terminal_ownership_incomplete_file_count"], 1);
+    assert_eq!(status["last_snapshot_unproven_terminal_count"], 1);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_existing_protected_v1_upload_hold_is_retained_after_restart() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("protected v1 upload hold: UNEXECUTED unsupported layout");
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut control = P2aControl::new(FinishOutcome::Accept);
+    write_native_bootstrap_sidecars(&control.fixture, &control.support);
+    control.cycle();
+    let first = control.offers();
+    assert_eq!(
+        first.last().unwrap()["usage_accounting_contract"],
+        "session_exclusive_reported_usage:v1",
+        "seed an actual v1 predecessor"
+    );
+    let mut changed: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(control.transcript())
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    changed["requestId"] = "req_held_v1".into();
+    changed["message"]["id"] = "m-held-v1".into();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(control.transcript())
+        .unwrap()
+        .write_all((changed.to_string() + "\n").as_bytes())
+        .unwrap();
+    write_native_bootstrap_sidecars(&control.fixture, &control.support);
+    *control.server.outcome.lock().unwrap() = FinishOutcome::MoneyHeld;
+    control.cycle();
+    let before = control.saved();
+    let (fingerprint, held) = before
+        .quarantined_snapshot_fingerprints
+        .iter()
+        .find(|(_, record)| record.hold.is_some())
+        .expect("real server v1 hold persisted");
+    let offered = control.offers().len();
+    std::fs::write(
+        control
+            .support
+            .join("snapshots/claude_code-reemission-exclusions.txt"),
+        format!("{:x}\n", Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())),
+    )
+    .unwrap();
+    let _live = money::LiveForTest::new(&control.support);
+    control.restart();
+    control.cycle();
+    let after = control.saved();
+    assert_eq!(
+        after.quarantined_snapshot_fingerprints.get(fingerprint),
+        Some(held),
+        "protected existing v1 hold stays byte-for-byte retained"
+    );
+    assert_eq!(
+        control.offers().len(),
+        offered,
+        "protection cannot turn retained v1 hold into a new literal or v1 offer"
+    );
+    assert!(after
+        .files
+        .values()
+        .all(|entry| entry.effective_upload_body_witness_revision != 3));
+}
