@@ -56,7 +56,6 @@ impl Site {
 
 /// What a vanished Claude census member's retirement dropped with its index
 /// entry. Content-free and process-only, like the site split.
-#[allow(dead_code)] // tests-first: wired by the fix commit
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Vanished {
     /// Its unverified audit debt (SOURCE N2).
@@ -191,7 +190,6 @@ pub(super) fn not_found_removal(source: SnapshotSource, site: Site) {
 }
 
 /// The page merge dropped `vanished` with a vanished Claude member's entry.
-#[allow(dead_code)] // tests-first: wired by the fix commit
 pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
     TOTALS[source_index(source)].record_vanished(vanished);
     #[cfg(test)]
@@ -756,6 +754,15 @@ mod tests {
         let fixture = ForcedFamilyFixture::new("absence-forced-family");
         let member_key = local_index_key(&fixture.member_path);
         let mut index = fixture.index();
+        // N3: the member's own snapshot fingerprints and account hold are not
+        // released with its marker; their own rules settle them.
+        let held = std::collections::BTreeSet::from(["held-member-body".to_string()]);
+        index
+            .file_snapshot_fingerprints
+            .insert(member_key.clone(), held.clone());
+        index
+            .claude_account_deferred_holds
+            .insert(member_key.clone(), "held-member-revision".to_string());
         for at in [NOW, RETRY] {
             let (((pages, events), sites), vanished) = observe_vanished(|| {
                 observe_sites(|| {
@@ -788,6 +795,17 @@ mod tests {
                 .files
                 .values()
                 .any(|entry| entry.has_unverified_source()));
+            assert_eq!(
+                index.file_snapshot_fingerprints.get(&member_key),
+                Some(&held)
+            );
+            assert_eq!(
+                index
+                    .claude_account_deferred_holds
+                    .get(&member_key)
+                    .map(String::as_str),
+                Some("held-member-revision")
+            );
         }
     }
 
@@ -1295,6 +1313,28 @@ mod tests {
             source.matches("claude_absence_is_removal(source, ").count(),
             2
         );
+        // Only those two parent-present branches mark a key vanished, and
+        // only the page merge drops its audit debt or counts its retirement.
+        assert_eq!(
+            source
+                .matches("census.claude_vanished_index_keys.insert(")
+                .count(),
+            2
+        );
+        assert_eq!(
+            source
+                .matches(".retire_vanished_claude_audit_debt_entry(")
+                .count(),
+            1
+        );
+        let vanished = calls("vanished");
+        assert_eq!(vanished.len(), 2);
+        for (call, kind) in vanished
+            .into_iter()
+            .zip(["AuditDebtDropped", "RequestCensusRemoved"])
+        {
+            assert!(call.contains(&format!("Vanished::{kind}")));
+        }
         assert_eq!(source.matches("Site::CandidateWalk,").count(), 1);
         assert_eq!(source.matches("Site::CandidateForcedIndex,").count(), 1);
         assert!(!source.contains("disappeared_file_count += 1;"));
