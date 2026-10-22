@@ -270,6 +270,117 @@ fn rewind_copy_counts_only_own_records() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// RFC 3339 at `offset_millis` from the file's own birth, so which side of
+/// the 60 s copy line a record falls on does not depend on test timing.
+fn from_birth(birth: i128, offset_millis: i64) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(birth + i128::from(offset_millis) * 1_000_000)
+        .expect("fixture timestamp")
+        .format(&Rfc3339)
+        .expect("format fixture timestamp")
+}
+
+fn uuid_boundary(timestamp: &str, uuid: &str, pre: u64, post: u64) -> String {
+    format!(
+        "{{\"timestamp\":\"{timestamp}\",\"uuid\":\"{uuid}\",\"parentUuid\":null,\"sessionId\":\"{ROOT}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"trigger\":\"auto\",\"preTokens\":{pre},\"postTokens\":{post}}}}}\n"
+    )
+}
+
+fn compaction_attachment(timestamp: &str, uuid: &str, parent: &str) -> String {
+    format!(
+        "{{\"timestamp\":\"{timestamp}\",\"uuid\":\"{uuid}\",\"parentUuid\":\"{parent}\",\"sessionId\":\"{ROOT}\",\"type\":\"attachment\"}}\n"
+    )
+}
+
+/// A legacy compaction summary; `parent: None` names no `parentUuid`.
+fn compaction_summary(timestamp: &str, uuid: &str, parent: Option<&str>) -> String {
+    let parent = parent.map_or("null".to_string(), |parent| format!("\"{parent}\""));
+    format!(
+        "{{\"timestamp\":\"{timestamp}\",\"uuid\":\"{uuid}\",\"parentUuid\":{parent},\"sessionId\":\"{ROOT}\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{{\"role\":\"user\",\"content\":\"summary\"}}}}\n"
+    )
+}
+
+/// Pair ambiguity on the #676-integrated head: the birth filter drops records
+/// one by one, then #676 pairs what is left (by `parentUuid` chain, else by a
+/// 2 s window for a summary naming no parent). No compaction counts twice, and
+/// a copied half never lends an owned half its metrics or its partner.
+#[test]
+fn compaction_pairs_across_the_copy_line_count_once() {
+    let dir = temp_dir("claude-file-birth-pair-ambiguity");
+    let path = dir.join(format!("{ROOT}.jsonl"));
+    fs::write(&path, "").expect("create transcript fixture");
+    let birth = fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.created().ok())
+        .and_then(system_time_unix_nanos_i128)
+        .expect("the test file system must report file birth");
+    let at = |offset_millis| from_birth(birth, offset_millis);
+    let lines = [
+        assistant(ROOT, "req_c1", &at(-2 * 24 * 60 * 60 * 1_000), 900_000),
+        // 1. A linked pair split by the copy line before the first own
+        //    request: copied boundary, summary 2 s later on the owned side.
+        uuid_boundary(&at(-61_000), "bnd-line", 900_010, 90_000),
+        compaction_attachment(&at(-60_900), "att-line", "bnd-line"),
+        compaction_summary(&at(-59_000), "sum-line", Some("att-line")),
+        assistant(ROOT, "req_a1", &at(-50_000), 100),
+        // 2. The same split after own requests: the copied boundary leaves,
+        //    the linked owned summary stays as one event without metrics.
+        uuid_boundary(&at(-61_500), "bnd-late", 990_000, 99_000),
+        compaction_attachment(&at(-61_400), "att-late", "bnd-late"),
+        compaction_summary(&at(-58_000), "sum-late", Some("att-late")),
+        assistant(ROOT, "req_a2", &at(-40_000), 300),
+        // 3. An owned boundary and an owned summary naming no parent, 1 s
+        //    apart: the time window pairs them.
+        uuid_boundary(&at(-30_000), "bnd-own", 310, 50),
+        compaction_summary(&at(-29_000), "sum-own", None),
+        // 4. An owned boundary 1.5 s after a copied summary naming no
+        //    parent: paired before the filter, the boundary alone after it.
+        uuid_boundary(&at(-59_000), "bnd-near", 410, 60),
+        compaction_summary(&at(-60_500), "sum-near", None),
+        assistant(ROOT, "req_a3", &at(-20_000), 200),
+    ];
+    // Truncating rewrite of the same file: the birth read above stays.
+    fs::write(&path, lines.concat()).expect("write transcript fixture");
+    let parsed = parse(&path, OffsetDateTime::now_utc());
+    assert!(parsed.claude_file_birth.is_root_with_birth_for_test());
+    // Today's parser: two linked pairs plus two time-window pairs.
+    assert_eq!(parsed.compaction_count, Some(4));
+
+    let mut items = vec![parsed.clone()];
+    let mut index = indexed(&[&path], true);
+    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let item = items.remove(0);
+    let mut control = vec![parsed.clone()];
+    let mut control_index = indexed(&[&path], true);
+    let _ = claude_context_file_birth::with_file_birth_rule_disabled_for_test(|| {
+        fold(&mut control, &no_reports(), &mut control_index, true)
+    });
+
+    assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
+    assert_eq!(posture(&item), (Some(100), Some(300), Some(200), Some(3)));
+    let mut timestamps = item.compaction_timestamps.clone();
+    timestamps.sort();
+    let mut expected = vec![at(-59_000), at(-58_000), at(-30_000)];
+    expected.sort();
+    assert_eq!(
+        timestamps, expected,
+        "bnd-near, sum-late and bnd-own; never a copied record or sum-own"
+    );
+    assert_eq!(item.compaction_total_pre_tokens, Some(310 + 410));
+    assert_eq!(item.compaction_total_post_tokens, Some(50 + 60));
+    let counts = &disposition.context_file_birth.total;
+    assert_eq!(
+        counts.tagged_record_count, 4,
+        "1 response + 2 boundaries + 1 summary"
+    );
+    assert_eq!(counts.partially_pre_birth_session_count, 1);
+    assert_cleared(&control[0]);
+    let differing = differing_keys(&item, &control[0]);
+    assert!(differing.is_subset(&allowed_difference()), "{differing:?}");
+    assert_eq!(item.request_count, parsed.request_count);
+    assert_eq!(item.input_tokens, parsed.input_tokens);
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn fresh_growing_file_has_numbers_on_its_first_upload() {
     let dir = temp_dir("claude-file-birth-growing");
