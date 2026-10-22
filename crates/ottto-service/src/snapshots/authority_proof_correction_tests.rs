@@ -2336,3 +2336,229 @@ mod previous_release_0_1_173 {
         serde_json::to_string(&decoded).unwrap()
     }
 }
+
+/// A proven family using real parsed synthetic requests and paired reports.
+fn binding_family() -> (
+    crate::test_scratch::ScratchDir,
+    String,
+    ScanIndex,
+    Vec<SnapshotItem>,
+    crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) {
+    let scratch = crate::test_scratch::ScratchDir::new("authority-binding");
+    let (dir, root, mut items) = claude_account_family_fixture();
+    let mut index = ScanIndex::default();
+    for (n, item) in items.iter_mut().enumerate() {
+        item.source_file_fingerprint = Some(apc_hex(if n == 0 { 'a' } else { 'b' }));
+        let key = if n == 0 {
+            dir.join(format!("{root}.jsonl"))
+        } else {
+            dir.join(&root)
+                .join("subagents/agent-a4d1585d310070d0f.jsonl")
+        };
+        index.files.insert(
+            local_index_key(&key),
+            apc_entry(
+                item.source_file_fingerprint.as_ref().unwrap(),
+                &apc_hex('c'),
+            ),
+        );
+    }
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+        evidence: BTreeMap::from([(
+            root.clone(),
+            (1..=5)
+                .map(|n| {
+                    complete_api_row(
+                        &root,
+                        &format!("req_{n}"),
+                        n,
+                        10,
+                        if n == 5 { 1 } else { 10 },
+                        0,
+                    )
+                })
+                .collect(),
+        )]),
+        ..Default::default()
+    };
+    let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+        evidence: BTreeMap::from([(
+            root.clone(),
+            (1..=5)
+                .map(|n| {
+                    complete_trace_row(
+                        &root,
+                        &format!("req_{n}"),
+                        if n == 5 { "a4d1585d310070d0f" } else { "" },
+                    )
+                })
+                .collect(),
+        )]),
+        ..Default::default()
+    };
+    apply_claude_reported_usage_with_index(&mut items, &api, &trace, &mut index, true, APC_WINDOW);
+    assert!(index.claude_usage_family_witnesses.contains_key(&root));
+    for entry in index.files.values_mut() {
+        entry.source_file_fingerprint = apc_hex('a');
+    }
+    fs::remove_dir_all(dir).unwrap();
+    (scratch, root, index, items, api, trace)
+}
+
+#[test]
+fn demotion_after_same_call_reproof_binds_current_witness() {
+    let (scratch, root, mut index, items, mut api, trace) = binding_family();
+    let old = claude_usage_family_witness_fingerprint(&index.claude_usage_family_witnesses[&root]);
+    api.evidence.get_mut(&root).unwrap()[0].fingerprint = format!("sha256:{}", apc_hex('9'));
+    // Controlled seam: native observations retain the complete real family;
+    // the page item has no matching rows, so its rebuild cannot become v1.
+    let counts = accumulate_claude_usage_family_pending_with_limit(
+        &items,
+        &mut index.claude_usage_family_pending,
+        APC_WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+    );
+    let observations = ClaudeNativeObservations {
+        counts,
+        census_window_end: APC_WINDOW.to_string(),
+        index_generation: index.generation,
+    };
+    let mut page = vec![items[1].clone()];
+    page[0].claude_usage_request_ids.clear();
+    page[0].claude_usage_occurrences.clear();
+    let disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
+        &mut page,
+        &api,
+        &trace,
+        &mut index,
+        true,
+        APC_WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        None,
+        &BTreeSet::new(),
+        Some(observations),
+        None,
+        &BTreeMap::new(),
+    );
+    assert!(disposition
+        .quarantined_source_session_ids
+        .contains(&page[0].source_session_id));
+    let current =
+        claude_usage_family_witness_fingerprint(&index.claude_usage_family_witnesses[&root]);
+    assert_ne!(old, current, "this call actually reproves the family");
+    assert_eq!(
+        index.claude_usage_authority_quarantine[&root].proven_witness_fingerprint, current,
+        "demotion binds the current proof"
+    );
+    apc_save_reload(&mut index, &scratch.join("index.json"));
+}
+
+#[test]
+fn witness_removed_while_member_demotes_does_not_quarantine_index() {
+    let (scratch, root, mut index, mut items, api, trace) = binding_family();
+    index.files.insert(
+        format!("/synthetic/twin/{root}.jsonl"),
+        apc_entry(&apc_hex('d'), &apc_hex('e')),
+    );
+    items[0].claude_usage_request_ids.clear();
+    items[0].claude_usage_occurrences.clear();
+    apply_claude_reported_usage_with_index_limits_and_current_files(
+        &mut items,
+        &api,
+        &trace,
+        &mut index,
+        true,
+        APC_WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        None,
+        &BTreeSet::new(),
+        None,
+        None,
+        &BTreeMap::new(),
+    );
+    assert!(
+        !index.claude_usage_family_witnesses.contains_key(&root),
+        "twin makes the family incomplete"
+    );
+    assert!(
+        !index.claude_usage_authority_quarantine.contains_key(&root),
+        "no witness means no new authority record"
+    );
+    let count = index.files.len();
+    let loaded = apc_save_reload(&mut index, &scratch.join("index.json"));
+    assert_eq!(loaded.files.len(), count);
+}
+
+#[test]
+fn load_drops_unbound_authority_record_and_keeps_index() {
+    let scratch = crate::test_scratch::ScratchDir::new("authority-load-containment");
+    let mut index = apc_terminal_fixture();
+    index.generation = 29;
+    let record = index
+        .claude_usage_authority_quarantine
+        .get_mut(APC_ROOT)
+        .unwrap();
+    record.disposition = ClaudeUsageAuthorityQuarantineDisposition::RetryPending;
+    record.failed_reconstruction_count = 1;
+    record.proven_witness_fingerprint = apc_hex('9');
+    let mut refusal = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+    refusal.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+    refusal.retry_after_unix_seconds = 0;
+    refusal.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+    index
+        .quarantined_snapshot_fingerprints
+        .insert(apc_hex('7'), refusal.clone());
+    refusal.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+    index
+        .quarantined_snapshot_fingerprints
+        .insert(apc_hex('8'), refusal);
+    let mut expected = serde_json::to_value(&index).unwrap();
+    expected["claude_usage_authority_quarantine"]
+        .as_object_mut()
+        .unwrap()
+        .remove(APC_ROOT);
+    expected["claude_usage_family_pending"]
+        .as_object_mut()
+        .unwrap()
+        .remove(APC_ROOT);
+    let (loaded, quarantined) =
+        apc_load_value(&scratch, "unbound", &serde_json::to_value(&index).unwrap());
+    assert!(
+        !quarantined,
+        "one unbound record cannot quarantine the whole index"
+    );
+    assert_eq!(loaded.generation, 29);
+    assert_eq!(loaded.snapshot_unproven_terminal_count(), 1);
+    assert_eq!(loaded.snapshot_superseded_terminal_count(), 1);
+    assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
+}
+
+#[test]
+fn empty_map_restore_never_removes_owed_member() {
+    let scratch = crate::test_scratch::ScratchDir::new("authority-empty-restore");
+    let mut index = apc_granted();
+    let member = apc_members()[1].clone();
+    let revision = apc_record(&index).member_source_file_fingerprints[&member].clone();
+    index.restore_claude_empty_map_advances(vec![ClaudeEmptyMapAdvance {
+        root: APC_ROOT.to_string(),
+        member: member.clone(),
+        key: apc_keys()[1].clone(),
+        revision: revision.clone(),
+        previous: None,
+    }]);
+    assert!(
+        claude_authority_record_contract_is_valid(apc_record(&index)),
+        "rollback keeps the owed member represented"
+    );
+    assert!(apc_owed(&index).unwrap().contains(&member));
+    assert_ne!(
+        apc_record(&index).member_source_file_fingerprints[&member],
+        revision,
+        "rolled-back empty facts cannot certify a revision"
+    );
+    apc_save_reload(&mut index, &scratch.join("index.json"));
+}
