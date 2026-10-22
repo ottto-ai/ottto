@@ -2523,23 +2523,45 @@ impl PermanentRefusalCounts {
             Self::default(),
             |mut counts, (fingerprint, refusal)| {
                 counts.total += 1;
-                let terminal_for_refused_body = progress
-                    .quarantined_fingerprints
-                    .get(fingerprint)
-                    .is_some_and(|record| {
-                        matches!(
-                            record.disposition,
-                            SnapshotQuarantineDisposition::UnprovenTerminal
-                                | SnapshotQuarantineDisposition::SupersededTerminal
-                        ) && record.upload_body_witness.as_deref()
-                            == Some(refusal.body_witness.as_str())
-                    });
-                if refusal.reason.is_dominated() && terminal_for_refused_body {
+                if Self::is_dominated(progress, fingerprint, refusal) {
                     counts.dominated += 1;
                 }
                 counts
             },
         )
+    }
+
+    /// Dominated refusals whose reason is an authority downgrade. That guard
+    /// has refused real growth before, so the local log keeps their own count.
+    fn authority_downgrades(progress: &SnapshotUploadProgress) -> usize {
+        progress
+            .permanent_rejections
+            .iter()
+            .filter(|(fingerprint, refusal)| {
+                refusal.reason
+                    == crate::upload_receipts::RejectedUsageReason::UsageAccountingAuthorityDowngrade
+                    && Self::is_dominated(progress, fingerprint, refusal)
+            })
+            .count()
+    }
+
+    fn is_dominated(
+        progress: &SnapshotUploadProgress,
+        fingerprint: &str,
+        refusal: &PermanentSnapshotRejection,
+    ) -> bool {
+        refusal.reason.is_dominated()
+            && progress
+                .quarantined_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| {
+                    matches!(
+                        record.disposition,
+                        SnapshotQuarantineDisposition::UnprovenTerminal
+                            | SnapshotQuarantineDisposition::SupersededTerminal
+                    ) && record.upload_body_witness.as_deref()
+                        == Some(refusal.body_witness.as_str())
+                })
     }
 }
 
@@ -2548,17 +2570,21 @@ impl PermanentRefusalCounts {
 static SOURCE_REFUSAL_LOGS: OnceLock<Mutex<BTreeMap<&'static str, RefusalLogLine>>> =
     OnceLock::new();
 
-/// Retained refusal counts, and whether they were reported as settled residue.
-type RefusalLogLine = (PermanentRefusalCounts, bool);
+/// Retained refusal counts, the authority-downgrade share of the dominated
+/// ones, and whether they were reported as settled residue.
+type RefusalLogLine = (PermanentRefusalCounts, usize, bool);
 
-/// Content-free, local-only: counts of the refusals retained this cycle, and
-/// whether the cycle reported them as settled residue. Logs on change only.
+/// Content-free, local-only: counts of the refusals retained this cycle, with
+/// the dominated ones split by reason, and whether the cycle reported them as
+/// settled residue. Logs on change only; each refusal is also logged with its
+/// reason when it arrives.
 fn log_retained_permanent_refusals(
     source: SnapshotSource,
     retained: PermanentRefusalCounts,
+    authority_downgrades: usize,
     settled_residue: bool,
 ) {
-    let line = (retained, settled_residue);
+    let line = (retained, authority_downgrades, settled_residue);
     let changed = match SOURCE_REFUSAL_LOGS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
@@ -2570,8 +2596,11 @@ fn log_retained_permanent_refusals(
         return;
     }
     eprintln!(
-        "local snapshot sync retains {} dominated and {} other permanent refusal(s) for {}{}",
+        "local snapshot sync retains {} dominated ({} usage_accounting_authority_downgrade, {} \
+         accepted_log_stale_older_upload) and {} other permanent refusal(s) for {}{}",
         retained.dominated,
+        authority_downgrades,
+        retained.dominated - authority_downgrades,
         retained.total - retained.dominated,
         source.api_slug(),
         if settled_residue {
@@ -6079,6 +6108,7 @@ fn finish_sync_source(
         .retain(|fingerprint, _| current_entities.contains(fingerprint));
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
+    let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_count {
@@ -6091,6 +6121,7 @@ fn finish_sync_source(
             log_retained_permanent_refusals(
                 source,
                 retained_refusals,
+                retained_downgrades,
                 matches!(state, CollectorState::Success),
             );
         }
