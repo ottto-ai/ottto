@@ -16,7 +16,7 @@
 //! explained by its category except `unexplained`, which is exactly the
 //! money the switch would lose without a reason.
 
-use super::super::claude_request_census::claude_request_hash;
+use super::super::claude_request_census::{claude_request_hash, ClaudeRequestBirth};
 use super::super::claude_request_ledger::{
     ClaudeClassifyContext, ClaudeCountedBy, ClaudeRemovedBy, ClaudeRequestVerdict,
     ClaudeUndecidedBy,
@@ -208,6 +208,9 @@ pub(crate) struct ClaudeGrainKey {
 /// The shadow and live emitter consume this same partition.
 #[derive(Debug)]
 pub(crate) struct ClaudeEntityBody {
+    /// Logical ownership is assigned to the same primary the emitter retains.
+    primary_file: Option<String>,
+    primary_opened_birth: Option<ClaudeRequestBirth>,
     pub(crate) grains: BTreeMap<(ClaudeLiveKey, Option<ClaudeRequestUsageOrigin>), ClaudeGrainSide>,
     pub(crate) counted: Vec<ClaudeCountedContribution>,
     /// Some is original transcript provenance; None explicitly marks a side
@@ -239,6 +242,8 @@ pub(crate) struct ClaudeCountedContribution {
 impl Default for ClaudeEntityBody {
     fn default() -> Self {
         Self {
+            primary_file: None,
+            primary_opened_birth: None,
             grains: BTreeMap::new(),
             counted: Vec::new(),
             contribution_clocks: BTreeMap::new(),
@@ -256,7 +261,47 @@ impl Default for ClaudeEntityBody {
         }
     }
 }
+/// A counted request's cache-producer view. An absent event clock is an
+/// explicit refusal to treat an observer/incomplete clock as original time.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeCountedRequest<'a> {
+    pub(crate) request_key: u64,
+    pub(crate) event_clock: Option<u64>,
+    pub(crate) owning_file_key: &'a str,
+}
+
 impl ClaudeEntityBody {
+    /// Pure view for the future cache producer: original event order, then
+    /// request key; unqualified clocks sort last. Message-only/idless grains
+    /// have no request key and cannot produce request cache records. Copies
+    /// in a multi-file union belong to its emitted logical primary.
+    #[allow(dead_code)] // Owner B's producer will consume this after P2a.
+    pub(crate) fn counted_requests(
+        &self,
+    ) -> (Vec<ClaudeCountedRequest<'_>>, Option<ClaudeRequestBirth>) {
+        let mut requests = Vec::new();
+        if let Some(owner) = self.primary_file.as_deref() {
+            requests.extend(self.counted.iter().filter_map(|counted| {
+                let request_key = counted.request?;
+                let event_clock = self
+                    .contribution_clocks
+                    .get(&request_key)
+                    .copied()
+                    .flatten()
+                    .and_then(|(clock, complete)| complete.then_some(clock));
+                Some(ClaudeCountedRequest {
+                    request_key,
+                    event_clock,
+                    owning_file_key: owner,
+                })
+            }));
+            requests.sort_unstable_by_key(|request| {
+                (request.event_clock.unwrap_or(u64::MAX), request.request_key)
+            });
+        }
+        (requests, self.primary_opened_birth)
+    }
+
     fn note_clock(&mut self, key: &ClaudeLiveKey, nanos: i128) {
         let bounds = self
             .bucket_activity
@@ -487,7 +532,17 @@ pub(crate) fn build_claude_request_body(
             return body;
         }
         let member = item.source_session_id.as_str();
-        body.entities.entry(member.to_owned()).or_default();
+        let entity = body.entities.entry(member.to_owned()).or_default();
+        if entity.primary_file.is_none() {
+            if let Some(Some(primary)) = family.member_keys.get(member) {
+                entity.primary_file = Some(primary.clone());
+                entity.primary_opened_birth = ctx
+                    .index
+                    .claude_request_census
+                    .get(primary)
+                    .and_then(|record| record.birth());
+            }
+        }
         if super::synthetic(item) {
             built_members.insert(member);
             body.members_built = built_members.len();
@@ -1464,5 +1519,69 @@ fn side_calls(
                 Some((&row.tokens, 1, row.cost_micros)),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod counted_request_accessor_tests {
+    use super::*;
+
+    #[test]
+    fn counted_requests_use_primary_and_only_original_complete_event_clocks() {
+        let birth = ClaudeRequestBirth {
+            unix_seconds: 5,
+            device: 6,
+            inode: 7,
+        };
+        let mut entity = ClaudeEntityBody {
+            primary_file: Some("/fixture/primary.jsonl".into()),
+            primary_opened_birth: Some(birth),
+            ..ClaudeEntityBody::default()
+        };
+        for request in [Some(3), None, Some(1), Some(2), Some(4), Some(5)] {
+            entity.counted.push(ClaudeCountedContribution {
+                key: ("hour".into(), "model".into(), BTreeMap::new()),
+                origin: None,
+                tokens: ClaudeMoneyTokens::default(),
+                requests: 1,
+                cost: None,
+                request,
+                clock: 999,
+                by: ClaudeCountedBy::TelemetryProven,
+            });
+        }
+        entity.contribution_clocks = BTreeMap::from([
+            (1, Some((20, true))),
+            (2, Some((10, true))),
+            (3, None),
+            (4, Some((1, false))),
+            (5, Some((10, true))),
+        ]);
+        let (requests, opened_birth) = entity.counted_requests();
+        assert_eq!(opened_birth, Some(birth));
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| (r.request_key, r.event_clock))
+                .collect::<Vec<_>>(),
+            [
+                (2, Some(10)),
+                (5, Some(10)),
+                (1, Some(20)),
+                (3, None),
+                (4, None)
+            ]
+        );
+        assert!(requests
+            .iter()
+            .all(|r| r.owning_file_key == "/fixture/primary.jsonl"));
+        assert_eq!(
+            entity.counted[0].request,
+            Some(3),
+            "view never reorders body"
+        );
+        assert_eq!(entity.counted_requests(), (requests, opened_birth));
+        let empty = ClaudeEntityBody::default();
+        assert_eq!(empty.counted_requests(), (Vec::new(), None));
     }
 }

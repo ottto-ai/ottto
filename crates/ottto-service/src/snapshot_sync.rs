@@ -6401,15 +6401,15 @@ fn finish_sync_source(
     {
         return Err(anyhow!("request money scheduling checkpoint pending"));
     }
-    if source == SnapshotSource::ClaudeCode {
-        if !crate::snapshots::claude_request_money::note_adoption_outcomes(
+    if source == SnapshotSource::ClaudeCode
+        && !crate::snapshots::claude_request_money::note_adoption_outcomes(
             support_dir,
             &index,
             &scan_result.snapshots,
             |item| u64::from(claude_authority_disposition.was_quarantined(&item.source_session_id)),
-        ) {
-            return Err(anyhow!("request money scheduling checkpoint pending"));
-        }
+        )
+    {
+        return Err(anyhow!("request money scheduling checkpoint pending"));
     }
     let local_holds = LocalHoldSettlement::classify(
         source,

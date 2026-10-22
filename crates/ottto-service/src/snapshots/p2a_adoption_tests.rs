@@ -981,7 +981,7 @@ fn p2a_bootstrap_union_debt_obeys_adoption_pause_and_budgets() {
                     || {
                         scan_source_roots_with_limit(
                             SnapshotSource::ClaudeCode,
-                            &[root.clone()],
+                            std::slice::from_ref(&root),
                             &mut index,
                             "2026-08-23T18:40:00Z",
                             BACKFILL_WINDOW_DAYS,
@@ -1002,4 +1002,98 @@ fn p2a_bootstrap_union_debt_obeys_adoption_pause_and_budgets() {
             .all(|entry| entry.effective_upload_body_witness_revision == 2));
         let _ = fs::remove_dir_all(home);
     }
+}
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn p2a_real_index_rebuild_latch_blocks_bootstrap_and_due_ratio_probe() {
+    for damage in ["absent", "corrupt", "empty"] {
+        for missing_list in [false, true] {
+            for recovery_probe in [false, true] {
+                restart_claude_reemission_stop_for_test();
+                let (home, root, mut index) =
+                    claude_context_backfill_fixture("p2a-rebuild-latch", 1);
+                let support = p2a_support(&home);
+                let _live = money::LiveForTest::new(&support);
+                let mut discovered = p2a_scan(&root, &support, &mut index);
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut discovered, &mut index);
+                for entry in index.files.values_mut() {
+                    entry.effective_upload_body_witness_revision = 2;
+                }
+                money::store::with_ledger_for_test(&support, |ledger| {
+                    for key in index.files.keys() {
+                        ledger.insert(
+                            money::store::money_key("dirty:", key),
+                            claude_request_census::ClaudeRequestCensusRecord::money_debt(
+                                [9; 32], 0,
+                            ),
+                        );
+                    }
+                    if recovery_probe {
+                        let mut rates = [0_u8; 32];
+                        // One local-held entity: ratio stop, known accounting.
+                        for (slot, value) in rates.chunks_exact_mut(8).zip([1_u64, 1, 0, 0]) {
+                            slot.copy_from_slice(&value.to_be_bytes());
+                        }
+                        ledger.insert(
+                            format!("{}rates", money::adoption_prefix(&index)),
+                            claude_request_census::ClaudeRequestCensusRecord::money_debt(rates, 0),
+                        );
+                    }
+                    assert!(money::store::checkpoint_for_test(&support, ledger));
+                })
+                .unwrap();
+                assert_eq!(money::adoption_paused(&support, &index), recovery_probe);
+                if recovery_probe {
+                    assert!(
+                        money::adoption_probe_due(&support, &index),
+                        "probe must really be due"
+                    );
+                }
+                if missing_list {
+                    fs::remove_file(ReemissionExclusions::path(&support)).unwrap();
+                }
+                let path = home.join("rebuilt-destination.json");
+                match damage {
+                    "corrupt" => fs::write(&path, "{truncated").unwrap(),
+                    "empty" => fs::write(&path, serde_json::to_vec(&ScanIndex::default()).unwrap())
+                        .unwrap(),
+                    _ => {}
+                }
+                let mut loaded = ScanIndex::load_for_snapshot_source(
+                    &path,
+                    SnapshotSource::ClaudeCode,
+                    &support,
+                )
+                .unwrap();
+                assert!(claude_reemission_stop_latched());
+                assert_eq!(claude_reemission_stop_reason(), "index_rebuild_withheld");
+                // Existing destination's bootstrap watch debt and a genuinely
+                // due ratio probe cannot bypass the process-wide load latch.
+                let denied = p2a_scan(&root, &support, &mut index);
+                assert_eq!(
+                    denied.scanned_file_count, 0,
+                    "{damage}/{missing_list}/{recovery_probe}"
+                );
+                assert!(denied.snapshots.is_empty());
+                assert!(index
+                    .files
+                    .values()
+                    .all(|entry| entry.effective_upload_body_witness_revision == 2));
+                // A different/new destination still reads actual NewFile work.
+                let fresh = p2a_scan(&root, &support, &mut loaded);
+                assert!(fresh.scanned_file_count > 0);
+                assert!(
+                    loaded
+                        .files
+                        .values()
+                        .all(|entry| entry.effective_upload_body_witness_revision != 3),
+                    "reading cannot stamp an unACKed literal"
+                );
+                money::store::flush();
+                let _ = fs::remove_dir_all(home);
+            }
+        }
+    }
+    restart_claude_reemission_stop_for_test();
 }

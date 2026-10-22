@@ -909,18 +909,37 @@ fn money_gate_off_saved_fixture_receipt() {
             .unwrap()
             .write_all((serde_json::to_string(&trace).unwrap() + "\n").as_bytes())
             .unwrap();
-        rows.extend([missing.clone(), side]);
+        // A missing trace invalidates the reported rebuild for its whole
+        // root. Keep that adverse population separate so the paired side
+        // call really reaches the primary's reported body and BadClock.
+        const MISSING_ROOT: &str = "4c8d914c-e346-4b16-91ab-99840cb5c1ae";
+        missing.session_id = MISSING_ROOT.into();
+        rows.push(side);
         let transcript = fixture
             .home
             .join(".claude/projects/-synthetic-repo")
-            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
-        let extra = serde_json::json!({"timestamp":missing.observed_at,"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,"requestId":missing.request_id,"message":{"id":"missing-trace-message","model":missing.model,"usage":{"input_tokens":missing.input_tokens,"output_tokens":missing.output_tokens}}});
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(transcript)
-            .unwrap()
-            .write_all((extra.to_string() + "\n").as_bytes())
-            .unwrap();
+            .join(format!("{MISSING_ROOT}.jsonl"));
+        let marker = serde_json::json!({"timestamp":missing.observed_at,"type":"attachment","sessionId":MISSING_ROOT,
+            "attachment":{"type":"credential_org","organizationUuid":IDENTITY_PIPELINE_ORG}});
+        let extra = serde_json::json!({"timestamp":missing.observed_at,"type":"assistant","sessionId":MISSING_ROOT,"requestId":missing.request_id,"message":{"id":"missing-trace-message","model":missing.model,"usage":{"input_tokens":missing.input_tokens,"output_tokens":missing.output_tokens}}});
+        std::fs::write(
+            transcript,
+            marker.to_string() + "\n" + &extra.to_string() + "\n",
+        )
+        .unwrap();
+        missing.fingerprint.clear();
+        missing.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&missing).unwrap())
+        );
+        std::fs::write(
+            support.join("local-otel/claude-code-effort").join(format!(
+                "{:x}.jsonl",
+                Sha256::digest(MISSING_ROOT.as_bytes())
+            )),
+            serde_json::to_string(&missing).unwrap() + "\n",
+        )
+        .unwrap();
         for row in &mut rows {
             row.fingerprint.clear();
             row.fingerprint = format!(
@@ -997,7 +1016,6 @@ fn money_gate_off_saved_fixture_receipt() {
             )
         });
         let mut decision = "refused";
-        let mut accepted = 0;
         let mut local_markers = Vec::new();
         if let Ok(Some(mut frame)) = frame {
             for n in 0..history {
@@ -1022,7 +1040,6 @@ fn money_gate_off_saved_fixture_receipt() {
                 );
                 local_markers.push(format!("{:?}", item.claude_org_markers));
             }
-            let progress_path = preparation.upload_progress_path.clone();
             let result = crate::agent_status_refresh::with_test_collection(collection(), || {
                 finish_sync_source(
                     preparation,
@@ -1041,20 +1058,30 @@ fn money_gate_off_saved_fixture_receipt() {
                 )
             });
             decision = if result.is_ok() { "accepted" } else { "failed" };
-            let progress = SnapshotUploadProgress::load(
-                &progress_path,
-                &namespace,
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .unwrap();
-            accepted = progress.accepted_fingerprints.len();
+            assert!(result.is_ok(), "saved-fixture finish failed: {result:?}");
         }
         let mut offers = server.bodies.lock().unwrap().clone();
         for item in &mut offers {
             item.as_object_mut().unwrap().remove("collected_at");
         }
+        // A successful finish transfers ACKs to the scan index and clears
+        // transient upload progress. Assert durable acceptance of actual POSTs.
+        let saved = ScanIndex::load(&index_path).unwrap();
+        let accepted = offers
+            .iter()
+            .filter(|item| {
+                saved.accepted_snapshot_fingerprint_recorded(
+                    item["snapshot_fingerprint"].as_str().unwrap(),
+                )
+            })
+            .count();
+        assert!(!offers.is_empty(), "baseline must exercise real upload");
+        assert_eq!(
+            accepted,
+            offers.len(),
+            "every actual offer must have a durable ACK"
+        );
         if history == 0 {
-            assert!(!offers.is_empty(), "baseline must exercise real upload");
             assert!(accepted > 0);
             let item = offers
                 .iter()
@@ -1069,8 +1096,28 @@ fn money_gate_off_saved_fixture_receipt() {
                 "C1 real C5 evidence"
             );
             assert_eq!(
-                item["request_identity_refusals"], 2,
-                "missing trace + paired BadClock side call: {item}"
+                item["request_identity_refusals"], 1,
+                "paired BadClock side call must reach the real counted body: {item}"
+            );
+            assert_eq!(
+                item["request_count"], 3,
+                "two transcripts plus the actual paired side call"
+            );
+            let missing = offers
+                .iter()
+                .find(|item| item["source_session_id"] == "4c8d914c-e346-4b16-91ab-99840cb5c1ae")
+                .unwrap();
+            assert_eq!(
+                missing["request_identity_refusals"], 1,
+                "missing trace must independently refuse"
+            );
+            assert_eq!(
+                offers
+                    .iter()
+                    .map(|item| item["request_identity_refusals"].as_u64().unwrap())
+                    .sum::<u64>(),
+                2,
+                "missing trace + paired BadClock side call must both reach the real upload"
             );
             for rows in [
                 item["model_usage"].as_array().unwrap().clone(),
