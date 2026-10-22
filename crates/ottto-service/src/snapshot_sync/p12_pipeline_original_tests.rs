@@ -410,7 +410,7 @@ impl RearmFixture {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         index.activate_upload_context("upload-context-rearm".to_string());
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
         let (mut native_preparation, mut index, mut scan, committed_index) =
             if crate::snapshots::claude_native_comparison::enabled()
@@ -1651,7 +1651,9 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
     let before_progress = std::fs::read(&fixture.progress_path).ok();
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
     index.activate_upload_context("upload-context-rearm".into());
-    index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        SnapshotSource::ClaudeCode,
+    ));
     let frame = fixture.native_preparation(index, "2026-08-02T14:00:00Z");
     let target_hook =
         crate::snapshots::claude_native_comparison::target_unknown_allowance_for_test();
