@@ -844,6 +844,37 @@ fn carry_cancel(index: &mut ScanIndex) {
     );
 }
 
+/// N1: a member-only list line excludes the whole carried family, so the
+/// root's adoption never reaches the C1b cancel and the listed member keeps
+/// its revision.
+#[test]
+fn c1b_member_only_reemission_line_excludes_the_carried_family_root() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut index = carry_cancel_index(1);
+    let support = temp_dir("member-only-reemission");
+    let path = ReemissionExclusions::path(&support);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let agent = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
+    fs::write(&path, format!("{:x}\n", Sha256::digest(agent.as_bytes()))).unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    let [root_key, agent_key] = carry_family_keys();
+    let before = index.files[&agent_key].source_file_fingerprint.clone();
+    // The root is excluded although only the member is listed.
+    assert!(index
+        .claude_reemission_exclusions
+        .excludes(CARRY_ROOT, None));
+    // Unrelated families stay unlisted.
+    assert!(!index
+        .claude_reemission_exclusions
+        .excludes(CARRY_OTHER, None));
+    // The carry is intact and the member is not re-armed.
+    assert!(index.claude_stale_family_carry.roots.contains(CARRY_ROOT));
+    assert_eq!(index.files[&agent_key].source_file_fingerprint, before);
+    let _ = (root_key, fs::remove_dir_all(support));
+}
+
 /// R1, admitted: a parse of a carried family's member on a non-terminal page
 /// clears the other member's revision and queues it, once, into the replay
 /// buffer the carry funded, never into the candidate queue. The parsed member

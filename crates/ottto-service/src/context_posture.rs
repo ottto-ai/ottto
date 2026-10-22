@@ -743,6 +743,8 @@ mod tests {
             peak_context_fill_tokens: posture.1,
             compaction_count: posture.2,
             compaction_timestamps: Vec::new(),
+            compaction_events: Vec::new(),
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
