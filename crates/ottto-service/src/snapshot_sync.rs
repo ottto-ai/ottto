@@ -17244,7 +17244,8 @@ mod tests {
             retry_pending_family_count: 0,
             held_fingerprints: held_fingerprints.clone(),
             account_deferred_fingerprints: BTreeSet::new(),
-            progress_blocking: false,
+            // Restorable non-blocking Rejected holds settle once H1 is composed.
+            progress_blocking: !held_fingerprints.is_empty(),
         };
 
         let blocked = commit_completed_with_local_holds(
