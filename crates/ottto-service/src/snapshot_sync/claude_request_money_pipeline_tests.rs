@@ -488,17 +488,32 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     std::fs::write(&off, b"").unwrap();
     let _ = scan(&mut ScanIndex::default());
     assert!(money::capture::capture_reserved() > baseline_reserved);
+    let rows_on = money_jsonl_rows(&fixture.support).len();
     page();
     assert_eq!(
         money::capture::capture_reserved(),
         baseline_reserved,
         "the page that sees the switch drops the waiting captures"
     );
+    // StateMissing B: the day's first off page writes one false coverage
+    // row, so the part of the day the shadow skipped never reads complete.
+    let rows = money_jsonl_rows(&fixture.support);
+    assert_eq!(rows.len(), rows_on + 1, "one row for the off day");
+    let row = rows.last().unwrap();
+    assert_eq!(row["row"], "coverage", "{row}");
+    assert_eq!(row["coverage_complete"], false, "{row}");
+    assert_eq!(row["refused"], true, "{row}");
     let _ = scan(&mut ScanIndex::default());
     assert_eq!(
         money::capture::capture_reserved(),
         baseline_reserved,
         "a parse while the shadow is off captures nothing"
+    );
+    page();
+    assert_eq!(
+        money_jsonl_rows(&fixture.support).len(),
+        rows_on + 1,
+        "later off pages of the day write nothing"
     );
     std::fs::remove_file(&off).unwrap();
     page();

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 777,
-  "content_sha256": "d17f3a64752c5515090083e5fd97b32b80aab4d7ea6cd8fe8263084bdb34c5a7",
+  "content_sha256": "676015ade7ce5c0aa1f152f0510d5f2cb7f0331853c6acdb2149adcfbef3f385",
   "files": [
     {
       "executable": false,
@@ -1350,8 +1350,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/claude_request_money_pipeline_tests.rs",
-      "sha256": "337603f0f197efffd4341e16f3a8a04a00cf6d7964aac528d425cb8dbf559592",
-      "size_bytes": 45910
+      "sha256": "79cc1a6ddc5e4a92fc02c034c6bdde4b0fcab183d8c22e50cf75412a9986a3bf",
+      "size_bytes": 46586
     },
     {
       "executable": false,
@@ -1595,8 +1595,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money.rs",
-      "sha256": "129dbfa5d96b4bb5761c148b9716d091c7be451ede6d323c0a24974ec1690d02",
-      "size_bytes": 88251
+      "sha256": "9edcca1d6fb2eaa416d083a7e0aa99f6fa4187179a4a9a392e0e5f35f5ed10ea",
+      "size_bytes": 89956
     },
     {
       "executable": false,

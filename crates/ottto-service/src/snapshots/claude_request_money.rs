@@ -35,7 +35,8 @@
 //! shadow is then off for the rest of the process, counted), every phase
 //! under the sync lock checks the page deadline, and a local file
 //! (`<support>/claude-request-money-shadow.off`) turns it off without a
-//! release. Off, it captures nothing either.
+//! release. Off, it captures nothing either, and the first off page of a
+//! day writes one false coverage row.
 
 pub(crate) mod body;
 pub(crate) mod capture;
@@ -433,28 +434,73 @@ pub(crate) fn capture_armed(path: &Path) -> Option<PathBuf> {
         let _ = path;
         Some(PathBuf::new())
     };
-    scope.filter(|scope| !SHADOW_OFF.lock().is_ok_and(|off| off.contains(scope)))
+    scope.filter(|scope| !SHADOW_OFF.lock().is_ok_and(|off| off.contains_key(scope)))
 }
 
-/// Scopes whose last page found the shadow off (the kill switch file).
-static SHADOW_OFF: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+/// Scopes whose last page found the shadow off (the kill switch file), and
+/// the last day an off page published its false coverage row.
+static SHADOW_OFF: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
 
 /// The shadow is off for `support_dir` (panic latch or kill switch): the
-/// scope stops capturing and its waiting captures are dropped.
-fn shadow_off(support_dir: &Path) -> bool {
+/// scope stops capturing, its waiting captures are dropped, and the first
+/// off page of each day hands the writer one false coverage row
+/// (StateMissing B), so a day the shadow skipped part of never reads
+/// complete.
+fn shadow_off(support_dir: &Path, now: u64) -> bool {
     let scope = shadow_scope(support_dir);
     let off = SHADOW_PANICKED.load(Ordering::Acquire) || support_dir.join(SHADOW_OFF_FILE).exists();
-    if let Ok(mut scopes) = SHADOW_OFF.lock() {
+    let day = day_stamp(now).unwrap_or_default();
+    let first_today = SHADOW_OFF.lock().is_ok_and(|mut scopes| {
         if off {
-            scopes.insert(scope.clone());
+            scopes.insert(scope.clone(), day.clone()).as_ref() != Some(&day)
         } else {
             scopes.remove(&scope);
+            false
         }
-    }
+    });
     if off {
         capture::purge_before(&scope, Instant::now());
     }
+    if first_today {
+        guarded(|| publish_off(support_dir, now));
+    }
     off
+}
+
+/// An off page's false coverage row, straight to the writer (no page, no
+/// ledger). A refused handoff owes the day its row in memory.
+fn publish_off(support_dir: &Path, now: u64) {
+    let Some(reservation) = ShadowReservation::admit(1024) else {
+        owe_coverage(support_dir, now, false);
+        return;
+    };
+    let job = WriteJob {
+        support_dir: support_dir.to_path_buf(),
+        jsonl: JsonlBatch {
+            now,
+            families: Vec::new(),
+            coverage: CoverageRow {
+                row: "coverage",
+                v: JSONL_VERSION,
+                observed_unix: now,
+                coverage_complete: false,
+                families: 0,
+                families_incomplete: 0,
+                refused: true,
+                truncated: false,
+                telemetry_sweep_complete: false,
+                rows_unavailable_roots: 0,
+                dropped: false,
+            },
+            buffer_bytes: 0,
+        },
+        memos: Vec::new(),
+        save: None,
+        reservations: vec![reservation],
+    };
+    if store::submit_unledgered(job).is_err() {
+        owe_coverage(support_dir, now, false);
+    }
 }
 
 /// Faults a test injects at the page's last gates (the caller's thread).
@@ -980,7 +1026,8 @@ pub(crate) fn shadow_page(
     trace_report: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
 ) {
-    if !shadow_enabled(support_dir) || shadow_off(support_dir) {
+    let now = now_unix();
+    if !shadow_enabled(support_dir) || shadow_off(support_dir, now) {
         return;
     }
     guarded(|| {
@@ -991,7 +1038,7 @@ pub(crate) fn shadow_page(
             api_report,
             trace_report,
             census_complete,
-            now_unix(),
+            now,
         );
     });
 }
