@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 779,
-  "content_sha256": "d033d407d770fb57246fddc7709dda509cecca99f65513c08cb50a1a824f3dac",
+  "content_sha256": "d0eed127749e708e2ee9e95452940eacf1290d5b8029ad834e1cb0549c43e35e",
   "files": [
     {
       "executable": false,
@@ -90,8 +90,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "164e32b205150433507be8f9fc3122ab085354e35e8ef2cdd223c8b0df33b5a1",
-      "size_bytes": 55592
+      "sha256": "8436f8a8af7fdb5b960a89b15030ee0abefa225d068e41579f9420d55b4e6deb",
+      "size_bytes": 55926
     },
     {
       "executable": false,
@@ -1035,8 +1035,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "9afdb6dcb505a841432bcb1a8dc6c9b7c89f9b6455ab8821e68cecc33ec3375d",
-      "size_bytes": 1362600
+      "sha256": "a24d030c2e014efc6eeab1c1e1ddcacc8e942d15cda510afee6350eea2e244c7",
+      "size_bytes": 1378045
     },
     {
       "executable": false,
@@ -3723,8 +3723,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/troubleshooting.md",
-      "sha256": "38d6bded5da3aeb41b19da270c9cdda750e1382cf914145c4b25db1c70f3c14a",
-      "size_bytes": 6207
+      "sha256": "37f12ddc45c6409be029ca0117dde537ebd940f7810e66f5d11ec04162012f53",
+      "size_bytes": 6453
     },
     {
       "executable": false,
@@ -5456,7 +5456,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T17:28:32+00:00",
+  "generated_at": "2026-10-22T18:58:46+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 780,
   "public_roots": [
@@ -5495,5 +5495,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d03fdc9b6ee41772ae8b026b9dc42fd95f3d9320"
+  "source_commit": "a01dfd5ed497550874a54798ff8b4193f8df1e47"
 }
