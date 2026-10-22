@@ -3169,6 +3169,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The money shadow's kill switch, seen before this process's first parse.
+    crate::snapshots::claude_request_money::seed_shadow_off(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -4107,6 +4109,11 @@ impl SourcePreparation {
             let occupied = initialize
                 .then(|| self.native_incremental_owned_bytes(&state))
                 .flatten();
+            #[cfg(test)]
+            let remaining = self
+                .native_comparison_reservation
+                .as_ref()
+                .and_then(crate::source_rotation::PaidReservation::remaining_for_test);
             let paid = self
                 .native_comparison_reservation
                 .as_mut()
@@ -4117,6 +4124,12 @@ impl SourcePreparation {
                     occupied
                         .is_some_and(|bytes| paid.grow_for(bytes) && paid.record_allocated(bytes))
                 });
+            #[cfg(test)]
+            if initialize {
+                tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::note_native_allowance(
+                    remaining, occupied, paid,
+                );
+            }
             if !paid {
                 state.disable_native_comparison();
             }
@@ -4422,7 +4435,9 @@ fn try_collect_native_preparation_with_rotation(
     };
     // The original rotation calculates queue/parked/retained deductions. No
     // independently fabricated full-budget argument reaches the native caller.
-    crate::source_rotation::run(&mut owner, &[source], crate::source_rotation::PARKED_BUDGET);
+    let budget =
+        tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::rotation_budget();
+    crate::source_rotation::run(&mut owner, &[source], budget);
     if let Some(error) = owner.failure {
         return Err(error);
     }
@@ -7086,6 +7101,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
+    // P1 per-request money, shadow only: reads this page's final items, the
+    // index and the rows loaded above; writes only its own ledger, through
+    // its writer thread after this page. Never fails or changes the page.
+    crate::snapshots::claude_request_money::shadow_page(
+        support_dir,
+        &scan_result.snapshots,
+        index,
+        &api_report,
+        &trace_report,
+        scan_result.census_complete,
+    );
     Ok((disposition, census_withheld, stats))
 }
 
@@ -19226,6 +19252,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
+    mod claude_request_money_pipeline_tests {
+        include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
+    }
     mod p12_base_exit_tests {
         include!("snapshot_sync/p12_base_exit_tests.rs");
     }
