@@ -109,13 +109,19 @@ fn shell_commands_split_into_output_segments() {
             vec![(Read, paths(&["/w/repo/a.md", "/w/repo/b.md"]))],
         ),
         ("git -C /other status", vec![(Git, vec![])]),
+        // `rev:path` is relative to the checkout root, so it stays as
+        // written; `rev:./path` is relative to the folder git runs in.
         (
             "git -C /other show HEAD:src/a.rs",
-            vec![(Read, paths(&["/other/src/a.rs"]))],
+            vec![(Read, paths(&["src/a.rs"]))],
         ),
         (
-            "git show abc123:docs/x.md",
-            vec![(Read, paths(&["/w/repo/docs/x.md"]))],
+            "cd sub && git show abc123:docs/x.md",
+            vec![(Read, paths(&["docs/x.md"]))],
+        ),
+        (
+            "cd sub && git show HEAD:./x.md HEAD:../y.md",
+            vec![(Read, paths(&["/w/repo/sub/x.md", "/w/repo/y.md"]))],
         ),
         ("git show HEAD", vec![(Git, vec![])]),
         ("git grep -n foo", vec![(Search, vec![])]),
@@ -183,6 +189,28 @@ fn shell_commands_split_into_output_segments() {
         ("timeout 60 cargo check", vec![(TestsBuilds, vec![])]),
         ("echo done", vec![(Other, vec![])]),
         ("mkdir -p x && cd x", vec![]),
+        // Tests and `read` print nothing.
+        (
+            "test -f a.md && cat a.md",
+            vec![(Read, paths(&["/w/repo/a.md"]))],
+        ),
+        (
+            "[ -f a.md ] && cat a.md",
+            vec![(Read, paths(&["/w/repo/a.md"]))],
+        ),
+        (
+            "[[ -n \"$X\" ]] && cat a.md",
+            vec![(Read, paths(&["/w/repo/a.md"]))],
+        ),
+        (
+            "while read l; do echo \"$l\"; done < list.txt",
+            vec![(Other, vec![])],
+        ),
+        // `xargs -I{}`'s placeholder is not a file.
+        (
+            "xargs -I{} cat {} a.md < list.txt",
+            vec![(Read, paths(&["/w/repo/a.md", "/w/repo/list.txt"]))],
+        ),
         // Variables set earlier in the command; unknown ones and globs leave
         // the read without a file.
         (
@@ -396,6 +424,26 @@ fn claude_tools_by_name_and_server() {
             "web_and_browser/browser",
         ),
         (
+            "mcp__chrome-devtools-mcp__take_snapshot",
+            json!({}),
+            "web_and_browser/browser",
+        ),
+        (
+            "mcp__puppeteer__puppeteer_click",
+            json!({}),
+            "web_and_browser/browser",
+        ),
+        (
+            "mcp__browser-use__open",
+            json!({}),
+            "web_and_browser/browser",
+        ),
+        (
+            "mcp__browsermcp__browser_snapshot",
+            json!({}),
+            "web_and_browser/browser",
+        ),
+        (
             "mcp__computer-use__app_click",
             json!({}),
             "computer_use/app_control",
@@ -490,14 +538,15 @@ fn images_follow_their_call_or_the_prompt() {
         )),
         "automatic_additions/start_not_measured"
     );
-    // A result with no call (a kinds_version 1 class) keeps the v1 answer.
-    assert_eq!(
-        image(&claude(), Some(&CallClass::unmatched())),
-        Verdict::Count {
-            kind: Kind::BrowserAndImages,
-            part: Part::Unsplit
-        }
-    );
+}
+
+// A kinds_version 2 reader must classify every call the kinds_version 2 way;
+// a kinds_version 1 class slipping through is caught in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "kinds_version 1 call class")]
+fn images_reject_a_v1_call_in_a_v2_line() {
+    image(&claude(), Some(&CallClass::unmatched()));
 }
 
 fn attachment(
@@ -758,8 +807,23 @@ fn claude_attachments_every_type() {
             ids(claude_attachment(&ctx, &snapshot)),
             "skip:PromptSnapshot"
         );
-        assert_eq!(ids(claude_attachment(&ctx, &bare)), "skip:Unrendered");
     }
+    // A measured start skips request 1 before the rendered rule, so only
+    // content that would have counted is an unrendered skip.
+    assert_eq!(
+        ids(claude_attachment(
+            &with_request_1(claude(), Request1::StartMeasured),
+            &bare
+        )),
+        "skip:RequestOne"
+    );
+    assert_eq!(
+        ids(claude_attachment(
+            &with_request_1(claude(), Request1::StartNotMeasured),
+            &bare
+        )),
+        "skip:Unrendered"
+    );
 }
 
 #[test]
@@ -1011,6 +1075,78 @@ fn codex_cells_split_across_inner_items() {
     assert_eq!(
         cells(&codex_cell(&exec, &items, 5)),
         ["web_and_browser/web 3 -", "other_tools/addon 2 -"]
+    );
+}
+
+/// `kind/part tokens tool` lines of a split result.
+fn tool_cells(shares: &[CellShare]) -> Vec<String> {
+    shares
+        .iter()
+        .map(|share| {
+            format!(
+                "{}/{} {} {}",
+                share.kind.as_str(),
+                share.part.as_str(),
+                share.tokens,
+                share.tool.as_ref().map_or("-", ToolKey::as_str)
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn add_on_shares_keep_their_server_and_tool() {
+    let exec = codex_call(&codex(), Some("exec"), "await tools.github__search({})");
+    // Two add-on servers in one cell keep apart, each with its label.
+    let items = [
+        InnerItem::Mcp {
+            server: "github",
+            tool: "search",
+            output_chars: 30,
+        },
+        InnerItem::Mcp {
+            server: "linear",
+            tool: "list_issues",
+            output_chars: 10,
+        },
+        InnerItem::Mcp {
+            server: "github",
+            tool: "search",
+            output_chars: 10,
+        },
+    ];
+    assert_eq!(
+        tool_cells(&codex_cell(&exec, &items, 50)),
+        [
+            "other_tools/addon 40 github/search",
+            "other_tools/addon 10 linear/list_issues"
+        ]
+    );
+    // A cell with no inner item: the first `tools.<server>__<tool>(` call.
+    assert_eq!(
+        tool_cells(&codex_cell(&exec, &[], 7)),
+        ["other_tools/addon 7 github/search"]
+    );
+    // Direct add-on calls of either agent, and built-in calls (no label).
+    let calls = [
+        claude_tool(&claude(), "mcp__linear__list_issues", &json!({})),
+        codex_mcp(
+            &codex(),
+            Some(&json!({"server": "linear", "tool": "list_issues"})),
+        ),
+        codex_call(&codex(), Some("mcp__linear/list_issues"), "{}"),
+    ];
+    for call in &calls {
+        assert_eq!(
+            tool_cells(&codex_cell(call, &[], 3)),
+            ["other_tools/addon 3 linear/list_issues"],
+            "{call:?}"
+        );
+    }
+    let read = claude_tool(&claude(), "Read", &json!({"file_path": "a.md"}));
+    assert_eq!(
+        tool_cells(&codex_cell(&read, &[], 3)),
+        ["files_read/file_tool 3 -"]
     );
 }
 
@@ -1527,6 +1663,87 @@ fn checkout_relative_names_need_the_v2_cache_and_the_same_repository() {
     assert!(v2.roots.contains_key(&format!("{root}/worktree/docs")));
     assert_eq!(v2.hashes.len(), 2);
     assert!(v1.roots.is_empty() && v1.hashes.is_empty());
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+#[test]
+fn repository_hash_matches_the_workspace_identity_without_git() {
+    let scratch = crate::test_scratch::ScratchDir::new("composition-repo-hash");
+    let main = scratch.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let worktree = scratch.join("worktree");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let identity = |root: &Path| {
+        crate::context_footprint::resolve_repository_identity(root, false).repository_hash
+    };
+    for root in [&main, &worktree] {
+        let hash = repository_hash(root);
+        assert!(hash.is_some(), "{root:?}");
+        assert_eq!(hash, identity(root), "{root:?}");
+    }
+    // Both checkouts are one repository.
+    assert_eq!(repository_hash(&main), repository_hash(&worktree));
+    // A `.git` that is not a git folder names no repository.
+    let fake = scratch.join("fake");
+    std::fs::create_dir_all(fake.join(".git")).unwrap();
+    assert_eq!(repository_hash(&fake), None);
+}
+
+#[test]
+fn a_full_cache_stops_looking_up_and_counts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn counted_hash(_root: &Path) -> Option<String> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Some("repo-a".to_string())
+    }
+    let mut cache = GitRootCache {
+        repository_hash: counted_hash,
+        ..GitRootCache::v2()
+    };
+    for index in 0..MAX_CACHED_FOLDERS {
+        cache.hashes.insert(format!("/r/{index}"), None);
+        cache.roots.insert(format!("/f/{index}"), None);
+    }
+    assert_eq!(cache.root_hash("/r/new"), None);
+    assert_eq!(cache.root_of("/f/new/sub"), None);
+    // Cached entries still answer.
+    assert_eq!(cache.root_of("/f/1"), None);
+    assert_eq!(cache.skipped(), 2);
+    assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+    assert_eq!(cache.hashes.len(), MAX_CACHED_FOLDERS);
+    assert_eq!(cache.roots.len(), MAX_CACHED_FOLDERS);
 }
 
 /// Every Part but `Unsplit`.

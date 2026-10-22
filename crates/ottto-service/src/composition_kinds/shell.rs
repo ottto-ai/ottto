@@ -737,10 +737,12 @@ fn program_name(text: &str) -> &str {
 }
 
 pub(crate) const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
-const SILENT: [&str; 31] = [
+/// Commands that print nothing (tests and `read` only set a status or a
+/// variable).
+const SILENT: [&str; 35] = [
     "cd", "pushd", "popd", "export", "set", "unset", "source", ".", "alias", "unalias", "true",
     "false", ":", "shopt", "trap", "wait", "sleep", "exit", "return", "umask", "ulimit", "mkdir",
-    "touch", "rm", "rmdir", "mv", "cp", "ln", "chmod", "chown", "kill",
+    "touch", "rm", "rmdir", "mv", "cp", "ln", "chmod", "chown", "kill", "test", "[", "[[", "read",
 ];
 const SEARCH: [&str; 16] = [
     "grep", "egrep", "fgrep", "rg", "ag", "ack", "find", "fd", "fdfind", "locate", "mdfind", "ls",
@@ -1158,7 +1160,10 @@ fn eval_git(args: &[Word], state: &mut EvalState) -> Stage {
     match subcommand {
         "grep" | "ls-files" | "ls-tree" => Stage::Class(ShellClass::Search, Vec::new()),
         "show" | "cat-file" => {
-            // `git show rev:path` prints the file at `rev`.
+            // `git show rev:path` prints the file at `rev`. git reads `path`
+            // from the checkout root, so it stays as written (relative to a
+            // root this parser does not know); only `rev:./path` and
+            // `rev:../path` are relative to the folder git runs in.
             let paths: Vec<String> = rest
                 .iter()
                 .filter(|word| !word.text.starts_with('-'))
@@ -1166,9 +1171,13 @@ fn eval_git(args: &[Word], state: &mut EvalState) -> Stage {
                 .filter(|text| !text.contains("://"))
                 .filter_map(|text| {
                     let (_, path) = text.split_once(':')?;
-                    (!path.is_empty() && !path.starts_with('/'))
-                        .then(|| join(dir.as_deref(), path.trim_start_matches("./")))
-                        .flatten()
+                    if path.is_empty() || path.starts_with('/') {
+                        None
+                    } else if path.starts_with("./") || path.starts_with("../") {
+                        join(dir.as_deref(), path)
+                    } else {
+                        join(None, path)
+                    }
                 })
                 .take(MAX_SHELL_PATH_TOKENS)
                 .collect();
@@ -1296,7 +1305,8 @@ fn eval_reader(
         .into_iter()
         .filter(|word| !word.glob)
         .filter_map(|word| resolve(word, state))
-        .filter(|text| text != "-" && !text.contains("://"))
+        // `{}` is `xargs -I{}`'s placeholder, not a file.
+        .filter(|text| text != "-" && text != "{}" && !text.contains("://"))
         .filter_map(|text| join(state.base.as_deref(), &text))
         .take(MAX_SHELL_PATH_TOKENS)
         .collect();

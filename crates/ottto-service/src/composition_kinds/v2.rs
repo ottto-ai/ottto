@@ -85,6 +85,7 @@ fn read_share(path: Option<&str>, default: Part, weight: u32) -> CallShare {
         part: path.map_or(default, |path| read_part(path, default)),
         weight,
         file: path.map(Into::into),
+        tool: None,
     }
 }
 
@@ -94,6 +95,15 @@ fn share(part: Part, weight: u32) -> CallShare {
         part,
         weight,
         file: None,
+        tool: None,
+    }
+}
+
+/// The share of an add-on (MCP) tool's result, labelled `server/tool`.
+fn server_share(server: &str, tool: &str, part: Part) -> CallShare {
+    CallShare {
+        tool: Some(ToolKey::new(&format!("{server}/{tool}"))),
+        ..share(part, 1)
     }
 }
 
@@ -138,13 +148,18 @@ pub(super) fn shell_shares(segments: &[ShellSegment]) -> Vec<CallShare> {
 
 /// Browser add-on servers (lowercase, `-` as `_`). A plugin (`plugin_<p>_<s>`)
 /// or connector (`claude_ai_<s>`) form ends with the same name.
-const BROWSER_SERVERS: [&str; 5] = [
+const BROWSER_SERVERS: [&str; 7] = [
     "claude_browser",
     "claude_in_chrome",
     "control_chrome",
     "claude_preview",
-    "chrome_devtools",
+    "puppeteer",
+    "browser_use",
+    "browsermcp",
 ];
+
+/// Browser server names matched anywhere in the name (`chrome_devtools_mcp`).
+const BROWSER_SERVER_WORDS: [&str; 2] = ["chrome_devtools", "playwright"];
 
 /// Computer-use add-on servers, same form.
 const COMPUTER_SERVERS: [&str; 3] = ["computer_use", "cua_repl", "remote_devices"];
@@ -160,7 +175,11 @@ pub(super) fn server_part(server: &str, tool: &str) -> Part {
             Part::AppControl
         };
     }
-    if BROWSER_SERVERS.iter().any(|name| server.ends_with(name)) || server.contains("playwright") {
+    if BROWSER_SERVERS.iter().any(|name| server.ends_with(name))
+        || BROWSER_SERVER_WORDS
+            .iter()
+            .any(|word| server.contains(word))
+    {
         return Part::Browser;
     }
     // Codex's own thread tools report other threads' work.
@@ -173,7 +192,7 @@ pub(super) fn server_part(server: &str, tool: &str) -> Part {
 fn server_call(server: &str, tool: &str) -> CallClass {
     CallClass::from_shares(
         ToolKey::new(&format!("{server}/{tool}")),
-        vec![share(server_part(server, tool), 1)],
+        vec![server_share(server, tool, server_part(server, tool))],
     )
 }
 
@@ -260,6 +279,11 @@ pub(super) fn claude_attachment(ctx: &LineCtx, att: &super::ClaudeAttachment) ->
         "prompt_snapshot" => return Verdict::Skip(SkipReason::PromptSnapshot),
         "deferred_tools_record" => return Verdict::Skip(SkipReason::DeferredToolsRecord),
         _ => {}
+    }
+    // A measured start skips everything in request 1, rendered or not, so
+    // the unrendered count holds only what would otherwise have counted.
+    if ctx.request_1 == Request1::StartMeasured {
+        return Verdict::Skip(SkipReason::RequestOne);
     }
     if ctx.file_has_rendered && !att.has_rendered {
         return Verdict::Skip(SkipReason::Unrendered);
@@ -441,26 +465,24 @@ pub(super) fn codex_call(ctx: &LineCtx, name: Option<&str>, input: &str) -> Call
 fn codex_function(name: &str, input: &str, cwd: Option<&Path>, depth: u8) -> Vec<CallShare> {
     let (namespace, base) = name.split_once('/').unwrap_or(("", name));
     if let Some(server) = namespace.strip_prefix("mcp__") {
-        return vec![share(server_part(server, base), 1)];
+        return vec![server_share(server, base, server_part(server, base))];
     }
     if let Some((server, tool)) = split_mcp_name(base) {
-        return vec![share(server_part(server, tool), 1)];
+        return vec![server_share(server, tool, server_part(server, tool))];
     }
     if CODEX_AGENT_NAMESPACES.contains(&namespace) {
         return vec![share(Part::AgentReports, 1)];
     }
     if let Some((server, tool)) = base.split_once("__") {
         // A code cell's `tools.<server>__<tool>(` form.
-        return vec![share(
-            if CODEX_AGENT_NAMESPACES.contains(&server) {
-                Part::AgentReports
-            } else if matches!(server, "clock" | "tool_search") {
-                Part::BuiltInOther
-            } else {
-                server_part(server, tool)
-            },
-            1,
-        )];
+        let part = if CODEX_AGENT_NAMESPACES.contains(&server) {
+            Part::AgentReports
+        } else if matches!(server, "clock" | "tool_search") {
+            Part::BuiltInOther
+        } else {
+            server_part(server, tool)
+        };
+        return vec![server_share(server, tool, part)];
     }
     if namespace.is_empty() && base == "exec" && depth == 0 {
         return codex_code_cell(input, cwd);
@@ -677,7 +699,9 @@ pub(super) fn item_shares(item: &InnerItem) -> Vec<CallShare> {
                 })
                 .collect()
         }
-        InnerItem::Mcp { server, tool, .. } => vec![share(server_part(server, tool), 1)],
+        InnerItem::Mcp { server, tool, .. } => {
+            vec![server_share(server, tool, server_part(server, tool))]
+        }
         InnerItem::Extension { name, .. } => codex_function(name, "", None, 1),
         InnerItem::WebSearch { .. } => vec![share(Part::Web, 1)],
     }

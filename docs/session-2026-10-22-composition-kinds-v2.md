@@ -19,14 +19,19 @@ checks every id the classifier produces against it.
   command into output-producing pipelines (reads, git, searches, tests and
   builds, other). The output splits evenly across pipelines and a read's share
   evenly across its files. `cd` changes the folder relative paths join to;
-  heredocs, `> file`, `tee` and `sed -i` are writes, never reads. Estimates.
+  heredocs, `> file`, `tee` and `sed -i` are writes, never reads; `test`,
+  `[`, `[[` and `read` print nothing. `git show rev:path` names a path relative
+  to the checkout root, so it stays as written (a reader without that root
+  names it by its basename); only `rev:./path` and `rev:../path` join to the
+  folder git runs in. Estimates.
 - Codex cells: split across the inner `item_completed` items in proportion to
   each item's output length. Codex's own `parsed_cmd` is used when every entry
   is a read, search or listing; otherwise our parser reads the command. Cells
   with no inner item fall back to the first `tools.<name>(` call in the code.
 - Add-on servers: computer use and browser are decided by server name, never
   by tool name (browser servers have a tool called `computer`). Plugin
-  (`plugin_<p>_<s>`) and connector (`claude_ai_<s>`) forms match by suffix.
+  (`plugin_<p>_<s>`) and connector (`claude_ai_<s>`) forms match by suffix;
+  `chrome_devtools` and `playwright` match anywhere in the name.
 - Prompts: written by an agent for Claude side chains and SDK entry points, and
   for any session the reader marks `Author::Agent`. Background task
   notifications are `other_tools` / `background_reports`; compaction summaries
@@ -46,10 +51,23 @@ checks every id the classifier produces against it.
 - `codex_cell` splits any kinds_version 2 call, Claude's included; a result
   with no call is classified with `claude_tool(ctx, "", &Value::Null)` or
   `codex_call(ctx, None, "")`, not `CallClass::unmatched()` (kinds_version 1).
+  `image` asserts this in debug builds; `codex_cell` has no line context, so
+  it cannot.
+- `CallShare.tool` and `CellShare.tool` name the add-on (MCP) tool behind a
+  share as `server/tool`, so add-on calls inside a Codex code cell (whose call
+  is `exec`) keep their server. Shares with different tools stay apart.
+- In a measured start, request-1 attachments are request-1 skips, never
+  unrendered skips.
 - `codex_event(ctx, "compacted")` counts a Codex compaction record.
 - `GitRootCache::v2()` finds each folder's checkout root (one `stat` per folder
-  walked, cached) and its repository hash (once per root), so files in another
-  checkout of the workspace's repository keep their repo-relative path.
+  walked, cached) and its repository hash (once per root, cached), so files in
+  another checkout of the workspace's repository keep their repo-relative path.
+  The hash is read from the files under `.git` without running git: a few
+  `stat`s, at most two small file reads and one `canonicalize` per root. It
+  equals the workspace identity's hash (a test checks a real repository and a
+  linked worktree). Each map holds at most 4096 entries; after that new
+  folders and roots are not looked up and `skipped()` counts them. One cache
+  should serve a whole scan.
 - `claude_attachment_known` feeds an unknown-type health counter.
 
 ## Validation

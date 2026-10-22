@@ -393,8 +393,9 @@ pub(crate) struct CallClass {
     /// or joined to the folder the read ran in (kinds_version 2).
     pub(crate) file: Option<Box<str>>,
     /// kinds_version 2: every share when the result shows more than one thing
-    /// (a shell command with several parts, a read of several files). Empty
-    /// when `kind`, `part` and `file` are the whole result.
+    /// (a shell command with several parts, a read of several files) or its
+    /// one share names an add-on tool. Empty when `kind`, `part` and `file`
+    /// are the whole result.
     pub(crate) shares: Box<[CallShare]>,
 }
 
@@ -406,6 +407,9 @@ pub(crate) struct CallShare {
     /// Relative size: shares split the result in proportion.
     pub(crate) weight: u32,
     pub(crate) file: Option<Box<str>>,
+    /// The add-on (MCP) tool behind the share, `server/tool`: a code cell's
+    /// call names `exec`, not the add-on tools it ran.
+    pub(crate) tool: Option<ToolKey>,
 }
 
 impl CallClass {
@@ -426,13 +430,14 @@ impl CallClass {
         Self::v1(Kind::OtherTools, ToolKey::new(""), None)
     }
 
-    /// A kinds_version 2 class from its shares; equal (kind, part, file)
-    /// shares merge.
+    /// A kinds_version 2 class from its shares; equal (kind, part, file,
+    /// tool) shares merge.
     fn from_shares(tool: ToolKey, shares: Vec<CallShare>) -> Self {
         let mut merged: Vec<CallShare> = Vec::with_capacity(shares.len());
         for share in shares {
             match merged.iter_mut().find(|known| {
-                (known.kind, known.part, &known.file) == (share.kind, share.part, &share.file)
+                (known.kind, known.part, &known.file, &known.tool)
+                    == (share.kind, share.part, &share.file, &share.tool)
             }) {
                 Some(known) => known.weight = known.weight.saturating_add(share.weight),
                 None => merged.push(share),
@@ -452,13 +457,14 @@ impl CallClass {
                 part: Part::BuiltInOther,
                 weight: 1,
                 file: None,
+                tool: None,
             });
         Self {
             kind: largest.kind,
             part: largest.part,
             tool,
             file: largest.file,
-            shares: if merged.len() > 1 {
+            shares: if merged.len() > 1 || largest.tool.is_some() {
                 merged.into_boxed_slice()
             } else {
                 Box::default()
@@ -474,6 +480,7 @@ impl CallClass {
                 part: self.part,
                 weight: 1,
                 file: self.file.clone(),
+                tool: None,
             }]
         } else {
             self.shares.to_vec()
@@ -541,6 +548,10 @@ pub(crate) fn claude_user_text(ctx: &LineCtx, line: &Value) -> Verdict {
 
 /// Image blocks: in a tool result (`call`) or directly in a message.
 pub(crate) fn image(ctx: &LineCtx, call: Option<&CallClass>) -> Verdict {
+    debug_assert!(
+        ctx.is_v1() || call.map_or(true, |call| call.part != Part::Unsplit),
+        "a kinds_version 2 line got a kinds_version 1 call class"
+    );
     if !ctx.is_v1() && call.map_or(true, |call| call.part != Part::Unsplit) {
         return v2::image(ctx, call);
     }
@@ -632,13 +643,17 @@ pub(crate) struct CellShare {
     pub(crate) part: Part,
     pub(crate) tokens: u64,
     pub(crate) file: Option<Box<str>>,
+    /// The add-on (MCP) tool behind the share, `server/tool`.
+    pub(crate) tool: Option<ToolKey>,
 }
 
 /// Split a call output's tokens: across the inner items the call wrote (a
 /// Codex cell, in proportion to each item's output length), else across the
 /// call's own shares (any agent's call). The shares sum to `output_tokens`;
 /// shares that round to nothing are dropped, keeping at least one.
-/// kinds_version 1 gives the call's whole output to the call's class.
+/// kinds_version 1 gives the call's whole output to the call's class, inner
+/// items or not; this function has no line context, so a kinds_version 2
+/// reader must never hand it a kinds_version 1 class (`CallClass::unmatched`).
 pub(crate) fn codex_cell(
     call: &CallClass,
     items: &[InnerItem],
@@ -650,6 +665,7 @@ pub(crate) fn codex_cell(
             part: call.part,
             tokens: output_tokens,
             file: call.file.clone(),
+            tool: None,
         }];
     }
     let mut cells: Vec<CellShare> = Vec::new();
@@ -657,7 +673,8 @@ pub(crate) fn codex_cell(
         let weights: Vec<u64> = shares.iter().map(|share| u64::from(share.weight)).collect();
         for (share, tokens) in shares.into_iter().zip(split_tokens(tokens, &weights)) {
             match cells.iter_mut().find(|cell| {
-                (cell.kind, cell.part, &cell.file) == (share.kind, share.part, &share.file)
+                (cell.kind, cell.part, &cell.file, &cell.tool)
+                    == (share.kind, share.part, &share.file, &share.tool)
             }) {
                 Some(cell) => cell.tokens += tokens,
                 None => cells.push(CellShare {
@@ -665,6 +682,7 @@ pub(crate) fn codex_cell(
                     part: share.part,
                     tokens,
                     file: share.file,
+                    tool: share.tool,
                 }),
             }
         }
@@ -798,8 +816,11 @@ const MAX_CACHED_FOLDERS: usize = 4096;
 /// default (kinds_version 1) looks nothing up and only strips the workspace
 /// prefix; `GitRootCache::v2` also finds each folder's checkout root (the
 /// nearest folder holding `.git`, one `stat` per folder walked) and that
-/// checkout's repository hash (once per root), so a file in another
-/// checkout of the same repository keeps its repo-relative path.
+/// checkout's repository hash (once per root, from the files under `.git`,
+/// without running git), so a file in another checkout of the same
+/// repository keeps its repo-relative path. Once a map holds
+/// `MAX_CACHED_FOLDERS` entries, new folders and roots are not looked up
+/// (the file keeps its basename) and `skipped` counts them.
 #[derive(Debug)]
 pub(crate) struct GitRootCache {
     lookup: bool,
@@ -807,6 +828,8 @@ pub(crate) struct GitRootCache {
     roots: std::collections::HashMap<String, Option<String>>,
     /// Checkout root -> repository hash.
     hashes: std::collections::HashMap<String, Option<String>>,
+    /// Lookups not made because a map was full.
+    skipped: u64,
     repository_hash: fn(&Path) -> Option<String>,
 }
 
@@ -816,14 +839,55 @@ impl Default for GitRootCache {
             lookup: false,
             roots: Default::default(),
             hashes: Default::default(),
+            skipped: 0,
             repository_hash,
         }
     }
 }
 
-/// The same repository hash the workspace identity uses.
+/// Largest `.git` or `commondir` file read.
+const MAX_GIT_POINTER_BYTES: u64 = 4096;
+
+/// The repository hash `resolve_repository_identity` gives a checkout root,
+/// read from the files git itself reads instead of running git: the hash of
+/// the canonical shared git folder (`--git-common-dir`). `<root>/.git` is that
+/// folder in a main checkout; in a linked worktree or submodule `.git` is a
+/// file naming the checkout's own git folder (`gitdir: ...`), whose
+/// `commondir` file, when present, names the shared one. `None` when the
+/// folder is not a git folder (no `HEAD`).
 fn repository_hash(root: &Path) -> Option<String> {
-    crate::context_footprint::resolve_repository_identity(root, false).repository_hash
+    fn read_small(path: &Path) -> Option<String> {
+        use std::io::Read as _;
+        let mut text = String::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take(MAX_GIT_POINTER_BYTES)
+            .read_to_string(&mut text)
+            .ok()?;
+        Some(text)
+    }
+    let dot_git = root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let text = read_small(&dot_git)?;
+        let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+        if target.is_empty() {
+            return None;
+        }
+        root.join(target)
+    };
+    if !git_dir.join("HEAD").is_file() {
+        return None;
+    }
+    let common_dir = match read_small(&git_dir.join("commondir")) {
+        Some(text) if !text.trim().is_empty() => git_dir.join(text.trim()),
+        _ => git_dir,
+    };
+    let common_dir = common_dir.canonicalize().unwrap_or(common_dir);
+    Some(crate::context_footprint::sha256_hex(&[common_dir
+        .to_string_lossy()
+        .as_ref()]))
 }
 
 impl GitRootCache {
@@ -834,6 +898,13 @@ impl GitRootCache {
             lookup: true,
             ..Self::default()
         }
+    }
+
+    /// Lookups not made because the cache was full (a health counter's
+    /// input).
+    #[allow(dead_code)] // Read once the reader keeps health counters.
+    pub(crate) fn skipped(&self) -> u64 {
+        self.skipped
     }
 
     /// The checkout root holding `folder` (absolute, normalized).
@@ -847,6 +918,10 @@ impl GitRootCache {
                 found = cached.clone();
                 break;
             }
+            if self.roots.len() + walked.len() >= MAX_CACHED_FOLDERS {
+                self.skipped += 1;
+                return None;
+            }
             walked.push(key.into_owned());
             if dir.join(".git").symlink_metadata().is_ok() {
                 found = Some(dir.to_string_lossy().into_owned());
@@ -855,9 +930,6 @@ impl GitRootCache {
             current = dir.parent();
         }
         for dir in walked {
-            if self.roots.len() >= MAX_CACHED_FOLDERS {
-                break;
-            }
             self.roots.insert(dir, found.clone());
         }
         found
@@ -867,10 +939,12 @@ impl GitRootCache {
         if let Some(hash) = self.hashes.get(root) {
             return hash.clone();
         }
-        let hash = (self.repository_hash)(Path::new(root));
-        if self.hashes.len() < MAX_CACHED_FOLDERS {
-            self.hashes.insert(root.to_string(), hash.clone());
+        if self.hashes.len() >= MAX_CACHED_FOLDERS {
+            self.skipped += 1;
+            return None;
         }
+        let hash = (self.repository_hash)(Path::new(root));
+        self.hashes.insert(root.to_string(), hash.clone());
         hash
     }
 

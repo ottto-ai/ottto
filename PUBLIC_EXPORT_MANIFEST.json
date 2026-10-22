@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 764,
-  "content_sha256": "a573caad64d2f2a886ed00c41b530a698514619c819c4ef8ba2d781d538e6449",
+  "content_sha256": "ae52062643cf00981b1dddb40d62d72922745a4f7640c29e8b17c6763f9021b3",
   "files": [
     {
       "executable": false,
@@ -902,36 +902,36 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/mod.rs",
-      "sha256": "e7313945695b76eed8e9eb230cc34bab587103937b50aaeb4278d92b067928cd",
-      "size_bytes": 37264
+      "sha256": "0014c10e93fd06c11ec7eee73a86c4e085eccf3b59db7ff0fff8494701338379",
+      "size_bytes": 40266
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/shell.rs",
-      "sha256": "af19511432a4d6b16e2b531795bf0d7106cc10ae2eae1a0c25f9f66224e89a59",
-      "size_bytes": 46107
+      "sha256": "56763bf9324f81d2e9082ee3aac7287596fd3f03b17b9f1de7672f7f77e37134",
+      "size_bytes": 46664
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/tests.rs",
-      "sha256": "25fb3eeb81131bf3bc67a083dc622b4b065bf4e08586c0580a8262c306f7992d",
-      "size_bytes": 14260
+      "sha256": "7b99fdbb98df19a287cb5d963f064f82f344b794280d6ee8b843adacb6be001e",
+      "size_bytes": 14292
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/tests_v2.rs",
-      "sha256": "d5e935d53b73938f6185734e6724e899cbc2e9bb8c44ec38868b79ec6554cf5a",
-      "size_bytes": 55940
+      "sha256": "442e68fb2c78948078ecaf128fb1b3f94f337a729abece8841cadc7728463e98",
+      "size_bytes": 62779
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/composition_kinds/v2.rs",
-      "sha256": "f8cd14a04d77a51b1f37ec9f1c6b642ea41c1229acffd2005bd3c9063b8a003a",
-      "size_bytes": 27539
+      "sha256": "bd64c3f21aa534e0f97eeecf02569145303bacb9661603c69aa041419ea214a6",
+      "size_bytes": 28427
     },
     {
       "executable": false,
@@ -3583,8 +3583,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-composition-kinds-v2.md",
-      "sha256": "01dcfdbab23511336ea5b06b9fcf23c69f9f43e818da3b8441ca4dc8b6bb0553",
-      "size_bytes": 3595
+      "sha256": "c272cd0b45e4ca8eb800a4c64c89ad9c323ddb01f1f5e2ae1f7291360f248891",
+      "size_bytes": 4745
     },
     {
       "executable": false,
