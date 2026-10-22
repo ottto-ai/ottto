@@ -11790,8 +11790,9 @@ fn claude_transcript_file_live_window(path: &Path) -> Option<ClaudeTranscriptLiv
 }
 
 /// Reads at most the first and last `CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES` and
-/// takes the top-level `timestamp` of each whole line there. The start is
-/// also capped by the file's birth time where the platform has one.
+/// takes the top-level `timestamp` of each whole line there; each read must
+/// yield one. The start is also capped by the file's birth time where the
+/// platform has one.
 fn read_claude_transcript_live_window(
     path: &Path,
 ) -> Result<(fs::Metadata, Option<ClaudeTranscriptLiveWindow>)> {
@@ -11841,6 +11842,7 @@ fn read_claude_transcript_live_window(
             lines.pop();
         }
         let skip = usize::from(!starts_whole);
+        let mut region_dated = false;
         for line in lines.into_iter().skip(skip) {
             let Some(stamp) = serde_json::from_slice::<Stamp>(line)
                 .ok()
@@ -11849,8 +11851,14 @@ fn read_claude_transcript_live_window(
             else {
                 continue;
             };
+            region_dated = true;
             first = Some(first.map_or(stamp, |first| first.min(stamp)));
             last = Some(last.map_or(stamp, |last| last.max(stamp)));
+        }
+        // A head or tail filled by one oversized record cannot place that
+        // end; the other region's stamps would understate the window.
+        if !region_dated {
+            return Ok((metadata, None));
         }
     }
     let born = metadata
@@ -57451,6 +57459,20 @@ mod tests {
                 .map(|lineage| lineage.parent_session_id.clone()),
             Some(spawn_cli("old"))
         );
+
+        // A final record larger than the tail read leaves the end unknown.
+        let oversized_tail = project.join("oversized-tail.jsonl");
+        fs::write(
+            &oversized_tail,
+            format!(
+                "{}{}{{\"type\":\"user\",\"timestamp\":\"2026-09-30T00:00:00Z\",\"pad\":\"{}\"}}\n",
+                line("2026-09-09T18:31:55Z"),
+                filler.repeat(64),
+                "x".repeat(CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES as usize * 2)
+            ),
+        )
+        .expect("write oversized tail");
+        assert_eq!(claude_transcript_file_live_window(&oversized_tail), None);
 
         // Without the old transcript on disk the child is undatable.
         fs::remove_file(&old_path).expect("remove old transcript");
