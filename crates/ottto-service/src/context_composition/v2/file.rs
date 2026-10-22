@@ -5,8 +5,12 @@
 use super::aggregate::{Day, Entered, Sink, Slot};
 use super::checkpoint::ParseState;
 use super::reader::{LineEvent, LineReader};
+use super::upload::safe_file_name;
 use super::{claude, codex};
-use crate::composition_kinds::Kind;
+use crate::composition_kinds::{
+    self as kinds, Agent, Author, CallClass, CellShare, GitRootCache, Kind, KindsVersion, LineCtx,
+    Request1,
+};
 use std::fs::File;
 use std::path::Path;
 use std::time::Instant;
@@ -36,6 +40,44 @@ pub(super) struct LineStats {
     pub(super) classifier_skipped: u64,
     pub(super) dropped_calls: u64,
     pub(super) dropped_items: u64,
+    /// File names left out of the totals: not display-safe (the tokens
+    /// still count, under no file).
+    pub(super) unnamed_files: u64,
+    /// Codex `web_search_end` events inside an open call: the call's output
+    /// holds the search, so it counts once, there.
+    pub(super) web_search_in_call: u64,
+}
+
+/// How the file paths a transcript names become the names kept in state:
+/// repo-relative within the scope's repository (any checkout of it), else
+/// the basename, resolved when the line is read (a worktree removed later
+/// can no longer be looked up). State never keeps an absolute path.
+pub(super) enum Names<'a> {
+    Resolve {
+        /// One per scan, shared by every scope.
+        cache: &'a mut GitRootCache,
+        workspace: &'a Path,
+        repository_hash: Option<&'a str>,
+    },
+    /// Paths as written (the kinds_version 1 parity tests compare with the
+    /// kinds_version 1 reader, which keeps them so).
+    #[cfg(test)]
+    Raw,
+}
+
+impl Names<'_> {
+    fn name(&mut self, raw: &str) -> Option<String> {
+        match self {
+            Names::Resolve {
+                cache,
+                workspace,
+                repository_hash,
+            } => kinds::repo_relative(raw, workspace, *repository_hash, cache)
+                .and_then(|name| safe_file_name(&name)),
+            #[cfg(test)]
+            Names::Raw => Some(raw.to_string()),
+        }
+    }
 }
 
 /// What line handlers write to: the scope's totals and the counters.
@@ -46,9 +88,79 @@ pub(super) struct LineSink<'a> {
     /// Day for lines without a timestamp: the day they are read.
     pub(super) fallback_day: Day,
     pub(super) stats: &'a mut LineStats,
+    /// The methodology lines are classified with: kinds_version 2, except
+    /// in the tests that compare with the kinds_version 1 reader.
+    pub(super) kinds: KindsVersion,
+    pub(super) names: Names<'a>,
 }
 
 impl LineSink<'_> {
+    /// The classifier's context for one line.
+    pub(super) fn ctx<'p>(
+        &self,
+        agent: Agent,
+        cwd: Option<&'p Path>,
+        file_has_rendered: bool,
+        author: Author,
+    ) -> LineCtx<'p> {
+        match self.kinds {
+            KindsVersion::V1 => LineCtx::v1(agent),
+            // The request-1 phase is not tracked yet: every line is after it.
+            KindsVersion::V2 => LineCtx::v2(agent, Request1::No, cwd, file_has_rendered, author),
+        }
+    }
+
+    /// One tool call's result, split into the call's shares (`cells`, from
+    /// `codex_cell`). Each share counts under its own kind, part and file;
+    /// the tool totals count it under the add-on tool behind it, else the
+    /// call's own tool, once per call for each tool.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn result(
+        &mut self,
+        state: &mut ParseState,
+        day: Day,
+        call: &CallClass,
+        cells: Vec<CellShare>,
+        ts: Option<i64>,
+        copied: bool,
+    ) {
+        // (tool, tokens, the kind of its largest share and that share's tokens)
+        let mut tools: Vec<(&str, u64, Kind, u64)> = Vec::new();
+        for cell in &cells {
+            let tool = cell
+                .tool
+                .as_ref()
+                .map_or(call.tool.as_str(), |tool| tool.as_str());
+            let slot = Slot::new(cell.kind, cell.part, tool);
+            self.record(
+                state,
+                day,
+                slot,
+                cell.tokens,
+                0,
+                cell.file.as_deref(),
+                ts,
+                copied,
+            );
+            match tools.iter_mut().find(|(known, ..)| *known == tool) {
+                Some((_, tokens, kind, largest)) => {
+                    *tokens += cell.tokens;
+                    if cell.tokens > *largest {
+                        *kind = cell.kind;
+                        *largest = cell.tokens;
+                    }
+                }
+                None => tools.push((tool, cell.tokens, cell.kind, cell.tokens)),
+            }
+        }
+        if copied {
+            return;
+        }
+        for (tool, tokens, kind, _) in tools {
+            self.tool(day, tool, kind, &state.session, tokens, true);
+        }
+    }
+
     /// A counted request: every open line stays in context for it.
     pub(super) fn request(&mut self, state: &ParseState) {
         for (day, slot, tokens) in &state.open {
@@ -73,13 +185,23 @@ impl LineSink<'_> {
         if !self.sink.window.contains(day) {
             return;
         }
+        debug_assert!(
+            self.kinds == KindsVersion::V1 || Kind::V2.contains(&slot.kind),
+            "a kinds_version 2 line counted under {:?}",
+            slot.kind
+        );
         if !copied {
+            let name = file.and_then(|raw| {
+                let name = self.names.name(raw);
+                self.stats.unnamed_files += u64::from(name.is_none());
+                name
+            });
             self.sink.entered(&Entered {
                 day,
                 slot: slot.clone(),
                 tokens,
                 images,
-                file,
+                file: name.as_deref(),
                 session: &state.session,
                 ts,
             });

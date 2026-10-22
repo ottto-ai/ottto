@@ -10,7 +10,7 @@
 //! prompt-snapshot and deferred-tools records are never counted, and copied
 //! history is found by its timestamp, not its record id.
 
-use super::super::measure::{basename, basename_stem, serialize_attachment};
+use super::super::measure::{basename, basename_stem, python_json_dumps, serialize_attachment};
 use super::super::IMAGE_NOMINAL_TOKENS;
 use super::aggregate::{Day, Slot};
 use super::checkpoint::{LastAssistant, ParseState};
@@ -20,8 +20,7 @@ use super::decode::{
 };
 use super::file::LineSink;
 use crate::composition_kinds::{
-    self as kinds, Agent, Author, CallClass, ClaudeAttachment, KindsVersion, LineCtx, Request1,
-    Verdict,
+    self as kinds, Agent, Author, ClaudeAttachment, Kind, KindsVersion, LineCtx, Part, Verdict,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -150,15 +149,12 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         Author::You
     };
     let cwd = state.cwd.clone();
-    let ctx = LineCtx {
-        agent: Agent::Claude,
-        request_1: Request1::No,
-        cwd: cwd.as_deref().map(Path::new),
-        file_has_rendered: state.has_rendered,
+    let ctx = out.ctx(
+        Agent::Claude,
+        cwd.as_deref().map(Path::new),
+        state.has_rendered,
         author,
-        // kinds_version 1 ids until this reader adopts the v2 classifier.
-        kinds_version: KindsVersion::V1,
-    };
+    );
 
     let blocks: Vec<Raw> = message
         .as_ref()
@@ -206,35 +202,20 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         match block.kind.str().as_deref().unwrap_or("") {
             "tool_result" => {
                 has_result = true;
+                // A result whose call is not in the file: the classifier's
+                // class for a call with no name.
                 let call = block
                     .tool_use_id
                     .str()
                     .and_then(|id| state.open_calls.remove(id.as_ref()))
                     .map(|call| call.class)
-                    .unwrap_or_else(CallClass::unmatched);
+                    .unwrap_or_else(|| kinds::claude_tool(&ctx, "", &Value::Null));
                 let (chars, images) = content_chars_and_images(block.content);
                 let tokens = tokens_for_chars(chars);
-                let slot = Slot::new(call.kind, call.part, call.tool.as_str());
-                out.record(
-                    state,
-                    day,
-                    slot,
-                    tokens,
-                    0,
-                    call.file.as_deref(),
-                    ts_secs,
-                    copied,
-                );
-                if !copied {
-                    out.tool(
-                        day,
-                        call.tool.as_str(),
-                        call.kind,
-                        &state.session,
-                        tokens,
-                        true,
-                    );
-                }
+                // Split over the call's shares (a command's segments, a read
+                // of several files).
+                let cells = kinds::codex_cell(&call, &[], tokens);
+                out.result(state, day, &call, cells, ts_secs, copied);
                 if images > 0 {
                     if let Verdict::Count { kind, part } = kinds::image(&ctx, Some(&call)) {
                         let tokens = images * IMAGE_NOMINAL_TOKENS;
@@ -339,17 +320,63 @@ fn attachment(
         file_type,
         has_rendered,
     };
-    let ctx = LineCtx {
-        file_has_rendered: state.has_rendered,
-        ..*ctx
-    };
+    // This line may be the file's first with `rendered` text.
+    let ctx = out.ctx(Agent::Claude, ctx.cwd, state.has_rendered, ctx.author);
     match kinds::claude_attachment(&ctx, &facts) {
         Verdict::Count { kind, part } => {
             let text = serialize_attachment(&att);
             let tokens = tokens_for_chars(text.chars().count());
+            if out.kinds == KindsVersion::V2 && att_type == "instructions" {
+                if let Some(shares) = instruction_shares(&ctx, &att, &facts) {
+                    let weights: Vec<u64> = shares.iter().map(|(_, _, weight)| *weight).collect();
+                    for ((kind, part, _), tokens) in shares
+                        .into_iter()
+                        .zip(kinds::split_tokens(tokens, &weights))
+                    {
+                        let slot = Slot::plain(kind, part);
+                        out.record(state, day, slot, tokens, 0, None, ts, copied);
+                    }
+                    return;
+                }
+            }
+            // kinds_version 2 lists only files read (the top-file parts);
+            // a mentioned or changed file is context, not a read.
+            let file =
+                filename.filter(|_| out.kinds == KindsVersion::V1 || kind == Kind::FilesRead);
             let slot = Slot::plain(kind, part);
-            out.record(state, day, slot, tokens, 0, filename, ts, copied);
+            out.record(state, day, slot, tokens, 0, file, ts, copied);
         }
         Verdict::Skip(_) => out.stats.classifier_skipped += 1,
     }
+}
+
+/// An instructions attachment's `files[]` entries, each classified with its
+/// own `type` (project instructions and auto-memory reload together) and
+/// weighted by its size; equal parts merge. `None` when it lists at most one
+/// kind of entry (the attachment counts whole).
+fn instruction_shares(
+    ctx: &LineCtx,
+    att: &Value,
+    facts: &ClaudeAttachment,
+) -> Option<Vec<(Kind, Part, u64)>> {
+    let files = att.get("files")?.as_array()?;
+    let mut shares: Vec<(Kind, Part, u64)> = Vec::new();
+    for entry in files {
+        let entry_facts = ClaudeAttachment {
+            file_type: entry.get("type").and_then(Value::as_str),
+            ..*facts
+        };
+        let Verdict::Count { kind, part } = kinds::claude_attachment(ctx, &entry_facts) else {
+            continue;
+        };
+        let weight = python_json_dumps(entry).chars().count() as u64;
+        match shares
+            .iter_mut()
+            .find(|(known, known_part, _)| (*known, *known_part) == (kind, part))
+        {
+            Some((_, _, total)) => *total += weight,
+            None => shares.push((kind, part, weight)),
+        }
+    }
+    (shares.len() > 1).then_some(shares)
 }

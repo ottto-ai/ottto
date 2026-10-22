@@ -28,7 +28,7 @@ use super::{
     COLLECTOR_VERSION, MAX_TOOL_LABEL_CHARS, UPLOAD_MAX_PARTS, UPLOAD_STALENESS_SECS,
     UPLOAD_TOP_FILES, UPLOAD_TOP_SERVERS, UPLOAD_TOP_SESSIONS, UPLOAD_TOP_TOOLS,
 };
-use crate::composition_kinds::{repo_relative, GitRootCache, Kind, Part};
+use crate::composition_kinds::{Kind, Part};
 use crate::context_footprint::sha256_hex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -210,6 +210,10 @@ pub(super) struct FileRow {
     pub(super) part: Option<String>,
     pub(super) events_30d: u64,
     pub(super) tokens_entered_est_30d: u64,
+    /// Sessions that read the file in the window and in the 30-day period;
+    /// a subagent's transcript counts as its parent session.
+    pub(super) session_count: u64,
+    pub(super) session_count_30d: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -326,11 +330,10 @@ fn safe_text(raw: &str, max: usize) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// A kinds_version 2 kind. The reader classifies with kinds_version 2 only
+/// (a debug build stops on anything else when the line is read); this guard
+/// keeps a release build's upload acceptable if one ever slips through.
 fn is_v2(kind: Kind) -> bool {
-    #[cfg(test)]
-    if tests::accept_v1_kinds() {
-        return true;
-    }
     Kind::V2.contains(&kind)
 }
 
@@ -359,7 +362,7 @@ fn safe_repository_label(raw: &str) -> Option<String> {
 }
 
 /// A file name the server accepts: display-safe, relative, no `..` part.
-fn safe_file_name(raw: &str) -> Option<String> {
+pub(super) fn safe_file_name(raw: &str) -> Option<String> {
     let text = safe_text(raw, MAX_FILE_NAME_CHARS)?;
     let absolute =
         text.starts_with(['/', '\\', '~']) || text.contains(":/") || text.contains(":\\");
@@ -662,32 +665,24 @@ fn tool_row(
 
 fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<FileRow> {
     let agg = &scope.agg;
-    let workspace = Path::new(&scope.info.workspace_path);
-    let repository_hash = scope.info.identity.repository_hash.as_deref();
-    let mut cache = GitRootCache::default();
-    let mut names: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // Names were resolved when their lines were read; this only keeps the
+    // server's rules. A top file is a file read (a `files_read` part).
     let mut unsafe_names = 0u64;
-    let mut name_of = |path: &str| -> Option<String> {
-        names
-            .entry(path.to_string())
-            .or_insert_with(|| {
-                let name = repo_relative(path, workspace, repository_hash, &mut cache)?;
-                let safe = safe_file_name(&name);
-                unsafe_names += u64::from(safe.is_none());
-                safe
-            })
-            .clone()
+    let mut non_v2 = 0u64;
+    let mut keep = |path: &str, kind: Kind, part: Part| -> Option<String> {
+        if !part_of(kind, part) || kind != Kind::FilesRead {
+            non_v2 += 1;
+            return None;
+        }
+        let name = safe_file_name(path);
+        unsafe_names += u64::from(name.is_none());
+        name
     };
     // name -> per (kind, part) totals, all kept and 30 days.
     type Totals = BTreeMap<(Kind, Part), (FileTotals, FileTotals)>;
     let mut by_name: BTreeMap<String, Totals> = BTreeMap::new();
-    let mut non_v2 = 0u64;
     for (key, totals) in &agg.all_files {
-        if !is_v2(key.kind) {
-            non_v2 += 1;
-            continue;
-        }
-        let Some(name) = name_of(&key.path) else {
+        let Some(name) = keep(&key.path, key.kind, key.part) else {
             continue;
         };
         let entry = by_name
@@ -698,10 +693,10 @@ fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<File
         merge_file_totals(&mut entry.0, totals);
     }
     for ((day, key), totals) in &agg.day_files {
-        if *day < window.period_floor || !is_v2(key.kind) {
+        if *day < window.period_floor {
             continue;
         }
-        let Some(name) = name_of(&key.path) else {
+        let Some(name) = keep(&key.path, key.kind, key.part) else {
             continue;
         };
         let entry = by_name
@@ -716,7 +711,7 @@ fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<File
     let mut rows: Vec<FileRow> = by_name
         .into_iter()
         .filter_map(|(name, slots)| {
-            // The file's kind is the one it entered the most tokens under.
+            // The file's part is the one it entered the most tokens under.
             let (&(kind, part), _) = slots.iter().max_by(|a, b| {
                 (a.1)
                     .0
@@ -739,9 +734,11 @@ fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<File
                 events: all.events.max(recent.events),
                 tokens_entered_est: all.tokens.max(recent.tokens),
                 last_accessed_at: all.last.or(recent.last).and_then(iso),
-                part: part_of(kind, part).then(|| part.as_str().to_string()),
+                part: Some(part.as_str().to_string()),
                 events_30d: recent.events,
                 tokens_entered_est_30d: recent.tokens,
+                session_count: 0,
+                session_count_30d: 0,
             })
         })
         .collect();
@@ -751,7 +748,55 @@ fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<File
             .then_with(|| a.relative_path_or_name.cmp(&b.relative_path_or_name))
     });
     rows.truncate(UPLOAD_TOP_FILES);
+    count_file_sessions(scope, window, &mut rows);
     rows
+}
+
+/// The session a transcript belongs to: a Claude subagent's transcript
+/// (`<session> (subagent:<id>)`) folds into its parent session; any other
+/// counts alone.
+fn parent_session(session: &str) -> &str {
+    match session.find(" (subagent:") {
+        Some(at) if session.ends_with(')') => &session[..at],
+        _ => session,
+    }
+}
+
+/// Fill each top file's session counts from the checkpoints' own per-day
+/// file rows (the days still in the window): no state of its own.
+fn count_file_sessions(scope: &Scope, window: Window, rows: &mut [FileRow]) {
+    let mut sessions: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = rows
+        .iter()
+        .map(|row| (row.relative_path_or_name.as_str(), Default::default()))
+        .collect();
+    for checkpoint in scope.files.values() {
+        let Some(session) = checkpoint.contribution.session() else {
+            continue;
+        };
+        let session = parent_session(session);
+        for (day, path) in checkpoint.contribution.file_days() {
+            if !window.contains(day) {
+                continue;
+            }
+            // Names in state are the safe names the rows carry.
+            if let Some((all, recent)) = sessions.get_mut(path) {
+                all.insert(session);
+                if day >= window.period_floor {
+                    recent.insert(session);
+                }
+            }
+        }
+    }
+    let counts: BTreeMap<String, (u64, u64)> = sessions
+        .into_iter()
+        .map(|(name, (all, recent))| (name.to_string(), (all.len() as u64, recent.len() as u64)))
+        .collect();
+    for row in rows {
+        if let Some((all, recent)) = counts.get(&row.relative_path_or_name) {
+            row.session_count = *all;
+            row.session_count_30d = *recent;
+        }
+    }
 }
 
 /// The top sessions of each period (their union), with the period counts.
@@ -839,25 +884,5 @@ trait TopKind {
 impl TopKind for Option<(Kind, u64)> {
     fn is_none_or_less(&self, tokens: u64) -> bool {
         self.map_or(true, |(_, best)| tokens > best)
-    }
-}
-
-#[cfg(test)]
-pub(super) mod tests {
-    use std::cell::Cell;
-
-    thread_local! {
-        static ACCEPT_V1_KINDS: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Until the kinds_version 2 classifier lands, fixture lines classify to
-    /// kinds_version 1 ids; tests of row selection (which days, which zero
-    /// rows) accept them in daily rows, files, sessions and tools.
-    pub(in super::super) fn set_accept_v1_kinds(accept: bool) {
-        ACCEPT_V1_KINDS.with(|cell| cell.set(accept));
-    }
-
-    pub(super) fn accept_v1_kinds() -> bool {
-        ACCEPT_V1_KINDS.with(Cell::get)
     }
 }

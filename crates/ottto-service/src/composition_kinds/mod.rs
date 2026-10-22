@@ -720,8 +720,9 @@ impl InnerItem<'_> {
 }
 
 /// `total` split in proportion to `weights`, summing to `total` exactly
-/// (largest remainders first, earlier shares on ties).
-fn split_tokens(total: u64, weights: &[u64]) -> Vec<u64> {
+/// (largest remainders first, earlier shares on ties). All weights zero: the
+/// first share takes everything.
+pub(crate) fn split_tokens(total: u64, weights: &[u64]) -> Vec<u64> {
     let sum: u128 = weights.iter().map(|weight| u128::from(*weight)).sum();
     if sum == 0 {
         let mut even = vec![0; weights.len()];

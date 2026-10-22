@@ -1095,6 +1095,34 @@ impl StoredContribution {
         Some(share)
     }
 
+    /// The file's session, as first counted.
+    pub(super) fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
+    /// (day, file name) of each per-day file row.
+    pub(super) fn file_days(&self) -> impl Iterator<Item = (Day, &str)> {
+        self.files.iter().map(|row| (row.0, row.1.as_str()))
+    }
+
+    /// Bytes held in memory, approximately: each row's fixed part and its
+    /// text.
+    pub(super) fn accounted_bytes(&self) -> usize {
+        const ROW: usize = 96;
+        self.parts
+            .iter()
+            .map(|row| ROW + row.1.len() + row.2.len() + row.3.as_ref().map_or(0, String::len))
+            .chain(
+                self.files
+                    .iter()
+                    .map(|row| ROW + row.1.len() + row.2.len() + row.3.len()),
+            )
+            .chain(self.tools.iter().map(|row| ROW / 2 + row.1.len()))
+            .chain(self.sessions.iter().map(|row| ROW / 2 + row.1.len()))
+            .sum::<usize>()
+            + self.session.as_ref().map_or(0, String::len)
+    }
+
     /// Drop days before `floor` (their daily rows are gone).
     pub(super) fn prune(&mut self, floor: Day) {
         self.parts.retain(|row| row.0 >= floor);

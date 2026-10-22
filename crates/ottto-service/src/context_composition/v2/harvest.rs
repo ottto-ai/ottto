@@ -29,7 +29,7 @@ use super::checkpoint::{
     birth_secs, born_secs, file_identity, fingerprints, fingerprints_match, prefix_matches,
     read_json, stamp, write_json, Checkpoint, Index, Pin, RunRecord, Stamp, Status, StoredParse,
 };
-use super::file::{head_cwds, new_parse_state, read_lines, LineSink, LineStats, Source};
+use super::file::{head_cwds, new_parse_state, read_lines, LineSink, LineStats, Names, Source};
 use super::scope::{
     linked_worktrees, load_scope, resolved_missing, save_scope, scope_path, GitScopeResolver,
     Scope, ScopeInfo, ScopeResolver,
@@ -39,6 +39,7 @@ use super::{
     COPIED_SLACK_SECS, FORGET_MISSING_DAYS, KEEP_DAYS, LIVE_AT_INSTALL, MIN_UPTIME, PARSER_VERSION,
     REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
 };
+use crate::composition_kinds::{GitRootCache, KindsVersion};
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
@@ -257,7 +258,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} bad_state={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} bad_state={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -275,6 +276,9 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         lines.bad_lines,
         lines.dropped_calls,
         lines.dropped_items,
+        lines.unnamed_files,
+        stats.name_lookups_skipped,
+        lines.web_search_in_call,
         stats.scan_errors,
         stats.repair_waiting,
         stats.repair_waiting_bytes,
@@ -456,6 +460,9 @@ pub(super) struct SourceStats {
     pub(super) upload_failed: u64,
     pub(super) upload_dropped_non_v2: u64,
     pub(super) upload_dropped_unsafe: u64,
+    /// File-name lookups not made because the scan's folder cache was full
+    /// (those files keep their basename).
+    pub(super) name_lookups_skipped: u64,
     pub(super) lines: LineStats,
     pub(super) cut: bool,
     pub(super) cpu_micros: u64,
@@ -836,10 +843,13 @@ pub(super) fn run_source(
     });
 
     // Pins first, so no file ever counts in two scopes.
-    if write_json(&path, &index).is_err() {
-        stats.scopes_failed += 1;
-        finish(&mut stats, started, cpu_started);
-        return stats;
+    match write_json(&path, &index) {
+        Ok(bytes) => stats.state_bytes += bytes,
+        Err(_) => {
+            stats.scopes_failed += 1;
+            finish(&mut stats, started, cpu_started);
+            return stats;
+        }
     }
 
     let mut by_scope: BTreeMap<String, Vec<Work>> = BTreeMap::new();
@@ -864,6 +874,9 @@ pub(super) fn run_source(
         .collect();
     order.sort_by(|a, b| b.cmp(a));
 
+    // One folder cache for the whole scan: file names resolve when their
+    // line is read.
+    let mut names = GitRootCache::v2();
     let mut uploaded = BTreeSet::new();
     for (_, scope_id) in order {
         if stats.cut {
@@ -871,7 +884,7 @@ pub(super) fn run_source(
         }
         let items = by_scope.remove(&scope_id).unwrap_or_default();
         let Some(scope) = process_scope(
-            run, source, &scope_id, items, &mut index, &present, window, &mut stats,
+            run, source, &scope_id, items, &mut index, &present, window, &mut names, &mut stats,
         ) else {
             continue;
         };
@@ -881,8 +894,11 @@ pub(super) fn run_source(
             uploaded.insert(scope_id);
         }
     }
+    stats.name_lookups_skipped = names.skipped();
     tidy_index(&mut index, today);
-    let _ = write_json(&path, &index);
+    if let Ok(bytes) = write_json(&path, &index) {
+        stats.state_bytes += bytes;
+    }
 
     if let Some(target) = target.as_mut() {
         upload_other_scopes(run, source, &index, &uploaded, target, window, &mut stats);
@@ -1033,6 +1049,7 @@ fn process_scope(
     index: &mut Index,
     present: &BTreeMap<String, Found>,
     window: Window,
+    names: &mut GitRootCache,
     stats: &mut SourceStats,
 ) -> Option<Scope> {
     let path = scope_path(&run.state_dir, source, scope_id);
@@ -1084,6 +1101,11 @@ fn process_scope(
             Scope::new(scope_id, info)
         }
     };
+    // The loaded checkpoints and totals stay in memory for the whole scope;
+    // loading held the file's bytes next to them.
+    let held = scope.accounted_bytes();
+    let loaded_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
+    stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(held + loaded_bytes);
     let generation = scope.generation + 1;
     // Oldest transcript first (a stable order).
     items.sort_by(|a, b| {
@@ -1112,7 +1134,8 @@ fn process_scope(
             continue;
         };
         match read_file(
-            run, source, &mut scope, &item, start, first_seen, window, generation, stats,
+            run, source, &mut scope, &item, start, first_seen, window, generation, names, held,
+            stats,
         ) {
             Ok(Some(Outcome::Read(checkpoint))) => {
                 read_files.push((item.key, *checkpoint));
@@ -1178,7 +1201,13 @@ fn process_scope(
         return None;
     }
     match save_scope(&path, source, &scope) {
-        Ok(bytes) => stats.state_bytes += bytes,
+        Ok(bytes) => {
+            stats.state_bytes += bytes;
+            // Writing serializes the whole scope into one buffer.
+            stats.peak_accounted_bytes = stats
+                .peak_accounted_bytes
+                .max(scope.accounted_bytes() + bytes as usize);
+        }
         Err(_) => {
             stats.scopes_failed += 1;
             return None;
@@ -1241,6 +1270,8 @@ fn read_file(
     first_seen: i64,
     window: Window,
     generation: u64,
+    names: &mut GitRootCache,
+    held: usize,
     stats: &mut SourceStats,
 ) -> Result<Option<Outcome>, ReadFailed> {
     let opened = File::open(&item.found.path)
@@ -1344,6 +1375,12 @@ fn read_file(
         copied_before: Some(checkpoint.created - COPIED_SLACK_SECS),
         fallback_day: window.today,
         stats: &mut stats.lines,
+        kinds: KindsVersion::V2,
+        names: Names::Resolve {
+            cache: names,
+            workspace: Path::new(&scope.info.workspace_path),
+            repository_hash: scope.info.identity.repository_hash.as_deref(),
+        },
     };
     let end = match read_lines(
         reader_file,
@@ -1373,12 +1410,10 @@ fn read_file(
         stats.bytes_failed += end.bytes;
         return Err(ReadFailed);
     };
-    stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(
-        end.buffer_bytes
-            + state.accounted_bytes()
-            + scope.agg.accounted_bytes()
-            + delta.accounted_bytes(),
-    );
+    // `held`: the scope's checkpoints and totals as loaded.
+    stats.peak_accounted_bytes = stats
+        .peak_accounted_bytes
+        .max(held + end.buffer_bytes + state.accounted_bytes() + delta.accounted_bytes());
     // The read succeeded: only now does it change the scope's totals.
     if let Some(old) = old_share {
         scope.agg.subtract(&old, generation);

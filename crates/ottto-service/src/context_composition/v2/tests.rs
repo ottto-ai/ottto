@@ -19,13 +19,13 @@ use super::aggregate::{
 };
 use super::checkpoint::{CopiedMode, Index, ParseState, StoredParse};
 use super::decode::{claude_never_counted, codex_never_counted, content_chars_and_images, Raw};
-use super::file::{new_parse_state, read_lines, LineSink, LineStats, Source};
+use super::file::{new_parse_state, read_lines, LineSink, LineStats, Names, Source};
 use super::harvest::{begin_run, run_source, Run, SourceStats};
 use super::reader::{LineEvent, LineReader};
 use super::scope::{load_scope, scope_path, ScopeInfo, ScopeResolver};
 use super::upload::{UploadTarget, Uploader};
 use super::*;
-use crate::composition_kinds::Kind;
+use crate::composition_kinds::{GitRootCache, Kind, KindsVersion};
 use crate::context_footprint::sha256_hex;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,16 +74,50 @@ fn wide() -> Window {
 }
 
 /// Totals of one or more files read in pieces.
-#[derive(Default)]
 struct Reading {
     agg: Aggregate,
     stats: LineStats,
     contributions: BTreeMap<u32, Contribution>,
     /// Per file id: Claude records dated before this are copied history.
     copied_before: BTreeMap<u32, i64>,
+    /// kinds_version 2 as the reader runs; 1 to compare with the
+    /// kinds_version 1 reader.
+    kinds: KindsVersion,
+    /// File names resolved against this folder as a run does; paths as
+    /// written when `None`.
+    workspace: Option<PathBuf>,
+}
+
+impl Default for Reading {
+    fn default() -> Self {
+        Self {
+            agg: Aggregate::default(),
+            stats: LineStats::default(),
+            contributions: BTreeMap::new(),
+            copied_before: BTreeMap::new(),
+            kinds: KindsVersion::V2,
+            workspace: None,
+        }
+    }
 }
 
 impl Reading {
+    /// The kinds_version 1 methodology, for parity with its reader.
+    fn v1() -> Self {
+        Self {
+            kinds: KindsVersion::V1,
+            ..Self::default()
+        }
+    }
+
+    /// File names as a run in `workspace` (a folder scope) keeps them.
+    fn in_workspace(workspace: &Path) -> Self {
+        Self {
+            workspace: Some(workspace.to_path_buf()),
+            ..Self::default()
+        }
+    }
+
     /// Read `path` (file id `file_id`) ending a piece at each of `cuts`,
     /// round-tripping the parse state through its stored form between
     /// pieces, as a checkpoint does.
@@ -94,6 +128,7 @@ impl Reading {
         let mut skipping = false;
         let base = Aggregate::default();
         let copied_before = self.copied_before.get(&file_id).copied();
+        let mut cache = GitRootCache::v2();
         for end in cuts.iter().copied().chain([len]) {
             state = StoredParse::from_state(&state).into_state().unwrap();
             let contribution = self.contributions.entry(file_id).or_default();
@@ -108,6 +143,15 @@ impl Reading {
                 copied_before,
                 fallback_day: day_of(fallback_date()),
                 stats: &mut self.stats,
+                kinds: self.kinds,
+                names: match &self.workspace {
+                    Some(workspace) => Names::Resolve {
+                        cache: &mut cache,
+                        workspace,
+                        repository_hash: None,
+                    },
+                    None => Names::Raw,
+                },
             };
             let file = File::open(path).unwrap();
             let read = read_lines(
@@ -130,7 +174,16 @@ impl Reading {
 }
 
 fn read_whole(source: Source, paths: &[&Path]) -> Reading {
-    let mut reading = Reading::default();
+    read_whole_as(Reading::default, source, paths)
+}
+
+/// One read of each file with the kinds_version 1 methodology.
+fn read_whole_v1(source: Source, paths: &[&Path]) -> Reading {
+    read_whole_as(Reading::v1, source, paths)
+}
+
+fn read_whole_as(new: fn() -> Reading, source: Source, paths: &[&Path]) -> Reading {
+    let mut reading = new();
     for (index, path) in paths.iter().enumerate() {
         reading.read(source, path, index as u32 + 1, &[]);
     }
@@ -259,12 +312,12 @@ fn cut_points(path: &Path) -> Vec<u64> {
 }
 
 /// Every single cut, and every line as its own piece, equal one read.
-fn assert_split_parity(source: Source, paths: &[&Path]) {
-    let whole = read_whole(source, paths);
+fn assert_split_parity(new: fn() -> Reading, source: Source, paths: &[&Path]) {
+    let whole = read_whole_as(new, source, paths);
     for (index, path) in paths.iter().enumerate() {
         let cuts = cut_points(path);
         for cut in &cuts {
-            let mut split = Reading::default();
+            let mut split = new();
             for (other, other_path) in paths.iter().enumerate() {
                 let pieces: &[u64] = if other == index {
                     std::slice::from_ref(cut)
@@ -275,7 +328,7 @@ fn assert_split_parity(source: Source, paths: &[&Path]) {
             }
             assert_eq!(split.agg, whole.agg, "cut at {cut} of file {index}");
         }
-        let mut every_line = Reading::default();
+        let mut every_line = new();
         for (other, other_path) in paths.iter().enumerate() {
             let pieces: Vec<u64> = if other == index {
                 cuts.clone()
@@ -443,13 +496,14 @@ fn claude_goldens_match_v1_and_any_split() {
     let dir = scratch("composition-v2-claude-goldens");
     let paths = claude_fixture_paths(&dir);
     let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-    let whole = read_whole(Source::Claude, &refs);
+    let whole = read_whole_v1(Source::Claude, &refs);
     assert_matches_v1(&v1_claude(&refs), &whole);
     // The hand-computed v1 totals (EXPECTED_CLAUDE): tokens, residency, images.
     let tokens: u64 = whole.agg.days.values().map(|bucket| bucket.tokens).sum();
     let residency: u64 = whole.agg.days.values().map(|bucket| bucket.residency).sum();
     assert_eq!((tokens, residency), (1324, 1344));
-    assert_split_parity(Source::Claude, &refs);
+    assert_split_parity(Reading::v1, Source::Claude, &refs);
+    assert_split_parity(Reading::default, Source::Claude, &refs);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -518,9 +572,10 @@ fn codex_goldens_match_v1_and_any_split() {
     for (name, records) in fixtures {
         let path = dir.join(format!("{name}.jsonl"));
         write_records(&path, &records);
-        let whole = read_whole(Source::Codex, &[&path]);
+        let whole = read_whole_v1(Source::Codex, &[&path]);
         assert_matches_v1(&v1_codex(&[&path]), &whole);
-        assert_split_parity(Source::Codex, &[&path]);
+        assert_split_parity(Reading::v1, Source::Codex, &[&path]);
+        assert_split_parity(Reading::default, Source::Codex, &[&path]);
     }
     fs::remove_dir_all(dir).unwrap();
 }
@@ -561,7 +616,7 @@ fn claude_copied_records_count_once_in_either_order() {
         ([&resumed, &original], [born(120), born(0)]),
     ] {
         let refs: Vec<&Path> = order.iter().map(|path| path.as_path()).collect();
-        let mut whole = Reading::default();
+        let mut whole = Reading::v1();
         for (index, path) in refs.iter().enumerate() {
             let id = index as u32 + 1;
             whole
@@ -576,7 +631,7 @@ fn claude_copied_records_count_once_in_either_order() {
     }
     assert_eq!(totals[0], totals[1]);
     // Within the slack a record is the transcript's own.
-    let mut reading = Reading::default();
+    let mut reading = Reading::v1();
     reading
         .copied_before
         .insert(1, born(30) - COPIED_SLACK_SECS);
@@ -584,7 +639,7 @@ fn claude_copied_records_count_once_in_either_order() {
     assert_eq!(reading.stats.lines, 4);
     assert_eq!(
         v2_rows(&reading.agg),
-        v2_rows(&read_whole(Source::Claude, &[&resumed]).agg)
+        v2_rows(&read_whole_v1(Source::Claude, &[&resumed]).agg)
     );
     fs::remove_dir_all(dir).unwrap();
 }
@@ -644,7 +699,7 @@ fn defined_differences_from_v1() {
         .agg
         .days
         .iter()
-        .filter(|((_, kind), _)| *kind == Kind::ShellOutput)
+        .filter(|((_, kind), _)| *kind == Kind::CommandOutput)
         .map(|(_, bucket)| bucket.events)
         .sum::<u64>();
     assert_eq!(shell, 1);
@@ -683,6 +738,8 @@ fn codex_inner_items_wait_with_their_open_call() {
         copied_before: None,
         fallback_day: day_of(fallback_date()),
         stats: &mut reading.stats,
+        kinds: KindsVersion::V2,
+        names: Names::Raw,
     };
     read_lines(
         file,
@@ -1070,7 +1127,6 @@ fn assert_same_totals(actual: &Aggregate, expected: &Aggregate) {
 
 #[test]
 fn rewritten_files_are_read_again_within_the_budget() {
-    super::upload::tests::set_accept_v1_kinds(true);
     let env = Env::new("composition-v2-rewrite");
     let now = base_now();
     let day = now.date();
@@ -1100,7 +1156,7 @@ fn rewritten_files_are_read_again_within_the_budget() {
     // Within budget the next day: replaced, not added.
     let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
     assert_eq!(stats.bytes_repair, fs::metadata(&path).unwrap().len());
-    let mut whole = Reading::default();
+    let mut whole = Reading::in_workspace(&env.workspace);
     whole.read(Source::Claude, &path, 1, &[]);
     assert_same_totals(&env.scope(Source::Claude).agg, &whole.agg);
 
@@ -1113,7 +1169,7 @@ fn rewritten_files_are_read_again_within_the_budget() {
         Some(&mut capture),
     );
     assert_eq!(stats.bytes_repair, fs::metadata(&path).unwrap().len());
-    let mut whole = Reading::default();
+    let mut whole = Reading::in_workspace(&env.workspace);
     whole.read(Source::Claude, &path, 1, &[]);
     assert_same_totals(&env.scope(Source::Claude).agg, &whole.agg);
     let last = capture.payloads.last().unwrap();
@@ -1125,15 +1181,15 @@ fn rewritten_files_are_read_again_within_the_budget() {
             .find(|row| row["category"] == kind)
             .cloned()
     };
-    let shell = row("shell_output").expect("zero row for the emptied kind");
-    assert_eq!(
-        (
-            shell["events"].as_u64(),
-            shell["tokens_entered_est"].as_u64()
-        ),
-        (Some(0), Some(0))
-    );
-    assert!(row("harness_attachments").is_some());
+    for emptied in ["command_output", "files_read"] {
+        let zero = row(emptied).expect("zero row for the emptied kind");
+        assert_eq!(
+            (zero["events"].as_u64(), zero["tokens_entered_est"].as_u64()),
+            (Some(0), Some(0)),
+            "{emptied}"
+        );
+    }
+    assert!(row("automatic_additions").is_some());
     env.cleanup();
 }
 
@@ -1355,7 +1411,6 @@ fn bad_state_reads_again_and_never_fails() {
 
 #[test]
 fn rebuilt_scope_uploads_every_rebuilt_day() {
-    super::upload::tests::set_accept_v1_kinds(true);
     let env = Env::new("composition-v2-rebuilt-upload");
     let now = base_now();
     let day = now.date();
@@ -1397,7 +1452,6 @@ fn rebuilt_scope_uploads_every_rebuilt_day() {
 
 #[test]
 fn changed_days_upload() {
-    super::upload::tests::set_accept_v1_kinds(true);
     let env = Env::new("composition-v2-upload");
     let now = base_now();
     let day = now.date();
@@ -1558,6 +1612,16 @@ fn scope_key_is_stable_across_worktrees() {
             None,
         )
     };
+    let in_worktree = |name: &str| worktree.join(name).to_string_lossy().into_owned();
+    append_records(
+        &path,
+        &claude_read_turn(
+            &worktree.to_string_lossy(),
+            now.date(),
+            3,
+            &in_worktree("src/w.rs"),
+        ),
+    );
     run(now, &mut super::scope::GitScopeResolver);
     git(
         &main,
@@ -1566,6 +1630,15 @@ fn scope_key_is_stable_across_worktrees() {
     append_records(
         &path,
         &claude_turn(&worktree.to_string_lossy(), now.date(), 2),
+    );
+    append_records(
+        &path,
+        &claude_read_turn(
+            &worktree.to_string_lossy(),
+            now.date(),
+            4,
+            &in_worktree("src/x.rs"),
+        ),
     );
     let stats = run(
         now + time::Duration::days(1),
@@ -1580,6 +1653,20 @@ fn scope_key_is_stable_across_worktrees() {
         index.scope_info[&main_scope].workspace_hash,
         wt_info.workspace_hash
     );
+    // Names resolve when the line is read: a file read while its worktree
+    // existed keeps its repo-relative name; one read after it was removed
+    // keeps its basename. State never holds the absolute path.
+    let scope = load_scope(
+        &scope_path(&state, Source::Claude, &main_scope),
+        Source::Claude,
+        &main_scope,
+    )
+    .unwrap()
+    .unwrap();
+    let names: BTreeSet<&str> = scope.agg.all_files.keys().map(|key| &*key.path).collect();
+    assert_eq!(names, BTreeSet::from(["src/w.rs", "x.rs"]));
+    let stored = fs::read_to_string(scope_path(&state, Source::Claude, &main_scope)).unwrap();
+    assert!(!stored.contains(&in_worktree("src")));
     fs::remove_dir_all(base).unwrap();
 }
 
@@ -1618,6 +1705,212 @@ fn parse_state_round_trips() {
     assert_eq!(round.copied, CopiedMode::BeforeOrdinal(3));
     assert_eq!(round.min_ts, Some(5));
     assert_eq!(&*round.session, "s");
+
+    // An open call keeps every share (kind, part, weight, file, tool).
+    let ctx = crate::composition_kinds::LineCtx::v2(
+        crate::composition_kinds::Agent::Claude,
+        crate::composition_kinds::Request1::No,
+        Some(Path::new("/w")),
+        false,
+        crate::composition_kinds::Author::You,
+    );
+    let mut state = ParseState::default();
+    let calls = [
+        (
+            "bash",
+            crate::composition_kinds::claude_tool(
+                &ctx,
+                "Bash",
+                &json!({"command":"cat a.md b.rs && git log"}),
+            ),
+        ),
+        (
+            "mcp",
+            crate::composition_kinds::claude_tool(&ctx, "mcp__github__search", &Value::Null),
+        ),
+    ];
+    for (id, class) in &calls {
+        state.open_call((*id).into(), class.clone());
+    }
+    assert!(calls[0].1.shares.len() == 3 && calls[1].1.shares.len() == 1);
+    let round = StoredParse::from_state(&state).into_state().unwrap();
+    for (id, class) in &calls {
+        assert_eq!(&round.open_calls[*id].class, class, "{id}");
+    }
+}
+
+#[test]
+fn v2_splits_match_one_read_with_calls_open_across_a_checkpoint() {
+    let dir = scratch("composition-v2-share-parity");
+    let (claude, codex) = every_family("/w", fallback_date());
+    for (source, records) in [(Source::Claude, claude), (Source::Codex, codex)] {
+        let path = dir.join(format!("{}.jsonl", source.label()));
+        write_records(&path, &records);
+        assert_split_parity(Reading::default, source, &[&path]);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn results_split_over_their_shares_and_tools() {
+    let dir = scratch("composition-v2-result-shares");
+    let (claude, codex) = every_family("/w", fallback_date());
+    let path = dir.join("claude.jsonl");
+    write_records(&path, &claude);
+    let reading = read_whole(Source::Claude, &[&path]);
+    let parts = |agg: &Aggregate| -> BTreeMap<(String, String, Option<String>), u64> {
+        agg.all_parts
+            .iter()
+            .map(|(slot, bucket)| {
+                (
+                    (
+                        slot.part.as_str().to_string(),
+                        slot.kind.as_str().to_string(),
+                        slot.server.as_deref().map(str::to_string),
+                    ),
+                    bucket.tokens,
+                )
+            })
+            .collect()
+    };
+    let claude_parts = parts(&reading.agg);
+    let tokens = |part: &str| {
+        claude_parts
+            .iter()
+            .filter(|((name, ..), _)| name == part)
+            .map(|(_, tokens)| *tokens)
+            .sum::<u64>()
+    };
+    // `cat README.md docs/b.md && git status`: two file reads and git
+    // share the result, which sums to the result's tokens.
+    let bash_tokens = tokens_for("readme text, docs text, and git status output");
+    assert_eq!(tokens("shell_read") + tokens("git"), bash_tokens);
+    assert!(tokens("shell_read") > 0 && tokens("git") > 0);
+    let files: BTreeSet<&str> = reading.agg.all_files.keys().map(|key| &*key.path).collect();
+    assert!(["/w/README.md", "/w/docs/b.md", "/w/src/a.rs"]
+        .iter()
+        .all(|file| files.contains(file)));
+    // The add-on result is the github server's; an unmatched result is
+    // "other built-in"; the instructions reload splits by file type.
+    assert!(claude_parts.contains_key(&(
+        "addon".to_string(),
+        "other_tools".to_string(),
+        Some("github".to_string())
+    )));
+    assert!(tokens("built_in_other") > 0);
+    assert!(tokens("instructions_reloaded") > 0 && tokens("memory_reloaded") > 0);
+    assert!(tokens("memory_reloaded") > tokens("instructions_reloaded"));
+    // A nested instruction file is a file read; a mentioned one is not.
+    assert!(files.contains("/w/sub/CLAUDE.md"));
+    assert!(tokens("by_you") > 0 && tokens("web") > 0 && tokens("reminders") > 0);
+    // One call per tool.
+    let tools: BTreeMap<&str, (u64, u64)> = reading
+        .agg
+        .all_tools
+        .iter()
+        .map(|(tool, totals)| (&**tool, (totals.calls, totals.tokens)))
+        .collect();
+    assert_eq!(tools["Bash"], (1, bash_tokens));
+    assert_eq!(tools["github/search_code"].0, 1);
+
+    // A Codex cell: the command, the add-on call and the search each take
+    // their share; the add-on share counts under its own tool and server.
+    let path = dir.join("codex.jsonl");
+    write_records(&path, &codex);
+    let reading = read_whole(Source::Codex, &[&path]);
+    let codex_parts = parts(&reading.agg);
+    assert!(codex_parts.contains_key(&(
+        "addon".to_string(),
+        "other_tools".to_string(),
+        Some("linear".to_string())
+    )));
+    let tools: BTreeMap<&str, u64> = reading
+        .agg
+        .all_tools
+        .iter()
+        .map(|(tool, totals)| (&**tool, totals.calls))
+        .collect();
+    assert_eq!(tools.get("linear/list_issues"), Some(&1));
+    assert_eq!(tools.get("exec"), Some(&1));
+    // The search inside the cell counts once, in the cell.
+    assert_eq!(reading.stats.web_search_in_call, 1);
+    let web_events: u64 = reading
+        .agg
+        .all_parts
+        .iter()
+        .filter(|(slot, _)| slot.part == crate::composition_kinds::Part::Web)
+        .map(|(_, bucket)| bucket.events)
+        .sum();
+    assert_eq!(web_events, 1);
+    // Developer text blocks classify one by one.
+    let developer: BTreeSet<&str> = codex_parts
+        .keys()
+        .filter(|(_, kind, _)| kind == "automatic_additions")
+        .map(|(part, ..)| part.as_str())
+        .collect();
+    assert_eq!(developer, BTreeSet::from(["environment", "other"]));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+fn tokens_for(text: &str) -> u64 {
+    super::decode::tokens_for_chars(text.chars().count())
+}
+
+#[test]
+fn top_files_count_the_sessions_that_read_them() {
+    let env = Env::new("composition-v2-file-sessions");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let file = format!("{cwd}/src/shared.rs");
+    let session = |name: &str, reads: u32| -> Vec<Value> {
+        (0..reads)
+            .flat_map(|n| claude_read_turn(&cwd, day, 10 + n, &file))
+            .map(|mut record| {
+                record["sessionId"] = json!(name);
+                record["uuid"] = json!(format!("{name}-{}", record["uuid"].as_str().unwrap()));
+                record
+            })
+            .collect()
+    };
+    // Two sessions read it; one of them five times; a subagent of the
+    // first counts as that session.
+    write_records(&env.root.join("p/one.jsonl"), &session("one", 5));
+    write_records(&env.root.join("p/two.jsonl"), &session("two", 1));
+    write_records(
+        &env.root.join("p/one/subagents/agent-x.jsonl"),
+        &session("one", 1),
+    );
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
+    let row = capture.payloads[0]["top_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["relative_path_or_name"] == "src/shared.rs")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["events"], 7);
+    assert_eq!(
+        (&row["session_count"], &row["session_count_30d"]),
+        (&json!(2), &json!(2))
+    );
+    // One session alone: 1, however often it read the file.
+    let env_one = Env::new("composition-v2-file-sessions-one");
+    let cwd_one = env_one.cwd();
+    let records: Vec<Value> = (0..5)
+        .flat_map(|n| claude_read_turn(&cwd_one, day, 10 + n, &format!("{cwd_one}/src/shared.rs")))
+        .collect();
+    write_records(&env_one.root.join("p/only.jsonl"), &records);
+    let mut capture = Capture::default();
+    env_one.run(Source::Claude, now, Some(&mut capture));
+    let row = &capture.payloads[0]["top_files"][0];
+    assert_eq!(
+        (&row["events"], &row["session_count"]),
+        (&json!(5), &json!(1))
+    );
+    env.cleanup();
+    env_one.cleanup();
 }
 
 // -------------------------------------------------------------------------
@@ -2075,42 +2368,147 @@ fn a_re_read_that_changes_nothing_does_not_upload() {
     env.cleanup();
 }
 
-#[test]
-fn a_v2_upload_never_carries_a_v1_kind() {
-    let env = Env::new("composition-v2-guard");
-    let now = base_now();
-    let cwd = env.cwd();
-    write_records(
-        &env.root.join("p/s.jsonl"),
-        &claude_read_turn(&cwd, now.date(), 1, "/w/src/a.rs"),
-    );
-    let mut capture = Capture::default();
-    // Fixture lines classify to kinds_version 1 ids until the v2 classifier
-    // lands: every such row is dropped and counted.
-    let stats = env.run(Source::Claude, now, Some(&mut capture));
-    assert!(stats.upload_dropped_non_v2 > 0);
-    let payload = &capture.payloads[0];
-    let v2: BTreeSet<&str> = Kind::V2.iter().map(|kind| kind.as_str()).collect();
-    let field = |list: &str, key: &str| -> Vec<String> {
-        payload[list]
+/// Lines of every family the reader classifies: tool calls (a shell
+/// command with several parts, reads, an add-on tool), attachments (an
+/// instructions reload of several files, a nested instruction file),
+/// prompts, and a Codex cell with inner items.
+fn every_family(cwd: &str, day: Date) -> (Vec<Value>, Vec<Value>) {
+    let at = |n: u32| ts(day, n);
+    let claude = vec![
+        json!({"type":"attachment","uuid":"a1","sessionId":"s1","cwd":cwd,"timestamp":at(1),
+            "attachment":{"type":"task_reminder","content":"REMINDER"}}),
+        json!({"type":"attachment","uuid":"a2","sessionId":"s1","cwd":cwd,"timestamp":at(2),
+            "attachment":{"type":"instructions","files":[{"type":"Project","path":format!("{cwd}/CLAUDE.md"),"content":"PROJECT RULES"},
+                {"type":"AutoMem","path":"/m/MEMORY.md","content":"REMEMBERED NOTES AND MORE"}]}}),
+        json!({"type":"attachment","uuid":"a3","sessionId":"s1","cwd":cwd,"timestamp":at(3),
+            "attachment":{"type":"nested_memory","filename":format!("{cwd}/sub/CLAUDE.md"),"content":"NESTED"}}),
+        json!({"type":"user","uuid":"u1","sessionId":"s1","cwd":cwd,"timestamp":at(4),
+            "message":{"role":"user","content":"please look at the code"}}),
+        json!({"type":"assistant","uuid":"as1","sessionId":"s1","cwd":cwd,"timestamp":at(5),
+            "message":{"id":"m1","content":[
+                {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":format!("{cwd}/src/a.rs")}},
+                {"type":"tool_use","id":"t2","name":"Bash","input":{"command":"cat README.md docs/b.md && git status"}},
+                {"type":"tool_use","id":"t3","name":"mcp__github__search_code","input":{"q":"x"}},
+                {"type":"tool_use","id":"t4","name":"WebSearch","input":{"query":"x"}}]}}),
+        json!({"type":"user","uuid":"r1","sessionId":"s1","cwd":cwd,"timestamp":at(6),
+            "message":{"content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"fn main() {}"},
+                {"type":"tool_result","tool_use_id":"t2","content":"readme text, docs text, and git status output"},
+                {"type":"tool_result","tool_use_id":"t3","content":"search results"},
+                {"type":"tool_result","tool_use_id":"t4","content":"web results"},
+                {"type":"tool_result","tool_use_id":"t-unknown","content":"orphan"}]}}),
+    ];
+    let codex = vec![
+        json!({"timestamp":at(1),"type":"session_meta","payload":{"id":"c1","cwd":cwd}}),
+        json!({"timestamp":at(2),"type":"response_item","payload":{"type":"message","role":"developer",
+            "content":[{"type":"input_text","text":"<environment_context>x</environment_context>"},{"type":"input_text","text":"be careful"}]}}),
+        json!({"timestamp":at(3),"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"fix it"}]}}),
+        json!({"timestamp":at(4),"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"k1","input":"tools.exec_command({cmd: 'cat a.md'})"}}),
+        json!({"timestamp":at(5),"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution",
+            "command":["zsh","-lc","cat src/b.rs"],"cwd":cwd,"parsed_cmd":[{"type":"read","path":"src/b.rs"}],"aggregated_output":"code"}}}),
+        json!({"timestamp":at(5),"type":"event_msg","payload":{"type":"item_completed","item":{"type":"McpToolCall",
+            "server":"linear","tool":"list_issues","result":{"content":[{"type":"text","text":"issues"}]}}}}),
+        json!({"timestamp":at(5),"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Extension","kind":"web.search","results":[{"t":"x"}]}}}),
+        json!({"timestamp":at(5),"type":"event_msg","payload":{"type":"web_search_end","query":"q"}}),
+        json!({"timestamp":at(6),"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"k1","output":"cell output with code, issues and results"}}),
+        json!({"timestamp":at(7),"type":"response_item","payload":{"type":"function_call_output","call_id":"k-unknown","output":"orphan"}}),
+        json!({"timestamp":at(8),"type":"response_item","payload":{"type":"agent_message","content":[]}}),
+    ];
+    (claude, codex)
+}
+
+/// The shared wire fixture (also read by the classifier tests).
+fn wire_ids() -> (BTreeSet<String>, BTreeMap<String, String>, BTreeSet<String>) {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/context-composition/kinds-v2.json"
+    ))
+    .unwrap();
+    let strings = |value: &Value| -> BTreeSet<String> {
+        value
             .as_array()
             .unwrap()
             .iter()
-            .map(|row| row[key].as_str().unwrap().to_string())
+            .map(|id| id.as_str().unwrap().to_string())
             .collect()
     };
-    for (list, key) in [
-        ("daily_aggregates", "category"),
-        ("top_files", "category"),
-        ("sessions", "top_kind"),
-        ("parts", "kind"),
-        ("tools", "kind"),
-    ] {
-        for kind in field(list, key) {
-            assert!(v2.contains(kind.as_str()), "{list}.{key} = {kind}");
+    let part_kind = fixture["part_kind"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(part, kind)| (part.clone(), kind.as_str().unwrap().to_string()))
+        .collect();
+    (
+        strings(&fixture["kinds"]),
+        part_kind,
+        strings(&fixture["top_file_parts"]),
+    )
+}
+
+#[test]
+fn every_id_in_a_v2_upload_is_in_the_shared_fixture() {
+    let now = base_now();
+    let (kinds, part_kind, file_parts) = wire_ids();
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-v2-wire-ids-{}", source.label()));
+        let cwd = env.cwd();
+        let (claude, codex) = every_family(&cwd, now.date());
+        match source {
+            Source::Claude => write_records(&env.root.join("p/s1.jsonl"), &claude),
+            Source::Codex => write_records(
+                &env.root.join("2026/rollout-2026-07-19T00-00-00-c1.jsonl"),
+                &codex,
+            ),
         }
+        let mut capture = Capture::default();
+        let stats = env.run(source, now, Some(&mut capture));
+        assert_eq!(stats.files_read, 1, "{source:?}");
+        assert_eq!(
+            (stats.upload_dropped_non_v2, stats.upload_dropped_unsafe),
+            (0, 0),
+            "{source:?}"
+        );
+        assert_eq!(stats.lines.unnamed_files, 0, "{source:?}");
+        let payload = &capture.payloads[0];
+        assert_eq!(payload["kinds_version"], 2);
+        let rows = |list: &str| payload[list].as_array().unwrap().clone();
+        let kind_of = |row: &Value, key: &str| row[key].as_str().unwrap().to_string();
+        for row in rows("daily_aggregates") {
+            assert!(kinds.contains(&kind_of(&row, "category")), "{row}");
+        }
+        for row in rows("sessions") {
+            assert!(kinds.contains(&kind_of(&row, "top_kind")), "{row}");
+        }
+        for row in rows("tools") {
+            assert!(kinds.contains(&kind_of(&row, "kind")), "{row}");
+        }
+        for row in rows("parts") {
+            assert_eq!(
+                part_kind.get(&kind_of(&row, "part")),
+                Some(&kind_of(&row, "kind")),
+                "{row}"
+            );
+        }
+        let files = rows("top_files");
+        assert!(!files.is_empty(), "{source:?}");
+        for row in &files {
+            let part = kind_of(row, "part");
+            assert!(file_parts.contains(&part), "{row}");
+            assert_eq!(part_kind.get(&part), Some(&kind_of(row, "category")));
+            // Repo-relative names, never a path.
+            let name = row["relative_path_or_name"].as_str().unwrap();
+            assert!(!name.starts_with('/'), "{name}");
+        }
+        check_server_rules(payload).unwrap();
+        // Every kind the fixture lines reach is a kinds_version 2 kind.
+        let scope = env.scope(source);
+        assert!(scope
+            .agg
+            .days
+            .keys()
+            .all(|(_, kind)| Kind::V2.contains(kind)));
+        env.cleanup();
     }
-    env.cleanup();
 }
 
 // The server's field rules for a kinds_version 2 upload, copied (not
@@ -2149,6 +2547,19 @@ const SERVER_PART_KIND: [(&str, &str); 31] = [
     ("other", "automatic_additions"),
     ("by_you", "your_prompts"),
     ("by_agent", "your_prompts"),
+];
+
+const SERVER_FILE_FIELDS: [&str; 10] = [
+    "relative_path_or_name",
+    "category",
+    "events",
+    "tokens_entered_est",
+    "last_accessed_at",
+    "part",
+    "events_30d",
+    "tokens_entered_est_30d",
+    "session_count",
+    "session_count_30d",
 ];
 
 const SERVER_KINDS: [&str; 7] = [
@@ -2282,6 +2693,16 @@ fn check_server_rules(payload: &Value) -> Result<(), String> {
         if let Some(part) = row["part"].as_str() {
             if part_kind.get(part) != Some(&kind) {
                 return Err(format!("file part {part}"));
+            }
+        }
+        // The file input forbids other fields; the session counts are the
+        // optional non-negative integers the server adds for kinds_version 2.
+        for (field, value) in row.as_object().into_iter().flatten() {
+            if !SERVER_FILE_FIELDS.contains(&field.as_str()) {
+                return Err(format!("file field {field}"));
+            }
+            if field.starts_with("session_count") && value.as_u64().is_none() {
+                return Err(format!("file {field} {value}"));
             }
         }
     }
@@ -2468,7 +2889,7 @@ fn a_maximal_upload_meets_the_server_field_rules() {
     );
     for n in 0..150 {
         let key = FileKey {
-            path: format!("/w/repo/src/file{n}.rs").into(),
+            path: format!("src/file{n}.rs").into(),
             kind: Kind::FilesRead,
             part: Part::FileTool,
         };

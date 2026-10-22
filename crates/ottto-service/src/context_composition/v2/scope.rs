@@ -152,6 +152,16 @@ pub(super) struct Scope {
 }
 
 impl Scope {
+    /// Bytes held in memory, approximately: totals and checkpoints.
+    pub(super) fn accounted_bytes(&self) -> usize {
+        self.agg.accounted_bytes()
+            + self
+                .files
+                .iter()
+                .map(|(key, checkpoint)| key.len() + checkpoint.accounted_bytes())
+                .sum::<usize>()
+    }
+
     pub(super) fn new(scope_id: &str, info: ScopeInfo) -> Self {
         Self {
             scope_id: scope_id.to_string(),

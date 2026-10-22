@@ -15,7 +15,7 @@
 use super::aggregate::{Day, Slot, StoredContribution};
 use super::scope::ScopeInfo;
 use super::{MAX_OPEN_CALLS, STATE_SCHEMA};
-use crate::composition_kinds::{CallClass, Kind, Part, ToolKey};
+use crate::composition_kinds::{CallClass, CallShare, Kind, Part, ToolKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -205,6 +205,16 @@ pub(super) struct Checkpoint {
     pub(super) last_seen: Day,
 }
 
+impl Checkpoint {
+    /// Bytes held in memory, approximately (the run's memory figure).
+    pub(super) fn accounted_bytes(&self) -> usize {
+        256 + self.path.len()
+            + self.parser_version.len()
+            + self.parse.accounted_bytes()
+            + self.contribution.accounted_bytes()
+    }
+}
+
 // -------------------------------------------------------------------------
 // Parse state.
 // -------------------------------------------------------------------------
@@ -342,6 +352,9 @@ impl ParseState {
     }
 }
 
+/// A call share as stored: kind, part, weight, file and add-on tool.
+type StoredShare = (String, String, u32, Option<String>, Option<String>);
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct StoredCall {
@@ -350,6 +363,10 @@ pub(super) struct StoredCall {
     part: String,
     tool: String,
     file: Option<String>,
+    /// Every share of a call whose result splits (empty when it does not),
+    /// so a call open across a checkpoint splits as in one read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shares: Vec<StoredShare>,
     items: Vec<SavedItem>,
     seq: u64,
 }
@@ -374,6 +391,18 @@ pub(super) struct StoredParse {
 }
 
 impl StoredParse {
+    /// Bytes held in memory, approximately.
+    pub(super) fn accounted_bytes(&self) -> usize {
+        160 + self.session.len()
+            + self.cwd.as_ref().map_or(0, String::len)
+            + self.open.len() * 96
+            + self
+                .open_calls
+                .iter()
+                .map(|call| 192 + call.shares.len() * 96 + call.items.len() * 128)
+                .sum::<usize>()
+    }
+
     pub(super) fn from_state(state: &ParseState) -> Self {
         Self {
             session: state.session.to_string(),
@@ -391,6 +420,20 @@ impl StoredParse {
                     part: call.class.part.as_str().to_string(),
                     tool: call.class.tool.as_str().to_string(),
                     file: call.class.file.as_deref().map(str::to_string),
+                    shares: call
+                        .class
+                        .shares
+                        .iter()
+                        .map(|share| {
+                            (
+                                share.kind.as_str().to_string(),
+                                share.part.as_str().to_string(),
+                                share.weight,
+                                share.file.as_deref().map(str::to_string),
+                                share.tool.as_ref().map(|tool| tool.as_str().to_string()),
+                            )
+                        })
+                        .collect(),
                     items: call.items.clone(),
                     seq: call.seq,
                 })
@@ -422,23 +465,29 @@ impl StoredParse {
     /// `None` when a stored kind or part is unknown (bad state).
     pub(super) fn into_state(self) -> Option<ParseState> {
         use super::aggregate::{kind_from_str, part_from_str};
-        let class = |kind: &str, part: &str, tool: &str, file: Option<String>| {
-            Some(CallClass {
-                kind: kind_from_str(kind)?,
-                part: part_from_str(part)?,
-                tool: ToolKey::new(tool),
-                file: file.map(Into::into),
-                // kinds_version 1 classes have no shares; storing them comes
-                // with the v2 classifier.
-                shares: Box::default(),
-            })
-        };
         let mut open_calls = BTreeMap::new();
         for call in self.open_calls {
+            let mut shares = Vec::with_capacity(call.shares.len());
+            for (kind, part, weight, file, tool) in call.shares {
+                shares.push(CallShare {
+                    kind: kind_from_str(&kind)?,
+                    part: part_from_str(&part)?,
+                    weight,
+                    file: file.map(Into::into),
+                    tool: tool.as_deref().map(ToolKey::new),
+                });
+            }
+            let class = CallClass {
+                kind: kind_from_str(&call.kind)?,
+                part: part_from_str(&call.part)?,
+                tool: ToolKey::new(&call.tool),
+                file: call.file.map(Into::into),
+                shares: shares.into_boxed_slice(),
+            };
             open_calls.insert(
                 call.id.into(),
                 OpenCall {
-                    class: class(&call.kind, &call.part, &call.tool, call.file)?,
+                    class,
                     items: call.items,
                     seq: call.seq,
                 },

@@ -19,8 +19,8 @@ use super::decode::{
 use super::file::LineSink;
 use super::MAX_ITEMS_PER_CALL;
 use crate::composition_kinds::{
-    self as kinds, Agent, Author, CallClass, ContentLabel, InnerItem, Kind, KindsVersion, LineCtx,
-    ParsedCommand, Request1, Verdict,
+    self as kinds, Agent, Author, ContentLabel, InnerItem, Kind, KindsVersion, LineCtx,
+    ParsedCommand, Part, Verdict,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -178,19 +178,12 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     }
     let day: Day = ts.map_or(out.fallback_day, |ts| ts.date().to_julian_day());
     let cwd = state.cwd.clone();
-    let ctx = LineCtx {
-        agent: Agent::Codex,
-        request_1: Request1::No,
-        cwd: cwd.as_deref().map(Path::new),
-        file_has_rendered: false,
-        author: if state.agent_author {
-            Author::Agent
-        } else {
-            Author::You
-        },
-        // kinds_version 1 ids until this reader adopts the v2 classifier.
-        kinds_version: KindsVersion::V1,
+    let author = if state.agent_author {
+        Author::Agent
+    } else {
+        Author::You
     };
+    let ctx = out.ctx(Agent::Codex, cwd.as_deref().map(Path::new), false, author);
     let payload_type = payload.kind.str();
     let payload_type = payload_type.as_deref().unwrap_or("");
     match payload_type {
@@ -228,7 +221,9 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
             }
             let (class, items) = match call {
                 Some(call) => (call.class, call.items),
-                None => (CallClass::unmatched(), Vec::new()),
+                // A result whose call is not in the file: the classifier's
+                // class for a call with no name.
+                None => (kinds::codex_call(&ctx, None, ""), Vec::new()),
             };
             let (chars, images) = output_chars_and_images(payload.output);
             let tokens = tokens_for_chars(chars);
@@ -250,29 +245,11 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
                 .zip(&parsed)
                 .map(|(item, parsed)| inner_item(item, parsed))
                 .collect();
-            for share in kinds::codex_cell(&class, &inner, tokens) {
-                let slot = Slot::new(share.kind, share.part, class.tool.as_str());
-                out.record(
-                    state,
-                    day,
-                    slot,
-                    share.tokens,
-                    0,
-                    share.file.as_deref(),
-                    ts_secs,
-                    copied,
-                );
-            }
-            if !copied {
-                out.tool(
-                    day,
-                    class.tool.as_str(),
-                    class.kind,
-                    &state.session,
-                    tokens,
-                    true,
-                );
-            }
+            // Split over the inner items (a code cell's commands, add-on
+            // calls and searches), else the call's own shares; an add-on
+            // call inside a cell counts under its own tool.
+            let cells = kinds::codex_cell(&class, &inner, tokens);
+            out.result(state, day, &class, cells, ts_secs, copied);
             if images > 0 {
                 if let Verdict::Count { kind, part } = kinds::image(&ctx, Some(&class)) {
                     let tokens = images * IMAGE_NOMINAL_TOKENS;
@@ -297,27 +274,8 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
             let result = payload.result.value();
             let (text, images) = codex_mcp_result_text_and_images(result.as_ref());
             let tokens = estimate_text_tokens(&text);
-            let slot = Slot::new(class.kind, class.part, class.tool.as_str());
-            out.record(
-                state,
-                day,
-                slot,
-                tokens,
-                0,
-                class.file.as_deref(),
-                ts_secs,
-                copied,
-            );
-            if !copied {
-                out.tool(
-                    day,
-                    class.tool.as_str(),
-                    class.kind,
-                    &state.session,
-                    tokens,
-                    true,
-                );
-            }
+            let cells = kinds::codex_cell(&class, &[], tokens);
+            out.result(state, day, &class, cells, ts_secs, copied);
             if images > 0 {
                 if let Verdict::Count { kind, part } = kinds::image(&ctx, Some(&class)) {
                     let tokens = images * IMAGE_NOMINAL_TOKENS;
@@ -350,6 +308,17 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
             }
         }
         "session_meta" | "" => {}
+        // A search run inside an open call is in that call's output (an
+        // in-cell `web.search` item): count it once, there.
+        "web_search_end"
+            if out.kinds == KindsVersion::V2
+                && state
+                    .last_call
+                    .as_deref()
+                    .is_some_and(|id| state.open_calls.contains_key(id)) =>
+        {
+            out.stats.web_search_in_call += 1;
+        }
         other => {
             if let Verdict::Count { kind, part } = kinds::codex_event(&ctx, other) {
                 let chars = view
@@ -389,8 +358,8 @@ fn message(
         return;
     }
     let (chars, images) = content_chars_and_images(payload.content);
-    if role == "developer" {
-        // A developer message counts whole, even when empty.
+    if role == "developer" && out.kinds == KindsVersion::V1 {
+        // kinds_version 1 counts a developer message whole, even when empty.
         if let Verdict::Count { kind, part } =
             kinds::codex_message(ctx, role, ContentLabel::Absent, "")
         {
@@ -407,7 +376,8 @@ fn message(
             );
         }
     } else {
-        for (kind, part, joined) in user_groups(ctx, payload) {
+        // kinds_version 2 classifies every text block of both roles.
+        for (kind, part, joined) in text_groups(ctx, role, payload) {
             if !joined.is_empty() {
                 let slot = Slot::plain(kind, part);
                 out.record(
@@ -432,13 +402,10 @@ fn message(
     }
 }
 
-/// The counted text blocks of a user message, joined per kind and part in
+/// The counted text blocks of a message, joined per kind and part in
 /// first-seen order. Codex's per-block `content_item_kinds` labels apply only
 /// when they line up with the blocks.
-fn user_groups(
-    ctx: &LineCtx,
-    payload: &CodexPayload,
-) -> Vec<(Kind, crate::composition_kinds::Part, Joined)> {
+fn text_groups(ctx: &LineCtx, role: &str, payload: &CodexPayload) -> Vec<(Kind, Part, Joined)> {
     let Some(blocks) = payload.content.elements() else {
         return Vec::new();
     };
@@ -455,7 +422,7 @@ fn user_groups(
             )
         })
         .filter(|labels: &Vec<Option<String>>| labels.len() == blocks.len());
-    let mut groups: Vec<(Kind, crate::composition_kinds::Part, Joined)> = Vec::new();
+    let mut groups: Vec<(Kind, Part, Joined)> = Vec::new();
     for (index, block) in blocks.iter().enumerate() {
         let Some(block_text) = block.text() else {
             continue;
@@ -471,7 +438,7 @@ fn user_groups(
             Some(labels) => ContentLabel::Present(labels[index].as_deref()),
             None => ContentLabel::Absent,
         };
-        let Verdict::Count { kind, part } = kinds::codex_message(ctx, "user", label, &text) else {
+        let Verdict::Count { kind, part } = kinds::codex_message(ctx, role, label, &text) else {
             continue;
         };
         match groups
